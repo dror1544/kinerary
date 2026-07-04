@@ -1,0 +1,118 @@
+{
+  "meta": {
+    "title": "Test Trip 2027",
+    "brand": "TEST",
+    "departure": "2027-03-10T06:00:00+03:00",
+    "defaultLang": "he"
+  },
+  "participants": [
+    { "username": "alice", "name": "אליס", "name_en": "Alice", "age": 35, "family": "family-a", "color": "#3B82F6" },
+    { "username": "bob",   "name": "בוב",   "name_en": "Bob",   "age": 10, "family": "family-a", "color": "#10B981" }
+  ],
+  "families": [
+    {
+      "id": "family-a",
+      "name": { "he": "משפחת א", "en": "Family A" },
+      "letter": "A",
+      "description": { "he": "2 נפשות", "en": "2 people" },
+      "members": ["alice", "bob"]
+    }
+  ],
+  "stats": [
+    { "number": "2", "description": { "he": "נפשות", "en": "people" } },
+    { "number": "1", "description": { "he": "שלב", "en": "phase" } }
+  ],
+  "alerts": {
+    "booked": { "he": "הכל מוזמן", "en": "All booked" },
+    "pending": { "he": "בטיפול", "en": "Pending" }
+  },
+  "phases": [
+    {
+      "id": "ny",
+      "short_id": "ny",
+      "tabLabel": "NEW YORK",
+      "emoji": "🗽",
+      "title": { "he": "ניו יורק", "en": "New York" },
+      "dates": { "start": "2027-03-11", "end": "2027-03-14" },
+      "hero": {
+        "photo": "",
+        "label": { "he": "ניו יורק", "en": "New York" },
+        "sub":   { "he": "3 לילות",  "en": "3 nights" },
+        "badge": { "he": "11–14/3",  "en": "11–14 Mar" }
+      },
+      "accommodation": {
+        "type": "hotel",
+        "name": { "he": "מלון מרידיאן", "en": "Hotel Meridian" },
+        "address": "100 Example Ave, New York, NY",
+        "phone": "+1-212-0000",
+        "confirmation": "TEST-001",
+        "pin": "9999",
+        "cost": 1000,
+        "dates": { "he": "11–14/3 · 2 אורחים", "en": "11–14 Mar · 2 guests" },
+        "guests": "2",
+        "notes": [
+          { "text": { "he": "ארוחת בוקר כלולה", "en": "Breakfast included" }, "style": "info" }
+        ]
+      },
+      "mapStop": { "lat": 40.7128, "lng": -74.0060, "weatherKey": "nyc" },
+      "venues": [{ "id": "ny-tms", "name": "Times Square", "url": "" }],
+      "rsvp_activities": [],
+      "packing": [],
+      "days": []
+    },
+    {
+      "id": "colorado",
+      "short_id": "co",
+      "tabLabel": "COLORADO",
+      "emoji": "⛰️",
+      "title": { "he": "קולורדו", "en": "Colorado" },
+      "dates": { "start": "2027-03-17", "end": "2027-03-23" },
+      "hero": {
+        "photo": "",
+        "label": { "he": "קולורדו", "en": "Colorado" },
+        "sub":   { "he": "6 לילות",  "en": "6 nights" },
+        "badge": { "he": "17–23/3",  "en": "17–23 Mar" }
+      },
+      "accommodation": {
+        "type": "private",
+        "name": { "he": "בית פרטי, הר האלפים", "en": "Private Home, Alpine Ridge" },
+        "address": "200 Example Rd, Alpine Ridge, CO",
+        "confirmation": "VRBO-TEST",
+        "pin": "1234",
+        "cost": 5000,
+        "dates": { "he": "17–23/3 · 2 אורחים", "en": "17–23 Mar · 2 guests" },
+        "guests": "2",
+        "notes": []
+      },
+      "mapStop": { "lat": 39.1911, "lng": -106.8175, "weatherKey": "co" },
+      "venues": [],
+      "rsvp_activities": [],
+      "packing": [],
+      "days": []
+    }
+  ],
+  "tasks": [
+    { "id": "t1", "text": { "he": "משימה ראשונה", "en": "First task" },  "owner": { "he": "אליס", "en": "Alice" }, "deadline": "2027-03-05" },
+    { "id": "t2", "text": { "he": "משימה שנייה",  "en": "Second task" }, "owner": { "he": "בוב",   "en": "Bob" },   "deadline": "" }
+  ],
+  "bookings": {
+    "flights": [
+      { "flight": "LY008", "date": "2027-03-10", "passengers": { "he": "אליס, בוב", "en": "Alice, Bob" }, "confirmation": "ABC123", "cost": 2000 }
+    ],
+    "hotels": [
+      { "name": "Hotel Meridian NYC", "dates": { "he": "11–14/3", "en": "11–14 Mar" }, "confirmation": "TEST-001", "pin": "9999", "cost": 1000, "cancelled": false }
+    ],
+    "cars": [
+      { "name": "Test Car", "dates": { "he": "17–23/3", "en": "17–23 Mar" }, "confirmation": "CAR-001", "cost": 500 }
+    ]
+  },
+  "budget": {
+    "party_size": 2,
+    "phases": [],
+    "seed_items": []
+  },
+  "trivia": {
+    "total_questions": 5,
+    "participants": ["alice", "bob"]
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "_comment": "Reference shape for `node driver.mjs generate <this-file>`. Delete fields you don't have — only meta/participants/phases are required (see SKILL.md).",
+  "meta": {
+    "title": "Italy 2027",
+    "brand": "ITALY",
+    "defaultLang": "he",
+    "departure": "2027-04-10T08:00:00+03:00",
+    "returnDate": "2027-04-18",
+    "homePhoto": "https://images.unsplash.com/photo-1555992828-ca4dbe41d294?w=2400&q=80&auto=format&fit=crop",
+    "mapPhoto": "https://images.unsplash.com/photo-1499678329028-101435549a4e?w=2400&q=80&auto=format&fit=crop"
+  },
+  "participants": [
+    { "username": "marco", "name": "מרקו", "name_en": "Marco", "age": 53, "family": "bianchi", "color": "#3B82F6" },
+    { "username": "giulia", "name": "ג'וליה", "name_en": "Giulia", "age": 16, "family": "bianchi", "color": "#8B5CF6" },
+    { "username": "luca", "name": "לוקה", "name_en": "Luca", "age": 22, "family": "bianchi", "color": "#10B981" }
+  ],
+  "families": [
+    { "id": "bianchi", "name_he": "משפחת ביאנקי", "name_en": "Bianchi Family", "letter": "A", "phases": "all", "description_he": "3 נפשות", "description_en": "3 people" }
+  ],
+  "phases": [
+    {
+      "id": "rome",
+      "tabLabel": "ROME",
+      "emoji": "🏛️",
+      "title_he": "רומא",
+      "title_en": "Rome",
+      "start": "2027-04-10",
+      "end": "2027-04-14",
+      "accommodation": {
+        "name_he": "מלון ארטמידה",
+        "name_en": "Hotel Artemide",
+        "address": "Via Nazionale 22, Rome",
+        "confirmation": "IT-ROMA-001",
+        "weatherKey": "rome"
+      },
+      "hero": {
+        "photo": "https://images.unsplash.com/photo-1735088694828-e86c572a9f19?w=1600&q=80",
+        "sub_he": "קולוסיאום, וותיקן, טרסטבר",
+        "sub_en": "Colosseum, Vatican, Trastevere"
+      },
+      "mapStop": { "lat": 41.9028, "lng": 12.4964 },
+      "venues": [
+        { "id": "rome-colosseum", "name": "Colosseum", "name_he": "קולוסיאום", "url": "https://parcocolosseo.it/en/", "area": "Centro" }
+      ],
+      "rsvp_activities": [
+        { "id": "rome-vatican-tour", "title": { "he": "🎨 סיור מודרך בוותיקן", "en": "🎨 Guided Vatican tour" }, "date": "12/4", "price": { "he": "€35 / אדם", "en": "€35 / person" }, "url": "" }
+      ]
+    },
+    {
+      "id": "florence",
+      "tabLabel": "FLORENCE",
+      "emoji": "🎨",
+      "title_he": "פירנצה",
+      "title_en": "Florence",
+      "start": "2027-04-14",
+      "end": "2027-04-18",
+      "accommodation": {
+        "name_he": "מלון פירנצה (טרם נבחר)",
+        "name_en": "Florence Hotel (TBD)",
+        "address": "",
+        "weatherKey": "florence"
+      },
+      "hero": { "photo": "https://images.unsplash.com/photo-1761427271446-7eb5df444a8b?w=1600&q=80" },
+      "mapStop": { "lat": 43.7696, "lng": 11.2558 },
+      "venues": [],
+      "rsvp_activities": []
+    }
+  ],
+  "tasks": [
+    { "id": "t1", "text": { "he": "הזמנת כרטיסים לקולוסיאום", "en": "Book Colosseum tickets" }, "owner": { "he": "מרקו", "en": "Marco" }, "deadline": "2027-03-01" }
+  ],
+  "bookings": {
+    "flights": [
+      { "flight": "TLV-FCO", "date": "2027-04-10", "passengers": { "he": "כל המשפחה", "en": "Whole family" }, "confirmation": "ABC123", "cost": 1800 }
+    ]
+  },
+  "budget": {
+    "party_size": 3,
+    "seed_items": [
+      { "phase": "rome", "description": "מלון ארטמידה × 4 לילות", "amount": 900, "is_estimate": true, "category": "hotel" }
+    ]
+  },
+  "trivia": {
+    "total_questions": 10,
+    "questions": []
+  },
+  "travel_info": {
+    "countries": {
+      "Italy": {
+        "capital": "Rome",
+        "flag": "🇮🇹",
+        "currency": { "code": "EUR", "name": "Euro", "symbol": "€" },
+        "callingCode": "+39",
+        "emergency": { "police": "113", "ambulance": "118", "fire": "115", "general": null, "unified112": true }
+      }
+    },
+    "money": [
+      { "he": "אין תרבות טיפים משמעותית באיטליה — עיגול חשבון מספיק", "en": "No major tipping culture in Italy — rounding up is enough" }
+    ]
+  }
+}

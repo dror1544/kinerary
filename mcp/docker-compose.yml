@@ -1,0 +1,18 @@
+services:
+  trip-mcp:
+    build: .
+    container_name: trip-mcp
+    restart: always
+    # Bound to localhost only — expose it via whatever reverse proxy/tunnel
+    # you already use for the site itself if you want Claude Cowork or a
+    # remote agent to reach it; don't publish this port directly.
+    ports:
+      - "127.0.0.1:3001:3001"
+    env_file: .env
+    environment:
+      # Set API_BASE_URL in .env to wherever the trip site's Express server
+      # actually runs — this default only works if trip-mcp runs on the same
+      # host as the site, port 8080.
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8080}
+      MCP_PORT: "3001"
+      TRIP_API_KEY: ${TRIP_API_KEY}

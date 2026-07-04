@@ -1,0 +1,39 @@
+version: '3.9'
+services:
+  trip-site:
+    image: nginx:stable-alpine
+    container_name: trip-framework-site
+    restart: unless-stopped
+    ports:
+      - '8081:80'
+    volumes:
+      - ./site:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    environment:
+      TZ: Asia/Jerusalem
+    depends_on:
+      - trip-server
+    networks:
+      - trip_net
+
+  trip-server:
+    build: ./server
+    container_name: trip-framework-server
+    restart: unless-stopped
+    privileged: true
+    env_file: .env
+    environment:
+      TZ: Asia/Jerusalem
+      TRIP_DIR: /trip
+    volumes:
+      - ./server/data:/app/data
+      - ./site/avatars:/app/avatars
+      - ${TRIP_DIR_HOST:-./trip}:/trip:ro
+    networks:
+      - trip_net
+
+
+
+networks:
+  trip_net:
+    driver: bridge

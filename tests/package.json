@@ -1,0 +1,14 @@
+{
+  "name": "trip-framework-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-reporter=spec config.test.js server.test.js render.test.js",
+    "test:config": "node --test --test-reporter=spec config.test.js",
+    "test:server": "node --test --test-reporter=spec server.test.js",
+    "test:render": "node --test --test-reporter=spec render.test.js"
+  },
+  "devDependencies": {
+    "happy-dom": "^14.0.0"
+  }
+}

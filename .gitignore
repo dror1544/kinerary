@@ -1,0 +1,18 @@
+.env
+node_modules/
+.DS_Store
+.fastembed_cache/
+server/data/
+
+# Media assets — stored on NAS, not in git
+site/avatars/
+site/*.mp3
+site/*.wav
+site/*.ogg
+
+# Booking confirmation PDFs — deployed via rsync, not git
+site/confirmations/
+scripts/__pycache__/
+
+# Design references — local only, not committed
+references/

@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html lang="he" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🏆 Trip Quiz</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;700;900&family=Anton&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --c-red:    #e21b3c;
+    --c-blue:   #1368ce;
+    --c-yellow: #d89e00;
+    --c-green:  #26890c;
+    --c-red-h:  #ff1f44;
+    --c-blue-h: #1a82ff;
+    --c-yellow-h: #ffc200;
+    --c-green-h: #33b30f;
+    --bg: #1a0533;
+    --card: rgba(255,255,255,0.07);
+    --text: #fff;
+    --radius: 14px;
+  }
+
+  body {
+    font-family: 'Heebo', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow-x: hidden;
+    user-select: none;
+  }
+
+  /* ── HEADER ─────────────────────────────────────── */
+  #header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px;
+    background: rgba(0,0,0,.4);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(255,255,255,.1);
+    position: sticky; top: 0; z-index: 50;
+    gap: 12px;
+  }
+  #header h1 { font-family: 'Anton', sans-serif; font-size: 1.4rem; letter-spacing: 1px; }
+  #lang-btn {
+    background: rgba(255,255,255,.15); border: none; color: #fff;
+    padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: .85rem;
+    transition: background .2s;
+  }
+  #lang-btn:hover { background: rgba(255,255,255,.25); }
+  #player-chip {
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(255,255,255,.12); border-radius: 20px; padding: 4px 12px 4px 4px;
+    font-size: .85rem;
+  }
+  #player-chip .avatar { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; object-position: top; }
+  #back-btn {
+    background: none; border: 1px solid rgba(255,255,255,.3); color: #fff;
+    padding: 5px 12px; border-radius: 20px; cursor: pointer; font-size: .8rem;
+    text-decoration: none; transition: background .2s;
+  }
+  #back-btn:hover { background: rgba(255,255,255,.1); }
+
+  /* ── SCREENS ─────────────────────────────────────── */
+  .screen { display: none; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 24px 20px; text-align: center; }
+  .screen.active { display: flex; }
+
+  /* ── LOGIN ─────────────────────────────────────── */
+  #s-login { gap: 20px; }
+  #s-login h2 { font-size: 1.8rem; text-align: center; }
+  .login-form {
+    background: var(--card); border-radius: var(--radius); padding: 28px;
+    width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .login-form input {
+    background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2);
+    border-radius: 8px; padding: 12px 14px; color: #fff; font-size: 1rem;
+    font-family: inherit; outline: none; width: 100%;
+  }
+  .login-form input::placeholder { color: rgba(255,255,255,.45); }
+  .login-form input:focus { border-color: rgba(255,255,255,.5); }
+  .btn-primary {
+    background: linear-gradient(135deg, #7c3aed, #a855f7);
+    border: none; color: #fff; padding: 13px; border-radius: 10px;
+    font-size: 1.05rem; font-weight: 700; cursor: pointer; font-family: inherit;
+    transition: opacity .2s; width: 100%;
+  }
+  .btn-primary:hover { opacity: .85; }
+  #login-err { color: #ff8080; font-size: .88rem; text-align: center; min-height: 1.2em; }
+
+  /* ── LOBBY ─────────────────────────────────────── */
+  #s-lobby { gap: 20px; max-width: 960px; width: 100%; }
+  .lobby-title { font-family: 'Anton', sans-serif; font-size: 2.2rem; text-align: center; letter-spacing: 2px; }
+  .lobby-sub { color: rgba(255,255,255,.6); text-align: center; font-size: 1rem; }
+  #player-grid {
+    display: flex; flex-wrap: wrap; justify-content: center;
+    gap: 8px; width: 100%;
+  }
+  .pcard { width: 100px; flex-shrink: 0; }
+
+  /* Participant card */
+  .pcard {
+    border-radius: 12px; border: 2px solid rgba(255,255,255,.15);
+    background: rgba(255,255,255,.05); position: relative; overflow: hidden;
+    transition: border-color .4s, box-shadow .4s;
+  }
+  .pcard.waiting { animation: waitPulse 2.4s ease-in-out infinite; }
+  .pcard.joined  { border-color: #22c55e; box-shadow: 0 0 14px rgba(34,197,94,.45); animation: joinPop .55s ease forwards; }
+
+  .pcard-photo {
+    width: 100%; height: 118px;
+    object-fit: cover; object-position: top; display: block;
+  }
+  .pcard.joined .pcard-photo { filter: brightness(.38); }
+
+  .pcard-av-wrap {
+    display: none; position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -55%);
+  }
+  .pcard.joined .pcard-av-wrap { display: block; }
+  .pcard-av {
+    width: 56px; height: 56px; border-radius: 50%;
+    border: 3px solid #22c55e; object-fit: cover; object-position: top;
+    background: #1a0533;
+  }
+
+  .pcard-label {
+    font-size: .65rem; font-weight: 600; text-align: center;
+    padding: 5px 3px; background: rgba(0,0,0,.5);
+    color: rgba(255,255,255,.5);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pcard.joined .pcard-label { color: #4ade80; }
+
+  @keyframes waitPulse {
+    0%, 100% { transform: scale(1);    opacity: .78; }
+    50%       { transform: scale(1.05); opacity: 1;   }
+  }
+  @keyframes joinPop {
+    0%   { transform: scale(1);    }
+    40%  { transform: scale(1.12); }
+    100% { transform: scale(1);    }
+  }
+  .admin-bar {
+    background: rgba(0,0,0,.5); border-radius: var(--radius); padding: 16px 20px;
+    width: 100%; display: flex; flex-wrap: wrap; gap: 10px; justify-content: center;
+    border: 1px solid rgba(255,255,255,.15);
+  }
+  .ctrl-btn {
+    padding: 10px 20px; border-radius: 8px; border: none; font-family: inherit;
+    font-size: .95rem; font-weight: 700; cursor: pointer; transition: opacity .15s;
+  }
+  .ctrl-btn:hover { opacity: .85; }
+  .ctrl-green  { background: var(--c-green);  color: #fff; }
+  .ctrl-blue   { background: var(--c-blue);   color: #fff; }
+  .ctrl-yellow { background: var(--c-yellow); color: #fff; }
+  .ctrl-red    { background: var(--c-red);    color: #fff; }
+  .ctrl-gray   { background: rgba(255,255,255,.2); color: #fff; }
+
+  /* ── QUESTION ─────────────────────────────────────── */
+  #s-question { gap: 0; padding: 0; justify-content: flex-start; max-width: 100%; width: 100%; }
+  #q-header {
+    width: 100%; padding: 14px 20px 8px; text-align: center;
+  }
+  #q-meta { font-size: .8rem; color: rgba(255,255,255,.55); margin-bottom: 4px; }
+  #q-text {
+    font-size: clamp(1.1rem, 3.5vw, 1.7rem); font-weight: 700; line-height: 1.4;
+    max-width: 760px; margin: 0 auto 12px; text-align: center;
+  }
+  #timer-bar-wrap {
+    width: 100%; height: 8px; background: rgba(255,255,255,.15); border-radius: 4px; overflow: hidden;
+  }
+  #timer-bar { height: 100%; width: 100%; background: #a855f7; transition: width .5s linear; border-radius: 4px; }
+  #paused-badge {
+    display: none; background: #f59e0b; color: #000; font-weight: 700;
+    padding: 4px 14px; border-radius: 20px; font-size: .85rem; margin: 4px auto 0;
+  }
+  #timer-label { font-size: .85rem; color: rgba(255,255,255,.6); margin-top: 4px; }
+
+  #answer-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    width: 100%; max-width: 800px; padding: 16px 16px 20px; margin: 0 auto; flex: 1;
+  }
+  .ans-btn {
+    border: none; border-radius: var(--radius); padding: 20px 14px;
+    font-family: inherit; font-size: clamp(.9rem, 2.5vw, 1.15rem); font-weight: 700;
+    cursor: pointer; color: #fff; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 6px; text-align: center;
+    line-height: 1.3; min-height: 80px; transition: transform .1s, opacity .2s;
+    position: relative; overflow: hidden;
+  }
+  .ans-btn:hover:not(:disabled) { transform: scale(1.03); }
+  .ans-btn:active:not(:disabled) { transform: scale(.97); }
+  .ans-btn:disabled { cursor: default; }
+  .ans-btn .shape { font-size: 1.4rem; }
+  .ans-btn[data-i="0"] { background: var(--c-red); }
+  .ans-btn[data-i="1"] { background: var(--c-blue); }
+  .ans-btn[data-i="2"] { background: var(--c-yellow); color: #111; }
+  .ans-btn[data-i="3"] { background: var(--c-green); }
+  .ans-btn.locked { opacity: .6; }
+  .ans-btn.correct { background: #16a34a !important; animation: flashGreen .5s; }
+  .ans-btn.wrong   { background: #6b7280 !important; animation: flashRed .5s; }
+  .ans-btn.correct::after { content: ' ✓'; }
+  @keyframes flashGreen { 0%,100% { filter: brightness(1); } 50% { filter: brightness(1.5); } }
+  @keyframes flashRed   { 0%,100% { filter: brightness(1); } 50% { filter: brightness(.6); } }
+
+  #locked-overlay {
+    display: none; position: fixed; inset: 0; z-index: 20;
+    background: rgba(0,0,0,.7); flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; font-size: 1.5rem; font-weight: 700;
+  }
+  #locked-overlay.show { display: flex; }
+  #locked-overlay .big { font-size: 3rem; }
+
+  #answer-count-bar {
+    text-align: center; font-size: .85rem; color: rgba(255,255,255,.5);
+    padding: 4px 0 8px;
+  }
+
+  /* ── ADMIN FLOATING BAR ─────────────────────────────────────── */
+  #admin-float {
+    display: none; position: fixed; bottom: 0; left: 0; right: 0; z-index: 60;
+    background: rgba(15,0,40,.95); border-top: 1px solid rgba(255,255,255,.15);
+    padding: 10px 16px; flex-wrap: wrap; gap: 8px; justify-content: center;
+  }
+  #admin-float.show { display: flex; }
+  #admin-float .ctrl-btn { font-size: .85rem; padding: 8px 16px; }
+
+  /* ── LEADERBOARD ─────────────────────────────────────── */
+  #s-leaderboard { gap: 20px; max-width: 600px; width: 100%; }
+  .lb-title { font-family: 'Anton', sans-serif; font-size: 1.8rem; text-align: center; letter-spacing: 2px; }
+  #lb-list { width: 100%; display: flex; flex-direction: column; gap: 10px; }
+  .lb-row {
+    background: var(--card); border-radius: var(--radius); padding: 12px 16px;
+    display: flex; align-items: center; gap: 14px;
+    border: 1px solid rgba(255,255,255,.1);
+    animation: slideIn .3s ease both;
+  }
+  @keyframes slideIn { from { transform: translateX(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .lb-rank { font-family: 'Anton', sans-serif; font-size: 1.4rem; min-width: 32px; text-align: center; }
+  .lb-av { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; object-position: top; flex-shrink: 0; }
+  .lb-info { flex: 1; text-align: center; }
+  .lb-name { font-weight: 700; font-size: 1rem; }
+  .lb-fam  { font-size: .75rem; color: rgba(255,255,255,.5); }
+  .lb-score { font-family: 'Anton', sans-serif; font-size: 1.4rem; text-align: right; }
+  .lb-delta { font-size: .78rem; text-align: right; }
+  .lb-delta.pos { color: #4ade80; }
+  .lb-delta.neg { color: #f87171; }
+  .lb-delta.zer { color: rgba(255,255,255,.4); }
+
+  /* ── GAME OVER ─────────────────────────────────────── */
+  #s-gameover { gap: 24px; max-width: 600px; width: 100%; }
+  .go-title { font-family: 'Anton', sans-serif; font-size: 2.2rem; text-align: center; }
+  #go-podium { display: flex; align-items: flex-end; justify-content: center; gap: 12px; margin-top: 8px; }
+  .podium-slot {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    padding: 10px 14px; border-radius: var(--radius); background: var(--card);
+    border: 1px solid rgba(255,255,255,.15);
+  }
+  .podium-slot.p1 { order: 2; transform: translateY(-20px); }
+  .podium-slot.p2 { order: 1; }
+  .podium-slot.p3 { order: 3; }
+  .podium-slot .pav { width: 60px; height: 60px; border-radius: 50%; object-fit: cover; object-position: top; }
+  .podium-slot .pcrown { font-size: 1.6rem; text-align: center; }
+  .podium-slot .pscore { font-family: 'Anton', sans-serif; font-size: 1.2rem; text-align: center; }
+  .podium-slot .pname  { font-size: .85rem; font-weight: 700; text-align: center; }
+  #go-list { width: 100%; display: flex; flex-direction: column; gap: 8px; }
+
+  /* ── CANVAS CONFETTI ─────────────────────────────────────── */
+  #confetti-canvas { position: fixed; inset: 0; pointer-events: none; z-index: 99; }
+
+  /* ── MUSIC BTN ─────────────────────────────────────── */
+  #music-btn {
+    background: rgba(255,255,255,.15); border: none; color: #fff; font-size: 1.2rem;
+    width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex;
+    align-items: center; justify-content: center; transition: background .2s;
+  }
+  #music-btn:hover { background: rgba(255,255,255,.25); }
+
+  @media (max-width: 500px) {
+    #answer-grid { grid-template-columns: 1fr 1fr; gap: 7px; padding: 10px 10px 70px; }
+    .ans-btn { min-height: 70px; padding: 12px 8px; font-size: .85rem; }
+    .lb-title, .go-title { font-size: 1.4rem; }
+  }
+
+  /* ── SCREEN MODE (TV / projector) ──────────────────── */
+  #screen-badge {
+    display: none;
+    background: #7c3aed; color: #fff;
+    padding: 4px 14px; border-radius: 20px;
+    font-size: .8rem; font-weight: 700; letter-spacing: .5px;
+  }
+  .screen-mode #screen-badge   { display: inline-block; }
+  .screen-mode #player-chip    { display: none !important; }
+  .screen-mode #back-btn       { display: none !important; }
+  .screen-mode #lang-btn       { display: none !important; }
+  .screen-mode #locked-overlay { display: none !important; }
+  .screen-mode #admin-float    { display: none !important; }
+  .screen-mode #admin-lobby    { display: none !important; }
+  .screen-mode #admin-lb       { display: none !important; }
+  .screen-mode #admin-go       { display: none !important; }
+  .screen-mode #screen-mode-btn { display: none !important; }
+  /* Larger question text */
+  .screen-mode #q-text {
+    font-size: clamp(2rem, 4vw, 3.4rem) !important;
+    line-height: 1.35;
+  }
+  /* Larger answer tiles, read-only */
+  .screen-mode .ans-btn {
+    font-size: clamp(1.3rem, 2.5vw, 2rem) !important;
+    min-height: 150px !important;
+    pointer-events: none;
+  }
+  .screen-mode #answer-count-bar {
+    font-size: 1.1rem; color: rgba(255,255,255,.9); padding: 8px 0;
+  }
+  .screen-mode #s-lobby  { max-width: 100%; padding: 20px 24px; }
+  .screen-mode .pcard { width: 130px; }
+  .screen-mode .pcard-photo { height: 160px; }
+  .screen-mode #s-leaderboard { max-width: min(860px, 90vw); margin: 0 auto; }
+  .screen-mode #s-gameover    { max-width: min(860px, 90vw); margin: 0 auto; }
+  .screen-mode #lb-list   { align-items: stretch; }
+  .screen-mode #go-list   { align-items: stretch; }
+  /* Dual-language spans */
+  .sc-he { display: block; }
+  .sc-en { display: block; font-size: .72em; opacity: .72; margin-top: 2px; font-style: italic; }
+</style>
+</head>
+<body>
+
+<!-- AUDIO -->
+<audio id="bg-music" src="/trivia-music.mp3" loop preload="none"></audio>
+
+<!-- CONFETTI CANVAS -->
+<canvas id="confetti-canvas"></canvas>
+
+<!-- HEADER -->
+<header id="header">
+  <a id="back-btn" href="/">← Back / חזרה</a>
+  <h1><img src="/api/trip/logo" id="tq-logo" style="height:32px;width:32px;object-fit:contain;vertical-align:middle;margin-inline-end:8px" onerror="this.style.display='none'">🏆 <span id="tq-brand">Trip Quiz</span></h1>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span id="screen-badge">📺 SCREEN</span>
+    <button id="music-btn" title="Toggle music">🎵</button>
+    <button id="lang-btn">EN / עב</button>
+    <div id="player-chip" style="display:none">
+      <img class="avatar" id="chip-av" src="" alt="">
+      <span id="chip-name"></span>
+    </div>
+  </div>
+</header>
+
+<!-- ── SCREEN: LOGIN ─────────────── -->
+<section id="s-login" class="screen active">
+  <h2 id="t-login-title">🏆 Trip Quiz</h2>
+  <p style="color:rgba(255,255,255,.6);text-align:center" id="t-login-sub">Log in to join the game</p>
+  <div class="login-form">
+    <input id="l-user" type="text" placeholder="Username / שם משתמש" autocomplete="username" autocapitalize="none">
+    <input id="l-pass" type="password" placeholder="Password / סיסמה" autocomplete="current-password">
+    <button class="btn-primary" id="l-btn">Login / כניסה</button>
+    <div id="login-err"></div>
+  </div>
+</section>
+
+<!-- ── SCREEN: LOBBY ─────────────── -->
+<section id="s-lobby" class="screen">
+  <div class="lobby-title" id="t-lobby-title">Waiting Room</div>
+  <div class="lobby-sub" id="t-lobby-sub">The host will start the game shortly. Get ready!</div>
+  <div id="player-grid"></div>
+  <div id="admin-lobby" class="admin-bar" style="display:none">
+    <button class="ctrl-btn ctrl-green" id="t-start-btn" onclick="control('start')">🎯 Start Game</button>
+    <button class="ctrl-btn ctrl-green" id="t-launch-btn" onclick="control('launch')" style="display:none">▶ Launch!</button>
+    <button class="ctrl-btn ctrl-red" onclick="control('stop')" id="t-stop-btn">⏹ End Game</button>
+  </div>
+  <div id="screen-mode-btn" style="margin-top:12px">
+    <a class="ctrl-btn" href="trivia.html?screen=1" target="_blank" style="text-decoration:none;background:#7c3aed;font-size:.85rem;padding:8px 16px">📺 Screen Mode</a>
+  </div>
+</section>
+
+<!-- ── SCREEN: QUESTION ─────────────── -->
+<section id="s-question" class="screen">
+  <div id="q-header">
+    <div id="q-meta"></div>
+    <div id="q-text"></div>
+    <div id="timer-bar-wrap"><div id="timer-bar"></div></div>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div id="timer-label">⏱ 20s</div>
+      <div id="paused-badge">⏸ PAUSED</div>
+      <div id="answer-count-bar"></div>
+    </div>
+  </div>
+  <div id="answer-grid">
+    <button class="ans-btn" data-i="0"><span class="shape">▲</span><span class="ans-text" data-i="0"></span></button>
+    <button class="ans-btn" data-i="1"><span class="shape">◆</span><span class="ans-text" data-i="1"></span></button>
+    <button class="ans-btn" data-i="2"><span class="shape">●</span><span class="ans-text" data-i="2"></span></button>
+    <button class="ans-btn" data-i="3"><span class="shape">■</span><span class="ans-text" data-i="3"></span></button>
+  </div>
+</section>
+
+<!-- LOCKED OVERLAY -->
+<div id="locked-overlay">
+  <div class="big">🔒</div>
+  <div id="t-locked-msg">Answer locked in! Waiting for others…</div>
+</div>
+
+<!-- ── SCREEN: LEADERBOARD ─────────────── -->
+<section id="s-leaderboard" class="screen">
+  <div class="lb-title" id="t-lb-title">🏆 Leaderboard</div>
+  <div id="lb-list"></div>
+  <div id="admin-lb" class="admin-bar" style="display:none">
+    <div id="next-persons-badge" style="width:100%;text-align:center;font-size:.82rem;opacity:.75;padding-bottom:4px;display:none"></div>
+    <button class="ctrl-btn ctrl-green" id="lb-next-btn" onclick="control('next')">▶ Next Question</button>
+    <button class="ctrl-btn ctrl-blue" onclick="control('stop')" id="t-stop-lb-btn">⏹ End Game</button>
+    <button class="ctrl-btn ctrl-gray" onclick="control('restart')" id="t-restart-lb-btn">🔄 Restart</button>
+  </div>
+</section>
+
+<!-- ── SCREEN: GAME OVER ─────────────── -->
+<section id="s-gameover" class="screen">
+  <div class="go-title" id="t-go-title">🎉 Game Over!</div>
+  <div id="go-podium"></div>
+  <div id="go-list"></div>
+  <div id="admin-go" class="admin-bar" style="display:none">
+    <button class="ctrl-btn ctrl-green" onclick="control('start')" id="t-play-again-btn">🔄 Play Again</button>
+  </div>
+</section>
+
+<!-- ADMIN FLOATING BAR (during question) -->
+<div id="admin-float">
+  <button class="ctrl-btn ctrl-yellow" id="pause-btn" onclick="control('pause')">⏸ Pause</button>
+  <button class="ctrl-btn ctrl-green"  id="resume-btn" onclick="control('resume')" style="display:none">▶ Resume</button>
+  <button class="ctrl-btn ctrl-blue"   onclick="control('reveal')" id="t-reveal-btn">⚡ Reveal Now</button>
+  <button class="ctrl-btn ctrl-red"    onclick="control('stop')" id="t-stop-q-btn">⏹ End Game</button>
+  <button class="ctrl-btn ctrl-gray"   onclick="control('leaderboard')" id="t-lb-skip-btn" style="display:none">📊 Leaderboard</button>
+</div>
+
+<script>
+// ── I18N ─────────────────────────────────────────────────────────────────────
+const T = {
+  he: {
+    loginTitle: '🏆 חידון הטיול המשפחתי',
+    loginSub: 'התחבר/י כדי להצטרף למשחק',
+    loginBtn: 'כניסה',
+    lobbyTitle: 'חדר המתנה',
+    lobbySub: 'המנחה יתחיל את המשחק בקרוב. תתכוננו!',
+    launchBtn: '▶ התחל!',
+    stopBtn: '⏹ סיים משחק',
+    pauseBtn: '⏸ השהה',
+    resumeBtn: '▶ המשך',
+    revealBtn: '⚡ גלה עכשיו',
+    nextBtn: '▶ שאלה הבאה',
+    restartBtn: '🔄 התחל מחדש',
+    playAgainBtn: '🔄 שחק שוב',
+    lbTitle: '🏆 לוח הניצחון',
+    goTitle: '🎉 המשחק הסתיים!',
+    lockedMsg: 'תשובה נעולה! ממתינים לשאר…',
+    paused: '⏸ מושהה',
+    answerCount: (n, t) => `${n} מתוך ${t} ענו`,
+    qMeta: (n, t, cat) => `שאלה ${n} מתוך ${t}  •  ${cat === 'trip' ? '✈️ טיול' : '👨‍👩‍👧‍👦 משפחה'}`,
+    timerLabel: s => `⏱ ${s}שניות`,
+    waiting: 'ממתינ/ה…',
+    joined: name => `${name} הצטרפ/ה! ✓`
+  },
+  en: {
+    loginTitle: '🏆 Family Trip Quiz',
+    loginSub: 'Log in to join the game',
+    loginBtn: 'Login',
+    lobbyTitle: 'Waiting Room',
+    lobbySub: 'The host will start the game shortly. Get ready!',
+    launchBtn: '▶ Launch Game!',
+    stopBtn: '⏹ End Game',
+    pauseBtn: '⏸ Pause',
+    resumeBtn: '▶ Resume',
+    revealBtn: '⚡ Reveal Now',
+    nextBtn: '▶ Next Question',
+    restartBtn: '🔄 Restart',
+    playAgainBtn: '🔄 Play Again',
+    lbTitle: '🏆 Leaderboard',
+    goTitle: '🎉 Game Over!',
+    lockedMsg: 'Answer locked in! Waiting for others…',
+    paused: '⏸ PAUSED',
+    answerCount: (n, t) => `${n} of ${t} answered`,
+    qMeta: (n, t, cat) => `Question ${n} of ${t}  •  ${cat === 'trip' ? '✈️ Trip' : '👨‍👩‍👧‍👦 Family'}`,
+    timerLabel: s => `⏱ ${s}s`,
+    waiting: 'Waiting…',
+    joined: name => `${name} Joined! ✓`
+  }
+};
+
+let lang = localStorage.getItem('trivia-lang') || localStorage.getItem('trip-lang') || 'he';
+function setLang(l) {
+  lang = l;
+  localStorage.setItem('trivia-lang', l);
+  document.documentElement.setAttribute('lang', l);
+  applyLang();
+  if (gameState) renderState(gameState);
+}
+function applyLang() {
+  const t = T[lang];
+  document.getElementById('t-login-title').textContent = t.loginTitle;
+  document.getElementById('t-login-sub').textContent = t.loginSub;
+  document.getElementById('l-btn').textContent = t.loginBtn;
+  if (isScreenMode) {
+    document.getElementById('t-lobby-title').textContent = `${T.he.lobbyTitle} / ${T.en.lobbyTitle}`;
+    document.getElementById('t-lb-title').textContent = `${T.he.lbTitle} / ${T.en.lbTitle}`;
+    document.getElementById('t-go-title').textContent = `${T.he.goTitle} / ${T.en.goTitle}`;
+  } else {
+    document.getElementById('t-lobby-title').textContent = t.lobbyTitle;
+    document.getElementById('t-lb-title').textContent = t.lbTitle;
+    document.getElementById('t-go-title').textContent = t.goTitle;
+  }
+  document.getElementById('t-lobby-sub').textContent = t.lobbySub;
+  document.getElementById('t-launch-btn').textContent = t.launchBtn;
+  document.getElementById('t-stop-btn').textContent = t.stopBtn;
+  document.getElementById('t-stop-lb-btn').textContent = t.stopBtn;
+  document.getElementById('t-stop-q-btn').textContent = t.stopBtn;
+  document.getElementById('pause-btn').textContent = t.pauseBtn;
+  document.getElementById('resume-btn').textContent = t.resumeBtn;
+  document.getElementById('t-reveal-btn').textContent = t.revealBtn;
+  document.getElementById('lb-next-btn').textContent = t.nextBtn;
+  document.getElementById('t-restart-lb-btn').textContent = t.restartBtn;
+  document.getElementById('t-play-again-btn').textContent = t.playAgainBtn;
+  document.getElementById('t-locked-msg').textContent = t.lockedMsg;
+  document.getElementById('paused-badge').textContent = t.paused;
+}
+document.getElementById('lang-btn').addEventListener('click', () => setLang(lang === 'he' ? 'en' : 'he'));
+
+// ── SCREEN MODE ───────────────────────────────────────────────────────────────
+const isScreenMode = new URLSearchParams(location.search).has('screen');
+if (isScreenMode) document.body.classList.add('screen-mode');
+
+// Render text for current context: players see one lang, screen sees both stacked
+function screenEl(he, en) {
+  if (!isScreenMode) {
+    const s = document.createElement('span');
+    s.textContent = lang === 'he' ? he : en;
+    return s;
+  }
+  const wrap = document.createElement('div');
+  const h = document.createElement('span'); h.className = 'sc-he'; h.textContent = he;
+  const e = document.createElement('span'); e.className = 'sc-en'; e.textContent = en;
+  wrap.append(h, e);
+  return wrap;
+}
+function screenText(he, en) {
+  if (!isScreenMode) return lang === 'he' ? he : en;
+  return he + ' / ' + en;
+}
+
+// ── ALL PLAYERS (for lobby display) ──────────────────────────────────────────
+// Populated from /api/config at init — see loadAllPlayers() below. Every trip
+// has a different roster; this must never be hardcoded to one family's names.
+let ALL_PLAYERS = [];
+async function loadAllPlayers() {
+  try {
+    const cfg = await fetch('/api/config').then(r => r.json());
+    ALL_PLAYERS = (cfg.trivia?.participants?.length
+      ? cfg.participants.filter(p => cfg.trivia.participants.includes(p.username))
+      : cfg.participants || []
+    ).map(p => ({ u: p.username, name: p.name, name_en: p.name_en, color: p.color || '#888' }));
+
+    (cfg.families || []).forEach(f => {
+      const he = f.name?.he || f.name, en = f.name?.en || f.name;
+      if (he && en) FAMILY_EN[he] = en;
+    });
+    (cfg.participants || []).forEach(p => { PERSON_LABELS[p.username] = p.name; });
+
+    ADMIN_USER = cfg.meta?.admin || cfg.participants?.[0]?.username || null;
+
+    // Brand the quiz page from trip config instead of a hardcoded name.
+    const brand = cfg.meta?.brand || cfg.meta?.title;
+    if (brand) {
+      document.title = `🏆 ${brand} Quiz`;
+      const brandEl = document.getElementById('tq-brand');
+      if (brandEl) brandEl.textContent = `${brand} Quiz`;
+      T.he.loginTitle = `🏆 ${brand} – חידון הטיול המשפחתי`;
+      T.en.loginTitle = `🏆 ${brand} – Family Trip Quiz`;
+      applyLang();
+    }
+  } catch (e) {
+    console.error('Failed to load participants from /api/config:', e.message);
+    ALL_PLAYERS = [];
+  }
+}
+function _activeFile(username) {
+  const u = username.toLowerCase();
+  if (currentUser && currentUser.username === u && currentUser.avatar_file) return currentUser.avatar_file;
+  const cap = u.charAt(0).toUpperCase() + u.slice(1);
+  return localStorage.getItem(`avatar_${u}`) || `${cap}.png`;
+}
+function avatarUrl(username)   { return `/avatars/${_activeFile(username)}`; }
+function fullPhotoUrl(username){ return `/avatars/FullPhoto/${_activeFile(username)}`; }
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
+let currentUser = null;
+let token = null;
+
+function buildAvatar(username, cls = 'av', color = '#888', name = '?') {
+  const img = document.createElement('img');
+  img.className = cls;
+  img.src = avatarUrl(username);
+  img.alt = name;
+  img.onerror = function() {
+    // .png not found → try .jpg
+    img.onerror = function() {
+      // .jpg not found either → draw colored initial on canvas
+      img.onerror = null;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 100;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(50, 50, 50, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 44px Heebo, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText((name || '?')[0].toUpperCase(), 50, 52);
+      img.src = canvas.toDataURL();
+    };
+    img.src = `/avatars/${username}.jpg`;
+  };
+  return img;
+}
+
+async function doLogin(username, password) {
+  const r = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  });
+  if (!r.ok) throw new Error((await r.json()).error || 'Login failed');
+  const data = await r.json();
+  localStorage.setItem('trip-token', data.token);
+  localStorage.setItem('trip-user', JSON.stringify(data.user));
+  return data;
+}
+
+async function checkAuth() {
+  token = localStorage.getItem('trip-token');
+  const stored = localStorage.getItem('trip-user');
+  if (!token || !stored) return false;
+  try {
+    const r = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return false;
+    currentUser = await r.json();
+    return true;
+  } catch (_) { return false; }
+}
+
+// ── LOGIN FORM ────────────────────────────────────────────────────────────────
+document.getElementById('l-btn').addEventListener('click', async () => {
+  const u = document.getElementById('l-user').value.trim().toLowerCase();
+  const p = document.getElementById('l-pass').value;
+  document.getElementById('login-err').textContent = '';
+  try {
+    const data = await doLogin(u, p);
+    token = data.token;
+    currentUser = data.user;
+    onAuthenticated();
+  } catch (e) {
+    document.getElementById('login-err').textContent = e.message;
+  }
+});
+document.getElementById('l-pass').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('l-btn').click(); });
+
+// ── SCREEN MANAGEMENT ─────────────────────────────────────────────────────────
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ── GAME STATE ────────────────────────────────────────────────────────────────
+let gameState = null;
+let timerInterval = null;
+let questionStartLocal = null;
+let questionDurationMs = null;
+let myAnswer = null;
+let myAnswerForQuestion = -1; // tracks which question.number myAnswer belongs to
+let _currentQNumber = -1;    // prevents restarting timer on repeat state broadcasts
+let _lastLbKey = '';         // prevents leaderboard re-animation when data unchanged
+let ADMIN_USER = null;        // set from trip config in loadAllPlayers()
+const isAdmin = () => currentUser?.username === ADMIN_USER;
+
+function onAuthenticated() {
+  const u = currentUser;
+  // Update chip
+  const chip = document.getElementById('player-chip');
+  chip.style.display = 'flex';
+  const chipAv = document.getElementById('chip-av');
+  chipAv.src = avatarUrl(u.username);
+  chipAv.onerror = () => { chipAv.style.display = 'none'; };
+  document.getElementById('chip-name').textContent = lang === 'he' ? u.name : (u.name_en || u.name);
+  applyLang();
+  showScreen('s-lobby');
+  if (isAdmin()) {
+    document.getElementById('admin-lobby').style.display = 'flex';
+    document.getElementById('t-start-btn').style.display = 'inline-block';
+    document.getElementById('t-launch-btn').style.display = 'none';
+    document.getElementById('t-stop-btn').style.display = 'none';
+  }
+  connectSSE();
+}
+
+// ── SSE + POLL FALLBACK ───────────────────────────────────────────────────────
+let sseConn = null;
+let sseAlive = false;          // true once server has delivered at least one event
+let pollInterval = null;
+
+async function fetchState() {
+  try {
+    const r = await fetch('/api/trivia/state', { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return;
+    const state = await r.json();
+    state.myAnswer = myAnswer;
+    renderState(state);
+  } catch (_) {}
+}
+
+function startPoll() {
+  if (pollInterval) return;
+  pollInterval = setInterval(() => { if (!sseAlive) fetchState(); }, 2000);
+}
+
+function stopPoll() {
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+}
+
+function connectSSE() {
+  if (sseConn) { try { sseConn.close(); } catch(_) {} }
+  sseAlive = false;
+  // EventSource can't set Authorization headers; pass JWT via query param
+  sseConn = new EventSource(`/api/trivia/events?_t=${encodeURIComponent(token)}`);
+
+  sseConn.addEventListener('state', e => {
+    sseAlive = true;
+    stopPoll();
+    const state = JSON.parse(e.data);
+    state.myAnswer = myAnswer;
+    renderState(state);
+  });
+  sseConn.addEventListener('answer_count', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('answer-count-bar').textContent = T[lang].answerCount(d.count, d.total);
+  });
+  sseConn.onerror = () => {
+    sseAlive = false;
+    startPoll();
+    setTimeout(connectSSE, 3000);
+  };
+
+  // If no event arrives within 2 s, fall back to polling
+  setTimeout(() => { if (!sseAlive) startPoll(); }, 2000);
+}
+
+// Screen mode: unauthenticated SSE, no player registration
+function connectScreenSSE() {
+  const es = new EventSource('/api/trivia/public-events');
+  es.addEventListener('state', e => {
+    renderState(JSON.parse(e.data));
+  });
+  es.addEventListener('answer_count', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('answer-count-bar').textContent = T[lang].answerCount(d.count, d.total);
+  });
+  es.onerror = () => setTimeout(connectScreenSSE, 3000);
+}
+
+// ── RENDER STATE ──────────────────────────────────────────────────────────────
+function renderState(state) {
+  gameState = state;
+  const status = state.status;
+
+  // Admin floating bar visibility
+  if (isAdmin()) {
+    document.getElementById('admin-float').classList.toggle('show', status === 'question' || status === 'reveal');
+    document.getElementById('admin-lb').style.display = (status === 'leaderboard') ? 'flex' : 'none';
+    document.getElementById('admin-go').style.display = (status === 'gameover') ? 'flex' : 'none';
+    // Update "Next" button label
+    const nextBtn = document.getElementById('lb-next-btn');
+    if (state.question) {
+      const isLast = state.question.number >= state.question.total;
+      nextBtn.textContent = isLast ? (lang === 'he' ? '🏆 תוצאות סופיות' : '🏆 Final Results') : T[lang].nextBtn;
+    }
+    // During reveal: show leaderboard button, hide question controls
+    const inReveal = status === 'reveal';
+    document.getElementById('pause-btn').style.display = inReveal ? 'none' : '';
+    document.getElementById('resume-btn').style.display = 'none';
+    document.getElementById('t-reveal-btn').style.display = inReveal ? 'none' : '';
+    document.getElementById('t-lb-skip-btn').style.display = inReveal ? 'inline-block' : 'none';
+  }
+
+  if (status === 'idle') {
+    stopTimer();
+    if (isScreenMode) stopMusic();
+    showScreen('s-lobby');
+    document.getElementById('player-grid').innerHTML = '';
+    document.getElementById('t-lobby-sub').textContent = lang === 'he'
+      ? 'ממתינים שהמנחה יתחיל את המשחק…' : 'Waiting for the host to start the game…';
+    if (isAdmin()) {
+      document.getElementById('admin-lobby').style.display = 'flex';
+      document.getElementById('t-start-btn').style.display = 'inline-block';
+      document.getElementById('t-launch-btn').style.display = 'none';
+      document.getElementById('t-stop-btn').style.display = 'none';
+    }
+    return;
+  }
+
+  if (status === 'gameover') {
+    stopTimer();
+    _currentQNumber = -1;
+    if (isScreenMode) stopMusic();
+    showScreen('s-gameover');
+    renderGameOver(state);
+    startConfetti();
+    return;
+  }
+
+  if (status === 'lobby') {
+    stopTimer();
+    _currentQNumber = -1;
+    if (isScreenMode) startMusic();
+    showScreen('s-lobby');
+    renderLobby(state);
+    if (isAdmin()) {
+      document.getElementById('admin-lobby').style.display = 'flex';
+      document.getElementById('t-start-btn').style.display = 'none';
+      document.getElementById('t-launch-btn').style.display = 'inline-block';
+      document.getElementById('t-stop-btn').style.display = 'inline-block';
+    }
+    return;
+  }
+
+  if (status === 'question') {
+    showScreen('s-question');
+    document.getElementById('locked-overlay').classList.remove('show');
+    _lastLbKey = '';
+    renderQuestion(state);
+    return;
+  }
+
+  if (status === 'reveal') {
+    showScreen('s-question');
+    document.getElementById('locked-overlay').classList.remove('show');
+    renderReveal(state);
+    stopTimer();
+    return;
+  }
+
+  if (status === 'leaderboard') {
+    showScreen('s-leaderboard');
+    document.getElementById('locked-overlay').classList.remove('show');
+    renderLeaderboard(state);
+    stopTimer();
+    return;
+  }
+}
+
+// ── LOBBY ─────────────────────────────────────────────────────────────────────
+function renderLobby(state) {
+  const grid = document.getElementById('player-grid');
+
+  // Build all 17 cards once (persist between state updates)
+  if (!grid.querySelector('.pcard')) {
+    grid.innerHTML = '';
+    ALL_PLAYERS.forEach(p => {
+      const card = document.createElement('div');
+      card.className = 'pcard waiting';
+      card.dataset.user = p.u;
+
+      const photo = document.createElement('img');
+      photo.className = 'pcard-photo';
+      photo.alt = p.name_en;
+      photo.src = fullPhotoUrl(p.u);
+      photo.onerror = () => { photo.src = avatarUrl(p.u); };
+
+      const avWrap = document.createElement('div');
+      avWrap.className = 'pcard-av-wrap';
+      avWrap.appendChild(buildAvatar(p.u, 'pcard-av', p.color, p.name_en));
+
+      const label = document.createElement('div');
+      label.className = 'pcard-label';
+
+      card.append(photo, avWrap, label);
+      grid.appendChild(card);
+    });
+  }
+
+  // Update each card's join state and label (runs on every state update + lang change)
+  ALL_PLAYERS.forEach(p => {
+    const card = grid.querySelector(`[data-user="${p.u}"]`);
+    if (!card) return;
+    const serverP = state.players[p.u];
+    const joined  = !!serverP;
+    const displayName = lang === 'he'
+      ? (serverP?.name || p.name)
+      : (serverP?.name_en || p.name_en);
+    const label = card.querySelector('.pcard-label');
+
+    if (joined && !card.classList.contains('joined')) {
+      card.classList.remove('waiting');
+      card.classList.add('joined');
+    }
+    if (isScreenMode) {
+      label.innerHTML = '';
+      if (joined) {
+        const he = T.he.joined(serverP?.name || p.name);
+        const en = T.en.joined(serverP?.name_en || p.name_en);
+        label.appendChild(screenEl(he, en));
+      } else {
+        label.appendChild(screenEl(T.he.waiting, T.en.waiting));
+      }
+    } else {
+      label.textContent = joined ? T[lang].joined(displayName) : T[lang].waiting;
+    }
+  });
+}
+
+// ── QUESTION ──────────────────────────────────────────────────────────────────
+function renderQuestion(state) {
+  const q = state.question;
+  if (!q) return;
+
+  // New question arrived → discard any answer from the previous question
+  if (q.number !== myAnswerForQuestion) {
+    myAnswer = null;
+  }
+
+  document.getElementById('q-meta').textContent = isScreenMode
+    ? T.he.qMeta(q.number, q.total, q.category) + '  /  ' + T.en.qMeta(q.number, q.total, q.category)
+    : T[lang].qMeta(q.number, q.total, q.category);
+  const qTextEl = document.getElementById('q-text');
+  qTextEl.innerHTML = '';
+  qTextEl.appendChild(screenEl(q.he, q.en));
+
+  q.answers.forEach((a, i) => {
+    const span = document.querySelector(`.ans-text[data-i="${i}"]`);
+    if (span) { span.innerHTML = ''; span.appendChild(screenEl(a.he, a.en)); }
+  });
+
+  // Reset button states
+  document.querySelectorAll('.ans-btn').forEach(btn => {
+    btn.classList.remove('correct', 'wrong', 'locked');
+    btn.disabled = false;
+  });
+
+  // Re-lock if user already answered this specific question (e.g. SSE reconnect)
+  if (myAnswer !== null) {
+    lockAnswerUI(myAnswer);
+  }
+
+  // Timer — only (re)start for new question numbers to avoid resetting on repeat state events
+  questionDurationMs = q.duration * 1000;
+  questionStartLocal = Date.now() - (q.elapsedMs || 0);
+  if (q.number !== _currentQNumber) {
+    _currentQNumber = q.number;
+    startTimer(q.duration);
+  }
+
+  // Answer count
+  document.getElementById('answer-count-bar').textContent = '';
+}
+
+function lockAnswerUI(idx) {
+  document.querySelectorAll('.ans-btn').forEach((btn, i) => {
+    btn.disabled = true;
+    if (i !== idx) btn.classList.add('locked');
+  });
+  document.getElementById('locked-overlay').classList.add('show');
+}
+
+// ── REVEAL ────────────────────────────────────────────────────────────────────
+function renderReveal(state) {
+  const q = state.question;
+  if (!q) return;
+
+  document.getElementById('q-meta').textContent = isScreenMode
+    ? T.he.qMeta(q.number, q.total, q.category) + '  /  ' + T.en.qMeta(q.number, q.total, q.category)
+    : T[lang].qMeta(q.number, q.total, q.category);
+  const qTextElR = document.getElementById('q-text');
+  qTextElR.innerHTML = '';
+  qTextElR.appendChild(screenEl(q.he, q.en));
+
+  q.answers.forEach((a, i) => {
+    const span = document.querySelector(`.ans-text[data-i="${i}"]`);
+    if (span) { span.innerHTML = ''; span.appendChild(screenEl(a.he, a.en)); }
+    const btn = document.querySelector(`.ans-btn[data-i="${i}"]`);
+    if (btn) {
+      btn.disabled = true;
+      if (a.correct) {
+        btn.classList.add('correct');
+        playSound('correct');
+      } else if (myAnswer === i) {
+        btn.classList.add('wrong');
+        playSound('wrong');
+      } else {
+        btn.classList.add('locked');
+      }
+    }
+  });
+
+  document.getElementById('locked-overlay').classList.remove('show');
+  document.getElementById('timer-bar').style.width = '0%';
+
+  // After reveal, show leaderboard button (admin) after 3s
+  if (isAdmin()) {
+    document.getElementById('t-lb-skip-btn').style.display = 'inline-block';
+  }
+}
+
+// ── LEADERBOARD ───────────────────────────────────────────────────────────────
+// Both maps are populated from /api/config in loadAllPlayers() — never hardcode
+// a trip's families/participants here, every trip has a different roster.
+let FAMILY_EN = {};
+function familyLabel(f) {
+  if (!f) return '';
+  if (isScreenMode) return `${f} / ${FAMILY_EN[f] || f}`;
+  return lang === 'he' ? f : (FAMILY_EN[f] || f);
+}
+
+// Map username (or "general"/"trip") → Hebrew display name
+let PERSON_LABELS = { general: 'כללי', trip: 'טיול' };
+function personsToLabel(persons) {
+  if (!persons) return '';
+  const arr = Array.isArray(persons) ? persons : [persons];
+  return arr.map(p => PERSON_LABELS[p] || p).join(' + ');
+}
+
+function renderLeaderboard(state) {
+  const lbKey = JSON.stringify(state.players);
+  if (lbKey === _lastLbKey) return;
+  _lastLbKey = lbKey;
+
+  document.getElementById('t-lb-title').textContent =
+    isScreenMode ? `${T.he.lbTitle} / ${T.en.lbTitle}` : T[lang].lbTitle;
+
+  // Show next-question persons hint for admin
+  if (isAdmin() && !isScreenMode) {
+    const badge = document.getElementById('next-persons-badge');
+    if (state.nextPersons) {
+      badge.textContent = `⬇ שאלה הבאה: ${personsToLabel(state.nextPersons)}`;
+      badge.style.display = 'block';
+    } else {
+      badge.textContent = '⬇ שאלה אחרונה';
+      badge.style.display = 'block';
+    }
+  }
+  const list = document.getElementById('lb-list');
+  list.innerHTML = '';
+  const sorted = Object.entries(state.players)
+    .sort(([, a], [, b]) => b.score - a.score);
+
+  sorted.forEach(([username, p], idx) => {
+    const row = document.createElement('div');
+    row.className = 'lb-row';
+    row.style.animationDelay = `${idx * 0.06}s`;
+    const name = lang === 'he' ? p.name : (p.name_en || p.name);
+    const delta = p.delta || 0;
+    const deltaClass = delta > 0 ? 'pos' : delta < 0 ? 'neg' : 'zer';
+    const deltaText = delta > 0 ? `+${delta}` : delta < 0 ? `${delta}` : '';
+    const medals = ['🥇','🥈','🥉'];
+    row.innerHTML = `
+      <div class="lb-rank">${medals[idx] || (idx+1)}</div>
+      <div class="lb-av-wrap"></div>
+      <div class="lb-info">
+        <div class="lb-name"></div>
+        <div class="lb-fam">${familyLabel(p.family)}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="lb-score">${p.score}</div>
+        <div class="lb-delta ${deltaClass}">${deltaText}</div>
+      </div>
+    `;
+    row.querySelector('.lb-name').appendChild(screenEl(p.name, p.name_en || p.name));
+    const avWrap = row.querySelector('.lb-av-wrap');
+    avWrap.appendChild(buildAvatar(username, 'lb-av', p.color || '#888', name));
+    list.appendChild(row);
+  });
+}
+
+// ── GAME OVER ─────────────────────────────────────────────────────────────────
+function renderGameOver(state) {
+  document.getElementById('t-go-title').textContent =
+    isScreenMode ? `${T.he.goTitle} / ${T.en.goTitle}` : T[lang].goTitle;
+  const sorted = Object.entries(state.players)
+    .sort(([, a], [, b]) => b.score - a.score);
+
+  const podium = document.getElementById('go-podium');
+  podium.innerHTML = '';
+  [1, 0, 2].forEach(rank => {
+    if (!sorted[rank]) return;
+    const [username, p] = sorted[rank];
+    const name = lang === 'he' ? p.name : (p.name_en || p.name);
+    const slot = document.createElement('div');
+    slot.className = `podium-slot p${rank+1}`;
+    const crowns = ['👑','🥈','🥉'];
+    slot.innerHTML = `<div class="pcrown">${crowns[rank]}</div><div class="pav-wrap"></div><div class="pname"></div><div class="pscore">${p.score}</div>`;
+    slot.querySelector('.pname').appendChild(screenEl(p.name, p.name_en || p.name));
+    slot.querySelector('.pav-wrap').appendChild(buildAvatar(username, 'pav', p.color || '#888', name));
+    podium.appendChild(slot);
+  });
+
+  const goList = document.getElementById('go-list');
+  goList.innerHTML = '';
+  sorted.slice(3).forEach(([username, p], idx) => {
+    const name = lang === 'he' ? p.name : (p.name_en || p.name);
+    const row = document.createElement('div');
+    row.className = 'lb-row';
+    row.innerHTML = `<div class="lb-rank">${idx+4}</div><div class="lb-av-wrap"></div><div class="lb-info"><div class="lb-name"></div><div class="lb-fam">${familyLabel(p.family)}</div></div><div class="lb-score">${p.score}</div>`;
+    row.querySelector('.lb-name').appendChild(screenEl(p.name, p.name_en || p.name));
+    row.querySelector('.lb-av-wrap').appendChild(buildAvatar(username, 'lb-av', p.color || '#888', name));
+    goList.appendChild(row);
+  });
+}
+
+// ── TIMER ─────────────────────────────────────────────────────────────────────
+function startTimer(durationSec) {
+  stopTimer();
+  const bar = document.getElementById('timer-bar');
+  const label = document.getElementById('timer-label');
+  const paused = document.getElementById('paused-badge');
+  paused.style.display = 'none';
+
+  timerInterval = setInterval(() => {
+    const elapsed = Date.now() - questionStartLocal;
+    const remaining = Math.max(0, durationSec * 1000 - elapsed);
+    const pct = (remaining / (durationSec * 1000)) * 100;
+    bar.style.width = pct + '%';
+    const sec = Math.ceil(remaining / 1000);
+    label.textContent = T[lang].timerLabel(sec);
+    // Colour shift: green → yellow → red
+    const hue = Math.max(0, pct * 1.2);
+    bar.style.background = `hsl(${hue}, 80%, 50%)`;
+    if (remaining <= 0) {
+      stopTimer();
+      if (myAnswer === null) {
+        document.querySelectorAll('.ans-btn').forEach(b => { b.disabled = true; });
+      }
+    }
+  }, 100);
+}
+
+function stopTimer() {
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  document.getElementById('timer-bar').style.width = '0%';
+}
+
+// ── ANSWER SUBMISSION ─────────────────────────────────────────────────────────
+document.querySelectorAll('.ans-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    if (btn.disabled || myAnswer !== null) return;
+    const idx = parseInt(btn.dataset.i);
+    myAnswer = idx;
+    myAnswerForQuestion = gameState?.question?.number ?? -1;
+    lockAnswerUI(idx);
+    playSound('click');
+    try {
+      const r = await fetch('/api/trivia/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ answerIndex: idx })
+      });
+      if (!r.ok && gameState?.status === 'question') {
+        myAnswer = null;
+        myAnswerForQuestion = -1;
+        document.getElementById('locked-overlay').classList.remove('show');
+        document.querySelectorAll('.ans-btn').forEach(b => { b.disabled = false; b.classList.remove('locked'); });
+      }
+    } catch (_) {}
+  });
+});
+
+// ── ADMIN CONTROLS ────────────────────────────────────────────────────────────
+async function control(action) {
+  try {
+    const r = await fetch('/api/trivia/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ action })
+    });
+    if (!r.ok) { console.error('control failed', r.status, await r.text()); return; }
+    if (action === 'start' || action === 'launch' || action === 'restart') {
+      myAnswer = null; myAnswerForQuestion = -1;
+    }
+    if (action === 'next') {
+      myAnswer = null; myAnswerForQuestion = -1;
+      document.getElementById('t-lb-skip-btn').style.display = 'none';
+    }
+    // Immediately sync state so UI reflects the action even if SSE is buffered
+    await fetchState();
+  } catch (e) { console.error('control error', e); }
+}
+
+// ── SOUND ─────────────────────────────────────────────────────────────────────
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+function playTone(freq, duration, type = 'sine', vol = 0.3) {
+  try {
+    const ctx = getAudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = type; osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    osc.start(); osc.stop(ctx.currentTime + duration);
+  } catch (_) {}
+}
+function playSound(type) {
+  if (type === 'click')   playTone(880, 0.08, 'square', 0.15);
+  if (type === 'correct') { playTone(660, 0.12); setTimeout(() => playTone(880, 0.15), 120); }
+  if (type === 'wrong')   playTone(200, 0.4, 'sawtooth', 0.2);
+}
+
+// ── MUSIC ─────────────────────────────────────────────────────────────────────
+let musicOn = false;
+let musicStarted = false;
+const bgMusic = document.getElementById('bg-music');
+
+function updateMusicBtn() {
+  document.getElementById('music-btn').textContent = musicOn ? '🔇' : '🎵';
+}
+function startMusic() {
+  if (musicOn) return;
+  bgMusic.currentTime = 0;
+  bgMusic.play().then(() => {
+    musicOn = true;
+    musicStarted = true;
+    updateMusicBtn();
+  }).catch(() => {
+    // Autoplay blocked — user must tap music button
+  });
+}
+function stopMusic() {
+  if (!musicOn) return;
+  bgMusic.pause();
+  bgMusic.currentTime = 0;
+  musicOn = false;
+  musicStarted = false;
+  updateMusicBtn();
+}
+document.getElementById('music-btn').addEventListener('click', () => {
+  if (musicOn) {
+    stopMusic();
+  } else {
+    bgMusic.play().then(() => {
+      musicOn = true;
+      musicStarted = true;
+      updateMusicBtn();
+    }).catch(() => {});
+  }
+});
+
+// ── CONFETTI ──────────────────────────────────────────────────────────────────
+let confettiAF = null;
+function startConfetti() {
+  const canvas = document.getElementById('confetti-canvas');
+  const ctx2 = canvas.getContext('2d');
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  const pieces = Array.from({length: 120}, () => ({
+    x: Math.random() * canvas.width,
+    y: Math.random() * canvas.height - canvas.height,
+    r: 6 + Math.random() * 8,
+    c: `hsl(${Math.random()*360},80%,60%)`,
+    vx: (Math.random() - .5) * 3,
+    vy: 2 + Math.random() * 4,
+    angle: Math.random() * Math.PI * 2,
+    spin: (Math.random() - .5) * .1
+  }));
+  if (confettiAF) cancelAnimationFrame(confettiAF);
+  let frames = 0;
+  function draw() {
+    ctx2.clearRect(0, 0, canvas.width, canvas.height);
+    pieces.forEach(p => {
+      ctx2.save(); ctx2.translate(p.x, p.y); ctx2.rotate(p.angle);
+      ctx2.fillStyle = p.c; ctx2.fillRect(-p.r/2, -p.r/2, p.r, p.r * .5);
+      ctx2.restore();
+      p.x += p.vx; p.y += p.vy; p.angle += p.spin;
+      if (p.y > canvas.height + 20) { p.y = -20; p.x = Math.random() * canvas.width; }
+    });
+    if (frames++ < 300) confettiAF = requestAnimationFrame(draw);
+    else { ctx2.clearRect(0, 0, canvas.width, canvas.height); }
+  }
+  draw();
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+(async () => {
+  await loadAllPlayers();
+  setLang(lang);
+  if (isScreenMode) {
+    // Skip login — screen is an unauthenticated read-only spectator
+    showScreen('s-lobby');
+    connectScreenSSE();
+  } else {
+    const ok = await checkAuth();
+    if (ok) {
+      onAuthenticated();
+    } else {
+      showScreen('s-login');
+    }
+  }
+})();
+</script>
+
+</body>
+</html>

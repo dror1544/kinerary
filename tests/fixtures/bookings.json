@@ -1,0 +1,17 @@
+[
+  {
+    "phase": "ny",
+    "type": "hotel",
+    "name": "Hotel Meridian NYC (test seed)",
+    "date_from": "2027-03-11",
+    "date_to": "2027-03-14",
+    "passengers": null,
+    "confirmation": "TEST-001",
+    "pin": null,
+    "notes": "Test seed booking — do not delete",
+    "cost": 1000,
+    "conf_file": null,
+    "seed_key": "test-seed-hotel-nyc",
+    "created_by": "system"
+  }
+]
