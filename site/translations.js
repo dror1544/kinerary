@@ -13,6 +13,8 @@ const T = {
     login_pwd_placeholder: 'Password',
     err_empty:      'אנא הזן שם משתמש וסיסמה.',
     err_wrong:      'שם משתמש או סיסמה שגויים. נסה שוב.',
+    login_or:       'או',
+    err_google_not_linked: 'אין חשבון המקושר לכניסה זו של Google — התחבר/י קודם עם שם משתמש וסיסמה, ואז חבר/י את Google מהפרופיל שלך.',
 
     /* side menu */
     sm_nav:         'ניווט',
@@ -230,6 +232,7 @@ const T = {
     avatar_crop_confirm: 'העלה',
     avatar_crop_cancel:  'ביטול',
     avatar_upload_error: 'שגיאה בהעלאה, נסה שוב',
+    avatar_reset_default:     '↺ חזור לברירת המחדל',
     avatar_change_password:   '🔑 שנה סיסמה',
     avatar_new_password_ph:      'סיסמה חדשה',
     avatar_confirm_password_ph:  'אימות סיסמה חדשה',
@@ -239,6 +242,10 @@ const T = {
     avatar_pw_mismatch:      'הסיסמאות אינן תואמות',
     avatar_pw_success:       '✓ הסיסמה עודכנה',
     avatar_pw_error:         'שגיאה בעדכון הסיסמה, נסה שוב',
+    avatar_google_connected_prefix: 'מחובר/ת עם',
+    avatar_google_disconnect: 'נתק Google',
+    avatar_google_conflict:  'חשבון Google זה כבר מקושר למשתמש/ת אחר/ת',
+    avatar_google_error:     'שגיאה בחיבור ל-Google, נסה שוב',
 
     /* ── INFO ── */
     info_h2:        'מידע שימושי · בריאות, חירום, אריזה',
@@ -265,6 +272,8 @@ const T = {
     login_pwd_placeholder: 'Password',
     err_empty:      'Please enter your username and password.',
     err_wrong:      'Wrong username or password. Try again.',
+    login_or:       'or',
+    err_google_not_linked: 'No account is linked to this Google login yet — log in with your username and password first, then connect Google from your profile.',
 
     /* side menu */
     sm_nav:         'NAVIGATION',
@@ -479,6 +488,7 @@ const T = {
     avatar_crop_confirm: 'Upload',
     avatar_crop_cancel:  'Cancel',
     avatar_upload_error: 'Upload failed, try again',
+    avatar_reset_default:     '↺ Reset to default',
     avatar_change_password:   '🔑 Change password',
     avatar_new_password_ph:      'New password',
     avatar_confirm_password_ph:  'Confirm new password',
@@ -488,6 +498,10 @@ const T = {
     avatar_pw_mismatch:      "Passwords don't match",
     avatar_pw_success:       '✓ Password updated',
     avatar_pw_error:         'Failed to update password, try again',
+    avatar_google_connected_prefix: 'Connected as',
+    avatar_google_disconnect: 'Disconnect Google',
+    avatar_google_conflict:  'This Google account is already linked to someone else',
+    avatar_google_error:     'Could not connect Google account, try again',
 
     /* ── INFO ── */
     info_h2:        'Useful Info · Health, Emergency, Packing',

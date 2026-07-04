@@ -249,3 +249,24 @@ Assemble everything into one JSON file matching
 see [SKILL.md](SKILL.md) for the exact commands. Report back to the user
 with what was created and the concrete next steps from the generator's own
 output (avatars, Logo.png, trivia content, how to preview it).
+
+## 10. Mention, don't block: Google Sign-In and AI agent access
+
+These are both optional, both configured outside `trip.config.json` (`.env`
++ server restart, not part of the generated file), and neither should hold
+up finishing the trip — just tell the user they exist and where to look
+once the site is up and confirmed working:
+
+- **Google Sign-In** — lets participants log in with Google instead of (not
+  instead of — *in addition to*) the seeded password. Needs the user to
+  create their own Google Cloud OAuth client ID (an interactive step only
+  they can do), then set `GOOGLE_CLIENT_ID` in `.env` and restart the
+  server. Point them at the "Connecting Google Sign-In" section of the
+  top-level [README.md](../../../README.md) for the exact steps — don't
+  duplicate them here.
+- **AI agent access (Claude Cowork or a local always-on agent)** — lets an
+  agent manage the trip day-to-day (bookings, RSVPs, trivia control)
+  through `mcp/`, separately from this skill (which only scaffolds the
+  trip once). Point them at [mcp/README.md](../../../mcp/README.md),
+  specifically the Cowork custom-connector steps if they mention wanting
+  to manage the trip remotely or "from my phone."

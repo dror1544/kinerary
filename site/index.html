@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;700;800;900&family=Anton&family=Assistant:wght@400;700;800&family=Rubik:wght@400;700;900&family=Frank+Ruhl+Libre:wght@500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css" crossorigin=""/>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <link rel="icon" type="image/png" href="Logo.png">
 <link rel="apple-touch-icon" href="logo-180.png">
 <link rel="manifest" href="manifest.json">
@@ -34,6 +35,10 @@
     </div>
     <button id="pwd-btn" data-i18n="login_btn">כניסה →</button>
     <p id="pwd-err" class="login-error"></p>
+    <div id="google-signin-wrap" class="google-signin-wrap" style="display:none">
+      <div class="login-divider" data-i18n="login_or">או</div>
+      <div id="google-signin-btn"></div>
+    </div>
     <a class="lf-login-link" onclick="showLostFoundForm()" data-i18n="lf_login_link">🔍 מצאת משהו של הקבוצה? Lost &amp; Found</a>
   </div>
 </div>
@@ -467,6 +472,7 @@
     <button class="avatar-lb-use" id="avatar-lb-use"></button>
     <input type="file" id="avatar-lb-file" accept="image/*" style="display:none">
     <button class="avatar-lb-upload" id="avatar-lb-upload"></button>
+    <button class="avatar-lb-upload" id="avatar-lb-reset-default" style="display:none" data-i18n="avatar_reset_default"></button>
     <button class="avatar-lb-upload" id="avatar-lb-pw-toggle" data-i18n="avatar_change_password"></button>
     <div class="avatar-lb-crop-panel" id="avatar-lb-crop-panel">
       <div class="avatar-lb-crop-wrap">
@@ -488,6 +494,11 @@
         <button class="avatar-lb-crop-cancel" id="avatar-lb-pw-cancel" data-i18n="avatar_crop_cancel"></button>
         <button class="avatar-lb-crop-confirm" id="avatar-lb-pw-save" data-i18n="avatar_pw_save"></button>
       </div>
+    </div>
+    <div class="avatar-lb-google-wrap" id="avatar-lb-google-wrap" style="display:none">
+      <div class="avatar-lb-crop-status" id="avatar-lb-google-status"></div>
+      <div id="avatar-lb-google-btn"></div>
+      <button class="avatar-lb-upload" id="avatar-lb-google-disconnect" style="display:none" data-i18n="avatar_google_disconnect"></button>
     </div>
   </div>
 </div>

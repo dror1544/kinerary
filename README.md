@@ -33,6 +33,13 @@ the conversation *is* the interface. The assistant looks up map
 coordinates, finds and verifies royalty-free hero photos, and fills in
 sensible defaults for anything you skip.
 
+This step — scaffolding a brand-new trip — needs local filesystem and shell
+access, so it's a **Claude Code** (or another local coding agent) job. Once
+the trip exists, day-to-day management (add a booking, answer "where are we
+eating tonight", control the trivia game) can be handed to **Claude Cowork**
+instead, including from your phone with your computer off — see
+[mcp/README.md](mcp/README.md) for connecting it as a custom connector.
+
 ### Option B — manual CLI wizard
 
 No AI assistant needed:
@@ -64,6 +71,29 @@ menu → "🔑 Change password") before this trip is ever actually shared with
 real people; the seeded password is meant to get you in the door once, not
 to stay in place.
 
+### Connecting Google Sign-In (optional)
+
+Password login always works — this just adds "Continue with Google" as an
+extra option, bound to an already-seeded account (never a way to self-register).
+
+1. Go to the [Google Cloud Console credentials page](https://console.cloud.google.com/apis/credentials)
+   and create an OAuth client ID, type **"Web application"**.
+2. Under **Authorized JavaScript origins**, add the exact URL your site runs
+   at (e.g. `http://localhost:8081` for local testing, or your real domain
+   once deployed).
+3. Copy the client ID (looks like `xxxx.apps.googleusercontent.com`) — this
+   is a public identifier, not a secret, but it still belongs in `.env`, not
+   committed to git.
+4. Add to `.env`: `GOOGLE_CLIENT_ID=xxxx.apps.googleusercontent.com`
+5. Restart the server container so it picks up the new env var:
+   `docker compose up -d --force-recreate trip-server`
+   (a plain `restart` does *not* reload `.env` — it needs to recreate the container)
+
+Without a Client ID, the Google button simply doesn't render — nothing else
+changes. The `/create-trip` interview can walk you through this same setup
+when scaffolding a new trip; see [FRAMEWORK.md](FRAMEWORK.md) for the full
+technical details (schema, endpoints, security model).
+
 ---
 
 ## Hosting options
@@ -85,8 +115,9 @@ Infrastructure section for the exact Compose block.
 
 If you want an AI agent (Claude Cowork, a local agent like Hermes/OpenClaw,
 or your own) to help manage bookings and answer trip questions on your
-behalf, it talks to the site through `mcp/` — see that folder's docs for
-local-agent vs. remote-connector setup.
+behalf, it talks to the site through `mcp/` — see
+[mcp/README.md](mcp/README.md) for local-agent vs. Cowork/remote-connector
+setup, including the exact steps to add it as a Cowork custom connector.
 
 ---
 

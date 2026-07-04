@@ -14,8 +14,9 @@ root, not to this skill directory.
 
 If the person wants an AI agent (Claude Cowork, a local always-on agent, or
 their own) to help manage the trip after it's created — answering questions,
-adding bookings — point them at `mcp/`, not this skill; that's a separate,
-already-generic MCP server, not something `/create-trip` sets up.
+adding bookings — point them at `mcp/README.md`, not this skill; that's a
+separate, already-generic MCP server (with its own Cowork custom-connector
+setup steps), not something `/create-trip` sets up.
 
 **Never write to `trip/`** (singular) — that's the directory the running
 dev server currently has live (`docker-compose.yml`'s default

@@ -337,6 +337,12 @@ function _activeAvatarFile(username) {
 }
 
 function avatarSrc(username) {
+  const u = username.toLowerCase();
+  // Google profile photo is only a default — an explicitly picked/uploaded
+  // avatar_file always wins.
+  if (currentUser && currentUser.username === u && !currentUser.avatar_file && currentUser.google_picture) {
+    return currentUser.google_picture;
+  }
   return `/avatars/${_activeAvatarFile(username)}`;
 }
 
@@ -385,6 +391,30 @@ async function openAvatarLightbox(username) {
   const lb = document.getElementById('avatar-lightbox');
   if (lb) lb.classList.add('open');
   _updateLightboxUI();
+  _updateGoogleConnectUI();
+}
+
+// Reflects current link state whenever the avatar lightbox is (re)opened or
+// right after a connect/disconnect action — shows the GIS button when not yet
+// linked, or "Connected as <email>" + a disconnect button when linked.
+function _updateGoogleConnectUI() {
+  const wrap = document.getElementById('avatar-lb-google-wrap');
+  if (!wrap || wrap.style.display !== 'flex') return; // Google Sign-In not configured on this deployment
+  const tr = T[currentLang] || T['he'];
+  const statusEl = document.getElementById('avatar-lb-google-status');
+  const btnEl = document.getElementById('avatar-lb-google-btn');
+  const disconnectBtn = document.getElementById('avatar-lb-google-disconnect');
+  const linked = currentUser?.username === lbState.username && currentUser?.google_email;
+
+  if (linked) {
+    if (statusEl) statusEl.textContent = `✓ ${tr.avatar_google_connected_prefix || 'Connected as'} ${currentUser.google_email}`;
+    if (btnEl) btnEl.style.display = 'none';
+    if (disconnectBtn) disconnectBtn.style.display = '';
+  } else {
+    if (statusEl) statusEl.textContent = '';
+    if (btnEl) btnEl.style.display = '';
+    if (disconnectBtn) disconnectBtn.style.display = 'none';
+  }
 }
 
 function _buildLightboxSlides() {
@@ -463,6 +493,14 @@ function _updateLightboxUI() {
     uploadBtn.textContent = tr.avatar_upload || '📷 העלה תמונה חדשה';
     uploadBtn.disabled = false;
   }
+
+  // "Reset to default" — only shown when there's an explicit choice to reset
+  const resetBtn = document.getElementById('avatar-lb-reset-default');
+  if (resetBtn) {
+    const hasOverride = currentUser?.username === username && currentUser?.avatar_file;
+    resetBtn.style.display = hasOverride ? '' : 'none';
+    resetBtn.textContent = tr.avatar_reset_default || '↺ חזור לברירת המחדל';
+  }
 }
 
 function lbGoTo(i) {
@@ -516,6 +554,24 @@ function initAvatarLightbox() {
       if (img) img.src = avatarSrc(username);
     }
     _updateLightboxUI();
+  });
+
+  document.getElementById('avatar-lb-reset-default')?.addEventListener('click', async () => {
+    const { username } = lbState;
+    if (!(currentUser && currentUser.username === username)) return;
+    localStorage.removeItem(`avatar_${username}`);
+    currentUser.avatar_file = null;
+    localStorage.setItem('trip-user', JSON.stringify(currentUser));
+    const token = localStorage.getItem('trip-token');
+    if (token) {
+      fetch('/api/auth/avatar', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+    }
+    const files = await _discoverAvatarFiles(username);
+    lbState.files = files;
+    lbState.index = Math.max(0, files.indexOf(_activeAvatarFile(username)));
+    _buildLightboxSlides();
+    _updateLightboxUI();
+    showLoggedIn(); // refresh the small side-menu avatar (Google photo or convention default)
   });
 
   // ── Upload flow: file → crop panel → confirm → POST cropped + full ──
@@ -646,6 +702,22 @@ function initAvatarLightbox() {
 
   pwCancel?.addEventListener('click', _hidePwPanel);
 
+  // ── Connect / disconnect Google ──────────────────────────────────────────
+  document.getElementById('avatar-lb-google-disconnect')?.addEventListener('click', async () => {
+    const token = localStorage.getItem('trip-token');
+    if (!token) return;
+    try {
+      await fetch('/api/auth/google-link', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+      if (currentUser) {
+        currentUser.google_email = null;
+        currentUser.google_picture = null;
+        localStorage.setItem('trip-user', JSON.stringify(currentUser));
+      }
+      _updateGoogleConnectUI();
+      showLoggedIn(); // fall back to the file-based avatar now that Google is disconnected
+    } catch {}
+  });
+
   pwSave?.addEventListener('click', async () => {
     const tr = (T[currentLang] || T['he']) || {};
     const token = localStorage.getItem('trip-token');
@@ -687,6 +759,96 @@ function initAvatarLightbox() {
       pwCancel.disabled = false;
     }
   });
+}
+
+// ── GOOGLE SIGN-IN ────────────────────────────────────────────────────────────
+// One GIS callback handles both flows, told apart by whether currentUser is
+// already set: logged out → login with a linked Google account; logged in →
+// link the Google account onto the current (already-predefined) user.
+async function initGoogleAuth() {
+  let clientId = null;
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    clientId = d.googleClientId || null;
+  } catch {}
+  if (!clientId || typeof google === 'undefined' || !google.accounts?.id) return;
+
+  google.accounts.id.initialize({ client_id: clientId, callback: handleGoogleCredential });
+
+  const loginWrap = document.getElementById('google-signin-wrap');
+  if (loginWrap) {
+    loginWrap.style.display = 'flex';
+    google.accounts.id.renderButton(document.getElementById('google-signin-btn'), {
+      type: 'standard', theme: 'outline', size: 'large', text: 'signin_with', width: 280,
+    });
+  }
+
+  const googleWrap = document.getElementById('avatar-lb-google-wrap');
+  if (googleWrap) {
+    googleWrap.style.display = 'flex';
+    google.accounts.id.renderButton(document.getElementById('avatar-lb-google-btn'), {
+      type: 'standard', theme: 'outline', size: 'medium', text: 'continue_with', width: 220,
+    });
+    _updateGoogleConnectUI();
+  }
+}
+
+async function handleGoogleCredential(response) {
+  const idToken = response.credential;
+  const tr = T[currentLang] || T['he'];
+
+  if (currentUser) {
+    // Already logged in → this is the "connect" flow from the avatar screen
+    const token = localStorage.getItem('trip-token');
+    const statusEl = document.getElementById('avatar-lb-google-status');
+    try {
+      const res = await fetch('/api/auth/google-link', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ idToken }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (statusEl) statusEl.textContent = data.error === 'already_linked'
+          ? (tr.avatar_google_conflict || 'This Google account is already linked to someone else')
+          : (tr.avatar_google_error || 'Could not connect Google account');
+        return;
+      }
+      currentUser.google_email = data.google_email;
+      currentUser.google_picture = data.google_picture;
+      localStorage.setItem('trip-user', JSON.stringify(currentUser));
+      _updateGoogleConnectUI();
+      showLoggedIn(); // refresh the small side-menu avatar if no avatar was explicitly picked
+    } catch {
+      if (statusEl) statusEl.textContent = tr.avatar_google_error || 'Could not connect Google account';
+    }
+    return;
+  }
+
+  // Logged out → login flow
+  try {
+    const res = await fetch('/api/auth/google-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('pwd-err').textContent = data.error === 'not_linked'
+        ? (tr.err_google_not_linked || 'No account is linked to this Google login yet — log in with your username and password first, then connect Google from your profile.')
+        : (tr.err_wrong || 'Login failed');
+      return;
+    }
+    localStorage.setItem('trip-token', data.token);
+    localStorage.setItem('trip-user', JSON.stringify(data.user));
+    currentUser = data.user;
+    showLoggedIn();
+    document.getElementById('login-overlay').style.display = 'none';
+    document.dispatchEvent(new Event('trivia-poll-start'));
+  } catch {
+    document.getElementById('pwd-err').textContent = tr.err_wrong;
+  }
 }
 
 function buildLoginPicker() {
@@ -2996,6 +3158,7 @@ window.addEventListener('load', async () => {
 
   loadUsersCache();
   buildLoginPicker();
+  initGoogleAuth();
   checkAuth().then(() => {
     loadRatings();
     loadTaskDone();

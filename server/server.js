@@ -7,6 +7,7 @@ const jwt      = require('jsonwebtoken');
 const fs       = require('fs');
 const path     = require('path');
 const Database = require('better-sqlite3');
+const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 app.use(express.json());
@@ -18,6 +19,16 @@ const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
 const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', isAgent: true };
+
+// Optional: "Sign in with Google" as an alternate login method bound to an
+// already-predefined user (see /api/auth/google-link). Unset → feature is
+// simply absent; the site still works password-only.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+async function verifyGoogleToken(idToken) {
+  const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
+  return ticket.getPayload(); // { sub, email, ... }
+}
 
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
@@ -171,6 +182,9 @@ try { db.exec('ALTER TABLE bookings ADD COLUMN apple_wallet_url TEXT'); } catch 
 try { db.exec('ALTER TABLE bookings ADD COLUMN google_wallet_url TEXT'); } catch {}
 try { db.exec('ALTER TABLE bookings ADD COLUMN location_url TEXT'); } catch {}
 try { db.exec('ALTER TABLE bookings ADD COLUMN pkpass_file TEXT'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
 // Backfill name_en for any existing users that don't have it yet
 for (const u of SEED_USERS) {
   db.prepare('UPDATE users SET name_en = ? WHERE username = ? AND (name_en IS NULL OR name_en = \'\')').run(u.name_en, u.username);
@@ -304,7 +318,7 @@ function authRequired(req, res, next) {
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, immich: !!(IMMICH_URL && IMMICH_KEY) });
+  res.json({ ok: true, immich: !!(IMMICH_URL && IMMICH_KEY), googleClientId: GOOGLE_CLIENT_ID || null });
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
@@ -358,12 +372,68 @@ app.put('/api/auth/avatar', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
+// Clears the explicit avatar_file choice — falls back to the connected Google
+// picture (if any) or the {Username}.png convention, same as a brand-new user.
+app.delete('/api/auth/avatar', authRequired, (req, res) => {
+  db.prepare('UPDATE users SET avatar_file = NULL WHERE username = ?').run(req.user.username);
+  res.json({ ok: true });
+});
+
 app.put('/api/auth/password', authRequired, async (req, res) => {
   const { password } = req.body || {};
   if (!password || password.length < 4) return res.status(400).json({ error: 'password_too_short' });
   const hash = await bcrypt.hash(password, 10);
   db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, req.user.username);
   res.json({ ok: true });
+});
+
+// ── GOOGLE SIGN-IN (bind to an already-predefined user) ───────────────────────
+// This never creates accounts — it only links a Google identity onto a
+// username the trip admin already seeded in trip.config.json.
+app.put('/api/auth/google-link', authRequired, async (req, res) => {
+  if (!googleClient) return res.status(503).json({ error: 'google_not_configured' });
+  const { idToken } = req.body || {};
+  if (!idToken) return res.status(400).json({ error: 'missing_id_token' });
+
+  let payload;
+  try { payload = await verifyGoogleToken(idToken); }
+  catch (e) { return res.status(401).json({ error: 'invalid_id_token' }); }
+
+  const taken = db.prepare('SELECT username FROM users WHERE google_sub = ? AND username != ?')
+    .get(payload.sub, req.user.username);
+  if (taken) return res.status(409).json({ error: 'already_linked' });
+
+  db.prepare('UPDATE users SET google_sub = ?, google_email = ?, google_picture = ? WHERE username = ?')
+    .run(payload.sub, payload.email || null, payload.picture || null, req.user.username);
+  res.json({ ok: true, google_email: payload.email || null, google_picture: payload.picture || null });
+});
+
+app.delete('/api/auth/google-link', authRequired, (req, res) => {
+  db.prepare('UPDATE users SET google_sub = NULL, google_email = NULL, google_picture = NULL WHERE username = ?').run(req.user.username);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/google-login', async (req, res) => {
+  if (!googleClient) return res.status(503).json({ error: 'google_not_configured' });
+  const { idToken } = req.body || {};
+  if (!idToken) return res.status(400).json({ error: 'missing_id_token' });
+
+  let payload;
+  try { payload = await verifyGoogleToken(idToken); }
+  catch (e) { return res.status(401).json({ error: 'invalid_id_token' }); }
+
+  const user = db.prepare('SELECT * FROM users WHERE google_sub = ?').get(payload.sub);
+  if (!user) return res.status(404).json({ error: 'not_linked' });
+
+  // Refresh the cached picture URL — Google's URLs can rotate over time.
+  if (payload.picture && payload.picture !== user.google_picture) {
+    db.prepare('UPDATE users SET google_picture = ? WHERE username = ?').run(payload.picture, user.username);
+    user.google_picture = payload.picture;
+  }
+
+  const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+  const { password: _p, ...safeUser } = user;
+  res.json({ token, user: safeUser });
 });
 
 const avatarUpload = multer({

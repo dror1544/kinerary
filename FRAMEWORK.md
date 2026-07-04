@@ -380,11 +380,30 @@ IMMICH_API_KEY=your-api-key
 ```
 Without these, photos still work — stored locally in `server/data/uploads/`.
 
+### Google Sign-In (optional, additive)
+Set in `.env`:
+```
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+```
+Get one from the [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
+(OAuth client ID, type "Web application"). This is a public identifier, not a
+secret — it's meant to be embedded in client-side JS.
+
+Without it, the site is password-only — the Google button simply doesn't
+render. With it, Google Sign-In is an *additional* login method bound to an
+already-predefined user, never a way to self-register: a participant logs in
+once with their seeded password, links their Google account from the avatar
+screen (`PUT /api/auth/google-link`), and can use either method from then on.
+`POST /api/auth/google-login` 404s with `not_linked` if the Google account
+hasn't been connected to any username yet — the response is meant to prompt
+"log in with your password first, then connect Google."
+
 ### Security Model
 - JWT tokens (30-day expiry); `authRequired` middleware on all private routes
 - Guest endpoints: lost & found form, photo file downloads, public trivia TV view
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
 - Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
+- Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
 
 ---
 

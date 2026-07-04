@@ -148,6 +148,17 @@ a { color: inherit; text-decoration: none; }
 .login-error {
   color: var(--urgent); margin-top: 10px; min-height: 1.3em; font-size: 13px;
 }
+.google-signin-wrap {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  margin-top: 14px; width: 100%;
+}
+.login-divider {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  color: var(--ink-2); font-size: 12px;
+}
+.login-divider::before, .login-divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--ink-2); opacity: .25;
+}
 a.lf-login-link {
   display: block; margin-top: 18px; font-size: 13px; color: var(--accent);
   text-decoration: none; cursor: pointer; opacity: .8; transition: opacity .15s;
@@ -1752,6 +1763,15 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 .avatar-lb-box.changing-password .avatar-lb-upload,
 .avatar-lb-box.changing-password #avatar-lb-pw-toggle { display: none !important; }
 .avatar-lb-box.changing-password .avatar-lb-pw-panel { display: flex; }
+/* display toggled inline by JS (hidden until we know Google Sign-In is configured
+   server-side); flex-direction etc. only matter once shown */
+.avatar-lb-google-wrap {
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.avatar-lb-box.changing-password .avatar-lb-google-wrap { display: none !important; }
 .avatar-lb-pw-input {
   width: 100%;
   padding: 10px 14px;

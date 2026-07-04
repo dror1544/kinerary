@@ -207,6 +207,60 @@ describe('GET /api/auth/me', () => {
   });
 });
 
+// ── DELETE /api/auth/avatar ───────────────────────────────────────────────────
+describe('DELETE /api/auth/avatar', () => {
+  test('rejects an unauthenticated request', async () => {
+    const res = await api('/api/auth/avatar', { method: 'DELETE' });
+    assert.equal(res.status, 401);
+  });
+
+  test('clears avatar_file back to default', async () => {
+    await api('/api/auth/avatar', { method: 'PUT', token, body: { avatar_file: 'Alice2.png' } });
+    const before = await (await api('/api/auth/me', { token })).json();
+    assert.equal(before.avatar_file, 'Alice2.png');
+
+    const res = await api('/api/auth/avatar', { method: 'DELETE', token });
+    assert.equal(res.status, 200);
+
+    const after = await (await api('/api/auth/me', { token })).json();
+    assert.equal(after.avatar_file, null);
+  });
+});
+
+// ── Google Sign-In ────────────────────────────────────────────────────────────
+// The test server never sets GOOGLE_CLIENT_ID, so link/login correctly report
+// "not configured" here — this is the deployment default (password-only)
+// and exercises the guard clauses. Verifying real Google ID tokens requires
+// a signed token from Google itself, so that path is left to manual/staging
+// verification rather than faked out in a unit test.
+describe('Google Sign-In (not configured in test env)', () => {
+  test('PUT /api/auth/google-link returns 503 when Google Sign-In is not configured', async () => {
+    const res = await api('/api/auth/google-link', { method: 'PUT', token, body: { idToken: 'x' } });
+    assert.equal(res.status, 503);
+    const { error } = await res.json();
+    assert.equal(error, 'google_not_configured');
+  });
+
+  test('POST /api/auth/google-login returns 503 when Google Sign-In is not configured', async () => {
+    const res = await api('/api/auth/google-login', { method: 'POST', body: { idToken: 'x' } });
+    assert.equal(res.status, 503);
+    const { error } = await res.json();
+    assert.equal(error, 'google_not_configured');
+  });
+
+  test('DELETE /api/auth/google-link requires auth but never needs Google configured (idempotent unlink)', async () => {
+    const unauth = await api('/api/auth/google-link', { method: 'DELETE' });
+    assert.equal(unauth.status, 401);
+
+    const res = await api('/api/auth/google-link', { method: 'DELETE', token });
+    assert.equal(res.status, 200);
+
+    const me = await (await api('/api/auth/me', { token })).json();
+    assert.equal(me.google_sub, null);
+    assert.equal(me.google_email, null);
+  });
+});
+
 // ── Config-driven generalization: phases derive from config ───────────────────
 describe('config-driven phase structure', () => {
   test('phase count matches fixture config', async () => {
