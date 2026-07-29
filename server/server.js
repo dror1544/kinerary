@@ -6,6 +6,7 @@ const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const fs       = require('fs');
 const path     = require('path');
+const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 
@@ -44,8 +45,10 @@ const DB_FILE      = path.join(DATA_DIR, 'trip.db');
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
 const TRIP_DIR = process.env.TRIP_DIR || path.join(__dirname, '..', 'trip');
 let TRIP_CONFIG = {};
+let TRIP_CONFIG_RAW = null;
 try {
-  TRIP_CONFIG = JSON.parse(fs.readFileSync(path.join(TRIP_DIR, 'trip.config.json'), 'utf8'));
+  TRIP_CONFIG_RAW = fs.readFileSync(path.join(TRIP_DIR, 'trip.config.json'), 'utf8');
+  TRIP_CONFIG = JSON.parse(TRIP_CONFIG_RAW);
   console.log(`Loaded trip config: ${TRIP_CONFIG.meta?.title || '(untitled)'}`);
 } catch (e) { console.error('trip.config.json not found:', e.message); }
 
@@ -166,7 +169,33 @@ db.exec(`
     created_by   TEXT NOT NULL DEFAULT 'seed',
     created_at   TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS trip_config_versions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    version    INTEGER NOT NULL UNIQUE,
+    content    TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
+
+// ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
+// Snapshots trip.config.json into trip_config_versions whenever its content
+// changes from the last stored version. Runs once at boot; no write API for
+// trip.config.json exists, so a boot-time diff against the last snapshot is
+// the change-detection point. Retains every prior version for future diffing.
+try {
+  if (TRIP_CONFIG_RAW !== null) {
+    const hash = crypto.createHash('sha256').update(TRIP_CONFIG_RAW).digest('hex');
+    const latest = db.prepare('SELECT hash, version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get();
+    if (!latest || latest.hash !== hash) {
+      const nextVersion = (latest?.version || 0) + 1;
+      db.prepare('INSERT INTO trip_config_versions (version, content, hash) VALUES (?, ?, ?)')
+        .run(nextVersion, TRIP_CONFIG_RAW, hash);
+      console.log(`Stored trip config version ${nextVersion}`);
+    }
+  }
+} catch (e) { console.error('trip config version snapshot failed:', e.message); }
 
 // ── USER SEED DATA ────────────────────────────────────────────────────────────
 const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
@@ -333,6 +362,22 @@ app.get('/api/config', (_req, res) => {
   if (safe.participants) safe.participants.forEach(p => delete p.pin);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   res.json(safe);
+});
+
+// Stage 1 groundwork: read-only access to stored config history for a future
+// diff view. Auth-gated because, unlike /api/config, raw snapshots are not
+// scrubbed of fields like accommodation PINs.
+app.get('/api/config/versions', authRequired, (_req, res) => {
+  const rows = db.prepare('SELECT version, created_at, hash FROM trip_config_versions ORDER BY version DESC').all();
+  res.json(rows);
+});
+
+app.get('/api/config/versions/:version', authRequired, (req, res) => {
+  const row = db.prepare('SELECT version, content, hash, created_at FROM trip_config_versions WHERE version = ?').get(req.params.version);
+  if (!row) return res.status(404).json({ error: 'version not found' });
+  let content;
+  try { content = JSON.parse(row.content); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
+  res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
 app.get('/api/trip/logo', (_req, res) => {
