@@ -95,7 +95,7 @@ describe('GET /api/config/versions', () => {
     assert.equal(res.status, 200);
     const { version, content } = await res.json();
     assert.equal(version, 1);
-    assert.equal(content.participants.length, 2);
+    assert.equal(content.participants.length, 3);
     assert.ok(content.meta?.title);
   });
 

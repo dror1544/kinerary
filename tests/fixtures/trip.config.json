@@ -12,6 +12,12 @@
         { "type": "allergy", "severity": "critical", "text": { "he": "אלרגיה חמורה לבוטנים", "en": "Severe peanut allergy" } },
         { "type": "dietary", "severity": "preference", "text": { "he": "מעדיף לא אוכל חריף", "en": "Prefers not spicy food" } }
       ]
+    },
+    { "username": "eve",   "name": "איב",   "name_en": "Eve",   "age": 40, "family": "family-a", "color": "#F59E0B",
+      "needs": [
+        { "type": "medical", "severity": "firm", "visibility": "group", "text": { "he": "סוכרת מסוג 1", "en": "Type 1 diabetes" } },
+        { "type": "unrecognized-type", "severity": "crticial", "text": { "en": "Missing Hebrew text on purpose, for the malformed-needs test" } }
+      ]
     }
   ],
   "families": [
@@ -20,7 +26,7 @@
       "name": { "he": "משפחת א", "en": "Family A" },
       "letter": "A",
       "description": { "he": "2 נפשות", "en": "2 people" },
-      "members": ["alice", "bob"]
+      "members": ["alice", "bob", "eve"]
     }
   ],
   "stats": [

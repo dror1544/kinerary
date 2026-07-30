@@ -9,6 +9,7 @@ const path     = require('path');
 const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
+const { NEED_TYPES, NEED_SEVERITIES, defaultVisibility, normalizeSeverity } = require('../shared/needs-schema');
 
 const app = express();
 app.use(express.json());
@@ -54,13 +55,19 @@ try {
 
 // Diagnostic only — malformed needs entries are logged, never fatal, so a
 // typo in one participant's config can't take the whole trip site down.
-const NEED_TYPES = ['allergy', 'medical', 'dietary', 'mobility', 'other'];
-const NEED_SEVERITIES = ['critical', 'firm', 'preference'];
+// Also collected into CONFIG_WARNINGS (exposed via GET /api/config/warnings)
+// since console.warn alone goes to a log nobody reads on a family's hosted box.
+const CONFIG_WARNINGS = [];
 (TRIP_CONFIG.participants || []).forEach(p => {
   (p.needs || []).forEach(n => {
-    if (!NEED_TYPES.includes(n.type)) console.warn(`trip.config.json: participant "${p.username}" has a need with unknown type "${n.type}"`);
-    if (!NEED_SEVERITIES.includes(n.severity)) console.warn(`trip.config.json: participant "${p.username}" has a need with unknown severity "${n.severity}"`);
-    if (!n.text?.he || !n.text?.en) console.warn(`trip.config.json: participant "${p.username}" has a need missing bilingual text`);
+    const issues = [];
+    if (!NEED_TYPES.includes(n.type)) issues.push(`unknown type "${n.type}"`);
+    if (!NEED_SEVERITIES.includes(n.severity)) issues.push(`unknown severity "${n.severity}" (treated as critical)`);
+    if (!n.text?.he || !n.text?.en) issues.push('missing bilingual text');
+    for (const issue of issues) {
+      console.warn(`trip.config.json: participant "${p.username}" need — ${issue}`);
+      CONFIG_WARNINGS.push({ username: p.username, type: n.type, severity: n.severity, issue });
+    }
   });
 });
 
@@ -363,22 +370,30 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
-// Strip PIN codes before serving to clients — every family member is authed,
-// including kids and one-off guests, so auth alone isn't a safety boundary
-// for this field. Shared by /api/config and /api/config/versions/:version.
-function scrubPins(cfg) {
+// Strip PIN codes and organizer-only needs before serving to clients — every
+// family member is authed, including kids and one-off guests, so auth alone
+// isn't a safety boundary for either field. Shared by /api/config and
+// /api/config/versions/:version.
+function sanitizeConfig(cfg) {
   const safe = JSON.parse(JSON.stringify(cfg));
   if (safe.phases) safe.phases.forEach(p => {
     if (p.accommodation) delete p.accommodation.pin;
     (p.hotels || []).forEach(h => delete h.pin);
   });
   if (safe.bookings?.hotels) safe.bookings.hotels.forEach(h => delete h.pin);
-  if (safe.participants) safe.participants.forEach(p => delete p.pin);
+  if (safe.participants) safe.participants.forEach(p => {
+    delete p.pin;
+    if (p.needs) {
+      p.needs = p.needs
+        .filter(n => (n.visibility || defaultVisibility(n.type)) !== 'organizer')
+        .map(n => ({ ...n, severity: normalizeSeverity(n.severity) }));
+    }
+  });
   return safe;
 }
 
 app.get('/api/config', (_req, res) => {
-  const safe = scrubPins(TRIP_CONFIG);
+  const safe = sanitizeConfig(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   res.json(safe);
 });
@@ -391,11 +406,18 @@ app.get('/api/config/versions', authRequired, (_req, res) => {
   res.json(rows);
 });
 
+// Organizer-facing: config validation issues (malformed needs, etc.) that
+// only ever went to a server log otherwise. Same authRequired posture as
+// /api/config/versions — not organizer-scoped yet, but no longer silent.
+app.get('/api/config/warnings', authRequired, (_req, res) => {
+  res.json(CONFIG_WARNINGS);
+});
+
 app.get('/api/config/versions/:version', authRequired, (req, res) => {
   const row = db.prepare('SELECT version, content, hash, created_at FROM trip_config_versions WHERE version = ?').get(req.params.version);
   if (!row) return res.status(404).json({ error: 'version not found' });
   let content;
-  try { content = scrubPins(JSON.parse(row.content)); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
+  try { content = sanitizeConfig(JSON.parse(row.content)); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 

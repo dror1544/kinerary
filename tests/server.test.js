@@ -30,10 +30,10 @@ describe('GET /api/config', () => {
     }
   });
 
-  test('has correct participant count from fixture (2)', async () => {
+  test('has correct participant count from fixture (3)', async () => {
     const res = await api('/api/config');
     const data = await res.json();
-    assert.equal(data.participants.length, 2);
+    assert.equal(data.participants.length, 3);
   });
 
   test('strips pin from accommodation objects', async () => {
@@ -67,16 +67,67 @@ describe('GET /api/config', () => {
     assert.ok(Array.isArray(stats) && stats.length === 2, 'expected 2 stats from fixture');
   });
 
-  test('participant needs round-trip unchanged (read path preserves them)', async () => {
+  test('organizer-only needs (default for allergy/medical) are stripped from the public read path', async () => {
     const res = await api('/api/config');
     const data = await res.json();
     const bob = data.participants.find(p => p.username === 'bob');
-    assert.ok(bob?.needs?.length === 2, 'expected bob to still have 2 needs entries');
-    const critical = bob.needs.find(n => n.severity === 'critical');
-    assert.equal(critical?.type, 'allergy');
-    assert.ok(critical.text?.he && critical.text?.en, 'critical need missing bilingual text');
+    // bob's fixture has 2 needs: a critical allergy (no explicit visibility,
+    // defaults to organizer-only) and a dietary preference (defaults group).
+    // Only the group-visible one should survive /api/config.
+    assert.equal(bob.needs.length, 1, 'expected bob\'s organizer-only allergy to be stripped');
+    assert.equal(bob.needs[0].type, 'dietary');
+    assert.ok(!bob.needs.some(n => n.type === 'allergy'), 'organizer-only allergy leaked through /api/config');
+  });
+
+  test('explicit visibility:"group" overrides the organizer default for medical/allergy', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    const medical = eve.needs.find(n => n.type === 'medical');
+    assert.ok(medical, 'expected eve\'s explicitly group-visible medical need to survive /api/config');
+    assert.ok(medical.text?.he && medical.text?.en, 'medical need missing bilingual text');
+  });
+
+  test('unrecognized severity is normalized to critical, fail-safe not fail-quiet', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    const malformed = eve.needs.find(n => n.type === 'unrecognized-type');
+    assert.ok(malformed, 'expected the malformed (but group-visible) need to still be served');
+    assert.equal(malformed.severity, 'critical', 'unrecognized severity should fail safe to critical, not pass through as-is');
+  });
+
+  test('alice has no needs field, matching the fixture', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
     const alice = data.participants.find(p => p.username === 'alice');
     assert.ok(!('needs' in alice), 'alice should have no needs field, matching the fixture');
+  });
+});
+
+// ── /api/config/warnings ────────────────────────────────────────────────────────
+describe('GET /api/config/warnings', () => {
+  test('requires auth', async () => {
+    const res = await api('/api/config/warnings');
+    assert.equal(res.status, 401);
+  });
+
+  test('reports eve\'s malformed need instead of only logging it', async () => {
+    const res = await api('/api/config/warnings', { token });
+    assert.equal(res.status, 200);
+    const warnings = await res.json();
+    const eveWarnings = warnings.filter(w => w.username === 'eve');
+    // The malformed entry has 3 issues: unknown type, unknown severity, missing bilingual text.
+    assert.equal(eveWarnings.length, 3, `expected 3 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
+    assert.ok(eveWarnings.some(w => /unknown type/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /unknown severity/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /missing bilingual text/.test(w.issue)));
+  });
+
+  test('bob and alice have no warnings (well-formed / no needs)', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const warnings = await res.json();
+    assert.ok(!warnings.some(w => w.username === 'bob' || w.username === 'alice'));
   });
 });
 
