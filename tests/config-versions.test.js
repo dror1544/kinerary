@@ -99,6 +99,21 @@ describe('GET /api/config/versions', () => {
     assert.ok(content.meta?.title);
   });
 
+  test('strips pin fields from content, same as /api/config', async () => {
+    const res = await fetch(`http://localhost:${PORT}/api/config/versions/1`, { headers: { Authorization: `Bearer ${token}` } });
+    const { content } = await res.json();
+    for (const phase of content.phases) {
+      assert.ok(!('pin' in (phase.accommodation ?? {})),
+        `phase ${phase.id} accommodation still has pin field`);
+    }
+    for (const hotel of (content.bookings?.hotels ?? [])) {
+      assert.ok(!('pin' in hotel), `hotel "${hotel.name}" still has pin field`);
+    }
+    for (const p of content.participants) {
+      assert.ok(!('pin' in p), `participant ${p.username} still has pin field`);
+    }
+  });
+
   test('unknown version returns 404', async () => {
     const res = await fetch(`http://localhost:${PORT}/api/config/versions/999`, { headers: { Authorization: `Bearer ${token}` } });
     assert.equal(res.status, 404);

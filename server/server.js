@@ -351,22 +351,29 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
-app.get('/api/config', (_req, res) => {
-  const safe = JSON.parse(JSON.stringify(TRIP_CONFIG));
-  // Strip PIN codes before serving to clients
+// Strip PIN codes before serving to clients — every family member is authed,
+// including kids and one-off guests, so auth alone isn't a safety boundary
+// for this field. Shared by /api/config and /api/config/versions/:version.
+function scrubPins(cfg) {
+  const safe = JSON.parse(JSON.stringify(cfg));
   if (safe.phases) safe.phases.forEach(p => {
     if (p.accommodation) delete p.accommodation.pin;
     (p.hotels || []).forEach(h => delete h.pin);
   });
   if (safe.bookings?.hotels) safe.bookings.hotels.forEach(h => delete h.pin);
   if (safe.participants) safe.participants.forEach(p => delete p.pin);
+  return safe;
+}
+
+app.get('/api/config', (_req, res) => {
+  const safe = scrubPins(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   res.json(safe);
 });
 
 // Stage 1 groundwork: read-only access to stored config history for a future
-// diff view. Auth-gated because, unlike /api/config, raw snapshots are not
-// scrubbed of fields like accommodation PINs.
+// diff view. Content is scrubbed the same way as /api/config; authRequired
+// here is defense-in-depth, not the safety boundary.
 app.get('/api/config/versions', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT version, created_at, hash FROM trip_config_versions ORDER BY version DESC').all();
   res.json(rows);
@@ -376,7 +383,7 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   const row = db.prepare('SELECT version, content, hash, created_at FROM trip_config_versions WHERE version = ?').get(req.params.version);
   if (!row) return res.status(404).json({ error: 'version not found' });
   let content;
-  try { content = JSON.parse(row.content); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
+  try { content = scrubPins(JSON.parse(row.content)); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
