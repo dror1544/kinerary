@@ -66,6 +66,18 @@ describe('GET /api/config', () => {
     const { stats } = await res.json();
     assert.ok(Array.isArray(stats) && stats.length === 2, 'expected 2 stats from fixture');
   });
+
+  test('participant needs round-trip unchanged (read path preserves them)', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const bob = data.participants.find(p => p.username === 'bob');
+    assert.ok(bob?.needs?.length === 2, 'expected bob to still have 2 needs entries');
+    const critical = bob.needs.find(n => n.severity === 'critical');
+    assert.equal(critical?.type, 'allergy');
+    assert.ok(critical.text?.he && critical.text?.en, 'critical need missing bilingual text');
+    const alice = data.participants.find(p => p.username === 'alice');
+    assert.ok(!('needs' in alice), 'alice should have no needs field, matching the fixture');
+  });
 });
 
 // ── /api/auth/login ───────────────────────────────────────────────────────────

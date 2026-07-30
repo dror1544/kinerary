@@ -52,6 +52,18 @@ try {
   console.log(`Loaded trip config: ${TRIP_CONFIG.meta?.title || '(untitled)'}`);
 } catch (e) { console.error('trip.config.json not found:', e.message); }
 
+// Diagnostic only — malformed needs entries are logged, never fatal, so a
+// typo in one participant's config can't take the whole trip site down.
+const NEED_TYPES = ['allergy', 'medical', 'dietary', 'mobility', 'other'];
+const NEED_SEVERITIES = ['critical', 'firm', 'preference'];
+(TRIP_CONFIG.participants || []).forEach(p => {
+  (p.needs || []).forEach(n => {
+    if (!NEED_TYPES.includes(n.type)) console.warn(`trip.config.json: participant "${p.username}" has a need with unknown type "${n.type}"`);
+    if (!NEED_SEVERITIES.includes(n.severity)) console.warn(`trip.config.json: participant "${p.username}" has a need with unknown severity "${n.severity}"`);
+    if (!n.text?.he || !n.text?.en) console.warn(`trip.config.json: participant "${p.username}" has a need missing bilingual text`);
+  });
+});
+
 // ── DATABASE INIT ─────────────────────────────────────────────────────────────
 const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');

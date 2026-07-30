@@ -89,6 +89,23 @@ describe('trip.config.json schema', () => {
       assert.ok(p.family, `participant missing family: ${p.username}`);
     }
   });
+  const NEED_TYPES = ['allergy', 'medical', 'dietary', 'mobility', 'other'];
+  const NEED_SEVERITIES = ['critical', 'firm', 'preference'];
+  test('participant needs, when present, are well-formed', () => {
+    const withNeeds = cfg.participants.filter(p => p.needs?.length);
+    assert.ok(withNeeds.length > 0, 'fixture should exercise at least one participant with needs');
+    for (const p of withNeeds) {
+      for (const n of p.needs) {
+        assert.ok(NEED_TYPES.includes(n.type), `participant ${p.username} has need with invalid type: ${n.type}`);
+        assert.ok(NEED_SEVERITIES.includes(n.severity), `participant ${p.username} has need with invalid severity: ${n.severity}`);
+        assert.ok(n.text?.he && n.text?.en, `participant ${p.username} has need missing bilingual text`);
+      }
+    }
+  });
+  test('participants without needs are unaffected (field is optional)', () => {
+    const withoutNeeds = cfg.participants.filter(p => !('needs' in p));
+    assert.ok(withoutNeeds.length > 0, 'fixture should also exercise a participant with no needs field at all');
+  });
   test('families reference only known participant usernames', () => {
     const knownUsernames = new Set(cfg.participants.map(p => p.username));
     for (const fam of cfg.families) {

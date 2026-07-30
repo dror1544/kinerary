@@ -7,7 +7,12 @@
   },
   "participants": [
     { "username": "alice", "name": "אליס", "name_en": "Alice", "age": 35, "family": "family-a", "color": "#3B82F6" },
-    { "username": "bob",   "name": "בוב",   "name_en": "Bob",   "age": 10, "family": "family-a", "color": "#10B981" }
+    { "username": "bob",   "name": "בוב",   "name_en": "Bob",   "age": 10, "family": "family-a", "color": "#10B981",
+      "needs": [
+        { "type": "allergy", "severity": "critical", "text": { "he": "אלרגיה חמורה לבוטנים", "en": "Severe peanut allergy" } },
+        { "type": "dietary", "severity": "preference", "text": { "he": "מעדיף לא אוכל חריף", "en": "Prefers not spicy food" } }
+      ]
+    }
   ],
   "families": [
     {
