@@ -30,10 +30,10 @@ describe('GET /api/config', () => {
     }
   });
 
-  test('has correct participant count from fixture (2)', async () => {
+  test('has correct participant count from fixture (3)', async () => {
     const res = await api('/api/config');
     const data = await res.json();
-    assert.equal(data.participants.length, 2);
+    assert.equal(data.participants.length, 3);
   });
 
   test('strips pin from accommodation objects', async () => {
@@ -65,6 +65,87 @@ describe('GET /api/config', () => {
     const res = await api('/api/config');
     const { stats } = await res.json();
     assert.ok(Array.isArray(stats) && stats.length === 2, 'expected 2 stats from fixture');
+  });
+
+  test('organizer-only needs (default for allergy/medical) are stripped from the public read path', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const bob = data.participants.find(p => p.username === 'bob');
+    // bob's fixture has 2 needs: a critical allergy (no explicit visibility,
+    // defaults to organizer-only) and a dietary preference (defaults group).
+    // Only the group-visible one should survive /api/config.
+    assert.equal(bob.needs.length, 1, 'expected bob\'s organizer-only allergy to be stripped');
+    assert.equal(bob.needs[0].type, 'dietary');
+    assert.ok(!bob.needs.some(n => n.type === 'allergy'), 'organizer-only allergy leaked through /api/config');
+  });
+
+  test('explicit visibility:"group" overrides the organizer default for medical/allergy', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    const medical = eve.needs.find(n => n.type === 'medical');
+    assert.ok(medical, 'expected eve\'s explicitly group-visible medical need to survive /api/config');
+    assert.ok(medical.text?.he && medical.text?.en, 'medical need missing bilingual text');
+  });
+
+  test('unrecognized severity is normalized to critical, fail-safe not fail-quiet', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    const malformed = eve.needs.find(n => n.type === 'unrecognized-type');
+    assert.ok(malformed, 'expected the malformed (but group-visible) need to still be served');
+    assert.equal(malformed.severity, 'critical', 'unrecognized severity should fail safe to critical, not pass through as-is');
+  });
+
+  test('unrecognized visibility value fails safe to organizer-only (hidden), not visible', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    assert.ok(!eve.needs.some(n => n.type === 'dietary' && n.visibility === 'porcupine'),
+      'a garbage visibility value should be treated as organizer-only and stripped, not fall through as visible');
+  });
+
+  test('alice has no needs field, matching the fixture', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const alice = data.participants.find(p => p.username === 'alice');
+    assert.ok(!('needs' in alice), 'alice should have no needs field, matching the fixture');
+  });
+});
+
+// ── /api/config/warnings ────────────────────────────────────────────────────────
+describe('GET /api/config/warnings', () => {
+  test('requires auth', async () => {
+    const res = await api('/api/config/warnings');
+    assert.equal(res.status, 401);
+  });
+
+  test('reports eve\'s malformed need instead of only logging it', async () => {
+    const res = await api('/api/config/warnings', { token });
+    assert.equal(res.status, 200);
+    const warnings = await res.json();
+    const eveWarnings = warnings.filter(w => w.username === 'eve');
+    // The malformed entry has 3 issues (unknown type, unknown severity,
+    // missing bilingual text); the garbage-visibility entry adds a 4th
+    // (unknown visibility).
+    assert.equal(eveWarnings.length, 4, `expected 4 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
+    assert.ok(eveWarnings.some(w => /unknown type/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /unknown severity/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /unknown visibility/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /missing bilingual text/.test(w.issue)));
+  });
+
+  test('warning objects never carry the need\'s type, so category (e.g. medical) can\'t leak through this side door', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const warnings = await res.json();
+    assert.ok(warnings.length > 0, 'expected at least one warning to check');
+    assert.ok(!warnings.some(w => 'type' in w), 'a warning object still carries a type field');
+  });
+
+  test('bob and alice have no warnings (well-formed / no needs)', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const warnings = await res.json();
+    assert.ok(!warnings.some(w => w.username === 'bob' || w.username === 'alice'));
   });
 });
 
