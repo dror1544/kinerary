@@ -97,6 +97,14 @@ describe('GET /api/config', () => {
     assert.equal(malformed.severity, 'critical', 'unrecognized severity should fail safe to critical, not pass through as-is');
   });
 
+  test('unrecognized visibility value fails safe to organizer-only (hidden), not visible', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    assert.ok(!eve.needs.some(n => n.type === 'dietary' && n.visibility === 'porcupine'),
+      'a garbage visibility value should be treated as organizer-only and stripped, not fall through as visible');
+  });
+
   test('alice has no needs field, matching the fixture', async () => {
     const res = await api('/api/config');
     const data = await res.json();
@@ -117,11 +125,21 @@ describe('GET /api/config/warnings', () => {
     assert.equal(res.status, 200);
     const warnings = await res.json();
     const eveWarnings = warnings.filter(w => w.username === 'eve');
-    // The malformed entry has 3 issues: unknown type, unknown severity, missing bilingual text.
-    assert.equal(eveWarnings.length, 3, `expected 3 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
+    // The malformed entry has 3 issues (unknown type, unknown severity,
+    // missing bilingual text); the garbage-visibility entry adds a 4th
+    // (unknown visibility).
+    assert.equal(eveWarnings.length, 4, `expected 4 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
     assert.ok(eveWarnings.some(w => /unknown type/.test(w.issue)));
     assert.ok(eveWarnings.some(w => /unknown severity/.test(w.issue)));
+    assert.ok(eveWarnings.some(w => /unknown visibility/.test(w.issue)));
     assert.ok(eveWarnings.some(w => /missing bilingual text/.test(w.issue)));
+  });
+
+  test('warning objects never carry the need\'s type, so category (e.g. medical) can\'t leak through this side door', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const warnings = await res.json();
+    assert.ok(warnings.length > 0, 'expected at least one warning to check');
+    assert.ok(!warnings.some(w => 'type' in w), 'a warning object still carries a type field');
   });
 
   test('bob and alice have no warnings (well-formed / no needs)', async () => {

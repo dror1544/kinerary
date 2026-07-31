@@ -9,7 +9,7 @@ const path     = require('path');
 const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
-const { NEED_TYPES, NEED_SEVERITIES, defaultVisibility, normalizeSeverity } = require('../shared/needs-schema');
+const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 
 const app = express();
 app.use(express.json());
@@ -57,16 +57,21 @@ try {
 // typo in one participant's config can't take the whole trip site down.
 // Also collected into CONFIG_WARNINGS (exposed via GET /api/config/warnings)
 // since console.warn alone goes to a log nobody reads on a family's hosted box.
+// Note: warning objects deliberately omit `type` — GET /api/config/warnings
+// is authRequired but not organizer-scoped, so a malformed medical/allergy
+// need must not leak its category through this side door around the
+// visibility rule below. `severity` alone doesn't identify the category.
 const CONFIG_WARNINGS = [];
 (TRIP_CONFIG.participants || []).forEach(p => {
   (p.needs || []).forEach(n => {
     const issues = [];
     if (!NEED_TYPES.includes(n.type)) issues.push(`unknown type "${n.type}"`);
     if (!NEED_SEVERITIES.includes(n.severity)) issues.push(`unknown severity "${n.severity}" (treated as critical)`);
+    if (n.visibility !== undefined && !VISIBILITIES.includes(n.visibility)) issues.push(`unknown visibility "${n.visibility}" (treated as organizer-only)`);
     if (!n.text?.he || !n.text?.en) issues.push('missing bilingual text');
     for (const issue of issues) {
       console.warn(`trip.config.json: participant "${p.username}" need — ${issue}`);
-      CONFIG_WARNINGS.push({ username: p.username, type: n.type, severity: n.severity, issue });
+      CONFIG_WARNINGS.push({ username: p.username, severity: n.severity, issue });
     }
   });
 });
@@ -385,7 +390,7 @@ function sanitizeConfig(cfg) {
     delete p.pin;
     if (p.needs) {
       p.needs = p.needs
-        .filter(n => (n.visibility || defaultVisibility(n.type)) !== 'organizer')
+        .filter(n => normalizeVisibility(n.visibility, n.type) !== 'organizer')
         .map(n => ({ ...n, severity: normalizeSeverity(n.severity) }));
     }
   });

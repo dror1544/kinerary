@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { NEED_TYPES, NEED_SEVERITIES } from '../shared/needs-schema.js';
+import { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES } from '../shared/needs-schema.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const cfg  = JSON.parse(readFileSync(join(HERE, 'fixtures', 'trip.config.json'), 'utf8'));
@@ -106,17 +106,21 @@ describe('trip.config.json schema', () => {
     const withoutNeeds = cfg.participants.filter(p => !('needs' in p));
     assert.ok(withoutNeeds.length > 0, 'fixture should also exercise a participant with no needs field at all');
   });
-  test('eve\'s needs exercise an explicit visibility override and a malformed entry', () => {
+  test('eve\'s needs exercise a visibility override, a malformed entry, and a garbage visibility value', () => {
     const eve = cfg.participants.find(p => p.username === 'eve');
-    assert.ok(eve?.needs?.length === 2, 'expected eve to have exactly 2 needs in the fixture');
+    assert.ok(eve?.needs?.length === 3, 'expected eve to have exactly 3 needs in the fixture');
 
-    const [override, malformed] = eve.needs;
+    const [override, malformed, garbageVisibility] = eve.needs;
     assert.equal(override.visibility, 'group', 'expected an explicit visibility override on eve\'s medical need');
     assert.equal(override.type, 'medical', 'expected the override to be on a type that defaults to organizer-only');
 
     assert.ok(!NEED_TYPES.includes(malformed.type), 'expected an intentionally-invalid type for the malformed-needs test');
     assert.ok(!NEED_SEVERITIES.includes(malformed.severity), 'expected an intentionally-invalid severity for the malformed-needs test');
     assert.ok(!malformed.text?.he, 'expected the malformed entry to be missing Hebrew text');
+
+    assert.ok(!VISIBILITIES.includes(garbageVisibility.visibility), 'expected an intentionally-invalid visibility for the fail-safe test');
+    assert.ok(NEED_TYPES.includes(garbageVisibility.type) && NEED_SEVERITIES.includes(garbageVisibility.severity),
+      'the garbage-visibility entry should otherwise be well-formed, to isolate the visibility fail-safe');
   });
   test('families reference only known participant usernames', () => {
     const knownUsernames = new Set(cfg.participants.map(p => p.username));

@@ -5,6 +5,7 @@
 
 const NEED_TYPES = ['allergy', 'medical', 'dietary', 'mobility', 'other'];
 const NEED_SEVERITIES = ['critical', 'firm', 'preference'];
+const VISIBILITIES = ['group', 'organizer'];
 
 // medical/allergy needs default to organizer-only since /api/config has no
 // auth at all and /api/config/versions/:version is authRequired but not
@@ -20,4 +21,12 @@ function normalizeSeverity(severity) {
   return NEED_SEVERITIES.includes(severity) ? severity : 'critical';
 }
 
-module.exports = { NEED_TYPES, NEED_SEVERITIES, defaultVisibility, normalizeSeverity };
+// Same fail-safe reasoning as normalizeSeverity: an explicit-but-invalid
+// visibility (e.g. a typo) must not fall through as visible. Omitted →
+// the type-based default; present-but-unrecognized → the restrictive one.
+function normalizeVisibility(visibility, type) {
+  if (visibility === undefined) return defaultVisibility(type);
+  return VISIBILITIES.includes(visibility) ? visibility : 'organizer';
+}
+
+module.exports = { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, defaultVisibility, normalizeSeverity, normalizeVisibility };

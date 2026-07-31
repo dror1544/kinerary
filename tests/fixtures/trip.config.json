@@ -16,7 +16,8 @@
     { "username": "eve",   "name": "איב",   "name_en": "Eve",   "age": 40, "family": "family-a", "color": "#F59E0B",
       "needs": [
         { "type": "medical", "severity": "firm", "visibility": "group", "text": { "he": "סוכרת מסוג 1", "en": "Type 1 diabetes" } },
-        { "type": "unrecognized-type", "severity": "crticial", "text": { "en": "Missing Hebrew text on purpose, for the malformed-needs test" } }
+        { "type": "unrecognized-type", "severity": "crticial", "text": { "en": "Missing Hebrew text on purpose, for the malformed-needs test" } },
+        { "type": "dietary", "severity": "firm", "visibility": "porcupine", "text": { "he": "צמחוני", "en": "Vegetarian" } }
       ]
     }
   ],
