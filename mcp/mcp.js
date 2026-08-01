@@ -104,11 +104,17 @@ async function apiDelete(path) {
   if (!r.ok) throw new Error(`DELETE ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.json();
 }
-async function apiPostPdf(path, filePath) {
+async function apiPostFile(path, filePath, fieldName, contentType, fields = {}) {
   const fs = require('fs');
   const FormData = require('form-data');
   const form = new FormData();
-  form.append('file', fs.createReadStream(filePath), { contentType: 'application/pdf' });
+  form.append(fieldName, fs.createReadStream(filePath), {
+    filename: require('path').basename(filePath),
+    contentType,
+  });
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined && v !== null && v !== '') form.append(k, String(v));
+  }
   const r = await fetchTrip(path, {
     method: 'POST',
     headers: { 'x-api-key': TRIP_API_KEY, ...form.getHeaders() },
@@ -117,6 +123,14 @@ async function apiPostPdf(path, filePath) {
   if (!r.ok) throw new Error(`POST ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.json();
 }
+async function apiPostPdf(path, filePath) {
+  return apiPostFile(path, filePath, 'file', 'application/pdf');
+}
+
+const IMAGE_MIME_BY_EXT = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif',
+};
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -135,6 +149,24 @@ mcp.tool('get_config', 'Get the trip config: meta, participants, families, phase
 mcp.tool('get_photos', 'Fetch trip photos, optionally filtered by phase', {
   phase: z.string().optional().describe('Phase id from trip.config.json (see get_config). Omit for all.'),
 }, async ({ phase }) => ok(await apiGet(`/api/photos${phase ? `?phase=${phase}` : ''}`)));
+
+mcp.tool('add_photo',
+  'Upload a photo into the trip gallery and its phase album (synced to Immich in the background if configured). ' +
+  'filePath must be an absolute path on the machine running this MCP server.', {
+  filePath: z.string().describe('Absolute filesystem path to an image file on this machine'),
+  phase:    z.string().optional().describe('Phase id from trip.config.json (see get_config) — determines which album the photo is added to. Omit to land in the general/unsorted album.'),
+  caption:  z.string().optional().describe('Caption for the photo'),
+}, async ({ filePath, phase, caption }) => {
+  const ext = require('path').extname(filePath).toLowerCase();
+  const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';
+  return ok(await apiPostFile('/api/photos/upload', filePath, 'photo', contentType, { phase, caption }));
+});
+
+mcp.tool('delete_photo',
+  'Delete a photo from the trip gallery and its Immich album (if synced). Unlike a family member on the site, ' +
+  'the agent may delete any photo, not just ones it uploaded — use with care.', {
+  photoId: z.string().describe('Photo ID from get_photos'),
+}, async ({ photoId }) => ok(await apiDelete(`/api/photos/${photoId}`)));
 
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));

@@ -1549,7 +1549,14 @@ function renderPacking(containerId, items) {
   if (!c) return;
   const lang = currentLang || 'he';
   const cats = {};
-  items.forEach(([catObj, itemObj]) => {
+  // buildGlobalsFromConfig() only sets PACKING[phase.id] when phase.packing is
+  // non-empty, but the pack-<id> container div is created for *every* phase —
+  // so a phase with "packing": [] resolves to undefined here. The initial
+  // render guards with `if (p.packing?.length)`, applyLang() does not, and an
+  // unguarded throw there aborts the rest of the language switch (RSVP cards
+  // and everything after it silently stop re-rendering). Normalize at the
+  // choke point so all four call sites are safe.
+  (Array.isArray(items) ? items : []).forEach(([catObj, itemObj]) => {
     const cat  = catObj[lang]  || catObj.he;
     const item = itemObj[lang] || itemObj.he;
     (cats[cat] = cats[cat] || []).push({ key: itemObj.he, label: item });

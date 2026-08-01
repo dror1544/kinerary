@@ -681,7 +681,7 @@ app.get('/api/photos/file/:filename', (req, res) => {
 app.delete('/api/photos/:id', authRequired, async (req, res) => {
   const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
   if (!photo) return res.status(404).json({ error: 'not_found' });
-  if (photo.username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+  if (photo.username !== req.user.username && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
 
   // Delete from Immich
   if (photo.immich_id && IMMICH_URL && IMMICH_KEY) {
