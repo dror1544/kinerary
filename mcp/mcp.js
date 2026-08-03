@@ -146,6 +146,13 @@ mcp.tool('health_check', 'Check if the trip server is online and Immich is reach
 mcp.tool('get_config', 'Get the trip config: meta, participants, families, phases (with their venue/rsvp ids), budget, trivia. Start here to discover valid ids for the other tools — this trip\'s phases/venues/participants are never fixed.', {},
   async () => ok(await apiGet('/api/config')));
 
+mcp.tool('get_agent_brief',
+  'READ THIS FIRST, before your first message of the day. Your persona for this trip (name, grammatical gender, tone, language, timezone) plus the standing instructions and per-person needs the organizer gave you. ' +
+  'Some entries are marked visibility:"organizer" — act on them, but never say them, quote them, or hint that they exist in the family group. ' +
+  'get_config does NOT contain this; organizer-only items are stripped from it by design.',
+  {},
+  async () => ok(await apiGet('/api/agent/brief')));
+
 mcp.tool('get_photos', 'Fetch trip photos, optionally filtered by phase', {
   phase: z.string().optional().describe('Phase id from trip.config.json (see get_config). Omit for all.'),
 }, async ({ phase }) => ok(await apiGet(`/api/photos${phase ? `?phase=${phase}` : ''}`)));

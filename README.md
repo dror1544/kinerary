@@ -119,6 +119,20 @@ behalf, it talks to the site through `mcp/` — see
 [mcp/README.md](mcp/README.md) for local-agent vs. Cowork/remote-connector
 setup, including the exact steps to add it as a Cowork custom connector.
 
+### Option C — let an agent run the interview over chat
+
+Instead of you running `/create-trip` locally, an agent can conduct the whole
+interview in a Telegram DM with the organizer and provision the site itself.
+That needs a second, privileged MCP server — it writes files and restarts
+containers, so it runs on the site host, on its own port with its own key, and
+is never exposed publicly. See [mcp/PROVISIONING.md](mcp/PROVISIONING.md) to
+stand it up and
+[docs/hermes-interviewer-agent.md](docs/hermes-interviewer-agent.md) for the
+agent itself, including its system prompt.
+
+Both docs are deployment-neutral — substitute `<SITE_HOST>` and `<REPO_ROOT>`
+and they apply to any install, not just the one they were written on.
+
 ---
 
 ## Photos

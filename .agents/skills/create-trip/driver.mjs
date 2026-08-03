@@ -229,6 +229,25 @@ function buildConfig(answers) {
   // by leaving this out rather than writing empty placeholder structures.
   if (answers.travel_info) config.travel_info = answers.travel_info;
 
+  // agent — the per-trip personalization for the bot that escorts the trip.
+  // Passed through rather than defaulted: a trip with no escort agent should
+  // have no `agent` key at all, not an empty persona the bot might adopt.
+  // Validated here rather than only at boot, because a typo'd organizer
+  // username means the bot never enters ORGANIZER MODE for anyone — it would
+  // silently treat the whole family as a group audience, which is the failure
+  // mode the two-mode model exists to prevent.
+  if (answers.agent) {
+    const a = answers.agent;
+    if (!a.name) die('agent.name is required when an agent block is present — the family needs something to call the bot');
+    if (a.organizer && !participantsOut.some(p => p.username === a.organizer)) {
+      die(`agent.organizer "${a.organizer}" is not one of the participant usernames (${participantsOut.map(p => p.username).join(', ')})`);
+    }
+    for (const [i, ins] of (a.standing_instructions || []).entries()) {
+      if (!ins.text?.he && !ins.text?.en) die(`agent.standing_instructions[${i}] has no text`);
+    }
+    config.agent = a;
+  }
+
   // alerts is intentionally omitted unless real content is given — renderAlerts()
   // treats any truthy alerts.booked/pending as "show the bubble", so an empty
   // placeholder object still renders a hollow checkmark chip.

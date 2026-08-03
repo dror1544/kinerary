@@ -79,6 +79,18 @@ describe('GET /api/config', () => {
     assert.ok(!bob.needs.some(n => n.type === 'allergy'), 'organizer-only allergy leaked through /api/config');
   });
 
+  test('unrecognized severity is normalized to critical, fail-safe not fail-quiet', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    // "crticial" on an otherwise-fine dietary need — dietary defaults to
+    // group, so the need is still served, but the typo'd severity must not
+    // pass through as-is or read as non-critical.
+    const typo = eve.needs.find(n => n.text?.en === 'Gluten free');
+    assert.ok(typo, 'expected the group-visible dietary need to still be served');
+    assert.equal(typo.severity, 'critical', 'unrecognized severity should fail safe to critical, not pass through as-is');
+  });
+
   test('explicit visibility:"group" overrides the organizer default for medical/allergy', async () => {
     const res = await api('/api/config');
     const data = await res.json();
@@ -88,13 +100,17 @@ describe('GET /api/config', () => {
     assert.ok(medical.text?.he && medical.text?.en, 'medical need missing bilingual text');
   });
 
-  test('unrecognized severity is normalized to critical, fail-safe not fail-quiet', async () => {
+  test('an unrecognized need TYPE fails safe to organizer-only, not published to the group', async () => {
     const res = await api('/api/config');
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
-    const malformed = eve.needs.find(n => n.type === 'unrecognized-type');
-    assert.ok(malformed, 'expected the malformed (but group-visible) need to still be served');
-    assert.equal(malformed.severity, 'critical', 'unrecognized severity should fail safe to critical, not pass through as-is');
+    // The regression this guards: defaultVisibility() used to check
+    // `type === 'medical' || type === 'allergy'` and fall through to 'group'
+    // for anything else — so "medicl", or "Medical" with the wrong case,
+    // published a medical need to an endpoint served with no auth at all.
+    // Every other unknown value in the schema fails safe; this one didn't.
+    assert.ok(!eve.needs.some(n => n.type === 'unrecognized-type'),
+      'a need with an unrecognized type must not fall through as group-visible');
   });
 
   test('unrecognized visibility value fails safe to organizer-only (hidden), not visible', async () => {
@@ -105,11 +121,135 @@ describe('GET /api/config', () => {
       'a garbage visibility value should be treated as organizer-only and stripped, not fall through as visible');
   });
 
+  test('a participant whose needs are ALL organizer-only has the key dropped, not left as []', async () => {
+    const res = await api('/api/config');
+    const data = await res.json();
+    const eve = data.participants.find(p => p.username === 'eve');
+    // eve keeps one group-visible medical need, so she still has the key —
+    // this asserts the shape rule via bob/alice below. The disclosure being
+    // guarded: `needs: []` distinguishes "had needs, all hidden" from "no
+    // needs at all", which tells an unauthenticated reader exactly who has
+    // something to hide.
+    assert.ok(Array.isArray(eve.needs) && eve.needs.length > 0);
+    for (const p of data.participants) {
+      assert.ok(!('needs' in p) || p.needs.length > 0,
+        `${p.username} was served an empty needs array, which itself signals hidden needs`);
+    }
+  });
+
   test('alice has no needs field, matching the fixture', async () => {
     const res = await api('/api/config');
     const data = await res.json();
     const alice = data.participants.find(p => p.username === 'alice');
     assert.ok(!('needs' in alice), 'alice should have no needs field, matching the fixture');
+  });
+});
+
+// ── agent block ───────────────────────────────────────────────────────────────
+describe('GET /api/config — agent persona', () => {
+  test('public persona fields are served', async () => {
+    const res = await api('/api/config');
+    const { agent } = await res.json();
+    assert.ok(agent, 'expected the agent block to be served');
+    assert.equal(agent.name, 'ויקטור');
+    assert.equal(agent.gender, 'male', 'grammatical gender must survive — Hebrew needs it to conjugate');
+    assert.equal(agent.organizer, 'alice');
+  });
+
+  test('unrecognized tone falls back to warm rather than passing through', async () => {
+    const res = await api('/api/config');
+    const { agent } = await res.json();
+    assert.equal(agent.tone, 'warm', 'fixture tone is "porcupine" and should normalize, not leak a junk value to the bot');
+  });
+
+  test('organizer-only standing instructions are stripped from the public read path', async () => {
+    const res = await api('/api/config');
+    const { agent } = await res.json();
+    const texts = (agent.standing_instructions || []).map(i => i.text?.en);
+    assert.equal(texts.length, 1, `expected only the group-visible instruction, got ${JSON.stringify(texts)}`);
+    assert.equal(texts[0], 'Rental car — mention parking');
+  });
+
+  test('an instruction with NO visibility defaults to organizer-only (unlike needs)', async () => {
+    const res = await api('/api/config');
+    const body = await res.text();
+    assert.ok(!body.includes('defaults to organizer'),
+      'an instruction with no explicit visibility must default to hidden — every standing instruction is sensitive by default');
+  });
+
+  test('a typo\'d visibility fails safe to organizer-only', async () => {
+    const res = await api('/api/config');
+    const body = await res.text();
+    assert.ok(!body.includes('Typo\'d visibility'),
+      'a garbage visibility value must resolve restrictive, not fall through as visible');
+  });
+
+  test('no organizer-only instruction text appears anywhere in the payload', async () => {
+    // Belt-and-braces against the whole serialized response, not just the
+    // agent block — catches a future refactor that copies the raw config
+    // somewhere else in the payload (a versions snapshot, a debug echo).
+    const res = await api('/api/config');
+    const body = await res.text();
+    for (const secret of ['Sensitive topic to avoid', 'נושא רגיש']) {
+      assert.ok(!body.includes(secret), `organizer-only instruction text "${secret}" leaked into /api/config`);
+    }
+  });
+});
+
+// ── /api/agent/brief ──────────────────────────────────────────────────────────
+describe('GET /api/agent/brief', () => {
+  test('rejects an unauthenticated request', async () => {
+    const res = await api('/api/agent/brief');
+    assert.equal(res.status, 401);
+  });
+
+  test('rejects an authed NON-organizer — this is the whole point of the endpoint', async () => {
+    // bob is a legitimate family member with a valid token. The fixture's
+    // organizer is alice. authRequired would have let bob straight in, which
+    // is why this route uses a stricter middleware.
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    assert.equal(login.status, 200, 'expected bob to be able to log in at all');
+    const bobToken = (await login.json()).token;
+    const res = await api('/api/agent/brief', { token: bobToken });
+    assert.equal(res.status, 403);
+  });
+
+  test('serves the agent service account (X-API-Key)', async () => {
+    const res = await api('/api/agent/brief', { apiKey: 'test-hermes-key' });
+    assert.equal(res.status, 200);
+    const brief = await res.json();
+    assert.equal(brief.persona?.name, 'ויקטור');
+    assert.equal(brief.persona?.gender, 'male');
+    assert.equal(brief.persona?.tone, 'warm', 'junk tone should normalize here too');
+    assert.equal(brief.organizer, 'alice');
+  });
+
+  test('includes the organizer-only material that /api/config strips', async () => {
+    const res = await api('/api/agent/brief', { apiKey: 'test-hermes-key' });
+    const brief = await res.json();
+
+    const texts = brief.standing_instructions.map(i => i.text?.en);
+    assert.equal(brief.standing_instructions.length, 4, 'all four instructions, not just the group-visible one');
+    assert.ok(texts.includes('Sensitive topic to avoid'), 'the organizer-only instruction must be readable here');
+
+    // bob's peanut allergy is the case that motivated this: stored, stripped
+    // from every read path, and therefore visible to nobody until now.
+    const allergy = brief.needs.find(n => n.username === 'bob' && n.type === 'allergy');
+    assert.ok(allergy, 'expected bob\'s organizer-only allergy in the brief');
+    assert.equal(allergy.visibility, 'organizer');
+    assert.equal(allergy.severity, 'critical');
+  });
+
+  test('every item carries a resolved visibility, so the bot knows what it may say aloud', async () => {
+    const res = await api('/api/agent/brief', { apiKey: 'test-hermes-key' });
+    const brief = await res.json();
+    for (const i of brief.standing_instructions) {
+      assert.ok(['group', 'organizer'].includes(i.visibility), `instruction ${i.index} has no resolved visibility`);
+    }
+    for (const n of brief.needs) {
+      assert.ok(['group', 'organizer'].includes(n.visibility), `need for ${n.username} has no resolved visibility`);
+    }
+    assert.ok(brief.disclosure_policy?.organizer, 'the payload should state the disclosure rule, not assume the reader knows it');
   });
 });
 
@@ -125,14 +265,28 @@ describe('GET /api/config/warnings', () => {
     assert.equal(res.status, 200);
     const warnings = await res.json();
     const eveWarnings = warnings.filter(w => w.username === 'eve');
-    // The malformed entry has 3 issues (unknown type, unknown severity,
-    // missing bilingual text); the garbage-visibility entry adds a 4th
-    // (unknown visibility).
-    assert.equal(eveWarnings.length, 4, `expected 4 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
+    // eve's 4 fixture needs contribute 5 issues between them:
+    //   [1] malformed entry      → unknown type, unknown severity, missing text (3)
+    //   [2] garbage visibility   → unknown visibility (1)
+    //   [3] bad-severity entry   → unknown severity (1)
+    // The medical override is clean and contributes none.
+    assert.equal(eveWarnings.length, 5, `expected 5 warnings for eve, got ${JSON.stringify(eveWarnings)}`);
     assert.ok(eveWarnings.some(w => /unknown type/.test(w.issue)));
     assert.ok(eveWarnings.some(w => /unknown severity/.test(w.issue)));
     assert.ok(eveWarnings.some(w => /unknown visibility/.test(w.issue)));
     assert.ok(eveWarnings.some(w => /missing bilingual text/.test(w.issue)));
+  });
+
+  test('the offending VALUE is withheld from the API even though the log keeps it', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const body = await res.text();
+    // "medicl" identifies the category as well as "medical" does, and this
+    // endpoint is authRequired but not organizer-scoped — so the raw value
+    // must not appear, only the fact that something was unrecognized.
+    for (const raw of ['unrecognized-type', 'crticial', 'porcupine']) {
+      assert.ok(!body.includes(raw), `raw config value "${raw}" leaked into /api/config/warnings`);
+    }
+    assert.ok(body.includes('value withheld'), 'expected the redaction marker so the organizer knows where to look');
   });
 
   test('warning objects never carry the need\'s type, so category (e.g. medical) can\'t leak through this side door', async () => {
@@ -142,10 +296,28 @@ describe('GET /api/config/warnings', () => {
     assert.ok(!warnings.some(w => 'type' in w), 'a warning object still carries a type field');
   });
 
-  test('bob and alice have no warnings (well-formed / no needs)', async () => {
+  test('alice has no warnings (no needs at all)', async () => {
     const res = await api('/api/config/warnings', { token });
     const warnings = await res.json();
-    assert.ok(!warnings.some(w => w.username === 'bob' || w.username === 'alice'));
+    assert.ok(!warnings.some(w => w.username === 'alice'));
+  });
+
+  test('reports the agent block\'s malformed fields', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const warnings = await res.json();
+    const agentWarnings = warnings.filter(w => w.scope === 'agent');
+    assert.ok(agentWarnings.some(w => /unknown tone/.test(w.issue)), 'expected a tone warning');
+    assert.ok(agentWarnings.some(w => /unknown proactive key/.test(w.issue)), 'expected an unknown proactive key warning');
+    assert.ok(agentWarnings.some(w => /unknown visibility/.test(w.issue)), 'expected a standing_instructions visibility warning');
+  });
+
+  test('agent warnings never carry the instruction text itself', async () => {
+    const res = await api('/api/config/warnings', { token });
+    const body = await res.text();
+    for (const secret of ['Sensitive topic to avoid', 'נושא רגיש', 'Typo\'d visibility']) {
+      assert.ok(!body.includes(secret),
+        `instruction text "${secret}" leaked through /api/config/warnings — this endpoint is authRequired but not organizer-scoped`);
+    }
   });
 });
 

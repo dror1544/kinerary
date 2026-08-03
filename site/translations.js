@@ -64,6 +64,9 @@ const T = {
     cd_hours:  'שעות',
     cd_min:    'דקות',
     cd_sec:    'שניות',
+    cd_until_departure: 'עד היציאה',
+    cd_until_end:       'עד סוף הטיול',
+    cd_finished:        '✅ הטיול הסתיים',
 
     /* hero ctas / labels per tab — framework tabs only; phase heroes come from config */
     hero_home_label: '— מסע משפחתי',
@@ -323,6 +326,9 @@ const T = {
     cd_hours:  'hours',
     cd_min:    'min',
     cd_sec:    'sec',
+    cd_until_departure: 'until departure',
+    cd_until_end:       'until the trip ends',
+    cd_finished:        '✅ Trip complete',
 
     /* hero — framework tabs only; phase heroes come from config */
     hero_home_label: '— Family Journey',

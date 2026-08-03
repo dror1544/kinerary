@@ -962,25 +962,64 @@ function uname(username, userObj) {
 /* =========================================================
    COUNTDOWN
    ========================================================= */
+// Three states, not one. The original only counted down to departure and, once
+// that passed, wrote a rocket into the days slot and returned early — leaving
+// hours/minutes/seconds on their "–" placeholders forever. Any trip whose
+// departure is in the past therefore displayed a permanently broken timer,
+// which is every past trip and every demo of one.
+//
+// Now: before departure → time until departure; during the trip → time until
+// it ends; after → a finished state, no timer at all.
+function tripPhaseNow(meta, now = new Date()) {
+  const dep = meta?.departure ? new Date(meta.departure) : null;
+  if (!dep || isNaN(dep)) return null;
+  // returnDate is a plain YYYY-MM-DD (the day everyone gets home), so the trip
+  // is still running for the whole of that day — end of it, not the start.
+  let end = null;
+  if (meta.returnDate) {
+    end = new Date(`${meta.returnDate}T23:59:59`);
+    if (isNaN(end)) end = null;
+  }
+  if (now < dep)             return { state: 'before',   target: dep };
+  if (end && now <= end)     return { state: 'during',   target: end };
+  if (end)                   return { state: 'finished', target: null };
+  // No returnDate to work from: departure has passed and we can't tell whether
+  // the trip is still running. "Finished" is the wrong guess mid-trip, so show
+  // the in-progress state without a timer rather than declaring it over.
+  return { state: 'during', target: null };
+}
+
 function tick() {
-  const depStr = window.TRIP_CONFIG?.meta?.departure;
-  if (!depStr) return; // config not loaded yet — nothing to count down to
-  const dep = new Date(depStr);
-  const now = new Date();
-  const diff = dep - now;
-  const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-  if (diff <= 0) {
-    setText('cd-d', '🚀');
+  const meta = window.TRIP_CONFIG?.meta;
+  const phase = tripPhaseNow(meta);
+  if (!phase) return; // config not loaded yet — nothing to count down to
+
+  const el = id => document.getElementById(id);
+  const setText = (id, v) => { const e = el(id); if (e) e.textContent = v; };
+  const tr = (typeof T !== 'undefined' && T[currentLang]) || {};
+
+  const units    = el('cd-units');
+  const finished = el('cd-finished');
+  const caption  = el('cd-caption');
+
+  if (phase.state === 'finished') {
+    if (units) units.hidden = true;
+    if (caption) caption.textContent = '';
+    if (finished) { finished.hidden = false; finished.textContent = tr.cd_finished || '✅ הטיול הסתיים'; }
     return;
   }
-  const d = Math.floor(diff / 86400000);
-  const h = Math.floor((diff % 86400000) / 3600000);
-  const m = Math.floor((diff % 3600000) / 60000);
-  const s = Math.floor((diff % 60000) / 1000);
-  setText('cd-d', d);
-  setText('cd-h', String(h).padStart(2, '0'));
-  setText('cd-m', String(m).padStart(2, '0'));
-  setText('cd-s', String(s).padStart(2, '0'));
+
+  if (units) units.hidden = false;
+  if (finished) finished.hidden = true;
+  if (caption) caption.textContent = phase.state === 'during' ? (tr.cd_until_end || '') : (tr.cd_until_departure || '');
+
+  if (!phase.target) { setText('cd-d', '🚀'); setText('cd-h', '—'); setText('cd-m', '—'); setText('cd-s', '—'); return; }
+
+  const diff = Math.max(0, phase.target - new Date());
+  setText('cd-d', Math.floor(diff / 86400000));
+  setText('cd-h', String(Math.floor((diff % 86400000) / 3600000)).padStart(2, '0'));
+  setText('cd-m', String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0'));
+  setText('cd-s', String(Math.floor((diff % 60000) / 1000)).padStart(2, '0'));
 }
 setInterval(tick, 1000); tick();
 
@@ -2560,8 +2599,15 @@ function applyTweaks() {
   if (!shell) return;
   shell.dataset.palette = tweakState.palette;
   shell.dataset.font = tweakState.font;
-  // override NY hero photo
-  HERO.ny.photo = NY_PHOTOS[tweakState.nyPhoto % NY_PHOTOS.length];
+  // Leftover from the original single-trip (New York) version. HERO is built
+  // from trip.config.json phases, so HERO.ny exists only if a trip happens to
+  // have a phase literally called "ny" — no generated trip does. Unguarded,
+  // this threw on every real trip and took the REST OF BOOT with it: the
+  // lang-toggle listener and initDragDrop() are registered on the lines
+  // immediately after applyTweaks(), so the EN/HE button silently did nothing.
+  // The test fixture's phases are named ny/colorado, which is exactly why the
+  // suite never caught it.
+  if (HERO.ny) HERO.ny.photo = NY_PHOTOS[tweakState.nyPhoto % NY_PHOTOS.length];
   // re-apply current hero if NY active
   const active = document.querySelector('.section.active');
   if (active && active.id === 'ny') setHero('ny');

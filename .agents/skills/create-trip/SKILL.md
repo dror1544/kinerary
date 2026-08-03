@@ -24,6 +24,12 @@ dev server currently has live (`docker-compose.yml`'s default
 live with a new trip means repointing `TRIP_DIR`/`TRIP_DIR_HOST`, covered
 below — never overwriting `trip/` directly.
 
+> **`$SKILL_DIR`** below means the directory this file is in. There is one copy
+> of this skill; `.claude/skills/create-trip` and `.agents/skills/create-trip`
+> are the same directory via a symlink, so the commands work unchanged from
+> either path. Substitute whichever one you were invoked from, or just use the
+> path you read this file from.
+
 ## Prerequisites
 
 None beyond what the repo already needs — Node (`node --version` — this
@@ -43,7 +49,7 @@ install --prefix server`). No new dependencies were added for this skill.
    stub).
 3. **Generate:**
    ```bash
-   node .agents/skills/create-trip/driver.mjs generate /path/to/answers.json
+   node "$SKILL_DIR"/driver.mjs generate /path/to/answers.json
    ```
    Validates first (missing title, no participants, a family pointing at an
    unknown username, duplicate phase ids, etc. all fail loudly *before*
@@ -51,7 +57,7 @@ install --prefix server`). No new dependencies were added for this skill.
    `trips/<slug>/` unless you pass `--force`.
 4. **Verify — actually run it, don't just eyeball the JSON:**
    ```bash
-   node .agents/skills/create-trip/driver.mjs verify <slug>
+   node "$SKILL_DIR"/driver.mjs verify <slug>
    ```
    This boots the real `server/server.js` against the new trip dir on a
    throwaway port + temp `DATA_DIR`, hits `/api/health` and `/api/config`
@@ -116,7 +122,7 @@ directly, not for viewing the site.
 ## Test
 
 ```bash
-node .agents/skills/create-trip/driver.mjs verify <slug>   # this skill's own driver
+node "$SKILL_DIR"/driver.mjs verify <slug>   # this skill's own driver
 cd tests && ./run-tests.sh                                  # framework's full suite (71 tests as of this writing)
 ```
 

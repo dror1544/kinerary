@@ -15,7 +15,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Family Trip">
-<link rel="stylesheet" href="styles.css?v=28">
+<link rel="stylesheet" href="styles.css?v=29">
 </head>
 <body>
 
@@ -157,14 +157,18 @@
           <p id="hero-blurb"></p>
         </div>
 
-        <div class="hero-countdown">
-          <div class="cu"><strong id="cd-d">–</strong><small data-i18n="cd_days">ימים</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-h">–</strong><small data-i18n="cd_hours">שעות</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
+        <div class="hero-countdown" id="hero-countdown">
+          <div class="cd-caption" id="cd-caption"></div>
+          <div class="cd-units" id="cd-units">
+            <div class="cu"><strong id="cd-d">–</strong><small data-i18n="cd_days">ימים</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-h">–</strong><small data-i18n="cd_hours">שעות</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
+          </div>
+          <div class="cd-finished" id="cd-finished" hidden></div>
         </div>
 
         <div class="hero-right">
@@ -506,9 +510,9 @@
 <div class="tab-transition" id="tab-transition">
   <img src="ara_united_transparent_horizontal_spin.gif" class="tt-gif" alt="">
 </div>
-<script src="translations.js?v=17"></script>
+<script src="translations.js?v=18"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js" crossorigin=""></script>
-<script src="app.js?v=38"></script>
+<script src="app.js?v=40"></script>
 </body>
 </html>

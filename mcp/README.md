@@ -65,6 +65,16 @@ gets its own MCP server instance server-side.
 
 Creating a brand-new trip (scaffolding `trip.config.json` from an interview)
 needs local filesystem + shell access, which a remote connector doesn't
-have — that's what the `/create-trip` Claude Code skill is for (see the
-top-level [README.md](../README.md)). This MCP server is for managing a
-trip that already exists.
+have. This MCP server is for managing a trip that already exists.
+
+Two things fill that gap, depending on who is doing the interview:
+
+- **You, with a coding agent** — the `/create-trip` Claude Code skill (see the
+  top-level [README.md](../README.md)).
+- **An agent, over chat** — `provision.js`, a second and deliberately separate
+  MCP server that can scaffold, verify and activate trips. It is privileged
+  (it writes files and restarts containers), runs on its own port with its own
+  key, and must never be exposed publicly the way this one can be. See
+  [PROVISIONING.md](PROVISIONING.md), and
+  [docs/hermes-interviewer-agent.md](../docs/hermes-interviewer-agent.md) for
+  wiring it to a Telegram interviewer agent.

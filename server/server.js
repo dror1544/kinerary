@@ -10,6 +10,7 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
+const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender } = require('../shared/agent-schema');
 
 const app = express();
 app.use(express.json());
@@ -62,19 +63,74 @@ try {
 // need must not leak its category through this side door around the
 // visibility rule below. `severity` alone doesn't identify the category.
 const CONFIG_WARNINGS = [];
+// Two audiences, two levels of detail. The server log is organizer-only by
+// definition (you need shell on the box to read it), so it gets the offending
+// value verbatim — that's what makes a typo findable. The API response does
+// not: it is authRequired but NOT organizer-scoped, so every authed kid can
+// read it. Echoing a bad type there would defeat the visibility rule below,
+// since "medicl" identifies the category just as well as "medical" does.
+const redact = (label, value, note) => ({
+  log:  `${label} "${value}"${note ? ` ${note}` : ''}`,
+  api:  `${label} (value withheld — check the server log)${note ? ` ${note}` : ''}`,
+});
 (TRIP_CONFIG.participants || []).forEach(p => {
   (p.needs || []).forEach(n => {
     const issues = [];
-    if (!NEED_TYPES.includes(n.type)) issues.push(`unknown type "${n.type}"`);
-    if (!NEED_SEVERITIES.includes(n.severity)) issues.push(`unknown severity "${n.severity}" (treated as critical)`);
-    if (n.visibility !== undefined && !VISIBILITIES.includes(n.visibility)) issues.push(`unknown visibility "${n.visibility}" (treated as organizer-only)`);
-    if (!n.text?.he || !n.text?.en) issues.push('missing bilingual text');
+    if (!NEED_TYPES.includes(n.type)) issues.push(redact('unknown type', n.type));
+    if (!NEED_SEVERITIES.includes(n.severity)) issues.push(redact('unknown severity', n.severity, '(treated as critical)'));
+    if (n.visibility !== undefined && !VISIBILITIES.includes(n.visibility)) issues.push(redact('unknown visibility', n.visibility, '(treated as organizer-only)'));
+    if (!n.text?.he || !n.text?.en) issues.push({ log: 'missing bilingual text', api: 'missing bilingual text' });
     for (const issue of issues) {
-      console.warn(`trip.config.json: participant "${p.username}" need — ${issue}`);
-      CONFIG_WARNINGS.push({ username: p.username, severity: n.severity, issue });
+      console.warn(`trip.config.json: participant "${p.username}" need — ${issue.log}`);
+      // Normalized, not raw. A valid severity is safe to return — it says how
+      // urgent, never what category — but the raw field is whatever the config
+      // author typed, and "crticial" is a config value like any other. The
+      // invariant this endpoint holds is simply: no raw config values, ever.
+      CONFIG_WARNINGS.push({ username: p.username, severity: normalizeSeverity(n.severity), issue: issue.api });
     }
   });
 });
+
+// Same diagnostic treatment for the `agent` block. Note what is deliberately
+// NOT reported: the instruction text itself, and which instructions resolved
+// to organizer-only. /api/config/warnings is authRequired but not
+// organizer-scoped, so echoing either would route sensitive standing
+// instructions straight around the visibility filter below. Index only.
+(() => {
+  const a = TRIP_CONFIG.agent;
+  if (!a) return;
+  const issues = [];
+  if (!a.name) issues.push('missing name (the family has nothing to call the bot)');
+  // Blanket rule, applied even to fields that look harmless: NO raw
+  // trip.config.json value reaches this endpoint. Judging each field on its
+  // merits is how the first three leaks happened — a "cosmetic" tone still
+  // echoed a string an author chose, and the exemption list has to be
+  // re-audited every time a field is added. One invariant is checkable at a
+  // glance; five exceptions are not. The server log keeps every value.
+  if (a.tone !== undefined && !AGENT_TONES.includes(a.tone)) issues.push(redact('unknown tone', a.tone, '(treated as warm)'));
+  if (a.gender !== undefined && !AGENT_GENDERS.includes(a.gender)) issues.push(redact('unknown gender', a.gender, '(treated as neutral)'));
+  if (a.organizer && !(TRIP_CONFIG.participants || []).some(p => p.username === a.organizer)) {
+    issues.push(redact('agent.organizer', a.organizer, 'is not a known participant username'));
+  }
+  for (const key of Object.keys(a.proactive || {})) {
+    if (!PROACTIVE_KEYS.includes(key)) issues.push(redact('unknown proactive key', key, '(ignored)'));
+  }
+  // Standing instructions are the sensitive half — index and problem only,
+  // never the text and never the resolved visibility.
+  (a.standing_instructions || []).forEach((ins, i) => {
+    if (ins.visibility !== undefined && !VISIBILITIES.includes(ins.visibility)) {
+      issues.push(redact(`standing_instructions[${i}]: unknown visibility`, ins.visibility, '(treated as organizer-only)'));
+    }
+    if (!ins.text?.he || !ins.text?.en) {
+      const m = `standing_instructions[${i}]: missing bilingual text`;
+      issues.push({ log: m, api: m });
+    }
+  });
+  for (const issue of issues) {
+    console.warn(`trip.config.json: agent — ${issue.log}`);
+    CONFIG_WARNINGS.push({ scope: 'agent', issue: issue.api });
+  }
+})();
 
 // ── DATABASE INIT ─────────────────────────────────────────────────────────────
 const db = new Database(DB_FILE);
@@ -375,10 +431,10 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
-// Strip PIN codes and organizer-only needs before serving to clients — every
-// family member is authed, including kids and one-off guests, so auth alone
-// isn't a safety boundary for either field. Shared by /api/config and
-// /api/config/versions/:version.
+// Strip PIN codes, organizer-only needs, and organizer-only agent standing
+// instructions before serving to clients — every family member is authed,
+// including kids and one-off guests, so auth alone isn't a safety boundary for
+// any of these fields. Shared by /api/config and /api/config/versions/:version.
 function sanitizeConfig(cfg) {
   const safe = JSON.parse(JSON.stringify(cfg));
   if (safe.phases) safe.phases.forEach(p => {
@@ -392,8 +448,13 @@ function sanitizeConfig(cfg) {
       p.needs = p.needs
         .filter(n => normalizeVisibility(n.visibility, n.type) !== 'organizer')
         .map(n => ({ ...n, severity: normalizeSeverity(n.severity) }));
+      // An empty array is itself a disclosure: a participant with no `needs`
+      // key looks different from one whose needs were all filtered out, which
+      // tells an unauthenticated reader exactly who has something hidden.
+      if (!p.needs.length) delete p.needs;
     }
   });
+  if (safe.agent) safe.agent = publicAgent(safe.agent);
   return safe;
 }
 
@@ -416,6 +477,81 @@ app.get('/api/config/versions', authRequired, (_req, res) => {
 // /api/config/versions — not organizer-scoped yet, but no longer silent.
 app.get('/api/config/warnings', authRequired, (_req, res) => {
   res.json(CONFIG_WARNINGS);
+});
+
+// ── AGENT BRIEF ───────────────────────────────────────────────────────────────
+// The counterpart to sanitizeConfig(): everything the read path deliberately
+// withholds, served to the two principals actually entitled to it.
+//
+// authRequired is not enough here — it admits every family member including
+// kids, which is exactly who organizer-only content is being kept from. This
+// middleware narrows to:
+//   • the agent service account (X-API-Key), so the companion bot can read the
+//     standing instructions it was given; and
+//   • the organizer's own browser session, which until now had no read path to
+//     organizer-only needs at all — they were stored and visible to nobody.
+function organizerOrAgentRequired(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (HERMES_KEY && apiKey === HERMES_KEY) { req.user = AGENT_USER; return next(); }
+
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  let payload;
+  try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+
+  const organizer = TRIP_CONFIG.agent?.organizer;
+  // No configured organizer means nobody qualifies. Failing closed here matters
+  // more than convenience: the alternative — treating "unset" as "everyone" —
+  // would silently publish every organizer-only note the moment a trip is
+  // scaffolded without an agent block.
+  if (!organizer || payload.username !== organizer) return res.status(403).json({ error: 'organizer_only' });
+  req.user = { username: payload.username };
+  next();
+}
+
+app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
+  const agent = TRIP_CONFIG.agent || null;
+  const instructions = (agent?.standing_instructions || []).map((ins, i) => ({
+    index: i,
+    visibility: normalizeInstructionVisibility(ins.visibility),
+    text: ins.text,
+  }));
+  // Needs are folded in because they answer the same question the standing
+  // instructions do — "what should the bot keep in mind about these people" —
+  // and splitting them across two calls invites reading one and not the other.
+  const needs = [];
+  for (const p of TRIP_CONFIG.participants || []) {
+    for (const n of p.needs || []) {
+      needs.push({
+        username: p.username,
+        name: p.name_en || p.name || p.username,
+        type: n.type,
+        severity: normalizeSeverity(n.severity),
+        visibility: normalizeVisibility(n.visibility, n.type),
+        text: n.text,
+      });
+    }
+  }
+  res.json({
+    trip: TRIP_CONFIG.meta?.title || null,
+    organizer: agent?.organizer || null,
+    persona: agent ? {
+      name: agent.name, name_en: agent.name_en,
+      gender: normalizeGender(agent.gender), tone: normalizeTone(agent.tone),
+      default_language: agent.default_language || TRIP_CONFIG.meta?.defaultLang || 'he',
+      timezone: agent.timezone || null,
+      proactive: agent.proactive || {},
+    } : null,
+    standing_instructions: instructions,
+    needs,
+    // Spelled out in the payload rather than left to documentation, because the
+    // consumer is a language model that may only ever see this response.
+    disclosure_policy: {
+      group: 'Items with visibility "group" may be referred to in the family group chat.',
+      organizer: 'Items with visibility "organizer" are for your understanding only. Act on them — adjust plans, avoid topics, flag risks — but never state them, quote them, or allude to their existence in the group. Discuss them only in the private channel with the organizer.',
+    },
+  });
 });
 
 app.get('/api/config/versions/:version', authRequired, (req, res) => {

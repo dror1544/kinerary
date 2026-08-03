@@ -2115,3 +2115,9 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 }
 .budget-add-btn:hover { opacity: .85; }
 .budget-loading { padding: 40px 0; text-align: center; opacity: .5; }
+
+/* Countdown states — caption above the units, finished state replacing them */
+.cd-caption{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;opacity:.65;margin-bottom:.35rem}
+.cd-units[hidden],.cd-finished[hidden]{display:none}
+.cd-units{display:flex;align-items:center;gap:.5rem}
+.cd-finished{font-size:1.05rem;font-weight:700;letter-spacing:.02em}

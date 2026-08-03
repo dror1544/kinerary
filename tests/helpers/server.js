@@ -66,10 +66,13 @@ export function stopTestServer() {
 
 /** Fetch against the test server. Pass `auth: true` to send the cached token. */
 let _token = null;
-export async function api(path, { method = 'GET', body, auth = false, token } = {}) {
+export async function api(path, { method = 'GET', body, auth = false, token, apiKey } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   const t = token ?? (auth ? _token : null);
   if (t) headers['Authorization'] = `Bearer ${t}`;
+  // Service-account path — how the companion agent authenticates, as distinct
+  // from a family member's JWT. Matches HERMES_API_KEY in startTestServer().
+  if (apiKey) headers['X-API-Key'] = apiKey;
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers,
