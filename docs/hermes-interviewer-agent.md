@@ -31,6 +31,15 @@ filesystem also sits in a group chat with a dozen relatives. Don't.
 
 ## Prerequisites
 
+`scripts/hermes-pipeline/run.sh` automates everything in this section plus
+step 1 and 2 below: key generation, `.env` files, `provision.js` +
+`mcp.js` running and LAN-reachable, SSH access to `<AGENT_HOST>`, and a
+Hermes profile with `mcp_servers` wired and the interview loaded as a skill.
+It deliberately stops before model/provider selection, the Telegram bot
+token, and starting the gateway — see the script's own final summary for
+what's still a manual, live decision. The manual steps below are what it
+automates, spelled out for anyone not using the script.
+
 On the **site host** (<SITE_HOST>):
 
 1. `provision.js` running and reachable — see [PROVISIONING.md](../mcp/PROVISIONING.md).
@@ -77,6 +86,19 @@ key.
 The trip MCP is only useful *after* activation (seeding trivia questions,
 confirming the site is healthy). Connect it anyway; the prompt below tells the
 agent when each is appropriate.
+
+**Two ways to wire the provisioning connection — pick one:**
+
+| | Full access (below) | Deterministic handoff (`scripts/hermes-pipeline/`) |
+|---|---|---|
+| Provisioning tools available | all of them, including `create_trip`/`activate_trip` | read-only only: `provision_health`, `list_trips`, `validate_answers` — via Hermes's `tools: { include: [...] }` on that connector |
+| Who creates/verifies/activates the trip | the conversational agent, mid-chat | you, running `04-create-trip-from-answers.sh` after the agent writes a finished `workspace/answers.json` |
+| Consent gate on activation | prompt instructions + provision.js's one-time activation token | a human running a script — no LLM judgment call in the loop at all |
+
+The rest of this doc (sections 1, 3, 4, 5) describes the full-access model,
+useful as background even if you use the script — `scripts/hermes-pipeline/`
+generates its own, shorter `SOUL.md`/`SKILL.md` for the deterministic model
+rather than pasting the prompt below.
 
 ---
 
@@ -182,9 +204,7 @@ not.
 
 ## 5. Test it before pointing anyone at it
 
-Interview yourself. Use a throwaway trip title so the slug doesn't collide, and
-stop before activation — `create_trip` and `verify_trip` are both safe to run
-against a live site because neither touches what's currently being served.
+Interview yourself. Use a throwaway trip title so the slug doesn't collide.
 
 Check that:
 
@@ -194,10 +214,16 @@ Check that:
   isn't a participant)
 - it asked about the companion bot's name **and** gender (Hebrew needs both)
 - it defaulted the organizer to you without asking who the organizer is
-- it refused to activate when you said something vague like "yeah looks good"
 
-That last one is the one to actually test. It's the only tool call in the set
-that can disrupt a running trip.
+**Full-access model:** also check it refused to activate when you said
+something vague like "yeah looks good" — that's the one tool call in the set
+that can disrupt a running trip, so it's the one worth actually testing, not
+just reading the prompt and assuming.
+
+**Deterministic-handoff model:** instead check it wrote a well-formed
+`workspace/answers.json` and stopped there — no claim of having created or
+activated anything — then run `04-create-trip-from-answers.sh` against it and
+confirm `generate`/`verify` both succeed.
 
 Then clean up:
 
@@ -209,12 +235,17 @@ rm -rf trips/<throwaway-slug>
 
 ## Known gaps
 
-- **The companion bot can't read its private instructions yet.** §9.4 answers
-  are stored organizer-only and stripped from every current read path, so
-  Victor can fetch its name and tone via `get_config` but not the standing
-  instructions. Needs an agent-scoped brief endpoint.
-- **Avatars stay manual.** `/api/auth/avatar/upload` is scoped to the
-  logged-in user, so the agent can't set them on anyone's behalf. Each person
-  uploads their own from the site.
-- **One organizer per trip.** `agent.organizer` is a single username. Couples
-  who plan together will ask for two; the answer today is no.
+- **Standing up the trip companion ("Victor") in Hermes isn't documented
+  yet.** This doc covers the interviewer only, which ends at `activate_trip`.
+  Someone still has to manually create a second Hermes profile for the
+  per-trip companion persona and connect it to `mcp.js`.
+- **`set_participant_avatar` isn't in this interview's tool list.** The MCP
+  tool exists (`mcp.js`), but nothing in `INTERVIEW.md` or the system prompt
+  above tells the interviewer to use it, so avatars stay a manual per-person
+  step from the site regardless.
+
+Resolved since this doc was written: the companion bot can now read its
+organizer-only standing instructions via `GET /api/agent/brief`; avatars can
+be set on someone else's behalf by the agent service account (not a JWT); and
+`agent.organizer` accepts a list (`organizers: [...]`) for couples who plan
+together, with the legacy single-string form still normalized on read.

@@ -16,3 +16,4 @@ scripts/__pycache__/
 
 # Design references — local only, not committed
 references/
+scripts/hermes-pipeline/.last-answers.json
