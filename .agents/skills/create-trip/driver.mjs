@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { normalizeOrganizers } from '../../../shared/agent-schema.js';
 
 const SELF = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(SELF);
@@ -239,8 +240,10 @@ function buildConfig(answers) {
   if (answers.agent) {
     const a = answers.agent;
     if (!a.name) die('agent.name is required when an agent block is present — the family needs something to call the bot');
-    if (a.organizer && !participantsOut.some(p => p.username === a.organizer)) {
-      die(`agent.organizer "${a.organizer}" is not one of the participant usernames (${participantsOut.map(p => p.username).join(', ')})`);
+    for (const org of normalizeOrganizers(a)) {
+      if (!participantsOut.some(p => p.username === org)) {
+        die(`agent.organizer(s) "${org}" is not one of the participant usernames (${participantsOut.map(p => p.username).join(', ')})`);
+      }
     }
     for (const [i, ins] of (a.standing_instructions || []).entries()) {
       if (!ins.text?.he && !ins.text?.en) die(`agent.standing_instructions[${i}] has no text`);

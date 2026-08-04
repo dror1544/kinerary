@@ -221,7 +221,7 @@ describe('GET /api/agent/brief', () => {
     assert.equal(brief.persona?.name, 'ויקטור');
     assert.equal(brief.persona?.gender, 'male');
     assert.equal(brief.persona?.tone, 'warm', 'junk tone should normalize here too');
-    assert.equal(brief.organizer, 'alice');
+    assert.deepEqual(brief.organizers, ['alice'], 'legacy single-organizer string should normalize to a one-element list');
   });
 
   test('includes the organizer-only material that /api/config strips', async () => {
@@ -457,6 +457,53 @@ describe('GET /api/auth/me', () => {
     assert.equal(res.status, 200);
     const user = await res.json();
     assert.equal(user.username, 'alice');
+  });
+});
+
+// ── POST /api/auth/avatar/upload ────────────────────────────────────────────
+describe('POST /api/auth/avatar/upload', () => {
+  function avatarForm(username) {
+    const form = new FormData();
+    form.append('avatar', new Blob([Buffer.from([0])], { type: 'image/png' }), 'a.png');
+    if (username !== undefined) form.append('username', username);
+    return form;
+  }
+
+  test('agent key + username writes that participant\'s avatar', async () => {
+    const res = await api('/api/auth/avatar/upload', {
+      method: 'POST', apiKey: 'test-hermes-key', body: avatarForm('bob'),
+    });
+    assert.equal(res.status, 200);
+    const { avatar_file } = await res.json();
+    assert.ok(avatar_file.startsWith('Bob'), `expected bob's avatar, got ${avatar_file}`);
+  });
+
+  test('family-member JWT + someone else\'s username does NOT reassign it', async () => {
+    // alice's own token, asking to set bob's avatar. If this ever passed
+    // through to bob, the response would report "Bob..." instead of "Alice...".
+    const res = await api('/api/auth/avatar/upload', {
+      method: 'POST', token, body: avatarForm('bob'),
+    });
+    assert.equal(res.status, 200);
+    const { avatar_file } = await res.json();
+    assert.ok(avatar_file.startsWith('Alice'), `username field must be ignored on the JWT path, got ${avatar_file}`);
+    assert.ok(!avatar_file.startsWith('Bob'), 'a JWT-authed request must never reassign another participant\'s avatar');
+  });
+
+  test('agent key + unknown username returns 400', async () => {
+    const res = await api('/api/auth/avatar/upload', {
+      method: 'POST', apiKey: 'test-hermes-key', body: avatarForm('nonexistent-user'),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test('a family member can still upload their own avatar, unaffected by the agent path', async () => {
+    const res = await api('/api/auth/avatar/upload', {
+      method: 'POST', token, body: avatarForm(),
+    });
+    assert.equal(res.status, 200);
+    const { avatar_file } = await res.json();
+    assert.ok(avatar_file.startsWith('Alice'));
   });
 });
 

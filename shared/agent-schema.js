@@ -62,6 +62,17 @@ function normalizeGender(gender) {
   return AGENT_GENDERS.includes(gender) ? gender : 'neutral';
 }
 
+// Couples planning together need two organizers; older configs only ever
+// wrote the single `organizer` string. Every consumer (the boot warning,
+// organizerOrAgentRequired, driver.mjs, /api/agent/brief) works off this one
+// normalized list instead of each branching on which key is present.
+function normalizeOrganizers(agent) {
+  if (!agent) return [];
+  if (Array.isArray(agent.organizers)) return agent.organizers.filter(Boolean);
+  if (agent.organizer) return [agent.organizer];
+  return [];
+}
+
 // The public view of the agent block: persona survives, organizer-only
 // standing instructions are removed entirely. Returns undefined for a missing
 // block so callers can leave the key off the payload rather than emit an
@@ -92,5 +103,6 @@ module.exports = {
   normalizeInstructionVisibility,
   normalizeTone,
   normalizeGender,
+  normalizeOrganizers,
   publicAgent,
 };

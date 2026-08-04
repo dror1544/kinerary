@@ -21,8 +21,9 @@ export async function startTestServer() {
       cwd: join(HERE, '..', '..', 'server'),
       env: {
         ...process.env,
-        TRIP_DIR:   FIXTURES_DIR,
-        DATA_DIR:   dataDir,
+        TRIP_DIR:     FIXTURES_DIR,
+        DATA_DIR:     dataDir,
+        AVATARS_DIR:  join(dataDir, 'avatars'),
         PORT:       String(TEST_PORT),
         JWT_SECRET: 'test-secret-000',
         IMMICH_URL: '',
@@ -67,16 +68,25 @@ export function stopTestServer() {
 /** Fetch against the test server. Pass `auth: true` to send the cached token. */
 let _token = null;
 export async function api(path, { method = 'GET', body, auth = false, token, apiKey } = {}) {
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = {};
   const t = token ?? (auth ? _token : null);
   if (t) headers['Authorization'] = `Bearer ${t}`;
   // Service-account path — how the companion agent authenticates, as distinct
   // from a family member's JWT. Matches HERMES_API_KEY in startTestServer().
   if (apiKey) headers['X-API-Key'] = apiKey;
+  // FormData sets its own multipart boundary via Content-Type — must not be
+  // overridden or fetch serializes it as a plain object instead.
+  let finalBody;
+  if (body instanceof FormData) {
+    finalBody = body;
+  } else if (body != null) {
+    headers['Content-Type'] = 'application/json';
+    finalBody = JSON.stringify(body);
+  }
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers,
-    body: body != null ? JSON.stringify(body) : undefined,
+    body: finalBody,
   });
   return res;
 }

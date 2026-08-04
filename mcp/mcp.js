@@ -175,6 +175,18 @@ mcp.tool('delete_photo',
   photoId: z.string().describe('Photo ID from get_photos'),
 }, async ({ photoId }) => ok(await apiDelete(`/api/photos/${photoId}`)));
 
+mcp.tool('set_participant_avatar',
+  'Set a participant\'s avatar photo — e.g. after they send the bot a selfie. ' +
+  'Unlike the site\'s own upload, this can target any participant, not just the caller. ' +
+  'filePath must be an absolute path on the machine running this MCP server.', {
+  username: z.string().describe('Participant username from get_config'),
+  filePath: z.string().describe('Absolute filesystem path to an image file on this machine'),
+}, async ({ username, filePath }) => {
+  const ext = require('path').extname(filePath).toLowerCase();
+  const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';
+  return ok(await apiPostFile('/api/auth/avatar/upload', filePath, 'avatar', contentType, { username }));
+});
+
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));
 

@@ -10,7 +10,7 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
-const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender } = require('../shared/agent-schema');
+const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 
 const app = express();
 app.use(express.json());
@@ -36,7 +36,11 @@ async function verifyGoogleToken(idToken) {
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
-const AVATARS_DIR = path.join(__dirname, 'avatars');
+// Not under DATA_DIR: nginx serves this directory as static content directly
+// (docker-compose mounts ./site/avatars to /app/avatars here), so it has to
+// live where the web server can reach it, not in the app's private data
+// volume. Overridable so tests don't write into the real checked-out dir.
+const AVATARS_DIR = process.env.AVATARS_DIR || path.join(__dirname, 'avatars');
 const USERS_FILE  = path.join(DATA_DIR, 'users.json');
 const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
 const PHOTOS_FILE  = path.join(DATA_DIR, 'photos.json');
@@ -109,8 +113,10 @@ const redact = (label, value, note) => ({
   // glance; five exceptions are not. The server log keeps every value.
   if (a.tone !== undefined && !AGENT_TONES.includes(a.tone)) issues.push(redact('unknown tone', a.tone, '(treated as warm)'));
   if (a.gender !== undefined && !AGENT_GENDERS.includes(a.gender)) issues.push(redact('unknown gender', a.gender, '(treated as neutral)'));
-  if (a.organizer && !(TRIP_CONFIG.participants || []).some(p => p.username === a.organizer)) {
-    issues.push(redact('agent.organizer', a.organizer, 'is not a known participant username'));
+  for (const org of normalizeOrganizers(a)) {
+    if (!(TRIP_CONFIG.participants || []).some(p => p.username === org)) {
+      issues.push(redact('agent.organizer(s)', org, 'is not a known participant username'));
+    }
   }
   for (const key of Object.keys(a.proactive || {})) {
     if (!PROACTIVE_KEYS.includes(key)) issues.push(redact('unknown proactive key', key, '(ignored)'));
@@ -500,12 +506,12 @@ function organizerOrAgentRequired(req, res, next) {
   let payload;
   try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
 
-  const organizer = TRIP_CONFIG.agent?.organizer;
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   // No configured organizer means nobody qualifies. Failing closed here matters
   // more than convenience: the alternative — treating "unset" as "everyone" —
   // would silently publish every organizer-only note the moment a trip is
   // scaffolded without an agent block.
-  if (!organizer || payload.username !== organizer) return res.status(403).json({ error: 'organizer_only' });
+  if (!organizers.length || !organizers.includes(payload.username)) return res.status(403).json({ error: 'organizer_only' });
   req.user = { username: payload.username };
   next();
 }
@@ -535,7 +541,7 @@ app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   }
   res.json({
     trip: TRIP_CONFIG.meta?.title || null,
-    organizer: agent?.organizer || null,
+    organizers: normalizeOrganizers(agent),
     persona: agent ? {
       name: agent.name, name_en: agent.name_en,
       gender: normalizeGender(agent.gender), tone: normalizeTone(agent.tone),
@@ -677,7 +683,18 @@ app.post('/api/auth/avatar/upload', authRequired,
     const fullPhotoFile = req.files?.fullPhoto?.[0];
     if (!avatarFile) return res.status(400).json({ error: 'no_file' });
 
-    const u   = req.user.username.toLowerCase();
+    // req.user.isAgent is only ever true on the X-API-Key path (see
+    // authRequired) — a family member's JWT never carries it, so this can't
+    // drift into a checkable-later permission flag. That's what makes the
+    // `username` override structurally impossible for a JWT caller, not just
+    // disallowed by convention.
+    let u;
+    if (req.user.isAgent && req.body.username) {
+      u = req.body.username.toLowerCase();
+      if (!getUser(u)) return res.status(400).json({ error: 'unknown_username' });
+    } else {
+      u = req.user.username.toLowerCase();
+    }
     const cap = u.charAt(0).toUpperCase() + u.slice(1);
 
     let allFiles = [];

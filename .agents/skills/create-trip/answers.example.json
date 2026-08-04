@@ -104,7 +104,7 @@
     "gender": "male",
     "tone": "warm",
     "default_language": "he",
-    "organizer": "marco",
+    "organizers": ["marco"],
     "timezone": "Europe/Rome",
     "proactive": {
       "morning_briefing": "07:30",

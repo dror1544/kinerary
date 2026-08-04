@@ -311,31 +311,42 @@ saying that plainly, because otherwise people try to describe the whole bot:
 - **`default_language`** — usually mirrors `meta.defaultLang`. Offer it as a
   confirmation, not an open question.
 
-### 9.2 Who is the organizer (`organizer`)
+### 9.2 Who is the organizer (`organizers`)
 
 **Default to the person you're interviewing.** Whoever is sitting here
 scaffolding a trip site for their family is the organizer until they say
 otherwise — that's true in essentially every run of this interview, and
 asking it as an open question invites a confused "…me?".
 
-So confirm, don't ask:
+So confirm, don't ask — and leave room for a co-organizer without making it
+sound like a rare option:
 
 > "I'll set you as the organizer — that's the private channel where the bot
-> tells you what it actually knows, and you're the only one it takes
-> itinerary corrections from. Sound right?"
+> tells you what it actually knows, and takes itinerary corrections from.
+> Is there anyone else, a partner planning this with you, who should be in
+> that same private channel?"
 
-Match them to their own `participants[]` entry and use that username. If they
-haven't put themselves in the participant list, that's the real thing to
-fix — an organizer who isn't on the trip is almost always an oversight, so
-ask before working around it.
+Match each name to its own `participants[]` entry and use that username.
+Default to just the interviewee if they don't name anyone else — don't press
+for a second name once they've answered. If someone they name hasn't put
+themselves in the participant list, that's the real thing to fix — an
+organizer who isn't on the trip is almost always an oversight, so ask before
+working around it.
 
 Say what the choice costs, because it isn't obvious: **everyone else gets
-group mode only.** Two co-organizers is a real want and not currently
-supported — if they ask, note it rather than fudging it.
+group mode only.** Every name listed here shares the same private channel
+and sees the same organizer-only material — there's no way to give one
+organizer more visibility than another.
 
-`driver.mjs` hard-fails on a username that isn't in `participants[]`, and it
-should — a typo here means nobody is the organizer and the bot quietly treats
-the whole family as a group audience.
+Write it as a list even for one person — `organizers: ["alice"]` — since
+that's the current field name. (The older `organizer: "alice"` string is
+still accepted on existing configs, normalized on read, but don't write new
+configs with it.)
+
+`driver.mjs` hard-fails on any name in the list that isn't in
+`participants[]`, and it should — a typo here means that person silently
+never qualifies as organizer, and the bot quietly treats them as a group
+audience for material they were supposed to see.
 
 ### 9.3 Proactive messages (`proactive`) — opt in, don't opt out
 
