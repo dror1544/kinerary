@@ -128,9 +128,14 @@ before `activate_trip` is called at all.
 - **Touch the database.** Accounts, photos, comments and trivia scores live in
   SQLite and are *not* per-trip. Switching trips does not switch data — worth
   saying out loud to anyone who expects activation to be a clean slate.
-- **Set participant avatars.** `/api/auth/avatar/upload` is scoped to the
-  logged-in user, so an agent uploading with an API key would file every image
-  under its own account. Avatars stay a per-person onboarding step.
+- **Set participant avatars.** `/api/auth/avatar/upload` now accepts an
+  agent-supplied `username` override (gated on `req.user.isAgent`, so only
+  the API-key path can use it — a participant's own JWT still can't set
+  anyone else's), and `mcp/mcp.js` exposes it as `set_participant_avatar`.
+  That's a deliberate split, not a limitation of the route: managing a
+  trip's own participant data is `mcp.js`'s job (see `mcp/README.md`'s
+  trust-level table), not this LAN-only provisioning server's — `provision.js`
+  stays scoped to trips themselves, never their day-to-day content.
 
 ## Coupling worth knowing about
 

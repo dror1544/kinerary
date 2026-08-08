@@ -29,3 +29,4 @@ scripts/hermes-pipeline/.last-answers.json
 provisioning/__pycache__/
 tests/provisioning/__pycache__/
 telegram_manager/__pycache__/
+.hermes-pr3-architecture-review.md

@@ -29,6 +29,7 @@ const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js'
 const { z }                  = require('zod');
 const express                = require('express');
 const fetch                  = require('node-fetch');
+const crypto                 = require('crypto');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -196,7 +197,9 @@ mcp.tool('set_participant_avatar',
 // happen upstream, in whatever's driving this MCP connection.
 mcp.tool('add_participant',
   'Add a new participant to the live trip — Telegram-bound (immediate login via the widget, gated on group membership) if telegramId is given, ' +
-  'otherwise password-only (returns a one-time enrollment link for the organizer to relay; never collect a password directly in chat).', {
+  'otherwise password-only (returns a one-time enrollment_token for the organizer to relay; never collect a password directly in chat). ' +
+  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL FRAGMENT (#), not a query string (?): the token must never appear ' +
+  'in a query string, since that would land it in server access logs and in Referer headers sent to third-party origins the page loads.', {
   username: z.string().describe('Site username — lowercase letters, numbers, underscore, hyphen only'),
   name: z.string().describe('Display name'),
   nameEn: z.string().optional().describe('English display name'),
@@ -208,7 +211,8 @@ mcp.tool('add_participant',
 
 mcp.tool('reset_participant_password',
   'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
-  'Returns a one-time enrollment link for the organizer to relay; never collect the new password directly in chat.', {
+  'Returns a one-time enrollment_token for the organizer to relay; never collect the new password directly in chat. ' +
+  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL fragment (#), not a query string (?).', {
   username: z.string().describe('Existing participant username'),
 }, async ({ username }) => ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, {})));
 
@@ -474,7 +478,11 @@ function requireKey(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   const key = req.headers['x-api-key'] || req.query.key || bearerKey;
-  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
+  // Constant-time compare — matches provision.js's requireKey. This server
+  // is the one meant to be public, so its key deserves the same treatment.
+  const a = Buffer.from(String(key || ''));
+  const b = Buffer.from(API_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 

@@ -2119,10 +2119,14 @@ async function submitLostFound() {
 }
 
 /* =========================================================
-   PARTICIPANT ENROLLMENT (one-time ?enroll=<token> link)
+   PARTICIPANT ENROLLMENT (one-time #enroll=<token> link)
+   Fragment, not a query param: never sent to the server (so it can't land
+   in an access log) and excluded from Referer headers by the URL spec
+   itself (so no cross-origin leak to the third-party origins this page
+   loads) — stronger than a query string plus a referrer-policy meta tag.
    ========================================================= */
 function enrollmentTokenFromUrl() {
-  return new URLSearchParams(window.location.search).get('enroll');
+  return new URLSearchParams(window.location.hash.replace(/^#/, '')).get('enroll');
 }
 function showEnrollmentForm() {
   document.getElementById('login-overlay').style.display = 'none';
