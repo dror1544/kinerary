@@ -1,0 +1,123 @@
+"""Validated, secret-free provisioning topology models."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+import re
+from typing import Any, Mapping
+
+
+class ProvisioningError(ValueError):
+    """Raised when a topology is unsafe or incomplete."""
+
+
+@dataclass(frozen=True)
+class LxcSpec:
+    name: str
+    node: str
+    template: str
+    storage: str
+    cores: int
+    memory_mb: int
+    disk_gb: int
+    bridge: str
+    ipv4: str
+
+
+@dataclass(frozen=True)
+class ProxySpec:
+    hostname: str
+    forward_host: str
+    forward_port: int
+
+
+@dataclass(frozen=True)
+class CloudflareSpec:
+    tunnel_name: str
+    hostname: str
+    service: str
+
+
+@dataclass(frozen=True)
+class Topology:
+    version: int
+    name: str
+    lxc: LxcSpec
+    proxy: ProxySpec
+    cloudflare: CloudflareSpec
+
+
+_ENV_REFERENCE = re.compile(r"^\$\{([A-Z][A-Z0-9_]*)\}$")
+
+
+def _value(data: Mapping[str, Any], key: str, context: str) -> Any:
+    if key not in data or data[key] in (None, ""):
+        raise ProvisioningError(f"{context}.{key} is required")
+    value = data[key]
+    if isinstance(value, str):
+        match = _ENV_REFERENCE.fullmatch(value)
+        if match:
+            env_value = os.environ.get(match.group(1))
+            if not env_value:
+                raise ProvisioningError(f"environment variable {match.group(1)} for {context}.{key} is required")
+            return env_value
+    return value
+
+
+def _mapping(data: Mapping[str, Any], key: str, context: str) -> Mapping[str, Any]:
+    value = _value(data, key, context)
+    if not isinstance(value, Mapping):
+        raise ProvisioningError(f"{context}.{key} must be a mapping")
+    return value
+
+
+def _positive_int(data: Mapping[str, Any], key: str, context: str) -> int:
+    value = _value(data, key, context)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ProvisioningError(f"{context}.{key} must be a positive integer")
+    return value
+
+
+def _nonempty_string(data: Mapping[str, Any], key: str, context: str) -> str:
+    value = _value(data, key, context)
+    if not isinstance(value, str) or not value.strip():
+        raise ProvisioningError(f"{context}.{key} must be a non-empty string")
+    return value
+
+
+def load_topology(raw: Mapping[str, Any]) -> Topology:
+    """Convert parsed YAML into a validated topology without accepting secrets."""
+    if not isinstance(raw, Mapping):
+        raise ProvisioningError("topology must be a mapping")
+    if raw.get("version") != 1:
+        raise ProvisioningError("version must be 1")
+    name = _nonempty_string(raw, "name", "topology")
+    proxmox = _mapping(raw, "proxmox", "topology")
+    lxc = _mapping(proxmox, "lxc", "proxmox")
+    proxy = _mapping(raw, "npm", "topology")
+    cloudflare = _mapping(raw, "cloudflare", "topology")
+    return Topology(
+        version=1,
+        name=name,
+        lxc=LxcSpec(
+            name=_nonempty_string(lxc, "name", "proxmox.lxc"),
+            node=_nonempty_string(proxmox, "node", "proxmox"),
+            template=_nonempty_string(lxc, "template", "proxmox.lxc"),
+            storage=_nonempty_string(lxc, "storage", "proxmox.lxc"),
+            cores=_positive_int(lxc, "cores", "proxmox.lxc"),
+            memory_mb=_positive_int(lxc, "memory_mb", "proxmox.lxc"),
+            disk_gb=_positive_int(lxc, "disk_gb", "proxmox.lxc"),
+            bridge=_nonempty_string(lxc, "bridge", "proxmox.lxc"),
+            ipv4=_nonempty_string(lxc, "ipv4", "proxmox.lxc"),
+        ),
+        proxy=ProxySpec(
+            hostname=_nonempty_string(proxy, "hostname", "npm"),
+            forward_host=_nonempty_string(proxy, "forward_host", "npm"),
+            forward_port=_positive_int(proxy, "forward_port", "npm"),
+        ),
+        cloudflare=CloudflareSpec(
+            tunnel_name=_nonempty_string(cloudflare, "tunnel_name", "cloudflare"),
+            hostname=_nonempty_string(cloudflare, "hostname", "cloudflare"),
+            service=_nonempty_string(cloudflare, "service", "cloudflare"),
+        ),
+    )

@@ -18,12 +18,12 @@ after(() => stopTestServer());
 // ── /api/config ───────────────────────────────────────────────────────────────
 describe('GET /api/config', () => {
   test('returns 200', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     assert.equal(res.status, 200);
   });
 
   test('response is valid JSON with required keys', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     for (const key of ['meta', 'participants', 'phases', 'tasks']) {
       assert.ok(key in data, `missing key: ${key}`);
@@ -31,13 +31,13 @@ describe('GET /api/config', () => {
   });
 
   test('has correct participant count from fixture (3)', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     assert.equal(data.participants.length, 3);
   });
 
   test('strips pin from accommodation objects', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     for (const phase of data.phases) {
       assert.ok(!('pin' in (phase.accommodation ?? {})),
@@ -46,7 +46,7 @@ describe('GET /api/config', () => {
   });
 
   test('strips pin from bookings.hotels entries', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     for (const hotel of (data.bookings?.hotels ?? [])) {
       assert.ok(!('pin' in hotel), `hotel "${hotel.name}" still has pin field`);
@@ -54,7 +54,7 @@ describe('GET /api/config', () => {
   });
 
   test('strips pin from participants', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     for (const p of data.participants) {
       assert.ok(!('pin' in p), `participant ${p.username} still has pin field`);
@@ -62,13 +62,13 @@ describe('GET /api/config', () => {
   });
 
   test('stats array is present', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { stats } = await res.json();
     assert.ok(Array.isArray(stats) && stats.length === 2, 'expected 2 stats from fixture');
   });
 
   test('organizer-only needs (default for allergy/medical) are stripped from the public read path', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const bob = data.participants.find(p => p.username === 'bob');
     // bob's fixture has 2 needs: a critical allergy (no explicit visibility,
@@ -80,7 +80,7 @@ describe('GET /api/config', () => {
   });
 
   test('unrecognized severity is normalized to critical, fail-safe not fail-quiet', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
     // "crticial" on an otherwise-fine dietary need — dietary defaults to
@@ -92,7 +92,7 @@ describe('GET /api/config', () => {
   });
 
   test('explicit visibility:"group" overrides the organizer default for medical/allergy', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
     const medical = eve.needs.find(n => n.type === 'medical');
@@ -101,7 +101,7 @@ describe('GET /api/config', () => {
   });
 
   test('an unrecognized need TYPE fails safe to organizer-only, not published to the group', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
     // The regression this guards: defaultVisibility() used to check
@@ -114,7 +114,7 @@ describe('GET /api/config', () => {
   });
 
   test('unrecognized visibility value fails safe to organizer-only (hidden), not visible', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
     assert.ok(!eve.needs.some(n => n.type === 'dietary' && n.visibility === 'porcupine'),
@@ -122,7 +122,7 @@ describe('GET /api/config', () => {
   });
 
   test('a participant whose needs are ALL organizer-only has the key dropped, not left as []', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const eve = data.participants.find(p => p.username === 'eve');
     // eve keeps one group-visible medical need, so she still has the key —
@@ -138,7 +138,7 @@ describe('GET /api/config', () => {
   });
 
   test('alice has no needs field, matching the fixture', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const data = await res.json();
     const alice = data.participants.find(p => p.username === 'alice');
     assert.ok(!('needs' in alice), 'alice should have no needs field, matching the fixture');
@@ -148,7 +148,7 @@ describe('GET /api/config', () => {
 // ── agent block ───────────────────────────────────────────────────────────────
 describe('GET /api/config — agent persona', () => {
   test('public persona fields are served', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { agent } = await res.json();
     assert.ok(agent, 'expected the agent block to be served');
     assert.equal(agent.name, 'ויקטור');
@@ -157,13 +157,13 @@ describe('GET /api/config — agent persona', () => {
   });
 
   test('unrecognized tone falls back to warm rather than passing through', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { agent } = await res.json();
     assert.equal(agent.tone, 'warm', 'fixture tone is "porcupine" and should normalize, not leak a junk value to the bot');
   });
 
   test('organizer-only standing instructions are stripped from the public read path', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { agent } = await res.json();
     const texts = (agent.standing_instructions || []).map(i => i.text?.en);
     assert.equal(texts.length, 1, `expected only the group-visible instruction, got ${JSON.stringify(texts)}`);
@@ -171,14 +171,14 @@ describe('GET /api/config — agent persona', () => {
   });
 
   test('an instruction with NO visibility defaults to organizer-only (unlike needs)', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const body = await res.text();
     assert.ok(!body.includes('defaults to organizer'),
       'an instruction with no explicit visibility must default to hidden — every standing instruction is sensitive by default');
   });
 
   test('a typo\'d visibility fails safe to organizer-only', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const body = await res.text();
     assert.ok(!body.includes('Typo\'d visibility'),
       'a garbage visibility value must resolve restrictive, not fall through as visible');
@@ -188,7 +188,7 @@ describe('GET /api/config — agent persona', () => {
     // Belt-and-braces against the whole serialized response, not just the
     // agent block — catches a future refactor that copies the raw config
     // somewhere else in the payload (a versions snapshot, a debug echo).
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const body = await res.text();
     for (const secret of ['Sensitive topic to avoid', 'נושא רגיש']) {
       assert.ok(!body.includes(secret), `organizer-only instruction text "${secret}" leaked into /api/config`);
@@ -561,24 +561,68 @@ describe('Google Sign-In (not configured in test env)', () => {
   });
 });
 
+// ── GET /api/health ────────────────────────────────────────────────────────────
+describe('GET /api/health', () => {
+  test('reports telegramBotUsername: null when Telegram is not configured', async () => {
+    const res = await api('/api/health');
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.equal(data.telegramBotUsername, null);
+  });
+});
+
+// ── GET /api/config/roster ──────────────────────────────────────────────────────
+// Deliberately public — the pre-auth login picker needs a "who's on this
+// trip" list before any session exists, but it must carry only the four
+// fields the picker actually renders, never anything from the full,
+// authenticated /api/config (itinerary, budget, needs, PII).
+describe('GET /api/config/roster', () => {
+  test('is reachable without a token', async () => {
+    const res = await api('/api/config/roster');
+    assert.equal(res.status, 200);
+  });
+
+  test('includes every participant with only username/name/name_en/color', async () => {
+    const res = await api('/api/config/roster');
+    const { participants } = await res.json();
+    const usernames = participants.map(p => p.username);
+    assert.ok(usernames.includes('alice'));
+    assert.ok(usernames.includes('bob'));
+    assert.ok(usernames.includes('eve'));
+    for (const p of participants) {
+      assert.deepEqual(Object.keys(p).sort(), ['color', 'name', 'name_en', 'username']);
+    }
+  });
+
+  test('never exposes age, family, needs, pin, or telegram_id', async () => {
+    const res = await api('/api/config/roster');
+    const { participants } = await res.json();
+    const serialized = JSON.stringify(participants);
+    for (const forbidden of ['age', 'family', 'needs', 'pin', 'telegram_id']) {
+      assert.ok(!serialized.includes(forbidden), `roster leaked a "${forbidden}" field`);
+    }
+  });
+});
+
 // ── Config-driven generalization: phases derive from config ───────────────────
 describe('config-driven phase structure', () => {
   test('phase count matches fixture config', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { phases } = await res.json();
     // fixture has 2 phases: ny + colorado
     assert.equal(phases.length, 2);
   });
 
   test('colorado phase has short_id "co" in config', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { phases } = await res.json();
     const co = phases.find(p => p.id === 'colorado');
     assert.equal(co?.short_id, 'co');
   });
 
   test('no participant pin fields exposed via /api/config', async () => {
-    const res = await api('/api/config');
+    const res = await api('/api/config', { token });
     const { participants } = await res.json();
     for (const p of participants) {
       assert.ok(!p.pin, `participant ${p.username} has a pin exposed`);

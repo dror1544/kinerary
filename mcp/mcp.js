@@ -187,6 +187,47 @@ mcp.tool('set_participant_avatar',
   return ok(await apiPostFile('/api/auth/avatar/upload', filePath, 'avatar', contentType, { username }));
 });
 
+// ── Participant management ──────────────────────────────────────────────────
+// These write identity/login data, not trip content — a meaningfully
+// different blast radius than photos/bookings/comments. The underlying
+// routes verify an organizer JWT OR this server's own key; when called
+// through this MCP server they always authenticate as the latter, so the
+// site cannot itself confirm which human asked. That verification has to
+// happen upstream, in whatever's driving this MCP connection.
+mcp.tool('add_participant',
+  'Add a new participant to the live trip — Telegram-bound (immediate login via the widget, gated on group membership) if telegramId is given, ' +
+  'otherwise password-only (returns a one-time enrollment link for the organizer to relay; never collect a password directly in chat).', {
+  username: z.string().describe('Site username — lowercase letters, numbers, underscore, hyphen only'),
+  name: z.string().describe('Display name'),
+  nameEn: z.string().optional().describe('English display name'),
+  color: z.string().optional().describe('Hex color for their avatar/picker chip'),
+  family: z.string().optional().describe('Family group key from get_config'),
+  telegramId: z.string().optional().describe('Numeric Telegram user ID — omit for the password-only path'),
+}, async ({ username, name, nameEn, color, family, telegramId }) =>
+  ok(await apiPost('/api/agent/participants', { username, name, name_en: nameEn, color, family, telegram_id: telegramId })));
+
+mcp.tool('reset_participant_password',
+  'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
+  'Returns a one-time enrollment link for the organizer to relay; never collect the new password directly in chat.', {
+  username: z.string().describe('Existing participant username'),
+}, async ({ username }) => ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, {})));
+
+mcp.tool('bind_participant_telegram',
+  'Bind a Telegram numeric ID to an EXISTING participant, enabling Telegram login for them — e.g. "bind @dror to dror". ' +
+  'Does not create a participant or touch their password; use add_participant for a brand-new person.', {
+  username: z.string().describe('Existing site username to bind'),
+  telegramId: z.string().describe('Numeric Telegram user ID'),
+}, async ({ username, telegramId }) =>
+  ok(await apiPatch(`/api/agent/participants/${encodeURIComponent(username)}/telegram`, { telegram_id: telegramId })));
+
+mcp.tool('remove_participant',
+  'Remove a participant from the trip — e.g. "remove dror from the website". Drops them from the roster and revokes future logins ' +
+  '(clears their Telegram link, replaces their password with an unusable one). Does not delete their photos/bookings/comments history, ' +
+  'and does not invalidate a session token they already have (valid up to 30 days) — there is no session-revocation mechanism yet. ' +
+  'Refuses to remove a currently-configured trip organizer.', {
+  username: z.string().describe('Existing participant username to remove'),
+}, async ({ username }) => ok(await apiDelete(`/api/agent/participants/${encodeURIComponent(username)}`)));
+
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));
 
@@ -413,9 +454,16 @@ JSON fields (omit any field you cannot determine):
 Return ONLY the JSON object, no commentary.`;
 }
 
-// Auth middleware — check X-API-Key header or ?key= query param
+// Auth middleware — X-API-Key header, ?key= query param, or Authorization:
+// Bearer. The Bearer form exists specifically because `hermes mcp add`'s
+// standard connectivity flow always sends the key that way — without this,
+// no Hermes profile can use this server through its normal setup path at
+// all, not just a scripted one (confirmed against hermes_cli/mcp_config.py's
+// _bearer_auth_headers()).
 function requireKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.key;
+  const authHeader = req.headers['authorization'] || '';
+  const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const key = req.headers['x-api-key'] || req.query.key || bearerKey;
   if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
   next();
 }

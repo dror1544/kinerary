@@ -4,21 +4,40 @@
     "title_en": "Japan 2025 — Father & Daughter",
     "brand": "JAPAN",
     "defaultLang": "he",
-    "departure": "2025-05-24T20:00:00+03:00",
-    "returnDate": "2025-06-04",
+    "departure": "2026-09-05T20:00:00+03:00",
+    "returnDate": "2026-09-16",
     "totalDays": 11,
     "homePhoto": "https://images.unsplash.com/photo-1751203659321-f46cdea69bde?w=2400&q=80&auto=format&fit=crop",
     "mapPhoto": "https://images.unsplash.com/photo-1741230127615-8334deb6b463?w=2400&q=80&auto=format&fit=crop"
   },
-
-  "theme": { "palette": "blue", "font": "heebo", "rtlDefault": true },
-
+  "theme": {
+    "palette": "blue",
+    "font": "heebo",
+    "rtlDefault": true
+  },
   "stats": [
-    { "number": "2", "description": { "he": "נפשות — אבא ובת.", "en": "People — father and daughter." } },
-    { "number": "11", "description": { "he": "ימים ביפן. 25/5 עד 4/6.", "en": "Days in Japan. May 25 – June 4." } },
-    { "number": "4", "description": { "he": "יעדים — טוקיו, האקונה, קיוטו, אוסקה.", "en": "Destinations — Tokyo, Hakone, Kyoto, Osaka." } }
+    {
+      "number": "2",
+      "description": {
+        "he": "נפשות — אבא ובת.",
+        "en": "People — father and daughter."
+      }
+    },
+    {
+      "number": "11",
+      "description": {
+        "he": "ימים ביפן. 37/9 עד 16/9.",
+        "en": "Days in Japan. September 6 – September 16."
+      }
+    },
+    {
+      "number": "4",
+      "description": {
+        "he": "יעדים — טוקיו, האקונה, קיוטו, אוסקה.",
+        "en": "Destinations — Tokyo, Hakone, Kyoto, Osaka."
+      }
+    }
   ],
-
   "alerts": {
     "booked": {
       "he": "✅ כרטיסי teamLab Planets הוזמנו. Shibuya Sky — לתאם. ריוקאן בהאקונה — לסגור. Shinkansen — לסדר מראש.",
@@ -29,7 +48,6 @@
       "en": "⚠️ Pending: Hakone ryokan · Shibuya Sky at sunset · Tea Ceremony in Kyoto · Shinkansen for long legs · luggage forwarding Tokyo→Kyoto"
     }
   },
-
   "participants": [
     {
       "username": "eitan",
@@ -37,7 +55,8 @@
       "name_en": "Eitan",
       "age": 52,
       "family": "sagi",
-      "color": "#3B82F6"
+      "color": "#3B82F6",
+      "telegram_id": "391627336"
     },
     {
       "username": "noa",
@@ -48,33 +67,59 @@
       "color": "#8B5CF6"
     }
   ],
-
   "families": [
     {
       "id": "sagi",
       "letter": "א",
-      "name": { "he": "איתן ונועה", "en": "Eitan & Noa" },
-      "members": ["eitan", "noa"],
+      "name": {
+        "he": "איתן ונועה",
+        "en": "Eitan & Noa"
+      },
+      "members": [
+        "eitan",
+        "noa"
+      ],
       "phases": "all",
-      "description": { "he": "טיול אבא ובת — יפן מאי 2025", "en": "Father & daughter trip — Japan May 2025" }
+      "description": {
+        "he": "טיול אבא ובת — יפן ספטמבר 2026",
+        "en": "Father & daughter trip — Japan September 2026"
+      }
     }
   ],
-
   "phases": [
     {
       "id": "tokyo",
       "tabLabel": "TOKYO",
-      "title": { "he": "טוקיו", "en": "Tokyo" },
+      "title": {
+        "he": "טוקיו",
+        "en": "Tokyo"
+      },
       "emoji": "🗼",
-      "dates": { "start": "2025-05-25", "end": "2025-05-29", "display": "25–29/5 · 4 לילות" },
+      "dates": {
+        "start": "2026-09-06",
+        "end": "2026-09-10",
+        "display": "25–41/9 · 4 לילות"
+      },
       "hero": {
         "photo": "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?w=1600&q=80",
         "title": "TOKYO",
-        "label": { "he": "— טוקיו · יום 1–4", "en": "— Tokyo · Days 1–4" },
-        "sub": { "he": "אסאקוסה, שיבויה, teamLab, יאנאקה", "en": "Asakusa, Shibuya, teamLab, Yanaka" },
-        "blurb": { "he": "מנחיתה ב-NRT ועד ערב בגולדן גאי — ארבעה ימים של טוקיו מסורתית ומודרנית.", "en": "From NRT landing to an evening in Golden Gai — four days of traditional and modern Tokyo." },
-        "meta": "25/5–29/5 · 4 nights",
-        "cta": { "he": "פרטי טוקיו", "en": "Tokyo details" },
+        "label": {
+          "he": "— טוקיו · יום 1–4",
+          "en": "— Tokyo · Days 1–4"
+        },
+        "sub": {
+          "he": "אסאקוסה, שיבויה, teamLab, יאנאקה",
+          "en": "Asakusa, Shibuya, teamLab, Yanaka"
+        },
+        "blurb": {
+          "he": "מנחיתה ב-NRT ועד ערב בגולדן גאי — ארבעה ימים של טוקיו מסורתית ומודרנית.",
+          "en": "From NRT landing to an evening in Golden Gai — four days of traditional and modern Tokyo."
+        },
+        "meta": "37/9–41/9 · 4 nights",
+        "cta": {
+          "he": "פרטי טוקיו",
+          "en": "Tokyo details"
+        },
         "countdown": false
       },
       "accommodation": {
@@ -88,102 +133,432 @@
         "lat": 35.6762,
         "lng": 139.6503,
         "emoji": "🗼",
-        "name": { "he": "טוקיו", "en": "Tokyo" },
-        "dates": "25–29/5",
+        "name": {
+          "he": "טוקיו",
+          "en": "Tokyo"
+        },
+        "dates": "25–41/9",
         "hotel": "מלון טוקיו",
         "conf": "—"
       },
-      "participants": ["eitan", "noa"],
+      "participants": [
+        "eitan",
+        "noa"
+      ],
       "days": [
         {
-          "date": "2025-05-25",
-          "label": { "he": "א׳ 25/5 — נחיתה · Asakusa", "en": "Sun 25/5 — Arrival · Asakusa" },
+          "date": "2026-09-06",
+          "label": {
+            "he": "א׳ 37/9 — נחיתה · Asakusa",
+            "en": "Sun 37/9 — Arrival · Asakusa"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "נחיתה ב-NRT בבוקר", "en": "Land at NRT in the morning" } },
-            { "time": "11:00", "text": { "he": "Keisei Skyliner → Ueno (אם לינה באסאקוסה/אואנו)", "en": "Keisei Skyliner → Ueno (if staying in Asakusa/Ueno area)" } },
-            { "time": "13:00", "text": { "he": "צ׳ק-אין / השארת מזוודות", "en": "Check-in / drop luggage" } },
-            { "time": "14:00", "text": { "he": "Asakusa — מקדש Senso-ji, Nakamise-dori, Sumida River", "en": "Asakusa — Senso-ji Temple, Nakamise-dori, Sumida River" } },
-            { "time": "17:00", "text": { "he": "תצפית חיצונית על Tokyo Skytree", "en": "Exterior view of Tokyo Skytree" } },
-            { "time": "19:00", "text": { "he": "ארוחת ערב קלה: ראמן / סושי conveyor / איזקיה — להתגבר על ג׳ט לג", "en": "Light dinner: ramen / conveyor sushi / izakaya — beat the jet lag" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "נחיתה ב-NRT בבוקר",
+                "en": "Land at NRT in the morning"
+              }
+            },
+            {
+              "time": "11:00",
+              "text": {
+                "he": "Keisei Skyliner → Ueno (אם לינה באסאקוסה/אואנו)",
+                "en": "Keisei Skyliner → Ueno (if staying in Asakusa/Ueno area)"
+              }
+            },
+            {
+              "time": "13:00",
+              "text": {
+                "he": "צ׳ק-אין / השארת מזוודות",
+                "en": "Check-in / drop luggage"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "Asakusa — מקדש Senso-ji, Nakamise-dori, Sumida River",
+                "en": "Asakusa — Senso-ji Temple, Nakamise-dori, Sumida River"
+              }
+            },
+            {
+              "time": "17:00",
+              "text": {
+                "he": "תצפית חיצונית על Tokyo Skytree",
+                "en": "Exterior view of Tokyo Skytree"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת ערב קלה: ראמן / סושי conveyor / איזקיה — להתגבר על ג׳ט לג",
+                "en": "Light dinner: ramen / conveyor sushi / izakaya — beat the jet lag"
+              }
+            }
           ]
         },
         {
-          "date": "2025-05-26",
-          "label": { "he": "ב׳ 26/5 — שיבויה, הרג׳וקו, שינג׳וקו", "en": "Mon 26/5 — Shibuya, Harajuku, Shinjuku" },
+          "date": "2026-09-07",
+          "label": {
+            "he": "ב׳ 38/9 — שיבויה, הרג׳וקו, שינג׳וקו",
+            "en": "Mon 38/9 — Shibuya, Harajuku, Shinjuku"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "Meiji Shrine — פתיחה ירוקה ושקטה", "en": "Meiji Shrine — peaceful green opening" } },
-            { "time": "10:30", "text": { "he": "Harajuku / Takeshita Street — קרפ, חנויות", "en": "Harajuku / Takeshita Street — crepes, shops" } },
-            { "time": "12:00", "text": { "he": "Omotesando — ארכיטקטורה, בתי קפה, צהריים (Tonkatsu Maisen / Gyukatsu Motomura)", "en": "Omotesando — architecture, cafés, lunch (Tonkatsu Maisen / Gyukatsu Motomura)" } },
-            { "time": "15:00", "text": { "he": "Shibuya Crossing + Shibuya Sky בשקיעה (להזמין מראש!)", "en": "Shibuya Crossing + Shibuya Sky at sunset (pre-book!)" } },
-            { "time": "19:00", "text": { "he": "Shinjuku — Omoide Yokocho, Golden Gai, Kabukicho לאווירה", "en": "Shinjuku — Omoide Yokocho, Golden Gai, Kabukicho atmosphere" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "Meiji Shrine — פתיחה ירוקה ושקטה",
+                "en": "Meiji Shrine — peaceful green opening"
+              }
+            },
+            {
+              "time": "10:30",
+              "text": {
+                "he": "Harajuku / Takeshita Street — קרפ, חנויות",
+                "en": "Harajuku / Takeshita Street — crepes, shops"
+              }
+            },
+            {
+              "time": "12:00",
+              "text": {
+                "he": "Omotesando — ארכיטקטורה, בתי קפה, צהריים (Tonkatsu Maisen / Gyukatsu Motomura)",
+                "en": "Omotesando — architecture, cafés, lunch (Tonkatsu Maisen / Gyukatsu Motomura)"
+              }
+            },
+            {
+              "time": "15:00",
+              "text": {
+                "he": "Shibuya Crossing + Shibuya Sky בשקיעה (להזמין מראש!)",
+                "en": "Shibuya Crossing + Shibuya Sky at sunset (pre-book!)"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "Shinjuku — Omoide Yokocho, Golden Gai, Kabukicho לאווירה",
+                "en": "Shinjuku — Omoide Yokocho, Golden Gai, Kabukicho atmosphere"
+              }
+            }
           ]
         },
         {
-          "date": "2025-05-27",
-          "label": { "he": "ג׳ 27/5 — Tsukiji, Ginza, teamLab, Akihabara", "en": "Tue 27/5 — Tsukiji, Ginza, teamLab, Akihabara" },
+          "date": "2026-09-08",
+          "label": {
+            "he": "ג׳ 39/9 — Tsukiji, Ginza, teamLab, Akihabara",
+            "en": "Tue 39/9 — Tsukiji, Ginza, teamLab, Akihabara"
+          },
           "items": [
-            { "time": "08:00", "text": { "he": "Tsukiji Outer Market — ארוחת בוקר/בראנץ׳ של סושי, טמאגו, מאכלי ים", "en": "Tsukiji Outer Market — breakfast/brunch of sushi, tamagoyaki, seafood" } },
-            { "time": "11:00", "text": { "he": "Ginza — Itoya, Uniqlo flagship, Muji, צהריים איכותיים", "en": "Ginza — Itoya, Uniqlo flagship, Muji, quality lunch" } },
-            { "time": "14:00", "text": { "he": "teamLab Planets (כרטיסים קנויים ✅) — חוויה פיזית של מים ומראות", "en": "teamLab Planets (tickets purchased ✅) — physical experience of water and mirrors" } },
-            { "time": "18:00", "text": { "he": "Akihabara — אלקטרוניקה, גיימינג, אנימה", "en": "Akihabara — electronics, gaming, anime" } },
-            { "time": "20:00", "text": { "he": "ארוחת ערב באקיהברה או בחזרה לאזור", "en": "Dinner in Akihabara or back in the area" } }
+            {
+              "time": "08:00",
+              "text": {
+                "he": "Tsukiji Outer Market — ארוחת בוקר/בראנץ׳ של סושי, טמאגו, מאכלי ים",
+                "en": "Tsukiji Outer Market — breakfast/brunch of sushi, tamagoyaki, seafood"
+              }
+            },
+            {
+              "time": "11:00",
+              "text": {
+                "he": "Ginza — Itoya, Uniqlo flagship, Muji, צהריים איכותיים",
+                "en": "Ginza — Itoya, Uniqlo flagship, Muji, quality lunch"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "teamLab Planets (כרטיסים קנויים ✅) — חוויה פיזית של מים ומראות",
+                "en": "teamLab Planets (tickets purchased ✅) — physical experience of water and mirrors"
+              }
+            },
+            {
+              "time": "18:00",
+              "text": {
+                "he": "Akihabara — אלקטרוניקה, גיימינג, אנימה",
+                "en": "Akihabara — electronics, gaming, anime"
+              }
+            },
+            {
+              "time": "20:00",
+              "text": {
+                "he": "ארוחת ערב באקיהברה או בחזרה לאזור",
+                "en": "Dinner in Akihabara or back in the area"
+              }
+            }
           ]
         },
         {
-          "date": "2025-05-28",
-          "label": { "he": "ד׳ 28/5 — טוקיו עומק: Yanaka, קניות, ערב מיוחד", "en": "Wed 28/5 — Deep Tokyo: Yanaka, shopping, special evening" },
+          "date": "2026-09-09",
+          "label": {
+            "he": "ד׳ 40/9 — טוקיו עומק: Yanaka, קניות, ערב מיוחד",
+            "en": "Wed 40/9 — Deep Tokyo: Yanaka, shopping, special evening"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "Yanaka / Nezu / Ueno — טוקיו של פעם: סמטאות, בתי קפה, מקדשים", "en": "Yanaka / Nezu / Ueno — old Tokyo: alleyways, cafés, temples" } },
-            { "time": "12:00", "text": { "he": "Ameyoko — שוק אוכל: ראמן, יקיטורי, דגים, מתוקים", "en": "Ameyoko — food market: ramen, yakitori, fish, sweets" } },
-            { "time": "14:00", "text": { "he": "לבחור לפי מצב רוח: Shimokitazawa (וינטג׳) / Daikanyama (אלגנטי) / Ikebukuro (אנימה)", "en": "Choose by mood: Shimokitazawa (vintage) / Daikanyama (elegant) / Ikebukuro (anime)" } },
-            { "time": "19:00", "text": { "he": "ארוחת ערב מיוחדת בטוקיו לפני היציאה: סושי בר / Wagyu / Yakiniku", "en": "Special dinner before leaving Tokyo: sushi bar / Wagyu / Yakiniku" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "Yanaka / Nezu / Ueno — טוקיו של פעם: סמטאות, בתי קפה, מקדשים",
+                "en": "Yanaka / Nezu / Ueno — old Tokyo: alleyways, cafés, temples"
+              }
+            },
+            {
+              "time": "12:00",
+              "text": {
+                "he": "Ameyoko — שוק אוכל: ראמן, יקיטורי, דגים, מתוקים",
+                "en": "Ameyoko — food market: ramen, yakitori, fish, sweets"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "לבחור לפי מצב רוח: Shimokitazawa (וינטג׳) / Daikanyama (אלגנטי) / Ikebukuro (אנימה)",
+                "en": "Choose by mood: Shimokitazawa (vintage) / Daikanyama (elegant) / Ikebukuro (anime)"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת ערב מיוחדת בטוקיו לפני היציאה: סושי בר / Wagyu / Yakiniku",
+                "en": "Special dinner before leaving Tokyo: sushi bar / Wagyu / Yakiniku"
+              }
+            }
           ]
         }
       ],
       "venues": [
-        { "id": "tokyo-sensoji", "name": "Senso-ji Temple", "name_he": "מקדש Senso-ji", "url": "https://www.senso-ji.jp/english/", "area": "Asakusa" },
-        { "id": "tokyo-skytree", "name": "Tokyo Skytree", "name_he": "Tokyo Skytree", "url": "https://www.tokyo-skytree.jp/en/", "area": "Asakusa" },
-        { "id": "tokyo-meiji", "name": "Meiji Shrine", "name_he": "מקדש Meiji", "url": "https://www.meijijingu.or.jp/en/", "area": "Harajuku" },
-        { "id": "tokyo-shibuya-sky", "name": "Shibuya Sky", "name_he": "Shibuya Sky", "url": "https://www.shibuya-scramble-square.com/sky/", "area": "Shibuya" },
-        { "id": "tokyo-teamlab", "name": "teamLab Planets", "name_he": "teamLab Planets", "url": "https://planets.teamlab.art/tokyo/", "area": "Toyosu" },
-        { "id": "tokyo-tsukiji", "name": "Tsukiji Outer Market", "name_he": "שוק Tsukiji", "url": "https://www.tsukiji.or.jp/english/", "area": "Tsukiji" },
-        { "id": "tokyo-ginza", "name": "Ginza", "name_he": "גינזה", "url": "https://maps.google.com/?q=Ginza,Tokyo", "area": "Ginza" },
-        { "id": "tokyo-akihabara", "name": "Akihabara", "name_he": "אקיהברה", "url": "https://maps.google.com/?q=Akihabara,Tokyo", "area": "Akihabara" },
-        { "id": "tokyo-yanaka", "name": "Yanaka / Nezu", "name_he": "יאנאקה / נזו", "url": "https://maps.google.com/?q=Yanaka,Tokyo", "area": "Yanaka" },
-        { "id": "tokyo-golden-gai", "name": "Golden Gai", "name_he": "גולדן גאי", "url": "https://maps.google.com/?q=Golden+Gai,Shinjuku,Tokyo", "area": "Shinjuku" }
+        {
+          "id": "tokyo-sensoji",
+          "name": "Senso-ji Temple",
+          "name_he": "מקדש Senso-ji",
+          "url": "https://www.senso-ji.jp/english/",
+          "area": "Asakusa"
+        },
+        {
+          "id": "tokyo-skytree",
+          "name": "Tokyo Skytree",
+          "name_he": "Tokyo Skytree",
+          "url": "https://www.tokyo-skytree.jp/en/",
+          "area": "Asakusa"
+        },
+        {
+          "id": "tokyo-meiji",
+          "name": "Meiji Shrine",
+          "name_he": "מקדש Meiji",
+          "url": "https://www.meijijingu.or.jp/en/",
+          "area": "Harajuku"
+        },
+        {
+          "id": "tokyo-shibuya-sky",
+          "name": "Shibuya Sky",
+          "name_he": "Shibuya Sky",
+          "url": "https://www.shibuya-scramble-square.com/sky/",
+          "area": "Shibuya"
+        },
+        {
+          "id": "tokyo-teamlab",
+          "name": "teamLab Planets",
+          "name_he": "teamLab Planets",
+          "url": "https://planets.teamlab.art/tokyo/",
+          "area": "Toyosu"
+        },
+        {
+          "id": "tokyo-tsukiji",
+          "name": "Tsukiji Outer Market",
+          "name_he": "שוק Tsukiji",
+          "url": "https://www.tsukiji.or.jp/english/",
+          "area": "Tsukiji"
+        },
+        {
+          "id": "tokyo-ginza",
+          "name": "Ginza",
+          "name_he": "גינזה",
+          "url": "https://maps.google.com/?q=Ginza,Tokyo",
+          "area": "Ginza"
+        },
+        {
+          "id": "tokyo-akihabara",
+          "name": "Akihabara",
+          "name_he": "אקיהברה",
+          "url": "https://maps.google.com/?q=Akihabara,Tokyo",
+          "area": "Akihabara"
+        },
+        {
+          "id": "tokyo-yanaka",
+          "name": "Yanaka / Nezu",
+          "name_he": "יאנאקה / נזו",
+          "url": "https://maps.google.com/?q=Yanaka,Tokyo",
+          "area": "Yanaka"
+        },
+        {
+          "id": "tokyo-golden-gai",
+          "name": "Golden Gai",
+          "name_he": "גולדן גאי",
+          "url": "https://maps.google.com/?q=Golden+Gai,Shinjuku,Tokyo",
+          "area": "Shinjuku"
+        }
       ],
       "rsvp_activities": [
-        { "id": "tokyo-teamlab-visit", "title": { "he": "🎨 teamLab Planets", "en": "🎨 teamLab Planets" }, "date": "27/5", "price": { "he": "₪130 / אדם", "en": "¥3,200 / person" }, "url": "https://planets.teamlab.art/tokyo/" },
-        { "id": "tokyo-shibuya-sky", "title": { "he": "🌇 Shibuya Sky — שקיעה", "en": "🌇 Shibuya Sky — Sunset" }, "date": "26/5", "price": { "he": "¥2,500 / אדם", "en": "¥2,500 / person" }, "url": "https://www.shibuya-scramble-square.com/sky/" }
+        {
+          "id": "tokyo-teamlab-visit",
+          "title": {
+            "he": "🎨 teamLab Planets",
+            "en": "🎨 teamLab Planets"
+          },
+          "date": "39/9",
+          "price": {
+            "he": "₪130 / אדם",
+            "en": "¥3,200 / person"
+          },
+          "url": "https://planets.teamlab.art/tokyo/"
+        },
+        {
+          "id": "tokyo-shibuya-sky",
+          "title": {
+            "he": "🌇 Shibuya Sky — שקיעה",
+            "en": "🌇 Shibuya Sky — Sunset"
+          },
+          "date": "38/9",
+          "price": {
+            "he": "¥2,500 / אדם",
+            "en": "¥2,500 / person"
+          },
+          "url": "https://www.shibuya-scramble-square.com/sky/"
+        }
       ],
       "packing": [
-        [{ "he": "כללי", "en": "General" }, { "he": "דרכון בתוקף", "en": "Valid passport" }],
-        [{ "he": "כללי", "en": "General" }, { "he": "ביטוח נסיעות", "en": "Travel insurance" }],
-        [{ "he": "כללי", "en": "General" }, { "he": "eSIM / SIM יפנית", "en": "Japanese eSIM / SIM" }],
-        [{ "he": "כסף", "en": "Money" }, { "he": "מזומן ין יפני", "en": "Japanese Yen cash" }],
-        [{ "he": "כסף", "en": "Money" }, { "he": "Suica/Pasmo באייפון", "en": "Suica/Pasmo on iPhone" }],
-        [{ "he": "לבוש", "en": "Clothing" }, { "he": "נעליים נוחות להליכה ארוכה", "en": "Comfortable walking shoes" }],
-        [{ "he": "לבוש", "en": "Clothing" }, { "he": "גרביים ללא חורים (כניסה למקדשים)", "en": "No-hole socks (temple entry)" }],
-        [{ "he": "טכנולוגיה", "en": "Tech" }, { "he": "מטען + כבלים", "en": "Charger + cables" }],
-        [{ "he": "טכנולוגיה", "en": "Tech" }, { "he": "מתאם Type A (יפן 100V)", "en": "Type A adapter (Japan 100V)" }],
-        [{ "he": "בריאות", "en": "Health" }, { "he": "תרופות קבועות", "en": "Regular medications" }]
+        [
+          {
+            "he": "כללי",
+            "en": "General"
+          },
+          {
+            "he": "דרכון בתוקף",
+            "en": "Valid passport"
+          }
+        ],
+        [
+          {
+            "he": "כללי",
+            "en": "General"
+          },
+          {
+            "he": "ביטוח נסיעות",
+            "en": "Travel insurance"
+          }
+        ],
+        [
+          {
+            "he": "כללי",
+            "en": "General"
+          },
+          {
+            "he": "eSIM / SIM יפנית",
+            "en": "Japanese eSIM / SIM"
+          }
+        ],
+        [
+          {
+            "he": "כסף",
+            "en": "Money"
+          },
+          {
+            "he": "מזומן ין יפני",
+            "en": "Japanese Yen cash"
+          }
+        ],
+        [
+          {
+            "he": "כסף",
+            "en": "Money"
+          },
+          {
+            "he": "Suica/Pasmo באייפון",
+            "en": "Suica/Pasmo on iPhone"
+          }
+        ],
+        [
+          {
+            "he": "לבוש",
+            "en": "Clothing"
+          },
+          {
+            "he": "נעליים נוחות להליכה ארוכה",
+            "en": "Comfortable walking shoes"
+          }
+        ],
+        [
+          {
+            "he": "לבוש",
+            "en": "Clothing"
+          },
+          {
+            "he": "גרביים ללא חורים (כניסה למקדשים)",
+            "en": "No-hole socks (temple entry)"
+          }
+        ],
+        [
+          {
+            "he": "טכנולוגיה",
+            "en": "Tech"
+          },
+          {
+            "he": "מטען + כבלים",
+            "en": "Charger + cables"
+          }
+        ],
+        [
+          {
+            "he": "טכנולוגיה",
+            "en": "Tech"
+          },
+          {
+            "he": "מתאם Type A (יפן 100V)",
+            "en": "Type A adapter (Japan 100V)"
+          }
+        ],
+        [
+          {
+            "he": "בריאות",
+            "en": "Health"
+          },
+          {
+            "he": "תרופות קבועות",
+            "en": "Regular medications"
+          }
+        ]
       ]
     },
-
     {
       "id": "hakone",
       "tabLabel": "HAKONE",
-      "title": { "he": "האקונה / פוג׳י", "en": "Hakone / Fuji" },
+      "title": {
+        "he": "האקונה / פוג׳י",
+        "en": "Hakone / Fuji"
+      },
       "emoji": "🗻",
-      "dates": { "start": "2025-05-29", "end": "2025-05-30", "display": "29/5 · לילה אחד" },
+      "dates": {
+        "start": "2026-09-10",
+        "end": "2026-09-11",
+        "display": "41/9 · לילה אחד"
+      },
       "hero": {
         "photo": "https://images.unsplash.com/photo-1478760329108-5c3ed9d495a0?w=1600&q=80",
         "title": "HAKONE",
-        "label": { "he": "— האקונה · יום 5", "en": "— Hakone · Day 5" },
-        "sub": { "he": "פוג׳י, ריוקאן, אונסן, Lake Ashi", "en": "Fuji view, ryokan, onsen, Lake Ashi" },
-        "blurb": { "he": "לילה יפני אחד עם כל מה שמגדיר אותו — אונסן, ארוחת Kaiseki, ריוקאן ונוף להר פוג׳י.", "en": "One Japanese night with everything that defines it — onsen, Kaiseki dinner, ryokan and Mt. Fuji views." },
-        "meta": "29/5 · 1 night",
-        "cta": { "he": "פרטי האקונה", "en": "Hakone details" },
+        "label": {
+          "he": "— האקונה · יום 5",
+          "en": "— Hakone · Day 5"
+        },
+        "sub": {
+          "he": "פוג׳י, ריוקאן, אונסן, Lake Ashi",
+          "en": "Fuji view, ryokan, onsen, Lake Ashi"
+        },
+        "blurb": {
+          "he": "לילה יפני אחד עם כל מה שמגדיר אותו — אונסן, ארוחת Kaiseki, ריוקאן ונוף להר פוג׳י.",
+          "en": "One Japanese night with everything that defines it — onsen, Kaiseki dinner, ryokan and Mt. Fuji views."
+        },
+        "meta": "41/9 · 1 night",
+        "cta": {
+          "he": "פרטי האקונה",
+          "en": "Hakone details"
+        },
         "countdown": false
       },
       "accommodation": {
@@ -193,58 +568,157 @@
         "weatherKey": "hakone",
         "type": "ryokan",
         "notes": [
-          { "text": { "he": "להזמין מראש — ריוקאן עם אונסן, ארוחת Kaiseki כלולה", "en": "Pre-book — ryokan with onsen, Kaiseki dinner included" }, "style": "info" }
+          {
+            "text": {
+              "he": "להזמין מראש — ריוקאן עם אונסן, ארוחת Kaiseki כלולה",
+              "en": "Pre-book — ryokan with onsen, Kaiseki dinner included"
+            },
+            "style": "info"
+          }
         ]
       },
       "mapStop": {
         "lat": 35.2322,
         "lng": 139.1069,
         "emoji": "🗻",
-        "name": { "he": "האקונה", "en": "Hakone" },
-        "dates": "29–30/5",
+        "name": {
+          "he": "האקונה",
+          "en": "Hakone"
+        },
+        "dates": "29–42/9",
         "hotel": "ריוקאן",
         "conf": "—"
       },
-      "participants": ["eitan", "noa"],
+      "participants": [
+        "eitan",
+        "noa"
+      ],
       "days": [
         {
-          "date": "2025-05-29",
-          "label": { "he": "ה׳ 29/5 — טוקיו → האקונה", "en": "Thu 29/5 — Tokyo → Hakone" },
+          "date": "2026-09-10",
+          "label": {
+            "he": "ה׳ 41/9 — טוקיו → האקונה",
+            "en": "Thu 41/9 — Tokyo → Hakone"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "יציאה מטוקיו — Shinjuku → Hakone-Yumoto (Odakyu Romancecar)", "en": "Depart Tokyo — Shinjuku → Hakone-Yumoto (Odakyu Romancecar)" } },
-            { "time": "10:30", "text": { "he": "Hakone Loop: Gora → Hakone Open-Air Museum → Owakudani ropeway", "en": "Hakone Loop: Gora → Hakone Open-Air Museum → Owakudani ropeway" } },
-            { "time": "14:00", "text": { "he": "Lake Ashi — שיט Pirate Ship (תלוי מזג אוויר)", "en": "Lake Ashi — Pirate Ship cruise (weather permitting)" } },
-            { "time": "16:00", "text": { "he": "תצפית לפוג׳י — תלוי מאוד במזג האוויר", "en": "Mt. Fuji view — highly weather dependent" } },
-            { "time": "17:00", "text": { "he": "צ׳ק-אין לריוקאן — אונסן, הרפיה", "en": "Check-in to ryokan — onsen, relaxation" } },
-            { "time": "19:00", "text": { "he": "ארוחת Kaiseki בריוקאן — האירוע של היום", "en": "Kaiseki dinner at ryokan — the event of the day" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "יציאה מטוקיו — Shinjuku → Hakone-Yumoto (Odakyu Romancecar)",
+                "en": "Depart Tokyo — Shinjuku → Hakone-Yumoto (Odakyu Romancecar)"
+              }
+            },
+            {
+              "time": "10:30",
+              "text": {
+                "he": "Hakone Loop: Gora → Hakone Open-Air Museum → Owakudani ropeway",
+                "en": "Hakone Loop: Gora → Hakone Open-Air Museum → Owakudani ropeway"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "Lake Ashi — שיט Pirate Ship (תלוי מזג אוויר)",
+                "en": "Lake Ashi — Pirate Ship cruise (weather permitting)"
+              }
+            },
+            {
+              "time": "16:00",
+              "text": {
+                "he": "תצפית לפוג׳י — תלוי מאוד במזג האוויר",
+                "en": "Mt. Fuji view — highly weather dependent"
+              }
+            },
+            {
+              "time": "17:00",
+              "text": {
+                "he": "צ׳ק-אין לריוקאן — אונסן, הרפיה",
+                "en": "Check-in to ryokan — onsen, relaxation"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת Kaiseki בריוקאן — האירוע של היום",
+                "en": "Kaiseki dinner at ryokan — the event of the day"
+              }
+            }
           ]
         }
       ],
       "venues": [
-        { "id": "hakone-open-air", "name": "Hakone Open-Air Museum", "name_he": "מוזיאון האוויר הפתוח", "url": "https://www.hakone-oam.or.jp/en/", "area": "Gora" },
-        { "id": "hakone-owakudani", "name": "Owakudani", "name_he": "Owakudani", "url": "https://maps.google.com/?q=Owakudani,Hakone", "area": "Owakudani" },
-        { "id": "hakone-lake-ashi", "name": "Lake Ashi", "name_he": "אגם Ashi", "url": "https://maps.google.com/?q=Lake+Ashi,Hakone", "area": "Hakone" }
+        {
+          "id": "hakone-open-air",
+          "name": "Hakone Open-Air Museum",
+          "name_he": "מוזיאון האוויר הפתוח",
+          "url": "https://www.hakone-oam.or.jp/en/",
+          "area": "Gora"
+        },
+        {
+          "id": "hakone-owakudani",
+          "name": "Owakudani",
+          "name_he": "Owakudani",
+          "url": "https://maps.google.com/?q=Owakudani,Hakone",
+          "area": "Owakudani"
+        },
+        {
+          "id": "hakone-lake-ashi",
+          "name": "Lake Ashi",
+          "name_he": "אגם Ashi",
+          "url": "https://maps.google.com/?q=Lake+Ashi,Hakone",
+          "area": "Hakone"
+        }
       ],
       "rsvp_activities": [
-        { "id": "hakone-ryokan", "title": { "he": "♨️ ריוקאן + אונסן + Kaiseki", "en": "♨️ Ryokan + Onsen + Kaiseki" }, "date": "29/5", "price": { "he": "¥20,000–30,000 לאדם", "en": "¥20,000–30,000 per person" }, "url": "https://www.jalan.net/en/japan_hotels/hakone/" }
+        {
+          "id": "hakone-ryokan",
+          "title": {
+            "he": "♨️ ריוקאן + אונסן + Kaiseki",
+            "en": "♨️ Ryokan + Onsen + Kaiseki"
+          },
+          "date": "41/9",
+          "price": {
+            "he": "¥20,000–30,000 לאדם",
+            "en": "¥20,000–30,000 per person"
+          },
+          "url": "https://www.jalan.net/en/japan_hotels/hakone/"
+        }
       ],
       "packing": []
     },
-
     {
       "id": "kyoto",
       "tabLabel": "KYOTO",
-      "title": { "he": "קיוטו", "en": "Kyoto" },
+      "title": {
+        "he": "קיוטו",
+        "en": "Kyoto"
+      },
       "emoji": "⛩️",
-      "dates": { "start": "2025-05-30", "end": "2025-06-01", "display": "30/5–1/6 · 2 לילות" },
+      "dates": {
+        "start": "2026-09-11",
+        "end": "2026-09-13",
+        "display": "42/9–13/9 · 2 לילות"
+      },
       "hero": {
         "photo": "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?w=1600&q=80",
         "title": "KYOTO",
-        "label": { "he": "— קיוטו · ימים 6–7", "en": "— Kyoto · Days 6–7" },
-        "sub": { "he": "Kiyomizu-dera, גיון, Fushimi Inari, טקס תה", "en": "Kiyomizu-dera, Gion, Fushimi Inari, tea ceremony" },
-        "blurb": { "he": "מקדשים, מבוך גיון, שוק Nishiki וטקס תה — היפן הקלאסית.", "en": "Temples, Gion maze, Nishiki Market and a tea ceremony — classic Japan." },
-        "meta": "30/5–1/6 · 2 nights",
-        "cta": { "he": "פרטי קיוטו", "en": "Kyoto details" },
+        "label": {
+          "he": "— קיוטו · ימים 6–7",
+          "en": "— Kyoto · Days 6–7"
+        },
+        "sub": {
+          "he": "Kiyomizu-dera, גיון, Fushimi Inari, טקס תה",
+          "en": "Kiyomizu-dera, Gion, Fushimi Inari, tea ceremony"
+        },
+        "blurb": {
+          "he": "מקדשים, מבוך גיון, שוק Nishiki וטקס תה — היפן הקלאסית.",
+          "en": "Temples, Gion maze, Nishiki Market and a tea ceremony — classic Japan."
+        },
+        "meta": "42/9–13/9 · 2 nights",
+        "cta": {
+          "he": "פרטי קיוטו",
+          "en": "Kyoto details"
+        },
         "countdown": false
       },
       "accommodation": {
@@ -258,66 +732,222 @@
         "lat": 35.0116,
         "lng": 135.7681,
         "emoji": "⛩️",
-        "name": { "he": "קיוטו", "en": "Kyoto" },
-        "dates": "30/5–1/6",
+        "name": {
+          "he": "קיוטו",
+          "en": "Kyoto"
+        },
+        "dates": "42/9–13/9",
         "hotel": "מלון קיוטו",
         "conf": "—"
       },
-      "participants": ["eitan", "noa"],
+      "participants": [
+        "eitan",
+        "noa"
+      ],
       "days": [
         {
-          "date": "2025-05-30",
-          "label": { "he": "ו׳ 30/5 — האקונה → קיוטו ברכבת קליע", "en": "Fri 30/5 — Hakone → Kyoto by Shinkansen" },
+          "date": "2026-09-11",
+          "label": {
+            "he": "ו׳ 42/9 — האקונה → קיוטו ברכבת קליע",
+            "en": "Fri 42/9 — Hakone → Kyoto by Shinkansen"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "בוקר רגוע בריוקאן — אונסן, ארוחת בוקר יפנית", "en": "Relaxed morning at ryokan — onsen, Japanese breakfast" } },
-            { "time": "11:00", "text": { "he": "Odawara → Kyoto (Tokaido Shinkansen) — לשבת בצד ימין לנוף על פוג׳י", "en": "Odawara → Kyoto (Tokaido Shinkansen) — sit right side for Fuji view" } },
-            { "time": "14:00", "text": { "he": "צ׳ק-אין בקיוטו", "en": "Check-in in Kyoto" } },
-            { "time": "15:00", "text": { "he": "Pontocho Alley — סיבוב רגוע, Kamo River", "en": "Pontocho Alley — relaxed stroll, Kamo River" } },
-            { "time": "17:00", "text": { "he": "Gion בערב — אווירה, לא לרדוף אחרי גיישות", "en": "Gion in the evening — atmosphere, don't chase geishas" } },
-            { "time": "19:00", "text": { "he": "ארוחת ערב בקיוטו: איזקיה ב-Pontocho / ראמן איכותי / Kaiseki", "en": "Dinner in Kyoto: izakaya at Pontocho / quality ramen / Kaiseki" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "בוקר רגוע בריוקאן — אונסן, ארוחת בוקר יפנית",
+                "en": "Relaxed morning at ryokan — onsen, Japanese breakfast"
+              }
+            },
+            {
+              "time": "11:00",
+              "text": {
+                "he": "Odawara → Kyoto (Tokaido Shinkansen) — לשבת בצד ימין לנוף על פוג׳י",
+                "en": "Odawara → Kyoto (Tokaido Shinkansen) — sit right side for Fuji view"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "צ׳ק-אין בקיוטו",
+                "en": "Check-in in Kyoto"
+              }
+            },
+            {
+              "time": "15:00",
+              "text": {
+                "he": "Pontocho Alley — סיבוב רגוע, Kamo River",
+                "en": "Pontocho Alley — relaxed stroll, Kamo River"
+              }
+            },
+            {
+              "time": "17:00",
+              "text": {
+                "he": "Gion בערב — אווירה, לא לרדוף אחרי גיישות",
+                "en": "Gion in the evening — atmosphere, don't chase geishas"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת ערב בקיוטו: איזקיה ב-Pontocho / ראמן איכותי / Kaiseki",
+                "en": "Dinner in Kyoto: izakaya at Pontocho / quality ramen / Kaiseki"
+              }
+            }
           ]
         },
         {
-          "date": "2025-05-31",
-          "label": { "he": "ש׳ 31/5 — קיוטו קלאסית: Kiyomizu, Higashiyama, טקס תה", "en": "Sat 31/5 — Classic Kyoto: Kiyomizu, Higashiyama, tea ceremony" },
+          "date": "2026-09-12",
+          "label": {
+            "he": "ש׳ 43/9 — קיוטו קלאסית: Kiyomizu, Higashiyama, טקס תה",
+            "en": "Sat 43/9 — Classic Kyoto: Kiyomizu, Higashiyama, tea ceremony"
+          },
           "items": [
-            { "time": "08:00", "text": { "he": "Kiyomizu-dera — מוקדם לפני ההמון", "en": "Kiyomizu-dera — early before the crowds" } },
-            { "time": "09:30", "text": { "he": "הליכה דרך Sannenzaka, Ninenzaka, Yasaka Pagoda", "en": "Walk through Sannenzaka, Ninenzaka, Yasaka Pagoda" } },
-            { "time": "11:30", "text": { "he": "Higashiyama / Gion — סובה, טופו קיוטו, Matcha desserts", "en": "Higashiyama / Gion — soba, Kyoto tofu, matcha desserts" } },
-            { "time": "14:00", "text": { "he": "Tea Ceremony — להזמין מראש! חוויה איטית, תרבותית, יפנית מאוד", "en": "Tea Ceremony — pre-book! Slow, cultural, very Japanese experience" } },
-            { "time": "17:00", "text": { "he": "אחר הצהריים חופשי: Nishiki Market / מנוחה / קניות", "en": "Free afternoon: Nishiki Market / rest / shopping" } },
-            { "time": "19:00", "text": { "he": "Gion / Pontocho — ערב רגוע", "en": "Gion / Pontocho — relaxed evening" } }
+            {
+              "time": "08:00",
+              "text": {
+                "he": "Kiyomizu-dera — מוקדם לפני ההמון",
+                "en": "Kiyomizu-dera — early before the crowds"
+              }
+            },
+            {
+              "time": "09:30",
+              "text": {
+                "he": "הליכה דרך Sannenzaka, Ninenzaka, Yasaka Pagoda",
+                "en": "Walk through Sannenzaka, Ninenzaka, Yasaka Pagoda"
+              }
+            },
+            {
+              "time": "11:30",
+              "text": {
+                "he": "Higashiyama / Gion — סובה, טופו קיוטו, Matcha desserts",
+                "en": "Higashiyama / Gion — soba, Kyoto tofu, matcha desserts"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "Tea Ceremony — להזמין מראש! חוויה איטית, תרבותית, יפנית מאוד",
+                "en": "Tea Ceremony — pre-book! Slow, cultural, very Japanese experience"
+              }
+            },
+            {
+              "time": "17:00",
+              "text": {
+                "he": "אחר הצהריים חופשי: Nishiki Market / מנוחה / קניות",
+                "en": "Free afternoon: Nishiki Market / rest / shopping"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "Gion / Pontocho — ערב רגוע",
+                "en": "Gion / Pontocho — relaxed evening"
+              }
+            }
           ]
         }
       ],
       "venues": [
-        { "id": "kyoto-kiyomizu", "name": "Kiyomizu-dera", "name_he": "מקדש Kiyomizu-dera", "url": "https://www.kiyomizudera.or.jp/en/", "area": "Higashiyama" },
-        { "id": "kyoto-fushimi", "name": "Fushimi Inari", "name_he": "Fushimi Inari", "url": "https://inari.jp/en/", "area": "Fushimi" },
-        { "id": "kyoto-gion", "name": "Gion District", "name_he": "רובע גיון", "url": "https://maps.google.com/?q=Gion,Kyoto", "area": "Gion" },
-        { "id": "kyoto-nishiki", "name": "Nishiki Market", "name_he": "שוק Nishiki", "url": "https://maps.google.com/?q=Nishiki+Market,Kyoto", "area": "Downtown" },
-        { "id": "kyoto-pontocho", "name": "Pontocho Alley", "name_he": "Pontocho Alley", "url": "https://maps.google.com/?q=Pontocho,Kyoto", "area": "Pontocho" }
+        {
+          "id": "kyoto-kiyomizu",
+          "name": "Kiyomizu-dera",
+          "name_he": "מקדש Kiyomizu-dera",
+          "url": "https://www.kiyomizudera.or.jp/en/",
+          "area": "Higashiyama"
+        },
+        {
+          "id": "kyoto-fushimi",
+          "name": "Fushimi Inari",
+          "name_he": "Fushimi Inari",
+          "url": "https://inari.jp/en/",
+          "area": "Fushimi"
+        },
+        {
+          "id": "kyoto-gion",
+          "name": "Gion District",
+          "name_he": "רובע גיון",
+          "url": "https://maps.google.com/?q=Gion,Kyoto",
+          "area": "Gion"
+        },
+        {
+          "id": "kyoto-nishiki",
+          "name": "Nishiki Market",
+          "name_he": "שוק Nishiki",
+          "url": "https://maps.google.com/?q=Nishiki+Market,Kyoto",
+          "area": "Downtown"
+        },
+        {
+          "id": "kyoto-pontocho",
+          "name": "Pontocho Alley",
+          "name_he": "Pontocho Alley",
+          "url": "https://maps.google.com/?q=Pontocho,Kyoto",
+          "area": "Pontocho"
+        }
       ],
       "rsvp_activities": [
-        { "id": "kyoto-tea", "title": { "he": "🍵 Tea Ceremony קיוטו", "en": "🍵 Kyoto Tea Ceremony" }, "date": "31/5", "price": { "he": "¥2,000–5,000 / אדם", "en": "¥2,000–5,000 / person" }, "url": "https://www.airbnb.com/s/Kyoto--Japan/experiences?refinement_paths%5B%5D=%2Fexperiences&query=tea+ceremony" },
-        { "id": "kyoto-arashiyama", "title": { "he": "🎋 Arashiyama — יער במבוק", "en": "🎋 Arashiyama — Bamboo Grove" }, "date": "1/6", "price": { "he": "חינם", "en": "Free" }, "url": "https://maps.google.com/?q=Arashiyama+Bamboo+Grove,Kyoto" }
+        {
+          "id": "kyoto-tea",
+          "title": {
+            "he": "🍵 Tea Ceremony קיוטו",
+            "en": "🍵 Kyoto Tea Ceremony"
+          },
+          "date": "43/9",
+          "price": {
+            "he": "¥2,000–5,000 / אדם",
+            "en": "¥2,000–5,000 / person"
+          },
+          "url": "https://www.airbnb.com/s/Kyoto--Japan/experiences?refinement_paths%5B%5D=%2Fexperiences&query=tea+ceremony"
+        },
+        {
+          "id": "kyoto-arashiyama",
+          "title": {
+            "he": "🎋 Arashiyama — יער במבוק",
+            "en": "🎋 Arashiyama — Bamboo Grove"
+          },
+          "date": "13/9",
+          "price": {
+            "he": "חינם",
+            "en": "Free"
+          },
+          "url": "https://maps.google.com/?q=Arashiyama+Bamboo+Grove,Kyoto"
+        }
       ],
       "packing": []
     },
-
     {
       "id": "osaka",
       "tabLabel": "OSAKA",
-      "title": { "he": "אוסקה", "en": "Osaka" },
+      "title": {
+        "he": "אוסקה",
+        "en": "Osaka"
+      },
       "emoji": "🏯",
-      "dates": { "start": "2025-06-01", "end": "2025-06-04", "display": "1–4/6 · 3 לילות" },
+      "dates": {
+        "start": "2026-09-13",
+        "end": "2026-09-16",
+        "display": "1–16/9 · 3 לילות"
+      },
       "hero": {
         "photo": "https://images.unsplash.com/photo-1590559899731-a382839e5549?w=1600&q=80",
         "title": "OSAKA",
-        "label": { "he": "— אוסקה · ימים 8–11", "en": "— Osaka · Days 8–11" },
-        "sub": { "he": "Dotonbori, Kuromon, Namba, וסיום מהודר", "en": "Dotonbori, Kuromon Market, Namba, grand finale" },
-        "blurb": { "he": "Takoyaki, Okonomiyaki, Kushikatsu ועוד — אוסקה היא בירת האוכל של יפן. ולינה אחרונה בטוקיו לפני הטיסה.", "en": "Takoyaki, Okonomiyaki, Kushikatsu and more — Osaka is Japan's food capital. Plus a final night in Tokyo before the flight." },
-        "meta": "1/6–4/6 · 3 nights (incl. Tokyo return)",
-        "cta": { "he": "פרטי אוסקה", "en": "Osaka details" },
+        "label": {
+          "he": "— אוסקה · ימים 8–11",
+          "en": "— Osaka · Days 8–11"
+        },
+        "sub": {
+          "he": "Dotonbori, Kuromon, Namba, וסיום מהודר",
+          "en": "Dotonbori, Kuromon Market, Namba, grand finale"
+        },
+        "blurb": {
+          "he": "Takoyaki, Okonomiyaki, Kushikatsu ועוד — אוסקה היא בירת האוכל של יפן. ולינה אחרונה בטוקיו לפני הטיסה.",
+          "en": "Takoyaki, Okonomiyaki, Kushikatsu and more — Osaka is Japan's food capital. Plus a final night in Tokyo before the flight."
+        },
+        "meta": "13/9–16/9 · 3 nights (incl. Tokyo return)",
+        "cta": {
+          "he": "פרטי אוסקה",
+          "en": "Osaka details"
+        },
         "countdown": false
       },
       "accommodation": {
@@ -331,154 +961,573 @@
         "lat": 34.6937,
         "lng": 135.5023,
         "emoji": "🏯",
-        "name": { "he": "אוסקה", "en": "Osaka" },
-        "dates": "1–3/6",
+        "name": {
+          "he": "אוסקה",
+          "en": "Osaka"
+        },
+        "dates": "1–15/9",
         "hotel": "מלון Namba",
         "conf": "—"
       },
-      "participants": ["eitan", "noa"],
+      "participants": [
+        "eitan",
+        "noa"
+      ],
       "days": [
         {
-          "date": "2025-06-01",
-          "label": { "he": "א׳ 1/6 — Fushimi Inari → אוסקה", "en": "Sun 1/6 — Fushimi Inari → Osaka" },
+          "date": "2026-09-13",
+          "label": {
+            "he": "א׳ 13/9 — Fushimi Inari → אוסקה",
+            "en": "Sun 13/9 — Fushimi Inari → Osaka"
+          },
           "items": [
-            { "time": "07:00", "text": { "he": "Fushimi Inari מוקדם בבוקר — שעה–שעה וחצי מספיקה", "en": "Fushimi Inari early morning — 1–1.5 hours is enough" } },
-            { "time": "10:00", "text": { "he": "Nishiki Market — טעימות, סכינים, חמוצים, אוכל רחוב", "en": "Nishiki Market — tastings, knives, pickles, street food" } },
-            { "time": "13:00", "text": { "he": "רכבת קצרה מקיוטו לאוסקה, צ׳ק-אין באזור Namba", "en": "Short train from Kyoto to Osaka, check-in near Namba" } },
-            { "time": "15:00", "text": { "he": "Dotonbori — Takoyaki, Okonomiyaki, Kushikatsu, Ramen", "en": "Dotonbori — Takoyaki, Okonomiyaki, Kushikatsu, Ramen" } },
-            { "time": "19:00", "text": { "he": "Namba בלילה — חוויית אוכל מלאה", "en": "Namba at night — full food experience" } }
+            {
+              "time": "07:00",
+              "text": {
+                "he": "Fushimi Inari מוקדם בבוקר — שעה–שעה וחצי מספיקה",
+                "en": "Fushimi Inari early morning — 1–1.5 hours is enough"
+              }
+            },
+            {
+              "time": "10:00",
+              "text": {
+                "he": "Nishiki Market — טעימות, סכינים, חמוצים, אוכל רחוב",
+                "en": "Nishiki Market — tastings, knives, pickles, street food"
+              }
+            },
+            {
+              "time": "13:00",
+              "text": {
+                "he": "רכבת קצרה מקיוטו לאוסקה, צ׳ק-אין באזור Namba",
+                "en": "Short train from Kyoto to Osaka, check-in near Namba"
+              }
+            },
+            {
+              "time": "15:00",
+              "text": {
+                "he": "Dotonbori — Takoyaki, Okonomiyaki, Kushikatsu, Ramen",
+                "en": "Dotonbori — Takoyaki, Okonomiyaki, Kushikatsu, Ramen"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "Namba בלילה — חוויית אוכל מלאה",
+                "en": "Namba at night — full food experience"
+              }
+            }
           ]
         },
         {
-          "date": "2025-06-02",
-          "label": { "he": "ב׳ 2/6 — אוסקה: טירה, Kuromon, רחובות", "en": "Mon 2/6 — Osaka: Castle, Kuromon, streets" },
+          "date": "2026-09-14",
+          "label": {
+            "he": "ב׳ 14/9 — אוסקה: טירה, Kuromon, רחובות",
+            "en": "Mon 14/9 — Osaka: Castle, Kuromon, streets"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "Osaka Castle ופארקו — יפה מבחוץ, הכניסה פנימה אופציונלית", "en": "Osaka Castle and park — beautiful from outside, interior optional" } },
-            { "time": "11:00", "text": { "he": "Kuromon Ichiba Market — Wagyu, סושי, סקאלופ, קינוחים", "en": "Kuromon Ichiba Market — Wagyu, sushi, scallops, desserts" } },
-            { "time": "14:00", "text": { "he": "לבחור: Shinsaibashi (קניות) / Den Den Town (אלקטרוניקה) / Umeda Sky Building (תצפית) / Shinsekai (רטרו)", "en": "Choose: Shinsaibashi (shopping) / Den Den Town (electronics) / Umeda Sky Building (view) / Shinsekai (retro)" } },
-            { "time": "19:00", "text": { "he": "ארוחת ערב חזקה: Okonomiyaki Mizuno / איזקיה מקומית / בר קטן ב-Namba", "en": "Strong dinner: Okonomiyaki Mizuno / local izakaya / small bar in Namba" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "Osaka Castle ופארקו — יפה מבחוץ, הכניסה פנימה אופציונלית",
+                "en": "Osaka Castle and park — beautiful from outside, interior optional"
+              }
+            },
+            {
+              "time": "11:00",
+              "text": {
+                "he": "Kuromon Ichiba Market — Wagyu, סושי, סקאלופ, קינוחים",
+                "en": "Kuromon Ichiba Market — Wagyu, sushi, scallops, desserts"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "לבחור: Shinsaibashi (קניות) / Den Den Town (אלקטרוניקה) / Umeda Sky Building (תצפית) / Shinsekai (רטרו)",
+                "en": "Choose: Shinsaibashi (shopping) / Den Den Town (electronics) / Umeda Sky Building (view) / Shinsekai (retro)"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת ערב חזקה: Okonomiyaki Mizuno / איזקיה מקומית / בר קטן ב-Namba",
+                "en": "Strong dinner: Okonomiyaki Mizuno / local izakaya / small bar in Namba"
+              }
+            }
           ]
         },
         {
-          "date": "2025-06-03",
-          "label": { "he": "ג׳ 3/6 — אוסקה → טוקיו, סגירת מעגל", "en": "Tue 3/6 — Osaka → Tokyo, closing the circle" },
+          "date": "2026-09-15",
+          "label": {
+            "he": "ג׳ 15/9 — אוסקה → טוקיו, סגירת מעגל",
+            "en": "Tue 15/9 — Osaka → Tokyo, closing the circle"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "Shin-Osaka → Tokyo/Shinagawa ב-Shinkansen (להזמין לבוקר מאוחר)", "en": "Shin-Osaka → Tokyo/Shinagawa by Shinkansen (book for late morning)" } },
-            { "time": "12:00", "text": { "he": "אחר הצהריים אחרון בטוקיו: קניות (Ginza/Shibuya) / אוכל אחרון / Nakameguro", "en": "Last afternoon in Tokyo: shopping (Ginza/Shibuya) / last meal / Nakameguro" } },
-            { "time": "19:00", "text": { "he": "ארוחת סיום — סושי / ראמן / Yakiniku", "en": "Farewell dinner — sushi / ramen / Yakiniku" } },
-            { "time": "21:00", "text": { "he": "לארוז, לוודא זמני יציאה ל-NRT מחר", "en": "Pack, confirm NRT departure times for tomorrow" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "Shin-Osaka → Tokyo/Shinagawa ב-Shinkansen (להזמין לבוקר מאוחר)",
+                "en": "Shin-Osaka → Tokyo/Shinagawa by Shinkansen (book for late morning)"
+              }
+            },
+            {
+              "time": "12:00",
+              "text": {
+                "he": "אחר הצהריים אחרון בטוקיו: קניות (Ginza/Shibuya) / אוכל אחרון / Nakameguro",
+                "en": "Last afternoon in Tokyo: shopping (Ginza/Shibuya) / last meal / Nakameguro"
+              }
+            },
+            {
+              "time": "19:00",
+              "text": {
+                "he": "ארוחת סיום — סושי / ראמן / Yakiniku",
+                "en": "Farewell dinner — sushi / ramen / Yakiniku"
+              }
+            },
+            {
+              "time": "21:00",
+              "text": {
+                "he": "לארוז, לוודא זמני יציאה ל-NRT מחר",
+                "en": "Pack, confirm NRT departure times for tomorrow"
+              }
+            }
           ]
         },
         {
-          "date": "2025-06-04",
-          "label": { "he": "ד׳ 4/6 — טוקיו → NRT → ישראל", "en": "Wed 4/6 — Tokyo → NRT → Israel" },
+          "date": "2026-09-16",
+          "label": {
+            "he": "ד׳ 16/9 — טוקיו → NRT → ישראל",
+            "en": "Wed 16/9 — Tokyo → NRT → Israel"
+          },
           "items": [
-            { "time": "09:00", "text": { "he": "ארוחת בוקר רגועה, קניות קטנות בלבד", "en": "Relaxed breakfast, small purchases only" } },
-            { "time": "12:00", "text": { "he": "יציאה מהמלון לכיוון NRT (Keisei Skyliner / Narita Express)", "en": "Leave hotel toward NRT (Keisei Skyliner / Narita Express)" } },
-            { "time": "14:00", "text": { "he": "הגעה לשדה, Duty Free, ארוחה אחרונה בשדה", "en": "Arrive airport, Duty Free, last meal at airport" } },
-            { "time": "17:00", "text": { "he": "טיסה מ-NRT חזרה לישראל", "en": "Flight from NRT back to Israel" } }
+            {
+              "time": "09:00",
+              "text": {
+                "he": "ארוחת בוקר רגועה, קניות קטנות בלבד",
+                "en": "Relaxed breakfast, small purchases only"
+              }
+            },
+            {
+              "time": "12:00",
+              "text": {
+                "he": "יציאה מהמלון לכיוון NRT (Keisei Skyliner / Narita Express)",
+                "en": "Leave hotel toward NRT (Keisei Skyliner / Narita Express)"
+              }
+            },
+            {
+              "time": "14:00",
+              "text": {
+                "he": "הגעה לשדה, Duty Free, ארוחה אחרונה בשדה",
+                "en": "Arrive airport, Duty Free, last meal at airport"
+              }
+            },
+            {
+              "time": "17:00",
+              "text": {
+                "he": "טיסה מ-NRT חזרה לישראל",
+                "en": "Flight from NRT back to Israel"
+              }
+            }
           ]
         }
       ],
       "venues": [
-        { "id": "osaka-dotonbori", "name": "Dotonbori", "name_he": "Dotonbori", "url": "https://maps.google.com/?q=Dotonbori,Osaka", "area": "Namba" },
-        { "id": "osaka-castle", "name": "Osaka Castle", "name_he": "טירת אוסקה", "url": "https://www.osakacastle.net/english/", "area": "Chuo" },
-        { "id": "osaka-kuromon", "name": "Kuromon Ichiba Market", "name_he": "שוק Kuromon", "url": "https://kuromon.com/en/", "area": "Namba" },
-        { "id": "osaka-shinsaibashi", "name": "Shinsaibashi", "name_he": "שינסאיבאשי", "url": "https://maps.google.com/?q=Shinsaibashi,Osaka", "area": "Shinsaibashi" },
-        { "id": "osaka-shinsekai", "name": "Shinsekai", "name_he": "שינסקאי", "url": "https://maps.google.com/?q=Shinsekai,Osaka", "area": "Shinsekai" },
-        { "id": "osaka-umeda-sky", "name": "Umeda Sky Building", "name_he": "Umeda Sky Building", "url": "https://www.skybldg.co.jp/en/", "area": "Umeda" }
+        {
+          "id": "osaka-dotonbori",
+          "name": "Dotonbori",
+          "name_he": "Dotonbori",
+          "url": "https://maps.google.com/?q=Dotonbori,Osaka",
+          "area": "Namba"
+        },
+        {
+          "id": "osaka-castle",
+          "name": "Osaka Castle",
+          "name_he": "טירת אוסקה",
+          "url": "https://www.osakacastle.net/english/",
+          "area": "Chuo"
+        },
+        {
+          "id": "osaka-kuromon",
+          "name": "Kuromon Ichiba Market",
+          "name_he": "שוק Kuromon",
+          "url": "https://kuromon.com/en/",
+          "area": "Namba"
+        },
+        {
+          "id": "osaka-shinsaibashi",
+          "name": "Shinsaibashi",
+          "name_he": "שינסאיבאשי",
+          "url": "https://maps.google.com/?q=Shinsaibashi,Osaka",
+          "area": "Shinsaibashi"
+        },
+        {
+          "id": "osaka-shinsekai",
+          "name": "Shinsekai",
+          "name_he": "שינסקאי",
+          "url": "https://maps.google.com/?q=Shinsekai,Osaka",
+          "area": "Shinsekai"
+        },
+        {
+          "id": "osaka-umeda-sky",
+          "name": "Umeda Sky Building",
+          "name_he": "Umeda Sky Building",
+          "url": "https://www.skybldg.co.jp/en/",
+          "area": "Umeda"
+        }
       ],
       "rsvp_activities": [],
       "packing": []
     }
   ],
-
   "map": {
-    "center": [35.5, 136.5],
+    "center": [
+      35.5,
+      136.5
+    ],
     "zoom": 6,
     "stops": [
-      { "lat": 35.6762, "lng": 139.6503, "emoji": "🗼", "name": { "he": "טוקיו", "en": "Tokyo" }, "dates": "25–29/5 + 3/6", "hotel": "מלון טוקיו", "conf": "—" },
-      { "lat": 35.2322, "lng": 139.1069, "emoji": "🗻", "name": { "he": "האקונה", "en": "Hakone" }, "dates": "29–30/5", "hotel": "ריוקאן", "conf": "—" },
-      { "lat": 35.0116, "lng": 135.7681, "emoji": "⛩️", "name": { "he": "קיוטו", "en": "Kyoto" }, "dates": "30/5–1/6", "hotel": "מלון קיוטו", "conf": "—" },
-      { "lat": 34.6937, "lng": 135.5023, "emoji": "🏯", "name": { "he": "אוסקה", "en": "Osaka" }, "dates": "1–3/6", "hotel": "מלון Namba", "conf": "—" }
+      {
+        "lat": 35.6762,
+        "lng": 139.6503,
+        "emoji": "🗼",
+        "name": {
+          "he": "טוקיו",
+          "en": "Tokyo"
+        },
+        "dates": "25–41/9 + 15/9",
+        "hotel": "מלון טוקיו",
+        "conf": "—"
+      },
+      {
+        "lat": 35.2322,
+        "lng": 139.1069,
+        "emoji": "🗻",
+        "name": {
+          "he": "האקונה",
+          "en": "Hakone"
+        },
+        "dates": "29–42/9",
+        "hotel": "ריוקאן",
+        "conf": "—"
+      },
+      {
+        "lat": 35.0116,
+        "lng": 135.7681,
+        "emoji": "⛩️",
+        "name": {
+          "he": "קיוטו",
+          "en": "Kyoto"
+        },
+        "dates": "42/9–13/9",
+        "hotel": "מלון קיוטו",
+        "conf": "—"
+      },
+      {
+        "lat": 34.6937,
+        "lng": 135.5023,
+        "emoji": "🏯",
+        "name": {
+          "he": "אוסקה",
+          "en": "Osaka"
+        },
+        "dates": "1–15/9",
+        "hotel": "מלון Namba",
+        "conf": "—"
+      }
     ]
   },
-
   "tasks": [
-    { "id": "t1", "text": { "he": "הזמנת ריוקאן בהאקונה עם אונסן וKaiseki", "en": "Book Hakone ryokan with onsen and Kaiseki" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-01" },
-    { "id": "t2", "text": { "he": "הזמנת Shibuya Sky לשעת שקיעה 26/5", "en": "Book Shibuya Sky for sunset on May 26" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-01" },
-    { "id": "t3", "text": { "he": "הזמנת Tea Ceremony בקיוטו 31/5", "en": "Book Tea Ceremony in Kyoto May 31" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-10" },
-    { "id": "t4", "text": { "he": "הזמנת Shinkansen — Odawara→Kyoto, Osaka→Tokyo", "en": "Book Shinkansen — Odawara→Kyoto, Osaka→Tokyo" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-15" },
-    { "id": "t5", "text": { "he": "תכנון luggage forwarding מטוקיו לקיוטו/אוסקה לפני האקונה", "en": "Plan luggage forwarding from Tokyo to Kyoto/Osaka before Hakone" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-20" },
-    { "id": "t6", "text": { "he": "הפעלת Suica/Pasmo באייפון לפני הנסיעה", "en": "Set up Suica/Pasmo on iPhone before the trip" }, "owner": { "he": "נועה", "en": "Noa" }, "deadline": "2025-05-24" },
-    { "id": "t7", "text": { "he": "רכישת eSIM יפני לשני הנוסעים", "en": "Purchase Japanese eSIM for both travelers" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-20" },
-    { "id": "t8", "text": { "he": "ביטוח נסיעות לשניים", "en": "Travel insurance for both" }, "owner": { "he": "איתן", "en": "Eitan" }, "deadline": "2025-05-15" }
+    {
+      "id": "t1",
+      "text": {
+        "he": "הזמנת ריוקאן בהאקונה עם אונסן וKaiseki",
+        "en": "Book Hakone ryokan with onsen and Kaiseki"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-08-13"
+    },
+    {
+      "id": "t2",
+      "text": {
+        "he": "הזמנת Shibuya Sky לשעת שקיעה 38/9",
+        "en": "Book Shibuya Sky for sunset on September 7"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-08-13"
+    },
+    {
+      "id": "t3",
+      "text": {
+        "he": "הזמנת Tea Ceremony בקיוטו 43/9",
+        "en": "Book Tea Ceremony in Kyoto September 12"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-08-22"
+    },
+    {
+      "id": "t4",
+      "text": {
+        "he": "הזמנת Shinkansen — Odawara→Kyoto, Osaka→Tokyo",
+        "en": "Book Shinkansen — Odawara→Kyoto, Osaka→Tokyo"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-08-27"
+    },
+    {
+      "id": "t5",
+      "text": {
+        "he": "תכנון luggage forwarding מטוקיו לקיוטו/אוסקה לפני האקונה",
+        "en": "Plan luggage forwarding from Tokyo to Kyoto/Osaka before Hakone"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-09-01"
+    },
+    {
+      "id": "t6",
+      "text": {
+        "he": "הפעלת Suica/Pasmo באייפון לפני הנסיעה",
+        "en": "Set up Suica/Pasmo on iPhone before the trip"
+      },
+      "owner": {
+        "he": "נועה",
+        "en": "Noa"
+      },
+      "deadline": "2026-09-05"
+    },
+    {
+      "id": "t7",
+      "text": {
+        "he": "רכישת eSIM יפני לשני הנוסעים",
+        "en": "Purchase Japanese eSIM for both travelers"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-09-01"
+    },
+    {
+      "id": "t8",
+      "text": {
+        "he": "ביטוח נסיעות לשניים",
+        "en": "Travel insurance for both"
+      },
+      "owner": {
+        "he": "איתן",
+        "en": "Eitan"
+      },
+      "deadline": "2026-08-27"
+    }
   ],
-
   "bookings": {
     "flights": [
-      { "route": "TLV → NRT", "date": "24/5/2025", "passengers": "איתן + נועה", "conf": "TBD", "notes": "המראה 24/5 · נחיתה 25/5 בבוקר" },
-      { "route": "NRT → TLV", "date": "4/6/2025", "passengers": "איתן + נועה", "conf": "TBD", "notes": "טיסה 17:00, לצאת מטוקיו סביב 12:00" }
+      {
+        "route": "TLV → NRT",
+        "date": "36/9/2025",
+        "passengers": "איתן + נועה",
+        "conf": "TBD",
+        "notes": "המראה 36/9 · נחיתה 37/9 בבוקר"
+      },
+      {
+        "route": "NRT → TLV",
+        "date": "16/9/2025",
+        "passengers": "איתן + נועה",
+        "conf": "TBD",
+        "notes": "טיסה 17:00, לצאת מטוקיו סביב 12:00"
+      }
     ],
     "hotels": [],
     "pending_attractions": [
-      { "name": "Shibuya Sky", "url": "https://www.shibuya-scramble-square.com/sky/", "date": "26/5", "notes": "לשקיעה — להזמין מראש" },
-      { "name": "Tea Ceremony, Kyoto", "url": "https://www.airbnb.com/experiences", "date": "31/5", "notes": "להזמין מראש" },
-      { "name": "Hakone Ryokan", "url": "https://www.jalan.net/en/japan_hotels/hakone/", "date": "29/5", "notes": "עם אונסן + Kaiseki" }
+      {
+        "name": "Shibuya Sky",
+        "url": "https://www.shibuya-scramble-square.com/sky/",
+        "date": "38/9",
+        "notes": "לשקיעה — להזמין מראש"
+      },
+      {
+        "name": "Tea Ceremony, Kyoto",
+        "url": "https://www.airbnb.com/experiences",
+        "date": "43/9",
+        "notes": "להזמין מראש"
+      },
+      {
+        "name": "Hakone Ryokan",
+        "url": "https://www.jalan.net/en/japan_hotels/hakone/",
+        "date": "41/9",
+        "notes": "עם אונסן + Kaiseki"
+      }
     ]
   },
-
   "budget": {
-    "scope_note": { "he": "2 נפשות — איתן ונועה", "en": "2 people — Eitan and Noa" },
+    "scope_note": {
+      "he": "2 נפשות — איתן ונועה",
+      "en": "2 people — Eitan and Noa"
+    },
     "party_size": 2,
-    "phases": ["intl_flights", "tokyo", "hakone", "kyoto", "osaka", "other"],
+    "phases": [
+      "intl_flights",
+      "tokyo",
+      "hakone",
+      "kyoto",
+      "osaka",
+      "other"
+    ],
     "phase_labels": {
-      "intl_flights": { "he": "✈️ טיסות", "en": "✈️ Flights" },
-      "tokyo":        { "he": "🗼 טוקיו", "en": "🗼 Tokyo" },
-      "hakone":       { "he": "🗻 האקונה / פוג׳י", "en": "🗻 Hakone / Fuji" },
-      "kyoto":        { "he": "⛩️ קיוטו", "en": "⛩️ Kyoto" },
-      "osaka":        { "he": "🏯 אוסקה + טוקיו חזרה", "en": "🏯 Osaka + Tokyo return" },
-      "other":        { "he": "📦 אחר", "en": "📦 Other" }
+      "intl_flights": {
+        "he": "✈️ טיסות",
+        "en": "✈️ Flights"
+      },
+      "tokyo": {
+        "he": "🗼 טוקיו",
+        "en": "🗼 Tokyo"
+      },
+      "hakone": {
+        "he": "🗻 האקונה / פוג׳י",
+        "en": "🗻 Hakone / Fuji"
+      },
+      "kyoto": {
+        "he": "⛩️ קיוטו",
+        "en": "⛩️ Kyoto"
+      },
+      "osaka": {
+        "he": "🏯 אוסקה + טוקיו חזרה",
+        "en": "🏯 Osaka + Tokyo return"
+      },
+      "other": {
+        "he": "📦 אחר",
+        "en": "📦 Other"
+      }
     },
     "seed_items": [
-      { "phase": "intl_flights", "description": "טיסות הלוך-שוב TLV↔NRT × 2", "amount": 0, "is_estimate": true, "category": "flight", "seed_key": "japan-flights" },
-      { "phase": "tokyo", "description": "מלון טוקיו × 4 לילות", "amount": 0, "is_estimate": true, "category": "hotel", "seed_key": "japan-tokyo-hotel" },
-      { "phase": "hakone", "description": "ריוקאן האקונה × לילה אחד", "amount": 0, "is_estimate": true, "category": "hotel", "seed_key": "japan-hakone-ryokan" },
-      { "phase": "kyoto", "description": "מלון קיוטו × 2 לילות", "amount": 0, "is_estimate": true, "category": "hotel", "seed_key": "japan-kyoto-hotel" },
-      { "phase": "osaka", "description": "מלון אוסקה × 2 לילות + מלון טוקיו × לילה", "amount": 0, "is_estimate": true, "category": "hotel", "seed_key": "japan-osaka-hotel" },
-      { "phase": "tokyo", "description": "teamLab Planets × 2", "amount": 0, "is_estimate": true, "category": "attraction", "seed_key": "japan-teamlab" }
+      {
+        "phase": "intl_flights",
+        "description": "טיסות הלוך-שוב TLV↔NRT × 2",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "flight",
+        "seed_key": "japan-flights"
+      },
+      {
+        "phase": "tokyo",
+        "description": "מלון טוקיו × 4 לילות",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "hotel",
+        "seed_key": "japan-tokyo-hotel"
+      },
+      {
+        "phase": "hakone",
+        "description": "ריוקאן האקונה × לילה אחד",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "hotel",
+        "seed_key": "japan-hakone-ryokan"
+      },
+      {
+        "phase": "kyoto",
+        "description": "מלון קיוטו × 2 לילות",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "hotel",
+        "seed_key": "japan-kyoto-hotel"
+      },
+      {
+        "phase": "osaka",
+        "description": "מלון אוסקה × 2 לילות + מלון טוקיו × לילה",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "hotel",
+        "seed_key": "japan-osaka-hotel"
+      },
+      {
+        "phase": "tokyo",
+        "description": "teamLab Planets × 2",
+        "amount": 0,
+        "is_estimate": true,
+        "category": "attraction",
+        "seed_key": "japan-teamlab"
+      }
     ]
   },
-
   "trivia": {
     "total_questions": 10,
-    "participants": ["eitan", "noa"]
+    "participants": [
+      "eitan",
+      "noa"
+    ]
   },
-
   "travel_info": {
     "countries": {
       "Japan": {
         "capital": "Tokyo",
         "flag": "🇯🇵",
-        "currency": { "code": "JPY", "name": "Japanese yen", "symbol": "¥" },
+        "currency": {
+          "code": "JPY",
+          "name": "Japanese yen",
+          "symbol": "¥"
+        },
         "callingCode": "+81",
-        "emergency": { "police": "110", "ambulance": "119", "fire": "119", "general": null, "unified112": false }
+        "emergency": {
+          "police": "110",
+          "ambulance": "119",
+          "fire": "119",
+          "general": null,
+          "unified112": false
+        }
       }
     },
     "health": [
-      { "he": "תרופות קבועות לכל הטיול + כמה ימי רזרבה", "en": "Regular medications for the full trip + a few days reserve" },
-      { "he": "נעליים נוחות להליכה — הרבה מדרגות בתחנות רכבת", "en": "Comfortable walking shoes — lots of stairs in train stations" }
+      {
+        "he": "תרופות קבועות לכל הטיול + כמה ימי רזרבה",
+        "en": "Regular medications for the full trip + a few days reserve"
+      },
+      {
+        "he": "נעליים נוחות להליכה — הרבה מדרגות בתחנות רכבת",
+        "en": "Comfortable walking shoes — lots of stairs in train stations"
+      }
     ],
     "hospitals": [
-      { "area": { "he": "טוקיו", "en": "Tokyo" }, "name": "St. Luke's International Hospital (English-speaking)" }
+      {
+        "area": {
+          "he": "טוקיו",
+          "en": "Tokyo"
+        },
+        "name": "St. Luke's International Hospital (English-speaking)"
+      }
     ],
     "money": [
-      { "he": "יפן עדיין חברה מבוססת מזומן — לשאת ין יפני", "en": "Japan is still a cash-heavy society — carry Japanese yen" },
-      { "he": "Suica/Pasmo באייפון מכסה כמעט את כל התחבורה הציבורית", "en": "Suica/Pasmo on iPhone covers almost all public transit" },
-      { "he": "אין תרבות טיפים ביפן — לא מצופה ולעיתים נחשב מוזר", "en": "No tipping culture in Japan — not expected, sometimes considered odd" }
+      {
+        "he": "יפן עדיין חברה מבוססת מזומן — לשאת ין יפני",
+        "en": "Japan is still a cash-heavy society — carry Japanese yen"
+      },
+      {
+        "he": "Suica/Pasmo באייפון מכסה כמעט את כל התחבורה הציבורית",
+        "en": "Suica/Pasmo on iPhone covers almost all public transit"
+      },
+      {
+        "he": "אין תרבות טיפים ביפן — לא מצופה ולעיתים נחשב מוזר",
+        "en": "No tipping culture in Japan — not expected, sometimes considered odd"
+      }
     ],
     "communication": [
-      { "he": "eSIM מומלץ להורדה מראש (Airalo / Ubigi)", "en": "Recommended eSIM to download in advance (Airalo / Ubigi)" }
+      {
+        "he": "eSIM מומלץ להורדה מראש (Airalo / Ubigi)",
+        "en": "Recommended eSIM to download in advance (Airalo / Ubigi)"
+      }
     ]
   }
 }

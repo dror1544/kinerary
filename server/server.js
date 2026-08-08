@@ -21,6 +21,11 @@ const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
+// Optional shared onboarding password for a fresh DB's seeded users. Leave
+// unset in production once Telegram/Google login is live — each participant
+// then gets an independent random password instead of one shared, guessable
+// default (see initData()).
+const SEED_PASSWORD = process.env.SEED_PASSWORD || '';
 const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', isAgent: true };
 
 // Optional: "Sign in with Google" as an alternate login method bound to an
@@ -28,6 +33,33 @@ const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', is
 // simply absent; the site still works password-only.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+
+// Telegram Login is verified server-side and additionally bound to live
+// membership in the configured trip group. No bot secret reaches the browser.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org').replace(/\/$/, '');
+const TELEGRAM_AUTH_MAX_AGE_SECONDS = Number(process.env.TELEGRAM_AUTH_MAX_AGE_SECONDS || 86400);
+// Public @handle only — never the token. Safe to serve pre-auth so the login
+// screen knows which widget to render.
+const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
+const telegramEnabled = () => Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+function verifyTelegramLogin(payload) {
+  const { hash, ...fields } = payload || {};
+  if (!hash || !fields.id || !fields.auth_date) return false;
+  const now = Math.floor(Date.now() / 1000), authDate = Number(fields.auth_date);
+  if (!Number.isSafeInteger(authDate) || authDate > now + 60 || now - authDate > TELEGRAM_AUTH_MAX_AGE_SECONDS) return false;
+  const check = Object.keys(fields).sort().map(k => `${k}=${fields[k]}`).join('\n');
+  const secret = crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest();
+  const expected = crypto.createHmac('sha256', secret).update(check).digest('hex');
+  return hash.length === expected.length && crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected));
+}
+async function telegramActiveMember(userId) {
+  const url = `${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&user_id=${encodeURIComponent(userId)}`;
+  const reply = await fetch(url).then(r => r.json());
+  const status = reply?.result?.status;
+  return reply?.ok && ['creator', 'administrator', 'member', 'restricted'].includes(status) && !(status === 'restricted' && reply.result?.is_member === false);
+}
 async function verifyGoogleToken(idToken) {
   const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
   return ticket.getPayload(); // { sub, email, ... }
@@ -286,6 +318,7 @@ try {
 // ── USER SEED DATA ────────────────────────────────────────────────────────────
 const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
   username: p.username, name: p.name, name_en: p.name_en,
+  telegram_id: p.telegram_id ? String(p.telegram_id) : null,
   age: p.age, family: p.family, color: p.color,
 }));
 
@@ -300,9 +333,50 @@ try { db.exec('ALTER TABLE bookings ADD COLUMN pkpass_file TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
 // Backfill name_en for any existing users that don't have it yet
 for (const u of SEED_USERS) {
   db.prepare('UPDATE users SET name_en = ? WHERE username = ? AND (name_en IS NULL OR name_en = \'\')').run(u.name_en, u.username);
+}
+// Unlike name_en, telegram_id is synced from config on every boot, not just
+// filled when blank — trip.config.json stays the live source of truth, since
+// an organizer normally adds/corrects participants' Telegram IDs long after
+// the DB already exists, not before first boot.
+for (const u of SEED_USERS) {
+  try {
+    db.prepare('UPDATE users SET telegram_id = ? WHERE username = ?').run(u.telegram_id, u.username);
+  } catch (e) {
+    console.error(`Skipped telegram_id sync for ${u.username}: ${e.message}`);
+  }
+}
+
+// Inserts one brand-new participant's row — used by POST /api/agent/participants
+// to add someone to an already-running trip without a restart. Deliberately
+// separate from the bulk boot-time seed path above: that path seeds a whole
+// config's worth of users in one transaction with its own SEED_PASSWORD/
+// random-password branching, and unifying it with a single-row insert risks
+// the already-tested boot sequence for no real benefit — both just happen to
+// write the same row shape, which is a schema fact, not shared logic.
+function insertParticipantUser(p, passwordHash) {
+  db.prepare(
+    'INSERT INTO users (username, name, name_en, telegram_id, age, family, color, password) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(p.username, p.name, p.name_en || null, p.telegram_id || null, p.age ?? null, p.family || null, p.color || null, passwordHash);
+}
+
+// Writes the in-memory TRIP_CONFIG back to trip.config.json and snapshots it
+// into trip_config_versions, same as boot-time versioning does. Shared by
+// every runtime config mutation (add/bind/remove participant) so there's one
+// place that defines what "persisting a config change" means.
+function persistConfigChange() {
+  TRIP_CONFIG_RAW = JSON.stringify(TRIP_CONFIG, null, 2);
+  fs.writeFileSync(path.join(TRIP_DIR, 'trip.config.json'), TRIP_CONFIG_RAW);
+  try {
+    const hash = crypto.createHash('sha256').update(TRIP_CONFIG_RAW).digest('hex');
+    const latest = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get();
+    const nextVersion = (latest?.version || 0) + 1;
+    db.prepare('INSERT INTO trip_config_versions (version, content, hash) VALUES (?, ?, ?)').run(nextVersion, TRIP_CONFIG_RAW, hash);
+  } catch (e) { console.error('trip config version snapshot failed:', e.message); }
 }
 
 // ── STARTUP MIGRATION ─────────────────────────────────────────────────────────
@@ -314,20 +388,35 @@ async function initData() {
       try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return null; }
     })();
     const insert = db.prepare(
-      'INSERT OR IGNORE INTO users (username, name, name_en, age, family, color, password) VALUES (?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO users (username, name, name_en, telegram_id, age, family, color, password) VALUES (?,?,?,?,?,?,?,?)'
     );
     if (existing && existing.length > 0) {
       console.log('Migrating users from users.json…');
       const seedMap = Object.fromEntries(SEED_USERS.map(u => [u.username, u.name_en]));
       const tx = db.transaction(() => {
-        for (const u of existing) insert.run(u.username, u.name, seedMap[u.username] || null, u.age, u.family, u.color, u.password);
+        for (const u of existing) insert.run(u.username, u.name, seedMap[u.username] || null, null, u.age, u.family, u.color, u.password);
+      });
+      tx();
+    } else if (SEED_PASSWORD) {
+      // Operator-chosen shared onboarding password (e.g. local/dev, or a
+      // trip where password login is still the plan for some participants).
+      // Never a hardcoded, source-visible default — deployments must opt in.
+      console.log('Seeding users with the configured SEED_PASSWORD — change it from the avatar screen…');
+      const hash = await bcrypt.hash(SEED_PASSWORD, 10);
+      const tx = db.transaction(() => {
+        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.telegram_id, u.age, u.family, u.color, hash);
       });
       tx();
     } else {
-      console.log('Seeding users with default password (1234) — change it from the avatar screen…');
-      const hash = await bcrypt.hash('1234', 10);
+      // No shared secret to leak or guess: each participant gets an
+      // independent, unrecoverable random password. Password login is
+      // effectively unavailable until a participant signs in another way
+      // (Telegram/Google) and sets their own via PUT /api/auth/password.
+      console.log('SEED_PASSWORD not set — seeding users with independent random passwords (password login is unavailable until each participant signs in via Telegram/Google and sets their own).');
+      const hashes = {};
+      for (const u of SEED_USERS) hashes[u.username] = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
       const tx = db.transaction(() => {
-        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.age, u.family, u.color, hash);
+        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.telegram_id, u.age, u.family, u.color, hashes[u.username]);
       });
       tx();
     }
@@ -433,7 +522,12 @@ function authRequired(req, res, next) {
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, immich: !!(IMMICH_URL && IMMICH_KEY), googleClientId: GOOGLE_CLIENT_ID || null });
+  res.json({
+    ok: true,
+    immich: !!(IMMICH_URL && IMMICH_KEY),
+    googleClientId: GOOGLE_CLIENT_ID || null,
+    telegramBotUsername: telegramEnabled() ? (TELEGRAM_BOT_USERNAME || null) : null,
+  });
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
@@ -449,6 +543,8 @@ function sanitizeConfig(cfg) {
   });
   if (safe.bookings?.hotels) safe.bookings.hotels.forEach(h => delete h.pin);
   if (safe.participants) safe.participants.forEach(p => {
+    // Identity links are server-side authentication material, never trip UI data.
+    delete p.telegram_id;
     delete p.pin;
     if (p.needs) {
       p.needs = p.needs
@@ -464,10 +560,27 @@ function sanitizeConfig(cfg) {
   return safe;
 }
 
-app.get('/api/config', (_req, res) => {
+app.get('/api/config', authRequired, (_req, res) => {
   const safe = sanitizeConfig(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   res.json(safe);
+});
+
+// Deliberately public and deliberately minimal: the login screen needs to
+// show a "pick yourself" roster before any session exists, but the full
+// /api/config now carries real trip content (itinerary, budget, bookings,
+// needs) that shouldn't be world-readable. Hand-picking these four fields
+// here — rather than reusing sanitizeConfig() — keeps the public surface
+// obvious at a glance instead of depending on a general-purpose sanitizer
+// that could grow more fields later.
+app.get('/api/config/roster', (_req, res) => {
+  const roster = (TRIP_CONFIG.participants || []).map(p => ({
+    username: p.username,
+    name: p.name,
+    name_en: p.name_en,
+    color: p.color,
+  }));
+  res.json({ participants: roster });
 });
 
 // Stage 1 groundwork: read-only access to stored config history for a future
@@ -560,6 +673,150 @@ app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   });
 });
 
+// Single-use, short-lived tokens for participant self-enrollment (the
+// password-only path below). Mirrors mcp/provision.js's activation-token
+// pattern: in-memory, spent on first use, time-limited.
+const pendingEnrollments = new Map();
+const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
+
+// The only runtime writer of trip.config.json in this codebase — kept
+// deliberately narrow (append one participant, touch nothing else) rather
+// than a general config-PUT. Telegram-bound (telegram_id given): login works
+// immediately through the widget, gated on live group membership like any
+// other Telegram-linked participant. Password-only (telegram_id omitted):
+// returns a one-time enrollment token for the organizer to relay — the
+// participant sets their own password via POST /api/auth/enroll, it is never
+// collected here or in chat.
+app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
+  const { username, name, name_en, color, family, telegram_id } = req.body || {};
+  if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
+  const uname = String(username).toLowerCase().trim();
+  if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+
+  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(409).json({ error: 'username_taken' });
+  }
+  const tgId = telegram_id ? String(telegram_id) : null;
+  if (tgId && db.prepare('SELECT 1 FROM users WHERE telegram_id = ?').get(tgId)) {
+    return res.status(409).json({ error: 'telegram_id_taken' });
+  }
+
+  const participant = { username: uname, name, name_en: name_en || null, color: color || null, family: family || null, telegram_id: tgId };
+
+  TRIP_CONFIG.participants = TRIP_CONFIG.participants || [];
+  TRIP_CONFIG.participants.push(participant);
+  persistConfigChange();
+
+  // Independent random, effectively-unusable password unless SEED_PASSWORD is
+  // explicitly configured — same posture as every other seeded user. The
+  // password-only path immediately overwrites this via the enrollment token.
+  const passwordHash = await bcrypt.hash(SEED_PASSWORD || crypto.randomBytes(24).toString('hex'), 10);
+  try {
+    insertParticipantUser(participant, passwordHash);
+  } catch (e) {
+    return res.status(500).json({ error: 'user_insert_failed', detail: e.message });
+  }
+
+  if (tgId) return res.json({ ok: true, username: uname, telegram_bound: true });
+
+  const token = crypto.randomBytes(24).toString('hex');
+  pendingEnrollments.set(token, { username: uname, at: Date.now() });
+  res.json({
+    ok: true, username: uname, telegram_bound: false,
+    enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000,
+  });
+});
+
+// Lets an organizer trigger a password reset for an EXISTING participant —
+// Telegram-bound or not, since a Telegram-linked participant may still want
+// a working password fallback. Mints a fresh one-time enrollment token on
+// the same terms as a brand-new participant; redeemed the same way, through
+// POST /api/auth/enroll. Does not touch trip.config.json or re-seed the
+// user — the row already exists, only its password needs to change.
+app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(404).json({ error: 'user_not_found' });
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  pendingEnrollments.set(token, { username: uname, at: Date.now() });
+  res.json({ ok: true, username: uname, enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000 });
+});
+
+// Binds a Telegram identity to an EXISTING participant — e.g. "bind @dror to
+// dror": the organizer already knows which site username maps to which
+// Telegram account, this just records it. Unlike POST /api/agent/participants,
+// this never creates a participant or touches a password.
+app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired, (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  const { telegram_id } = req.body || {};
+  if (!telegram_id) return res.status(400).json({ error: 'missing_telegram_id' });
+  const tgId = String(telegram_id);
+
+  const participant = (TRIP_CONFIG.participants || []).find(p => p.username === uname);
+  if (!participant || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(404).json({ error: 'user_not_found' });
+  }
+  const conflict = db.prepare('SELECT username FROM users WHERE telegram_id = ? AND username != ?').get(tgId, uname);
+  if (conflict) return res.status(409).json({ error: 'telegram_id_taken' });
+
+  participant.telegram_id = tgId;
+  persistConfigChange();
+  db.prepare('UPDATE users SET telegram_id = ? WHERE username = ?').run(tgId, uname);
+
+  res.json({ ok: true, username: uname, telegram_id: tgId });
+});
+
+// Removes a participant from the trip: drops them from trip.config.json and
+// revokes DB-level access (clears telegram_id, replaces the password with a
+// fresh unusable random hash) rather than deleting the users row outright —
+// photos/bookings/ratings reference the username by text, and a hard delete
+// would orphan that history. Blocks removing a currently-configured
+// organizer; that's a deliberate, separate decision, not something that
+// should fall out of a generic remove call.
+app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
+  if (idx === -1) return res.status(404).json({ error: 'user_not_found' });
+
+  if (normalizeOrganizers(TRIP_CONFIG.agent).includes(uname)) {
+    return res.status(409).json({ error: 'cannot_remove_organizer' });
+  }
+
+  TRIP_CONFIG.participants.splice(idx, 1);
+  persistConfigChange();
+
+  const randomPasswordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  db.prepare('UPDATE users SET telegram_id = NULL, password = ? WHERE username = ?').run(randomPasswordHash, uname);
+
+  res.json({
+    ok: true, username: uname,
+    // Surfaced in the response, not just a comment — the caller (agent or
+    // organizer) should know this doesn't yank an already-open session.
+    note: 'Future logins are revoked. An already-issued session token (valid up to 30 days) is not invalidated — this app has no session-revocation mechanism yet.',
+  });
+});
+
+// Redeems a one-time enrollment token minted by POST /api/agent/participants
+// or POST /api/agent/participants/:username/reset-password — the only way a
+// password-only participant (or one whose password was just reset) gets a
+// real password. No prior session required; the token itself is the
+// (already organizer-issued) authorization.
+app.post('/api/auth/enroll', async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'missing_fields' });
+  if (password.length < 4) return res.status(400).json({ error: 'password_too_short' });
+
+  const pending = pendingEnrollments.get(token);
+  if (!pending) return res.status(404).json({ error: 'invalid_or_used_token' });
+  pendingEnrollments.delete(token);
+  if (Date.now() - pending.at > ENROLLMENT_TTL_MS) return res.status(410).json({ error: 'token_expired' });
+
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, pending.username);
+  res.json({ ok: true, username: pending.username });
+});
+
 app.get('/api/config/versions/:version', authRequired, (req, res) => {
   const row = db.prepare('SELECT version, content, hash, created_at FROM trip_config_versions WHERE version = ?').get(req.params.version);
   if (!row) return res.status(404).json({ error: 'version not found' });
@@ -589,6 +846,21 @@ app.post('/api/auth/login', async (req, res) => {
 
   const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '30d' });
   const { password: _p, ...safeUser } = user;
+  res.json({ token, user: safeUser });
+});
+
+// Telegram identity is accepted only after both cryptographic verification and
+// a live membership check. A known participant is linked by telegram_id.
+app.post('/api/auth/telegram-login', async (req, res) => {
+  if (!telegramEnabled()) return res.status(503).json({ error: 'telegram_not_configured' });
+  if (!verifyTelegramLogin(req.body)) return res.status(401).json({ error: 'invalid_telegram_login' });
+  try {
+    if (!await telegramActiveMember(req.body.id)) return res.status(403).json({ error: 'not_group_member' });
+  } catch { return res.status(502).json({ error: 'telegram_membership_check_failed' }); }
+  const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(String(req.body.id));
+  if (!user) return res.status(403).json({ error: 'telegram_account_not_linked' });
+  const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+  const { password: _p, telegram_id: _tid, ...safeUser } = user;
   res.json({ token, user: safeUser });
 });
 

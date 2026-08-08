@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "status": "approved_replay_test",
+  "source": "trips/japan-2025/trip.config.json",
+  "organizer": {
+    "telegram_id": 391627336,
+    "role": "trip_admin"
+  },
+  "trip": {
+    "title": "Japan 2025 — אבא ובת",
+    "departure": "2026-09-05T20:00:00+03:00",
+    "return_date": "2026-09-16",
+    "party_size": 2,
+    "origin_country": "Israel"
+  },
+  "participants": [
+    {
+      "username": "eitan",
+      "name": "איתן"
+    },
+    {
+      "username": "noa",
+      "name": "נועה"
+    }
+  ],
+  "phases": [
+    {
+      "id": "tokyo",
+      "title": "טוקיו",
+      "start": "2026-09-06",
+      "end": "2026-09-10",
+      "accommodation_address": "Asakusa / Ueno area, Tokyo"
+    },
+    {
+      "id": "hakone",
+      "title": "האקונה / פוג׳י",
+      "start": "2026-09-10",
+      "end": "2026-09-11",
+      "accommodation_address": "Hakone-machi, Kanagawa"
+    },
+    {
+      "id": "kyoto",
+      "title": "קיוטו",
+      "start": "2026-09-11",
+      "end": "2026-09-13",
+      "accommodation_address": "Gion / Higashiyama area, Kyoto"
+    },
+    {
+      "id": "osaka",
+      "title": "אוסקה",
+      "start": "2026-09-13",
+      "end": "2026-09-16",
+      "accommodation_address": "Namba, Chuo-ku, Osaka"
+    }
+  ],
+  "assets": {
+    "hero_images": "provided_in_source_config",
+    "trivia_questions": "not_provided_do_not_generate"
+  },
+  "approval": {
+    "approved_by_telegram_id": 391627336,
+    "provisioning_allowed": true
+  }
+}

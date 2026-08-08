@@ -320,7 +320,7 @@ function buildMcpServer() {
           'The site restarts — anyone using it right now gets a brief outage.',
           'The site begins serving the new trip. The previous trip\'s config is untouched on disk and can be switched back.',
           'Accounts, photos, comments, ratings and trivia scores live in the SQLite database, which is NOT per-trip — the previous trip\'s data stays in the same database.',
-          'Every participant in the new trip is seeded with the default password 1234 on first boot.',
+          'On a genuinely fresh database, participants get a password only if SEED_PASSWORD is set in .env — otherwise each gets an independent random password and password login stays unavailable until they sign in via Telegram/Google and set their own.',
         ],
         confirmation_token: token,
         token_expires_in_seconds: ACTIVATION_TTL_MS / 1000,

@@ -29,6 +29,7 @@ export async function startTestServer() {
         IMMICH_URL: '',
         IMMICH_API_KEY: '',
         HERMES_API_KEY: 'test-hermes-key',
+        SEED_PASSWORD: '1234',
       },
     });
 
@@ -93,12 +94,19 @@ export async function api(path, { method = 'GET', body, auth = false, token, api
 
 /** Login as alice (default test user) and cache the token for subsequent api() calls. */
 export async function loginAsAlice() {
-  const res = await api('/api/auth/login', {
-    method: 'POST',
-    body: { username: 'alice', password: '1234' },
-  });
-  if (!res.ok) throw new Error(`Login failed: ${res.status}`);
-  const { token } = await res.json();
-  _token = token;
-  return token;
+  // HTTP readiness is logged before async bcrypt user seeding completes.
+  // Retry the normal login briefly so parallel test files cannot race it.
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const res = await api('/api/auth/login', {
+      method: 'POST',
+      body: { username: 'alice', password: '1234' },
+    });
+    if (res.ok) {
+      const { token } = await res.json();
+      _token = token;
+      return token;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('Login as alice never succeeded');
 }

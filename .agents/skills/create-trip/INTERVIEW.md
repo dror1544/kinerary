@@ -423,11 +423,21 @@ is the deliverable, and it's the step most likely to get skipped.
 Produce it as one short message, in the trip's `defaultLang`, covering:
 
 **1. How each person gets in the first time.** Their username (from
-`participants[]`), the site URL, and the seeded password — every participant
-starts on the same default, `1234`. Say plainly that it is a doorknob, not a
-lock: the first thing each person should do is open the side menu → their
-avatar → 🔑 Change password. Never send a real password around; the seeded
-one exists precisely so nothing sensitive is in the forwarded message.
+`participants[]`) and the site URL, plus however this trip actually gets
+people in the door:
+
+- If Telegram or Google login is configured for this trip, that's the first
+  login — nothing to hand out, no shared secret to forward.
+- Otherwise, only if the operator deliberately set `SEED_PASSWORD` before
+  first boot does a shared password exist at all — say plainly that it is a
+  doorknob, not a lock, and that the first thing each person should do is
+  open the side menu → their avatar → 🔑 Change password. Never send a real
+  password around.
+- If `SEED_PASSWORD` was left unset (the default, and the recommended
+  posture once Telegram/Google is live), each participant instead gets an
+  independent, unrecoverable random password — meaning password login is
+  simply unavailable to them until they sign in another way and set their
+  own. Don't promise a shared password exists in this case.
 
 **2. How to add the bot to the group chat.** The persona name from §9.1, and
 that it belongs in the family's existing group — not a new one. Also state the

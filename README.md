@@ -64,12 +64,14 @@ TRIP_DIR_HOST=./trips/<slug> docker compose up -d --build
 # → http://localhost:8081 (see docker-compose.override.yml for the port)
 ```
 
-**Logging in:** every participant is seeded with the same default password,
-**`1234`** — log in as any of them (username from `trip.config.json`) to look
-around. Change it from the avatar screen (click your avatar in the side
-menu → "🔑 Change password") before this trip is ever actually shared with
-real people; the seeded password is meant to get you in the door once, not
-to stay in place.
+**Logging in:** for local previewing, set `SEED_PASSWORD=1234` (or any value
+you like) in `.env` before the first boot, then log in as any participant
+(username from `trip.config.json`) with that password to look around. Leave
+`SEED_PASSWORD` unset for a trip that's actually going to real people — each
+participant then gets an independent, unrecoverable random password instead
+of one shared, guessable default, and password login stays unavailable for
+them until they sign in via Telegram or Google and set their own from the
+avatar screen (click your avatar in the side menu → "🔑 Change password").
 
 ### Connecting Google Sign-In (optional)
 
@@ -93,6 +95,15 @@ Without a Client ID, the Google button simply doesn't render — nothing else
 changes. The `/create-trip` interview can walk you through this same setup
 when scaffolding a new trip; see [FRAMEWORK.md](FRAMEWORK.md) for the full
 technical details (schema, endpoints, security model).
+
+### Connecting Telegram Login SSO (optional)
+
+Telegram Login can sign an already-configured participant into the same site
+session after the server verifies both Telegram's signed callback and current
+membership in a configured group. It is disabled by default; see
+[docs/telegram-sso.md](docs/telegram-sso.md) for the required environment
+values and participant binding. Do not put bot tokens, group IDs, or deployed
+site details in the repository.
 
 ---
 

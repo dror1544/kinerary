@@ -56,4 +56,7 @@ export const RENDER_TARGETS_HTML = `
   <div id="hotel-ny"></div>
   <div id="hotel-colorado"></div>
   <div id="photo-uploads"></div>
+  <div id="telegram-signin-wrap" style="display:none">
+    <div id="telegram-signin-btn"></div>
+  </div>
 `;

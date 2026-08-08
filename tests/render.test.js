@@ -220,3 +220,67 @@ describe('short_id alias in render outputs', () => {
       '"co" alias not found — short_id alias not applied');
   });
 });
+
+// ── renderTelegramLogin ─────────────────────────────────────────────────────────
+describe('renderTelegramLogin()', () => {
+  test('stays hidden when no bot username is configured', () => {
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    ctx.renderTelegramLogin(null);
+    const wrap = document.getElementById('telegram-signin-wrap');
+    assert.equal(wrap.style.display, 'none');
+    assert.equal(document.getElementById('telegram-signin-btn').innerHTML, '');
+  });
+
+  test('shows the wrap and injects the widget script when a bot username is present', () => {
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    ctx.renderTelegramLogin('my_trip_bot');
+    const wrap = document.getElementById('telegram-signin-wrap');
+    assert.equal(wrap.style.display, 'flex');
+    const script = document.querySelector('#telegram-signin-btn script');
+    assert.ok(script, 'expected an injected <script> in the mount point');
+    assert.equal(script.getAttribute('data-telegram-login'), 'my_trip_bot');
+    assert.equal(script.getAttribute('data-onauth'), 'onTelegramAuth(user)');
+  });
+
+  test('does not re-inject the script on a repeat call for the same bot', () => {
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    ctx.renderTelegramLogin('my_trip_bot');
+    ctx.renderTelegramLogin('my_trip_bot');
+    const scripts = document.querySelectorAll('#telegram-signin-btn script');
+    assert.equal(scripts.length, 1, 'expected exactly one injected script, not a duplicate');
+  });
+
+  test('re-injects when the bot username changes', () => {
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    ctx.renderTelegramLogin('bot_one');
+    ctx.renderTelegramLogin('bot_two');
+    const script = document.querySelector('#telegram-signin-btn script');
+    assert.equal(script.getAttribute('data-telegram-login'), 'bot_two');
+  });
+});
+
+// ── telegramLoginErrorMessage ─────────────────────────────────────────────────
+describe('telegramLoginErrorMessage()', () => {
+  const tr = {
+    err_telegram_not_configured: 'not configured',
+    err_telegram_invalid: 'invalid',
+    err_telegram_not_member: 'not a member',
+    err_telegram_check_failed: 'check failed',
+    err_telegram_not_linked: 'not linked',
+    err_wrong: 'generic wrong',
+  };
+
+  test('maps each known backend error code to its message', () => {
+    const { ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    assert.equal(ctx.telegramLoginErrorMessage('telegram_not_configured', tr), 'not configured');
+    assert.equal(ctx.telegramLoginErrorMessage('invalid_telegram_login', tr), 'invalid');
+    assert.equal(ctx.telegramLoginErrorMessage('not_group_member', tr), 'not a member');
+    assert.equal(ctx.telegramLoginErrorMessage('telegram_membership_check_failed', tr), 'check failed');
+    assert.equal(ctx.telegramLoginErrorMessage('telegram_account_not_linked', tr), 'not linked');
+  });
+
+  test('falls back to the generic error message for an unknown code', () => {
+    const { ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    assert.equal(ctx.telegramLoginErrorMessage('some_future_code', tr), 'generic wrong');
+  });
+});

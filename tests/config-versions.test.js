@@ -23,7 +23,7 @@ function bootOnce(port, env) {
   return new Promise((resolve, reject) => {
     const proc = spawn('node', [SERVER_JS], {
       cwd: SERVER_DIR,
-      env: { ...process.env, PORT: String(port), JWT_SECRET: 'test-secret-000', IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: 'test-hermes-key', ...env },
+      env: { ...process.env, PORT: String(port), JWT_SECRET: 'test-secret-000', IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: 'test-hermes-key', SEED_PASSWORD: '1234', ...env },
     });
     let ready = false;
     proc.stdout.on('data', chunk => {
