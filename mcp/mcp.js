@@ -30,6 +30,8 @@ const { z }                  = require('zod');
 const express                = require('express');
 const fetch                  = require('node-fetch');
 const crypto                 = require('crypto');
+const { execFile }           = require('child_process');
+const pdfParse               = require('pdf-parse');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -474,36 +476,86 @@ Return ONLY the JSON object, no commentary.`;
 // no Hermes profile can use this server through its normal setup path at
 // all, not just a scripted one (confirmed against hermes_cli/mcp_config.py's
 // _bearer_auth_headers()).
-function requireKey(req, res, next) {
+function presentedKey(req) {
   const authHeader = req.headers['authorization'] || '';
   const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const key = req.headers['x-api-key'] || req.query.key || bearerKey;
-  // Constant-time compare — matches provision.js's requireKey. This server
-  // is the one meant to be public, so its key deserves the same treatment.
-  const a = Buffer.from(String(key || ''));
-  const b = Buffer.from(API_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  return req.headers['x-api-key'] || req.query.key || bearerKey || '';
+}
+
+// Constant-time compare — matches provision.js's requireKey. This server is
+// the one meant to be public, so its key deserves the same treatment.
+function keyMatches(presented, expected) {
+  const a = Buffer.from(String(presented || ''));
+  const b = Buffer.from(String(expected || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireKey(req, res, next) {
+  if (!keyMatches(presentedKey(req), API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 
-app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, res) => {
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set for trip-mcp' });
+// /extract is called by the trip site itself (server.js's /api/bookings/extract
+// proxy), not by an agent — it has no MCP_API_KEY to present, only the
+// TRIP_API_KEY it already shares with this server (the same value setup-mcp.sh
+// syncs as the site's own HERMES_API_KEY). Accept either: an agent hitting this
+// route directly still works, and the site doesn't need a third secret minted
+// and kept in sync just to unlock one HTTP route.
+function requireSiteOrAgentKey(req, res, next) {
+  const key = presentedKey(req);
+  if (!keyMatches(key, API_KEY) && !keyMatches(key, TRIP_API_KEY)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+// Dedicated, no-skills, all-toolsets-disabled Hermes profile (see
+// mcp/README.md's "Extract Details with AI" section for how to create one) —
+// not any trip's interviewer/companion profile. Those hold real tool access
+// (terminal, file, memory, MCP servers); reusing one here would mean a
+// stranger's uploaded "confirmation PDF" gets a shot at a full agent via
+// prompt injection. Left unset, the feature is simply off — no default
+// profile name is assumed.
+const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || '';
+const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
+
+async function extractPdfText(buf) {
+  const { text } = await pdfParse(buf);
+  return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
+}
+
+// One-shot, non-interactive call: -q for the single query, -Q for
+// script-friendly output (no banner/spinner), --safe-mode to also strip
+// AGENTS.md/memory/plugin injection on top of the profile's own
+// already-disabled toolsets, --reasoning none so stdout is bare JSON instead
+// of a reasoning-trace panel. No shell involved (execFile, not exec) — the
+// extracted document text reaches this as a single argv entry, never
+// interpolated into a command string.
+function runHermesExtract(prompt) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      HERMES_BIN,
+      ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
+      { timeout: 45000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (!err) return resolve(stdout);
+        if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));
+        reject(err);
+      }
+    );
+  });
+}
+
+app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
 
   const { url, pdf_base64, pdf_name } = req.body || {};
   if (!url && !pdf_base64) return res.status(400).json({ error: 'Provide url or pdf_base64' });
 
-  const Anthropic = require('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: ANTHROPIC_KEY });
-
   try {
-    let userContent;
+    let content;
 
     if (pdf_base64) {
-      userContent = [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdf_base64 } },
-        { type: 'text', text: `Extract booking details from this PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}.` },
-      ];
+      const text = await extractPdfText(Buffer.from(pdf_base64, 'base64'));
+      content = `Content to extract from — PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}:\n\n${text}`;
     } else {
       const r = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TripBot/1.0)' },
@@ -511,27 +563,18 @@ app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, re
       });
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('application/pdf')) {
-        const buf = await r.buffer();
-        userContent = [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') } },
-          { type: 'text', text: 'Extract booking details from this PDF confirmation.' },
-        ];
+        const text = await extractPdfText(await r.buffer());
+        content = `Content to extract from — PDF confirmation:\n\n${text}`;
       } else {
         const html = await r.text();
         const plain = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 10000);
-        userContent = [{ type: 'text', text: `URL: ${url}\n\nPage content:\n${plain}\n\nExtract the booking information.` }];
+        content = `URL: ${url}\n\nContent to extract from — page content:\n\n${plain}`;
       }
     }
 
-    const msg = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
-      system: await buildExtractSystem(),
-      messages: [{ role: 'user', content: userContent }],
-    });
-
-    const text = (msg.content[0]?.text || '').trim();
-    const m = text.match(/\{[\s\S]*\}/);
+    const system = await buildExtractSystem();
+    const stdout = await runHermesExtract(`${system}\n\n---\n\n${content}`);
+    const m = stdout.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('No JSON in response');
     res.json(JSON.parse(m[0]));
   } catch (e) {
