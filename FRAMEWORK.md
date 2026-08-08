@@ -43,6 +43,7 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 | 23 | **PWA** | Installable on iPhone/Android home screen |
 | 24 | **Config-driven** | All trip data in `trip.config.json`; served via `/api/config`; no code changes needed for a new trip |
 | 25 | **Country info** | Emergency numbers, currency, calling code per destination country — auto-fetched live via `scripts/country-info.js`, not hardcoded |
+| 26 | **Agent integration (MCP)** | Standalone MCP server (`mcp/`) giving an agent read/write access to a trip's bookings, photos, tasks, ratings, and comments — local agent or remote connector (e.g. Claude Cowork); see [Agent Integration (MCP)](#agent-integration-mcp) |
 
 ---
 

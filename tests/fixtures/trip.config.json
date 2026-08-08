@@ -17,7 +17,8 @@
       "needs": [
         { "type": "medical", "severity": "firm", "visibility": "group", "text": { "he": "סוכרת מסוג 1", "en": "Type 1 diabetes" } },
         { "type": "unrecognized-type", "severity": "crticial", "text": { "en": "Missing Hebrew text on purpose, for the malformed-needs test" } },
-        { "type": "dietary", "severity": "firm", "visibility": "porcupine", "text": { "he": "צמחוני", "en": "Vegetarian" } }
+        { "type": "dietary", "severity": "firm", "visibility": "porcupine", "text": { "he": "צמחוני", "en": "Vegetarian" } },
+        { "type": "dietary", "severity": "crticial", "text": { "he": "ללא גלוטן", "en": "Gluten free" } }
       ]
     }
   ],
@@ -126,5 +127,21 @@
   "trivia": {
     "total_questions": 5,
     "participants": ["alice", "bob"]
+  },
+  "agent": {
+    "name": "ויקטור",
+    "name_en": "Victor",
+    "gender": "male",
+    "tone": "porcupine",
+    "default_language": "he",
+    "organizer": "alice",
+    "timezone": "Asia/Jerusalem",
+    "proactive": { "morning_briefing": "07:30", "flight_changes": true, "unknown_key": true },
+    "standing_instructions": [
+      { "visibility": "group", "text": { "he": "רכב שכור — לציין חניה", "en": "Rental car — mention parking" } },
+      { "visibility": "organizer", "text": { "he": "נושא רגיש", "en": "Sensitive topic to avoid" } },
+      { "text": { "he": "ללא visibility — ברירת מחדל organizer", "en": "No visibility — defaults to organizer" } },
+      { "visibility": "grup", "text": { "he": "visibility שגוי", "en": "Typo'd visibility — must fail safe to organizer" } }
+    ]
   }
 }

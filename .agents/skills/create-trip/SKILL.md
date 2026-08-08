@@ -24,6 +24,12 @@ dev server currently has live (`docker-compose.yml`'s default
 live with a new trip means repointing `TRIP_DIR`/`TRIP_DIR_HOST`, covered
 below — never overwriting `trip/` directly.
 
+> **`$SKILL_DIR`** below means the directory this file is in. There is one copy
+> of this skill; `.claude/skills/create-trip` and `.agents/skills/create-trip`
+> are the same directory via a symlink, so the commands work unchanged from
+> either path. Substitute whichever one you were invoked from, or just use the
+> path you read this file from.
+
 ## Prerequisites
 
 None beyond what the repo already needs — Node (`node --version` — this
@@ -43,7 +49,7 @@ install --prefix server`). No new dependencies were added for this skill.
    stub).
 3. **Generate:**
    ```bash
-   node .claude/skills/create-trip/driver.mjs generate /path/to/answers.json
+   node "$SKILL_DIR"/driver.mjs generate /path/to/answers.json
    ```
    Validates first (missing title, no participants, a family pointing at an
    unknown username, duplicate phase ids, etc. all fail loudly *before*
@@ -51,7 +57,7 @@ install --prefix server`). No new dependencies were added for this skill.
    `trips/<slug>/` unless you pass `--force`.
 4. **Verify — actually run it, don't just eyeball the JSON:**
    ```bash
-   node .claude/skills/create-trip/driver.mjs verify <slug>
+   node "$SKILL_DIR"/driver.mjs verify <slug>
    ```
    This boots the real `server/server.js` against the new trip dir on a
    throwaway port + temp `DATA_DIR`, hits `/api/health` and `/api/config`
@@ -104,10 +110,14 @@ won't serve the site's HTML/CSS/JS:
 TRIP_DIR_HOST=./trips/<slug> docker compose up -d --build
 # then open http://localhost:8081 in a real browser (see docker-compose.override.yml for the port)
 ```
-Log in as any participant (username from the trip's `trip.config.json`)
-with the seeded default password **`1234`** — verified working end-to-end
+To log in with a password for this manual check, set `SEED_PASSWORD=1234`
+(or any value) in `.env` before first boot — verified working end-to-end
 while building this skill (booted a real isolated instance, confirmed
-`/api/health`, the real HTML, and `/api/config`'s participant list).
+`/api/health`, the real HTML, and `/api/config`'s participant list). Leave
+`SEED_PASSWORD` unset for any trip that's actually going to real people:
+each participant then gets an independent random password instead of one
+shared default, and password login stays unavailable until they sign in via
+Telegram/Google and set their own.
 
 `TRIP_DIR=./trips/<slug> node server/server.js` alone only gets you the raw
 JSON API on whatever `PORT` you set — fine for `curl`-ing `/api/config`
@@ -116,7 +126,7 @@ directly, not for viewing the site.
 ## Test
 
 ```bash
-node .claude/skills/create-trip/driver.mjs verify <slug>   # this skill's own driver
+node "$SKILL_DIR"/driver.mjs verify <slug>   # this skill's own driver
 cd tests && ./run-tests.sh                                  # framework's full suite (71 tests as of this writing)
 ```
 
@@ -237,6 +247,13 @@ cd tests && ./run-tests.sh                                  # framework's full s
   are the only fields `generate` treats as hard-required — everything else
   degrades to a sane default. If validation fails, the message names the
   exact missing field.
-- **`verify` hangs then prints "server did not print ready line within
-  10s"**: usually means `server/node_modules` isn't installed —
+- **`verify` hangs then prints "server did not print ready line within 10s"**: usually means `server/node_modules` isn't installed —
   `npm install --prefix server`.
+- **macOS 26 Command Line Tools can fail to compile `better-sqlite3` with `fatal error: 'climits' file not found`**: its libc++ headers may exist only under the SDK, while the CLT compiler does not search that SDK path. Install JavaScript dependencies without lifecycle scripts, then build the native addon with the missing include path explicitly:
+  ```bash
+  npm install --prefix server --ignore-scripts
+  SDK="$(xcrun --show-sdk-path)"
+  make -C server/node_modules/better-sqlite3/build BUILDTYPE=Release \
+    "CXXFLAGS.target=-isystem $SDK/usr/include/c++/v1"
+  ```
+  Confirm the resulting addon loads by rerunning `node "$SKILL_DIR"/driver.mjs verify <slug>`.

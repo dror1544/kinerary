@@ -10,6 +10,7 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
+const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 
 const app = express();
 app.use(express.json());
@@ -20,6 +21,11 @@ const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
+// Optional shared onboarding password for a fresh DB's seeded users. Leave
+// unset in production once Telegram/Google login is live — each participant
+// then gets an independent random password instead of one shared, guessable
+// default (see initData()).
+const SEED_PASSWORD = process.env.SEED_PASSWORD || '';
 const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', isAgent: true };
 
 // Optional: "Sign in with Google" as an alternate login method bound to an
@@ -27,6 +33,42 @@ const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', is
 // simply absent; the site still works password-only.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+
+// Telegram Login is verified server-side and additionally bound to live
+// membership in the configured trip group. No bot secret reaches the browser.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+// Mutable: Telegram gives a bot no way to create or discover a group on its
+// own (confirmed against the Bot API docs — no such method exists), so the
+// chat_id can't be known at deploy time the way the token/username can. See
+// POST /api/agent/telegram-group, the one runtime writer of this value.
+let TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org').replace(/\/$/, '');
+const TELEGRAM_AUTH_MAX_AGE_SECONDS = Number(process.env.TELEGRAM_AUTH_MAX_AGE_SECONDS || 86400);
+// Public @handle only — never the token. Safe to serve pre-auth so the login
+// screen knows which widget to render.
+const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
+const telegramEnabled = () => Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+function verifyTelegramLogin(payload) {
+  const { hash, ...fields } = payload || {};
+  if (!hash || !fields.id || !fields.auth_date) return false;
+  const now = Math.floor(Date.now() / 1000), authDate = Number(fields.auth_date);
+  if (!Number.isSafeInteger(authDate) || authDate > now + 60 || now - authDate > TELEGRAM_AUTH_MAX_AGE_SECONDS) return false;
+  const check = Object.keys(fields).sort().map(k => `${k}=${fields[k]}`).join('\n');
+  const secret = crypto.createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest();
+  const expected = crypto.createHmac('sha256', secret).update(check).digest('hex');
+  return hash.length === expected.length && crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected));
+}
+async function telegramChatMemberStatus(chatId, userId) {
+  const url = `${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${encodeURIComponent(userId)}`;
+  return fetch(url).then(r => r.json());
+}
+function isActiveMemberReply(reply) {
+  const status = reply?.result?.status;
+  return reply?.ok && ['creator', 'administrator', 'member', 'restricted'].includes(status) && !(status === 'restricted' && reply.result?.is_member === false);
+}
+async function telegramActiveMember(userId) {
+  return isActiveMemberReply(await telegramChatMemberStatus(TELEGRAM_CHAT_ID, userId));
+}
 async function verifyGoogleToken(idToken) {
   const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
   return ticket.getPayload(); // { sub, email, ... }
@@ -35,7 +77,25 @@ async function verifyGoogleToken(idToken) {
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
-const AVATARS_DIR = path.join(__dirname, 'avatars');
+// Not under DATA_DIR: nginx serves this directory as static content directly
+// (docker-compose mounts ./site/avatars to /app/avatars here), so it has to
+// live where the web server can reach it, not in the app's private data
+// volume. Overridable so tests don't write into the real checked-out dir.
+const AVATARS_DIR = process.env.AVATARS_DIR || path.join(__dirname, 'avatars');
+// Where systemd's EnvironmentFile= points in production (one level above
+// server/, alongside docker-compose.yml). Overridable so tests don't write
+// into the real checked-out .env. The only value ever written back here is
+// TELEGRAM_CHAT_ID (see POST /api/agent/telegram-group) — every other secret
+// stays operator-set, deploy-time only.
+const ENV_FILE = process.env.ENV_FILE_PATH || path.join(__dirname, '..', '.env');
+function persistEnvVar(key, value) {
+  let content = '';
+  try { content = fs.readFileSync(ENV_FILE, 'utf8'); } catch { /* no .env yet — fine, we're creating it */ }
+  const line = `${key}=${value}`;
+  const pattern = new RegExp(`^${key}=.*$`, 'm');
+  content = pattern.test(content) ? content.replace(pattern, line) : content.replace(/\n?$/, '\n') + line + '\n';
+  fs.writeFileSync(ENV_FILE, content.replace(/^\n/, ''));
+}
 const USERS_FILE  = path.join(DATA_DIR, 'users.json');
 const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
 const PHOTOS_FILE  = path.join(DATA_DIR, 'photos.json');
@@ -62,19 +122,76 @@ try {
 // need must not leak its category through this side door around the
 // visibility rule below. `severity` alone doesn't identify the category.
 const CONFIG_WARNINGS = [];
+// Two audiences, two levels of detail. The server log is organizer-only by
+// definition (you need shell on the box to read it), so it gets the offending
+// value verbatim — that's what makes a typo findable. The API response does
+// not: it is authRequired but NOT organizer-scoped, so every authed kid can
+// read it. Echoing a bad type there would defeat the visibility rule below,
+// since "medicl" identifies the category just as well as "medical" does.
+const redact = (label, value, note) => ({
+  log:  `${label} "${value}"${note ? ` ${note}` : ''}`,
+  api:  `${label} (value withheld — check the server log)${note ? ` ${note}` : ''}`,
+});
 (TRIP_CONFIG.participants || []).forEach(p => {
   (p.needs || []).forEach(n => {
     const issues = [];
-    if (!NEED_TYPES.includes(n.type)) issues.push(`unknown type "${n.type}"`);
-    if (!NEED_SEVERITIES.includes(n.severity)) issues.push(`unknown severity "${n.severity}" (treated as critical)`);
-    if (n.visibility !== undefined && !VISIBILITIES.includes(n.visibility)) issues.push(`unknown visibility "${n.visibility}" (treated as organizer-only)`);
-    if (!n.text?.he || !n.text?.en) issues.push('missing bilingual text');
+    if (!NEED_TYPES.includes(n.type)) issues.push(redact('unknown type', n.type));
+    if (!NEED_SEVERITIES.includes(n.severity)) issues.push(redact('unknown severity', n.severity, '(treated as critical)'));
+    if (n.visibility !== undefined && !VISIBILITIES.includes(n.visibility)) issues.push(redact('unknown visibility', n.visibility, '(treated as organizer-only)'));
+    if (!n.text?.he || !n.text?.en) issues.push({ log: 'missing bilingual text', api: 'missing bilingual text' });
     for (const issue of issues) {
-      console.warn(`trip.config.json: participant "${p.username}" need — ${issue}`);
-      CONFIG_WARNINGS.push({ username: p.username, severity: n.severity, issue });
+      console.warn(`trip.config.json: participant "${p.username}" need — ${issue.log}`);
+      // Normalized, not raw. A valid severity is safe to return — it says how
+      // urgent, never what category — but the raw field is whatever the config
+      // author typed, and "crticial" is a config value like any other. The
+      // invariant this endpoint holds is simply: no raw config values, ever.
+      CONFIG_WARNINGS.push({ username: p.username, severity: normalizeSeverity(n.severity), issue: issue.api });
     }
   });
 });
+
+// Same diagnostic treatment for the `agent` block. Note what is deliberately
+// NOT reported: the instruction text itself, and which instructions resolved
+// to organizer-only. /api/config/warnings is authRequired but not
+// organizer-scoped, so echoing either would route sensitive standing
+// instructions straight around the visibility filter below. Index only.
+(() => {
+  const a = TRIP_CONFIG.agent;
+  if (!a) return;
+  const issues = [];
+  if (!a.name) issues.push('missing name (the family has nothing to call the bot)');
+  // Blanket rule, applied even to fields that look harmless: NO raw
+  // trip.config.json value reaches this endpoint. Judging each field on its
+  // merits is how the first three leaks happened — a "cosmetic" tone still
+  // echoed a string an author chose, and the exemption list has to be
+  // re-audited every time a field is added. One invariant is checkable at a
+  // glance; five exceptions are not. The server log keeps every value.
+  if (a.tone !== undefined && !AGENT_TONES.includes(a.tone)) issues.push(redact('unknown tone', a.tone, '(treated as warm)'));
+  if (a.gender !== undefined && !AGENT_GENDERS.includes(a.gender)) issues.push(redact('unknown gender', a.gender, '(treated as neutral)'));
+  for (const org of normalizeOrganizers(a)) {
+    if (!(TRIP_CONFIG.participants || []).some(p => p.username === org)) {
+      issues.push(redact('agent.organizer(s)', org, 'is not a known participant username'));
+    }
+  }
+  for (const key of Object.keys(a.proactive || {})) {
+    if (!PROACTIVE_KEYS.includes(key)) issues.push(redact('unknown proactive key', key, '(ignored)'));
+  }
+  // Standing instructions are the sensitive half — index and problem only,
+  // never the text and never the resolved visibility.
+  (a.standing_instructions || []).forEach((ins, i) => {
+    if (ins.visibility !== undefined && !VISIBILITIES.includes(ins.visibility)) {
+      issues.push(redact(`standing_instructions[${i}]: unknown visibility`, ins.visibility, '(treated as organizer-only)'));
+    }
+    if (!ins.text?.he || !ins.text?.en) {
+      const m = `standing_instructions[${i}]: missing bilingual text`;
+      issues.push({ log: m, api: m });
+    }
+  });
+  for (const issue of issues) {
+    console.warn(`trip.config.json: agent — ${issue.log}`);
+    CONFIG_WARNINGS.push({ scope: 'agent', issue: issue.api });
+  }
+})();
 
 // ── DATABASE INIT ─────────────────────────────────────────────────────────────
 const db = new Database(DB_FILE);
@@ -224,6 +341,7 @@ try {
 // ── USER SEED DATA ────────────────────────────────────────────────────────────
 const SEED_USERS = (TRIP_CONFIG.participants || []).map(p => ({
   username: p.username, name: p.name, name_en: p.name_en,
+  telegram_id: p.telegram_id ? String(p.telegram_id) : null,
   age: p.age, family: p.family, color: p.color,
 }));
 
@@ -238,9 +356,50 @@ try { db.exec('ALTER TABLE bookings ADD COLUMN pkpass_file TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
+try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
 // Backfill name_en for any existing users that don't have it yet
 for (const u of SEED_USERS) {
   db.prepare('UPDATE users SET name_en = ? WHERE username = ? AND (name_en IS NULL OR name_en = \'\')').run(u.name_en, u.username);
+}
+// Unlike name_en, telegram_id is synced from config on every boot, not just
+// filled when blank — trip.config.json stays the live source of truth, since
+// an organizer normally adds/corrects participants' Telegram IDs long after
+// the DB already exists, not before first boot.
+for (const u of SEED_USERS) {
+  try {
+    db.prepare('UPDATE users SET telegram_id = ? WHERE username = ?').run(u.telegram_id, u.username);
+  } catch (e) {
+    console.error(`Skipped telegram_id sync for ${u.username}: ${e.message}`);
+  }
+}
+
+// Inserts one brand-new participant's row — used by POST /api/agent/participants
+// to add someone to an already-running trip without a restart. Deliberately
+// separate from the bulk boot-time seed path above: that path seeds a whole
+// config's worth of users in one transaction with its own SEED_PASSWORD/
+// random-password branching, and unifying it with a single-row insert risks
+// the already-tested boot sequence for no real benefit — both just happen to
+// write the same row shape, which is a schema fact, not shared logic.
+function insertParticipantUser(p, passwordHash) {
+  db.prepare(
+    'INSERT INTO users (username, name, name_en, telegram_id, age, family, color, password) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(p.username, p.name, p.name_en || null, p.telegram_id || null, p.age ?? null, p.family || null, p.color || null, passwordHash);
+}
+
+// Writes the in-memory TRIP_CONFIG back to trip.config.json and snapshots it
+// into trip_config_versions, same as boot-time versioning does. Shared by
+// every runtime config mutation (add/bind/remove participant) so there's one
+// place that defines what "persisting a config change" means.
+function persistConfigChange() {
+  TRIP_CONFIG_RAW = JSON.stringify(TRIP_CONFIG, null, 2);
+  fs.writeFileSync(path.join(TRIP_DIR, 'trip.config.json'), TRIP_CONFIG_RAW);
+  try {
+    const hash = crypto.createHash('sha256').update(TRIP_CONFIG_RAW).digest('hex');
+    const latest = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get();
+    const nextVersion = (latest?.version || 0) + 1;
+    db.prepare('INSERT INTO trip_config_versions (version, content, hash) VALUES (?, ?, ?)').run(nextVersion, TRIP_CONFIG_RAW, hash);
+  } catch (e) { console.error('trip config version snapshot failed:', e.message); }
 }
 
 // ── STARTUP MIGRATION ─────────────────────────────────────────────────────────
@@ -252,20 +411,35 @@ async function initData() {
       try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return null; }
     })();
     const insert = db.prepare(
-      'INSERT OR IGNORE INTO users (username, name, name_en, age, family, color, password) VALUES (?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO users (username, name, name_en, telegram_id, age, family, color, password) VALUES (?,?,?,?,?,?,?,?)'
     );
     if (existing && existing.length > 0) {
       console.log('Migrating users from users.json…');
       const seedMap = Object.fromEntries(SEED_USERS.map(u => [u.username, u.name_en]));
       const tx = db.transaction(() => {
-        for (const u of existing) insert.run(u.username, u.name, seedMap[u.username] || null, u.age, u.family, u.color, u.password);
+        for (const u of existing) insert.run(u.username, u.name, seedMap[u.username] || null, null, u.age, u.family, u.color, u.password);
+      });
+      tx();
+    } else if (SEED_PASSWORD) {
+      // Operator-chosen shared onboarding password (e.g. local/dev, or a
+      // trip where password login is still the plan for some participants).
+      // Never a hardcoded, source-visible default — deployments must opt in.
+      console.log('Seeding users with the configured SEED_PASSWORD — change it from the avatar screen…');
+      const hash = await bcrypt.hash(SEED_PASSWORD, 10);
+      const tx = db.transaction(() => {
+        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.telegram_id, u.age, u.family, u.color, hash);
       });
       tx();
     } else {
-      console.log('Seeding users with default password (1234) — change it from the avatar screen…');
-      const hash = await bcrypt.hash('1234', 10);
+      // No shared secret to leak or guess: each participant gets an
+      // independent, unrecoverable random password. Password login is
+      // effectively unavailable until a participant signs in another way
+      // (Telegram/Google) and sets their own via PUT /api/auth/password.
+      console.log('SEED_PASSWORD not set — seeding users with independent random passwords (password login is unavailable until each participant signs in via Telegram/Google and sets their own).');
+      const hashes = {};
+      for (const u of SEED_USERS) hashes[u.username] = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
       const tx = db.transaction(() => {
-        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.age, u.family, u.color, hash);
+        for (const u of SEED_USERS) insert.run(u.username, u.name, u.name_en, u.telegram_id, u.age, u.family, u.color, hashes[u.username]);
       });
       tx();
     }
@@ -371,14 +545,19 @@ function authRequired(req, res, next) {
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, immich: !!(IMMICH_URL && IMMICH_KEY), googleClientId: GOOGLE_CLIENT_ID || null });
+  res.json({
+    ok: true,
+    immich: !!(IMMICH_URL && IMMICH_KEY),
+    googleClientId: GOOGLE_CLIENT_ID || null,
+    telegramBotUsername: telegramEnabled() ? (TELEGRAM_BOT_USERNAME || null) : null,
+  });
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
-// Strip PIN codes and organizer-only needs before serving to clients — every
-// family member is authed, including kids and one-off guests, so auth alone
-// isn't a safety boundary for either field. Shared by /api/config and
-// /api/config/versions/:version.
+// Strip PIN codes, organizer-only needs, and organizer-only agent standing
+// instructions before serving to clients — every family member is authed,
+// including kids and one-off guests, so auth alone isn't a safety boundary for
+// any of these fields. Shared by /api/config and /api/config/versions/:version.
 function sanitizeConfig(cfg) {
   const safe = JSON.parse(JSON.stringify(cfg));
   if (safe.phases) safe.phases.forEach(p => {
@@ -387,20 +566,44 @@ function sanitizeConfig(cfg) {
   });
   if (safe.bookings?.hotels) safe.bookings.hotels.forEach(h => delete h.pin);
   if (safe.participants) safe.participants.forEach(p => {
+    // Identity links are server-side authentication material, never trip UI data.
+    delete p.telegram_id;
     delete p.pin;
     if (p.needs) {
       p.needs = p.needs
         .filter(n => normalizeVisibility(n.visibility, n.type) !== 'organizer')
         .map(n => ({ ...n, severity: normalizeSeverity(n.severity) }));
+      // An empty array is itself a disclosure: a participant with no `needs`
+      // key looks different from one whose needs were all filtered out, which
+      // tells an unauthenticated reader exactly who has something hidden.
+      if (!p.needs.length) delete p.needs;
     }
   });
+  if (safe.agent) safe.agent = publicAgent(safe.agent);
   return safe;
 }
 
-app.get('/api/config', (_req, res) => {
+app.get('/api/config', authRequired, (_req, res) => {
   const safe = sanitizeConfig(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
   res.json(safe);
+});
+
+// Deliberately public and deliberately minimal: the login screen needs to
+// show a "pick yourself" roster before any session exists, but the full
+// /api/config now carries real trip content (itinerary, budget, bookings,
+// needs) that shouldn't be world-readable. Hand-picking these four fields
+// here — rather than reusing sanitizeConfig() — keeps the public surface
+// obvious at a glance instead of depending on a general-purpose sanitizer
+// that could grow more fields later.
+app.get('/api/config/roster', (_req, res) => {
+  const roster = (TRIP_CONFIG.participants || []).map(p => ({
+    username: p.username,
+    name: p.name,
+    name_en: p.name_en,
+    color: p.color,
+  }));
+  res.json({ participants: roster });
 });
 
 // Stage 1 groundwork: read-only access to stored config history for a future
@@ -416,6 +619,267 @@ app.get('/api/config/versions', authRequired, (_req, res) => {
 // /api/config/versions — not organizer-scoped yet, but no longer silent.
 app.get('/api/config/warnings', authRequired, (_req, res) => {
   res.json(CONFIG_WARNINGS);
+});
+
+// ── AGENT BRIEF ───────────────────────────────────────────────────────────────
+// The counterpart to sanitizeConfig(): everything the read path deliberately
+// withholds, served to the two principals actually entitled to it.
+//
+// authRequired is not enough here — it admits every family member including
+// kids, which is exactly who organizer-only content is being kept from. This
+// middleware narrows to:
+//   • the agent service account (X-API-Key), so the companion bot can read the
+//     standing instructions it was given; and
+//   • the organizer's own browser session, which until now had no read path to
+//     organizer-only needs at all — they were stored and visible to nobody.
+function organizerOrAgentRequired(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (HERMES_KEY && apiKey === HERMES_KEY) { req.user = AGENT_USER; return next(); }
+
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  let payload;
+  try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  // No configured organizer means nobody qualifies. Failing closed here matters
+  // more than convenience: the alternative — treating "unset" as "everyone" —
+  // would silently publish every organizer-only note the moment a trip is
+  // scaffolded without an agent block.
+  if (!organizers.length || !organizers.includes(payload.username)) return res.status(403).json({ error: 'organizer_only' });
+  req.user = { username: payload.username };
+  next();
+}
+
+app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
+  const agent = TRIP_CONFIG.agent || null;
+  const instructions = (agent?.standing_instructions || []).map((ins, i) => ({
+    index: i,
+    visibility: normalizeInstructionVisibility(ins.visibility),
+    text: ins.text,
+  }));
+  // Needs are folded in because they answer the same question the standing
+  // instructions do — "what should the bot keep in mind about these people" —
+  // and splitting them across two calls invites reading one and not the other.
+  const needs = [];
+  for (const p of TRIP_CONFIG.participants || []) {
+    for (const n of p.needs || []) {
+      needs.push({
+        username: p.username,
+        name: p.name_en || p.name || p.username,
+        type: n.type,
+        severity: normalizeSeverity(n.severity),
+        visibility: normalizeVisibility(n.visibility, n.type),
+        text: n.text,
+      });
+    }
+  }
+  res.json({
+    trip: TRIP_CONFIG.meta?.title || null,
+    organizers: normalizeOrganizers(agent),
+    persona: agent ? {
+      name: agent.name, name_en: agent.name_en,
+      gender: normalizeGender(agent.gender), tone: normalizeTone(agent.tone),
+      default_language: agent.default_language || TRIP_CONFIG.meta?.defaultLang || 'he',
+      timezone: agent.timezone || null,
+      proactive: agent.proactive || {},
+    } : null,
+    standing_instructions: instructions,
+    needs,
+    // Spelled out in the payload rather than left to documentation, because the
+    // consumer is a language model that may only ever see this response.
+    disclosure_policy: {
+      group: 'Items with visibility "group" may be referred to in the family group chat.',
+      organizer: 'Items with visibility "organizer" are for your understanding only. Act on them — adjust plans, avoid topics, flag risks — but never state them, quote them, or allude to their existence in the group. Discuss them only in the private channel with the organizer.',
+    },
+  });
+});
+
+// Single-use, short-lived tokens for participant self-enrollment (the
+// password-only path below). Mirrors mcp/provision.js's activation-token
+// pattern: in-memory, spent on first use, time-limited.
+const pendingEnrollments = new Map();
+const ENROLLMENT_TTL_MS = 30 * 60 * 1000;
+
+// The only runtime writer of trip.config.json in this codebase — kept
+// deliberately narrow (append one participant, touch nothing else) rather
+// than a general config-PUT. Telegram-bound (telegram_id given): login works
+// immediately through the widget, gated on live group membership like any
+// other Telegram-linked participant. Password-only (telegram_id omitted):
+// returns a one-time enrollment token for the organizer to relay — the
+// participant sets their own password via POST /api/auth/enroll, it is never
+// collected here or in chat.
+app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) => {
+  const { username, name, name_en, color, family, telegram_id } = req.body || {};
+  if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
+  const uname = String(username).toLowerCase().trim();
+  if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+
+  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(409).json({ error: 'username_taken' });
+  }
+  const tgId = telegram_id ? String(telegram_id) : null;
+  if (tgId && db.prepare('SELECT 1 FROM users WHERE telegram_id = ?').get(tgId)) {
+    return res.status(409).json({ error: 'telegram_id_taken' });
+  }
+
+  const participant = { username: uname, name, name_en: name_en || null, color: color || null, family: family || null, telegram_id: tgId };
+
+  TRIP_CONFIG.participants = TRIP_CONFIG.participants || [];
+  TRIP_CONFIG.participants.push(participant);
+  persistConfigChange();
+
+  // Independent random, effectively-unusable password unless SEED_PASSWORD is
+  // explicitly configured — same posture as every other seeded user. The
+  // password-only path immediately overwrites this via the enrollment token.
+  const passwordHash = await bcrypt.hash(SEED_PASSWORD || crypto.randomBytes(24).toString('hex'), 10);
+  try {
+    insertParticipantUser(participant, passwordHash);
+  } catch (e) {
+    return res.status(500).json({ error: 'user_insert_failed', detail: e.message });
+  }
+
+  if (tgId) return res.json({ ok: true, username: uname, telegram_bound: true });
+
+  const token = crypto.randomBytes(24).toString('hex');
+  pendingEnrollments.set(token, { username: uname, at: Date.now() });
+  res.json({
+    ok: true, username: uname, telegram_bound: false,
+    enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000,
+  });
+});
+
+// Lets an organizer trigger a password reset for an EXISTING participant —
+// Telegram-bound or not, since a Telegram-linked participant may still want
+// a working password fallback. Mints a fresh one-time enrollment token on
+// the same terms as a brand-new participant; redeemed the same way, through
+// POST /api/auth/enroll. Does not touch trip.config.json or re-seed the
+// user — the row already exists, only its password needs to change.
+app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(404).json({ error: 'user_not_found' });
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  pendingEnrollments.set(token, { username: uname, at: Date.now() });
+  res.json({ ok: true, username: uname, enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000 });
+});
+
+// Binds a Telegram identity to an EXISTING participant — e.g. "bind @dror to
+// dror": the organizer already knows which site username maps to which
+// Telegram account, this just records it. Unlike POST /api/agent/participants,
+// this never creates a participant or touches a password.
+app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired, (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  const { telegram_id } = req.body || {};
+  if (!telegram_id) return res.status(400).json({ error: 'missing_telegram_id' });
+  const tgId = String(telegram_id);
+
+  const participant = (TRIP_CONFIG.participants || []).find(p => p.username === uname);
+  if (!participant || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+    return res.status(404).json({ error: 'user_not_found' });
+  }
+  const conflict = db.prepare('SELECT username FROM users WHERE telegram_id = ? AND username != ?').get(tgId, uname);
+  if (conflict) return res.status(409).json({ error: 'telegram_id_taken' });
+
+  participant.telegram_id = tgId;
+  persistConfigChange();
+  db.prepare('UPDATE users SET telegram_id = ? WHERE username = ?').run(tgId, uname);
+
+  res.json({ ok: true, username: uname, telegram_id: tgId });
+});
+
+// Removes a participant from the trip: drops them from trip.config.json and
+// revokes DB-level access (clears telegram_id, replaces the password with a
+// fresh unusable random hash) rather than deleting the users row outright —
+// photos/bookings/ratings reference the username by text, and a hard delete
+// would orphan that history. Blocks removing a currently-configured
+// organizer; that's a deliberate, separate decision, not something that
+// should fall out of a generic remove call.
+app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
+  const uname = String(req.params.username).toLowerCase().trim();
+  const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
+  if (idx === -1) return res.status(404).json({ error: 'user_not_found' });
+
+  if (normalizeOrganizers(TRIP_CONFIG.agent).includes(uname)) {
+    return res.status(409).json({ error: 'cannot_remove_organizer' });
+  }
+
+  TRIP_CONFIG.participants.splice(idx, 1);
+  persistConfigChange();
+
+  const randomPasswordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  db.prepare('UPDATE users SET telegram_id = NULL, password = ? WHERE username = ?').run(randomPasswordHash, uname);
+
+  res.json({
+    ok: true, username: uname,
+    // Surfaced in the response, not just a comment — the caller (agent or
+    // organizer) should know this doesn't yank an already-open session.
+    note: 'Future logins are revoked. An already-issued session token (valid up to 30 days) is not invalidated — this app has no session-revocation mechanism yet.',
+  });
+});
+
+// Binds the trip's Telegram group once it exists. TELEGRAM_BOT_TOKEN/
+// USERNAME are deployment-time secrets, set once and never touched here —
+// TELEGRAM_CHAT_ID is the one piece that genuinely can't be known ahead of
+// time (a bot can't create or discover a group on its own; there's no
+// username→group lookup either), so this is the only runtime write into
+// the deployment's .env this codebase has. Everything else stays in
+// trip.config.json, which sanitizeConfig() already guards from ever being
+// served raw — .env was the deliberate choice to keep this value out of
+// that path entirely, consistent with how the other TELEGRAM_* values
+// already live in .env rather than the config file.
+//
+// The caller only ever proves it holds the flat agent key or an organizer
+// JWT, never which human actually typed the chat_id — same caveat as every
+// other /api/agent/* route. What this route adds on top: it verifies, live
+// via getChatMember, that a Telegram-bound organizer is really an active
+// member of the given chat before trusting it, so a wrong or made-up
+// chat_id can't silently become "the trip group."
+app.post('/api/agent/telegram-group', organizerOrAgentRequired, async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) return res.status(409).json({ error: 'telegram_bot_not_configured' });
+  const chatId = String((req.body || {}).chat_id ?? '').trim();
+  if (!/^-\d+$/.test(chatId)) return res.status(400).json({ error: 'invalid_chat_id' });
+
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  const boundOrganizer = (TRIP_CONFIG.participants || []).find(p => organizers.includes(p.username) && p.telegram_id);
+  if (!boundOrganizer) return res.status(409).json({ error: 'no_telegram_bound_organizer' });
+
+  let reply;
+  try {
+    reply = await telegramChatMemberStatus(chatId, boundOrganizer.telegram_id);
+  } catch (e) {
+    return res.status(502).json({ error: 'telegram_api_unreachable', detail: e.message });
+  }
+  if (!isActiveMemberReply(reply)) {
+    return res.status(422).json({ error: 'organizer_not_member_of_chat', detail: reply?.description || reply?.result?.status || null });
+  }
+
+  TELEGRAM_CHAT_ID = chatId;
+  persistEnvVar('TELEGRAM_CHAT_ID', chatId);
+
+  res.json({ ok: true, chat_id: chatId, chat_title: (req.body || {}).chat_title || null, telegram_enabled: telegramEnabled() });
+});
+
+// Redeems a one-time enrollment token minted by POST /api/agent/participants
+// or POST /api/agent/participants/:username/reset-password — the only way a
+// password-only participant (or one whose password was just reset) gets a
+// real password. No prior session required; the token itself is the
+// (already organizer-issued) authorization.
+app.post('/api/auth/enroll', async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'missing_fields' });
+  if (password.length < 4) return res.status(400).json({ error: 'password_too_short' });
+
+  const pending = pendingEnrollments.get(token);
+  if (!pending) return res.status(404).json({ error: 'invalid_or_used_token' });
+  pendingEnrollments.delete(token);
+  if (Date.now() - pending.at > ENROLLMENT_TTL_MS) return res.status(410).json({ error: 'token_expired' });
+
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, pending.username);
+  res.json({ ok: true, username: pending.username });
 });
 
 app.get('/api/config/versions/:version', authRequired, (req, res) => {
@@ -447,6 +911,21 @@ app.post('/api/auth/login', async (req, res) => {
 
   const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '30d' });
   const { password: _p, ...safeUser } = user;
+  res.json({ token, user: safeUser });
+});
+
+// Telegram identity is accepted only after both cryptographic verification and
+// a live membership check. A known participant is linked by telegram_id.
+app.post('/api/auth/telegram-login', async (req, res) => {
+  if (!telegramEnabled()) return res.status(503).json({ error: 'telegram_not_configured' });
+  if (!verifyTelegramLogin(req.body)) return res.status(401).json({ error: 'invalid_telegram_login' });
+  try {
+    if (!await telegramActiveMember(req.body.id)) return res.status(403).json({ error: 'not_group_member' });
+  } catch { return res.status(502).json({ error: 'telegram_membership_check_failed' }); }
+  const user = db.prepare('SELECT * FROM users WHERE telegram_id = ?').get(String(req.body.id));
+  if (!user) return res.status(403).json({ error: 'telegram_account_not_linked' });
+  const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+  const { password: _p, telegram_id: _tid, ...safeUser } = user;
   res.json({ token, user: safeUser });
 });
 
@@ -541,7 +1020,18 @@ app.post('/api/auth/avatar/upload', authRequired,
     const fullPhotoFile = req.files?.fullPhoto?.[0];
     if (!avatarFile) return res.status(400).json({ error: 'no_file' });
 
-    const u   = req.user.username.toLowerCase();
+    // req.user.isAgent is only ever true on the X-API-Key path (see
+    // authRequired) — a family member's JWT never carries it, so this can't
+    // drift into a checkable-later permission flag. That's what makes the
+    // `username` override structurally impossible for a JWT caller, not just
+    // disallowed by convention.
+    let u;
+    if (req.user.isAgent && req.body.username) {
+      u = req.body.username.toLowerCase();
+      if (!getUser(u)) return res.status(400).json({ error: 'unknown_username' });
+    } else {
+      u = req.user.username.toLowerCase();
+    }
     const cap = u.charAt(0).toUpperCase() + u.slice(1);
 
     let allFiles = [];
@@ -681,7 +1171,7 @@ app.get('/api/photos/file/:filename', (req, res) => {
 app.delete('/api/photos/:id', authRequired, async (req, res) => {
   const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
   if (!photo) return res.status(404).json({ error: 'not_found' });
-  if (photo.username !== req.user.username) return res.status(403).json({ error: 'forbidden' });
+  if (photo.username !== req.user.username && !req.user.isAgent) return res.status(403).json({ error: 'forbidden' });
 
   // Delete from Immich
   if (photo.immich_id && IMMICH_URL && IMMICH_KEY) {

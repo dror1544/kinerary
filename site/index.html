@@ -15,7 +15,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Family Trip">
-<link rel="stylesheet" href="styles.css?v=28">
+<link rel="stylesheet" href="styles.css?v=31">
 </head>
 <body>
 
@@ -39,7 +39,34 @@
       <div class="login-divider" data-i18n="login_or">או</div>
       <div id="google-signin-btn"></div>
     </div>
+    <div id="telegram-signin-wrap" class="telegram-signin-wrap" style="display:none">
+      <div class="login-divider" data-i18n="login_or">או</div>
+      <div id="telegram-signin-btn"></div>
+    </div>
     <a class="lf-login-link" onclick="showLostFoundForm()" data-i18n="lf_login_link">🔍 מצאת משהו של הקבוצה? Lost &amp; Found</a>
+  </div>
+</div>
+
+<!-- ============================================
+     PARTICIPANT ENROLLMENT OVERLAY
+     Reached only via a one-time ?enroll=<token> link from
+     POST /api/agent/participants — never part of the normal login flow.
+     ============================================ -->
+<div id="enroll-overlay" class="lf-overlay" style="display:none">
+  <div class="lf-box">
+    <div class="lf-icon">🔑</div>
+    <h2 data-i18n="enroll_title">ברוך/ה הבא/ה</h2>
+    <p data-i18n="enroll_desc">בחר/י סיסמה כדי להצטרף לאתר הטיול.</p>
+    <div class="pwd-wrap">
+      <input id="enroll-pwd-input" type="password" data-i18n-ph="enroll_pwd_ph" placeholder="סיסמה חדשה" autocomplete="new-password"/>
+      <button type="button" class="pwd-eye" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password';this.textContent=this.previousElementSibling.type==='password'?'👁':'🙈'" aria-label="הצג סיסמה">👁</button>
+    </div>
+    <div class="pwd-wrap">
+      <input id="enroll-pwd-confirm-input" type="password" data-i18n-ph="enroll_pwd_confirm_ph" placeholder="אימות סיסמה" autocomplete="new-password"/>
+      <button type="button" class="pwd-eye" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password';this.textContent=this.previousElementSibling.type==='password'?'👁':'🙈'" aria-label="הצג סיסמה">👁</button>
+    </div>
+    <button class="lf-submit" onclick="submitEnrollment()" data-i18n="enroll_submit">קבע/י סיסמה →</button>
+    <p id="enroll-err" class="lf-err"></p>
   </div>
 </div>
 
@@ -157,14 +184,18 @@
           <p id="hero-blurb"></p>
         </div>
 
-        <div class="hero-countdown">
-          <div class="cu"><strong id="cd-d">–</strong><small data-i18n="cd_days">ימים</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-h">–</strong><small data-i18n="cd_hours">שעות</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
-          <div class="cu-sep">/</div>
-          <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
+        <div class="hero-countdown" id="hero-countdown">
+          <div class="cd-caption" id="cd-caption"></div>
+          <div class="cd-units" id="cd-units">
+            <div class="cu"><strong id="cd-d">–</strong><small data-i18n="cd_days">ימים</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-h">–</strong><small data-i18n="cd_hours">שעות</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
+            <div class="cu-sep">/</div>
+            <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
+          </div>
+          <div class="cd-finished" id="cd-finished" hidden></div>
         </div>
 
         <div class="hero-right">
@@ -506,9 +537,9 @@
 <div class="tab-transition" id="tab-transition">
   <img src="ara_united_transparent_horizontal_spin.gif" class="tt-gif" alt="">
 </div>
-<script src="translations.js?v=17"></script>
+<script src="translations.js?v=18"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js" crossorigin=""></script>
-<script src="app.js?v=37"></script>
+<script src="app.js?v=43"></script>
 </body>
 </html>

@@ -64,12 +64,14 @@ TRIP_DIR_HOST=./trips/<slug> docker compose up -d --build
 # → http://localhost:8081 (see docker-compose.override.yml for the port)
 ```
 
-**Logging in:** every participant is seeded with the same default password,
-**`1234`** — log in as any of them (username from `trip.config.json`) to look
-around. Change it from the avatar screen (click your avatar in the side
-menu → "🔑 Change password") before this trip is ever actually shared with
-real people; the seeded password is meant to get you in the door once, not
-to stay in place.
+**Logging in:** for local previewing, set `SEED_PASSWORD=1234` (or any value
+you like) in `.env` before the first boot, then log in as any participant
+(username from `trip.config.json`) with that password to look around. Leave
+`SEED_PASSWORD` unset for a trip that's actually going to real people — each
+participant then gets an independent, unrecoverable random password instead
+of one shared, guessable default, and password login stays unavailable for
+them until they sign in via Telegram or Google and set their own from the
+avatar screen (click your avatar in the side menu → "🔑 Change password").
 
 ### Connecting Google Sign-In (optional)
 
@@ -93,6 +95,15 @@ Without a Client ID, the Google button simply doesn't render — nothing else
 changes. The `/create-trip` interview can walk you through this same setup
 when scaffolding a new trip; see [FRAMEWORK.md](FRAMEWORK.md) for the full
 technical details (schema, endpoints, security model).
+
+### Connecting Telegram Login SSO (optional)
+
+Telegram Login can sign an already-configured participant into the same site
+session after the server verifies both Telegram's signed callback and current
+membership in a configured group. It is disabled by default; see
+[docs/telegram-sso.md](docs/telegram-sso.md) for the required environment
+values and participant binding. Do not put bot tokens, group IDs, or deployed
+site details in the repository.
 
 ---
 
@@ -118,6 +129,20 @@ or your own) to help manage bookings and answer trip questions on your
 behalf, it talks to the site through `mcp/` — see
 [mcp/README.md](mcp/README.md) for local-agent vs. Cowork/remote-connector
 setup, including the exact steps to add it as a Cowork custom connector.
+
+### Option C — let an agent run the interview over chat
+
+Instead of you running `/create-trip` locally, an agent can conduct the whole
+interview in a Telegram DM with the organizer and provision the site itself.
+That needs a second, privileged MCP server — it writes files and restarts
+containers, so it runs on the site host, on its own port with its own key, and
+is never exposed publicly. See [mcp/PROVISIONING.md](mcp/PROVISIONING.md) to
+stand it up and
+[docs/hermes-interviewer-agent.md](docs/hermes-interviewer-agent.md) for the
+agent itself, including its system prompt.
+
+Both docs are deployment-neutral — substitute `<SITE_HOST>` and `<REPO_ROOT>`
+and they apply to any install, not just the one they were written on.
 
 ---
 

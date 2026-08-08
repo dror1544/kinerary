@@ -29,6 +29,7 @@ const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js'
 const { z }                  = require('zod');
 const express                = require('express');
 const fetch                  = require('node-fetch');
+const crypto                 = require('crypto');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -104,11 +105,17 @@ async function apiDelete(path) {
   if (!r.ok) throw new Error(`DELETE ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.json();
 }
-async function apiPostPdf(path, filePath) {
+async function apiPostFile(path, filePath, fieldName, contentType, fields = {}) {
   const fs = require('fs');
   const FormData = require('form-data');
   const form = new FormData();
-  form.append('file', fs.createReadStream(filePath), { contentType: 'application/pdf' });
+  form.append(fieldName, fs.createReadStream(filePath), {
+    filename: require('path').basename(filePath),
+    contentType,
+  });
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined && v !== null && v !== '') form.append(k, String(v));
+  }
   const r = await fetchTrip(path, {
     method: 'POST',
     headers: { 'x-api-key': TRIP_API_KEY, ...form.getHeaders() },
@@ -117,6 +124,14 @@ async function apiPostPdf(path, filePath) {
   if (!r.ok) throw new Error(`POST ${path} → ${r.status}${await errorSuffix(r)}`);
   return r.json();
 }
+async function apiPostPdf(path, filePath) {
+  return apiPostFile(path, filePath, 'file', 'application/pdf');
+}
+
+const IMAGE_MIME_BY_EXT = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif',
+};
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -132,9 +147,100 @@ mcp.tool('health_check', 'Check if the trip server is online and Immich is reach
 mcp.tool('get_config', 'Get the trip config: meta, participants, families, phases (with their venue/rsvp ids), budget, trivia. Start here to discover valid ids for the other tools — this trip\'s phases/venues/participants are never fixed.', {},
   async () => ok(await apiGet('/api/config')));
 
+mcp.tool('get_agent_brief',
+  'READ THIS FIRST, before your first message of the day. Your persona for this trip (name, grammatical gender, tone, language, timezone) plus the standing instructions and per-person needs the organizer gave you. ' +
+  'Some entries are marked visibility:"organizer" — act on them, but never say them, quote them, or hint that they exist in the family group. ' +
+  'get_config does NOT contain this; organizer-only items are stripped from it by design.',
+  {},
+  async () => ok(await apiGet('/api/agent/brief')));
+
 mcp.tool('get_photos', 'Fetch trip photos, optionally filtered by phase', {
   phase: z.string().optional().describe('Phase id from trip.config.json (see get_config). Omit for all.'),
 }, async ({ phase }) => ok(await apiGet(`/api/photos${phase ? `?phase=${phase}` : ''}`)));
+
+mcp.tool('add_photo',
+  'Upload a photo into the trip gallery and its phase album (synced to Immich in the background if configured). ' +
+  'filePath must be an absolute path on the machine running this MCP server.', {
+  filePath: z.string().describe('Absolute filesystem path to an image file on this machine'),
+  phase:    z.string().optional().describe('Phase id from trip.config.json (see get_config) — determines which album the photo is added to. Omit to land in the general/unsorted album.'),
+  caption:  z.string().optional().describe('Caption for the photo'),
+}, async ({ filePath, phase, caption }) => {
+  const ext = require('path').extname(filePath).toLowerCase();
+  const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';
+  return ok(await apiPostFile('/api/photos/upload', filePath, 'photo', contentType, { phase, caption }));
+});
+
+mcp.tool('delete_photo',
+  'Delete a photo from the trip gallery and its Immich album (if synced). Unlike a family member on the site, ' +
+  'the agent may delete any photo, not just ones it uploaded — use with care.', {
+  photoId: z.string().describe('Photo ID from get_photos'),
+}, async ({ photoId }) => ok(await apiDelete(`/api/photos/${photoId}`)));
+
+mcp.tool('set_participant_avatar',
+  'Set a participant\'s avatar photo — e.g. after they send the bot a selfie. ' +
+  'Unlike the site\'s own upload, this can target any participant, not just the caller. ' +
+  'filePath must be an absolute path on the machine running this MCP server.', {
+  username: z.string().describe('Participant username from get_config'),
+  filePath: z.string().describe('Absolute filesystem path to an image file on this machine'),
+}, async ({ username, filePath }) => {
+  const ext = require('path').extname(filePath).toLowerCase();
+  const contentType = IMAGE_MIME_BY_EXT[ext] || 'application/octet-stream';
+  return ok(await apiPostFile('/api/auth/avatar/upload', filePath, 'avatar', contentType, { username }));
+});
+
+// ── Participant management ──────────────────────────────────────────────────
+// These write identity/login data, not trip content — a meaningfully
+// different blast radius than photos/bookings/comments. The underlying
+// routes verify an organizer JWT OR this server's own key; when called
+// through this MCP server they always authenticate as the latter, so the
+// site cannot itself confirm which human asked. That verification has to
+// happen upstream, in whatever's driving this MCP connection.
+mcp.tool('add_participant',
+  'Add a new participant to the live trip — Telegram-bound (immediate login via the widget, gated on group membership) if telegramId is given, ' +
+  'otherwise password-only (returns a one-time enrollment_token for the organizer to relay; never collect a password directly in chat). ' +
+  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL FRAGMENT (#), not a query string (?): the token must never appear ' +
+  'in a query string, since that would land it in server access logs and in Referer headers sent to third-party origins the page loads.', {
+  username: z.string().describe('Site username — lowercase letters, numbers, underscore, hyphen only'),
+  name: z.string().describe('Display name'),
+  nameEn: z.string().optional().describe('English display name'),
+  color: z.string().optional().describe('Hex color for their avatar/picker chip'),
+  family: z.string().optional().describe('Family group key from get_config'),
+  telegramId: z.string().optional().describe('Numeric Telegram user ID — omit for the password-only path'),
+}, async ({ username, name, nameEn, color, family, telegramId }) =>
+  ok(await apiPost('/api/agent/participants', { username, name, name_en: nameEn, color, family, telegram_id: telegramId })));
+
+mcp.tool('reset_participant_password',
+  'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
+  'Returns a one-time enrollment_token for the organizer to relay; never collect the new password directly in chat. ' +
+  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL fragment (#), not a query string (?).', {
+  username: z.string().describe('Existing participant username'),
+}, async ({ username }) => ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, {})));
+
+mcp.tool('bind_participant_telegram',
+  'Bind a Telegram numeric ID to an EXISTING participant, enabling Telegram login for them — e.g. "bind @dror to dror". ' +
+  'Does not create a participant or touch their password; use add_participant for a brand-new person.', {
+  username: z.string().describe('Existing site username to bind'),
+  telegramId: z.string().describe('Numeric Telegram user ID'),
+}, async ({ username, telegramId }) =>
+  ok(await apiPatch(`/api/agent/participants/${encodeURIComponent(username)}/telegram`, { telegram_id: telegramId })));
+
+mcp.tool('remove_participant',
+  'Remove a participant from the trip — e.g. "remove dror from the website". Drops them from the roster and revokes future logins ' +
+  '(clears their Telegram link, replaces their password with an unusable one). Does not delete their photos/bookings/comments history, ' +
+  'and does not invalidate a session token they already have (valid up to 30 days) — there is no session-revocation mechanism yet. ' +
+  'Refuses to remove a currently-configured trip organizer.', {
+  username: z.string().describe('Existing participant username to remove'),
+}, async ({ username }) => ok(await apiDelete(`/api/agent/participants/${encodeURIComponent(username)}`)));
+
+mcp.tool('set_telegram_group',
+  'Bind the trip\'s Telegram group once it exists, turning on Telegram Login for the site — e.g. once the organizer creates the group, ' +
+  'adds this bot, and you observe a message there. Pass the chat_id you saw it on (a negative number — group and supergroup chat IDs ' +
+  'always are). Verifies live that a Telegram-bound organizer is actually an active member of that chat before accepting it, so it will ' +
+  'refuse a wrong or made-up chat_id. Requires an organizer to already have a telegram_id bound (bind_participant_telegram) — bind the ' +
+  'organizer first if this fails with no_telegram_bound_organizer.', {
+  chatId: z.string().describe('Telegram chat_id of the group, e.g. "-1002345678901" — negative, as seen on an incoming message\'s chat.id'),
+  chatTitle: z.string().optional().describe('Group title, for confirmation purposes only — not verified against Telegram'),
+}, async ({ chatId, chatTitle }) => ok(await apiPost('/api/agent/telegram-group', { chat_id: chatId, chat_title: chatTitle })));
 
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));
@@ -362,10 +468,21 @@ JSON fields (omit any field you cannot determine):
 Return ONLY the JSON object, no commentary.`;
 }
 
-// Auth middleware — check X-API-Key header or ?key= query param
+// Auth middleware — X-API-Key header, ?key= query param, or Authorization:
+// Bearer. The Bearer form exists specifically because `hermes mcp add`'s
+// standard connectivity flow always sends the key that way — without this,
+// no Hermes profile can use this server through its normal setup path at
+// all, not just a scripted one (confirmed against hermes_cli/mcp_config.py's
+// _bearer_auth_headers()).
 function requireKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.key;
-  if (key !== API_KEY) return res.status(401).json({ error: 'unauthorized' });
+  const authHeader = req.headers['authorization'] || '';
+  const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const key = req.headers['x-api-key'] || req.query.key || bearerKey;
+  // Constant-time compare — matches provision.js's requireKey. This server
+  // is the one meant to be public, so its key deserves the same treatment.
+  const a = Buffer.from(String(key || ''));
+  const b = Buffer.from(API_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 

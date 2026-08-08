@@ -4,6 +4,14 @@ node_modules/
 .fastembed_cache/
 server/data/
 
+# Local runtime state — bot/group state, sqlite DBs, signed payloads.
+# Never product source, never a specific trip's data.
+/data/
+
+# Per-trip Hermes agent workspaces — always a specific real trip's private
+# notes/references, never something to commit.
+/workspaces/
+
 # Media assets — stored on NAS, not in git
 site/avatars/
 site/*.mp3
@@ -16,3 +24,9 @@ scripts/__pycache__/
 
 # Design references — local only, not committed
 references/
+scripts/hermes-pipeline/.last-answers.json
+.venv-telegram-manager/
+provisioning/__pycache__/
+tests/provisioning/__pycache__/
+telegram_manager/__pycache__/
+.hermes-pr3-architecture-review.md

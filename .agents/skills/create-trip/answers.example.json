@@ -97,5 +97,37 @@
     "money": [
       { "he": "אין תרבות טיפים משמעותית באיטליה — עיגול חשבון מספיק", "en": "No major tipping culture in Italy — rounding up is enough" }
     ]
+  },
+  "agent": {
+    "name": "ויקטור",
+    "name_en": "Victor",
+    "gender": "male",
+    "tone": "warm",
+    "default_language": "he",
+    "organizers": ["marco"],
+    "timezone": "Europe/Rome",
+    "proactive": {
+      "morning_briefing": "07:30",
+      "tomorrow_preview": false,
+      "photo_recap": "21:00",
+      "flight_changes": true,
+      "packing_reminders": false
+    },
+    "standing_instructions": [
+      {
+        "visibility": "group",
+        "text": {
+          "he": "אנחנו נוסעים ברכב שכור — תמיד לציין חניה ליעד",
+          "en": "We're driving a rental — always mention parking for the destination"
+        }
+      },
+      {
+        "visibility": "organizer",
+        "text": {
+          "he": "ג'וליה בת 16 ולא אוהבת שמזכירים אותה בשמה בקבוצה — לנסח בגוף כללי",
+          "en": "Giulia is 16 and dislikes being named in the group — phrase things generally"
+        }
+      }
+    ]
   }
 }

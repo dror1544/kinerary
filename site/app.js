@@ -289,10 +289,10 @@ async function doLogin() {
     if (!res.ok) { document.getElementById('pwd-err').textContent = tr.err_wrong; return; }
     localStorage.setItem('trip-token', data.token);
     localStorage.setItem('trip-user', JSON.stringify(data.user));
-    currentUser = data.user;
-    showLoggedIn();
-    document.getElementById('login-overlay').style.display = 'none';
-    document.dispatchEvent(new Event('trivia-poll-start'));
+    // /api/config is session-protected. Reload into the authenticated bootstrap
+    // so no trip data is fetched before a valid browser session exists.
+    window.location.reload();
+    return;
   } catch {
     document.getElementById('pwd-err').textContent = tr.err_wrong;
   }
@@ -842,10 +842,49 @@ async function handleGoogleCredential(response) {
     }
     localStorage.setItem('trip-token', data.token);
     localStorage.setItem('trip-user', JSON.stringify(data.user));
-    currentUser = data.user;
-    showLoggedIn();
-    document.getElementById('login-overlay').style.display = 'none';
-    document.dispatchEvent(new Event('trivia-poll-start'));
+    // /api/config is session-protected. Reload into the authenticated bootstrap
+    // so no trip data is fetched before a valid browser session exists.
+    window.location.reload();
+    return;
+  } catch {
+    document.getElementById('pwd-err').textContent = tr.err_wrong;
+  }
+}
+
+// ── TELEGRAM LOGIN ────────────────────────────────────────────────────────────
+// Login-only (no "connect" flow — Telegram identity is bound server-side via
+// trip.config.json telegram_id, not something a browser session can link).
+async function initTelegramAuth() {
+  let botUsername = null;
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    botUsername = d.telegramBotUsername || null;
+  } catch {}
+  renderTelegramLogin(botUsername);
+}
+
+// Called by Telegram's widget script (data-onauth="onTelegramAuth(user)"),
+// a plain global function since app.js loads as a classic (non-module) script.
+async function onTelegramAuth(user) {
+  const tr = T[currentLang] || T['he'];
+  try {
+    const res = await fetch('/api/auth/telegram-login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(user),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('pwd-err').textContent = telegramLoginErrorMessage(data.error, tr);
+      return;
+    }
+    localStorage.setItem('trip-token', data.token);
+    localStorage.setItem('trip-user', JSON.stringify(data.user));
+    // /api/config is session-protected. Reload into the authenticated bootstrap
+    // so no trip data is fetched before a valid browser session exists.
+    window.location.reload();
+    return;
   } catch {
     document.getElementById('pwd-err').textContent = tr.err_wrong;
   }
@@ -855,11 +894,12 @@ function buildLoginPicker() {
   const picker = document.getElementById('login-picker');
   if (!picker) return;
   const userInput = document.getElementById('user-input');
-  const PEOPLE = (window.TRIP_CONFIG?.participants || []).map(p => ({ u: p.username, color: p.color }));
+  // Pre-auth: window.LOGIN_ROSTER (from /api/config/roster) carries name/name_en
+  // directly, since window.USERS_CACHE isn't populated until after login.
+  const PEOPLE = (window.LOGIN_ROSTER || []).map(p => ({ u: p.username, color: p.color, name: p.name, name_en: p.name_en }));
   picker.innerHTML = '';
-  PEOPLE.forEach(({ u, color }) => {
-    const cache = window.USERS_CACHE?.[u] || {};
-    const name = currentLang === 'en' ? (cache.name_en || u) : (cache.name || u);
+  PEOPLE.forEach(({ u, color, name: nameHe, name_en }) => {
+    const name = currentLang === 'en' ? (name_en || u) : (nameHe || u);
     const chip = document.createElement('div');
     chip.className = 'lp-chip';
     chip.dataset.u = u;
@@ -906,12 +946,13 @@ async function checkAuth() {
         localStorage.setItem('trip-user', JSON.stringify(currentUser));
         showLoggedIn();
         document.getElementById('login-overlay').style.display = 'none';
-        return;
+        return true;
       }
     } catch {}
   }
   localStorage.removeItem('trip-token');
   localStorage.removeItem('trip-user');
+  return false;
 }
 
 function doLogout() {
@@ -962,25 +1003,64 @@ function uname(username, userObj) {
 /* =========================================================
    COUNTDOWN
    ========================================================= */
+// Three states, not one. The original only counted down to departure and, once
+// that passed, wrote a rocket into the days slot and returned early — leaving
+// hours/minutes/seconds on their "–" placeholders forever. Any trip whose
+// departure is in the past therefore displayed a permanently broken timer,
+// which is every past trip and every demo of one.
+//
+// Now: before departure → time until departure; during the trip → time until
+// it ends; after → a finished state, no timer at all.
+function tripPhaseNow(meta, now = new Date()) {
+  const dep = meta?.departure ? new Date(meta.departure) : null;
+  if (!dep || isNaN(dep)) return null;
+  // returnDate is a plain YYYY-MM-DD (the day everyone gets home), so the trip
+  // is still running for the whole of that day — end of it, not the start.
+  let end = null;
+  if (meta.returnDate) {
+    end = new Date(`${meta.returnDate}T23:59:59`);
+    if (isNaN(end)) end = null;
+  }
+  if (now < dep)             return { state: 'before',   target: dep };
+  if (end && now <= end)     return { state: 'during',   target: end };
+  if (end)                   return { state: 'finished', target: null };
+  // No returnDate to work from: departure has passed and we can't tell whether
+  // the trip is still running. "Finished" is the wrong guess mid-trip, so show
+  // the in-progress state without a timer rather than declaring it over.
+  return { state: 'during', target: null };
+}
+
 function tick() {
-  const depStr = window.TRIP_CONFIG?.meta?.departure;
-  if (!depStr) return; // config not loaded yet — nothing to count down to
-  const dep = new Date(depStr);
-  const now = new Date();
-  const diff = dep - now;
-  const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-  if (diff <= 0) {
-    setText('cd-d', '🚀');
+  const meta = window.TRIP_CONFIG?.meta;
+  const phase = tripPhaseNow(meta);
+  if (!phase) return; // config not loaded yet — nothing to count down to
+
+  const el = id => document.getElementById(id);
+  const setText = (id, v) => { const e = el(id); if (e) e.textContent = v; };
+  const tr = (typeof T !== 'undefined' && T[currentLang]) || {};
+
+  const units    = el('cd-units');
+  const finished = el('cd-finished');
+  const caption  = el('cd-caption');
+
+  if (phase.state === 'finished') {
+    if (units) units.hidden = true;
+    if (caption) caption.textContent = '';
+    if (finished) { finished.hidden = false; finished.textContent = tr.cd_finished || '✅ הטיול הסתיים'; }
     return;
   }
-  const d = Math.floor(diff / 86400000);
-  const h = Math.floor((diff % 86400000) / 3600000);
-  const m = Math.floor((diff % 3600000) / 60000);
-  const s = Math.floor((diff % 60000) / 1000);
-  setText('cd-d', d);
-  setText('cd-h', String(h).padStart(2, '0'));
-  setText('cd-m', String(m).padStart(2, '0'));
-  setText('cd-s', String(s).padStart(2, '0'));
+
+  if (units) units.hidden = false;
+  if (finished) finished.hidden = true;
+  if (caption) caption.textContent = phase.state === 'during' ? (tr.cd_until_end || '') : (tr.cd_until_departure || '');
+
+  if (!phase.target) { setText('cd-d', '🚀'); setText('cd-h', '—'); setText('cd-m', '—'); setText('cd-s', '—'); return; }
+
+  const diff = Math.max(0, phase.target - new Date());
+  setText('cd-d', Math.floor(diff / 86400000));
+  setText('cd-h', String(Math.floor((diff % 86400000) / 3600000)).padStart(2, '0'));
+  setText('cd-m', String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0'));
+  setText('cd-s', String(Math.floor((diff % 60000) / 1000)).padStart(2, '0'));
 }
 setInterval(tick, 1000); tick();
 
@@ -1215,12 +1295,11 @@ async function _loadPoiWeather(wxWrap, wxKey) {
   try {
     if (!WX_CACHE[wxKey]) {
       const loc = WX_LOCS[wxKey];
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lng}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto&forecast_days=2`;
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lng}&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto&forecast_days=7`;
       WX_CACHE[wxKey] = await (await fetch(url)).json();
     }
     const d = WX_CACHE[wxKey].daily;
-    const labels = currentLang === 'he' ? ['היום', 'מחר'] : ['Today', 'Tomorrow'];
-    wxWrap.innerHTML = `<div class="loc-wx-label">${trPoi.wx_forecast}</div><div class="loc-wx-days">${d.time.slice(0,2).map((t,i) => `<div class="loc-wx-day"><span class="wi">${wxIcon(d.weathercode[i])}</span><div class="wt">${Math.round(d.temperature_2m_max[i])}°/${Math.round(d.temperature_2m_min[i])}°</div><div class="wd">${labels[i]}</div></div>`).join('')}</div>`;
+    wxWrap.innerHTML = `<div class="loc-wx-label">${trPoi.wx_forecast}</div><div class="loc-wx-days">${d.time.slice(0,7).map((t,i) => `<div class="loc-wx-day"><span class="wi">${wxIcon(d.weathercode[i])}</span><div class="wt">${Math.round(d.temperature_2m_max[i])}°/${Math.round(d.temperature_2m_min[i])}°</div><div class="wd">${i === 0 ? (currentLang === 'he' ? 'היום' : 'Today') : dayName(t)}</div></div>`).join('')}</div>`;
   } catch(e) {
     wxWrap.innerHTML = `<span style="color:var(--urgent);font-size:12px">${trPoi.wx_error}</span>`;
   }
@@ -1549,7 +1628,14 @@ function renderPacking(containerId, items) {
   if (!c) return;
   const lang = currentLang || 'he';
   const cats = {};
-  items.forEach(([catObj, itemObj]) => {
+  // buildGlobalsFromConfig() only sets PACKING[phase.id] when phase.packing is
+  // non-empty, but the pack-<id> container div is created for *every* phase —
+  // so a phase with "packing": [] resolves to undefined here. The initial
+  // render guards with `if (p.packing?.length)`, applyLang() does not, and an
+  // unguarded throw there aborts the rest of the language switch (RSVP cards
+  // and everything after it silently stop re-rendering). Normalize at the
+  // choke point so all four call sites are safe.
+  (Array.isArray(items) ? items : []).forEach(([catObj, itemObj]) => {
     const cat  = catObj[lang]  || catObj.he;
     const item = itemObj[lang] || itemObj.he;
     (cats[cat] = cats[cat] || []).push({ key: itemObj.he, label: item });
@@ -2031,6 +2117,57 @@ async function submitLostFound() {
     if (btn) btn.disabled = false;
   }
 }
+
+/* =========================================================
+   PARTICIPANT ENROLLMENT (one-time #enroll=<token> link)
+   Fragment, not a query param: never sent to the server (so it can't land
+   in an access log) and excluded from Referer headers by the URL spec
+   itself (so no cross-origin leak to the third-party origins this page
+   loads) — stronger than a query string plus a referrer-policy meta tag.
+   ========================================================= */
+function enrollmentTokenFromUrl() {
+  return new URLSearchParams(window.location.hash.replace(/^#/, '')).get('enroll');
+}
+function showEnrollmentForm() {
+  document.getElementById('login-overlay').style.display = 'none';
+  document.getElementById('enroll-overlay').style.display = 'flex';
+}
+async function submitEnrollment() {
+  const token = enrollmentTokenFromUrl();
+  const password = document.getElementById('enroll-pwd-input')?.value || '';
+  const confirmPassword = document.getElementById('enroll-pwd-confirm-input')?.value || '';
+  const err = document.getElementById('enroll-err');
+  const tr = T[currentLang] || T['he'];
+
+  const showErr = (msg) => { if (err) { err.style.color = 'var(--urgent)'; err.textContent = msg; } };
+
+  if (!token) { showErr(tr.enroll_err_invalid || 'קישור לא תקין.'); return; }
+  if (password.length < 4) { showErr(tr.enroll_err_short || 'הסיסמה קצרה מדי.'); return; }
+  if (password !== confirmPassword) { showErr(tr.enroll_err_mismatch || 'הסיסמאות אינן תואמות.'); return; }
+
+  try {
+    const res = await fetch('/api/auth/enroll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, password }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const messages = {
+        invalid_or_used_token: tr.enroll_err_invalid || 'הקישור אינו תקף או שכבר נעשה בו שימוש.',
+        token_expired: tr.enroll_err_expired || 'פג תוקף הקישור — בקש/י קישור חדש.',
+      };
+      showErr(messages[data.error] || tr.enroll_err_server || 'שגיאה בשמירת הסיסמה.');
+      return;
+    }
+    // Land on the normal login screen, password-ready — never auto-login
+    // with a password that was just typed into a one-time-link page.
+    window.location.href = window.location.pathname;
+  } catch {
+    showErr(tr.enroll_err_server || 'שגיאה בשמירת הסיסמה.');
+  }
+}
+window.submitEnrollment = submitEnrollment;
 
 async function loadLostFound() {
   const list = document.getElementById('lf-list');
@@ -2553,8 +2690,15 @@ function applyTweaks() {
   if (!shell) return;
   shell.dataset.palette = tweakState.palette;
   shell.dataset.font = tweakState.font;
-  // override NY hero photo
-  HERO.ny.photo = NY_PHOTOS[tweakState.nyPhoto % NY_PHOTOS.length];
+  // Leftover from the original single-trip (New York) version. HERO is built
+  // from trip.config.json phases, so HERO.ny exists only if a trip happens to
+  // have a phase literally called "ny" — no generated trip does. Unguarded,
+  // this threw on every real trip and took the REST OF BOOT with it: the
+  // lang-toggle listener and initDragDrop() are registered on the lines
+  // immediately after applyTweaks(), so the EN/HE button silently did nothing.
+  // The test fixture's phases are named ny/colorado, which is exactly why the
+  // suite never caught it.
+  if (HERO.ny) HERO.ny.photo = NY_PHOTOS[tweakState.nyPhoto % NY_PHOTOS.length];
   // re-apply current hero if NY active
   const active = document.querySelector('.section.active');
   if (active && active.id === 'ny') setHero('ny');
@@ -2594,10 +2738,23 @@ document.querySelector('.t-close')?.addEventListener('click', () => {
    ========================================================= */
 async function loadTripConfig() {
   try {
-    const res = await fetch('/api/config');
+    const token = localStorage.getItem('trip-token');
+    const res = await fetch('/api/config', { headers: token ? { Authorization: `Bearer ${token}` } : {} });
     if (res.ok) window.TRIP_CONFIG = await res.json();
   } catch (e) {
     console.warn('Could not load trip config, using hardcoded defaults:', e);
+  }
+}
+
+// Pre-auth "pick yourself" data for the login screen. /api/config now
+// requires a session (it carries real trip content), so the picker uses the
+// deliberately minimal, unauthenticated /api/config/roster instead.
+async function loadLoginRoster() {
+  try {
+    const res = await fetch('/api/config/roster');
+    if (res.ok) window.LOGIN_ROSTER = (await res.json()).participants || [];
+  } catch (e) {
+    console.warn('Could not load login roster:', e);
   }
 }
 
@@ -3042,7 +3199,9 @@ function renderPhaseHotelCard(phase) {
   const guests = acc.guests;
   const rooms = acc.rooms;
   const phone = acc.phone;
-  const mapsUrl = acc.mapsUrl;
+  const mapsUrl = acc.mapsUrl || acc.maps;
+  const wazeUrl = acc.waze;
+  const weatherKey = acc.weatherKey;
   const pdfFile = acc.pdf;
 
   let metaHtml = '';
@@ -3058,7 +3217,7 @@ function renderPhaseHotelCard(phase) {
   });
 
   const pdfHtml = pdfFile ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="/confirmations/view/${pdfFile}" title="View">👁</a><a class="conf-pdf" href="/confirmations/${pdfFile}" download title="Download">⬇</a></span>` : '';
-  const navHtml = mapsUrl ? `<div class="loc-nav-row" style="margin-top:10px"><a class="btn" href="${mapsUrl}" target="_blank">🗺️ Google Maps</a></div>` : '';
+  const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${mapsUrl}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${wazeUrl}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
   const descHtml = acc.description ? `<p>${_biSpan(acc.description)}</p>` : '';
   const icon = acc.type === 'private' ? '🏠' : '🏨';
 
@@ -3101,6 +3260,7 @@ function renderInfo(cfg) {
   const countriesEl = document.getElementById('info-countries');
   if (countriesEl) {
     const entries = Object.entries(ti.countries || {});
+    const emergencyContacts = ti.emergency_contacts || [];
     countriesEl.innerHTML = entries.map(([name, c]) => {
       const e = c.emergency;
       const emergencyLine = e?.general
@@ -3112,10 +3272,10 @@ function renderInfo(cfg) {
         <p>📞 <strong class="ltr">${emergencyLine}</strong></p>
         <p>${[currencyLine, c.callingCode].filter(Boolean).join(' · ')}</p>
       </div>`;
-    }).join('');
+    }).join('') + emergencyContacts.map(c => `<div class="mini"><h4>${_biSpan(c.name)}</h4><p>📞 <a class="ltr" href="tel:${c.phone}">${c.phone}</a></p></div>`).join('');
   }
   const emrgBlock = document.getElementById('info-block-emrg');
-  if (emrgBlock) emrgBlock.style.display = Object.keys(ti.countries || {}).length ? '' : 'none';
+  if (emrgBlock) emrgBlock.style.display = (Object.keys(ti.countries || {}).length || (ti.emergency_contacts || []).length) ? '' : 'none';
 
   const listBlock = (blockId, listId, items, render) => {
     const block = document.getElementById(blockId);
@@ -3132,6 +3292,43 @@ function renderInfo(cfg) {
   listBlock('info-block-comm', 'info-communication', ti.communication, item => `<li>${_biSpan(item)}</li>`);
   listBlock('info-block-age', 'info-age-notes', ti.age_notes,
     n => `<li><strong>${_biSpan(n.who)}</strong> — ${_biSpan(n.note)}</li>`);
+}
+
+// ── TELEGRAM LOGIN WIDGET ──────────────────────────────────────────────────────
+// Pure DOM: shows/hides the widget block and injects Telegram's official
+// widget script once per bot username. Fetching /api/health and posting the
+// login itself live outside this render block, in initTelegramAuth() /
+// onTelegramAuth() near initGoogleAuth().
+function renderTelegramLogin(botUsername) {
+  const wrap = document.getElementById('telegram-signin-wrap');
+  const mount = document.getElementById('telegram-signin-btn');
+  if (!wrap || !mount) return;
+  if (!botUsername) { wrap.style.display = 'none'; return; }
+  wrap.style.display = 'flex';
+  if (mount.dataset.botUsername === botUsername) return; // already injected for this bot
+  mount.innerHTML = '';
+  const script = document.createElement('script');
+  script.async = true;
+  script.src = 'https://telegram.org/js/telegram-widget.js?22';
+  script.setAttribute('data-telegram-login', botUsername);
+  script.setAttribute('data-size', 'large');
+  script.setAttribute('data-onauth', 'onTelegramAuth(user)');
+  mount.appendChild(script);
+  mount.dataset.botUsername = botUsername;
+}
+
+// Maps POST /api/auth/telegram-login's error codes to a localized message.
+// telegram_account_not_linked is the one that will actually fire in practice
+// until every participant's numeric Telegram ID is added to trip.config.json.
+function telegramLoginErrorMessage(code, tr) {
+  const messages = {
+    telegram_not_configured: tr.err_telegram_not_configured,
+    invalid_telegram_login: tr.err_telegram_invalid,
+    not_group_member: tr.err_telegram_not_member,
+    telegram_membership_check_failed: tr.err_telegram_check_failed,
+    telegram_account_not_linked: tr.err_telegram_not_linked,
+  };
+  return messages[code] || tr.err_wrong;
 }
 
 function renderDays(phase) {
@@ -3153,22 +3350,39 @@ function renderDays(phase) {
    INIT
    ========================================================= */
 window.addEventListener('load', async () => {
+  // A one-time enrollment link short-circuits everything else — no roster,
+  // no picker, no auth check. Someone following this link has no account yet.
+  if (enrollmentTokenFromUrl()) {
+    showEnrollmentForm();
+    applyLang(currentLang);
+    return;
+  }
+
+  // Runs regardless of auth state — this is what populates the "pick
+  // yourself" login screen for a visitor who isn't signed in yet.
+  await loadLoginRoster();
+  buildLoginPicker();
+
+  const authenticated = await checkAuth();
+  initGoogleAuth();
+  initTelegramAuth();
+  if (!authenticated) {
+    applyLang(currentLang);
+    return;
+  }
+
   await loadTripConfig();
   buildGlobalsFromConfig(window.TRIP_CONFIG);
 
   loadUsersCache();
-  buildLoginPicker();
-  initGoogleAuth();
-  checkAuth().then(() => {
-    loadRatings();
-    loadTaskDone();
-    // Load RSVPs for all phases that have activities
-    (window.TRIP_CONFIG?.phases || []).forEach(p => {
-      if (p.rsvp_activities?.length) loadRsvps(`rsvps-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
-    });
-    if (document.querySelector('#photos.section.active')) loadPhotosGallery();
-    loadLostFound();
+  loadRatings();
+  loadTaskDone();
+  // Load RSVPs for all phases that have activities
+  (window.TRIP_CONFIG?.phases || []).forEach(p => {
+    if (p.rsvp_activities?.length) loadRsvps(`rsvps-${p.id}`, RSVP_ACTIVITIES[p.id] || []);
   });
+  if (document.querySelector('#photos.section.active')) loadPhotosGallery();
+  loadLostFound();
   applyLang(currentLang);
   setHero('home');
   applyTweaks();

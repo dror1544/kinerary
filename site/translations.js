@@ -15,6 +15,23 @@ const T = {
     err_wrong:      'שם משתמש או סיסמה שגויים. נסה שוב.',
     login_or:       'או',
     err_google_not_linked: 'אין חשבון המקושר לכניסה זו של Google — התחבר/י קודם עם שם משתמש וסיסמה, ואז חבר/י את Google מהפרופיל שלך.',
+    err_telegram_not_configured: 'כניסה עם טלגרם אינה זמינה כרגע.',
+    err_telegram_invalid: 'הכניסה עם טלגרם נכשלה. נסה/י שוב.',
+    err_telegram_not_member: 'עליך להיות חבר/ה פעיל/ה בקבוצת הטלגרם של הטיול כדי להתחבר כך.',
+    err_telegram_check_failed: 'לא ניתן היה לאמת את החברות בקבוצה — נסה/י שוב, או התחבר/י עם שם משתמש וסיסמה.',
+    err_telegram_not_linked: 'חשבון הטלגרם שלך עדיין לא מקושר — התחבר/י עם שם משתמש וסיסמה, ובקש/י מהמארגן/ת לקשר את הטלגרם שלך.',
+
+    /* enrollment */
+    enroll_title:        'ברוך/ה הבא/ה',
+    enroll_desc:         'בחר/י סיסמה כדי להצטרף לאתר הטיול.',
+    enroll_pwd_ph:       'סיסמה חדשה',
+    enroll_pwd_confirm_ph: 'אימות סיסמה',
+    enroll_submit:       'קבע/י סיסמה →',
+    enroll_err_short:    'הסיסמה קצרה מדי.',
+    enroll_err_mismatch: 'הסיסמאות אינן תואמות.',
+    enroll_err_invalid:  'הקישור אינו תקף או שכבר נעשה בו שימוש.',
+    enroll_err_expired:  'פג תוקף הקישור — בקש/י קישור חדש.',
+    enroll_err_server:   'שגיאה בשמירת הסיסמה.',
 
     /* side menu */
     sm_nav:         'ניווט',
@@ -64,6 +81,9 @@ const T = {
     cd_hours:  'שעות',
     cd_min:    'דקות',
     cd_sec:    'שניות',
+    cd_until_departure: 'עד היציאה',
+    cd_until_end:       'עד סוף הטיול',
+    cd_finished:        '✅ הטיול הסתיים',
 
     /* hero ctas / labels per tab — framework tabs only; phase heroes come from config */
     hero_home_label: '— מסע משפחתי',
@@ -274,6 +294,23 @@ const T = {
     err_wrong:      'Wrong username or password. Try again.',
     login_or:       'or',
     err_google_not_linked: 'No account is linked to this Google login yet — log in with your username and password first, then connect Google from your profile.',
+    err_telegram_not_configured: 'Telegram login is not available right now.',
+    err_telegram_invalid: 'Telegram login failed. Please try again.',
+    err_telegram_not_member: 'You need to be an active member of the trip\'s Telegram group to log in this way.',
+    err_telegram_check_failed: 'Could not verify your Telegram membership — try again, or log in with your username and password.',
+    err_telegram_not_linked: 'Your Telegram account isn\'t linked yet — log in with your username and password, and ask the organizer to link your Telegram.',
+
+    /* enrollment */
+    enroll_title:        'Welcome',
+    enroll_desc:         'Choose a password to join the trip site.',
+    enroll_pwd_ph:       'New password',
+    enroll_pwd_confirm_ph: 'Confirm password',
+    enroll_submit:       'Set password →',
+    enroll_err_short:    'Password is too short.',
+    enroll_err_mismatch: 'Passwords do not match.',
+    enroll_err_invalid:  'This link is invalid or has already been used.',
+    enroll_err_expired:  'This link has expired — ask for a new one.',
+    enroll_err_server:   'Could not save the password.',
 
     /* side menu */
     sm_nav:         'NAVIGATION',
@@ -323,6 +360,9 @@ const T = {
     cd_hours:  'hours',
     cd_min:    'min',
     cd_sec:    'sec',
+    cd_until_departure: 'until departure',
+    cd_until_end:       'until the trip ends',
+    cd_finished:        '✅ Trip complete',
 
     /* hero — framework tabs only; phase heroes come from config */
     hero_home_label: '— Family Journey',

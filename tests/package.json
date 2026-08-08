@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "test": "node --test --test-reporter=spec config.test.js server.test.js render.test.js config-versions.test.js",
+    "test": "node --test --test-reporter=spec config.test.js server.test.js render.test.js config-versions.test.js multi-organizer.test.js telegram-sso.test.js agent-participants.test.js",
     "test:config": "node --test --test-reporter=spec config.test.js",
     "test:server": "node --test --test-reporter=spec server.test.js",
     "test:render": "node --test --test-reporter=spec render.test.js",
-    "test:versions": "node --test --test-reporter=spec config-versions.test.js"
+    "test:versions": "node --test --test-reporter=spec config-versions.test.js",
+    "test:multi-organizer": "node --test --test-reporter=spec multi-organizer.test.js"
   },
   "devDependencies": {
     "happy-dom": "^14.0.0"

@@ -10,7 +10,15 @@ const VISIBILITIES = ['group', 'organizer'];
 // medical/allergy needs default to organizer-only since /api/config has no
 // auth at all and /api/config/versions/:version is authRequired but not
 // organizer-scoped (every family member, including kids, is authed there).
+//
+// An *unrecognized* type also defaults to organizer-only. Without that clause
+// a one-character typo — "medicl", or "Medical" with the wrong case — falls
+// through the medical/allergy check and publishes the need to the whole group
+// over an unauthenticated endpoint. Every other unknown value in this file
+// fails safe; this one used to fail open, which made a typo in the single
+// most sensitive field the one mistake the schema didn't catch.
 function defaultVisibility(type) {
+  if (!NEED_TYPES.includes(type)) return 'organizer';
   return (type === 'medical' || type === 'allergy') ? 'organizer' : 'group';
 }
 

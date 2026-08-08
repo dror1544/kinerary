@@ -106,11 +106,18 @@ describe('trip.config.json schema', () => {
     const withoutNeeds = cfg.participants.filter(p => !('needs' in p));
     assert.ok(withoutNeeds.length > 0, 'fixture should also exercise a participant with no needs field at all');
   });
-  test('eve\'s needs exercise a visibility override, a malformed entry, and a garbage visibility value', () => {
+  test('eve\'s needs exercise a visibility override, a malformed entry, a garbage visibility and a bad severity', () => {
     const eve = cfg.participants.find(p => p.username === 'eve');
-    assert.ok(eve?.needs?.length === 3, 'expected eve to have exactly 3 needs in the fixture');
+    assert.ok(eve?.needs?.length === 4, 'expected eve to have exactly 4 needs in the fixture');
 
-    const [override, malformed, garbageVisibility] = eve.needs;
+    const [override, malformed, garbageVisibility, badSeverity] = eve.needs;
+
+    // Isolates severity normalization from the visibility rules: type and
+    // visibility are both fine here, only the severity is a typo, so this is
+    // the one malformed need that still reaches the group.
+    assert.ok(NEED_TYPES.includes(badSeverity.type), 'the bad-severity entry should have a valid type');
+    assert.ok(!NEED_SEVERITIES.includes(badSeverity.severity), 'expected an intentionally-invalid severity');
+    assert.equal(badSeverity.visibility, undefined, 'the bad-severity entry should rely on the type default (group)');
     assert.equal(override.visibility, 'group', 'expected an explicit visibility override on eve\'s medical need');
     assert.equal(override.type, 'medical', 'expected the override to be on a type that defaults to organizer-only');
 
