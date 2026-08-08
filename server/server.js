@@ -37,7 +37,11 @@ const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : nul
 // Telegram Login is verified server-side and additionally bound to live
 // membership in the configured trip group. No bot secret reaches the browser.
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+// Mutable: Telegram gives a bot no way to create or discover a group on its
+// own (confirmed against the Bot API docs — no such method exists), so the
+// chat_id can't be known at deploy time the way the token/username can. See
+// POST /api/agent/telegram-group, the one runtime writer of this value.
+let TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org').replace(/\/$/, '');
 const TELEGRAM_AUTH_MAX_AGE_SECONDS = Number(process.env.TELEGRAM_AUTH_MAX_AGE_SECONDS || 86400);
 // Public @handle only — never the token. Safe to serve pre-auth so the login
@@ -54,11 +58,16 @@ function verifyTelegramLogin(payload) {
   const expected = crypto.createHmac('sha256', secret).update(check).digest('hex');
   return hash.length === expected.length && crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected));
 }
-async function telegramActiveMember(userId) {
-  const url = `${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&user_id=${encodeURIComponent(userId)}`;
-  const reply = await fetch(url).then(r => r.json());
+async function telegramChatMemberStatus(chatId, userId) {
+  const url = `${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(chatId)}&user_id=${encodeURIComponent(userId)}`;
+  return fetch(url).then(r => r.json());
+}
+function isActiveMemberReply(reply) {
   const status = reply?.result?.status;
   return reply?.ok && ['creator', 'administrator', 'member', 'restricted'].includes(status) && !(status === 'restricted' && reply.result?.is_member === false);
+}
+async function telegramActiveMember(userId) {
+  return isActiveMemberReply(await telegramChatMemberStatus(TELEGRAM_CHAT_ID, userId));
 }
 async function verifyGoogleToken(idToken) {
   const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
@@ -73,6 +82,20 @@ const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
 // live where the web server can reach it, not in the app's private data
 // volume. Overridable so tests don't write into the real checked-out dir.
 const AVATARS_DIR = process.env.AVATARS_DIR || path.join(__dirname, 'avatars');
+// Where systemd's EnvironmentFile= points in production (one level above
+// server/, alongside docker-compose.yml). Overridable so tests don't write
+// into the real checked-out .env. The only value ever written back here is
+// TELEGRAM_CHAT_ID (see POST /api/agent/telegram-group) — every other secret
+// stays operator-set, deploy-time only.
+const ENV_FILE = process.env.ENV_FILE_PATH || path.join(__dirname, '..', '.env');
+function persistEnvVar(key, value) {
+  let content = '';
+  try { content = fs.readFileSync(ENV_FILE, 'utf8'); } catch { /* no .env yet — fine, we're creating it */ }
+  const line = `${key}=${value}`;
+  const pattern = new RegExp(`^${key}=.*$`, 'm');
+  content = pattern.test(content) ? content.replace(pattern, line) : content.replace(/\n?$/, '\n') + line + '\n';
+  fs.writeFileSync(ENV_FILE, content.replace(/^\n/, ''));
+}
 const USERS_FILE  = path.join(DATA_DIR, 'users.json');
 const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
 const PHOTOS_FILE  = path.join(DATA_DIR, 'photos.json');
@@ -795,6 +818,48 @@ app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async 
     // organizer) should know this doesn't yank an already-open session.
     note: 'Future logins are revoked. An already-issued session token (valid up to 30 days) is not invalidated — this app has no session-revocation mechanism yet.',
   });
+});
+
+// Binds the trip's Telegram group once it exists. TELEGRAM_BOT_TOKEN/
+// USERNAME are deployment-time secrets, set once and never touched here —
+// TELEGRAM_CHAT_ID is the one piece that genuinely can't be known ahead of
+// time (a bot can't create or discover a group on its own; there's no
+// username→group lookup either), so this is the only runtime write into
+// the deployment's .env this codebase has. Everything else stays in
+// trip.config.json, which sanitizeConfig() already guards from ever being
+// served raw — .env was the deliberate choice to keep this value out of
+// that path entirely, consistent with how the other TELEGRAM_* values
+// already live in .env rather than the config file.
+//
+// The caller only ever proves it holds the flat agent key or an organizer
+// JWT, never which human actually typed the chat_id — same caveat as every
+// other /api/agent/* route. What this route adds on top: it verifies, live
+// via getChatMember, that a Telegram-bound organizer is really an active
+// member of the given chat before trusting it, so a wrong or made-up
+// chat_id can't silently become "the trip group."
+app.post('/api/agent/telegram-group', organizerOrAgentRequired, async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) return res.status(409).json({ error: 'telegram_bot_not_configured' });
+  const chatId = String((req.body || {}).chat_id ?? '').trim();
+  if (!/^-\d+$/.test(chatId)) return res.status(400).json({ error: 'invalid_chat_id' });
+
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  const boundOrganizer = (TRIP_CONFIG.participants || []).find(p => organizers.includes(p.username) && p.telegram_id);
+  if (!boundOrganizer) return res.status(409).json({ error: 'no_telegram_bound_organizer' });
+
+  let reply;
+  try {
+    reply = await telegramChatMemberStatus(chatId, boundOrganizer.telegram_id);
+  } catch (e) {
+    return res.status(502).json({ error: 'telegram_api_unreachable', detail: e.message });
+  }
+  if (!isActiveMemberReply(reply)) {
+    return res.status(422).json({ error: 'organizer_not_member_of_chat', detail: reply?.description || reply?.result?.status || null });
+  }
+
+  TELEGRAM_CHAT_ID = chatId;
+  persistEnvVar('TELEGRAM_CHAT_ID', chatId);
+
+  res.json({ ok: true, chat_id: chatId, chat_title: (req.body || {}).chat_title || null, telegram_enabled: telegramEnabled() });
 });
 
 // Redeems a one-time enrollment token minted by POST /api/agent/participants

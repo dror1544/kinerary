@@ -301,3 +301,115 @@ describe('telegram_id syncs from config on every boot, not just fresh-DB seed', 
     await stop(proc);
   });
 });
+
+// ── POST /api/agent/telegram-group ──────────────────────────────────────────
+// A bot can't create or discover a Telegram group on its own, so chat_id is
+// the one Telegram setting that can't be known at deploy time — this route
+// is how it gets bound once the organizer actually creates the group.
+describe('POST /api/agent/telegram-group', () => {
+  const PORT3 = 3102; // 3095-3101 already claimed by other test files
+  let apiServer3, apiBaseUrl3, tripServer3, dataDir3, tripDir3, envFile3, membership3;
+
+  before(async () => {
+    membership3 = { status: 'member' };
+    apiServer3 = createServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ok: true, result: { ...membership3 } }));
+    });
+    await new Promise(resolve => apiServer3.listen(0, '127.0.0.1', resolve));
+    apiBaseUrl3 = `http://127.0.0.1:${apiServer3.address().port}`;
+
+    dataDir3 = mkdtempSync(join(tmpdir(), 'trip-telegram-group-data-'));
+    tripDir3 = mkdtempSync(join(tmpdir(), 'trip-telegram-group-trip-'));
+    cpSync(FIXTURES_DIR, tripDir3, { recursive: true });
+    envFile3 = join(dataDir3, '.env');
+    // alice is already the fixture's configured organizer (agent.organizer);
+    // give her a telegram_id so the route has someone to verify membership
+    // against — the same precondition a real trip needs (bind the organizer
+    // first via bind_participant_telegram, then bind the group).
+    const configPath = join(tripDir3, 'trip.config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.participants[0].telegram_id = '1001';
+    writeFileSync(configPath, JSON.stringify(config));
+
+    tripServer3 = spawn('node', [SERVER_JS], {
+      cwd: SERVER_DIR,
+      env: {
+        ...process.env,
+        PORT: String(PORT3),
+        TRIP_DIR: tripDir3,
+        DATA_DIR: dataDir3,
+        AVATARS_DIR: join(dataDir3, 'avatars'),
+        JWT_SECRET: 'test-secret-000',
+        TELEGRAM_BOT_TOKEN: BOT_TOKEN,
+        TELEGRAM_API_BASE_URL: apiBaseUrl3,
+        ENV_FILE_PATH: envFile3,
+        IMMICH_URL: '',
+        IMMICH_API_KEY: '',
+        HERMES_API_KEY: 'test-hermes-key',
+      },
+    });
+    await waitForServer(tripServer3);
+  });
+
+  after(async () => {
+    await stop(tripServer3);
+    await new Promise(resolve => apiServer3.close(resolve));
+    rmSync(dataDir3, { recursive: true, force: true });
+    rmSync(tripDir3, { recursive: true, force: true });
+  });
+
+  function bindGroup(body, headers = { 'X-API-Key': 'test-hermes-key' }) {
+    return fetch(`http://localhost:${PORT3}/api/agent/telegram-group`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    });
+  }
+
+  test('rejects an unauthenticated request', async () => {
+    const res = await bindGroup({ chat_id: '-1002345678901' }, {});
+    assert.equal(res.status, 401);
+  });
+
+  test('rejects a malformed chat_id', async () => {
+    const res = await bindGroup({ chat_id: 'not-a-chat-id' });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_chat_id');
+  });
+
+  test('rejects when the bound organizer is not an active member of the given chat', async () => {
+    membership3 = { status: 'left' };
+    const res = await bindGroup({ chat_id: '-1002345678901' });
+    assert.equal(res.status, 422);
+    assert.equal((await res.json()).error, 'organizer_not_member_of_chat');
+  });
+
+  test('accepts, persists to .env, and takes effect immediately with no restart', async () => {
+    membership3 = { status: 'member' };
+    const res = await bindGroup({ chat_id: '-1002345678901', chat_title: 'Test Trip Group' });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.chat_id, '-1002345678901');
+    assert.equal(body.telegram_enabled, true);
+
+    assert.match(readFileSync(envFile3, 'utf8'), /^TELEGRAM_CHAT_ID=-1002345678901$/m);
+
+    // No restart: a login for this chat's member should work against the
+    // already-running process immediately.
+    const login = await fetch(`http://localhost:${PORT3}/api/auth/telegram-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedPayload({ id: '1001' })),
+    });
+    assert.equal(login.status, 200);
+  });
+
+  test('re-binding overwrites the previously persisted chat_id rather than duplicating the line', async () => {
+    const res = await bindGroup({ chat_id: '-1009999999999' });
+    assert.equal(res.status, 200);
+    const envContent = readFileSync(envFile3, 'utf8');
+    assert.match(envContent, /^TELEGRAM_CHAT_ID=-1009999999999$/m);
+    assert.equal(envContent.match(/TELEGRAM_CHAT_ID=/g).length, 1);
+  });
+});

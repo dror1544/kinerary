@@ -29,7 +29,3 @@ scripts/hermes-pipeline/.last-answers.json
 provisioning/__pycache__/
 tests/provisioning/__pycache__/
 telegram_manager/__pycache__/
-mcp/.trip-mcp-3011.log
-mcp/.trip-mcp-3011.pid
-mcp/.trip-mcp.log
-mcp/.trip-mcp.pid

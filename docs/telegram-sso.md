@@ -7,9 +7,11 @@ session used by password and Google login; it never creates a user account.
 ## Configuration
 
 1. Copy `.env.example` to the deployment's untracked `.env` file.
-2. Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and
-   `TELEGRAM_API_BASE_URL` from the Telegram deployment. Do not put any of
-   them in `trip.config.json`, source code, or git.
+2. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_API_BASE_URL` from the Telegram
+   deployment. Do not put either in `trip.config.json`, source code, or git.
+   `TELEGRAM_CHAT_ID` can be set here too if already known, but a bot can't
+   create or discover a group on its own — see "Binding the group" below for
+   the usual path, which doesn't require a redeploy.
 3. Set `TELEGRAM_BOT_USERNAME` to the bot's public `@handle` (no `@`, e.g.
    `my_trip_bot`). Unlike the token, this is not a secret — it's what
    `GET /api/health` serves to the pre-auth browser so the login screen knows
@@ -33,6 +35,33 @@ session used by password and Google login; it never creates a user account.
 
    `telegram_id` is removed by `sanitizeConfig()` and never returned from
    `GET /api/config`.
+
+## Binding the group
+
+`TELEGRAM_CHAT_ID` is normally the one Telegram setting you can't fill in at
+deploy time: Telegram gives a bot no way to create or discover a group on its
+own, and there's no username→group lookup either — the organizer has to
+create the group and add the bot themselves. Once that's happened and the
+bot has seen at least one message in it (so its `chat.id` is known),
+`POST /api/agent/telegram-group` (`organizerOrAgentRequired`) binds it live,
+no restart required:
+
+```bash
+curl -X POST http://localhost:8080/api/agent/telegram-group \
+  -H "X-API-Key: $HERMES_API_KEY" -H "Content-Type: application/json" \
+  -d '{"chat_id": "-1002345678901", "chat_title": "Trip Group"}'
+```
+
+It verifies, via a live `getChatMember` call, that a Telegram-bound organizer
+(bind them first with `PATCH /api/agent/participants/:username/telegram` if
+they aren't yet) is actually an active member of the given `chat_id` before
+accepting it — a wrong or made-up chat_id is refused with
+`organizer_not_member_of_chat`. On success it both updates the running
+process's in-memory value and persists `TELEGRAM_CHAT_ID` into the
+deployment's `.env`, so it survives the next restart too. Also exposed as the
+`set_telegram_group` MCP tool, for an agent that's already watching the bound
+Telegram account and can observe the group's `chat.id` directly once the
+organizer adds the bot.
 
 ## Login endpoint
 
