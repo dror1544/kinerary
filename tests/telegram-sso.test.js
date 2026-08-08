@@ -403,6 +403,12 @@ describe('POST /api/agent/telegram-group', () => {
       body: JSON.stringify(signedPayload({ id: '1001' })),
     });
     assert.equal(login.status, 200);
+
+    // GET /api/health flips telegramGroupBound live too — this is the signal
+    // an agent (or the pre-auth login screen) polls to know binding finished,
+    // no restart or separate confirmation needed.
+    const health = await fetch(`http://localhost:${PORT3}/api/health`);
+    assert.equal((await health.json()).telegramGroupBound, true);
   });
 
   test('re-binding overwrites the previously persisted chat_id rather than duplicating the line', async () => {
