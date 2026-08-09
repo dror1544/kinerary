@@ -13,7 +13,7 @@ export const TRIP_API_KEY = 'test-trip-key';
 
 let mcpProcess = null;
 
-export async function startTestMcp() {
+export async function startTestMcp(extraEnv = {}) {
   return new Promise((resolve, reject) => {
     mcpProcess = spawn('node', [MCP_JS], {
       cwd: MCP_DIR,
@@ -22,11 +22,11 @@ export async function startTestMcp() {
         MCP_PORT: String(TEST_PORT),
         MCP_API_KEY,
         TRIP_API_KEY,
-        // Deliberately no ANTHROPIC_API_KEY — auth is checked before the key
-        // is read, so these tests can prove the auth boundary without ever
-        // making a real Anthropic call.
-        ANTHROPIC_API_KEY: '',
-        API_BASE_URL: 'http://127.0.0.1:1', // unused by /extract; never dialed
+        // Deliberately no HERMES_EXTRACT_PROFILE by default — auth is checked
+        // before it's read, so the auth tests don't need a real hermes CLI.
+        HERMES_EXTRACT_PROFILE: '',
+        API_BASE_URL: 'http://127.0.0.1:1', // unreachable; apiGet() calls fail into their catch blocks
+        ...extraEnv,
       },
     });
 

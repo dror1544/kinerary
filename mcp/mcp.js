@@ -433,9 +433,12 @@ async function disposeSession(sessionId, { closeTransport = false } = {}) {
 }
 
 // ── /extract — AI booking data extraction ────────────────────────────────────
-// Built fresh per request from the live trip config — phase ids and dates are
-// never the same across trips, so this can't be a static prompt.
-async function buildExtractSystem() {
+// Built fresh per request from the live trip config/roster/bookings — phase
+// ids, participants and what's already booked are never the same across
+// trips, so this can't be a static prompt. `bookings` is passed in (rather
+// than fetched here too) so the caller can reuse the same list for the
+// deterministic duplicate-confirmation check below.
+async function buildExtractSystem(bookings) {
   let title = 'this trip', phaseLines = '- intl_flights: international flights';
   try {
     const cfg = await apiGet('/api/config');
@@ -447,11 +450,25 @@ async function buildExtractSystem() {
     if (lines.length) phaseLines = ['- intl_flights: international flights', ...lines].join('\n');
   } catch (_) { /* fall back to the generic defaults above */ }
 
+  let rosterLine = '';
+  try {
+    const { participants: roster } = await apiGet('/api/config/roster');
+    if (Array.isArray(roster) && roster.length) {
+      rosterLine = roster.map(p => p.name_en || p.name || p.username).filter(Boolean).join(', ');
+    }
+  } catch (_) { /* roster context is a nice-to-have, not required */ }
+
+  const bookingsSummary = (bookings || []).length
+    ? bookings.map(b => `- [${b.phase}] ${b.name} (${b.date_from || '?'}${b.date_to && b.date_to !== b.date_from ? `–${b.date_to}` : ''}), confirmation: ${b.confirmation || '—'}`).join('\n')
+    : '';
+
   return `You are a travel booking data extractor for "${title}".
 Extract structured booking data from the provided content and return ONLY a valid JSON object.
 
 Trip phase date ranges:
 ${phaseLines}
+${rosterLine ? `\nTrip participants: ${rosterLine}` : ''}
+${bookingsSummary ? `\nAlready-booked items on this trip (context for spotting conflicts only — do not repeat these back as your answer):\n${bookingsSummary}` : ''}
 
 JSON fields (omit any field you cannot determine):
 {
@@ -464,7 +481,7 @@ JSON fields (omit any field you cannot determine):
   "confirmation": "confirmation / reservation number",
   "pin": "PIN code if present",
   "cost": numeric USD amount,
-  "notes": "any relevant notes"
+  "notes": "any relevant notes from the document itself, plus — only if something genuinely doesn't fit this trip — one short line starting with '⚠️': dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
 }
 
 Return ONLY the JSON object, no commentary.`;
@@ -572,11 +589,31 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
       }
     }
 
-    const system = await buildExtractSystem();
+    let bookings = [];
+    try { bookings = await apiGet('/api/bookings'); } catch (_) { /* prompt still works without it */ }
+
+    const system = await buildExtractSystem(bookings);
     const stdout = await runHermesExtract(`${system}\n\n---\n\n${content}`);
     const m = stdout.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('No JSON in response');
-    res.json(JSON.parse(m[0]));
+    const parsed = JSON.parse(m[0]);
+    // Seen in practice: an occasional cold-start call returns `{}` — valid
+    // JSON, HTTP 200, but nothing usable. Treat "no name" as a failed
+    // extraction rather than a false-success empty form.
+    if (!parsed.name) throw new Error('Extraction returned no usable data — try again');
+
+    // Deterministic duplicate-confirmation check — exact string match isn't
+    // something worth leaving to the model's judgment when the data to check
+    // it against is already sitting right here.
+    if (parsed.confirmation) {
+      const dup = bookings.find(b => b.confirmation && b.confirmation === parsed.confirmation);
+      if (dup) {
+        const flag = `⚠️ Confirmation ${parsed.confirmation} matches existing booking #${dup.id} (${dup.name}) — check this isn't a duplicate.`;
+        parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+      }
+    }
+
+    res.json(parsed);
   } catch (e) {
     console.error('[extract]', e.message);
     res.status(500).json({ error: e.message });

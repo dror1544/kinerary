@@ -80,6 +80,19 @@ before wiring it up. No API-server, gateway, or new port involved — this
 server just shells out to `hermes -p kinerary-extract chat -q "<prompt>" -Q
 --safe-mode --reasoning none` per request and reads stdout.
 
+**Trip-aware, without a trip-specific agent.** One shared `kinerary-extract`
+profile serves every trip — it doesn't need its own identity per trip to
+catch trip-specific issues. Each request's prompt is built fresh from that
+trip's own live data: phase date ranges, the participant roster
+(`/api/config/roster`), and everything already booked (`/api/bookings`). The
+model is asked to add a short `⚠️` line to `notes` for a real, visible
+mismatch — a date outside the matched phase, a passenger nobody on the trip
+matches — and never to invent doubts for their own sake. A duplicate
+confirmation number is checked deterministically in code, not left to the
+model's judgment. A response with no `name` at all (seen in practice on an
+occasional cold-start call) is treated as a failed extraction, not a
+false-success empty form.
+
 To turn it on:
 
 1. Set `HERMES_EXTRACT_PROFILE=kinerary-extract` here in `mcp/.env` (or
