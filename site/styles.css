@@ -1263,6 +1263,24 @@ a.album-share-btn:hover { background: var(--bg-band); border-color: var(--accent
   color: var(--ink-2);
 }
 .upload-spinner { font-size: 15px; flex-shrink: 0; }
+
+/* Small inline spinner for anything that runs a few seconds (e.g. AI
+   extraction) — CSS-only, no gif asset (binary media doesn't belong in
+   the repo; see the dead ara_united_transparent_*.gif cleanup). */
+.inline-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: inline-spin .7s linear infinite;
+  vertical-align: middle;
+  margin-inline-end: 6px;
+}
+@keyframes inline-spin {
+  to { transform: rotate(360deg); }
+}
 .upload-fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr; }
 .upload-bar-wrap {
   width: 80px;

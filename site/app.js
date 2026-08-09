@@ -2499,7 +2499,8 @@ async function extractBookingWithAI() {
 
   const token = localStorage.getItem('trip-token');
   btn.disabled = true;
-  statusEl.textContent = tr.bk_extract_loading;
+  statusEl.style.color = '';
+  statusEl.innerHTML = `<span class="inline-spinner"></span>${tr.bk_extract_loading}`;
 
   try {
     let body, headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -2532,6 +2533,15 @@ async function extractBookingWithAI() {
     if (data.cost)         document.getElementById('bk-cost').value        = data.cost;
     if (data.notes)        document.getElementById('bk-notes').value       = data.notes;
     if (data.location_url) document.getElementById('bk-location-url').value = data.location_url;
+
+    if (file) {
+      // Same PDF already uploaded for extraction — carry it over as the
+      // confirmation attachment too, instead of making them attach it
+      // again below by hand.
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      document.getElementById('bk-file').files = dt.files;
+    }
 
     statusEl.style.color = 'var(--ok, #16a34a)';
     statusEl.textContent = tr.bk_extract_success;
