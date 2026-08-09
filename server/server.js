@@ -550,6 +550,7 @@ app.get('/api/health', (_req, res) => {
     immich: !!(IMMICH_URL && IMMICH_KEY),
     googleClientId: GOOGLE_CLIENT_ID || null,
     telegramBotUsername: telegramEnabled() ? (TELEGRAM_BOT_USERNAME || null) : null,
+    telegramGroupBound: Boolean(TELEGRAM_CHAT_ID),
   });
 });
 

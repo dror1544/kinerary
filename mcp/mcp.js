@@ -141,7 +141,7 @@ function ok(data) {
 function buildMcpServer() {
 const mcp = new McpServer({ name: 'trip-site', version: '1.0.0' });
 
-mcp.tool('health_check', 'Check if the trip server is online and Immich is reachable', {},
+mcp.tool('health_check', 'Check if the trip server is online and Immich is reachable. Also reports Telegram setup state: telegramBotUsername (non-null once the bot is fully live) and telegramGroupBound (true once set_telegram_group has bound the chat_id) — check this before assuming Telegram login is ready, or before troubleshooting why it isn\'t.', {},
   async () => ok(await apiGet('/api/health')));
 
 mcp.tool('get_config', 'Get the trip config: meta, participants, families, phases (with their venue/rsvp ids), budget, trivia. Start here to discover valid ids for the other tools — this trip\'s phases/venues/participants are never fixed.', {},

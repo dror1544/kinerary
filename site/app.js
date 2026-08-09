@@ -417,6 +417,17 @@ function _updateGoogleConnectUI() {
   }
 }
 
+// Same last resort as the side-menu avatar (showLoggedIn): no photo at all,
+// so show the user's initial on their color instead of a broken-image icon.
+function _avatarInitialsEl() {
+  const displayN = uname(lbState.username, currentUser);
+  const el = document.createElement('div');
+  el.className = 'avatar-lb-initials';
+  el.textContent = (displayN || '?')[0];
+  el.style.background = currentUser?.color || 'var(--ink-2)';
+  return el;
+}
+
 function _buildLightboxSlides() {
   const track = document.getElementById('avatar-lb-track');
   if (!track) return;
@@ -430,9 +441,15 @@ function _buildLightboxSlides() {
     img.className = 'avatar-lb-photo';
     img.draggable = false;
     img.alt = file;
-
+    // Hidden while (re)trying sources so a failed load never flashes the
+    // browser's native broken-image icon — only becomes visible on success.
+    img.style.visibility = 'hidden';
+    img.onload = () => { img.style.visibility = ''; };
+    img.onerror = () => {
+      img.onerror = () => { img.remove(); slide.appendChild(_avatarInitialsEl()); };
+      img.src = `/avatars/${file}`;
+    };
     img.src = `/avatars/FullPhoto/${file}`;
-    img.onerror = () => { img.src = `/avatars/${file}`; };
 
     slide.appendChild(img);
     track.appendChild(slide);
@@ -1128,15 +1145,7 @@ function setHero(tabId) {
   if (heroRight) heroRight.classList.toggle('meta-centered', tabId === 'photos');
 }
 
-const tabTransitionEl = document.getElementById('tab-transition');
-
 function switchTab(tabId) {
-  const ttGif = tabTransitionEl.querySelector('.tt-gif');
-  const src = ttGif.src;
-  ttGif.src = '';
-  ttGif.src = src;
-  tabTransitionEl.classList.add('active');
-
   document.querySelectorAll('.topnav a, .sm-link').forEach(a => a.classList.toggle('active', a.dataset.tab === tabId));
   document.querySelectorAll('.section').forEach(s => s.classList.toggle('active', s.id === tabId));
   setHero(tabId);
@@ -1150,8 +1159,6 @@ function switchTab(tabId) {
   if (tabId === 'dallas')    { loadPhaseAlbum('dallas');    loadPhaseBookings('dallas'); }
   if (tabId === 'colorado')  { loadPhaseAlbum('colorado');  loadPhaseBookings('colorado'); }
   if (tabId === 'westcoast') { loadPhaseAlbum('wc');        loadPhaseBookings('west_coast'); }
-
-  setTimeout(() => tabTransitionEl.classList.remove('active'), 550);
 }
 
 // Restart spinning GIF on logo hover
@@ -2974,28 +2981,20 @@ function applyBrandFromConfig(cfg) {
   const loginTitleEl = document.querySelector('[data-i18n="login_title"]');
   if (loginTitleEl) loginTitleEl.textContent = brand;
 
-  // Logo: load from /api/trip/logo; hide all logo imgs on failure
+  // Logo: load from /api/trip/logo; fall back to the Kinerary mark when the trip has none
+  const KINERARY_LOGO = '/brand/kinerary-icon.svg';
   const logoIds = ['topbar-logo', 'login-logo', 'sm-logo'];
-  if (cfg.meta.logo) {
-    fetch('/api/trip/logo', { method: 'HEAD' }).then(r => {
-      if (r.ok) {
-        logoIds.forEach(id => { const el = document.getElementById(id); if (el) el.src = '/api/trip/logo'; });
-        const gif = document.getElementById('topbar-logo-gif');
-        if (gif) gif.style.display = 'none';
-      } else {
-        logoIds.forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
-        const gif = document.getElementById('topbar-logo-gif');
-        if (gif) gif.style.display = 'none';
-      }
-    }).catch(() => {
-      logoIds.forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
-      const gif = document.getElementById('topbar-logo-gif');
-      if (gif) gif.style.display = 'none';
-    });
-  } else {
-    logoIds.forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
+  const setLogoSrc = (src) => {
+    logoIds.forEach(id => { const el = document.getElementById(id); if (el) { el.src = src; el.style.display = ''; } });
     const gif = document.getElementById('topbar-logo-gif');
     if (gif) gif.style.display = 'none';
+  };
+  if (cfg.meta.logo) {
+    fetch('/api/trip/logo', { method: 'HEAD' })
+      .then(r => setLogoSrc(r.ok ? '/api/trip/logo' : KINERARY_LOGO))
+      .catch(() => setLogoSrc(KINERARY_LOGO));
+  } else {
+    setLogoSrc(KINERARY_LOGO);
   }
 
   // Update home hero from meta
