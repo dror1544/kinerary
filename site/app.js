@@ -2454,7 +2454,12 @@ async function loadBookings() {
     if (!rows.length) { el.innerHTML = `<p style="color:var(--ink-2);padding:24px 0;text-align:center">${tr.bk_no_bookings}</p>`; return; }
     const byPhase = {};
     for (const b of rows) { (byPhase[b.phase] = byPhase[b.phase] || []).push(b); }
-    const phaseOrder = ['intl_flights','nyc','dallas','colorado','west_coast'];
+    // Config-driven, not the original trip's hardcoded ids — a booking whose
+    // phase isn't in trip.config.json at all (renamed/removed phase, typo)
+    // still gets a section instead of silently vanishing from the list.
+    const knownPhases = ['intl_flights', ...(window.TRIP_CONFIG?.phases || []).map(p => p.id)];
+    const leftoverPhases = Object.keys(byPhase).filter(p => !knownPhases.includes(p));
+    const phaseOrder = [...knownPhases, ...leftoverPhases];
     let html = '';
     for (const phase of phaseOrder) {
       if (!byPhase[phase]) continue;
