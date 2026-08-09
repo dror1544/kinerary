@@ -2584,6 +2584,14 @@ function showBookingForm(phase, bookingData) {
   document.getElementById('bk-location-url').value  = bookingData?.location_url || '';
   document.getElementById('bk-file').value     = '';
   document.getElementById('bk-err').textContent = '';
+  // Leftover from a previous extraction (text + color) otherwise stays on
+  // screen — a stale "✓ Details extracted" can sit there for an entirely
+  // new, unrelated booking.
+  document.getElementById('bk-extract-url').value = '';
+  document.getElementById('bk-extract-file').value = '';
+  const extractStatusEl = document.getElementById('bk-extract-status');
+  extractStatusEl.textContent = '';
+  extractStatusEl.style.color = '';
   const tr = T[currentLang] || T['he'];
   document.getElementById('bk-form-title').textContent = bookingData ? tr.bk_form_edit : tr.bk_form_title;
   document.getElementById('bk-overlay').style.display = 'flex';

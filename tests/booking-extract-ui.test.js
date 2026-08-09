@@ -1,13 +1,18 @@
 /**
- * booking-extract-ui.test.js — extractBookingWithAI() in site/app.js.
+ * booking-extract-ui.test.js — extractBookingWithAI() and showBookingForm()
+ * in site/app.js.
  *
- * Two UX fixes verified here, against the real function source (not a
+ * UX fixes verified here, against the real function source (not a
  * reimplementation):
  *  1. A loading indicator (spinner + "may take a few seconds" copy) shows
  *     while the request is in flight — extraction can take 10-30+ seconds.
  *  2. The same PDF already uploaded for extraction is carried over into the
  *     "Attach PDF confirmation" file input, instead of silently discarding
  *     it and making the user pick the identical file a second time.
+ *  3. Reopening the Add Booking form (new or edit) resets the extraction
+ *     status line — it used to leave a previous attempt's message and
+ *     color (e.g. a stale green "✓ Details extracted") showing for an
+ *     entirely unrelated booking.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,8 +28,8 @@ const APP_JS = join(HERE, '..', 'site', 'app.js');
 function extractSource() {
   const src = readFileSync(APP_JS, 'utf8');
   const start = src.indexOf('async function extractBookingWithAI');
-  const end = src.indexOf('function showBookingForm');
-  if (start === -1 || end === -1) throw new Error('Could not locate extractBookingWithAI() in app.js');
+  const end = src.indexOf('function hideBookingForm');
+  if (start === -1 || end === -1) throw new Error('Could not locate extractBookingWithAI()/showBookingForm() in app.js');
   return src.slice(start, end);
 }
 
@@ -35,6 +40,9 @@ const FORM_HTML = `
     <button id="bk-extract-btn"></button>
     <p id="bk-extract-status"></p>
   </div>
+  <input id="bk-id" type="hidden">
+  <h2 id="bk-form-title"></h2>
+  <div id="bk-overlay" style="display:none"></div>
   <select id="bk-phase"></select>
   <select id="bk-type"></select>
   <input id="bk-name">
@@ -45,8 +53,11 @@ const FORM_HTML = `
   <input id="bk-pin">
   <input id="bk-cost">
   <textarea id="bk-notes"></textarea>
+  <input id="bk-google-wallet">
   <input id="bk-location-url">
   <input id="bk-file" type="file">
+  <input id="bk-pkpass-file" type="file">
+  <p id="bk-err"></p>
 `;
 
 function makeContext({ fetchImpl }) {
@@ -61,7 +72,7 @@ function makeContext({ fetchImpl }) {
     DataTransfer: win.DataTransfer,
     FileReader: win.FileReader,
     currentLang: 'en',
-    T: { en: { bk_extract_loading: 'Extracting details... this may take a few seconds', bk_extract_success: 'Details extracted', bk_extract_error: 'Extraction failed' } },
+    T: { en: { bk_extract_loading: 'Extracting details... this may take a few seconds', bk_extract_success: 'Details extracted', bk_extract_error: 'Extraction failed', bk_form_title: 'Add Booking', bk_form_edit: 'Edit Booking' } },
     localStorage: { getItem: () => 'fake-token' },
     fetch: fetchImpl,
     console,
@@ -120,5 +131,35 @@ describe('extractBookingWithAI()', () => {
     await ctx.extractBookingWithAI();
     assert.equal(document.getElementById('bk-file').files.length, 0);
     assert.match(document.getElementById('bk-extract-status').textContent, /boom/);
+  });
+});
+
+describe('showBookingForm() resets the extraction section', () => {
+  test('clears a leftover success message and its color when reopening for a new booking', () => {
+    const { document, ctx } = makeContext({ fetchImpl: async () => ({ ok: true, json: async () => ({}) }) });
+    const statusEl = document.getElementById('bk-extract-status');
+    // Simulate what a previous, unrelated extraction left behind.
+    statusEl.textContent = '✓ Details extracted — review and save';
+    statusEl.style.color = 'rgb(22, 163, 74)';
+    document.getElementById('bk-extract-url').value = 'https://example.com/old';
+    setFile(document, 'bk-extract-file', 'old.pdf');
+
+    ctx.showBookingForm('intl_flights', null);
+
+    assert.equal(statusEl.textContent, '', 'stale extraction message must be cleared on reopen');
+    assert.equal(statusEl.style.color, '', 'stale (green) color must be cleared on reopen');
+    assert.equal(document.getElementById('bk-extract-url').value, '');
+  });
+
+  test('also clears it when reopening to edit an existing booking', () => {
+    const { document, ctx } = makeContext({ fetchImpl: async () => ({ ok: true, json: async () => ({}) }) });
+    const statusEl = document.getElementById('bk-extract-status');
+    statusEl.textContent = 'Extraction failed: boom';
+    statusEl.style.color = 'rgb(200, 0, 0)';
+
+    ctx.showBookingForm('intl_flights', { id: 5, name: 'Existing booking', type: 'hotel' });
+
+    assert.equal(statusEl.textContent, '');
+    assert.equal(statusEl.style.color, '');
   });
 });
