@@ -480,8 +480,8 @@ JSON fields (omit any field you cannot determine):
   "passengers": "passenger or guest names",
   "confirmation": "confirmation / reservation number",
   "pin": "PIN code if present",
-  "cost": numeric USD amount,
-  "notes": "any relevant notes from the document itself, plus — only if something genuinely doesn't fit this trip — one short line starting with '⚠️': dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
+  "cost": numeric USD amount — if the document shows a price in another currency (¥, €, £, etc.), convert it to USD yourself using a reasonable current exchange rate and put the converted number here. Never omit this just because the source wasn't already in USD,
+  "notes": "any relevant notes from the document itself, plus — only if applicable — one short line for each: (1) if you converted a cost, the original amount and currency and that it's an approximate conversion (e.g. '¥45,000 ≈ $300, approximate'); (2) starting with '⚠️', a genuine mismatch with this trip — dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
 }
 
 Return ONLY the JSON object, no commentary.`;
