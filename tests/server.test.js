@@ -570,6 +570,12 @@ describe('GET /api/health', () => {
     assert.equal(data.ok, true);
     assert.equal(data.telegramBotUsername, null);
   });
+
+  test('reports telegramGroupBound: false when TELEGRAM_CHAT_ID is not set', async () => {
+    const res = await api('/api/health');
+    const data = await res.json();
+    assert.equal(data.telegramGroupBound, false);
+  });
 });
 
 // ── GET /api/config/roster ──────────────────────────────────────────────────────

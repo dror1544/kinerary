@@ -239,6 +239,21 @@ rm -rf trips/<throwaway-slug>
   yet.** This doc covers the interviewer only, which ends at `activate_trip`.
   Someone still has to manually create a second Hermes profile for the
   per-trip companion persona and connect it to `mcp.js`.
+
+  Whoever writes that profile's system prompt must include this: **the first
+  time the companion is active in the family's Telegram group and can read
+  an incoming message's `chat.id`, it must call the trip MCP's
+  `set_telegram_group` tool with that `chat_id` (and the group's title) —
+  once, unprompted, not waiting to be asked.** This is the one Telegram
+  setting that can't be known at deploy time (see "Binding the group" in
+  [docs/telegram-sso.md](telegram-sso.md)) — the interviewer here can't do
+  it, since it only ever DMs the organizer and is never a group member.
+  Until the companion profile exists and does this, binding stays a manual
+  step: a human runs the `curl` example in that doc, or calls the same
+  `set_telegram_group` tool by hand. `GET /api/health`'s
+  `telegramGroupBound` field (and `health_check` on the trip MCP, which just
+  passes that response through) is how anyone — human or agent — confirms
+  whether this step has already happened before repeating it.
 - **`set_participant_avatar` isn't in this interview's tool list.** The MCP
   tool exists (`mcp.js`), but nothing in `INTERVIEW.md` or the system prompt
   above tells the interviewer to use it, so avatars stay a manual per-person
