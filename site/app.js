@@ -272,6 +272,8 @@ const NY_PHOTOS = [
    AUTH (multi-user, server-side JWT)
    ========================================================= */
 let currentUser = null;
+let isOrganizer = false;
+const PHASE_PLAN = {}; // phase_id → array of plan items loaded from DB
 
 async function doLogin() {
   const username = document.getElementById('user-input').value.trim().toLowerCase();
@@ -960,6 +962,7 @@ async function checkAuth() {
       const res = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } });
       if (res.ok) {
         currentUser = await res.json();
+        isOrganizer = !!currentUser.is_organizer;
         localStorage.setItem('trip-user', JSON.stringify(currentUser));
         showLoggedIn();
         document.getElementById('login-overlay').style.display = 'none';
@@ -2776,6 +2779,18 @@ async function loadTripConfig() {
   }
 }
 
+async function loadPhasePlans() {
+  const phases = window.TRIP_CONFIG?.phases || [];
+  const token = localStorage.getItem('trip-token');
+  if (!token) return;
+  await Promise.all(phases.map(async p => {
+    try {
+      const res = await fetch(`/api/phases/${p.id}/plan`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) PHASE_PLAN[p.id] = await res.json();
+    } catch {}
+  }));
+}
+
 // Pre-auth "pick yourself" data for the login screen. /api/config now
 // requires a session (it carries real trip content), so the picker uses the
 // deliberately minimal, unauthenticated /api/config/roster instead.
@@ -3353,19 +3368,184 @@ function telegramLoginErrorMessage(code, tr) {
   return messages[code] || tr.err_wrong;
 }
 
+/* ── PHASE PLAN ITEM HELPERS ─────────────────────────────────────────────── */
+
+function _authHeaders() {
+  const token = localStorage.getItem('trip-token');
+  return token ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+}
+
+async function savePlanItem(phaseId, payload) {
+  const res = await fetch(`/api/phases/${phaseId}/plan`, { method: 'POST', headers: _authHeaders(), body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(await res.text());
+  const item = await res.json();
+  PHASE_PLAN[phaseId] = [...(PHASE_PLAN[phaseId] || []), item];
+  return item;
+}
+
+async function updatePlanItem(phaseId, id, payload) {
+  const res = await fetch(`/api/phases/${phaseId}/plan/${id}`, { method: 'PATCH', headers: _authHeaders(), body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(await res.text());
+  const updated = await res.json();
+  PHASE_PLAN[phaseId] = (PHASE_PLAN[phaseId] || []).map(x => x.id === id ? updated : x);
+  return updated;
+}
+
+async function deletePlanItem(phaseId, id) {
+  const res = await fetch(`/api/phases/${phaseId}/plan/${id}`, { method: 'DELETE', headers: _authHeaders() });
+  if (!res.ok) throw new Error(await res.text());
+  PHASE_PLAN[phaseId] = (PHASE_PLAN[phaseId] || []).filter(x => x.id !== id);
+}
+
+function _wxDayForDate(wxKey, isoDate) {
+  if (!wxKey || !isoDate || !WX_CACHE[wxKey]) return '';
+  const d = WX_CACHE[wxKey].daily;
+  if (!d) return '';
+  const idx = d.time.indexOf(isoDate);
+  if (idx < 0) return '';
+  return ` <span class="plan-wx">${wxIcon(d.weathercode[idx])} ${Math.round(d.temperature_2m_max[idx])}°</span>`;
+}
+
+function _buildPlanItemRow(item, phaseId, tr) {
+  const loc = item.location_url
+    ? `<a class="plan-loc-link" href="${item.location_url}" target="_blank" title="${tr.plan_location}">📍</a>`
+    : '';
+  const conf = item.booking
+    ? `<span class="plan-conf-badge" title="${tr.plan_conf_badge}">${item.booking.name} · ${item.booking.confirmation || ''}</span>`
+    : '';
+  const review = item.status === 'needs_review'
+    ? `<span class="plan-needs-review">${tr.plan_needs_review}</span>`
+    : '';
+  const del = isOrganizer
+    ? `<button class="plan-del-btn" onclick="handleDeletePlanItem('${phaseId}',${item.id})" title="${tr.plan_delete_confirm}">✕</button>`
+    : '';
+  return `<li class="plan-item" data-id="${item.id}">
+    ${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan({ he: item.text_he, en: item.text_en })}${loc}${conf}${review}${del}
+  </li>`;
+}
+
+function _buildAddItemRow(phaseId, date, tr) {
+  if (!isOrganizer) return '';
+  return `<li class="plan-add-row">
+    <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
+    <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
+    <button class="btn plan-save-btn" onclick="handleAddPlanItem('${phaseId}','${date || ''}',this)">${tr.plan_save}</button>
+  </li>`;
+}
+
+window.handleDeletePlanItem = async function(phaseId, id) {
+  const tr = T[currentLang];
+  if (!confirm(tr.plan_delete_confirm)) return;
+  try {
+    await deletePlanItem(phaseId, id);
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+  } catch(e) { console.error('delete plan item failed', e); }
+};
+
+window.handleAddPlanItem = async function(phaseId, date, btn) {
+  const row = btn.closest('li');
+  const time = row.querySelector('.plan-time-in').value.trim();
+  const text = row.querySelector('.plan-text-in').value.trim();
+  if (!text) return;
+  try {
+    btn.disabled = true;
+    await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+  } catch(e) { btn.disabled = false; console.error('add plan item failed', e); }
+};
+
 function renderDays(phase) {
   const el = document.getElementById(`sched-${phase.id}`);
-  if (!el || !phase.days?.length) return;
-  el.innerHTML = phase.days.map(day => {
-    const items = (day.items || []).map(item =>
-      `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
-    ).join('');
-    return `<div class="day-block">
-      <div class="day-label">${_biSpan(day.label)}</div>
-      <ul>${items}</ul>
+  if (!el) return;
+  const tr = T[currentLang] || T['he'];
+  const wxKey = phase.accommodation?.weatherKey;
+  const dbItems = PHASE_PLAN[phase.id] || [];
+  let html = '';
+
+  // ── DB plan items (organizer's current plan — higher precedence) ──
+  if (dbItems.length) {
+    // group by date; items with no date go into '' bucket
+    const buckets = {};
+    for (const item of dbItems) {
+      const key = item.date || '';
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(item);
+    }
+    // unscheduled first, then sorted dates
+    const keys = [
+      ...(buckets[''] ? [''] : []),
+      ...Object.keys(buckets).filter(k => k).sort(),
+    ];
+    for (const key of keys) {
+      const label = key
+        ? (() => {
+            const d = new Date(key + 'T12:00:00');
+            const he = d.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
+            const en = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+            return `<span class="lang-he">${he}</span><span class="lang-en">${en}</span>`;
+          })()
+        : `<span class="lang-he">${tr.plan_unscheduled}</span><span class="lang-en">${tr.plan_unscheduled}</span>`;
+      const wxBadge = key ? _wxDayForDate(wxKey, key) : '';
+      const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');
+      const addRow = _buildAddItemRow(phase.id, key, tr);
+      html += `<div class="day-block db-plan-block">
+        <div class="day-label">${label}${wxBadge}</div>
+        <ul>${itemsHtml}${addRow}</ul>
+      </div>`;
+    }
+    // organizer: show an "add to a new date" row
+    if (isOrganizer) {
+      html += `<div class="plan-new-date-row">
+        <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
+        <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
+        <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
+        <button class="btn" onclick="handleAddPlanItemNewDate('${phase.id}',this)">${tr.plan_save}</button>
+      </div>`;
+    }
+  } else if (isOrganizer) {
+    // no DB items yet — show a single add row so organizer can start the plan
+    html += `<div class="plan-new-date-row">
+      <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
+      <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
+      <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
+      <button class="btn" onclick="handleAddPlanItemNewDate('${phase.id}',this)">${tr.plan_save}</button>
     </div>`;
-  }).join('');
+  }
+
+  // ── Config days (original schedule — lower precedence) ──
+  if (phase.days?.length) {
+    if (dbItems.length) {
+      html += `<div class="plan-orig-sep"><span class="lang-he">${tr.plan_original_sched}</span><span class="lang-en">${tr.plan_original_sched}</span></div>`;
+    }
+    html += phase.days.map(day => {
+      const items = (day.items || []).map(item =>
+        `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
+      ).join('');
+      return `<div class="day-block">
+        <div class="day-label">${_biSpan(day.label)}</div>
+        <ul>${items}</ul>
+      </div>`;
+    }).join('');
+  }
+
+  el.innerHTML = html;
 }
+
+window.handleAddPlanItemNewDate = async function(phaseId, btn) {
+  const row = btn.closest('.plan-new-date-row');
+  const date = row.querySelector('.plan-date-in').value.trim();
+  const time = row.querySelector('.plan-time-in').value.trim();
+  const text = row.querySelector('.plan-text-in').value.trim();
+  if (!text) return;
+  try {
+    btn.disabled = true;
+    await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+  } catch(e) { btn.disabled = false; console.error('add plan item failed', e); }
+};
 
 /* RENDER_FUNS_END */
 /* =========================================================
@@ -3394,6 +3574,7 @@ window.addEventListener('load', async () => {
   }
 
   await loadTripConfig();
+  await loadPhasePlans();
   buildGlobalsFromConfig(window.TRIP_CONFIG);
 
   loadUsersCache();

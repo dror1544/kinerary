@@ -636,6 +636,129 @@ describe('config-driven phase structure', () => {
   });
 });
 
+// ── Phase plan items ─────────────────────────────────────────────────────────
+// alice = organizer (fixture: agent.organizer = "alice")
+// bob   = family member only
+describe('Phase plan items', () => {
+  let bobToken;
+  before(async () => {
+    const r = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    bobToken = (await r.json()).token;
+  });
+
+  test('GET /api/phases/ny/plan — 401 without auth', async () => {
+    const res = await api('/api/phases/ny/plan');
+    assert.equal(res.status, 401);
+  });
+
+  test('GET /api/phases/ny/plan — 200 empty array for family member', async () => {
+    const res = await api('/api/phases/ny/plan', { token: bobToken });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(Array.isArray(data) && data.length === 0);
+  });
+
+  test('GET /api/phases/invalid/plan — 400 unknown phase', async () => {
+    const res = await api('/api/phases/invalid/plan', { token });
+    assert.equal(res.status, 400);
+  });
+
+  test('POST /api/phases/ny/plan — family member gets 403', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token: bobToken,
+      body: { text_he: 'פעילות', date: '2027-03-11', time: '09:00' },
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test('POST /api/phases/ny/plan — organizer creates item, 201', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token,
+      body: { text_he: 'סיור בעיר', text_en: 'City tour', date: '2027-03-11', time: '10:00', status: 'confirmed' },
+    });
+    assert.equal(res.status, 201);
+    const item = await res.json();
+    assert.equal(item.text_he, 'סיור בעיר');
+    assert.equal(item.status, 'confirmed');
+    assert.equal(item.phase_id, 'ny');
+  });
+
+  test('GET /api/phases/ny/plan — item persists and is returned', async () => {
+    const res = await api('/api/phases/ny/plan', { token: bobToken });
+    const items = await res.json();
+    assert.ok(items.length >= 1);
+    assert.ok(items.some(i => i.text_he === 'סיור בעיר'));
+  });
+
+  test('PATCH /api/phases/ny/plan/:id — organizer updates item', async () => {
+    const listRes = await api('/api/phases/ny/plan', { token });
+    const items = await listRes.json();
+    const id = items.find(i => i.text_he === 'סיור בעיר').id;
+    const res = await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token,
+      body: { location_url: 'https://maps.google.com/?q=NYC', status: 'confirmed' },
+    });
+    assert.equal(res.status, 200);
+    const updated = await res.json();
+    assert.equal(updated.location_url, 'https://maps.google.com/?q=NYC');
+  });
+
+  test('POST /api/phase-plan/import-from-bookings — creates item from long-notes booking', async () => {
+    // create a booking with long notes first
+    const bkRes = await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'ny', type: 'other', name: 'תוכנית יום 1', notes: 'א'.repeat(90) },
+    });
+    assert.equal(bkRes.status, 200);
+
+    const migRes = await api('/api/phase-plan/import-from-bookings', { method: 'POST', token });
+    assert.equal(migRes.status, 200);
+    const { created, skipped } = await migRes.json();
+    assert.ok(Array.isArray(created) && created.length >= 1);
+    assert.ok(created.some(i => i.status === 'needs_review'));
+  });
+
+  test('POST /api/phase-plan/import-from-bookings — idempotent on second call', async () => {
+    const res1 = await api('/api/phase-plan/import-from-bookings', { method: 'POST', token });
+    const { created: c1, skipped: s1 } = await res1.json();
+
+    const res2 = await api('/api/phase-plan/import-from-bookings', { method: 'POST', token });
+    const { created: c2, skipped: s2 } = await res2.json();
+
+    assert.equal(c2.length, 0, 're-running should create nothing new');
+    assert.ok(s2.length >= s1.length + c1.length - 1, 'previously-created items should be skipped');
+  });
+
+  test('DELETE /api/phases/ny/plan/:id — organizer removes item, 204', async () => {
+    const listRes = await api('/api/phases/ny/plan', { token });
+    const items = await listRes.json();
+    const id = items.find(i => i.text_he === 'סיור בעיר').id;
+    const res = await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
+    assert.equal(res.status, 204);
+    const listAfter = await api('/api/phases/ny/plan', { token });
+    const after = await listAfter.json();
+    assert.ok(!after.some(i => i.id === id), 'item should be gone after delete');
+  });
+});
+
+// ── GET /api/auth/me — is_organizer field ─────────────────────────────────────
+describe('GET /api/auth/me — is_organizer', () => {
+  test('organizer (alice) gets is_organizer: true', async () => {
+    const res = await api('/api/auth/me', { token });
+    assert.equal(res.status, 200);
+    const me = await res.json();
+    assert.equal(me.is_organizer, true);
+  });
+
+  test('family member (bob) gets is_organizer: false', async () => {
+    const r = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    const { token: bt } = await r.json();
+    const res = await api('/api/auth/me', { token: bt });
+    const me = await res.json();
+    assert.equal(me.is_organizer, false);
+  });
+});
+
 // ── /api/auth/password ───────────────────────────────────────────────────────
 // Placed last: changes alice's password, so any earlier test logging in with
 // the original password must not run after this one.

@@ -363,6 +363,20 @@ try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_items (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  phase_id     TEXT NOT NULL,
+  date         TEXT,
+  time         TEXT,
+  text_he      TEXT NOT NULL,
+  text_en      TEXT,
+  location_url TEXT,
+  booking_id   INTEGER,
+  status       TEXT DEFAULT 'confirmed',
+  sort_order   REAL DEFAULT 0,
+  created_by   TEXT NOT NULL DEFAULT 'agent',
+  created_at   TEXT DEFAULT (datetime('now'))
+)`); } catch {}
 // Backfill name_en for any existing users that don't have it yet
 for (const u of SEED_USERS) {
   db.prepare('UPDATE users SET name_en = ? WHERE username = ? AND (name_en IS NULL OR name_en = \'\')').run(u.name_en, u.username);
@@ -938,7 +952,8 @@ app.post('/api/auth/telegram-login', async (req, res) => {
 app.get('/api/auth/me', authRequired, (req, res) => {
   const user = getUser(req.user.username);
   if (!user) return res.status(404).json({ error: 'not_found' });
-  res.json(user);
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  res.json({ ...user, is_organizer: organizers.includes(user.username) });
 });
 
 app.put('/api/auth/avatar', authRequired, (req, res) => {
@@ -1663,6 +1678,91 @@ app.get('/api/bookings/wallet-apple/:fn', (req, res) => {
   res.setHeader('Content-Type', 'application/vnd.apple.pkpass');
   res.setHeader('Content-Disposition', `attachment; filename="${fn}"`);
   fs.createReadStream(filePath).pipe(res);
+});
+
+// ── PHASE PLAN ITEMS ──────────────────────────────────────────────────────────
+const VALID_PLAN_PHASES = new Set((TRIP_CONFIG.phases || []).map(p => p.id));
+
+function joinBooking(item) {
+  if (!item.booking_id) return item;
+  const bk = db.prepare('SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?').get(item.booking_id);
+  return { ...item, booking: bk || null };
+}
+
+app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
+  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const rows = db.prepare(
+    'SELECT * FROM phase_plan_items WHERE phase_id = ? ORDER BY date ASC, sort_order ASC, time ASC, id ASC'
+  ).all(req.params.phase_id);
+  res.json(rows.map(joinBooking));
+});
+
+app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
+  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const { date, time, text_he, text_en, location_url, booking_id, status, sort_order } = req.body || {};
+  if (!text_he) return res.status(400).json({ error: 'text_he required' });
+  const result = db.prepare(
+    'INSERT INTO phase_plan_items (phase_id,date,time,text_he,text_en,location_url,booking_id,status,sort_order,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)'
+  ).run(
+    req.params.phase_id,
+    date || null, time || null, text_he,
+    text_en || null, location_url || null,
+    booking_id ? Number(booking_id) : null,
+    status || 'confirmed',
+    sort_order != null ? Number(sort_order) : 0,
+    req.user.username
+  );
+  const created = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(joinBooking(created));
+});
+
+app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
+  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const allowed = ['date','time','text_he','text_en','location_url','booking_id','status','sort_order'];
+  const updates = [];
+  const params = [];
+  for (const f of allowed) {
+    if (req.body[f] !== undefined) {
+      updates.push(`${f} = ?`);
+      if (f === 'booking_id') params.push(req.body[f] ? Number(req.body[f]) : null);
+      else if (f === 'sort_order') params.push(Number(req.body[f]));
+      else params.push(req.body[f]);
+    }
+  }
+  if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
+  params.push(req.params.id, req.params.phase_id);
+  db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
+  const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(req.params.id);
+  if (!updated) return res.status(404).json({ error: 'not found' });
+  res.json(joinBooking(updated));
+});
+
+app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
+  if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
+  res.status(204).end();
+});
+
+// Migration: convert bookings with long notes to plan items (idempotent)
+app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req, res) => {
+  const bookings = db.prepare(
+    "SELECT * FROM bookings WHERE notes IS NOT NULL AND length(notes) > 80"
+  ).all();
+  const created = [];
+  const skipped = [];
+  for (const bk of bookings) {
+    const existing = db.prepare('SELECT id FROM phase_plan_items WHERE booking_id = ?').get(bk.id);
+    if (existing) { skipped.push(bk.id); continue; }
+    const text = [bk.name, bk.notes].filter(Boolean).join('\n\n');
+    const result = db.prepare(
+      'INSERT INTO phase_plan_items (phase_id,text_he,text_en,location_url,booking_id,status,created_by) VALUES (?,?,?,?,?,?,?)'
+    ).run(bk.phase, text, text, bk.location_url || null, bk.id, 'needs_review', 'migration');
+    const item = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
+    created.push(joinBooking(item));
+  }
+  res.json({ created, skipped });
 });
 
 // ── TRIVIA GAME ───────────────────────────────────────────────────────────────

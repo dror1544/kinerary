@@ -408,6 +408,77 @@ mcp.tool('add_trivia_question',
   },
   async (args) => ok(await apiPost('/api/trivia/questions', args)));
 
+// ── Phase plan items ──────────────────────────────────────────────────────────
+
+mcp.tool('get_phase_plan',
+  'Get the organizer\'s editable day-by-day plan items for a trip phase. ' +
+  'Returns items sorted by date, time, and sort_order. Each item may include a linked booking (for confirmation display). ' +
+  'status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review).',
+  {
+    phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
+  },
+  async ({ phase_id }) => {
+    if (phase_id) return ok(await apiGet(`/api/phases/${phase_id}/plan`));
+    const cfg = await apiGet('/api/config');
+    const phases = cfg.phases || [];
+    const results = {};
+    for (const p of phases) {
+      results[p.id] = await apiGet(`/api/phases/${p.id}/plan`);
+    }
+    return ok(results);
+  });
+
+mcp.tool('add_plan_item',
+  'Add a new item to the day-by-day plan for a trip phase. ' +
+  'Use this to record activities, meals, transfers, or any scheduled event. ' +
+  'Set location_url to a Waze or Google Maps link after a web search. ' +
+  'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
+  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
+  {
+    phase_id:     z.string().describe('Phase id from get_config'),
+    text_he:      z.string().describe('Activity description in Hebrew (required)'),
+    text_en:      z.string().optional().describe('Activity description in English'),
+    date:         z.string().optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    time:         z.string().optional().describe('Display time string e.g. "09:00"'),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
+    booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Default: confirmed'),
+    sort_order:   z.number().optional().describe('Ordering within a day block (lower = earlier in list)'),
+  },
+  async ({ phase_id, ...body }) => ok(await apiPost(`/api/phases/${phase_id}/plan`, body)));
+
+mcp.tool('update_plan_item',
+  'Update an existing plan item by ID — use to enrich with location_url, link a booking, confirm needs_review items, or correct text.',
+  {
+    phase_id:     z.string().describe('Phase id the item belongs to'),
+    id:           z.number().describe('Plan item ID from get_phase_plan'),
+    text_he:      z.string().optional(),
+    text_en:      z.string().optional(),
+    date:         z.string().optional(),
+    time:         z.string().optional(),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL'),
+    booking_id:   z.number().optional().describe('Link to a booking (shows confirmation inline)'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Set to "confirmed" after organizer review'),
+    sort_order:   z.number().optional(),
+  },
+  async ({ phase_id, id, ...fields }) => ok(await apiPatch(`/api/phases/${phase_id}/plan/${id}`, fields)));
+
+mcp.tool('delete_plan_item',
+  'Delete a plan item by ID.',
+  {
+    phase_id: z.string().describe('Phase id the item belongs to'),
+    id:       z.number().describe('Plan item ID from get_phase_plan'),
+  },
+  async ({ phase_id, id }) => ok(await apiDelete(`/api/phases/${phase_id}/plan/${id}`)));
+
+mcp.tool('import_plan_from_bookings',
+  'Migration tool: scan all bookings that have long notes (>80 chars) and create phase_plan_items from them. ' +
+  'Idempotent — skips bookings already linked to a plan item. ' +
+  'Created items get status="needs_review" so you can enrich and confirm them. ' +
+  'Use this once after deploying the plan feature to recover content an organizer stored in booking notes.',
+  {},
+  async () => ok(await apiPost('/api/phase-plan/import-from-bookings', {})));
+
 return mcp;
 }
 

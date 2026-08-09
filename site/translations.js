@@ -278,6 +278,19 @@ const T = {
     info_h3_pack:   '🎒 אריזה כללית',
     info_h3_age:    '⚠️ הגבלות גיל',
 
+    /* ── PHASE PLAN ── */
+    plan_add_btn:        '+ הוסף פריט לתוכנית',
+    plan_time_ph:        'שעה (09:00)',
+    plan_text_ph:        'תיאור הפעילות',
+    plan_save:           'שמור',
+    plan_cancel:         'ביטול',
+    plan_needs_review:   '⚠ לאישור',
+    plan_unscheduled:    'פעילויות ללא תאריך',
+    plan_conf_badge:     'אישור',
+    plan_location:       'מיקום',
+    plan_delete_confirm: 'למחוק פריט זה מהתוכנית?',
+    plan_original_sched: '— תוכנית מקורית —',
+
     /* footer */
     footer: 'Made with ❤️ for the trip',
   },
@@ -553,6 +566,19 @@ const T = {
     info_h3_comm:   '📱 Communication',
     info_h3_pack:   '🎒 General Packing',
     info_h3_age:    '⚠️ Age Restrictions',
+
+    /* ── PHASE PLAN ── */
+    plan_add_btn:        '+ Add plan item',
+    plan_time_ph:        'Time (09:00)',
+    plan_text_ph:        'Activity description',
+    plan_save:           'Save',
+    plan_cancel:         'Cancel',
+    plan_needs_review:   '⚠ Needs review',
+    plan_unscheduled:    'Unscheduled items',
+    plan_conf_badge:     'Confirmation',
+    plan_location:       'Location',
+    plan_delete_confirm: 'Delete this plan item?',
+    plan_original_sched: '— Original schedule —',
 
     footer: 'Made with ❤️ for the trip',
   }
