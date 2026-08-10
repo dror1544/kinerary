@@ -421,10 +421,11 @@ mcp.tool('get_phase_plan',
     if (phase_id) return ok(await apiGet(`/api/phases/${phase_id}/plan`));
     const cfg = await apiGet('/api/config');
     const phases = cfg.phases || [];
+    // Fetched together rather than awaited one at a time — an 8-phase trip was
+    // paying 8 sequential round trips for reads that don't depend on each other.
+    const plans = await Promise.all(phases.map(p => apiGet(`/api/phases/${p.id}/plan`)));
     const results = {};
-    for (const p of phases) {
-      results[p.id] = await apiGet(`/api/phases/${p.id}/plan`);
-    }
+    phases.forEach((p, i) => { results[p.id] = plans[i]; });
     return ok(results);
   });
 
@@ -473,8 +474,13 @@ mcp.tool('delete_plan_item',
 
 mcp.tool('import_plan_from_bookings',
   'Migration tool: scan all bookings that have long notes (>80 chars) and create phase_plan_items from them. ' +
-  'Idempotent — skips bookings already linked to a plan item. ' +
-  'Created items get status="needs_review" so you can enrich and confirm them. ' +
+  'Idempotent — each booking is imported at most once, and that stays true after you delete an imported item, ' +
+  'so re-running never resurrects something the organizer removed. ' +
+  'Returns {created, skipped}; every skip carries a reason ("already imported", or "phase not in trip config" ' +
+  'for a booking whose phase is absent from trip.config.json and so cannot be represented). ' +
+  'Imported items keep the booking\'s own date and get status="needs_review" so you can enrich and confirm them. ' +
+  'Note the >80-char filter is a heuristic — a genuine booking with long notes (a car rental voucher, say) will ' +
+  'match too, so review what came back before confirming it. ' +
   'Use this once after deploying the plan feature to recover content an organizer stored in booking notes.',
   {},
   async () => ok(await apiPost('/api/phase-plan/import-from-bookings', {})));

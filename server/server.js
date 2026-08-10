@@ -375,7 +375,19 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_items (
   status       TEXT DEFAULT 'confirmed',
   sort_order   REAL DEFAULT 0,
   created_by   TEXT NOT NULL DEFAULT 'agent',
-  created_at   TEXT DEFAULT (datetime('now'))
+  created_at   TEXT DEFAULT (datetime('now')),
+  CHECK (status IN ('confirmed','needs_review'))
+)`); } catch {}
+// GET filters by phase_id on every page load and joinBooking() looks up
+// booking_id per row; neither had an index.
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_phase   ON phase_plan_items(phase_id)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_booking ON phase_plan_items(booking_id)`); } catch {}
+// Records which bookings the one-off import already consumed. Kept separate
+// from phase_plan_items so that deleting an imported item is permanent —
+// inferring "already imported" from a surviving row resurrected every deletion.
+try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_import_log (
+  booking_id  INTEGER PRIMARY KEY,
+  imported_at TEXT DEFAULT (datetime('now'))
 )`); } catch {}
 // Backfill name_en for any existing users that don't have it yet
 for (const u of SEED_USERS) {
@@ -1689,6 +1701,50 @@ function joinBooking(item) {
   return { ...item, booking: bk || null };
 }
 
+const PLAN_STATUSES = new Set(['confirmed', 'needs_review']);
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Fails safe, the same way shared/needs-schema.js does: an unrecognized status
+// resolves to the MOST restrictive option. The z.enum in mcp/mcp.js only guards
+// the agent path — a direct HTTP caller writing 'needs-review' would otherwise
+// store it verbatim and the UI, which tests `=== 'needs_review'`, would render
+// it as organizer-confirmed and never surface it for review.
+function normalizePlanStatus(v) {
+  if (v === undefined || v === null || v === '') return null;
+  return PLAN_STATUSES.has(v) ? v : 'needs_review';
+}
+
+// Validates before binding. better-sqlite3 rejects a non-primitive binding with
+// an unhandled throw, which Express renders as a 500 carrying a stack trace and
+// absolute server paths.
+function planFieldError(body, { requireText }) {
+  const isStr = v => typeof v === 'string';
+  if (requireText && (!isStr(body.text_he) || !body.text_he.trim())) {
+    return 'text_he required (non-empty string)';
+  }
+  for (const f of ['text_he', 'text_en', 'location_url', 'time']) {
+    const v = body[f];
+    if (v !== undefined && v !== null && !isStr(v)) return `${f} must be a string`;
+  }
+  const d = body.date;
+  if (d !== undefined && d !== null && d !== '' && (!isStr(d) || !ISO_DATE_RE.test(d))) {
+    return 'date must be YYYY-MM-DD';
+  }
+  const u = body.location_url;
+  if (u !== undefined && u !== null && u !== '' && !/^https?:\/\//i.test(u)) {
+    return 'location_url must be an http(s) URL';
+  }
+  const s = body.sort_order;
+  if (s !== undefined && s !== null && !Number.isFinite(Number(s))) {
+    return 'sort_order must be a number';
+  }
+  const b = body.booking_id;
+  if (b !== undefined && b !== null && b !== '' && !Number.isInteger(Number(b))) {
+    return 'booking_id must be an integer';
+  }
+  return null;
+}
+
 app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
   if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
   const rows = db.prepare(
@@ -1699,16 +1755,18 @@ app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
 
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
-  const { date, time, text_he, text_en, location_url, booking_id, status, sort_order } = req.body || {};
-  if (!text_he) return res.status(400).json({ error: 'text_he required' });
+  const body = req.body || {};
+  const bad = planFieldError(body, { requireText: true });
+  if (bad) return res.status(400).json({ error: bad });
+  const { date, time, text_he, text_en, location_url, booking_id, status, sort_order } = body;
   const result = db.prepare(
     'INSERT INTO phase_plan_items (phase_id,date,time,text_he,text_en,location_url,booking_id,status,sort_order,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)'
   ).run(
     req.params.phase_id,
-    date || null, time || null, text_he,
+    date || null, time || null, text_he.trim(),
     text_en || null, location_url || null,
     booking_id ? Number(booking_id) : null,
-    status || 'confirmed',
+    normalizePlanStatus(status) || 'confirmed',
     sort_order != null ? Number(sort_order) : 0,
     req.user.username
   );
@@ -1718,22 +1776,39 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
   if (!VALID_PLAN_PHASES.has(req.params.phase_id)) return res.status(400).json({ error: 'unknown phase' });
+  const body = req.body || {};
+  const bad = planFieldError(body, { requireText: false });
+  if (bad) return res.status(400).json({ error: bad });
+  if (body.text_he !== undefined && !String(body.text_he).trim()) {
+    return res.status(400).json({ error: 'text_he cannot be empty' });
+  }
+
+  // Scope the existence check to this phase. Matching on id alone let a
+  // cross-phase PATCH change nothing yet return 200 with the OTHER phase's row,
+  // which the caller then cached under the wrong phase.
+  const existing = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?')
+    .get(req.params.id, req.params.phase_id);
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
   const allowed = ['date','time','text_he','text_en','location_url','booking_id','status','sort_order'];
   const updates = [];
   const params = [];
   for (const f of allowed) {
-    if (req.body[f] !== undefined) {
+    if (body[f] !== undefined) {
       updates.push(`${f} = ?`);
-      if (f === 'booking_id') params.push(req.body[f] ? Number(req.body[f]) : null);
-      else if (f === 'sort_order') params.push(Number(req.body[f]));
-      else params.push(req.body[f]);
+      if (f === 'booking_id') params.push(body[f] ? Number(body[f]) : null);
+      else if (f === 'sort_order') params.push(Number(body[f]));
+      // An explicit empty/unknown status is ambiguous, so it fails safe rather
+      // than clearing the column.
+      else if (f === 'status') params.push(normalizePlanStatus(body[f]) || 'needs_review');
+      else params.push(body[f]);
     }
   }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id, req.params.phase_id);
   db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
-  const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(req.params.id);
-  if (!updated) return res.status(404).json({ error: 'not found' });
+  const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
+    .get(req.params.id, req.params.phase_id);
   res.json(joinBooking(updated));
 });
 
@@ -1742,10 +1817,15 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
   const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
   if (!row) return res.status(404).json({ error: 'not found' });
   db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
-  res.status(204).end();
+  // Every other DELETE in this file answers {ok:true}, and mcp/mcp.js's
+  // apiDelete() parses the body unconditionally — a 204 made the agent's
+  // delete_plan_item throw on every successful delete.
+  res.json({ ok: true });
 });
 
-// Migration: convert bookings with long notes to plan items (idempotent)
+// One-off migration for a trip whose plan was typed into booking notes before
+// this feature existed. Every skip carries a reason so a caller can tell
+// "already done" apart from "this booking can't be imported".
 app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req, res) => {
   const bookings = db.prepare(
     "SELECT * FROM bookings WHERE notes IS NOT NULL AND length(notes) > 80"
@@ -1753,12 +1833,28 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
   const created = [];
   const skipped = [];
   for (const bk of bookings) {
-    const existing = db.prepare('SELECT id FROM phase_plan_items WHERE booking_id = ?').get(bk.id);
-    if (existing) { skipped.push(bk.id); continue; }
+    // A booking may carry a phase that isn't in trip.config.json (see the fix
+    // for the Bookings tab dropping off-config phases). Importing one produced
+    // a row that GET/PATCH/DELETE all reject as 'unknown phase' — unreachable
+    // forever. Skip it and say so.
+    if (!VALID_PLAN_PHASES.has(bk.phase)) {
+      skipped.push({ booking_id: bk.id, reason: 'phase not in trip config' });
+      continue;
+    }
+    // Idempotency is recorded here, not inferred from whether a plan item still
+    // points at the booking. The intended workflow is import → review → delete
+    // the junk, and inferring it resurrected every deleted item on the next run.
+    const already = db.prepare('SELECT 1 FROM phase_plan_import_log WHERE booking_id = ?').get(bk.id);
+    if (already) { skipped.push({ booking_id: bk.id, reason: 'already imported' }); continue; }
+
     const text = [bk.name, bk.notes].filter(Boolean).join('\n\n');
+    // Carry the booking's own date across — dropping it filed every imported
+    // item under "unscheduled" and made the organizer retype a date the DB had.
+    const date = ISO_DATE_RE.test(String(bk.date_from || '')) ? bk.date_from : null;
     const result = db.prepare(
-      'INSERT INTO phase_plan_items (phase_id,text_he,text_en,location_url,booking_id,status,created_by) VALUES (?,?,?,?,?,?,?)'
-    ).run(bk.phase, text, text, bk.location_url || null, bk.id, 'needs_review', 'migration');
+      'INSERT INTO phase_plan_items (phase_id,date,text_he,text_en,location_url,booking_id,status,created_by) VALUES (?,?,?,?,?,?,?,?)'
+    ).run(bk.phase, date, text, text, bk.location_url || null, bk.id, 'needs_review', 'migration');
+    db.prepare('INSERT INTO phase_plan_import_log (booking_id) VALUES (?)').run(bk.id);
     const item = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
     created.push(joinBooking(item));
   }

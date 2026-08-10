@@ -729,15 +729,115 @@ describe('Phase plan items', () => {
     assert.ok(s2.length >= s1.length + c1.length - 1, 'previously-created items should be skipped');
   });
 
-  test('DELETE /api/phases/ny/plan/:id — organizer removes item, 204', async () => {
+  // Answers {ok:true} like every other DELETE in server.js. A 204 with an empty
+  // body made mcp/mcp.js's apiDelete() — which parses the body unconditionally —
+  // throw on every successful delete.
+  test('DELETE /api/phases/ny/plan/:id — organizer removes item, 200 {ok:true}', async () => {
     const listRes = await api('/api/phases/ny/plan', { token });
     const items = await listRes.json();
     const id = items.find(i => i.text_he === 'סיור בעיר').id;
     const res = await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
-    assert.equal(res.status, 204);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true });
     const listAfter = await api('/api/phases/ny/plan', { token });
     const after = await listAfter.json();
     assert.ok(!after.some(i => i.id === id), 'item should be gone after delete');
+  });
+});
+
+// ── Regressions from the PR review ────────────────────────────────────────────
+describe('Phase plan items — validation and phase scoping', () => {
+  test('a non-string text_he is a 400, not a 500 leaking a stack trace', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: { he: 'obj' } },
+    });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /text_he/);
+  });
+
+  test('a malformed date is rejected rather than stored verbatim', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'x', date: "x','y'); alert(1);//" },
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test('a javascript: location_url is rejected', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token,
+      body: { text_he: 'x', location_url: 'javascript:alert(document.cookie)' },
+    });
+    assert.equal(res.status, 400);
+  });
+
+  test('an unrecognized status fails safe to needs_review, never confirmed', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'סטטוס לא מוכר', status: 'needs-review' },
+    });
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).status, 'needs_review');
+  });
+
+  test('PATCH across phases 404s and leaves the other phase’s row untouched', async () => {
+    const mk = await api('/api/phases/colorado/plan', {
+      method: 'POST', token, body: { text_he: 'קולורדו', date: '2027-03-20' },
+    });
+    const id = (await mk.json()).id;
+    const res = await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token, body: { text_he: 'HACKED-VIA-NY' },
+    });
+    assert.equal(res.status, 404);
+    const rows = await (await api('/api/phases/colorado/plan', { token })).json();
+    assert.equal(rows.find(i => i.id === id).text_he, 'קולורדו');
+  });
+});
+
+describe('Phase plan migration', () => {
+  test('carries the booking’s own date across instead of leaving it unscheduled', async () => {
+    await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'colorado', type: 'other', name: 'תוכנית קולורדו',
+              notes: 'ב'.repeat(120), date_from: '2027-03-21' },
+    });
+    const { created } = await (await api('/api/phase-plan/import-from-bookings',
+      { method: 'POST', token })).json();
+    const item = created.find(i => i.text_he.includes('תוכנית קולורדו'));
+    assert.ok(item, 'the booking should have been imported');
+    assert.equal(item.date, '2027-03-21');
+  });
+
+  test('a deleted imported item stays deleted when the import is re-run', async () => {
+    await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'ny', type: 'other', name: 'למחיקה', notes: 'ג'.repeat(120) },
+    });
+    const first = await (await api('/api/phase-plan/import-from-bookings',
+      { method: 'POST', token })).json();
+    const item = first.created.find(i => i.text_he.includes('למחיקה'));
+    assert.ok(item);
+
+    assert.equal((await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token })).status, 200);
+
+    const again = await (await api('/api/phase-plan/import-from-bookings',
+      { method: 'POST', token })).json();
+    assert.ok(!again.created.some(i => i.text_he.includes('למחיקה')),
+      'a deleted item must not be resurrected by a re-run');
+    assert.ok(again.skipped.some(s => s.reason === 'already imported'));
+    const list = await (await api('/api/phases/ny/plan', { token })).json();
+    assert.ok(!list.some(i => i.id === item.id));
+  });
+
+  test('skips a booking whose phase is not in trip.config.json', async () => {
+    await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'not-a-configured-phase', type: 'other', name: 'מחוץ לקונפיג',
+              notes: 'ד'.repeat(120) },
+    });
+    const { created, skipped } = await (await api('/api/phase-plan/import-from-bookings',
+      { method: 'POST', token })).json();
+    assert.ok(!created.some(i => i.text_he.includes('מחוץ לקונפיג')),
+      'importing an off-config phase creates a row no endpoint can reach');
+    assert.ok(skipped.some(s => s.reason === 'phase not in trip config'));
   });
 });
 

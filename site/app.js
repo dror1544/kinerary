@@ -1459,6 +1459,23 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+// escapeHtml() above only ever fed element text, so it leaves quotes alone and
+// assumes a string. Plan items come from the DB and from the AI PDF-extraction
+// path, where a value can land in an attribute and can be a number or object —
+// so this one escapes quotes too and coerces first.
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Only ever emit an http(s) href. A stored `javascript:` location_url would
+// otherwise execute for every family member who opens the phase tab.
+function safeUrl(u) {
+  const s = String(u ?? '').trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
 async function toggleVenueComments(venueId) {
   const thread = document.getElementById(`vc-thread-${venueId}`);
   const btn    = document.getElementById(`vc-toggle-${venueId}`);
@@ -3397,50 +3414,74 @@ async function deletePlanItem(phaseId, id) {
   PHASE_PLAN[phaseId] = (PHASE_PLAN[phaseId] || []).filter(x => x.id !== id);
 }
 
-function _wxDayForDate(wxKey, isoDate) {
-  if (!wxKey || !isoDate || !WX_CACHE[wxKey]) return '';
-  const d = WX_CACHE[wxKey].daily;
-  if (!d) return '';
-  const idx = d.time.indexOf(isoDate);
-  if (idx < 0) return '';
-  return ` <span class="plan-wx">${wxIcon(d.weathercode[idx])} ${Math.round(d.temperature_2m_max[idx])}°</span>`;
-}
+// NOTE: a per-day weather badge was dropped here. It read WX_CACHE, which is
+// only ever written by _loadPoiWeather() — reachable exclusively from the POI
+// click handler whose backing data (POI_DATA) was intentionally removed. So the
+// badge always rendered ''. Restoring it needs its own forecast fetch keyed on
+// phase.accommodation.weatherKey, not a read of that cache.
 
 function _buildPlanItemRow(item, phaseId, tr) {
-  const loc = item.location_url
-    ? `<a class="plan-loc-link" href="${item.location_url}" target="_blank" title="${tr.plan_location}">📍</a>`
+  const href = safeUrl(item.location_url);
+  const loc = href
+    ? `<a class="plan-loc-link" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(tr.plan_location)}">📍</a>`
     : '';
   const conf = item.booking
-    ? `<span class="plan-conf-badge" title="${tr.plan_conf_badge}">${item.booking.name} · ${item.booking.confirmation || ''}</span>`
+    ? `<span class="plan-conf-badge" title="${esc(tr.plan_conf_badge)}">${esc(item.booking.name)}${
+        item.booking.confirmation ? ` · ${esc(item.booking.confirmation)}` : ''}</span>`
     : '';
   const review = item.status === 'needs_review'
-    ? `<span class="plan-needs-review">${tr.plan_needs_review}</span>`
+    ? `<span class="plan-needs-review">${esc(tr.plan_needs_review)}</span>`
     : '';
+  // Handlers are bound by delegation off these data-* attributes rather than a
+  // string-built onclick — an apostrophe in a stored value used to break out of
+  // the attribute and execute.
   const del = isOrganizer
-    ? `<button class="plan-del-btn" onclick="handleDeletePlanItem('${phaseId}',${item.id})" title="${tr.plan_delete_confirm}">✕</button>`
+    ? `<button class="plan-del-btn" data-plan-del="${esc(item.id)}" data-plan-phase="${esc(phaseId)}" title="${esc(tr.plan_delete_confirm)}">✕</button>`
     : '';
-  return `<li class="plan-item" data-id="${item.id}">
-    ${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan({ he: item.text_he, en: item.text_en })}${loc}${conf}${review}${del}
+  return `<li class="plan-item" data-id="${esc(item.id)}">
+    ${item.time ? `<strong>${esc(item.time)}</strong> — ` : ''}${_biSpan({ he: esc(item.text_he), en: esc(item.text_en) })}${loc}${conf}${review}${del}
+    <span class="plan-err" hidden></span>
   </li>`;
 }
 
 function _buildAddItemRow(phaseId, date, tr) {
   if (!isOrganizer) return '';
   return `<li class="plan-add-row">
-    <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
-    <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
-    <button class="btn plan-save-btn" onclick="handleAddPlanItem('${phaseId}','${date || ''}',this)">${tr.plan_save}</button>
+    <input class="plan-time-in" placeholder="${esc(tr.plan_time_ph)}" style="width:70px">
+    <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
+    <button class="btn plan-save-btn" data-plan-add="${esc(phaseId)}" data-plan-date="${esc(date || '')}">${esc(tr.plan_save)}</button>
+    <span class="plan-err" hidden></span>
   </li>`;
 }
 
-window.handleDeletePlanItem = async function(phaseId, id) {
+// Rendered in two different branches below (with and without existing items);
+// keeping it in one place so the two copies can't drift.
+function _buildNewDateRow(phaseId, tr) {
+  return `<div class="plan-new-date-row">
+    <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
+    <input class="plan-time-in" placeholder="${esc(tr.plan_time_ph)}" style="width:70px">
+    <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
+    <button class="btn" data-plan-add-new="${esc(phaseId)}">${esc(tr.plan_save)}</button>
+    <span class="plan-err" hidden></span>
+  </div>`;
+}
+
+// A failed save used to go to console.error only, so the organizer's typed text
+// sat in the input looking exactly like a pending save. Show it on the row.
+function _planErr(el, e) {
+  const box = el?.closest('li, .plan-new-date-row')?.querySelector('.plan-err');
+  if (box) { box.textContent = (e && e.message) || String(e); box.hidden = false; }
+  console.error('plan item action failed', e);
+}
+
+window.handleDeletePlanItem = async function(phaseId, id, btn) {
   const tr = T[currentLang];
   if (!confirm(tr.plan_delete_confirm)) return;
   try {
     await deletePlanItem(phaseId, id);
     const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
     if (phase) renderDays(phase);
-  } catch(e) { console.error('delete plan item failed', e); }
+  } catch(e) { _planErr(btn, e); }
 };
 
 window.handleAddPlanItem = async function(phaseId, date, btn) {
@@ -3453,14 +3494,27 @@ window.handleAddPlanItem = async function(phaseId, date, btn) {
     await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
     const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
     if (phase) renderDays(phase);
-  } catch(e) { btn.disabled = false; console.error('add plan item failed', e); }
+  } catch(e) { btn.disabled = false; _planErr(btn, e); }
 };
+
+// One delegated listener for every plan control. renderDays() replaces
+// innerHTML wholesale, so per-element listeners would be lost on each render.
+document.addEventListener('click', (ev) => {
+  const t = ev.target.closest?.('[data-plan-del],[data-plan-add],[data-plan-add-new]');
+  if (!t) return;
+  if (t.dataset.planDel !== undefined) {
+    handleDeletePlanItem(t.dataset.planPhase, Number(t.dataset.planDel), t);
+  } else if (t.dataset.planAdd !== undefined) {
+    handleAddPlanItem(t.dataset.planAdd, t.dataset.planDate || '', t);
+  } else {
+    handleAddPlanItemNewDate(t.dataset.planAddNew, t);
+  }
+});
 
 function renderDays(phase) {
   const el = document.getElementById(`sched-${phase.id}`);
   if (!el) return;
   const tr = T[currentLang] || T['he'];
-  const wxKey = phase.accommodation?.weatherKey;
   const dbItems = PHASE_PLAN[phase.id] || [];
   let html = '';
 
@@ -3486,38 +3540,25 @@ function renderDays(phase) {
             const en = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
             return `<span class="lang-he">${he}</span><span class="lang-en">${en}</span>`;
           })()
-        : `<span class="lang-he">${tr.plan_unscheduled}</span><span class="lang-en">${tr.plan_unscheduled}</span>`;
-      const wxBadge = key ? _wxDayForDate(wxKey, key) : '';
+        : _biSpan({ he: T.he.plan_unscheduled, en: T.en.plan_unscheduled });
       const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');
       const addRow = _buildAddItemRow(phase.id, key, tr);
       html += `<div class="day-block db-plan-block">
-        <div class="day-label">${label}${wxBadge}</div>
+        <div class="day-label">${label}</div>
         <ul>${itemsHtml}${addRow}</ul>
       </div>`;
     }
     // organizer: show an "add to a new date" row
-    if (isOrganizer) {
-      html += `<div class="plan-new-date-row">
-        <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
-        <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
-        <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
-        <button class="btn" onclick="handleAddPlanItemNewDate('${phase.id}',this)">${tr.plan_save}</button>
-      </div>`;
-    }
+    if (isOrganizer) html += _buildNewDateRow(phase.id, tr);
   } else if (isOrganizer) {
     // no DB items yet — show a single add row so organizer can start the plan
-    html += `<div class="plan-new-date-row">
-      <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
-      <input class="plan-time-in" placeholder="${tr.plan_time_ph}" style="width:70px">
-      <input class="plan-text-in" placeholder="${tr.plan_text_ph}" style="flex:1">
-      <button class="btn" onclick="handleAddPlanItemNewDate('${phase.id}',this)">${tr.plan_save}</button>
-    </div>`;
+    html += _buildNewDateRow(phase.id, tr);
   }
 
   // ── Config days (original schedule — lower precedence) ──
   if (phase.days?.length) {
     if (dbItems.length) {
-      html += `<div class="plan-orig-sep"><span class="lang-he">${tr.plan_original_sched}</span><span class="lang-en">${tr.plan_original_sched}</span></div>`;
+      html += `<div class="plan-orig-sep">${_biSpan({ he: T.he.plan_original_sched, en: T.en.plan_original_sched })}</div>`;
     }
     html += phase.days.map(day => {
       const items = (day.items || []).map(item =>
@@ -3544,7 +3585,7 @@ window.handleAddPlanItemNewDate = async function(phaseId, btn) {
     await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
     const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
     if (phase) renderDays(phase);
-  } catch(e) { btn.disabled = false; console.error('add plan item failed', e); }
+  } catch(e) { btn.disabled = false; _planErr(btn, e); }
 };
 
 /* RENDER_FUNS_END */
