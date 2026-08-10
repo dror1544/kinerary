@@ -37,13 +37,78 @@ Or set these directly in `mcp/.env` (see `.env.example`) and `docker compose up 
 | `TRIP_API_KEY` | Yes | Key this server presents to the trip site's own API — must match a key the site accepts. |
 | `API_BASE_URL` | Yes | Where the trip site's Express server actually runs (`http://trip-server:3000` inside Docker Compose, or your LAN host otherwise). |
 | `TRIP_PUBLIC_URL` | No | Fallback public URL for reaching the trip site's API, used only if `API_BASE_URL` (usually a Docker-internal host) isn't reachable from wherever this MCP server runs. |
-| `ANTHROPIC_API_KEY` | No | Only needed for the `/extract` endpoint (AI-powered booking-confirmation extraction from a PDF/URL). |
+| `HERMES_EXTRACT_PROFILE` | No | Only needed for the `/extract` endpoint (AI-powered booking-confirmation extraction from a PDF/URL) — see below. |
+| `HERMES_BIN` | No | Path to the `hermes` CLI binary, if it's not on this server's `PATH`. Defaults to `hermes`. |
 | `MCP_PORT` | No | Defaults to `3001`. |
 
 ### 2. Connect a local agent
 
 Point it at `http://127.0.0.1:3001/sse` (or your LAN IP) with header
 `X-API-Key: <MCP_API_KEY>`. Nothing else to configure.
+
+### Add Booking's "Extract Details with AI" (`POST /extract`)
+
+The trip site's own Add Booking form can upload a confirmation PDF or paste a
+URL and have this server pull out the structured fields (`phase`, `type`,
+`name`, dates, passengers, confirmation number, PIN, cost, notes). This is a
+plain HTTP route, not an MCP tool — it runs a **local, one-shot call to a
+real Hermes profile** (via the `hermes` CLI, not the messaging gateway or API
+server), so it needs Hermes installed and set up on whatever host runs this
+`mcp.js`.
+
+**Use a dedicated profile — never your interviewer or trip-companion
+profile.** Those have real tool access (terminal, files, memory, MCP
+servers, browser). This route feeds them a stranger's uploaded document; a
+crafted "confirmation PDF" containing hidden instructions is a live prompt-
+injection vector, and a full-access agent is the wrong thing to expose to
+it. Create a throwaway profile with every toolset disabled instead:
+
+```bash
+hermes profile create kinerary-extract --no-skills \
+  --description "Single-turn document/URL data extraction for Add Booking. No tools, no memory."
+
+hermes -p kinerary-extract tools disable \
+  web browser terminal file code_execution vision image_gen bfl tts skills \
+  todo memory session_search clarify delegation cronjob computer_use
+
+hermes -p kinerary-extract config set model gpt-5.4-mini
+hermes -p kinerary-extract config set model.provider openai-codex   # or whatever provider you already have pooled — see `hermes auth list`
+```
+
+Verify `hermes -p kinerary-extract tools list` shows everything disabled
+before wiring it up. No API-server, gateway, or new port involved — this
+server just shells out to `hermes -p kinerary-extract chat -q "<prompt>" -Q
+--safe-mode --reasoning none` per request and reads stdout.
+
+**Trip-aware, without a trip-specific agent.** One shared `kinerary-extract`
+profile serves every trip — it doesn't need its own identity per trip to
+catch trip-specific issues. Each request's prompt is built fresh from that
+trip's own live data: phase date ranges, the participant roster
+(`/api/config/roster`), and everything already booked (`/api/bookings`). The
+model is asked to add a short `⚠️` line to `notes` for a real, visible
+mismatch — a date outside the matched phase, a passenger nobody on the trip
+matches — and never to invent doubts for their own sake. A duplicate
+confirmation number is checked deterministically in code, not left to the
+model's judgment. A response with no `name` at all (seen in practice on an
+occasional cold-start call) is treated as a failed extraction, not a
+false-success empty form.
+
+To turn it on:
+
+1. Set `HERMES_EXTRACT_PROFILE=kinerary-extract` here in `mcp/.env` (or
+   whatever you named the profile above). No API key to generate — the
+   profile uses whatever provider credential you already have pooled in
+   Hermes (`hermes auth list`).
+2. On the trip site itself, set `HERMES_URL` to this server's own reachable
+   address (e.g. `http://192.168.1.50:3001`) — see the root `.env.example`.
+   The site's existing `HERMES_API_KEY` is reused to authenticate that call;
+   nothing new to generate or keep in sync.
+3. Restart both the trip server and this server for the env changes to take
+   effect.
+
+`/extract`'s auth accepts either `MCP_API_KEY` (an agent calling it directly)
+or `TRIP_API_KEY` (the site's own proxy, which only ever holds the key it
+already shares with this server) — see `requireSiteOrAgentKey` in `mcp.js`.
 
 ### 3. Connect Claude Cowork
 

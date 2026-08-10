@@ -30,6 +30,8 @@ const { z }                  = require('zod');
 const express                = require('express');
 const fetch                  = require('node-fetch');
 const crypto                 = require('crypto');
+const { execFile }           = require('child_process');
+const pdfParse               = require('pdf-parse');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -431,9 +433,12 @@ async function disposeSession(sessionId, { closeTransport = false } = {}) {
 }
 
 // ── /extract — AI booking data extraction ────────────────────────────────────
-// Built fresh per request from the live trip config — phase ids and dates are
-// never the same across trips, so this can't be a static prompt.
-async function buildExtractSystem() {
+// Built fresh per request from the live trip config/roster/bookings — phase
+// ids, participants and what's already booked are never the same across
+// trips, so this can't be a static prompt. `bookings` is passed in (rather
+// than fetched here too) so the caller can reuse the same list for the
+// deterministic duplicate-confirmation check below.
+async function buildExtractSystem(bookings) {
   let title = 'this trip', phaseLines = '- intl_flights: international flights';
   try {
     const cfg = await apiGet('/api/config');
@@ -445,11 +450,25 @@ async function buildExtractSystem() {
     if (lines.length) phaseLines = ['- intl_flights: international flights', ...lines].join('\n');
   } catch (_) { /* fall back to the generic defaults above */ }
 
+  let rosterLine = '';
+  try {
+    const { participants: roster } = await apiGet('/api/config/roster');
+    if (Array.isArray(roster) && roster.length) {
+      rosterLine = roster.map(p => p.name_en || p.name || p.username).filter(Boolean).join(', ');
+    }
+  } catch (_) { /* roster context is a nice-to-have, not required */ }
+
+  const bookingsSummary = (bookings || []).length
+    ? bookings.map(b => `- [${b.phase}] ${b.name} (${b.date_from || '?'}${b.date_to && b.date_to !== b.date_from ? `–${b.date_to}` : ''}), confirmation: ${b.confirmation || '—'}`).join('\n')
+    : '';
+
   return `You are a travel booking data extractor for "${title}".
 Extract structured booking data from the provided content and return ONLY a valid JSON object.
 
 Trip phase date ranges:
 ${phaseLines}
+${rosterLine ? `\nTrip participants: ${rosterLine}` : ''}
+${bookingsSummary ? `\nAlready-booked items on this trip (context for spotting conflicts only — do not repeat these back as your answer):\n${bookingsSummary}` : ''}
 
 JSON fields (omit any field you cannot determine):
 {
@@ -461,8 +480,9 @@ JSON fields (omit any field you cannot determine):
   "passengers": "passenger or guest names",
   "confirmation": "confirmation / reservation number",
   "pin": "PIN code if present",
-  "cost": numeric USD amount,
-  "notes": "any relevant notes"
+  "cost_amount": numeric amount exactly as it appears in the document — do not convert or do any math yourself, just report the number,
+  "cost_currency": the ISO 4217 3-letter code for whatever currency that amount is in (e.g. "USD", "JPY", "EUR") — infer it from a symbol or context if the document doesn't spell it out. Use "USD" if the document is already in dollars,
+  "notes": "any relevant notes from the document itself, plus — only if applicable — one short line starting with '⚠️' for a genuine mismatch with this trip: dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
 }
 
 Return ONLY the JSON object, no commentary.`;
@@ -474,36 +494,122 @@ Return ONLY the JSON object, no commentary.`;
 // no Hermes profile can use this server through its normal setup path at
 // all, not just a scripted one (confirmed against hermes_cli/mcp_config.py's
 // _bearer_auth_headers()).
-function requireKey(req, res, next) {
+function presentedKey(req) {
   const authHeader = req.headers['authorization'] || '';
   const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const key = req.headers['x-api-key'] || req.query.key || bearerKey;
-  // Constant-time compare — matches provision.js's requireKey. This server
-  // is the one meant to be public, so its key deserves the same treatment.
-  const a = Buffer.from(String(key || ''));
-  const b = Buffer.from(API_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  return req.headers['x-api-key'] || req.query.key || bearerKey || '';
+}
+
+// Constant-time compare — matches provision.js's requireKey. This server is
+// the one meant to be public, so its key deserves the same treatment.
+function keyMatches(presented, expected) {
+  const a = Buffer.from(String(presented || ''));
+  const b = Buffer.from(String(expected || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireKey(req, res, next) {
+  if (!keyMatches(presentedKey(req), API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 
-app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, res) => {
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set for trip-mcp' });
+// /extract is called by the trip site itself (server.js's /api/bookings/extract
+// proxy), not by an agent — it has no MCP_API_KEY to present, only the
+// TRIP_API_KEY it already shares with this server (the same value setup-mcp.sh
+// syncs as the site's own HERMES_API_KEY). Accept either: an agent hitting this
+// route directly still works, and the site doesn't need a third secret minted
+// and kept in sync just to unlock one HTTP route.
+function requireSiteOrAgentKey(req, res, next) {
+  const key = presentedKey(req);
+  if (!keyMatches(key, API_KEY) && !keyMatches(key, TRIP_API_KEY)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+// Dedicated, no-skills, all-toolsets-disabled Hermes profile (see
+// mcp/README.md's "Extract Details with AI" section for how to create one) —
+// not any trip's interviewer/companion profile. Those hold real tool access
+// (terminal, file, memory, MCP servers); reusing one here would mean a
+// stranger's uploaded "confirmation PDF" gets a shot at a full agent via
+// prompt injection. Left unset, the feature is simply off — no default
+// profile name is assumed.
+const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || '';
+const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
+
+async function extractPdfText(buf) {
+  const { text } = await pdfParse(buf);
+  return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
+}
+
+// One-shot, non-interactive call: -q for the single query, -Q for
+// script-friendly output (no banner/spinner), --safe-mode to also strip
+// AGENTS.md/memory/plugin injection on top of the profile's own
+// already-disabled toolsets, --reasoning none so stdout is bare JSON instead
+// of a reasoning-trace panel. No shell involved (execFile, not exec) — the
+// extracted document text reaches this as a single argv entry, never
+// interpolated into a command string.
+function runHermesExtract(prompt) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      HERMES_BIN,
+      ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
+      { timeout: 45000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (!err) return resolve(stdout);
+        if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));
+        reject(err);
+      }
+    );
+  });
+}
+
+// Deterministic currency conversion — the model only reports the raw amount
+// and its currency (buildExtractSystem asks for cost_amount/cost_currency,
+// never cost directly); the actual math runs here against a real, free,
+// keyless exchange-rate API (frankfurter.dev, ECB-backed) instead of an LLM
+// guessing "a reasonable current exchange rate". On any failure (network,
+// unsupported currency code, timeout), cost is left unset with an
+// explanatory note rather than ever guessing a number.
+async function resolveCost(parsed) {
+  const rawAmount = parsed.cost_amount;
+  const currency = String(parsed.cost_currency || '').toUpperCase();
+  delete parsed.cost_amount;
+  delete parsed.cost_currency;
+  if (rawAmount === undefined || rawAmount === null || rawAmount === '') return;
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount)) return;
+
+  if (!currency || currency === 'USD') {
+    parsed.cost = amount;
+    return;
+  }
+
+  try {
+    const r = await fetch(`https://api.frankfurter.dev/v1/latest?amount=${amount}&from=${currency}&to=USD`, { timeout: 8000 });
+    if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
+    const data = await r.json();
+    const usd = data.rates?.USD;
+    if (typeof usd !== 'number') throw new Error('no USD rate in response');
+    parsed.cost = Math.round(usd * 100) / 100;
+    const flag = `${amount} ${currency} ≈ $${parsed.cost} USD (rate as of ${data.date})`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  } catch (e) {
+    const flag = `⚠️ Found ${amount} ${currency} but couldn't fetch a live conversion rate (${e.message}) — enter the USD cost manually.`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  }
+}
+
+app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
 
   const { url, pdf_base64, pdf_name } = req.body || {};
   if (!url && !pdf_base64) return res.status(400).json({ error: 'Provide url or pdf_base64' });
 
-  const Anthropic = require('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: ANTHROPIC_KEY });
-
   try {
-    let userContent;
+    let content;
 
     if (pdf_base64) {
-      userContent = [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdf_base64 } },
-        { type: 'text', text: `Extract booking details from this PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}.` },
-      ];
+      const text = await extractPdfText(Buffer.from(pdf_base64, 'base64'));
+      content = `Content to extract from — PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}:\n\n${text}`;
     } else {
       const r = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TripBot/1.0)' },
@@ -511,29 +617,42 @@ app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, re
       });
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('application/pdf')) {
-        const buf = await r.buffer();
-        userContent = [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') } },
-          { type: 'text', text: 'Extract booking details from this PDF confirmation.' },
-        ];
+        const text = await extractPdfText(await r.buffer());
+        content = `Content to extract from — PDF confirmation:\n\n${text}`;
       } else {
         const html = await r.text();
         const plain = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 10000);
-        userContent = [{ type: 'text', text: `URL: ${url}\n\nPage content:\n${plain}\n\nExtract the booking information.` }];
+        content = `URL: ${url}\n\nContent to extract from — page content:\n\n${plain}`;
       }
     }
 
-    const msg = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
-      system: await buildExtractSystem(),
-      messages: [{ role: 'user', content: userContent }],
-    });
+    let bookings = [];
+    try { bookings = await apiGet('/api/bookings'); } catch (_) { /* prompt still works without it */ }
 
-    const text = (msg.content[0]?.text || '').trim();
-    const m = text.match(/\{[\s\S]*\}/);
+    const system = await buildExtractSystem(bookings);
+    const stdout = await runHermesExtract(`${system}\n\n---\n\n${content}`);
+    const m = stdout.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('No JSON in response');
-    res.json(JSON.parse(m[0]));
+    const parsed = JSON.parse(m[0]);
+    // Seen in practice: an occasional cold-start call returns `{}` — valid
+    // JSON, HTTP 200, but nothing usable. Treat "no name" as a failed
+    // extraction rather than a false-success empty form.
+    if (!parsed.name) throw new Error('Extraction returned no usable data — try again');
+
+    await resolveCost(parsed);
+
+    // Deterministic duplicate-confirmation check — exact string match isn't
+    // something worth leaving to the model's judgment when the data to check
+    // it against is already sitting right here.
+    if (parsed.confirmation) {
+      const dup = bookings.find(b => b.confirmation && b.confirmation === parsed.confirmation);
+      if (dup) {
+        const flag = `⚠️ Confirmation ${parsed.confirmation} matches existing booking #${dup.id} (${dup.name}) — check this isn't a duplicate.`;
+        parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+      }
+    }
+
+    res.json(parsed);
   } catch (e) {
     console.error('[extract]', e.message);
     res.status(500).json({ error: e.message });

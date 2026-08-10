@@ -2454,7 +2454,12 @@ async function loadBookings() {
     if (!rows.length) { el.innerHTML = `<p style="color:var(--ink-2);padding:24px 0;text-align:center">${tr.bk_no_bookings}</p>`; return; }
     const byPhase = {};
     for (const b of rows) { (byPhase[b.phase] = byPhase[b.phase] || []).push(b); }
-    const phaseOrder = ['intl_flights','nyc','dallas','colorado','west_coast'];
+    // Config-driven, not the original trip's hardcoded ids — a booking whose
+    // phase isn't in trip.config.json at all (renamed/removed phase, typo)
+    // still gets a section instead of silently vanishing from the list.
+    const knownPhases = ['intl_flights', ...(window.TRIP_CONFIG?.phases || []).map(p => p.id)];
+    const leftoverPhases = Object.keys(byPhase).filter(p => !knownPhases.includes(p));
+    const phaseOrder = [...knownPhases, ...leftoverPhases];
     let html = '';
     for (const phase of phaseOrder) {
       if (!byPhase[phase]) continue;
@@ -2506,7 +2511,8 @@ async function extractBookingWithAI() {
 
   const token = localStorage.getItem('trip-token');
   btn.disabled = true;
-  statusEl.textContent = tr.bk_extract_loading;
+  statusEl.style.color = '';
+  statusEl.innerHTML = `<span class="inline-spinner"></span>${tr.bk_extract_loading}`;
 
   try {
     let body, headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -2540,6 +2546,15 @@ async function extractBookingWithAI() {
     if (data.notes)        document.getElementById('bk-notes').value       = data.notes;
     if (data.location_url) document.getElementById('bk-location-url').value = data.location_url;
 
+    if (file) {
+      // Same PDF already uploaded for extraction — carry it over as the
+      // confirmation attachment too, instead of making them attach it
+      // again below by hand.
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      document.getElementById('bk-file').files = dt.files;
+    }
+
     statusEl.style.color = 'var(--ok, #16a34a)';
     statusEl.textContent = tr.bk_extract_success;
     document.getElementById('bk-extract-url').value = '';
@@ -2569,6 +2584,14 @@ function showBookingForm(phase, bookingData) {
   document.getElementById('bk-location-url').value  = bookingData?.location_url || '';
   document.getElementById('bk-file').value     = '';
   document.getElementById('bk-err').textContent = '';
+  // Leftover from a previous extraction (text + color) otherwise stays on
+  // screen — a stale "✓ Details extracted" can sit there for an entirely
+  // new, unrelated booking.
+  document.getElementById('bk-extract-url').value = '';
+  document.getElementById('bk-extract-file').value = '';
+  const extractStatusEl = document.getElementById('bk-extract-status');
+  extractStatusEl.textContent = '';
+  extractStatusEl.style.color = '';
   const tr = T[currentLang] || T['he'];
   document.getElementById('bk-form-title').textContent = bookingData ? tr.bk_form_edit : tr.bk_form_title;
   document.getElementById('bk-overlay').style.display = 'flex';

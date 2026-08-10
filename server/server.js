@@ -13,7 +13,12 @@ const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeV
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 
 const app = express();
-app.use(express.json());
+// Default (100kb) is too small for /api/bookings/extract, which the browser
+// calls with a base64-encoded PDF as the JSON body — base64 alone inflates a
+// file ~33%, so even a modest few-MB confirmation PDF blew this immediately.
+// Every other route's payloads are trivially small, so one shared limit is
+// fine — no route needs its own override.
+app.use(express.json({ limit: '30mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -1537,18 +1542,27 @@ const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSi
 app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
   if (!HERMES_URL) return res.status(503).json({ error: 'HERMES_URL not configured' });
   const url = req.body?.url;
-  if (!req.file && !url) return res.status(400).json({ error: 'Provide a file or url' });
+  // The site's own "Extract Details with AI" upload (site/app.js) sends
+  // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
+  // populated for an actual multipart caller (e.g. a direct API client).
+  const pdfBase64 = req.file ? req.file.buffer.toString('base64') : req.body?.pdf_base64;
+  const pdfName = req.file ? req.file.originalname : req.body?.pdf_name;
+  if (!pdfBase64 && !url) return res.status(400).json({ error: 'Provide a file or url' });
 
   try {
     const body = url
       ? JSON.stringify({ url })
-      : JSON.stringify({ pdf_base64: req.file.buffer.toString('base64'), pdf_name: req.file.originalname || 'confirmation.pdf' });
+      : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
 
     const r = await fetch(`${HERMES_URL}/extract`, {
       method: 'POST',
       headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
       body,
-      timeout: 30000,
+      // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
+      // call (mcp/mcp.js) — this used to be shorter (30s), so this call
+      // could time out and error here while trip-mcp's own call was still
+      // legitimately running, producing a confusing failure under load.
+      timeout: 50000,
     });
     if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
     res.json(await r.json());
@@ -2120,6 +2134,25 @@ app.post('/api/trivia/questions', authRequired, (req, res) => {
   }
 
   res.json({ ok: true, id: newId, total: TRIVIA_QUESTIONS.length });
+});
+
+// Catches what body-parser throws on a still-too-large or malformed body
+// (and anything else unhandled) before Express's default HTML error page
+// can reach the client — every client-side fetch() here calls r.json() on
+// the response no matter what, so an HTML error page shows up in the
+// browser as a raw "Unexpected token '<'" JSON.parse crash instead of a
+// readable message.
+app.use((err, _req, res, _next) => {
+  if (res.headersSent) return;
+  const status = err.status || err.statusCode || 500;
+  console.error('[unhandled]', err.message);
+  // err.message is only ever safe to hand back for the one specific,
+  // already-vetted case this was written for. Everything else lands here
+  // from framework/driver code never audited for what it puts in .message
+  // (a DB error, a stack-trace fragment, a file path) — a fixed, generic
+  // message is the only safe default for those.
+  const message = err.type === 'entity.too.large' ? 'file too large' : 'internal server error';
+  res.status(status).json({ error: message });
 });
 
 const PORT = process.env.PORT || 3000;

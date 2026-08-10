@@ -475,3 +475,13 @@ once the site is up and confirmed working:
   trip once). Point them at [mcp/README.md](../../../mcp/README.md),
   specifically the Cowork custom-connector steps if they mention wanting
   to manage the trip remotely or "from my phone."
+- **"Extract Details with AI" on Add Booking** — lets anyone adding a
+  booking upload the confirmation PDF (or paste its URL) and have the form
+  fields fill themselves in, instead of retyping dates/confirmation
+  numbers/PINs by hand. Already in the UI regardless of setup — it just
+  errors until the operator points it at a dedicated, tools-disabled Hermes
+  profile (`HERMES_EXTRACT_PROFILE` on the trip-mcp bridge) and sets
+  `HERMES_URL` (on the site itself). See
+  [mcp/README.md](../../../mcp/README.md)'s `/extract` section. Don't
+  block the interview on this either — mention it exists, point at the
+  doc, move on.
