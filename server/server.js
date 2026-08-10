@@ -2146,7 +2146,13 @@ app.use((err, _req, res, _next) => {
   if (res.headersSent) return;
   const status = err.status || err.statusCode || 500;
   console.error('[unhandled]', err.message);
-  res.status(status).json({ error: err.type === 'entity.too.large' ? 'file too large' : err.message });
+  // err.message is only ever safe to hand back for the one specific,
+  // already-vetted case this was written for. Everything else lands here
+  // from framework/driver code never audited for what it puts in .message
+  // (a DB error, a stack-trace fragment, a file path) — a fixed, generic
+  // message is the only safe default for those.
+  const message = err.type === 'entity.too.large' ? 'file too large' : 'internal server error';
+  res.status(status).json({ error: message });
 });
 
 const PORT = process.env.PORT || 3000;

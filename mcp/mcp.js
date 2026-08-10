@@ -480,8 +480,9 @@ JSON fields (omit any field you cannot determine):
   "passengers": "passenger or guest names",
   "confirmation": "confirmation / reservation number",
   "pin": "PIN code if present",
-  "cost": numeric USD amount — if the document shows a price in another currency (¥, €, £, etc.), convert it to USD yourself using a reasonable current exchange rate and put the converted number here. Never omit this just because the source wasn't already in USD,
-  "notes": "any relevant notes from the document itself, plus — only if applicable — one short line for each: (1) if you converted a cost, the original amount and currency and that it's an approximate conversion (e.g. '¥45,000 ≈ $300, approximate'); (2) starting with '⚠️', a genuine mismatch with this trip — dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
+  "cost_amount": numeric amount exactly as it appears in the document — do not convert or do any math yourself, just report the number,
+  "cost_currency": the ISO 4217 3-letter code for whatever currency that amount is in (e.g. "USD", "JPY", "EUR") — infer it from a symbol or context if the document doesn't spell it out. Use "USD" if the document is already in dollars,
+  "notes": "any relevant notes from the document itself, plus — only if applicable — one short line starting with '⚠️' for a genuine mismatch with this trip: dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
 }
 
 Return ONLY the JSON object, no commentary.`;
@@ -561,6 +562,42 @@ function runHermesExtract(prompt) {
   });
 }
 
+// Deterministic currency conversion — the model only reports the raw amount
+// and its currency (buildExtractSystem asks for cost_amount/cost_currency,
+// never cost directly); the actual math runs here against a real, free,
+// keyless exchange-rate API (frankfurter.dev, ECB-backed) instead of an LLM
+// guessing "a reasonable current exchange rate". On any failure (network,
+// unsupported currency code, timeout), cost is left unset with an
+// explanatory note rather than ever guessing a number.
+async function resolveCost(parsed) {
+  const rawAmount = parsed.cost_amount;
+  const currency = String(parsed.cost_currency || '').toUpperCase();
+  delete parsed.cost_amount;
+  delete parsed.cost_currency;
+  if (rawAmount === undefined || rawAmount === null || rawAmount === '') return;
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount)) return;
+
+  if (!currency || currency === 'USD') {
+    parsed.cost = amount;
+    return;
+  }
+
+  try {
+    const r = await fetch(`https://api.frankfurter.dev/v1/latest?amount=${amount}&from=${currency}&to=USD`, { timeout: 8000 });
+    if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
+    const data = await r.json();
+    const usd = data.rates?.USD;
+    if (typeof usd !== 'number') throw new Error('no USD rate in response');
+    parsed.cost = Math.round(usd * 100) / 100;
+    const flag = `${amount} ${currency} ≈ $${parsed.cost} USD (rate as of ${data.date})`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  } catch (e) {
+    const flag = `⚠️ Found ${amount} ${currency} but couldn't fetch a live conversion rate (${e.message}) — enter the USD cost manually.`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  }
+}
+
 app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), async (req, res) => {
   if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
 
@@ -601,6 +638,8 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
     // JSON, HTTP 200, but nothing usable. Treat "no name" as a failed
     // extraction rather than a false-success empty form.
     if (!parsed.name) throw new Error('Extraction returned no usable data — try again');
+
+    await resolveCost(parsed);
 
     // Deterministic duplicate-confirmation check — exact string match isn't
     // something worth leaving to the model's judgment when the data to check

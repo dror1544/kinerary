@@ -5,21 +5,29 @@ import { fileURLToPath } from 'url';
 const HERE     = dirname(fileURLToPath(import.meta.url));
 const MCP_JS   = join(HERE, '..', '..', 'mcp', 'mcp.js');
 const MCP_DIR  = join(HERE, '..', '..', 'mcp');
-const TEST_PORT = 3098;
-const BASE_URL  = `http://localhost:${TEST_PORT}`;
+const DEFAULT_TEST_PORT = 3098;
 
 export const MCP_API_KEY  = 'test-mcp-key';
 export const TRIP_API_KEY = 'test-trip-key';
 
 let mcpProcess = null;
+// Mutable — see the equivalent note in helpers/server.js. Two describe
+// blocks in the same file reusing this same default port back-to-back also
+// hit this: killing the old process and binding a new one to the identical
+// port isn't instant, and got racy once enough other files' processes were
+// competing for CPU/ports at the same time. Pass MCP_PORT in extraEnv for a
+// dedicated one.
+let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
 export async function startTestMcp(extraEnv = {}) {
+  const port = extraEnv.MCP_PORT || DEFAULT_TEST_PORT;
+  BASE_URL = `http://localhost:${port}`;
   return new Promise((resolve, reject) => {
     mcpProcess = spawn('node', [MCP_JS], {
       cwd: MCP_DIR,
       env: {
         ...process.env,
-        MCP_PORT: String(TEST_PORT),
+        MCP_PORT: String(port),
         MCP_API_KEY,
         TRIP_API_KEY,
         // Deliberately no HERMES_EXTRACT_PROFILE by default — auth is checked
