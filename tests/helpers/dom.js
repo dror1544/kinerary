@@ -25,8 +25,9 @@ function getRenderCode() {
  * @param {string} html  - innerHTML to seed into document.body
  * @param {object} cfg   - window.TRIP_CONFIG value
  * @param {string} lang  - 'he' | 'en'
+ * @param {object} extra - additional context bindings (e.g. fetch, localStorage)
  */
-export function createRenderContext(html = '', cfg = {}, lang = 'he') {
+export function createRenderContext(html = '', cfg = {}, lang = 'he', extra = {}) {
   const win = new Window({ url: 'http://localhost/' });
   const doc = win.document;
   doc.body.innerHTML = html;
@@ -41,6 +42,7 @@ export function createRenderContext(html = '', cfg = {}, lang = 'he') {
       en: { upload_click: 'Click to upload',    bk_err_server: 'Error',  bk_no_bookings: 'None' },
     },
     console,
+    ...extra,
   });
 
   vm.runInContext(getRenderCode(), ctx, { filename: 'app.js (render fns)' });

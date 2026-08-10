@@ -590,6 +590,46 @@ app.get('/api/config', authRequired, (_req, res) => {
   res.json(safe);
 });
 
+// ── CURRENCY RATES — Info tab: each destination currency vs USD / home ──────
+// One shared, server-side cache refreshed at most once/day, not a per-visitor
+// fetch — a dozen family members opening the Info tab the same afternoon
+// should cost one external call, not a dozen.
+const HOME_CURRENCY = (TRIP_CONFIG.meta?.homeCurrency || '').toUpperCase() || null;
+const CURRENCY_CACHE_MS = 24 * 60 * 60 * 1000;
+let currencyRatesCache = null; // { base, home, rates, date, fetchedAt }
+
+function destinationCurrencyCodes() {
+  const countries = TRIP_CONFIG.travel_info?.countries || {};
+  return [...new Set(Object.values(countries).map(c => c.currency?.code).filter(Boolean))];
+}
+
+async function getCurrencyRates() {
+  if (currencyRatesCache && (Date.now() - currencyRatesCache.fetchedAt) < CURRENCY_CACHE_MS) {
+    return currencyRatesCache;
+  }
+  const codes = destinationCurrencyCodes();
+  if (HOME_CURRENCY && !codes.includes(HOME_CURRENCY)) codes.push(HOME_CURRENCY);
+  if (!codes.length) return { base: 'USD', home: HOME_CURRENCY, rates: {}, date: null };
+
+  const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=USD&to=${codes.join(',')}`, { timeout: 8000 });
+  if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
+  const data = await r.json();
+  currencyRatesCache = { base: 'USD', home: HOME_CURRENCY, rates: data.rates || {}, date: data.date, fetchedAt: Date.now() };
+  return currencyRatesCache;
+}
+
+app.get('/api/currency-rates', authRequired, async (_req, res) => {
+  try {
+    res.json(await getCurrencyRates());
+  } catch (e) {
+    console.error('[currency-rates]', e.message);
+    // A stale cached rate is still more useful than none on a transient
+    // network blip — only a genuine first-ever failure returns nothing.
+    if (currencyRatesCache) return res.json(currencyRatesCache);
+    res.status(502).json({ error: 'currency rate lookup failed' });
+  }
+});
+
 // Deliberately public and deliberately minimal: the login screen needs to
 // show a "pick yourself" roster before any session exists, but the full
 // /api/config now carries real trip content (itinerary, budget, bookings,
