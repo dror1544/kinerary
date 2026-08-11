@@ -1529,5 +1529,10 @@
         "en": "Recommended eSIM to download in advance (Airalo / Ubigi)"
       }
     ]
+  },
+  "agent": {
+    "organizers": [
+      "eitan"
+    ]
   }
 }
