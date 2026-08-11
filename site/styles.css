@@ -2273,3 +2273,10 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 
 /* Ticket state, reusing the site's .tag.g / .tag.r pills. */
 .plan-tag { font-size: 11.5px; }
+
+/* Clock input is inert unless "exact time" is selected. */
+.plan-time-in:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: var(--bg-sub);
+}

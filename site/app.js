@@ -3504,11 +3504,11 @@ function _buildPlanItemRow(item, phaseId, tr) {
 function _buildAddItemRow(phaseId, date, tr) {
   if (!isOrganizer) return '';
   return `<li class="plan-add-row">
-    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
     <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
       <option value="">${esc(tr.plan_rough_none)}</option>
       ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
     </select>
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
     <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
     <button class="btn plan-save-btn" data-plan-add="${esc(phaseId)}" data-plan-date="${esc(date || '')}">${esc(tr.plan_save)}</button>
     <span class="plan-err" hidden></span>
@@ -3520,11 +3520,11 @@ function _buildAddItemRow(phaseId, date, tr) {
 function _buildNewDateRow(phaseId, tr) {
   return `<div class="plan-new-date-row">
     <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
-    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
     <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
       <option value="">${esc(tr.plan_rough_none)}</option>
       ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
     </select>
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
     <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
     <button class="btn" data-plan-add-new="${esc(phaseId)}">${esc(tr.plan_save)}</button>
     <button class="btn plan-enrich-all" data-plan-enrich-all="1" title="${esc(tr.plan_enrich_all_hint)}">${esc(tr.plan_enrich_all)}</button>
@@ -3632,6 +3632,25 @@ function _planTimeFrom(row) {
   const rough = row.querySelector('.plan-rough-in')?.value || '';
   return rough || (row.querySelector('.plan-time-in')?.value || '').trim();
 }
+
+// The clock input only means anything under "exact time"; any rough slot
+// disables and clears it, so the row can't show 09:00 next to "afternoon" and
+// leave you guessing which one was saved.
+function _syncPlanTimeInput(select) {
+  const row = select.closest('li, .plan-new-date-row');
+  const input = row?.querySelector('.plan-time-in');
+  if (!input) return;
+  const rough = !!select.value;
+  input.disabled = rough;
+  if (rough) input.value = '';
+}
+
+// Delegated: renderDays() replaces innerHTML, so a listener bound to the
+// element itself would not survive a re-render.
+document.addEventListener('change', (ev) => {
+  const sel = ev.target.closest?.('.plan-rough-in');
+  if (sel) _syncPlanTimeInput(sel);
+});
 
 window.handleAddPlanItem = async function(phaseId, date, btn) {
   const row = btn.closest('li');
