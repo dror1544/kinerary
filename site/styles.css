@@ -2220,3 +2220,56 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
   padding-top: 12px;
   border-top: 1px solid var(--line);
 }
+
+/* ── Plan item AI enrichment strip ─────────────────────────────────────────── */
+/* Reuses .loc-panel for the collapsible itself; these only cover the parts the
+   plan rows add on top of it. */
+.plan-enrich { margin-top: 8px; }
+.plan-enrich .loc-panel-hdr { font-size: 12.5px; padding: 6px 10px; }
+.plan-enrich .loc-nav-row { flex-wrap: wrap; gap: 8px; }
+
+.plan-enrich-link { font-size: 12.5px; padding: 5px 10px; text-decoration: none; }
+
+/* Model-generated links are labelled as such — an unchecked link that looks
+   official is worse than no link. */
+.plan-enrich-note {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.plan-enrich-pending {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  font-style: italic;
+  padding: 2px 0;
+}
+
+.plan-rough-in {
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--bg-card);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.plan-enrich-all { font-size: 12.5px; }
+
+/* Original (config) schedule, collapsed under the living plan. Organizer-only
+   once plan items exist — see renderDays(). */
+.plan-orig-panel { margin-top: 18px; }
+.plan-orig-panel .loc-panel-hdr {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+.plan-orig-panel .loc-panel-body .day-block { margin-top: 10px; }
+
+.plan-hl-pending { font-weight: 400; font-style: italic; color: var(--ink-3); }
+
+/* Ticket state, reusing the site's .tag.g / .tag.r pills. */
+.plan-tag { font-size: 11.5px; }

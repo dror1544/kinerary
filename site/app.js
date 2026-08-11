@@ -274,6 +274,7 @@ const NY_PHOTOS = [
 let currentUser = null;
 let isOrganizer = false;
 const PHASE_PLAN = {}; // phase_id → array of plan items loaded from DB
+const PHASE_PLAN_DAYS = {}; // phase_id → { date: {label_he,label_en,...} }
 
 async function doLogin() {
   const username = document.getElementById('user-input').value.trim().toLowerCase();
@@ -2802,8 +2803,15 @@ async function loadPhasePlans() {
   if (!token) return;
   await Promise.all(phases.map(async p => {
     try {
-      const res = await fetch(`/api/phases/${p.id}/plan`, { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) PHASE_PLAN[p.id] = await res.json();
+      const h = { Authorization: `Bearer ${token}` };
+      const [items, days] = await Promise.all([
+        fetch(`/api/phases/${p.id}/plan`, { headers: h }),
+        fetch(`/api/phases/${p.id}/plan/days`, { headers: h }),
+      ]);
+      if (items.ok) PHASE_PLAN[p.id] = await items.json();
+      if (days.ok) {
+        PHASE_PLAN_DAYS[p.id] = Object.fromEntries((await days.json()).map(d => [d.date, d]));
+      }
     } catch {}
   }));
 }
@@ -3420,15 +3428,60 @@ async function deletePlanItem(phaseId, id) {
 // badge always rendered ''. Restoring it needs its own forecast fetch keyed on
 // phase.accommodation.weatherKey, not a read of that cache.
 
+// Rough-time tokens mirror ROUGH_TIMES in server.js. Kept as tokens rather than
+// free text so they stay translatable and sortable.
+const PLAN_ROUGH_TIMES = ['morning', 'noon', 'afternoon', 'evening'];
+
+function _planTimeLabel(t, tr) {
+  if (!t) return '';
+  return PLAN_ROUGH_TIMES.includes(t) ? (tr[`plan_rough_${t}`] || t) : t;
+}
+
+// The enrichment strip: a collapsed line per item that opens to the links the
+// model found. Reuses the existing loc-panel pattern rather than inventing a
+// second collapsible. Renders nothing at all when there is nothing to show and
+// nothing pending, so an un-enrichable item ("pack the suitcases") stays clean.
+function _buildEnrichPanel(item, tr) {
+  const links = [
+    ['🗺️', tr.plan_link_maps,    item.location_url],
+    ['🔵', tr.plan_link_waze,    item.waze_url],
+    ['🌐', tr.plan_link_website, item.website_url],
+    ['🎟️', tr.plan_link_tickets, item.ticket_url],
+  ].filter(([, , url]) => safeUrl(url));
+
+  const pending = item.enrichment_status === 'pending';
+  if (!links.length && !pending) return '';
+
+  if (!links.length) {
+    return `<div class="plan-enrich plan-enrich-pending">${esc(tr.plan_enriching)}</div>`;
+  }
+  const row = links.map(([icon, label, url]) =>
+    `<a class="btn plan-enrich-link" href="${esc(safeUrl(url))}" target="_blank" rel="noopener">${icon} ${esc(label)}</a>`
+  ).join('');
+  return `<div class="loc-panel plan-enrich">
+    <button class="loc-panel-hdr" type="button" data-plan-enrich-toggle>
+      <span>📍 ${esc(tr.plan_enrich_hdr)}${pending ? ` · ${esc(tr.plan_enriching)}` : ''}</span>
+      <span class="loc-panel-chevron">▼</span>
+    </button>
+    <div class="loc-panel-body">
+      <div class="loc-nav-row">${row}</div>
+      <div class="plan-enrich-note">${esc(tr.plan_enrich_note)}</div>
+    </div>
+  </div>`;
+}
+
 function _buildPlanItemRow(item, phaseId, tr) {
-  const href = safeUrl(item.location_url);
-  const loc = href
-    ? `<a class="plan-loc-link" href="${esc(href)}" target="_blank" rel="noopener" title="${esc(tr.plan_location)}">📍</a>`
-    : '';
-  const conf = item.booking
-    ? `<span class="plan-conf-badge" title="${esc(tr.plan_conf_badge)}">${esc(item.booking.name)}${
+  // Ticket state, in the same green/red pill vocabulary the rest of the site
+  // uses: green once a real booking backs it, red while money still has to
+  // change hands. Nothing at all when the place needs no ticket, so the
+  // schedule doesn't fill up with reassurances.
+  const ticket = item.booking
+    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)}${
         item.booking.confirmation ? ` · ${esc(item.booking.confirmation)}` : ''}</span>`
-    : '';
+    : item.needs_tickets
+      ? `<span class="tag r plan-tag">⚠️ ${esc(item.advance_booking ? tr.plan_tickets_advance : tr.plan_tickets_needed)}</span>`
+      : '';
+  const conf = ticket;
   const review = item.status === 'needs_review'
     ? `<span class="plan-needs-review">${esc(tr.plan_needs_review)}</span>`
     : '';
@@ -3438,16 +3491,24 @@ function _buildPlanItemRow(item, phaseId, tr) {
   const del = isOrganizer
     ? `<button class="plan-del-btn" data-plan-del="${esc(item.id)}" data-plan-phase="${esc(phaseId)}" title="${esc(tr.plan_delete_confirm)}">✕</button>`
     : '';
+  // The maps link used to be a bare 📍 next to the text; it now lives in the
+  // enrichment panel below alongside Waze/site/tickets, so it isn't repeated.
+  const when = _planTimeLabel(item.time, tr);
   return `<li class="plan-item" data-id="${esc(item.id)}">
-    ${item.time ? `<strong>${esc(item.time)}</strong> — ` : ''}${_biSpan({ he: esc(item.text_he), en: esc(item.text_en) })}${loc}${conf}${review}${del}
+    ${when ? `<strong>${esc(when)}</strong> — ` : ''}${_biSpan({ he: esc(item.text_he), en: esc(item.text_en) })}${conf}${review}${del}
     <span class="plan-err" hidden></span>
+    ${_buildEnrichPanel(item, tr)}
   </li>`;
 }
 
 function _buildAddItemRow(phaseId, date, tr) {
   if (!isOrganizer) return '';
   return `<li class="plan-add-row">
-    <input class="plan-time-in" placeholder="${esc(tr.plan_time_ph)}" style="width:70px">
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
+    <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
+      <option value="">${esc(tr.plan_rough_none)}</option>
+      ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
+    </select>
     <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
     <button class="btn plan-save-btn" data-plan-add="${esc(phaseId)}" data-plan-date="${esc(date || '')}">${esc(tr.plan_save)}</button>
     <span class="plan-err" hidden></span>
@@ -3459,12 +3520,93 @@ function _buildAddItemRow(phaseId, date, tr) {
 function _buildNewDateRow(phaseId, tr) {
   return `<div class="plan-new-date-row">
     <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
-    <input class="plan-time-in" placeholder="${esc(tr.plan_time_ph)}" style="width:70px">
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
+    <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
+      <option value="">${esc(tr.plan_rough_none)}</option>
+      ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
+    </select>
     <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
     <button class="btn" data-plan-add-new="${esc(phaseId)}">${esc(tr.plan_save)}</button>
+    <button class="btn plan-enrich-all" data-plan-enrich-all="1" title="${esc(tr.plan_enrich_all_hint)}">${esc(tr.plan_enrich_all)}</button>
+    <button class="btn plan-promote" data-plan-promote="1" title="${esc(tr.plan_promote_hint)}">${esc(tr.plan_promote)}</button>
     <span class="plan-err" hidden></span>
   </div>`;
 }
+
+// <input type="time"> already refuses bad input wherever it's supported, but a
+// browser that falls back to a plain text box would post whatever was typed and
+// get back a bare 400. Same shape the server enforces.
+const PLAN_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Enrichment lands seconds after the save returns, so the row that was just
+// added would otherwise sit link-less until the next page load. Re-fetch a few
+// times, backing off, and stop as soon as nothing is pending. Bounded on
+// purpose — Hermes may be unreachable, and the server keeps retrying anyway.
+const PLAN_REFRESH_DELAYS = [4000, 8000, 15000, 30000];
+const _planRefreshTimers = {};
+
+function scheduleEnrichRefresh(phaseId, step = 0) {
+  if (step >= PLAN_REFRESH_DELAYS.length) return;
+  clearTimeout(_planRefreshTimers[phaseId]);
+  _planRefreshTimers[phaseId] = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/phases/${encodeURIComponent(phaseId)}/plan`, { headers: _authHeaders() });
+      if (!res.ok) return;
+      PHASE_PLAN[phaseId] = await res.json();
+      const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+      if (phase) renderDays(phase);
+      if ((PHASE_PLAN[phaseId] || []).some(i => i.enrichment_status === 'pending')) {
+        scheduleEnrichRefresh(phaseId, step + 1);
+      }
+    } catch { /* transient; the next save or reload will pick it up */ }
+  }, PLAN_REFRESH_DELAYS[step]);
+}
+
+// Copies the read-only config schedule into the editable plan layer, once.
+// Confirmed first because it visibly duplicates the schedule on screen — the
+// promoted copy on top, the original still below the separator.
+window.handlePromoteConfigDays = async function(btn) {
+  const tr = T[currentLang] || T.he;
+  if (!confirm(tr.plan_promote_confirm)) return;
+  try {
+    btn.disabled = true;
+    const res = await fetch('/api/phase-plan/promote-config-days', { method: 'POST', headers: _authHeaders() });
+    if (!res.ok) throw new Error(`${res.status}`);
+    const { created, skipped } = await res.json();
+    btn.textContent = created ? `${tr.plan_promote} · ${created}` : tr.plan_promote_none;
+    await loadPhasePlans();
+    for (const p of (window.TRIP_CONFIG?.phases || [])) {
+      renderDays(p);
+      scheduleEnrichRefresh(p.id);
+    }
+    if (!created && skipped) console.info(`[plan] nothing promoted; ${skipped} already present`);
+  } catch (e) {
+    _planErr(btn, e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+window.handleEnrichAll = async function(btn) {
+  const tr = T[currentLang] || T.he;
+  try {
+    btn.disabled = true;
+    const res = await fetch('/api/phase-plan/enrich-pending', { method: 'POST', headers: _authHeaders() });
+    if (!res.ok) throw new Error(`${res.status}`);
+    const { in_flight, hermes_configured } = await res.json();
+    // "queued 0" is the normal answer when items are already being worked on,
+    // so report what the worker will actually process rather than what this
+    // click changed — otherwise a working button looks dead.
+    btn.textContent = !hermes_configured ? tr.plan_enrich_unavailable
+      : in_flight > 0 ? `${tr.plan_enrich_working} (${in_flight})`
+      : tr.plan_enrich_nothing;
+    for (const p of (window.TRIP_CONFIG?.phases || [])) scheduleEnrichRefresh(p.id);
+  } catch (e) {
+    _planErr(btn, e);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 // A failed save used to go to console.error only, so the organizer's typed text
 // sat in the input looking exactly like a pending save. Show it on the row.
@@ -3484,30 +3626,52 @@ window.handleDeletePlanItem = async function(phaseId, id, btn) {
   } catch(e) { _planErr(btn, e); }
 };
 
+// An explicit clock time and a rough slot are mutually exclusive; the rough
+// choice wins so picking "afternoon" doesn't silently keep a stale 09:00.
+function _planTimeFrom(row) {
+  const rough = row.querySelector('.plan-rough-in')?.value || '';
+  return rough || (row.querySelector('.plan-time-in')?.value || '').trim();
+}
+
 window.handleAddPlanItem = async function(phaseId, date, btn) {
   const row = btn.closest('li');
-  const time = row.querySelector('.plan-time-in').value.trim();
+  const time = _planTimeFrom(row);
   const text = row.querySelector('.plan-text-in').value.trim();
   if (!text) return;
+  if (time && !PLAN_TIME_RE.test(time) && !PLAN_ROUGH_TIMES.includes(time)) {
+    return _planErr(btn, new Error((T[currentLang] || T.he).plan_time_invalid));
+  }
   try {
     btn.disabled = true;
     await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
     const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
     if (phase) renderDays(phase);
+    // The item saves as enrichment_status 'pending'; this pulls the links in
+    // once the worker has them, without the organizer reloading.
+    scheduleEnrichRefresh(phaseId);
   } catch(e) { btn.disabled = false; _planErr(btn, e); }
 };
 
 // One delegated listener for every plan control. renderDays() replaces
 // innerHTML wholesale, so per-element listeners would be lost on each render.
 document.addEventListener('click', (ev) => {
-  const t = ev.target.closest?.('[data-plan-del],[data-plan-add],[data-plan-add-new]');
+  const t = ev.target.closest?.(
+    '[data-plan-del],[data-plan-add],[data-plan-add-new],[data-plan-enrich-toggle],' +
+    '[data-plan-enrich-all],[data-plan-promote]');
   if (!t) return;
+  if (t.dataset.planPromote !== undefined) return void handlePromoteConfigDays(t);
   if (t.dataset.planDel !== undefined) {
     handleDeletePlanItem(t.dataset.planPhase, Number(t.dataset.planDel), t);
   } else if (t.dataset.planAdd !== undefined) {
     handleAddPlanItem(t.dataset.planAdd, t.dataset.planDate || '', t);
-  } else {
+  } else if (t.dataset.planAddNew !== undefined) {
     handleAddPlanItemNewDate(t.dataset.planAddNew, t);
+  } else if (t.dataset.planEnrichToggle !== undefined) {
+    // Same collapsible the location panels use; with no data-wxkey it just
+    // opens and closes without trying to fetch a forecast.
+    toggleLocPanel(t);
+  } else {
+    handleEnrichAll(t);
   }
 });
 
@@ -3533,12 +3697,21 @@ function renderDays(phase) {
       ...Object.keys(buckets).filter(k => k).sort(),
     ];
     for (const key of keys) {
+      // The date alone doesn't say what the day IS. Prefer the stored headline
+      // (carried over from the config schedule, or written by enrichment) and
+      // fall back to the formatted date only when there isn't one yet.
       const label = key
         ? (() => {
             const d = new Date(key + 'T12:00:00');
             const he = d.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
             const en = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-            return `<span class="lang-he">${he}</span><span class="lang-en">${en}</span>`;
+            const meta = PHASE_PLAN_DAYS[phase.id]?.[key];
+            const hl = { he: meta?.label_he || '', en: meta?.label_en || meta?.label_he || '' };
+            const pendingHl = meta?.enrichment_status === 'pending' && !hl.he && !hl.en;
+            const suffix = hl.he || hl.en
+              ? _biSpan({ he: hl.he ? ` — ${hl.he}` : '', en: hl.en ? ` — ${hl.en}` : '' })
+              : (pendingHl ? `<span class="plan-hl-pending"> · ${esc(tr.plan_enriching)}</span>` : '');
+            return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}`;
           })()
         : _biSpan({ he: T.he.plan_unscheduled, en: T.en.plan_unscheduled });
       const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');
@@ -3556,19 +3729,33 @@ function renderDays(phase) {
   }
 
   // ── Config days (original schedule — lower precedence) ──
+  // Once the plan layer has content it IS the schedule, and showing the static
+  // copy underneath just reads as a duplicate. So it collapses, and is shown
+  // only to the organizer — who needs it to compare against. With no plan items
+  // it's the only schedule there is, so everyone still sees it, expanded.
   if (phase.days?.length) {
-    if (dbItems.length) {
-      html += `<div class="plan-orig-sep">${_biSpan({ he: T.he.plan_original_sched, en: T.en.plan_original_sched })}</div>`;
+    const supersededByPlan = dbItems.length > 0;
+    if (!supersededByPlan || isOrganizer) {
+      const daysHtml = phase.days.map(day => {
+        const items = (day.items || []).map(item =>
+          `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
+        ).join('');
+        return `<div class="day-block">
+          <div class="day-label">${_biSpan(day.label)}</div>
+          <ul>${items}</ul>
+        </div>`;
+      }).join('');
+
+      html += supersededByPlan
+        ? `<div class="loc-panel plan-orig-panel">
+             <button class="loc-panel-hdr" type="button" data-plan-enrich-toggle>
+               <span>${_biSpan({ he: T.he.plan_original_sched, en: T.en.plan_original_sched })}</span>
+               <span class="loc-panel-chevron">▼</span>
+             </button>
+             <div class="loc-panel-body">${daysHtml}</div>
+           </div>`
+        : daysHtml;
     }
-    html += phase.days.map(day => {
-      const items = (day.items || []).map(item =>
-        `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
-      ).join('');
-      return `<div class="day-block">
-        <div class="day-label">${_biSpan(day.label)}</div>
-        <ul>${items}</ul>
-      </div>`;
-    }).join('');
   }
 
   el.innerHTML = html;
@@ -3577,14 +3764,20 @@ function renderDays(phase) {
 window.handleAddPlanItemNewDate = async function(phaseId, btn) {
   const row = btn.closest('.plan-new-date-row');
   const date = row.querySelector('.plan-date-in').value.trim();
-  const time = row.querySelector('.plan-time-in').value.trim();
+  const time = _planTimeFrom(row);
   const text = row.querySelector('.plan-text-in').value.trim();
   if (!text) return;
+  if (time && !PLAN_TIME_RE.test(time) && !PLAN_ROUGH_TIMES.includes(time)) {
+    return _planErr(btn, new Error((T[currentLang] || T.he).plan_time_invalid));
+  }
   try {
     btn.disabled = true;
     await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
     const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
     if (phase) renderDays(phase);
+    // The item saves as enrichment_status 'pending'; this pulls the links in
+    // once the worker has them, without the organizer reloading.
+    scheduleEnrichRefresh(phaseId);
   } catch(e) { btn.disabled = false; _planErr(btn, e); }
 };
 

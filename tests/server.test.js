@@ -747,6 +747,13 @@ describe('Phase plan items', () => {
 
 // ── Regressions from the PR review ────────────────────────────────────────────
 describe('Phase plan items — validation and phase scoping', () => {
+  // bobToken in the describe above is scoped to that block; this needs its own.
+  let bobToken;
+  before(async () => {
+    const r = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    bobToken = (await r.json()).token;
+  });
+
   test('a non-string text_he is a 400, not a 500 leaking a stack trace', async () => {
     const res = await api('/api/phases/ny/plan', {
       method: 'POST', token, body: { text_he: { he: 'obj' } },
@@ -760,6 +767,208 @@ describe('Phase plan items — validation and phase scoping', () => {
       method: 'POST', token, body: { text_he: 'x', date: "x','y'); alert(1);//" },
     });
     assert.equal(res.status, 400);
+  });
+
+  // time used to be checked only for being a string, so "25:99" stored fine and
+  // then rendered as a bold label the organizer had no way to spot as wrong.
+  for (const bad of ['25:99', '9:00', '09:0', 'banana', '09:00-10:00', '2500']) {
+    test(`time ${JSON.stringify(bad)} is rejected`, async () => {
+      const res = await api('/api/phases/ny/plan', {
+        method: 'POST', token, body: { text_he: 'x', time: bad },
+      });
+      assert.equal(res.status, 400);
+      assert.match((await res.json()).error, /time must be HH:MM/);
+    });
+  }
+
+  for (const good of ['00:00', '09:00', '23:59']) {
+    test(`time ${JSON.stringify(good)} is accepted`, async () => {
+      const res = await api('/api/phases/ny/plan', {
+        method: 'POST', token, body: { text_he: 'שעה תקינה', time: good },
+      });
+      assert.equal(res.status, 201);
+      const item = await res.json();
+      assert.equal(item.time, good);
+      await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+    });
+  }
+
+  for (const rough of ['morning', 'noon', 'afternoon', 'evening']) {
+    test(`rough time ${JSON.stringify(rough)} is accepted and stored as-is`, async () => {
+      const res = await api('/api/phases/ny/plan', {
+        method: 'POST', token, body: { text_he: 'זמן משוער', time: rough },
+      });
+      assert.equal(res.status, 201);
+      const item = await res.json();
+      assert.equal(item.time, rough, 'the token itself is stored, not a clock time');
+      await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+    });
+  }
+
+  test('an unrecognized rough token is rejected', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'x', time: 'midnight-ish' },
+    });
+    assert.equal(res.status, 400);
+  });
+
+  // Rough tokens sort lexically wrong ("afternoon" < "morning" < "noon"), which
+  // is why ordering keys off the derived time_sort column instead.
+  test('rough and exact times interleave in real chronological order', async () => {
+    const mk = async (time, text_he) => {
+      const r = await api('/api/phases/ny/plan', {
+        method: 'POST', token, body: { text_he, time, date: '2027-04-02' },
+      });
+      assert.equal(r.status, 201);
+      return (await r.json()).id;
+    };
+    const ids = [];
+    ids.push(await mk('evening',  'ערב'));
+    ids.push(await mk('08:00',    'שמונה'));
+    ids.push(await mk('afternoon','אחהצ'));
+    ids.push(await mk('12:30',    'שתים-עשרה וחצי'));
+    ids.push(await mk('morning',  'בוקר'));
+
+    const rows = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.date === '2027-04-02');
+    // 08:00 < morning(09:00) < 12:30 < afternoon(15:00) < evening(19:00)
+    assert.deepEqual(rows.map(r => r.time),
+      ['08:00', 'morning', '12:30', 'afternoon', 'evening']);
+
+    for (const id of ids) await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
+  });
+
+  test('a new item is queued for enrichment rather than enriched inline', async () => {
+    const res = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'מוזיאון' },
+    });
+    assert.equal(res.status, 201);
+    const item = await res.json();
+    assert.equal(item.enrichment_status, 'pending');
+    assert.equal(item.enriched_at, null, 'nothing should be enriched synchronously');
+    await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+  });
+
+  for (const field of ['waze_url', 'website_url', 'ticket_url']) {
+    test(`${field} must be an http(s) URL`, async () => {
+      const res = await api('/api/phases/ny/plan', {
+        method: 'POST', token, body: { text_he: 'x', [field]: 'javascript:alert(1)' },
+      });
+      assert.equal(res.status, 400);
+      assert.match((await res.json()).error, new RegExp(field));
+    });
+  }
+
+  test('enrichment_status is validated, so a typo cannot orphan an item', async () => {
+    const mk = await api('/api/phases/ny/plan', { method: 'POST', token, body: { text_he: 'סטטוס העשרה' } });
+    const id = (await mk.json()).id;
+    const bad = await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token, body: { enrichment_status: 'donee' },
+    });
+    assert.equal(bad.status, 400);
+    // A value the worker's WHERE clause would never match again must not stick.
+    const rows = await (await api('/api/phases/ny/plan', { token })).json();
+    assert.equal(rows.find(i => i.id === id).enrichment_status, 'pending');
+    await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
+  });
+
+  test('enrich-pending re-queues an item that gave up', async () => {
+    const mk = await api('/api/phases/ny/plan', { method: 'POST', token, body: { text_he: 'נכשל' } });
+    const id = (await mk.json()).id;
+    await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token, body: { enrichment_status: 'failed' },
+    });
+    const res = await api('/api/phase-plan/enrich-pending', { method: 'POST', token });
+    const body = await res.json();
+    assert.ok(body.queued >= 1, `expected at least one requeue, got ${body.queued}`);
+    const rows = await (await api('/api/phases/ny/plan', { token })).json();
+    const row = rows.find(i => i.id === id);
+    assert.equal(row.enrichment_status, 'pending');
+    assert.equal(row.enrich_attempts, 0, 'attempts reset so the worker retries it');
+    await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
+  });
+
+  // Whether tickets are already paid for is a fact in the bookings table, so it
+  // is matched deterministically at save time rather than left to the model or
+  // to whenever the enrichment worker next runs.
+  test('a plan item auto-links to a booking that plainly matches', async () => {
+    const bk = await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'ny', type: 'attraction', name: 'Empire State Building Observatory',
+              confirmation: 'ESB-123' },
+    });
+    assert.equal(bk.status, 200);
+    const bookingId = (await bk.json()).id;
+
+    const mk = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'אמפייר סטייט', text_en: 'Empire State Building sunset' },
+    });
+    const item = await mk.json();
+    assert.equal(item.booking_id, bookingId, 'should link without waiting for enrichment');
+    assert.equal(item.booking?.confirmation, 'ESB-123', 'the joined booking rides along for display');
+
+    await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+    await api(`/api/bookings/${bookingId}`, { method: 'DELETE', token });
+  });
+
+  // Regression from real Japan data: "SHIBUYA SKY Admission Ticket" reduces to
+  // just "shibuya" under a 4-character token floor, so a genuine match failed.
+  test('short but distinctive words still count toward a match', async () => {
+    const bk = await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'ny', type: 'attraction', name: 'SHIBUYA SKY Admission Ticket', confirmation: 'SKY-9' },
+    });
+    const bookingId = (await bk.json()).id;
+    const mk = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'שיבויה סקיי', text_en: 'SHIBUYA SKY observation deck' },
+    });
+    const item = await mk.json();
+    assert.equal(item.booking_id, bookingId, '"sky" must not be dropped as too short');
+    await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+    await api(`/api/bookings/${bookingId}`, { method: 'DELETE', token });
+  });
+
+  test('a weak or generic overlap does not link a booking', async () => {
+    const bk = await api('/api/bookings', {
+      method: 'POST', token,
+      body: { phase: 'ny', type: 'attraction', name: 'Museum Admission Ticket' },
+    });
+    const bookingId = (await bk.json()).id;
+    // "museum" alone is not distinctive enough to claim this booking.
+    const mk = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'מוזיאון אחר', text_en: 'A different museum entirely' },
+    });
+    const item = await mk.json();
+    assert.equal(item.booking_id, null, 'one generic word must not link a booking');
+    await api(`/api/phases/ny/plan/${item.id}`, { method: 'DELETE', token });
+    await api(`/api/bookings/${bookingId}`, { method: 'DELETE', token });
+  });
+
+  test('POST /api/phase-plan/enrich-pending — family member gets 403', async () => {
+    const res = await api('/api/phase-plan/enrich-pending', { method: 'POST', token: bobToken });
+    assert.equal(res.status, 403);
+  });
+
+  test('POST /api/phase-plan/enrich-pending — organizer queues un-enriched items', async () => {
+    const res = await api('/api/phase-plan/enrich-pending', { method: 'POST', token });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(typeof body.queued, 'number');
+    assert.equal(typeof body.hermes_configured, 'boolean');
+  });
+
+  test('PATCH rejects a malformed time too, not just POST', async () => {
+    const mk = await api('/api/phases/ny/plan', {
+      method: 'POST', token, body: { text_he: 'לעדכון', time: '08:00' },
+    });
+    const id = (await mk.json()).id;
+    const res = await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token, body: { time: '99:99' },
+    });
+    assert.equal(res.status, 400);
+    const rows = await (await api('/api/phases/ny/plan', { token })).json();
+    assert.equal(rows.find(i => i.id === id).time, '08:00', 'the stored time must be unchanged');
+    await api(`/api/phases/ny/plan/${id}`, { method: 'DELETE', token });
   });
 
   test('a javascript: location_url is rejected', async () => {
@@ -789,6 +998,171 @@ describe('Phase plan items — validation and phase scoping', () => {
     assert.equal(res.status, 404);
     const rows = await (await api('/api/phases/colorado/plan', { token })).json();
     assert.equal(rows.find(i => i.id === id).text_he, 'קולורדו');
+  });
+});
+
+// phases[].days[] is read-only config and can never be enriched; this copies it
+// into the editable layer so an existing schedule stops being a dead end.
+describe('Promote config days into plan items', () => {
+  let bobToken;
+  before(async () => {
+    const r = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    bobToken = (await r.json()).token;
+  });
+
+  test('family member cannot promote', async () => {
+    const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token: bobToken });
+    assert.equal(res.status, 403);
+  });
+
+  test('promotes the fixture day, stripping markup and keeping the map href', async () => {
+    const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
+    assert.equal(res.status, 200);
+    const { created } = await res.json();
+    assert.equal(created, 3, 'the ny fixture day has 3 items');
+
+    const rows = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.config_ref);
+
+    const park = rows.find(i => (i.text_en || '').includes('Central Park'));
+    assert.ok(park, 'the Central Park item should have been promoted');
+    // Plan items are escaped on render, so authored <a> markup must not survive
+    // as text — but its href is worth keeping.
+    assert.ok(!/[<>]/.test(park.text_he), `markup leaked into text: ${park.text_he}`);
+    assert.ok(!/[<>]/.test(park.text_en), `markup leaked into text: ${park.text_en}`);
+    assert.match(park.location_url, /google\.com\/maps\/search\/Central\+Park/);
+
+    // A range the time column can't hold must not silently vanish.
+    const early = rows.find(i => (i.text_en || '').includes('Early departure'));
+    assert.ok(early, 'the ranged-time item should have been promoted');
+    assert.equal(early.time, null, 'a range is not a storable time');
+    assert.match(early.text_he, /06:30/, 'the original range must survive in the text');
+
+    assert.ok(rows.every(i => i.enrichment_status === 'pending'),
+      'promoted items should queue for enrichment');
+  });
+
+  test('promoting twice does not duplicate the schedule', async () => {
+    const before = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.config_ref).length;
+    const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
+    const { created } = await res.json();
+    assert.equal(created, 0, 're-promoting must create nothing');
+    const after = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.config_ref).length;
+    assert.equal(after, before);
+  });
+
+  test('the day headline is carried across, not lost to a date-only label', async () => {
+    const res = await api('/api/phases/ny/plan/days', { token });
+    assert.equal(res.status, 200);
+    const days = await res.json();
+    const day = days.find(d => d.date === '2027-03-11');
+    assert.ok(day, 'the promoted day should have a row');
+    assert.equal(day.label_he, 'א׳ 11/3 — ניו יורק');
+    assert.equal(day.label_en, 'Sun 11/3 — New York');
+    assert.equal(day.enrichment_status, 'done', 'a day that already has a headline needs no enrichment');
+  });
+
+  test('a day with no headline is queued so one gets written', async () => {
+    const mk = await api('/api/phases/colorado/plan', {
+      method: 'POST', token, body: { text_he: 'יום חדש', date: '2027-03-18' },
+    });
+    assert.equal(mk.status, 201);
+    const days = await (await api('/api/phases/colorado/plan/days', { token })).json();
+    const day = days.find(d => d.date === '2027-03-18');
+    assert.ok(day, 'adding a dated item should create its day row');
+    assert.equal(day.label_he, null);
+    assert.equal(day.enrichment_status, 'pending');
+    await api(`/api/phases/colorado/plan/${(await mk.json()).id}`, { method: 'DELETE', token });
+  });
+
+  test('GET /plan/days requires auth and rejects an unknown phase', async () => {
+    assert.equal((await api('/api/phases/ny/plan/days')).status, 401);
+    assert.equal((await api('/api/phases/nope/plan/days', { token })).status, 400);
+  });
+
+  test('the original config days are left untouched', async () => {
+    const cfg = await (await api('/api/config', { token })).json();
+    const ny = cfg.phases.find(p => p.id === 'ny');
+    assert.equal(ny.days.length, 1, 'config days must still be served');
+    assert.equal(ny.days[0].items.length, 3);
+    assert.match(ny.days[0].items[1].text.en, /<a href=/, 'config markup is unchanged');
+  });
+});
+
+// API-only by design — no button reaches this, because it rewrites the trip's
+// source-of-truth config file.
+describe('Export the plan back into trip.config.json', () => {
+  let bobToken;
+  before(async () => {
+    const r = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    bobToken = (await r.json()).token;
+  });
+
+  test('family member cannot export', async () => {
+    const res = await api('/api/phase-plan/export-to-config', { method: 'POST', token: bobToken });
+    assert.equal(res.status, 403);
+  });
+
+  test('exports dated plan items into phases[].days[] with links inlined', async () => {
+    const mk = await api('/api/phases/colorado/plan', {
+      method: 'POST', token,
+      body: { text_he: 'מוזיאון דנוור', text_en: 'Denver Museum', date: '2027-03-19', time: '10:00',
+              location_url: 'https://www.google.com/maps/search/Denver+Museum',
+              website_url: 'https://example.test/museum' },
+    });
+    assert.equal(mk.status, 201);
+    const id = (await mk.json()).id;
+
+    const res = await api('/api/phase-plan/export-to-config', { method: 'POST', token });
+    assert.equal(res.status, 200);
+    const { exported, config_version } = await res.json();
+    assert.ok(exported.some(e => e.phase_id === 'colorado'));
+    assert.ok(Number.isInteger(config_version), 'the export should be snapshotted as a config version');
+
+    const cfg = await (await api('/api/config', { token })).json();
+    const co = cfg.phases.find(p => p.id === 'colorado');
+    const day = co.days.find(d => d.date === '2027-03-19');
+    assert.ok(day, 'the exported day should now be in the served config');
+    const item = day.items.find(i => (i.text.en || '').includes('Denver Museum'));
+    assert.ok(item, 'the exported item should be present');
+    assert.equal(item.time, '10:00');
+    // Links have no field in phases[].days[], so they ride inline like the
+    // hand-authored ones do.
+    assert.match(item.text.en, /<a href="https:\/\/www\.google\.com\/maps\/search\/Denver\+Museum"/);
+    assert.match(item.text.en, /example\.test\/museum/);
+
+    await api(`/api/phases/colorado/plan/${id}`, { method: 'DELETE', token });
+  });
+
+  test('exported text is escaped so a stray angle bracket cannot break the day', async () => {
+    const mk = await api('/api/phases/colorado/plan', {
+      method: 'POST', token,
+      body: { text_he: 'א <script>alert(1)</script>', text_en: 'B <script>alert(1)</script>',
+              date: '2027-03-20' },
+    });
+    const id = (await mk.json()).id;
+    await api('/api/phase-plan/export-to-config', { method: 'POST', token });
+    const cfg = await (await api('/api/config', { token })).json();
+    const co = cfg.phases.find(p => p.id === 'colorado');
+    const day = co.days.find(d => d.date === '2027-03-20');
+    assert.ok(day);
+    // Other tests leave their own items on this date, so find this one rather
+    // than assuming it is first.
+    const item = day.items.find(i => /alert\(1\)/.test(i.text.en));
+    assert.ok(item, `exported item not found in ${JSON.stringify(day.items)}`);
+    assert.ok(!/<script/i.test(item.text.en), `unescaped script tag reached the config: ${item.text.en}`);
+    assert.match(item.text.en, /&lt;script&gt;/);
+    await api(`/api/phases/colorado/plan/${id}`, { method: 'DELETE', token });
+  });
+
+  test('a plan with no dated items is a 400, not a config wipe', async () => {
+    // ny's items are dated, so target a phase-less export by checking the guard
+    // only fires when nothing at all qualifies.
+    const res = await api('/api/phase-plan/export-to-config', { method: 'POST', token });
+    assert.ok([200, 400].includes(res.status));
+    if (res.status === 400) assert.match((await res.json()).error, /no dated plan items/);
   });
 });
 

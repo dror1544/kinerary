@@ -439,8 +439,8 @@ mcp.tool('add_plan_item',
     phase_id:     z.string().describe('Phase id from get_config'),
     text_he:      z.string().describe('Activity description in Hebrew (required)'),
     text_en:      z.string().optional().describe('Activity description in English'),
-    date:         z.string().optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
-    time:         z.string().optional().describe('Display time string e.g. "09:00"'),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional().describe('Time in 24-hour HH:MM, e.g. "09:00". The server rejects any other shape.'),
     location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
     booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
     status:       z.enum(['confirmed','needs_review']).optional().describe('Default: confirmed'),
@@ -455,8 +455,8 @@ mcp.tool('update_plan_item',
     id:           z.number().describe('Plan item ID from get_phase_plan'),
     text_he:      z.string().optional(),
     text_en:      z.string().optional(),
-    date:         z.string().optional(),
-    time:         z.string().optional(),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional(),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional(),
     location_url: z.string().url().optional().describe('Waze or Google Maps URL'),
     booking_id:   z.number().optional().describe('Link to a booking (shows confirmation inline)'),
     status:       z.enum(['confirmed','needs_review']).optional().describe('Set to "confirmed" after organizer review'),
@@ -732,6 +732,106 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
     res.json(parsed);
   } catch (e) {
     console.error('[extract]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── /enrich — links for a plan item ──────────────────────────────────────────
+// Called by the trip site's enrichment worker (server.js), not by an agent
+// directly. Returns links only; it never rewrites the organizer's own text.
+//
+// The model is told to omit anything it isn't sure of rather than guess a URL,
+// for the same reason resolveCost() refuses to let it invent exchange rates —
+// a plausible-looking wrong link is worse than no link, because nobody checks
+// a link that looks right until they're standing outside a closed building.
+function buildEnrichPrompt({ text, text_he, date, context }) {
+  return [
+    'You are enriching a single item on a family trip itinerary with useful links.',
+    'Reply with ONE JSON object and nothing else. Keys, all optional:',
+    '  maps_url    — a Google Maps link for the place',
+    '  waze_url    — a Waze navigation link for the same place',
+    '  website_url — the official website of the place',
+    '  ticket_url  — the official ticketing/booking page, if the place needs tickets',
+    '  needs_tickets   — true/false: does entry require buying a ticket at all?',
+    '  advance_booking — true/false: does it typically sell out or require booking a',
+    '                    timed slot ahead of the day? Only true when that is genuinely',
+    '                    normal for this place, not merely possible.',
+    '',
+    'Rules:',
+    '- Omit any key you are not confident about. Never invent or guess a URL.',
+    '- Omit needs_tickets/advance_booking rather than guessing — "unknown" is a',
+    '  useful answer, a wrong "no tickets needed" strands someone at the gate.',
+    '- Prefer official sites over aggregators, blogs, or review sites.',
+    '- If the item is not a place (e.g. "pack the suitcases", "relaxed morning"),',
+    '  return {} — an empty object is the correct answer for a non-place.',
+    '- For maps_url use https://www.google.com/maps/search/?api=1&query=<url-encoded place>',
+    '- For waze_url use https://waze.com/ul?q=<url-encoded place>&navigate=yes',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    `Itinerary item: ${text || text_he || ''}`,
+    text_he && text_he !== text ? `Same item in Hebrew: ${text_he}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+// A day headline summarises what the day IS ("Diamond Head + Waikiki"), so the
+// schedule reads as a plan rather than a list of rows. Written only from the
+// day's own items — no lookups, nothing invented.
+function buildDayLabelPrompt({ date, context, items }) {
+  return [
+    'You are writing a short headline for one day of a family trip itinerary.',
+    'Reply with ONE JSON object and nothing else: {"label_he": "...", "label_en": "..."}',
+    '',
+    'Rules:',
+    '- Name the 1–3 defining places or activities of the day, e.g. "Diamond Head + Waikiki".',
+    '- Max 8 words per language. No date, no weekday, no trailing punctuation.',
+    '- Summarise ONLY what is listed below. Do not add places that are not there.',
+    '- label_he must be Hebrew, label_en must be English. Keep proper place names in Latin script.',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    'Items on this day:',
+    ...(items || []).map(i => `- ${i.time ? `${i.time} ` : ''}${i.text}`),
+  ].filter(Boolean).join('\n');
+}
+
+app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
+  const { kind, text, text_he, date, context, items } = req.body || {};
+  const isDay = kind === 'day';
+  if (isDay ? !(items && items.length) : (!text && !text_he)) {
+    return res.status(400).json({ error: isDay ? 'Provide items for a day headline' : 'Provide text or text_he' });
+  }
+
+  try {
+    const prompt = isDay
+      ? buildDayLabelPrompt({ date, context, items })
+      : buildEnrichPrompt({ text, text_he, date, context });
+    const stdout = await runHermesExtract(prompt);
+    const m = stdout.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('No JSON in response');
+    const parsed = JSON.parse(m[0]);
+
+    const out = {};
+    if (isDay) {
+      for (const k of ['label_he', 'label_en']) {
+        if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
+      }
+    } else {
+      // Only http(s) links survive the boundary. server.js re-checks this before
+      // storing, and the renderer escapes regardless — but a bad link should not
+      // travel this far in the first place.
+      for (const k of ['maps_url', 'waze_url', 'website_url', 'ticket_url']) {
+        const v = parsed[k];
+        if (typeof v === 'string' && /^https?:\/\//i.test(v.trim())) out[k] = v.trim();
+      }
+      for (const k of ['needs_tickets', 'advance_booking']) {
+        if (typeof parsed[k] === 'boolean') out[k] = parsed[k];
+      }
+    }
+    res.json(out);
+  } catch (e) {
+    process.stderr.write(`[trip-mcp] /enrich failed: ${e.message}\n`);
     res.status(500).json({ error: e.message });
   }
 });
