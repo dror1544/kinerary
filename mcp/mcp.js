@@ -408,6 +408,83 @@ mcp.tool('add_trivia_question',
   },
   async (args) => ok(await apiPost('/api/trivia/questions', args)));
 
+// ── Phase plan items ──────────────────────────────────────────────────────────
+
+mcp.tool('get_phase_plan',
+  'Get the organizer\'s editable day-by-day plan items for a trip phase. ' +
+  'Returns items sorted by date, time, and sort_order. Each item may include a linked booking (for confirmation display). ' +
+  'status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review).',
+  {
+    phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
+  },
+  async ({ phase_id }) => {
+    if (phase_id) return ok(await apiGet(`/api/phases/${phase_id}/plan`));
+    const cfg = await apiGet('/api/config');
+    const phases = cfg.phases || [];
+    // Fetched together rather than awaited one at a time — an 8-phase trip was
+    // paying 8 sequential round trips for reads that don't depend on each other.
+    const plans = await Promise.all(phases.map(p => apiGet(`/api/phases/${p.id}/plan`)));
+    const results = {};
+    phases.forEach((p, i) => { results[p.id] = plans[i]; });
+    return ok(results);
+  });
+
+mcp.tool('add_plan_item',
+  'Add a new item to the day-by-day plan for a trip phase. ' +
+  'Use this to record activities, meals, transfers, or any scheduled event. ' +
+  'Set location_url to a Waze or Google Maps link after a web search. ' +
+  'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
+  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
+  {
+    phase_id:     z.string().describe('Phase id from get_config'),
+    text_he:      z.string().describe('Activity description in Hebrew (required)'),
+    text_en:      z.string().optional().describe('Activity description in English'),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional().describe('Time in 24-hour HH:MM, e.g. "09:00". The server rejects any other shape.'),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
+    booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Default: confirmed'),
+    sort_order:   z.number().optional().describe('Ordering within a day block (lower = earlier in list)'),
+  },
+  async ({ phase_id, ...body }) => ok(await apiPost(`/api/phases/${phase_id}/plan`, body)));
+
+mcp.tool('update_plan_item',
+  'Update an existing plan item by ID — use to enrich with location_url, link a booking, confirm needs_review items, or correct text.',
+  {
+    phase_id:     z.string().describe('Phase id the item belongs to'),
+    id:           z.number().describe('Plan item ID from get_phase_plan'),
+    text_he:      z.string().optional(),
+    text_en:      z.string().optional(),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional(),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional(),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL'),
+    booking_id:   z.number().optional().describe('Link to a booking (shows confirmation inline)'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Set to "confirmed" after organizer review'),
+    sort_order:   z.number().optional(),
+  },
+  async ({ phase_id, id, ...fields }) => ok(await apiPatch(`/api/phases/${phase_id}/plan/${id}`, fields)));
+
+mcp.tool('delete_plan_item',
+  'Delete a plan item by ID.',
+  {
+    phase_id: z.string().describe('Phase id the item belongs to'),
+    id:       z.number().describe('Plan item ID from get_phase_plan'),
+  },
+  async ({ phase_id, id }) => ok(await apiDelete(`/api/phases/${phase_id}/plan/${id}`)));
+
+mcp.tool('import_plan_from_bookings',
+  'Migration tool: scan all bookings that have long notes (>80 chars) and create phase_plan_items from them. ' +
+  'Idempotent — each booking is imported at most once, and that stays true after you delete an imported item, ' +
+  'so re-running never resurrects something the organizer removed. ' +
+  'Returns {created, skipped}; every skip carries a reason ("already imported", or "phase not in trip config" ' +
+  'for a booking whose phase is absent from trip.config.json and so cannot be represented). ' +
+  'Imported items keep the booking\'s own date and get status="needs_review" so you can enrich and confirm them. ' +
+  'Note the >80-char filter is a heuristic — a genuine booking with long notes (a car rental voucher, say) will ' +
+  'match too, so review what came back before confirming it. ' +
+  'Use this once after deploying the plan feature to recover content an organizer stored in booking notes.',
+  {},
+  async () => ok(await apiPost('/api/phase-plan/import-from-bookings', {})));
+
 return mcp;
 }
 
@@ -547,16 +624,24 @@ async function extractPdfText(buf) {
 // of a reasoning-trace panel. No shell involved (execFile, not exec) — the
 // extracted document text reaches this as a single argv entry, never
 // interpolated into a command string.
-function runHermesExtract(prompt) {
+function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
       ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
-      { timeout: 45000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout) => {
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
         if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));
-        reject(err);
+        // execFile's own message is just "Command failed:" plus the entire
+        // prompt, which buries the cause in a screenful of echoed text. Lead
+        // with what actually went wrong — a kill signal means the timeout
+        // fired, and stderr carries anything the CLI itself reported.
+        const why = err.killed || err.signal
+          ? `timed out after ${timeoutMs}ms (signal ${err.signal || 'none'})`
+          : `exit ${err.code}`;
+        const tail = String(stderr || '').trim().slice(-300);
+        reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ''}`));
       }
     );
   });
@@ -655,6 +740,109 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
     res.json(parsed);
   } catch (e) {
     console.error('[extract]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── /enrich — links for a plan item ──────────────────────────────────────────
+// Called by the trip site's enrichment worker (server.js), not by an agent
+// directly. Returns links only; it never rewrites the organizer's own text.
+//
+// The model is told to omit anything it isn't sure of rather than guess a URL,
+// for the same reason resolveCost() refuses to let it invent exchange rates —
+// a plausible-looking wrong link is worse than no link, because nobody checks
+// a link that looks right until they're standing outside a closed building.
+function buildEnrichPrompt({ text, text_he, date, context }) {
+  return [
+    'You are enriching a single item on a family trip itinerary with useful links.',
+    'Reply with ONE JSON object and nothing else. Keys, all optional:',
+    '  maps_url    — a Google Maps link for the place',
+    '  waze_url    — a Waze navigation link for the same place',
+    '  website_url — the official website of the place',
+    '  ticket_url  — the official ticketing/booking page, if the place needs tickets',
+    '  needs_tickets   — true/false: does entry require buying a ticket at all?',
+    '  advance_booking — true/false: does it typically sell out or require booking a',
+    '                    timed slot ahead of the day? Only true when that is genuinely',
+    '                    normal for this place, not merely possible.',
+    '',
+    'Rules:',
+    '- Omit any key you are not confident about. Never invent or guess a URL.',
+    '- Omit needs_tickets/advance_booking rather than guessing — "unknown" is a',
+    '  useful answer, a wrong "no tickets needed" strands someone at the gate.',
+    '- Prefer official sites over aggregators, blogs, or review sites.',
+    '- If the item is not a place (e.g. "pack the suitcases", "relaxed morning"),',
+    '  return {} — an empty object is the correct answer for a non-place.',
+    '- For maps_url use https://www.google.com/maps/search/?api=1&query=<url-encoded place>',
+    '- For waze_url use https://waze.com/ul?q=<url-encoded place>&navigate=yes',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    `Itinerary item: ${text || text_he || ''}`,
+    text_he && text_he !== text ? `Same item in Hebrew: ${text_he}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+// A day headline summarises what the day IS ("Diamond Head + Waikiki"), so the
+// schedule reads as a plan rather than a list of rows. Written only from the
+// day's own items — no lookups, nothing invented.
+function buildDayLabelPrompt({ date, context, items }) {
+  return [
+    'You are writing a short headline for one day of a family trip itinerary.',
+    'Reply with ONE JSON object and nothing else: {"label_he": "...", "label_en": "..."}',
+    '',
+    'Rules:',
+    '- Name the 1–3 defining places or activities of the day, e.g. "Diamond Head + Waikiki".',
+    '- Max 8 words per language. No date, no weekday, no trailing punctuation.',
+    '- Summarise ONLY what is listed below. Do not add places that are not there.',
+    '- label_he must be Hebrew, label_en must be English. Keep proper place names in Latin script.',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    'Items on this day:',
+    ...(items || []).map(i => `- ${i.time ? `${i.time} ` : ''}${i.text}`),
+  ].filter(Boolean).join('\n');
+}
+
+app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
+  const { kind, text, text_he, date, context, items } = req.body || {};
+  const isDay = kind === 'day';
+  if (isDay ? !(items && items.length) : (!text && !text_he)) {
+    return res.status(400).json({ error: isDay ? 'Provide items for a day headline' : 'Provide text or text_he' });
+  }
+
+  try {
+    const prompt = isDay
+      ? buildDayLabelPrompt({ date, context, items })
+      : buildEnrichPrompt({ text, text_he, date, context });
+    // Enrichment runs many calls back to back, and a single lookup routinely
+    // takes ~30s — close enough to the 45s extract default that slower ones
+    // were being killed mid-flight and logged as an opaque "Command failed".
+    const stdout = await runHermesExtract(prompt, { timeoutMs: 90000 });
+    const m = stdout.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('No JSON in response');
+    const parsed = JSON.parse(m[0]);
+
+    const out = {};
+    if (isDay) {
+      for (const k of ['label_he', 'label_en']) {
+        if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
+      }
+    } else {
+      // Only http(s) links survive the boundary. server.js re-checks this before
+      // storing, and the renderer escapes regardless — but a bad link should not
+      // travel this far in the first place.
+      for (const k of ['maps_url', 'waze_url', 'website_url', 'ticket_url']) {
+        const v = parsed[k];
+        if (typeof v === 'string' && /^https?:\/\//i.test(v.trim())) out[k] = v.trim();
+      }
+      for (const k of ['needs_tickets', 'advance_booking']) {
+        if (typeof parsed[k] === 'boolean') out[k] = parsed[k];
+      }
+    }
+    res.json(out);
+  } catch (e) {
+    process.stderr.write(`[trip-mcp] /enrich failed: ${e.message}\n`);
     res.status(500).json({ error: e.message });
   }
 });

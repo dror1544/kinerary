@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, cpSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -11,6 +11,7 @@ const DEFAULT_TEST_PORT = 3099;
 
 let serverProcess = null;
 let dataDir = null;
+let tripDir = null;
 // Mutable, not a module-level constant: node:test runs listed files
 // concurrently by default, and every file importing this helper used to
 // share one hardcoded port — harmless while few files raced for it, but
@@ -21,6 +22,12 @@ let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
 export async function startTestServer(extraEnv = {}) {
   dataDir = mkdtempSync(join(tmpdir(), 'trip-test-'));
+  // The trip dir is a throwaway copy, never the committed fixtures directory.
+  // Endpoints that persist config changes (participant binding, plan export)
+  // write trip.config.json in place, which used to dirty a tracked file — the
+  // other test files already copy for exactly this reason.
+  tripDir = join(dataDir, 'trip');
+  cpSync(FIXTURES_DIR, tripDir, { recursive: true });
   const port = extraEnv.PORT || DEFAULT_TEST_PORT;
   BASE_URL = `http://localhost:${port}`;
 
@@ -29,7 +36,7 @@ export async function startTestServer(extraEnv = {}) {
       cwd: join(HERE, '..', '..', 'server'),
       env: {
         ...process.env,
-        TRIP_DIR:     FIXTURES_DIR,
+        TRIP_DIR:     tripDir,
         DATA_DIR:     dataDir,
         AVATARS_DIR:  join(dataDir, 'avatars'),
         PORT:       String(port),
