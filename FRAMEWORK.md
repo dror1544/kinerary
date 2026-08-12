@@ -21,7 +21,7 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 | 1 | **Auth / Login** | JWT login with avatar selection; 30-day tokens; bcrypt passwords |
 | 2 | **Bilingual (he/en RTL)** | Full Hebrew ↔ English toggle; auto-detects browser locale; all text bilingual |
 | 3 | **Hero banner** | Dynamic hero image + headline per tab; animated tab transitions |
-| 4 | **Countdown** | Live countdown to departure on the home tab |
+| 4 | **Trip clock** | Counts down to departure; mid-trip flips to the active phase + trip day, clicking through to that phase |
 | 5 | **Interactive map** | Leaflet.js map with all destinations, route line, bilingual popups |
 | 6 | **Live weather** | 7-day forecast per destination via Open Meteo API (free, no auth) |
 | 7 | **Points of Interest** | Expandable venue cards with Maps/Waze/ticket links, per phase |

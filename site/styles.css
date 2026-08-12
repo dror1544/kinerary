@@ -1892,6 +1892,7 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
   .hero-countdown { width: 100%; box-sizing: border-box; flex-direction: column; align-items: stretch; gap: 8px; }
   .hero-countdown .cd-units { display: grid; grid-template-columns: repeat(7, max-content); justify-content: center; align-items: center; column-gap: 10px; direction: ltr; }
   .hero-countdown .cu { min-width: 42px; }
+  .hero-countdown .cd-live { justify-content: center; }
   .hero-right { justify-self: stretch; align-items: stretch; }
   .cta-pill { justify-content: center; }
 }
@@ -2127,9 +2128,9 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 .budget-add-btn:hover { opacity: .85; }
 .budget-loading { padding: 40px 0; text-align: center; opacity: .5; }
 
-/* Countdown states — caption above the units, finished state replacing them */
+/* Clock states — caption beside the units, live/finished states replacing them */
 .cd-caption{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;opacity:.65;margin-bottom:.35rem}
-.cd-units[hidden],.cd-finished[hidden]{display:none}
+.cd-units[hidden],.cd-finished[hidden],.cd-live[hidden]{display:none}
 .cd-units{display:flex;align-items:center;gap:.5rem}
 .cd-finished{font-size:1.05rem;font-weight:700;letter-spacing:.02em}
 
@@ -2283,3 +2284,16 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 
 /* Places the organizer linked by hand in the original schedule. */
 .plan-place-link { background: var(--bg-sub); }
+
+/* Live state: where the trip is right now, not how much of it is left */
+.cd-live{display:flex;align-items:center;gap:14px}
+.cd-live-text{display:flex;flex-direction:column;gap:5px;min-width:0}
+.cd-live-phase{font-size:26px;line-height:1.1;font-weight:700;letter-spacing:.01em}
+.cd-live-day{font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;opacity:.7}
+.cd-live-arrow{font-size:22px;opacity:.55;transition:transform .18s ease,opacity .18s ease}
+
+.hero-countdown.clickable{cursor:pointer;transition:background .18s ease,border-color .18s ease}
+.hero-countdown.clickable:hover{background:rgba(0,0,0,.68);border-color:rgba(255,255,255,.35)}
+.hero-countdown.clickable:hover .cd-live-arrow{opacity:1;transform:translateX(3px)}
+[dir="rtl"] .hero-countdown.clickable:hover .cd-live-arrow{transform:translateX(-3px)}
+.hero-countdown.clickable:focus-visible{outline:2px solid rgba(255,255,255,.8);outline-offset:3px}

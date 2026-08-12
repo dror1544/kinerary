@@ -15,7 +15,7 @@
 <link rel="manifest" href="manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Family Trip">
-<link rel="stylesheet" href="styles.css?v=38">
+<link rel="stylesheet" href="styles.css?v=39">
 </head>
 <body>
 
@@ -194,6 +194,15 @@
             <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
             <div class="cu-sep">/</div>
             <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
+          </div>
+          <!-- Mid-trip the counter is replaced by this: current phase + trip
+               day, and the whole card becomes a link into that phase. -->
+          <div class="cd-live" id="cd-live" hidden>
+            <div class="cd-live-text">
+              <strong class="cd-live-phase" id="cd-live-phase"></strong>
+              <small class="cd-live-day" id="cd-live-day"></small>
+            </div>
+            <span class="cd-live-arrow" id="cd-live-arrow" aria-hidden="true"></span>
           </div>
           <div class="cd-finished" id="cd-finished" hidden></div>
         </div>
@@ -534,9 +543,9 @@
   </div>
 </div>
 
-<script src="translations.js?v=25"></script>
+<script src="translations.js?v=26"></script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js" crossorigin=""></script>
-<script src="app.js?v=56"></script>
+<script src="app.js?v=57"></script>
 </body>
 </html>
