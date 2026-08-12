@@ -1460,22 +1460,6 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// escapeHtml() above only ever fed element text, so it leaves quotes alone and
-// assumes a string. Plan items come from the DB and from the AI PDF-extraction
-// path, where a value can land in an attribute and can be a number or object —
-// so this one escapes quotes too and coerces first.
-function esc(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-// Only ever emit an http(s) href. A stored `javascript:` location_url would
-// otherwise execute for every family member who opens the phase tab.
-function safeUrl(u) {
-  const s = String(u ?? '').trim();
-  return /^https?:\/\//i.test(s) ? s : '';
-}
 
 async function toggleVenueComments(venueId) {
   const thread = document.getElementById(`vc-thread-${venueId}`);
@@ -3029,6 +3013,29 @@ function buildGlobalsFromConfig(cfg) {
    ========================================================= */
 /* RENDER_FUNS_BEGIN */
 
+// Escaping helpers live inside the render region because that is the only
+// place that uses them (32 call sites, all below) — and because the region is
+// what tests/helpers/dom.js extracts, so leaving them outside made the render
+// code untestable in isolation.
+//
+// escapeHtml() elsewhere only ever fed element text, so it leaves quotes alone
+// and assumes a string. Plan items come from the DB and the AI extraction path,
+// where a value can land in an attribute and can be a number or object — so
+// this one escapes quotes too and coerces first.
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Only ever emit an http(s) href. A stored `javascript:` location_url would
+// otherwise execute for every family member who opens the phase tab.
+function safeUrl(u) {
+  const s = String(u ?? '').trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
+
 function applyBrandFromConfig(cfg) {
   if (!cfg?.meta) return;
   const title = cfg.meta.title || 'Family Trip';
@@ -3746,8 +3753,11 @@ function renderDays(phase) {
             const meta = PHASE_PLAN_DAYS[phase.id]?.[key];
             const hl = { he: meta?.label_he || '', en: meta?.label_en || meta?.label_he || '' };
             const pendingHl = meta?.enrichment_status === 'pending' && !hl.he && !hl.en;
+            // esc(), like the item text below: _biSpan emits raw HTML so that
+            // hand-authored config markup renders, but a stored headline is
+            // model output and must never be trusted with that.
             const suffix = hl.he || hl.en
-              ? _biSpan({ he: hl.he ? ` — ${hl.he}` : '', en: hl.en ? ` — ${hl.en}` : '' })
+              ? _biSpan({ he: hl.he ? ` — ${esc(hl.he)}` : '', en: hl.en ? ` — ${esc(hl.en)}` : '' })
               : (pendingHl ? `<span class="plan-hl-pending"> · ${esc(tr.plan_enriching)}</span>` : '');
             return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}`;
           })()

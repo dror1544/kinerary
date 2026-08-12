@@ -1987,6 +1987,12 @@ async function enrichOne(item) {
     // Must outlast trip-mcp's own 90s CLI budget, or this side gives up while
     // the model is still legitimately working and the item looks like a failure.
     timeout: 100000,
+    // Belt and braces. node-fetch@2 honours `timeout`, but that is an
+    // implementation detail of this one dependency — native fetch and
+    // node-fetch@3 both ignore it silently. If it ever stopped working here a
+    // single hung call would leave enrichRunning stuck true and stall the whole
+    // enrichment subsystem, with nothing logged, until a restart.
+    signal: AbortSignal.timeout(100000),
   });
   if (!r.ok) throw new Error(`hermes ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
@@ -2066,6 +2072,12 @@ async function enrichDay(day) {
       items: items.map(i => ({ time: i.time, text: i.text_en || i.text_he })),
     }),
     timeout: 100000,
+    // Belt and braces. node-fetch@2 honours `timeout`, but that is an
+    // implementation detail of this one dependency — native fetch and
+    // node-fetch@3 both ignore it silently. If it ever stopped working here a
+    // single hung call would leave enrichRunning stuck true and stall the whole
+    // enrichment subsystem, with nothing logged, until a restart.
+    signal: AbortSignal.timeout(100000),
   });
   if (!r.ok) throw new Error(`hermes ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
@@ -2090,8 +2102,14 @@ async function runDayEnrichmentPass() {
           .run(day.phase_id, day.date);
         continue;
       }
-      const he = typeof out.label_he === 'string' ? out.label_he.trim().slice(0, 120) : null;
-      const en = typeof out.label_en === 'string' ? out.label_en.trim().slice(0, 120) : null;
+      // stripTags, not just trim: the renderer puts a day headline through
+      // _biSpan(), which emits raw HTML by design so hand-authored config
+      // markup keeps working. A model-written label must therefore arrive as
+      // plain text — and its content is reachable by any family member, since
+      // POST /api/bookings is only authRequired and its notes feed the import
+      // that this headline summarises.
+      const he = typeof out.label_he === 'string' ? stripTags(out.label_he).slice(0, 120) : null;
+      const en = typeof out.label_en === 'string' ? stripTags(out.label_en).slice(0, 120) : null;
       db.prepare(
         "UPDATE phase_plan_days SET label_he = COALESCE(label_he, ?), label_en = COALESCE(label_en, ?), " +
         "enrichment_status = 'done', enriched_at = datetime('now') WHERE phase_id = ? AND date = ?"

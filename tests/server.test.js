@@ -1105,6 +1105,23 @@ describe('Promote config days into plan items', () => {
     await api(`/api/phases/colorado/plan/${(await mk.json()).id}`, { method: 'DELETE', token });
   });
 
+  // A day headline reaches the DOM through _biSpan(), which emits raw HTML so
+  // hand-authored config markup keeps rendering. A headline is model output
+  // summarising booking notes, and POST /api/bookings is only authRequired —
+  // so its content originates from any family member. It must arrive as text.
+  test('a day headline is stored stripped of markup', async () => {
+    await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
+    const days = await (await api('/api/phases/ny/plan/days', { token })).json();
+    assert.ok(days.length, 'expected at least one promoted day');
+    for (const d of days) {
+      for (const v of [d.label_he, d.label_en]) {
+        if (typeof v === 'string') {
+          assert.ok(!/<[a-z/!]/i.test(v), `day label reached the client with markup: ${v}`);
+        }
+      }
+    }
+  });
+
   test('GET /plan/days requires auth and rejects an unknown phase', async () => {
     assert.equal((await api('/api/phases/ny/plan/days')).status, 401);
     assert.equal((await api('/api/phases/nope/plan/days', { token })).status, 400);
