@@ -624,16 +624,24 @@ async function extractPdfText(buf) {
 // of a reasoning-trace panel. No shell involved (execFile, not exec) — the
 // extracted document text reaches this as a single argv entry, never
 // interpolated into a command string.
-function runHermesExtract(prompt) {
+function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
       ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
-      { timeout: 45000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout) => {
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
         if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));
-        reject(err);
+        // execFile's own message is just "Command failed:" plus the entire
+        // prompt, which buries the cause in a screenful of echoed text. Lead
+        // with what actually went wrong — a kill signal means the timeout
+        // fired, and stderr carries anything the CLI itself reported.
+        const why = err.killed || err.signal
+          ? `timed out after ${timeoutMs}ms (signal ${err.signal || 'none'})`
+          : `exit ${err.code}`;
+        const tail = String(stderr || '').trim().slice(-300);
+        reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ''}`));
       }
     );
   });
@@ -807,7 +815,10 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
     const prompt = isDay
       ? buildDayLabelPrompt({ date, context, items })
       : buildEnrichPrompt({ text, text_he, date, context });
-    const stdout = await runHermesExtract(prompt);
+    // Enrichment runs many calls back to back, and a single lookup routinely
+    // takes ~30s — close enough to the 45s extract default that slower ones
+    // were being killed mid-flight and logged as an opaque "Command failed".
+    const stdout = await runHermesExtract(prompt, { timeoutMs: 90000 });
     const m = stdout.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('No JSON in response');
     const parsed = JSON.parse(m[0]);

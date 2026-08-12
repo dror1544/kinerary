@@ -1984,7 +1984,9 @@ async function enrichOne(item) {
       // is unresolvable.
       context: (TRIP_CONFIG.phases || []).find(p => p.id === item.phase_id)?.title || null,
     }),
-    timeout: 50000,
+    // Must outlast trip-mcp's own 90s CLI budget, or this side gives up while
+    // the model is still legitimately working and the item looks like a failure.
+    timeout: 100000,
   });
   if (!r.ok) throw new Error(`hermes ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
@@ -2063,7 +2065,7 @@ async function enrichDay(day) {
       context: (TRIP_CONFIG.phases || []).find(p => p.id === day.phase_id)?.title || null,
       items: items.map(i => ({ time: i.time, text: i.text_en || i.text_he })),
     }),
-    timeout: 50000,
+    timeout: 100000,
   });
   if (!r.ok) throw new Error(`hermes ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
