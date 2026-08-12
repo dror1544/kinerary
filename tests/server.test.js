@@ -1064,6 +1064,34 @@ describe('Promote config days into plan items', () => {
     assert.equal(day.enrichment_status, 'done', 'a day that already has a headline needs no enrichment');
   });
 
+  // Regression from Shiran's live trip: her authored items name several places
+  // each, individually linked. Keeping only the first href dropped 32 of them.
+  test('every hand-authored place link is carried across, not just the first', async () => {
+    const rows = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.config_ref);
+    const park = rows.find(i => (i.text_en || '').includes('Central Park'));
+    assert.ok(park);
+    const links = JSON.parse(park.extra_links || '[]');
+    assert.equal(links.length, 1, 'the fixture item has one link');
+    assert.equal(links[0].label, 'Central Park', 'the place name becomes the button label');
+    assert.match(links[0].url, /google\.com\/maps\/search\/Central\+Park/);
+  });
+
+  test('re-running promote backfills links onto rows imported before this existed', async () => {
+    // Simulate a row promoted by the older code path.
+    const rows = (await (await api('/api/phases/ny/plan', { token })).json())
+      .filter(i => i.config_ref && (i.text_en || '').includes('Central Park'));
+    assert.ok(rows.length, 'expected the promoted Central Park row');
+    const id = rows[0].id;
+    await api(`/api/phases/ny/plan/${id}`, {
+      method: 'PATCH', token, body: { location_url: null },
+    });
+    const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
+    assert.equal(res.status, 200);
+    const after = (await (await api('/api/phases/ny/plan', { token })).json()).find(i => i.id === id);
+    assert.ok(JSON.parse(after.extra_links || '[]').length >= 1, 'links should survive a re-run');
+  });
+
   test('a day with no headline is queued so one gets written', async () => {
     const mk = await api('/api/phases/colorado/plan', {
       method: 'POST', token, body: { text_he: 'יום חדש', date: '2027-03-18' },

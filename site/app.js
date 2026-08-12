@@ -3442,21 +3442,40 @@ function _planTimeLabel(t, tr) {
 // second collapsible. Renders nothing at all when there is nothing to show and
 // nothing pending, so an un-enrichable item ("pack the suitcases") stays clean.
 function _buildEnrichPanel(item, tr) {
+  // Parsed first so a link the organizer named ("Podmore") keeps that name even
+  // when it is also the item's location_url — otherwise the place with a name
+  // is the one that renders as a generic "Google Maps".
+  let authored = [];
+  try {
+    const p = typeof item.extra_links === 'string' ? JSON.parse(item.extra_links) : item.extra_links;
+    if (Array.isArray(p)) authored = p.filter(l => l && safeUrl(l.url) && l.label);
+  } catch { /* malformed json is simply no authored links */ }
+  const namedFor = new Map(authored.map(l => [l.url, l.label]));
+
   const links = [
     ['🗺️', tr.plan_link_maps,    item.location_url],
     ['🔵', tr.plan_link_waze,    item.waze_url],
     ['🌐', tr.plan_link_website, item.website_url],
     ['🎟️', tr.plan_link_tickets, item.ticket_url],
-  ].filter(([, , url]) => safeUrl(url));
+  ].filter(([, , url]) => safeUrl(url))
+   .map(([icon, label, url]) => [icon, namedFor.get(url) || label, url]);
+
+  // Places the organizer linked by hand in the original schedule. An item may
+  // name several, and each keeps its own name as the button label.
+  // The enrichment buttons above already carry these URLs (now under their
+  // authored names), so only the remaining places need their own button.
+  const extra = authored.filter(l => !links.some(([, , u]) => u === l.url));
 
   const pending = item.enrichment_status === 'pending';
-  if (!links.length && !pending) return '';
+  if (!links.length && !extra.length && !pending) return '';
 
-  if (!links.length) {
+  if (!links.length && !extra.length) {
     return `<div class="plan-enrich plan-enrich-pending">${esc(tr.plan_enriching)}</div>`;
   }
   const row = links.map(([icon, label, url]) =>
     `<a class="btn plan-enrich-link" href="${esc(safeUrl(url))}" target="_blank" rel="noopener">${icon} ${esc(label)}</a>`
+  ).join('') + extra.map(l =>
+    `<a class="btn plan-enrich-link plan-place-link" href="${esc(safeUrl(l.url))}" target="_blank" rel="noopener">📍 ${esc(l.label)}</a>`
   ).join('');
   return `<div class="loc-panel plan-enrich">
     <button class="loc-panel-hdr" type="button" data-plan-enrich-toggle>

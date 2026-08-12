@@ -401,6 +401,11 @@ for (const [col, decl] of [
   // never by the model — "is this paid for" is a fact, not a judgment call.
   ['needs_tickets',     'INTEGER'],
   ['advance_booking',   'INTEGER'],
+  // A promoted config item may name several places, each separately linked
+  // ("Podmore, Foodland Farms, ABC Store…"). The four url columns can only
+  // describe ONE place, so the rest are kept here as [{label,url}] — stripping
+  // them lost real navigation the organizer had already written.
+  ['extra_links',       'TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
@@ -2202,11 +2207,40 @@ function firstMapHref(html) {
   return m ? m[1].replace(/&amp;/g, '&') : null;
 }
 
+// Every anchor in an authored config item, with the place name it wrapped.
+// A single item routinely names half a dozen places, each linked — keeping only
+// the first threw away navigation the organizer had already done by hand.
+function allConfigLinks(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<a\s[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(String(html || '')))) {
+    const url = decodeEntities(m[1]);
+    const label = stripTags(m[2]);
+    if (!/^https?:\/\//i.test(url) || !label || seen.has(url)) continue;
+    seen.add(url);
+    out.push({ label, url });
+  }
+  return out;
+}
+
+function decodeEntities(s) {
+  // &amp;amp; appears in real data — an earlier migration escaped an already
+  // escaped ampersand — so this loops rather than substituting once.
+  let prev = String(s ?? '');
+  for (let i = 0; i < 3; i++) {
+    const next = prev
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    if (next === prev) break;
+    prev = next;
+  }
+  return prev;
+}
+
 function stripTags(html) {
-  return String(html || '')
-    .replace(/<[^>]*>/g, '')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+  return decodeEntities(String(html || '').replace(/<[^>]*>/g, ''))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -2216,8 +2250,14 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
   const skipped = [];
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
-    '(phase_id,date,time,time_sort,text_he,text_en,location_url,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
-    "VALUES (?,?,?,?,?,?,?,?,'confirmed',?,?,'pending',?)"
+    '(phase_id,date,time,time_sort,text_he,text_en,location_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
+    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,'pending',?)"
+  );
+  // Re-running promote repairs rows imported before extra_links existed, rather
+  // than leaving an already-promoted trip permanently missing those links.
+  const backfillLinks = db.prepare(
+    'UPDATE phase_plan_items SET extra_links = ?, location_url = COALESCE(location_url, ?) ' +
+    'WHERE config_ref = ? AND extra_links IS NULL'
   );
 
   const upsertDay = db.prepare(
@@ -2245,8 +2285,13 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
       }
       (day.items || []).forEach((item, ii) => {
         const ref = `${phase.id}|${day.date || `d${di}`}|${ii}`;
+        const links = [...allConfigLinks(item.text?.he), ...allConfigLinks(item.text?.en)]
+          .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i);
+        const linksJson = links.length ? JSON.stringify(links) : null;
+
         if (db.prepare('SELECT 1 FROM phase_plan_items WHERE config_ref = ?').get(ref)) {
-          skipped.push({ config_ref: ref, reason: 'already promoted' });
+          const fixed = backfillLinks.run(linksJson, firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null, ref);
+          skipped.push({ config_ref: ref, reason: fixed.changes ? 'already promoted (links backfilled)' : 'already promoted' });
           return;
         }
         const rawTime = typeof item.time === 'string' ? item.time.trim() : '';
@@ -2263,6 +2308,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
           phase.id, day.date || null, time, planTimeSort(time),
           he || en, en || null,
           firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
+          linksJson,
           findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
           di * 1000 + ii, req.user.username, ref
         );

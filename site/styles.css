@@ -2280,3 +2280,6 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
   cursor: not-allowed;
   background: var(--bg-sub);
 }
+
+/* Places the organizer linked by hand in the original schedule. */
+.plan-place-link { background: var(--bg-sub); }
