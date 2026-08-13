@@ -497,19 +497,25 @@ html[dir="ltr"] .alert-i { border-inline-start-color: var(--info); }
 
 /* Countdown card sits in the middle of the hero bottom */
 .hero-countdown {
-  background: rgba(0,0,0,0.55);
+  /* Sits on top of an arbitrary hero photo, so it carries its own contrast
+     rather than relying on the image being dark: a denser scrim, a slightly
+     stronger edge, and a shadow that keeps the text readable even where the
+     photo underneath is bright. */
+  background: rgba(0,0,0,0.66);
   backdrop-filter: blur(10px);
   border-radius: 18px;
   padding: 18px 24px;
   display: flex; align-items: center; gap: 18px;
-  border: 1px solid rgba(255,255,255,0.15);
+  border: 1px solid rgba(255,255,255,0.22);
+  color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);
 }
 .hero-countdown .label {
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  opacity: 0.7;
+  opacity: 0.88;
 }
 .cu { text-align: center; min-width: 48px; }
 .cu strong {
@@ -524,11 +530,13 @@ html[dir="ltr"] .alert-i { border-inline-start-color: var(--info); }
   font-size: 9.5px;
   letter-spacing: 0.18em;
   text-transform: uppercase;
-  opacity: 0.7;
+  /* DAYS / HRS / MIN under each number — at 9.5px and heavily letter-spaced,
+     0.7 opacity was the least readable thing on the card. */
+  opacity: 0.9;
 }
 .cu-sep {
   font-family: var(--font-display-en);
-  font-size: 28px; opacity: 0.4;
+  font-size: 28px; opacity: 0.55;
 }
 
 .hero-right {
@@ -2129,7 +2137,7 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 .budget-loading { padding: 40px 0; text-align: center; opacity: .5; }
 
 /* Clock states — caption beside the units, live/finished states replacing them */
-.cd-caption{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;opacity:.65;margin-bottom:.35rem}
+.cd-caption{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;opacity:.88;margin-bottom:.35rem}
 .cd-units[hidden],.cd-finished[hidden],.cd-live[hidden]{display:none}
 .cd-units{display:flex;align-items:center;gap:.5rem}
 .cd-finished{font-size:1.05rem;font-weight:700;letter-spacing:.02em}
@@ -2288,12 +2296,12 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 /* Live state: where the trip is right now, not how much of it is left */
 .cd-live{display:flex;align-items:center;gap:14px}
 .cd-live-text{display:flex;flex-direction:column;gap:5px;min-width:0}
-.cd-live-phase{font-size:26px;line-height:1.1;font-weight:700;letter-spacing:.01em}
-.cd-live-day{font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;opacity:.7}
-.cd-live-arrow{font-size:22px;opacity:.55;transition:transform .18s ease,opacity .18s ease}
+.cd-live-phase{font-size:26px;line-height:1.1;font-weight:700;letter-spacing:.01em;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.6)}
+.cd-live-day{font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;opacity:.92}
+.cd-live-arrow{font-size:22px;opacity:.85;transition:transform .18s ease,opacity .18s ease}
 
 .hero-countdown.clickable{cursor:pointer;transition:background .18s ease,border-color .18s ease}
-.hero-countdown.clickable:hover{background:rgba(0,0,0,.68);border-color:rgba(255,255,255,.35)}
+.hero-countdown.clickable:hover{background:rgba(0,0,0,.78);border-color:rgba(255,255,255,.42)}
 .hero-countdown.clickable:hover .cd-live-arrow{opacity:1;transform:translateX(3px)}
 [dir="rtl"] .hero-countdown.clickable:hover .cd-live-arrow{transform:translateX(-3px)}
 .hero-countdown.clickable:focus-visible{outline:2px solid rgba(255,255,255,.8);outline-offset:3px}
