@@ -1948,6 +1948,118 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
   res.json({ ok: true });
 });
 
+// ── Active-plan day headlines: the part that says what a day IS ──────────────
+// Every existing writer of a headline is write-once: ensurePlanDay() inserts no
+// label at all, and both the enrichment worker and promote-config-days write
+// theirs through COALESCE, which only fills a NULL. So once a day had a name,
+// no API call could change it — re-plan a day and its items moved while the
+// headline stayed behind, describing yesterday's plan. This is the explicit
+// overwrite path that was missing.
+app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (req, res) => {
+  const phaseId = req.params.phase_id;
+  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  const { date } = req.params;
+  if (!ISO_DATE_RE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+  const body = req.body || {};
+  for (const f of ['label_he', 'label_en']) {
+    if (body[f] !== undefined && body[f] !== null && typeof body[f] !== 'string') {
+      return res.status(400).json({ error: `${f} must be a string` });
+    }
+  }
+  if (body.label_he === undefined && body.label_en === undefined) {
+    return res.status(400).json({ error: 'no fields to update' });
+  }
+  // Only the fields actually sent are touched; an omitted one keeps what's
+  // stored rather than being cleared to NULL.
+  const existing = db.prepare('SELECT label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date = ?')
+    .get(phaseId, date);
+  const pick = (f) => body[f] !== undefined
+    ? (String(body[f]).trim() || null)
+    : (existing?.[f] ?? null);
+  const labelHe = pick('label_he');
+  const labelEn = pick('label_en');
+  // A day that now has a headline has nothing left for the worker to write; one
+  // whose headline was just cleared goes back in the queue instead of staying
+  // blank forever.
+  const status = (labelHe || labelEn) ? 'done' : 'pending';
+  db.prepare(
+    'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status,enrich_attempts) ' +
+    'VALUES (?,?,?,?,?,0) ON CONFLICT(phase_id,date) DO UPDATE SET ' +
+    'label_he = excluded.label_he, label_en = excluded.label_en, ' +
+    'enrichment_status = excluded.enrichment_status, enrich_attempts = 0'
+  ).run(phaseId, date, labelHe, labelEn, status);
+  res.json(db.prepare(
+    'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
+    'WHERE phase_id = ? AND date = ?'
+  ).get(phaseId, date));
+});
+
+// Swapping two days of the active plan is one operation, not a batch of edits.
+// Done as N separate PATCHes there is no intermediate state that is correct —
+// halfway through, both days' items carry the same date and the site renders
+// them as one merged block — and a partial failure strands the schedule there.
+// It also cannot move the headlines at all, so 13/8 would keep announcing
+// "Diamond Head" while listing the Southeast Oahu items. Everything moves
+// together, in one transaction, or nothing does.
+app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req, res) => {
+  const phaseId = req.params.phase_id;
+  if (!VALID_PLAN_PHASES.has(phaseId)) return res.status(400).json({ error: 'unknown phase' });
+  const { date_a, date_b } = req.body || {};
+  for (const [name, v] of [['date_a', date_a], ['date_b', date_b]]) {
+    if (typeof v !== 'string' || !ISO_DATE_RE.test(v)) {
+      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
+    }
+  }
+  if (date_a === date_b) return res.status(400).json({ error: 'date_a and date_b must differ' });
+
+  db.transaction(() => {
+    // One statement, not two: moving A→B and then B→A as separate UPDATEs
+    // collides in the middle and lands everything on a single date.
+    db.prepare(
+      'UPDATE phase_plan_items SET date = CASE date WHEN ? THEN ? ELSE ? END ' +
+      'WHERE phase_id = ? AND date IN (?, ?)'
+    ).run(date_a, date_b, date_a, phaseId, date_a, date_b);
+
+    // The headline describes the day's content, so it travels with it.
+    const read = db.prepare(
+      'SELECT label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date = ?'
+    );
+    const fromA = read.get(phaseId, date_a);
+    const fromB = read.get(phaseId, date_b);
+    db.prepare('DELETE FROM phase_plan_days WHERE phase_id = ? AND date IN (?, ?)')
+      .run(phaseId, date_a, date_b);
+    const write = db.prepare(
+      'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status,enrich_attempts) ' +
+      'VALUES (?,?,?,?,?,0)'
+    );
+    // A date that carried no headline row still needs one once it holds items —
+    // queued as 'pending' so the worker names it after what is now there.
+    const put = (date, src) => {
+      const hasItems = db.prepare(
+        'SELECT 1 FROM phase_plan_items WHERE phase_id = ? AND date = ? LIMIT 1'
+      ).get(phaseId, date);
+      if (!src && !hasItems) return;
+      write.run(phaseId, date, src?.label_he ?? null, src?.label_en ?? null,
+                (src?.label_he || src?.label_en) ? 'done' : 'pending');
+    };
+    put(date_a, fromB);
+    put(date_b, fromA);
+  })();
+
+  // Read back both days in the same response. Verifying a swap means looking at
+  // what the schedule says afterwards, not at whether the write returned 200.
+  const items = db.prepare(
+    'SELECT * FROM phase_plan_items WHERE phase_id = ? AND date IN (?, ?) ' +
+    'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
+  ).all(phaseId, date_a, date_b);
+  const days = db.prepare(
+    'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
+    'WHERE phase_id = ? AND date IN (?, ?) ORDER BY date ASC'
+  ).all(phaseId, date_a, date_b);
+  kickEnrichmentSoon();
+  res.json({ ok: true, phase_id: phaseId, swapped: [date_a, date_b], days, items: items.map(joinBooking) });
+});
+
 // ── Plan-item AI enrichment ───────────────────────────────────────────────────
 // Enrichment runs out-of-band, never inside the save request. Hermes lives on
 // the organizer's own machine (mcp/mcp.js shells out to the hermes CLI), so it
@@ -2212,11 +2324,17 @@ app.post('/api/phase-plan/enrich-pending', organizerOrAgentRequired, (req, res) 
   });
 });
 
-// ── Promote the static schedule into the living plan ─────────────────────────
-// phases[].days[] is read-only and can't be enriched. This copies it into
-// phase_plan_items once, so the schedule an organizer already has becomes
-// editable and enrichable. The config days stay exactly where they are — they
-// keep rendering below as the "original schedule", so nothing is replaced.
+// ── Seed the active plan from the original plan ──────────────────────────────
+// The original plan (phases[].days[] in trip.config.json) is read-only and
+// can't be enriched. This copies it into phase_plan_items once, so the schedule
+// an organizer already has becomes the active plan — editable and enrichable.
+// The original stays exactly where it is; it keeps rendering below, organizer-
+// only, as the "original schedule", so nothing is replaced.
+//
+// This is also the right way to start editing a phase whose active plan is
+// still empty: renderDays() switches a phase to the active plan on its FIRST
+// item, so adding items one at a time would hide the rest of that phase's
+// schedule from participants until the last one lands.
 
 // Config day text may contain markup: the USA-2026-style inline <a> links are
 // authored straight into trip.config.json and rendered raw by _biSpan. Plan

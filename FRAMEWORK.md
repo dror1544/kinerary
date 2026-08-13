@@ -339,6 +339,30 @@ it's config-driven (start with the `get_config` tool to discover that
 trip's actual phase/venue/participant ids; nothing is hardcoded). One
 instance talks to one trip via `API_BASE_URL`.
 
+### Original plan vs active plan — the vocabulary
+
+A trip carries "what happens on a day" more than once. Use these names for
+them; the code, tool descriptions and agent handoff all do.
+
+| | **Original plan** | **Active plan** | Bookings |
+|---|---|---|---|
+| Where | `trip.config.json` → `phases[].days` | `phase_plan_items` + `phase_plan_days` | `bookings` table |
+| What | the schedule as authored, before the trip moved | the live schedule: original plan promoted in, plus AI enrichment and the organizer's own edits | reservations: supplier, confirmation, cost, passengers |
+| Written by | hand, at trip setup | `add/update/delete_plan_item`, `swap_plan_days`, `set_plan_day_label` | `add_booking`, `update_booking` |
+| Shown | organizer only, collapsed, as a comparison | **what everyone sees** | booking cards |
+
+**Every itinerary change edits the active plan.** A new route for today,
+moving or swapping two days, fixing tomorrow — all of it. The original plan is
+a read-only reference; nothing edits it in response to a change request.
+`update_booking` will happily accept an itinerary edit, return 200, and change
+nothing the family sees. That mismatch is why `swap_plan_days` exists as one
+atomic operation rather than a batch of per-item date edits.
+
+`renderDays()` flips a phase from original to active on its **first** active
+item — not per day. So a phase whose active plan is empty must be seeded
+wholesale (`POST /api/phase-plan/promote-config-days`) rather than one item at
+a time, or participants lose the rest of that phase's schedule.
+
 Two ways to use it, same server either way:
 - **A local always-on agent** (Hermes, OpenClaw, your own) on your own
   machine/LAN — point it at `http://127.0.0.1:3001/sse` with an
@@ -408,7 +432,7 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ---
 
-## Database Schema (11 tables)
+## Database Schema (13 tables)
 
 | Table | Purpose |
 |---|---|
@@ -423,6 +447,8 @@ hasn't been connected to any username yet — the response is meant to prompt
 | `lost_found` | Lost item reports with resolved flag |
 | `budget_items` | Expenses with phase, category, estimate flag |
 | `trivia_scores` | Game history with rank and score |
+| `phase_plan_items` | The active plan: one row per activity, dated into a phase |
+| `phase_plan_days` | The active plan's day headlines — one per (phase, date), shown above its items |
 
 ---
 

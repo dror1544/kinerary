@@ -299,7 +299,10 @@ mcp.tool('get_bookings', 'Get trip bookings (flights, hotels, cars, attractions)
   return ok(await apiGet(`/api/bookings${qs.toString() ? '?' + qs : ''}`));
 });
 
-mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
+mcp.tool('add_booking',
+  'Record a reservation — a flight, hotel, car or ticketed attraction with a confirmation to keep. ' +
+  'A booking is not part of the active plan and does not put anything on the family\'s day-by-day schedule: to make something ' +
+  'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline).', {
   phase:        z.string().describe('Phase id from trip.config.json (see get_config), plus "intl_flights" for international flights'),
   type:         z.enum(['flight','hotel','car','attraction','other']).describe('Booking type'),
   name:         z.string().describe('Booking name / description'),
@@ -315,7 +318,15 @@ mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
   location_url:      z.string().url().optional().describe('Location URL (Google Maps, Waze, etc.)'),
 }, async (args) => ok(await apiPost('/api/bookings', args)));
 
-mcp.tool('update_booking', 'Update an existing booking by ID', {
+mcp.tool('update_booking',
+  'Update the booking record itself — supplier, confirmation number, PIN, cost, passengers, the dates the reservation covers, voucher/wallet links. ' +
+  'This is NOT how the itinerary is changed. A trip holds two plans: the ORIGINAL PLAN (authored in trip.config.json, a read-only ' +
+  'reference) and the ACTIVE PLAN (get_phase_plan — the live schedule, including AI enrichment and the organizer\'s own edits). ' +
+  'The site renders the ACTIVE PLAN IN PREFERENCE TO both the original plan and bookings, so a booking edit made to change what a ' +
+  'day looks like returns 200, changes the booking, and changes nothing anyone sees. ' +
+  'Every itinerary change goes to the active plan — a day\'s route, moving or swapping two days, fixing "today\'s" or "tomorrow\'s" ' +
+  'plan: use swap_plan_days, update_plan_item, add_plan_item, delete_plan_item. Never edit the original plan to satisfy one. ' +
+  'Use update_booking when what is actually wrong is the reservation.', {
   id:           z.number().describe('Booking ID from get_bookings'),
   name:         z.string().optional(),
   date_from:    z.string().optional(),
@@ -411,27 +422,78 @@ mcp.tool('add_trivia_question',
 // ── Phase plan items ──────────────────────────────────────────────────────────
 
 mcp.tool('get_phase_plan',
-  'Get the organizer\'s editable day-by-day plan items for a trip phase. ' +
-  'Returns items sorted by date, time, and sort_order. Each item may include a linked booking (for confirmation display). ' +
-  'status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review).',
+  'THE ACTIVE PLAN for a phase — the live day-by-day schedule the family actually sees, including AI enrichment and every organizer ' +
+  'edit. Read this before answering or changing anything about what happens on a given day. ' +
+  'A trip also has an ORIGINAL PLAN (trip.config.json phases[].days), kept as a read-only reference; the site renders the active ' +
+  'plan in preference to it and to bookings, so "the itinerary" means the active plan, and every change is made here. ' +
+  'Returns { phase_id, days, items }: `items` sorted by date, time and sort_order (each may carry a linked booking for confirmation display), ' +
+  'and `days` the per-date headlines that say what each day IS ("Diamond Head + Waikiki") — the two are edited separately, ' +
+  'so a day whose items moved keeps its old headline until set_plan_day_label or swap_plan_days moves that too. ' +
+  'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
+  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
   {
     phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
   },
   async ({ phase_id }) => {
-    if (phase_id) return ok(await apiGet(`/api/phases/${phase_id}/plan`));
+    // Items and headlines are two tables and two endpoints, but one answer to
+    // "what does this day look like" — an agent given only the items cannot see
+    // that the headline still names the old plan.
+    const load = async (id) => {
+      const [items, days] = await Promise.all([
+        apiGet(`/api/phases/${id}/plan`),
+        apiGet(`/api/phases/${id}/plan/days`),
+      ]);
+      return { phase_id: id, days, items };
+    };
+    if (phase_id) return ok(await load(phase_id));
     const cfg = await apiGet('/api/config');
     const phases = cfg.phases || [];
     // Fetched together rather than awaited one at a time — an 8-phase trip was
     // paying 8 sequential round trips for reads that don't depend on each other.
-    const plans = await Promise.all(phases.map(p => apiGet(`/api/phases/${p.id}/plan`)));
+    const plans = await Promise.all(phases.map(p => load(p.id)));
     const results = {};
     phases.forEach((p, i) => { results[p.id] = plans[i]; });
     return ok(results);
   });
 
+mcp.tool('swap_plan_days',
+  'Exchange two dates in the ACTIVE PLAN — every item on both dates, plus both day headlines, trade places in one atomic write. ' +
+  'This is the right tool for "move today\'s plan to tomorrow", "swap Thursday and Friday", "today should be what tomorrow was", ' +
+  'and any correction that exchanges two days\' routes. It never touches the original plan in trip.config.json. ' +
+  'Use it rather than a sequence of update_plan_item calls: those render the two days merged into one date partway through, ' +
+  'leave the schedule wrong if any call fails, and cannot move the headlines at all. ' +
+  'If one of the dates has no items this is simply a move. ' +
+  'Returns the resulting items and headlines for both dates — read them to confirm the swap landed, rather than trusting the success status.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date_a:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('First date YYYY-MM-DD'),
+    date_b:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Second date YYYY-MM-DD'),
+  },
+  async ({ phase_id, date_a, date_b }) =>
+    ok(await apiPost(`/api/phases/${phase_id}/plan/swap-days`, { date_a, date_b })));
+
+mcp.tool('set_plan_day_label',
+  'Set a day\'s headline in the ACTIVE PLAN — the line that says what that date IS ("Diamond Head + Waikiki / Ala Moana"), shown above the day\'s items. ' +
+  'Needed because moving items with update_plan_item does not move the headline: change a day\'s route without this and the site ' +
+  'shows the new plan under the old day\'s name. swap_plan_days already handles the headlines for a two-day exchange; use this when ' +
+  'you rewrite a single day, or when a headline is simply wrong. ' +
+  'Send only the language you mean to change; the other is left as-is. Sending an empty string clears it and re-queues the day for an AI-written headline.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Date YYYY-MM-DD'),
+    label_he: z.string().optional().describe('Headline in Hebrew'),
+    label_en: z.string().optional().describe('Headline in English'),
+  },
+  async ({ phase_id, date, ...body }) =>
+    ok(await apiPatch(`/api/phases/${phase_id}/plan/days/${date}`, body)));
+
 mcp.tool('add_plan_item',
-  'Add a new item to the day-by-day plan for a trip phase. ' +
+  'Add an item to the ACTIVE PLAN for a phase — the schedule the family sees, so adding an activity here is how something appears ' +
+  'on the site. (Adding a booking does not put anything on the schedule.) ' +
   'Use this to record activities, meals, transfers, or any scheduled event. ' +
+  'NOTE: the active plan takes over a phase as soon as it holds a single item — if this phase\'s active plan is still empty, the ' +
+  'original plan stops being shown to participants and they will see only what you add. Check get_phase_plan first; a phase whose ' +
+  'active plan is empty should be seeded from the original plan wholesale, not one item at a time. ' +
   'Set location_url to a Waze or Google Maps link after a web search. ' +
   'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
   'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
@@ -449,7 +511,11 @@ mcp.tool('add_plan_item',
   async ({ phase_id, ...body }) => ok(await apiPost(`/api/phases/${phase_id}/plan`, body)));
 
 mcp.tool('update_plan_item',
-  'Update an existing plan item by ID — use to enrich with location_url, link a booking, confirm needs_review items, or correct text.',
+  'Update one item of the ACTIVE PLAN by ID — the way to change what the family sees for a given day: correct its text, move it to ' +
+  'another date or time, enrich it with location_url, link a booking, or confirm a needs_review item. ' +
+  'Changing `date` moves this ONE item; it does not move the day\'s headline, and it is not how two days are exchanged — ' +
+  'for that use swap_plan_days, which moves items and headlines together and atomically. ' +
+  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings.',
   {
     phase_id:     z.string().describe('Phase id the item belongs to'),
     id:           z.number().describe('Plan item ID from get_phase_plan'),
@@ -465,7 +531,8 @@ mcp.tool('update_plan_item',
   async ({ phase_id, id, ...fields }) => ok(await apiPatch(`/api/phases/${phase_id}/plan/${id}`, fields)));
 
 mcp.tool('delete_plan_item',
-  'Delete a plan item by ID.',
+  'Delete an item from the ACTIVE PLAN by ID. The original plan in trip.config.json is unaffected — a deletion here removes the item ' +
+  'from what the family sees, and the organizer can still see the original for comparison.',
   {
     phase_id: z.string().describe('Phase id the item belongs to'),
     id:       z.number().describe('Plan item ID from get_phase_plan'),
