@@ -316,7 +316,20 @@ Rules:
 - A day's items and its headline are separate records. Move the items and the headline still announces the old plan — move both.
 - The active plan takes over a phase on its first item, not per day. If a phase's active plan is empty, seed it from the original plan wholesale before editing; adding one item leaves participants seeing only that item.
 
-### 7.7 What counts as verifying a change
+### 7.7 Reordering days invalidates what the schedule says about itself
+
+Moving a day does not only move items. The prose around them was written against the old order and quietly stops being true: a headline that names its own date, "tomorrow we climb Diamond Head" sitting on the day before, "unlike Thursday, this beach is calm". None of it is visible on the day that moved, which is why it gets missed.
+
+After any reorder the whole phase is re-checked out of band, and wording that contradicts the new order is corrected. Corrections are applied, not merely proposed — but never silently: the superseded wording is kept and shown struck through on the site, with the reason.
+
+The agent's duty after a schedule change:
+
+- Re-read `get_phase_plan` a short while after the change (the check takes up to a couple of minutes).
+- Report every `correction` to the organizer in chat: what it said before, what it says now, and why. An organizer who does not open the site would otherwise never learn that a sentence they wrote was changed.
+- If `review.status` is `unavailable`, the descriptions were **not** checked. Say so plainly rather than implying the schedule was verified.
+- Corrections are the reviewer's judgement, not the organizer's. If one looks wrong, raise it — the original text is kept, so reverting is always possible.
+
+### 7.8 What counts as verifying a change
 
 "Updated on the site" is a claim about what the family will see, so a write returning success is not evidence for it. Before saying a change is live:
 

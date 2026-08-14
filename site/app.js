@@ -3522,9 +3522,24 @@ function _buildPlanItemRow(item, phaseId, tr) {
   const when = _planTimeLabel(item.time, tr);
   return `<li class="plan-item" data-id="${esc(item.id)}">
     ${when ? `<strong>${esc(when)}</strong> — ` : ''}${_biSpan({ he: esc(item.text_he), en: esc(item.text_en) })}${conf}${review}${del}
+    ${_buildCorrection(item.correction, { he: item.text_he_prev, en: item.text_en_prev }, tr)}
     <span class="plan-err" hidden></span>
     ${_buildEnrichPanel(item, tr)}
   </li>`;
+}
+
+// A line the post-reorder review rewrote shows what it used to say, struck
+// through, with the reason. Silently swapping words an organizer wrote is how
+// a family stops trusting the schedule — the change has to be legible as a
+// change, and attributable.
+function _buildCorrection(correction, prev, tr) {
+  if (!correction) return '';
+  const was = _biSpan({ he: prev?.he ? esc(prev.he) : '', en: prev?.en ? esc(prev.en) : '' });
+  if (!prev?.he && !prev?.en) return '';
+  return `<div class="plan-correction">
+    <s class="plan-correction-was">${was}</s>
+    <span class="plan-correction-note">✏️ ${esc(correction.note || tr.plan_corrected)}</span>
+  </div>`;
 }
 
 function _buildAddItemRow(phaseId, date, tr) {
@@ -3759,7 +3774,11 @@ function renderDays(phase) {
             const suffix = hl.he || hl.en
               ? _biSpan({ he: hl.he ? ` — ${esc(hl.he)}` : '', en: hl.en ? ` — ${esc(hl.en)}` : '' })
               : (pendingHl ? `<span class="plan-hl-pending"> · ${esc(tr.plan_enriching)}</span>` : '');
-            return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}`;
+            // A headline the review rewrote carries the same struck-through
+            // trail as an item, so a renamed day is never a silent rename.
+            const corrected = _buildCorrection(
+              meta?.correction, { he: meta?.label_he_prev, en: meta?.label_en_prev }, tr);
+            return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}${corrected}`;
           })()
         : _biSpan({ he: T.he.plan_unscheduled, en: T.en.plan_unscheduled });
       const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');

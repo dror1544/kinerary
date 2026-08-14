@@ -429,6 +429,9 @@ mcp.tool('get_phase_plan',
   'Returns { phase_id, days, items }: `items` sorted by date, time and sort_order (each may carry a linked booking for confirmation display), ' +
   'and `days` the per-date headlines that say what each day IS ("Diamond Head + Waikiki") — the two are edited separately, ' +
   'so a day whose items moved keeps its old headline until set_plan_day_label or swap_plan_days moves that too. ' +
+  'An item or day may carry `correction` — wording the post-reorder review rewrote because it referred to the old day order. ' +
+  'It holds the note (why) and previous (what it said before, shown struck through on the site). ' +
+  'These are what you relay to the organizer after a schedule change; do not silently pass over them. ' +
   'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
   'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
   {
@@ -463,7 +466,14 @@ mcp.tool('swap_plan_days',
   'Use it rather than a sequence of update_plan_item calls: those render the two days merged into one date partway through, ' +
   'leave the schedule wrong if any call fails, and cannot move the headlines at all. ' +
   'If one of the dates has no items this is simply a move. ' +
-  'Returns the resulting items and headlines for both dates — read them to confirm the swap landed, rather than trusting the success status.',
+  'Returns the resulting items and headlines for both dates — read them to confirm the swap landed, rather than trusting the success status. ' +
+  'It also returns `review`. Reordering days makes the schedule\'s own prose stale — a headline naming its own date, ' +
+  '"tomorrow we climb Diamond Head" written on the day before, "unlike Thursday, this beach is calm" — so a check over the whole ' +
+  'phase is queued. It runs out of band and takes up to a couple of minutes. ' +
+  'AFTER A SWAP YOU MUST: re-read get_phase_plan a short while later, look for items or days carrying a `correction`, and TELL THE ' +
+  'ORGANIZER what was rewritten — quote correction.previous (what it said before) and the current text, and give correction.note as ' +
+  'the reason. The site shows these struck through, so an organizer who reads the schedule will see them; one who only reads your ' +
+  'message will not, unless you say so. If review.status is "unavailable" the descriptions were NOT checked — say that instead of implying they were.',
   {
     phase_id: z.string().describe('Phase id from get_config'),
     date_a:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('First date YYYY-MM-DD'),
@@ -870,16 +880,60 @@ function buildDayLabelPrompt({ date, context, items }) {
   ].filter(Boolean).join('\n');
 }
 
+// After a day moves, the schedule's own prose is what goes stale — "tomorrow we
+// climb Diamond Head" written on the day before, a headline naming its own date,
+// "unlike Thursday, this beach is calm". The model sees the WHOLE phase as it
+// now stands and is asked only for lines that contradict it. Deliberately
+// conservative: a false correction rewrites something a person wrote by hand.
+function buildScheduleReviewPrompt({ context, days }) {
+  return [
+    'A family trip itinerary was just reordered — one or more days changed date.',
+    'Some descriptions were written when the order was different and are now wrong or confusing.',
+    '',
+    'Find ONLY lines whose wording contradicts the schedule as it now stands. Typical cases:',
+    '  - a day headline or item naming a date/weekday that is not the date it now sits on',
+    '  - "today" / "tomorrow" / "yesterday" / "the day before" pointing at the wrong day',
+    '  - a cross-reference to another day\'s activity that has moved ("after tomorrow\'s hike")',
+    '',
+    'Do NOT touch anything else. Not style, not grammar, not detail you think is missing,',
+    'not opening hours, not advice. If a line reads correctly against the schedule below,',
+    'leave it alone. Returning an empty list is the correct answer far more often than not.',
+    '',
+    'Keep every correction minimal: change only the words that became wrong, keep the',
+    'original language (Hebrew stays Hebrew), keep the author\'s voice and any markup.',
+    '',
+    'Reply with ONE JSON object and nothing else:',
+    '{"corrections":[{"kind":"item"|"day","id":<item id>,"date":"YYYY-MM-DD",',
+    '  "text_he":"...","text_en":"...","label_he":"...","label_en":"...",',
+    '  "note":"<short reason, in English, why this line was wrong>"}]}',
+    'Use id for kind "item" and date for kind "day". Include only the language fields you changed.',
+    '',
+    context ? `Trip phase: ${JSON.stringify(context)}` : '',
+    '',
+    'The schedule as it now stands:',
+    JSON.stringify(days, null, 1),
+  ].filter(Boolean).join('\n');
+}
+
 app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
   if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
-  const { kind, text, text_he, date, context, items } = req.body || {};
-  const isDay = kind === 'day';
-  if (isDay ? !(items && items.length) : (!text && !text_he)) {
-    return res.status(400).json({ error: isDay ? 'Provide items for a day headline' : 'Provide text or text_he' });
+  const { kind, text, text_he, date, context, items, days } = req.body || {};
+  const isDay    = kind === 'day';
+  const isReview = kind === 'schedule_review';
+  if (isReview ? !(days && days.length)
+               : isDay ? !(items && items.length)
+                       : (!text && !text_he)) {
+    return res.status(400).json({
+      error: isReview ? 'Provide days for a schedule review'
+           : isDay    ? 'Provide items for a day headline'
+                      : 'Provide text or text_he',
+    });
   }
 
   try {
-    const prompt = isDay
+    const prompt = isReview
+      ? buildScheduleReviewPrompt({ context, days })
+      : isDay
       ? buildDayLabelPrompt({ date, context, items })
       : buildEnrichPrompt({ text, text_he, date, context });
     // Enrichment runs many calls back to back, and a single lookup routinely
@@ -891,7 +945,35 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
     const parsed = JSON.parse(m[0]);
 
     const out = {};
-    if (isDay) {
+    if (isReview) {
+      // Every correction is validated here before it can reach a family's
+      // schedule: a malformed entry is dropped rather than written back as a
+      // rewrite of something a person authored.
+      const str = (v, max) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, max) : undefined;
+      out.corrections = (Array.isArray(parsed.corrections) ? parsed.corrections : [])
+        .map(c => {
+          const isItem = c?.kind === 'item';
+          const entry = { kind: isItem ? 'item' : 'day', note: str(c?.note, 200) || null };
+          if (isItem) {
+            if (!Number.isInteger(c.id)) return null;
+            entry.id = c.id;
+            for (const k of ['text_he', 'text_en']) { const v = str(c[k], 2000); if (v) entry[k] = v; }
+            if (!entry.text_he && !entry.text_en) return null;
+          } else {
+            const d = str(c?.date, 10);
+            if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+            entry.date = d;
+            for (const k of ['label_he', 'label_en']) { const v = str(c[k], 120); if (v) entry[k] = v; }
+            if (!entry.label_he && !entry.label_en) return null;
+          }
+          return entry;
+        })
+        .filter(Boolean)
+        // A "correction" for every line means the model rewrote the schedule
+        // rather than repairing it. Cap it: a reorder invalidates a handful of
+        // sentences, not all of them.
+        .slice(0, 25);
+    } else if (isDay) {
       for (const k of ['label_he', 'label_en']) {
         if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
       }

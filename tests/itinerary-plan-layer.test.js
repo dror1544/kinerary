@@ -240,6 +240,23 @@ describe('A. Itinerary-change routing guidance (MCP tool contract)', () => {
   test('update_plan_item points a two-day exchange at swap_plan_days', () => {
     assert.match(tools.update_plan_item.description, /swap_plan_days/);
   });
+
+  // A correction shown struck through on the site reaches an organizer who
+  // opens the site. One who only reads the chat learns nothing unless the
+  // agent is told, here, that relaying it is part of the job.
+  test('swap_plan_days obliges the agent to relay corrections to the organizer', () => {
+    const d = tools.swap_plan_days.description;
+    assert.match(d, /review/i, 'the queued wording review should be advertised');
+    assert.match(d, /organizer/i, 'the agent must be told who to tell');
+    assert.match(d, /correction/i);
+    assert.match(d, /get_phase_plan/, 'and where to read the corrections back from');
+    assert.match(d, /unavailable/i,
+      'it must also say what to do when no reviewer is configured');
+  });
+
+  test('get_phase_plan documents the correction field it now returns', () => {
+    assert.match(tools.get_phase_plan.description, /correction/i);
+  });
 });
 
 // ── B. The data layer: a swap moves items and headlines together ─────────────
@@ -373,6 +390,18 @@ describe('B. Swapping two days of the active plan', () => {
 
     await api(`/api/bookings/${bookingId}`, { method: 'DELETE', apiKey: AGENT_KEY });
     await seedHonolulu();
+  });
+
+  // This server runs with no HERMES_URL, which is the common case in the field
+  // — the reviewer lives on the organizer's laptop and it is often closed.
+  // Saying "queued" then would be a quiet lie about what was checked.
+  test('with no reviewer configured, the swap says so instead of implying a check ran', async () => {
+    await seedHonolulu();
+    const body = await (await api(`/api/phases/${PHASE}/plan/swap-days`, {
+      method: 'POST', apiKey: AGENT_KEY, body: { date_a: DAY_13, date_b: DAY_14 },
+    })).json();
+    assert.equal(body.review.status, 'unavailable');
+    assert.match(body.review.detail, /not checked/i);
   });
 
   test('rejects a malformed or degenerate swap', async () => {
