@@ -213,7 +213,9 @@ describe('corrections are applied, and the original is kept', () => {
     assert.equal(day.label_en, 'Thu 13/8 — Southeast Oahu');
     assert.equal(day.correction.previous.label_en, 'Fri 14/8 — Southeast Oahu',
       'the headline that travelled with the swap is what it replaced');
-    assert.match(day.correction.note, /Friday/);
+    // The stamp itself is repaired in code during the swap, so this particular
+    // headline never needs the reviewer — the note is the deterministic one.
+    assert.match(day.correction.note, /headline|date/i);
   });
 
   test('untouched lines are left completely alone', async () => {
@@ -255,6 +257,56 @@ describe('the reviewer cannot be trusted blindly', () => {
     const after = await planItems();
     assert.deepEqual(after.map(i => i.text_en).sort(), snapshot.map(i => i.text_en).sort());
     assert.ok(after.every(i => !i.correction));
+  });
+
+  // Observed on the first real run against a live model: asked to repair stale
+  // dates after a swap, it repaired them AND gave each day the other day's
+  // description, quietly half-undoing the swap. The items are the truth; a
+  // headline arriving from another date is content moving between days.
+  test('a headline that is really another date\'s headline is refused', async () => {
+    await seed();
+    await swap();
+    const daysBefore = await eventually(
+      async () => { const d = await planDays(); return d.length >= 2 ? d : null; }, 'the seeded days');
+    const on13 = daysBefore.find(d => d.date === DAY_13);
+    const on14 = daysBefore.find(d => d.date === DAY_14);
+
+    // Exactly the failure: hand 13/8 the description currently on 14/8,
+    // with a plausibly-repaired date stamp in front of it.
+    mockCorrections = [{
+      kind: 'day', date: DAY_13,
+      label_en: `Thu 13/8 — ${on14.label_en.split('—').pop().trim()}`,
+      note: 'date was stale',
+    }];
+    await swap();
+    await eventually(async () => (await planDays()).every(d => d.review_status === 'done'),
+      'the review pass to finish');
+
+    const after = (await planDays()).find(d => d.date === DAY_13);
+    // The date stamp is repaired in code on every swap, so a correction record
+    // exists — but its DESCRIPTION must still be the one that travelled here,
+    // not the one the reviewer tried to import from the other date.
+    const gist = (s) => String(s).split('—').pop().trim();
+    assert.equal(gist(after.label_en), gist(on14.label_en),
+      'the description that legitimately travelled with the swap must survive');
+    assert.notEqual(gist(after.label_en), gist(on13.label_en),
+      'the reviewer must not have moved the other day\'s description in');
+  });
+
+  test('a headline correction that only repairs the date is still allowed', async () => {
+    await seed();
+    const before = (await planDays()).find(d => d.date === DAY_13);
+    const description = before.label_en.split('—').pop().trim();
+    mockCorrections = [{
+      kind: 'day', date: DAY_14,
+      label_en: `Fri 14/8 — ${description} rethought`,
+      note: 'date stamp was wrong',
+    }];
+    await swap();
+    const corrected = await eventually(
+      async () => (await planDays()).find(d => d.date === DAY_14 && d.correction),
+      'the date-only correction');
+    assert.match(corrected.label_en, /Fri 14\/8/);
   });
 
   test('a correction identical to the current text is not recorded as a change', async () => {
@@ -310,7 +362,9 @@ describe('the site shows a correction rather than swapping words silently', () =
 
   test('the superseded wording is struck through, with the reason', () => {
     const el = render();
-    const corr = el.querySelector('.plan-correction');
+    // Scoped to the item: a day headline may carry its own correction from the
+    // deterministic stamp repair, and that is a different thing being asserted.
+    const corr = el.querySelector('li.plan-item .plan-correction');
     assert.ok(corr, 'a corrected line must show that it was corrected');
     const struck = corr.querySelector('s.plan-correction-was');
     assert.ok(struck, 'the old wording belongs in a <s>');

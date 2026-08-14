@@ -404,6 +404,43 @@ describe('B. Swapping two days of the active plan', () => {
     assert.match(body.review.detail, /not checked/i);
   });
 
+  // The stamp repair is arithmetic and runs inside the swap itself — no model,
+  // nothing queued. A model was tried for this and got it wrong twice on real
+  // data, so the swap now guarantees it.
+  test('a headline stamping its own date is re-stamped for the day it lands on', async () => {
+    await seedHonolulu();
+    await setLabel(DAY_13, { label_he: 'ה׳ 13/8 — דיאמונד הד', label_en: 'Thu 13/8 — Diamond Head' });
+    await setLabel(DAY_14, { label_he: 'ו׳ 14/8 — דרום־מזרח', label_en: 'Fri 14/8 — Southeast Oahu' });
+    await api(`/api/phases/${PHASE}/plan/swap-days`, {
+      method: 'POST', apiKey: AGENT_KEY, body: { date_a: DAY_13, date_b: DAY_14 },
+    });
+    const days = await planDays();
+    const on13 = days.find(d => d.date === DAY_13);
+    const on14 = days.find(d => d.date === DAY_14);
+
+    assert.equal(on13.label_en, 'Thu 13/8 — Southeast Oahu',
+      '13/8 must not announce Friday 14/8 after the swap');
+    assert.equal(on13.label_he, 'ה׳ 13/8 — דרום־מזרח');
+    assert.equal(on14.label_en, 'Fri 14/8 — Diamond Head');
+    assert.equal(on14.label_he, 'ו׳ 14/8 — דיאמונד הד');
+
+    // And it is a visible correction, not a silent rewrite.
+    assert.equal(on13.correction.previous.label_en, 'Fri 14/8 — Southeast Oahu');
+    assert.match(on13.correction.note, /headline/i);
+  });
+
+  test('a headline with no date stamp is carried across untouched', async () => {
+    await seedHonolulu();
+    await setLabel(DAY_13, { label_en: 'Diamond Head + Waikiki' });
+    await setLabel(DAY_14, { label_en: 'Southeast Oahu + beach' });
+    await api(`/api/phases/${PHASE}/plan/swap-days`, {
+      method: 'POST', apiKey: AGENT_KEY, body: { date_a: DAY_13, date_b: DAY_14 },
+    });
+    const on13 = (await planDays()).find(d => d.date === DAY_13);
+    assert.equal(on13.label_en, 'Southeast Oahu + beach');
+    assert.equal(on13.correction, undefined, 'nothing was wrong, so nothing is flagged');
+  });
+
   test('rejects a malformed or degenerate swap', async () => {
     for (const body of [
       { date_a: DAY_13, date_b: DAY_13 },

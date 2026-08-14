@@ -11,6 +11,7 @@ const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
+const { repairDayStamp } = require('../shared/day-stamp');
 
 const app = express();
 // Default (100kb) is too small for /api/bookings/extract, which the browser
@@ -1904,6 +1905,35 @@ app.get('/api/phases/:phase_id/plan/days', authRequired, (req, res) => {
   ).all(req.params.phase_id).map(withCorrection));
 });
 
+// Rewrites the leading date stamp of each given date's headline to match the
+// date it now sits on, recording it as an ordinary correction so the site shows
+// the old stamp struck through. Deterministic and immediate: no model, nothing
+// queued, no way for it to come back with the wrong answer.
+function repairStampsOn(phaseId, dates) {
+  const read = db.prepare(
+    'SELECT label_he, label_en, label_he_prev, label_en_prev FROM phase_plan_days WHERE phase_id = ? AND date = ?');
+  const write = db.prepare(
+    'UPDATE phase_plan_days SET label_he = ?, label_en = ?, ' +
+    'label_he_prev = COALESCE(label_he_prev, ?), label_en_prev = COALESCE(label_en_prev, ?), ' +
+    "correction_note = ?, corrected_at = datetime('now') WHERE phase_id = ? AND date = ?");
+  const repaired = [];
+  for (const date of dates) {
+    const row = read.get(phaseId, date);
+    if (!row) continue;
+    const he = repairDayStamp(row.label_he, date);
+    const en = repairDayStamp(row.label_en, date);
+    if (!he && !en) continue;
+    write.run(
+      he || row.label_he, en || row.label_en,
+      he ? row.label_he : null, en ? row.label_en : null,
+      'date in the headline updated to the day it now falls on',
+      phaseId, date
+    );
+    repaired.push(date);
+  }
+  return repaired;
+}
+
 // A date change makes wording wrong somewhere else, not where it happened:
 // "tomorrow we climb Diamond Head" sits on the day BEFORE the day that moved.
 // So the whole phase goes back through review, not just the dates touched.
@@ -2117,6 +2147,10 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
     };
     put(date_a, fromB);
     put(date_b, fromA);
+    // A headline that stamps its own date is now stamped with the date it came
+    // from. That repair is arithmetic, so it happens here and now rather than
+    // being queued for a model — which got it wrong in practice anyway.
+    repairStampsOn(phaseId, [date_a, date_b]);
   })();
 
   // Read back both days in the same response. Verifying a swap means looking at
@@ -2444,10 +2478,40 @@ function applyItemCorrection(c, note) {
   return true;
 }
 
+// The description part of a headline, with any leading date/weekday stamp
+// removed — "Thu 13/8 — Tsukiji, Ginza" and "Wed 40/9 — Tsukiji, Ginza" are the
+// same day being described, differently dated.
+function headlineGist(label) {
+  const s = String(label || '');
+  const afterStamp = s.includes('—') ? s.slice(s.indexOf('—') + 1) : s;
+  return afterStamp.toLowerCase().replace(/[\s.,:;·/–—-]+/g, ' ').trim();
+}
+
+// Seen on the first real run: asked to repair stale dates after a swap, the
+// reviewer corrected the dates AND handed each day the OTHER day's description,
+// quietly half-undoing the swap. A headline whose new text is another date's
+// current headline is not a repair, it is content moving between days — which
+// the reviewer is explicitly forbidden to do. Refuse it here too, because a
+// prompt is guidance and this is an invariant.
+function dayCorrectionMovesContent(phaseId, c) {
+  const others = db.prepare(
+    'SELECT date, label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date != ?'
+  ).all(phaseId, c.date);
+  const proposed = [c.label_he, c.label_en].filter(Boolean).map(headlineGist).filter(Boolean);
+  if (!proposed.length) return false;
+  return others.some(o =>
+    [o.label_he, o.label_en].filter(Boolean).map(headlineGist)
+      .some(gist => gist && proposed.includes(gist)));
+}
+
 function applyDayCorrection(phaseId, c, note) {
   const row = db.prepare('SELECT label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date = ?')
     .get(phaseId, c.date);
   if (!row) return false;
+  if (dayCorrectionMovesContent(phaseId, c)) {
+    console.error(`[review] ${phaseId} ${c.date}: refused a headline that belongs to another date`);
+    return false;
+  }
   const changedHe = c.label_he !== undefined && c.label_he !== row.label_he;
   const changedEn = c.label_en !== undefined && c.label_en !== row.label_en;
   if (!changedHe && !changedEn) return false;
