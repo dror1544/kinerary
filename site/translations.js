@@ -82,7 +82,10 @@ const T = {
     cd_min:    'דקות',
     cd_sec:    'שניות',
     cd_until_departure: 'עד היציאה',
-    cd_until_end:       'עד סוף הטיול',
+    cd_in_progress:     'הטיול בעיצומו',
+    cd_day_of:          'יום {n} מתוך {total}',
+    cd_day:             'יום {n}',
+    cd_open_phase:      'לפרטי השלב',
     cd_finished:        '✅ הטיול הסתיים',
 
     /* hero ctas / labels per tab — framework tabs only; phase heroes come from config */
@@ -400,7 +403,10 @@ const T = {
     cd_min:    'min',
     cd_sec:    'sec',
     cd_until_departure: 'until departure',
-    cd_until_end:       'until the trip ends',
+    cd_in_progress:     'Trip in progress',
+    cd_day_of:          'Day {n} of {total}',
+    cd_day:             'Day {n}',
+    cd_open_phase:      'Open this phase',
     cd_finished:        '✅ Trip complete',
 
     /* hero — framework tabs only; phase heroes come from config */

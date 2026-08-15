@@ -80,6 +80,26 @@ security-relevant path (anything above, or auth in general), show the actual
 request/response proving the thing is hidden or scoped correctly — not a
 description of the code.
 
+### Testing anything that depends on today's date
+
+The trip clock, phase highlighting and "day N of M" all answer "where is this
+trip right now?", so they only show their real states when today falls inside
+the trip. `scripts/shift-trip-dates.py` moves a trip to where the clock is,
+rather than faking the clock:
+
+```bash
+python3 scripts/shift-trip-dates.py --slug japan-2025 --days -28   # mid-trip
+python3 scripts/shift-trip-dates.py --slug japan-2025 --days -60   # finished
+python3 scripts/shift-trip-dates.py --slug japan-2025 --restore    # undo, exactly
+python3 scripts/shift-trip-dates.py --slug japan-2025 --status     # am I shifted?
+```
+
+**`trips/japan-2025/trip.config.json` is tracked by git**, so a forgotten
+restore commits fake dates. Always `--restore` before committing; `--status`
+exits non-zero while a trip is shifted. The script refuses outright to shift a
+trip that is running right now — that would move a live trip under the people
+on it.
+
 ## Working style
 
 Write the test first where it's practical. Prefer fixing something at its

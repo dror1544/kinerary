@@ -1022,7 +1022,7 @@ function uname(username, userObj) {
 }
 
 /* =========================================================
-   COUNTDOWN
+   TRIP CLOCK
    ========================================================= */
 // Three states, not one. The original only counted down to departure and, once
 // that passed, wrote a rocket into the days slot and returned early — leaving
@@ -1030,8 +1030,11 @@ function uname(username, userObj) {
 // departure is in the past therefore displayed a permanently broken timer,
 // which is every past trip and every demo of one.
 //
-// Now: before departure → time until departure; during the trip → time until
-// it ends; after → a finished state, no timer at all.
+// Counting is only interesting before the trip. Once it starts, "time until it
+// ends" is the one number nobody wants on screen, so the card stops counting
+// and answers "where am I?" instead: the active phase and which day of the trip
+// this is, clicking through to that phase's page. After → a finished state.
+/* TRIP_CLOCK_BEGIN */
 function tripPhaseNow(meta, now = new Date()) {
   const dep = meta?.departure ? new Date(meta.departure) : null;
   if (!dep || isNaN(dep)) return null;
@@ -1051,39 +1054,148 @@ function tripPhaseNow(meta, now = new Date()) {
   return { state: 'during', target: null };
 }
 
-function tick() {
-  const meta = window.TRIP_CONFIG?.meta;
-  const phase = tripPhaseNow(meta);
-  if (!phase) return; // config not loaded yet — nothing to count down to
+// Calendar day as a comparable integer. Built from UTC on purpose: a DST shift
+// inside the trip makes a local day 23 or 25 hours long, which would round a
+// plain millisecond division to the wrong day.
+function dayIndex(d) {
+  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+}
+
+function localYMD(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// "Day 4 of 12" — day 1 is the departure day itself.
+function tripDayNumber(meta, now = new Date()) {
+  const dep = meta?.departure ? new Date(meta.departure) : null;
+  if (!dep || isNaN(dep)) return null;
+  const day = dayIndex(now) - dayIndex(dep) + 1;
+  if (day < 1) return null;
+  // meta.totalDays is the length the hero already advertises ("5 people · 11
+  // days"), so it wins over the raw departure→return span — the two disagree
+  // whenever the trip opens with a night flight. Clamp rather than let the two
+  // numbers contradict each other: "day 12 of 11" is worse than a repeated
+  // final day. Noon avoids YYYY-MM-DD parsing as UTC midnight, which lands on
+  // the previous day west of Greenwich.
+  const ret  = meta.returnDate ? new Date(`${meta.returnDate}T12:00:00`) : null;
+  const span = ret && !isNaN(ret) ? dayIndex(ret) - dayIndex(dep) + 1 : null;
+  const total = meta.totalDays || span || null;
+  return { day: total ? Math.min(day, total) : day, total };
+}
+
+// Which phase the trip is in right now.
+function currentTripPhase(phases, now = new Date()) {
+  const list = (phases || [])
+    .filter(p => p?.dates?.start)
+    .sort((a, b) => String(a.dates.start).localeCompare(String(b.dates.start)));
+  if (!list.length) return null;
+  const today = localYMD(now);
+  // Phases share their boundary day — you check out of one and into the next on
+  // the same date — so the phase being travelled *into* wins.
+  const inRange = list.filter(p => p.dates.start <= today && today <= (p.dates.end || p.dates.start));
+  if (inRange.length) return inRange[inRange.length - 1];
+  // Evening of an outbound flight that lands tomorrow, or a gap between two
+  // phases: point at where the trip is heading, not where it's been.
+  return list.find(p => p.dates.start > today) || list[list.length - 1];
+}
+
+function tripClockState(cfg, now = new Date()) {
+  const state = tripPhaseNow(cfg?.meta, now);
+  if (!state || state.state !== 'during') return state;
+  const counted = tripDayNumber(cfg?.meta, now) || {};
+  return {
+    ...state,
+    phase:     currentTripPhase(cfg?.phases, now),
+    day:       counted.day  || null,
+    totalDays: counted.total || null,
+  };
+}
+
+// The whole card is the hit target mid-trip, and nothing at all otherwise —
+// leaving a stale role/tabindex behind would hand keyboard users a button that
+// silently does nothing once the trip is over.
+function setClockTarget(card, phaseId, label) {
+  if (!card) return;
+  card.classList.toggle('clickable', !!phaseId);
+  if (phaseId) {
+    card.setAttribute('data-phase-tab', phaseId);
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    if (label) { card.setAttribute('aria-label', label); card.setAttribute('title', label); }
+  } else {
+    ['data-phase-tab', 'role', 'tabindex', 'aria-label', 'title'].forEach(a => card.removeAttribute(a));
+  }
+}
+
+function tick(now = new Date()) {
+  const cfg = window.TRIP_CONFIG;
+  const clock = tripClockState(cfg, now);
+  if (!clock) return; // config not loaded yet — nothing to count down to
 
   const el = id => document.getElementById(id);
   const setText = (id, v) => { const e = el(id); if (e) e.textContent = v; };
   const tr = (typeof T !== 'undefined' && T[currentLang]) || {};
 
+  const card     = el('hero-countdown');
   const units    = el('cd-units');
+  const live     = el('cd-live');
   const finished = el('cd-finished');
   const caption  = el('cd-caption');
 
-  if (phase.state === 'finished') {
-    if (units) units.hidden = true;
+  if (units)    units.hidden    = clock.state !== 'before';
+  if (live)     live.hidden     = clock.state !== 'during';
+  if (finished) finished.hidden = clock.state !== 'finished';
+
+  if (clock.state === 'finished') {
+    setClockTarget(card, null);
     if (caption) caption.textContent = '';
-    if (finished) { finished.hidden = false; finished.textContent = tr.cd_finished || '✅ הטיול הסתיים'; }
+    if (finished) finished.textContent = tr.cd_finished || '✅ הטיול הסתיים';
     return;
   }
 
-  if (units) units.hidden = false;
-  if (finished) finished.hidden = true;
-  if (caption) caption.textContent = phase.state === 'during' ? (tr.cd_until_end || '') : (tr.cd_until_departure || '');
+  if (clock.state === 'during') {
+    const p = clock.phase;
+    const title = typeof p?.title === 'object' ? (p.title[currentLang] || p.title.he) : (p?.title || p?.tabLabel || '');
+    setClockTarget(card, p?.id || null, tr.cd_open_phase);
+    if (caption) caption.textContent = tr.cd_in_progress || '';
+    setText('cd-live-phase', [p?.emoji, title].filter(Boolean).join(' '));
+    setText('cd-live-day', clock.day
+      ? (clock.totalDays
+          ? (tr.cd_day_of || '{n}/{total}').replace('{n}', clock.day).replace('{total}', clock.totalDays)
+          : (tr.cd_day || '{n}').replace('{n}', clock.day))
+      : '');
+    setText('cd-live-arrow', currentLang === 'he' ? '←' : '→');
+    return;
+  }
 
-  if (!phase.target) { setText('cd-d', '🚀'); setText('cd-h', '—'); setText('cd-m', '—'); setText('cd-s', '—'); return; }
+  setClockTarget(card, null);
+  if (caption) caption.textContent = tr.cd_until_departure || '';
 
-  const diff = Math.max(0, phase.target - new Date());
+  const diff = Math.max(0, clock.target - now);
   setText('cd-d', Math.floor(diff / 86400000));
   setText('cd-h', String(Math.floor((diff % 86400000) / 3600000)).padStart(2, '0'));
   setText('cd-m', String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0'));
   setText('cd-s', String(Math.floor((diff % 60000) / 1000)).padStart(2, '0'));
 }
+
+// Wired once, on the card rather than on the live block, so the click target is
+// the whole card; tick() decides per second whether it currently leads anywhere.
+function wireTripClock() {
+  const card = document.getElementById('hero-countdown');
+  if (!card) return;
+  const open = () => {
+    const tab = card.getAttribute('data-phase-tab');
+    if (tab) switchTab(tab);
+  };
+  card.addEventListener('click', open);
+  card.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+}
+
+wireTripClock();
 setInterval(tick, 1000); tick();
+/* TRIP_CLOCK_END */
 
 /* =========================================================
    TABS + HERO SWAP
