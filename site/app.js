@@ -2531,24 +2531,45 @@ function bkConfUrls(confFile) {
   return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}` };
 }
 
+// Local to this section rather than reusing esc()/safeUrl() from the
+// RENDER_FUNS region below: those are already relied on by ~30 call sites in
+// the itinerary-plan-item renderers, and moving them out would drag that
+// unrelated, separately-tested code along for the ride. Same escaping rules,
+// scoped to booking-derived markup specifically.
+function bkEsc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// Only ever emit an http(s) href — a stored `javascript:` URL in a booking's
+// location/wallet field would otherwise execute for every viewer.
+function bkSafeUrl(u) {
+  const s = String(u ?? '').trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
 // Shared by the Bookings tab (buildBookingRow) and the Home "Full Overview"
 // anchor list — the clickable-reference badges (confirmation, PDF, wallet,
 // location→Maps) are the same "review it" affordance in both places, so
-// there's exactly one place that builds that markup.
+// there's exactly one place that builds that markup. Every field here can be
+// set by any authenticated participant via the booking form, so it's all
+// escaped/sanitized before it reaches innerHTML.
 function bookingRefBadges(b) {
   const urls = bkConfUrls(b.conf_file);
   const pdfLink = urls
     ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}" target="_blank" title="View">👁</a><a class="conf-pdf" href="${urls.download}" download title="Download">⬇</a></span>`
     : '';
-  const confBadge = b.confirmation ? `<span class="conf">${b.confirmation}</span>` : '';
+  const confBadge = b.confirmation ? `<span class="conf">${bkEsc(b.confirmation)}</span>` : '';
   const appleWalletBadge = b.pkpass_file
-    ? `<a href="/api/bookings/wallet-apple/${b.pkpass_file}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
+    ? `<a href="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
     : '';
-  const googleWalletBadge = b.google_wallet_url
-    ? `<a href="${b.google_wallet_url}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
+  const googleWalletUrl = bkSafeUrl(b.google_wallet_url);
+  const googleWalletBadge = googleWalletUrl
+    ? `<a href="${googleWalletUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
     : '';
-  const locationBadge = b.location_url
-    ? `<a href="${b.location_url}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
+  const locationUrl = bkSafeUrl(b.location_url);
+  const locationBadge = locationUrl
+    ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
     : '';
   return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}`;
 }
@@ -2566,7 +2587,7 @@ function buildBookingRow(b, canEdit) {
     ? `<button onclick="deleteBooking(${b.id})" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--warn);padding:0 4px" title="Delete">🗑️</button>`
     : '';
   return `<tr style="${cancelled ? 'opacity:0.55;text-decoration:line-through' : ''}">
-    <td>${icon} ${b.name}</td>
+    <td>${icon} ${bkEsc(b.name)}</td>
     <td style="white-space:nowrap">${dates || '–'}</td>
     <td>${b.passengers || '–'}</td>
     <td>${bookingRefBadges(b)}${pinBadge}</td>
@@ -2784,6 +2805,7 @@ async function submitBooking() {
     hideBookingForm();
     loadBookings();
     if (body.phase) loadPhaseBookings(body.phase);
+    loadHomeOverview(window.TRIP_CONFIG);
   } catch {
     errEl.textContent = tr.bk_err_server;
   }
@@ -2795,6 +2817,7 @@ async function deleteBooking(id) {
   const token = localStorage.getItem('trip-token');
   await fetch(`/api/bookings/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
   loadBookings();
+  loadHomeOverview(window.TRIP_CONFIG);
 }
 
 async function editBooking(id) {
@@ -3289,6 +3312,7 @@ function accommodationAnchors(cfg) {
     if (!name) return null;
     return {
       type: 'hotel',
+      phaseId: p.id,
       name,
       phaseLabel: `${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
       date_from: p.dates?.start || null,
@@ -3300,14 +3324,18 @@ function accommodationAnchors(cfg) {
   }).filter(Boolean);
 }
 
-// Anchor = an event that can't be moved once it exists. flight/hotel are
-// unconditional (a booking of that type is inherently date-bound); an
-// attraction is only an anchor once it has a fixed date — a loose idea with
-// no date is still a wishlist entry, not something locked in.
+// Anchor = an event that can't be moved once it exists. A cancelled booking
+// (the Bookings tab's own convention: name starts with ❌) no longer is one —
+// exclude it rather than show a dead reservation as if it were locked in.
+// flight/hotel are otherwise unconditional (a booking of that type is
+// inherently date-bound); an attraction is only an anchor once it has a
+// fixed date — a loose idea with no date is still a wishlist entry, not
+// something locked in.
 // A later pass could send borderline attractions (dated but no
 // confirmation/conf_file yet) through an LLM to read notes/PDF text and
 // catch what this deterministic check gets wrong; not built here.
 function isAnchorBooking(b) {
+  if (b.name?.startsWith('❌')) return false;
   if (!ANCHOR_TYPES.includes(b.type)) return false;
   if (b.type === 'attraction') return !!b.date_from;
   return true;
@@ -3318,7 +3346,7 @@ function bookingAnchors(cfg, bookings) {
     const phase = (cfg.phases || []).find(p => p.id === b.phase);
     const phaseLabel = phase
       ? `${phase.emoji || ''} ${_biSpan(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
-      : ((PHASE_LABELS[b.phase] || {})[currentLang] || b.phase);
+      : esc((PHASE_LABELS[b.phase] || {})[currentLang] || b.phase);
     return { ...b, phaseLabel };
   });
 }
@@ -3333,7 +3361,7 @@ function renderHomeOverview(cfg, anchors) {
     const icon = TYPE_ICONS[a.type] || '📌';
     return `<tr>
       <td style="white-space:nowrap">${dates}</td>
-      <td>${icon} ${a.name}</td>
+      <td>${icon} ${esc(a.name)}</td>
       <td>${a.phaseLabel || '–'}</td>
       <td>${bookingRefBadges(a) || '–'}</td>
     </tr>`;
@@ -3357,7 +3385,13 @@ async function loadHomeOverview(cfg) {
     const res = await fetch('/api/bookings', { headers: token ? { Authorization: `Bearer ${token}` } : {} });
     if (res.ok) bookings = await res.json();
   } catch { /* renders hotel-only anchors below if bookings can't be reached */ }
-  renderHomeOverview(cfg, [...accommodationAnchors(cfg), ...bookingAnchors(cfg, bookings)]);
+  const bkAnchors = bookingAnchors(cfg, bookings);
+  // A phase whose hotel is already a real booking shouldn't also show the
+  // accommodation placeholder — prefer the booking record (it carries the
+  // actual confirmation/PDF/wallet) over trip.config.json's authored stand-in.
+  const bookedHotelPhases = new Set(bkAnchors.filter(b => b.type === 'hotel').map(b => b.phase));
+  const accAnchors = accommodationAnchors(cfg).filter(a => !bookedHotelPhases.has(a.phaseId));
+  renderHomeOverview(cfg, [...accAnchors, ...bkAnchors]);
 }
 
 function _bi(obj, lang) {

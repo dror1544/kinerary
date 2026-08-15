@@ -53,6 +53,12 @@ describe('accommodationAnchors()', () => {
     assert.ok(anchors.every(a => a.type === 'hotel'));
   });
 
+  test('carries the raw phase id, for matching against a hotel booking on the same phase', () => {
+    const { ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
+    const [ny] = ctx.accommodationAnchors(cfg);
+    assert.equal(ny.phaseId, 'ny');
+  });
+
   test('falls back to a Maps search link built from address when no mapsUrl is authored', () => {
     const { ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
     const [ny] = ctx.accommodationAnchors(cfg);
@@ -90,6 +96,12 @@ describe('isAnchorBooking()', () => {
     assert.equal(ctx.isAnchorBooking({ type: 'car', date_from: '2027-03-12' }), false);
     assert.equal(ctx.isAnchorBooking({ type: 'other', date_from: '2027-03-12' }), false);
   });
+
+  test('a cancelled booking (❌-prefixed name, the Bookings tab convention) is never an anchor', () => {
+    const { ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
+    assert.equal(ctx.isAnchorBooking({ type: 'flight', name: '❌ TLV → JFK', date_from: '2027-03-10' }), false);
+    assert.equal(ctx.isAnchorBooking({ type: 'hotel', name: '❌ Hotel Meridian' }), false);
+  });
 });
 
 describe('renderHomeOverview()', () => {
@@ -119,6 +131,21 @@ describe('renderHomeOverview()', () => {
     const { document, ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
     ctx.renderHomeOverview(cfg, []);
     assert.ok(document.getElementById('home-overview').querySelector('table'));
+  });
+
+  test('escapes an XSS payload in an anchor name (esc() is real, part of the RENDER_FUNS block)', () => {
+    const { document, ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
+    ctx.renderHomeOverview(cfg, [
+      { type: 'attraction', name: '<img src=x onerror=alert(1)>', date_from: '2027-03-12', phaseLabel: '🗽' },
+    ]);
+    const el = document.getElementById('home-overview');
+    // Check the parsed DOM structure, not the serialized .innerHTML string —
+    // happy-dom's innerHTML getter doesn't re-escape text-node content on
+    // the way out (a known quirk), so a round-tripped string check would be
+    // a false positive/negative either way. What actually matters for XSS is
+    // whether a live <img> element exists to fire onerror; it must not.
+    assert.equal(el.querySelectorAll('img').length, 0, 'no live <img> element should be created from the payload');
+    assert.ok(el.textContent.includes('<img src=x onerror=alert(1)>'), 'the payload should still be visible as inert text');
   });
 });
 
@@ -151,5 +178,29 @@ describe('loadHomeOverview()', () => {
     await ctx.loadHomeOverview(cfg);
     const html = document.getElementById('home-overview').innerHTML;
     assert.ok(html.includes('Meridian') || html.includes('מרידיאן'), 'hotel anchors should still render');
+  });
+
+  test('a real hotel booking on a phase replaces that phase\'s accommodation placeholder, not duplicates it', async () => {
+    const { document, ctx } = createRenderContext(HTML, cfg, 'he', {
+      ...EXTRA,
+      localStorage: { getItem: () => null },
+      fetch: async () => ({
+        ok: true,
+        json: async () => [
+          { id: 1, phase: 'ny', type: 'hotel', name: 'Hotel Meridian (confirmed)', date_from: '2027-03-11', confirmation: 'RES-1' },
+        ],
+      }),
+    });
+    await ctx.loadHomeOverview(cfg);
+    const rows = [...document.querySelectorAll('#home-overview tr')].slice(1);
+    // Fixture has 2 phases with accommodation (ny, colorado); only ny has a
+    // booking. Correct total is 2 rows: ny's booking (deduped against its
+    // accommodation placeholder) + colorado's untouched placeholder — not 3.
+    assert.equal(rows.length, 2, 'ny should contribute one row (the booking), not both the booking and its accommodation placeholder');
+    const nyRow = rows.find(r => r.innerHTML.includes('confirmed'));
+    assert.ok(nyRow, 'the real booking record should win over the accommodation placeholder');
+    assert.ok(!document.getElementById('home-overview').innerHTML.includes('מרידיאן'), 'the bare accommodation-name placeholder for ny should not also appear');
+    // colorado has no booking, so its accommodation placeholder is untouched
+    assert.ok(document.getElementById('home-overview').innerHTML.includes('Alpine') || document.getElementById('home-overview').innerHTML.includes('אלפים'));
   });
 });
