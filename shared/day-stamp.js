@@ -20,12 +20,22 @@ const EN_LONG     = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Fr
 // Weekday token, then d/m, then a dash. The description after the dash is
 // captured whole and never touched — that is the part a person wrote.
 // Anchored to the start: a date mentioned mid-sentence is prose, not a stamp.
+//
+// The weekday token is matched against the closed vocabulary below, not
+// "any 3-9 letter word" — a headline that happens to start "Gate 3/4 — final
+// boarding" or "Day 3/4 — halfway point" is prose, not a date stamp, and must
+// not be treated as one just because it fits the shape.
+const WEEKDAY_TOKENS = [
+  ...EN_LONG, ...EN_SHORT,
+  ...HE_WEEKDAYS.map(w => `${w}׳?`),
+].join('|');
 const STAMP_RE = new RegExp(
   '^\\s*'
-  + '(?:(?<wd>[A-Za-z]{3,9}|[\\u05D0-\\u05EA]\\u05F3?)\\s+)?'   // weekday, optional
+  + `(?:(?<wd>${WEEKDAY_TOKENS})\\s+)?`                          // weekday, optional
   + '(?<d>\\d{1,2})\\s*/\\s*(?<m>\\d{1,2})'                      // 13/8
   + '\\s*(?<sep>[\\u2014\\u2013-])\\s*'                          // — – -
-  + '(?<rest>[\\s\\S]*)$'
+  + '(?<rest>[\\s\\S]*)$',
+  'i'
 );
 
 // Noon avoids every timezone/DST edge that makes a bare YYYY-MM-DD land on the
@@ -76,4 +86,14 @@ function hasDayStamp(label) {
   return typeof label === 'string' && STAMP_RE.test(label);
 }
 
-module.exports = { repairDayStamp, hasDayStamp, HE_WEEKDAYS, EN_SHORT, EN_LONG };
+// The description part of a headline, with any leading date/weekday stamp
+// removed — the one true parse of "what comes after the stamp", so every
+// caller that needs to compare descriptions (ignoring which date they're
+// stamped with) shares this instead of re-deriving it with a narrower regex.
+function stampRest(label) {
+  const s = String(label || '');
+  const m = STAMP_RE.exec(s);
+  return m ? m.groups.rest : s;
+}
+
+module.exports = { repairDayStamp, hasDayStamp, stampRest, HE_WEEKDAYS, EN_SHORT, EN_LONG };

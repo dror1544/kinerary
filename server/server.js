@@ -11,7 +11,7 @@ const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
-const { repairDayStamp } = require('../shared/day-stamp');
+const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 
 const app = express();
 // Default (100kb) is too small for /api/bookings/extract, which the browser
@@ -2027,6 +2027,13 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   // time and time_sort must never drift apart, so the derived column is written
   // alongside rather than left to a separate caller.
   if (body.time !== undefined) { updates.push('time_sort = ?'); params.push(planTimeSort(body.time)); }
+  // A direct organizer rewrite supersedes any pending review correction: the
+  // struck-through "corrected" indicator must not outlive the wording that
+  // triggered it, or it keeps showing stale text next to what's now the
+  // organizer's own deliberate edit with no way to dismiss it.
+  if (body.text_he !== undefined || body.text_en !== undefined) {
+    updates.push('text_he_prev = NULL', 'text_en_prev = NULL', 'correction_note = NULL', 'corrected_at = NULL');
+  }
   if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
   params.push(req.params.id, req.params.phase_id);
   db.prepare(`UPDATE phase_plan_items SET ${updates.join(', ')} WHERE id = ? AND phase_id = ?`).run(...params);
@@ -2076,20 +2083,30 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
   // stored rather than being cleared to NULL.
   const existing = db.prepare('SELECT label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date = ?')
     .get(phaseId, date);
-  const pick = (f) => body[f] !== undefined
-    ? (String(body[f]).trim() || null)
-    : (existing?.[f] ?? null);
+  // An explicit null clears the field directly — String(null).trim() would
+  // otherwise stringify it to the literal text "null" and store that.
+  const pick = (f) => {
+    if (body[f] === undefined) return existing?.[f] ?? null;
+    if (body[f] === null) return null;
+    return String(body[f]).trim() || null;
+  };
   const labelHe = pick('label_he');
   const labelEn = pick('label_en');
   // A day that now has a headline has nothing left for the worker to write; one
   // whose headline was just cleared goes back in the queue instead of staying
   // blank forever.
   const status = (labelHe || labelEn) ? 'done' : 'pending';
+  // A direct organizer rewrite supersedes any pending review correction, the
+  // same way the item PATCH above does — otherwise the struck-through
+  // "corrected" indicator would keep pointing at wording the organizer has
+  // since deliberately replaced, with no way to dismiss it.
+  const clearCorrection = body.label_he !== undefined || body.label_en !== undefined;
   db.prepare(
     'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status,enrich_attempts) ' +
     'VALUES (?,?,?,?,?,0) ON CONFLICT(phase_id,date) DO UPDATE SET ' +
     'label_he = excluded.label_he, label_en = excluded.label_en, ' +
-    'enrichment_status = excluded.enrichment_status, enrich_attempts = 0'
+    'enrichment_status = excluded.enrichment_status, enrich_attempts = 0' +
+    (clearCorrection ? ', label_he_prev = NULL, label_en_prev = NULL, correction_note = NULL, corrected_at = NULL' : '')
   ).run(phaseId, date, labelHe, labelEn, status);
   res.json(db.prepare(
     'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
@@ -2123,17 +2140,22 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
       'WHERE phase_id = ? AND date IN (?, ?)'
     ).run(date_a, date_b, date_a, phaseId, date_a, date_b);
 
-    // The headline describes the day's content, so it travels with it.
+    // The headline describes the day's content, so it travels with it — and so
+    // does any correction history riding on it: a headline the reviewer already
+    // corrected once is still the same correction after it moves to a new date,
+    // not something to silently forget.
     const read = db.prepare(
-      'SELECT label_he, label_en FROM phase_plan_days WHERE phase_id = ? AND date = ?'
+      'SELECT label_he, label_en, label_he_prev, label_en_prev, correction_note, corrected_at ' +
+      'FROM phase_plan_days WHERE phase_id = ? AND date = ?'
     );
     const fromA = read.get(phaseId, date_a);
     const fromB = read.get(phaseId, date_b);
     db.prepare('DELETE FROM phase_plan_days WHERE phase_id = ? AND date IN (?, ?)')
       .run(phaseId, date_a, date_b);
     const write = db.prepare(
-      'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status,enrich_attempts) ' +
-      'VALUES (?,?,?,?,?,0)'
+      'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,label_he_prev,label_en_prev,' +
+      'correction_note,corrected_at,enrichment_status,enrich_attempts) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,0)'
     );
     // A date that carried no headline row still needs one once it holds items —
     // queued as 'pending' so the worker names it after what is now there.
@@ -2143,6 +2165,8 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
       ).get(phaseId, date);
       if (!src && !hasItems) return;
       write.run(phaseId, date, src?.label_he ?? null, src?.label_en ?? null,
+                src?.label_he_prev ?? null, src?.label_en_prev ?? null,
+                src?.correction_note ?? null, src?.corrected_at ?? null,
                 (src?.label_he || src?.label_en) ? 'done' : 'pending');
     };
     put(date_a, fromB);
@@ -2159,10 +2183,16 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
     'SELECT * FROM phase_plan_items WHERE phase_id = ? AND date IN (?, ?) ' +
     'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
   ).all(phaseId, date_a, date_b);
+  // Same columns as GET /plan/days, so a swap response and a fresh fetch carry
+  // the same shape — including `correction`, which repairStampsOn() may have
+  // just written synchronously above. Without it, an agent reading this
+  // response straight off the swap (as swap_plan_days's own tool description
+  // tells it to) would have no way to see that a headline was just rewritten.
   const days = db.prepare(
-    'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
-    'WHERE phase_id = ? AND date IN (?, ?) ORDER BY date ASC'
-  ).all(phaseId, date_a, date_b);
+    'SELECT phase_id, date, label_he, label_en, enrichment_status, ' +
+    'label_he_prev, label_en_prev, correction_note, corrected_at, review_status ' +
+    'FROM phase_plan_days WHERE phase_id = ? AND date IN (?, ?) ORDER BY date ASC'
+  ).all(phaseId, date_a, date_b).map(withCorrection);
   // Wording that referred to the old order is now wrong somewhere in this
   // phase. Queued, not run inline: a Hermes call takes ~30-90s and the laptop
   // it runs on is routinely closed — a schedule edit must not depend on that.
@@ -2418,25 +2448,34 @@ function phaseScheduleForReview(phaseId) {
     'SELECT id, date, time, text_he, text_en FROM phase_plan_items WHERE phase_id = ? ' +
     'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
   ).all(phaseId);
-  const labels = Object.fromEntries(
-    db.prepare('SELECT date, label_he, label_en FROM phase_plan_days WHERE phase_id = ?')
-      .all(phaseId).map(d => [d.date, d])
-  );
+  const labelRows = db.prepare('SELECT date, label_he, label_en FROM phase_plan_days WHERE phase_id = ?').all(phaseId);
+  const labels = Object.fromEntries(labelRows.map(d => [d.date, d]));
   const byDate = new Map();
-  for (const it of items) {
-    const key = it.date || 'unscheduled';
+  const dayEntry = (date) => {
+    const key = date || 'unscheduled';
     if (!byDate.has(key)) {
       byDate.set(key, {
-        date: it.date || null,
-        weekday: it.date ? new Date(it.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' }) : null,
-        label_he: labels[it.date]?.label_he || null,
-        label_en: labels[it.date]?.label_en || null,
+        date: date || null,
+        weekday: date ? new Date(date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' }) : null,
+        label_he: labels[date]?.label_he || null,
+        label_en: labels[date]?.label_en || null,
         items: [],
       });
     }
-    byDate.get(key).items.push({ id: it.id, time: it.time || null, text_he: it.text_he, text_en: it.text_en });
+    return byDate.get(key);
+  };
+  for (const it of items) {
+    dayEntry(it.date).items.push({ id: it.id, time: it.time || null, text_he: it.text_he, text_en: it.text_en });
   }
-  return [...byDate.values()];
+  // A day may carry a headline with no items under it at all (set via
+  // set_plan_day_label before anything was scheduled) — it still needs to be
+  // reviewed, so it can't be reached only by walking items.
+  for (const d of labelRows) dayEntry(d.date);
+  return [...byDate.values()].sort((a, b) => {
+    if (!a.date) return 1;
+    if (!b.date) return -1;
+    return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
+  });
 }
 
 async function reviewPhase(phaseId, days) {
@@ -2458,8 +2497,13 @@ async function reviewPhase(phaseId, days) {
 // Writes one correction, keeping the superseded wording. Never overwrites an
 // existing *_prev: after two reorders the ORIGINAL is what an organizer wants
 // to see struck through, not the reviewer's own previous attempt.
-function applyItemCorrection(c, note) {
-  const row = db.prepare('SELECT text_he, text_en, text_he_prev, text_en_prev FROM phase_plan_items WHERE id = ?').get(c.id);
+//
+// Scoped by phase_id, not id alone: item ids are one auto-increment sequence
+// shared across every phase, so a correction the reviewer meant for phase A
+// could otherwise silently land on an unrelated row that just happens to
+// share that id in phase B.
+function applyItemCorrection(phaseId, c, note) {
+  const row = db.prepare('SELECT text_he, text_en, text_he_prev, text_en_prev FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(c.id, phaseId);
   if (!row) return false;
   const changedHe = c.text_he !== undefined && c.text_he !== row.text_he;
   const changedEn = c.text_en !== undefined && c.text_en !== row.text_en;
@@ -2469,22 +2513,24 @@ function applyItemCorrection(c, note) {
     'text_he = COALESCE(?, text_he), text_en = COALESCE(?, text_en), ' +
     'text_he_prev = COALESCE(text_he_prev, ?), text_en_prev = COALESCE(text_en_prev, ?), ' +
     "correction_note = ?, corrected_at = datetime('now'), status = 'needs_review' " +
-    'WHERE id = ?'
+    'WHERE id = ? AND phase_id = ?'
   ).run(
     changedHe ? c.text_he : null, changedEn ? c.text_en : null,
     changedHe ? row.text_he : null, changedEn ? row.text_en : null,
-    note, c.id
+    note, c.id, phaseId
   );
   return true;
 }
 
 // The description part of a headline, with any leading date/weekday stamp
 // removed — "Thu 13/8 — Tsukiji, Ginza" and "Wed 40/9 — Tsukiji, Ginza" are the
-// same day being described, differently dated.
+// same day being described, differently dated. Shares shared/day-stamp.js's
+// stamp parsing rather than re-detecting it with a narrower one: that one only
+// stripped an em dash, so a stamp separated by an en dash or hyphen (both of
+// which STAMP_RE itself accepts) slipped through with the date still attached,
+// and this safety check could then miss content that had actually moved.
 function headlineGist(label) {
-  const s = String(label || '');
-  const afterStamp = s.includes('—') ? s.slice(s.indexOf('—') + 1) : s;
-  return afterStamp.toLowerCase().replace(/[\s.,:;·/–—-]+/g, ' ').trim();
+  return stampRest(label).toLowerCase().replace(/[\s.,:;·/–—-]+/g, ' ').trim();
 }
 
 // Seen on the first real run: asked to repair stale dates after a swap, the
@@ -2531,13 +2577,25 @@ function applyDayCorrection(phaseId, c, note) {
 
 async function runScheduleReviewPass() {
   if (!HERMES_URL) return;
+  // A phase whose active plan is headline-only (days set via
+  // set_plan_day_label but no items under them yet) has nothing in
+  // phase_plan_items at all — discovering pending phases from that table
+  // alone left such a phase queued forever, its attempts ceiling never
+  // engaging either since that too was only ever computed over items.
   const phases = db.prepare(
-    "SELECT DISTINCT phase_id FROM phase_plan_items WHERE review_status = 'pending' AND review_attempts < ?"
+    "SELECT DISTINCT phase_id FROM (" +
+    "  SELECT phase_id, review_status, review_attempts FROM phase_plan_items " +
+    '  UNION ALL ' +
+    "  SELECT phase_id, review_status, review_attempts FROM phase_plan_days" +
+    ") WHERE review_status = 'pending' AND review_attempts < ?"
   ).all(REVIEW_MAX_ATTEMPTS).map(r => r.phase_id);
 
   for (const phaseId of phases) {
     db.prepare(
       'UPDATE phase_plan_items SET review_attempts = review_attempts + 1 WHERE phase_id = ? AND review_status = ?'
+    ).run(phaseId, 'pending');
+    db.prepare(
+      'UPDATE phase_plan_days SET review_attempts = review_attempts + 1 WHERE phase_id = ? AND review_status = ?'
     ).run(phaseId, 'pending');
     try {
       const days = phaseScheduleForReview(phaseId);
@@ -2546,7 +2604,7 @@ async function runScheduleReviewPass() {
       db.transaction(() => {
         for (const c of corrections) {
           const note = c.note || 'wording referred to the previous day order';
-          if (c.kind === 'item' ? applyItemCorrection(c, note) : applyDayCorrection(phaseId, c, note)) applied++;
+          if (c.kind === 'item' ? applyItemCorrection(phaseId, c, note) : applyDayCorrection(phaseId, c, note)) applied++;
         }
         db.prepare("UPDATE phase_plan_items SET review_status = 'done' WHERE phase_id = ? AND review_status = 'pending'").run(phaseId);
         db.prepare("UPDATE phase_plan_days  SET review_status = 'done' WHERE phase_id = ? AND review_status = 'pending'").run(phaseId);
@@ -2554,8 +2612,12 @@ async function runScheduleReviewPass() {
       if (applied) console.log(`[review] ${phaseId}: corrected ${applied} line(s) after a reorder`);
     } catch (e) {
       const attempts = db.prepare(
-        'SELECT MAX(review_attempts) a FROM phase_plan_items WHERE phase_id = ?'
-      ).get(phaseId)?.a || 0;
+        'SELECT MAX(a) a FROM (' +
+        '  SELECT review_attempts a FROM phase_plan_items WHERE phase_id = ?' +
+        '  UNION ALL' +
+        '  SELECT review_attempts a FROM phase_plan_days WHERE phase_id = ?' +
+        ')'
+      ).get(phaseId, phaseId)?.a || 0;
       if (attempts >= REVIEW_MAX_ATTEMPTS) {
         db.prepare("UPDATE phase_plan_items SET review_status = 'failed' WHERE phase_id = ? AND review_status = 'pending'").run(phaseId);
         db.prepare("UPDATE phase_plan_days  SET review_status = 'failed' WHERE phase_id = ? AND review_status = 'pending'").run(phaseId);
