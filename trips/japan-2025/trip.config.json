@@ -149,8 +149,8 @@
         {
           "date": "2026-09-06",
           "label": {
-            "he": "א׳ 37/9 — נחיתה · Asakusa",
-            "en": "Sun 37/9 — Arrival · Asakusa"
+            "he": "א׳ 6/9 — נחיתה · Asakusa",
+            "en": "Sun 6/9 — Arrival · Asakusa"
           },
           "items": [
             {
@@ -200,8 +200,8 @@
         {
           "date": "2026-09-07",
           "label": {
-            "he": "ב׳ 38/9 — שיבויה, הרג׳וקו, שינג׳וקו",
-            "en": "Mon 38/9 — Shibuya, Harajuku, Shinjuku"
+            "he": "ב׳ 7/9 — שיבויה, הרג׳וקו, שינג׳וקו",
+            "en": "Mon 7/9 — Shibuya, Harajuku, Shinjuku"
           },
           "items": [
             {
@@ -244,8 +244,8 @@
         {
           "date": "2026-09-08",
           "label": {
-            "he": "ג׳ 39/9 — Tsukiji, Ginza, teamLab, Akihabara",
-            "en": "Tue 39/9 — Tsukiji, Ginza, teamLab, Akihabara"
+            "he": "ג׳ 8/9 — Tsukiji, Ginza, teamLab, Akihabara",
+            "en": "Tue 8/9 — Tsukiji, Ginza, teamLab, Akihabara"
           },
           "items": [
             {
@@ -288,8 +288,8 @@
         {
           "date": "2026-09-09",
           "label": {
-            "he": "ד׳ 40/9 — טוקיו עומק: Yanaka, קניות, ערב מיוחד",
-            "en": "Wed 40/9 — Deep Tokyo: Yanaka, shopping, special evening"
+            "he": "ד׳ 9/9 — טוקיו עומק: Yanaka, קניות, ערב מיוחד",
+            "en": "Wed 9/9 — Deep Tokyo: Yanaka, shopping, special evening"
           },
           "items": [
             {
@@ -597,8 +597,8 @@
         {
           "date": "2026-09-10",
           "label": {
-            "he": "ה׳ 41/9 — טוקיו → האקונה",
-            "en": "Thu 41/9 — Tokyo → Hakone"
+            "he": "ה׳ 10/9 — טוקיו → האקונה",
+            "en": "Thu 10/9 — Tokyo → Hakone"
           },
           "items": [
             {
@@ -748,8 +748,8 @@
         {
           "date": "2026-09-11",
           "label": {
-            "he": "ו׳ 42/9 — האקונה → קיוטו ברכבת קליע",
-            "en": "Fri 42/9 — Hakone → Kyoto by Shinkansen"
+            "he": "ו׳ 11/9 — האקונה → קיוטו ברכבת קליע",
+            "en": "Fri 11/9 — Hakone → Kyoto by Shinkansen"
           },
           "items": [
             {
@@ -799,8 +799,8 @@
         {
           "date": "2026-09-12",
           "label": {
-            "he": "ש׳ 43/9 — קיוטו קלאסית: Kiyomizu, Higashiyama, טקס תה",
-            "en": "Sat 43/9 — Classic Kyoto: Kiyomizu, Higashiyama, tea ceremony"
+            "he": "ש׳ 12/9 — קיוטו קלאסית: Kiyomizu, Higashiyama, טקס תה",
+            "en": "Sat 12/9 — Classic Kyoto: Kiyomizu, Higashiyama, tea ceremony"
           },
           "items": [
             {
@@ -1528,6 +1528,11 @@
         "he": "eSIM מומלץ להורדה מראש (Airalo / Ubigi)",
         "en": "Recommended eSIM to download in advance (Airalo / Ubigi)"
       }
+    ]
+  },
+  "agent": {
+    "organizers": [
+      "eitan"
     ]
   }
 }

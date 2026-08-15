@@ -25,12 +25,23 @@ function getRenderCode() {
  * @param {string} html  - innerHTML to seed into document.body
  * @param {object} cfg   - window.TRIP_CONFIG value
  * @param {string} lang  - 'he' | 'en'
- * @param {object} extra - additional context bindings (e.g. fetch, localStorage)
+ * @param {object} extra - additional globals to define in the context (e.g.
+ *   fetch, localStorage). Some render functions read module-level state that
+ *   lives outside the RENDER_FUNS block (renderDays needs PHASE_PLAN,
+ *   PHASE_PLAN_DAYS and isOrganizer), so a caller exercising those has to
+ *   supply them. `T` is merged per-language rather than replaced, so passing
+ *   a few plan strings doesn't drop the defaults every other test relies on.
  */
 export function createRenderContext(html = '', cfg = {}, lang = 'he', extra = {}) {
   const win = new Window({ url: 'http://localhost/' });
   const doc = win.document;
   doc.body.innerHTML = html;
+
+  const { T: extraT, ...extraGlobals } = extra;
+  const baseT = {
+    he: { upload_click: 'לחץ לבחירת תמונות', bk_err_server: 'שגיאה', bk_no_bookings: 'אין' },
+    en: { upload_click: 'Click to upload',    bk_err_server: 'Error',  bk_no_bookings: 'None' },
+  };
 
   const ctx = vm.createContext({
     window:      win,
@@ -38,11 +49,11 @@ export function createRenderContext(html = '', cfg = {}, lang = 'he', extra = {}
     TRIP_CONFIG: cfg,
     currentLang: lang,
     T: {
-      he: { upload_click: 'לחץ לבחירת תמונות', bk_err_server: 'שגיאה', bk_no_bookings: 'אין' },
-      en: { upload_click: 'Click to upload',    bk_err_server: 'Error',  bk_no_bookings: 'None' },
+      he: { ...baseT.he, ...(extraT?.he || {}) },
+      en: { ...baseT.en, ...(extraT?.en || {}) },
     },
     console,
-    ...extra,
+    ...extraGlobals,
   });
 
   vm.runInContext(getRenderCode(), ctx, { filename: 'app.js (render fns)' });

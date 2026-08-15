@@ -272,6 +272,9 @@ const NY_PHOTOS = [
    AUTH (multi-user, server-side JWT)
    ========================================================= */
 let currentUser = null;
+let isOrganizer = false;
+const PHASE_PLAN = {}; // phase_id → array of plan items loaded from DB
+const PHASE_PLAN_DAYS = {}; // phase_id → { date: {label_he,label_en,...} }
 
 async function doLogin() {
   const username = document.getElementById('user-input').value.trim().toLowerCase();
@@ -960,6 +963,7 @@ async function checkAuth() {
       const res = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` } });
       if (res.ok) {
         currentUser = await res.json();
+        isOrganizer = !!currentUser.is_organizer;
         localStorage.setItem('trip-user', JSON.stringify(currentUser));
         showLoggedIn();
         document.getElementById('login-overlay').style.display = 'none';
@@ -1018,7 +1022,7 @@ function uname(username, userObj) {
 }
 
 /* =========================================================
-   COUNTDOWN
+   TRIP CLOCK
    ========================================================= */
 // Three states, not one. The original only counted down to departure and, once
 // that passed, wrote a rocket into the days slot and returned early — leaving
@@ -1026,8 +1030,11 @@ function uname(username, userObj) {
 // departure is in the past therefore displayed a permanently broken timer,
 // which is every past trip and every demo of one.
 //
-// Now: before departure → time until departure; during the trip → time until
-// it ends; after → a finished state, no timer at all.
+// Counting is only interesting before the trip. Once it starts, "time until it
+// ends" is the one number nobody wants on screen, so the card stops counting
+// and answers "where am I?" instead: the active phase and which day of the trip
+// this is, clicking through to that phase's page. After → a finished state.
+/* TRIP_CLOCK_BEGIN */
 function tripPhaseNow(meta, now = new Date()) {
   const dep = meta?.departure ? new Date(meta.departure) : null;
   if (!dep || isNaN(dep)) return null;
@@ -1047,39 +1054,148 @@ function tripPhaseNow(meta, now = new Date()) {
   return { state: 'during', target: null };
 }
 
-function tick() {
-  const meta = window.TRIP_CONFIG?.meta;
-  const phase = tripPhaseNow(meta);
-  if (!phase) return; // config not loaded yet — nothing to count down to
+// Calendar day as a comparable integer. Built from UTC on purpose: a DST shift
+// inside the trip makes a local day 23 or 25 hours long, which would round a
+// plain millisecond division to the wrong day.
+function dayIndex(d) {
+  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+}
+
+function localYMD(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// "Day 4 of 12" — day 1 is the departure day itself.
+function tripDayNumber(meta, now = new Date()) {
+  const dep = meta?.departure ? new Date(meta.departure) : null;
+  if (!dep || isNaN(dep)) return null;
+  const day = dayIndex(now) - dayIndex(dep) + 1;
+  if (day < 1) return null;
+  // meta.totalDays is the length the hero already advertises ("5 people · 11
+  // days"), so it wins over the raw departure→return span — the two disagree
+  // whenever the trip opens with a night flight. Clamp rather than let the two
+  // numbers contradict each other: "day 12 of 11" is worse than a repeated
+  // final day. Noon avoids YYYY-MM-DD parsing as UTC midnight, which lands on
+  // the previous day west of Greenwich.
+  const ret  = meta.returnDate ? new Date(`${meta.returnDate}T12:00:00`) : null;
+  const span = ret && !isNaN(ret) ? dayIndex(ret) - dayIndex(dep) + 1 : null;
+  const total = meta.totalDays || span || null;
+  return { day: total ? Math.min(day, total) : day, total };
+}
+
+// Which phase the trip is in right now.
+function currentTripPhase(phases, now = new Date()) {
+  const list = (phases || [])
+    .filter(p => p?.dates?.start)
+    .sort((a, b) => String(a.dates.start).localeCompare(String(b.dates.start)));
+  if (!list.length) return null;
+  const today = localYMD(now);
+  // Phases share their boundary day — you check out of one and into the next on
+  // the same date — so the phase being travelled *into* wins.
+  const inRange = list.filter(p => p.dates.start <= today && today <= (p.dates.end || p.dates.start));
+  if (inRange.length) return inRange[inRange.length - 1];
+  // Evening of an outbound flight that lands tomorrow, or a gap between two
+  // phases: point at where the trip is heading, not where it's been.
+  return list.find(p => p.dates.start > today) || list[list.length - 1];
+}
+
+function tripClockState(cfg, now = new Date()) {
+  const state = tripPhaseNow(cfg?.meta, now);
+  if (!state || state.state !== 'during') return state;
+  const counted = tripDayNumber(cfg?.meta, now) || {};
+  return {
+    ...state,
+    phase:     currentTripPhase(cfg?.phases, now),
+    day:       counted.day  || null,
+    totalDays: counted.total || null,
+  };
+}
+
+// The whole card is the hit target mid-trip, and nothing at all otherwise —
+// leaving a stale role/tabindex behind would hand keyboard users a button that
+// silently does nothing once the trip is over.
+function setClockTarget(card, phaseId, label) {
+  if (!card) return;
+  card.classList.toggle('clickable', !!phaseId);
+  if (phaseId) {
+    card.setAttribute('data-phase-tab', phaseId);
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    if (label) { card.setAttribute('aria-label', label); card.setAttribute('title', label); }
+  } else {
+    ['data-phase-tab', 'role', 'tabindex', 'aria-label', 'title'].forEach(a => card.removeAttribute(a));
+  }
+}
+
+function tick(now = new Date()) {
+  const cfg = window.TRIP_CONFIG;
+  const clock = tripClockState(cfg, now);
+  if (!clock) return; // config not loaded yet — nothing to count down to
 
   const el = id => document.getElementById(id);
   const setText = (id, v) => { const e = el(id); if (e) e.textContent = v; };
   const tr = (typeof T !== 'undefined' && T[currentLang]) || {};
 
+  const card     = el('hero-countdown');
   const units    = el('cd-units');
+  const live     = el('cd-live');
   const finished = el('cd-finished');
   const caption  = el('cd-caption');
 
-  if (phase.state === 'finished') {
-    if (units) units.hidden = true;
+  if (units)    units.hidden    = clock.state !== 'before';
+  if (live)     live.hidden     = clock.state !== 'during';
+  if (finished) finished.hidden = clock.state !== 'finished';
+
+  if (clock.state === 'finished') {
+    setClockTarget(card, null);
     if (caption) caption.textContent = '';
-    if (finished) { finished.hidden = false; finished.textContent = tr.cd_finished || '✅ הטיול הסתיים'; }
+    if (finished) finished.textContent = tr.cd_finished || '✅ הטיול הסתיים';
     return;
   }
 
-  if (units) units.hidden = false;
-  if (finished) finished.hidden = true;
-  if (caption) caption.textContent = phase.state === 'during' ? (tr.cd_until_end || '') : (tr.cd_until_departure || '');
+  if (clock.state === 'during') {
+    const p = clock.phase;
+    const title = typeof p?.title === 'object' ? (p.title[currentLang] || p.title.he) : (p?.title || p?.tabLabel || '');
+    setClockTarget(card, p?.id || null, tr.cd_open_phase);
+    if (caption) caption.textContent = tr.cd_in_progress || '';
+    setText('cd-live-phase', [p?.emoji, title].filter(Boolean).join(' '));
+    setText('cd-live-day', clock.day
+      ? (clock.totalDays
+          ? (tr.cd_day_of || '{n}/{total}').replace('{n}', clock.day).replace('{total}', clock.totalDays)
+          : (tr.cd_day || '{n}').replace('{n}', clock.day))
+      : '');
+    setText('cd-live-arrow', currentLang === 'he' ? '←' : '→');
+    return;
+  }
 
-  if (!phase.target) { setText('cd-d', '🚀'); setText('cd-h', '—'); setText('cd-m', '—'); setText('cd-s', '—'); return; }
+  setClockTarget(card, null);
+  if (caption) caption.textContent = tr.cd_until_departure || '';
 
-  const diff = Math.max(0, phase.target - new Date());
+  const diff = Math.max(0, clock.target - now);
   setText('cd-d', Math.floor(diff / 86400000));
   setText('cd-h', String(Math.floor((diff % 86400000) / 3600000)).padStart(2, '0'));
   setText('cd-m', String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0'));
   setText('cd-s', String(Math.floor((diff % 60000) / 1000)).padStart(2, '0'));
 }
+
+// Wired once, on the card rather than on the live block, so the click target is
+// the whole card; tick() decides per second whether it currently leads anywhere.
+function wireTripClock() {
+  const card = document.getElementById('hero-countdown');
+  if (!card) return;
+  const open = () => {
+    const tab = card.getAttribute('data-phase-tab');
+    if (tab) switchTab(tab);
+  };
+  card.addEventListener('click', open);
+  card.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+}
+
+wireTripClock();
 setInterval(tick, 1000); tick();
+/* TRIP_CLOCK_END */
 
 /* =========================================================
    TABS + HERO SWAP
@@ -1455,6 +1571,7 @@ const venueCommentsCache = {};
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+
 
 async function toggleVenueComments(venueId) {
   const thread = document.getElementById(`vc-thread-${venueId}`);
@@ -2454,7 +2571,12 @@ async function loadBookings() {
     if (!rows.length) { el.innerHTML = `<p style="color:var(--ink-2);padding:24px 0;text-align:center">${tr.bk_no_bookings}</p>`; return; }
     const byPhase = {};
     for (const b of rows) { (byPhase[b.phase] = byPhase[b.phase] || []).push(b); }
-    const phaseOrder = ['intl_flights','nyc','dallas','colorado','west_coast'];
+    // Config-driven, not the original trip's hardcoded ids — a booking whose
+    // phase isn't in trip.config.json at all (renamed/removed phase, typo)
+    // still gets a section instead of silently vanishing from the list.
+    const knownPhases = ['intl_flights', ...(window.TRIP_CONFIG?.phases || []).map(p => p.id)];
+    const leftoverPhases = Object.keys(byPhase).filter(p => !knownPhases.includes(p));
+    const phaseOrder = [...knownPhases, ...leftoverPhases];
     let html = '';
     for (const phase of phaseOrder) {
       if (!byPhase[phase]) continue;
@@ -2506,7 +2628,8 @@ async function extractBookingWithAI() {
 
   const token = localStorage.getItem('trip-token');
   btn.disabled = true;
-  statusEl.textContent = tr.bk_extract_loading;
+  statusEl.style.color = '';
+  statusEl.innerHTML = `<span class="inline-spinner"></span>${tr.bk_extract_loading}`;
 
   try {
     let body, headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
@@ -2540,6 +2663,15 @@ async function extractBookingWithAI() {
     if (data.notes)        document.getElementById('bk-notes').value       = data.notes;
     if (data.location_url) document.getElementById('bk-location-url').value = data.location_url;
 
+    if (file) {
+      // Same PDF already uploaded for extraction — carry it over as the
+      // confirmation attachment too, instead of making them attach it
+      // again below by hand.
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      document.getElementById('bk-file').files = dt.files;
+    }
+
     statusEl.style.color = 'var(--ok, #16a34a)';
     statusEl.textContent = tr.bk_extract_success;
     document.getElementById('bk-extract-url').value = '';
@@ -2569,6 +2701,14 @@ function showBookingForm(phase, bookingData) {
   document.getElementById('bk-location-url').value  = bookingData?.location_url || '';
   document.getElementById('bk-file').value     = '';
   document.getElementById('bk-err').textContent = '';
+  // Leftover from a previous extraction (text + color) otherwise stays on
+  // screen — a stale "✓ Details extracted" can sit there for an entirely
+  // new, unrelated booking.
+  document.getElementById('bk-extract-url').value = '';
+  document.getElementById('bk-extract-file').value = '';
+  const extractStatusEl = document.getElementById('bk-extract-status');
+  extractStatusEl.textContent = '';
+  extractStatusEl.style.color = '';
   const tr = T[currentLang] || T['he'];
   document.getElementById('bk-form-title').textContent = bookingData ? tr.bk_form_edit : tr.bk_form_title;
   document.getElementById('bk-overlay').style.display = 'flex';
@@ -2751,6 +2891,25 @@ async function loadTripConfig() {
   } catch (e) {
     console.warn('Could not load trip config, using hardcoded defaults:', e);
   }
+}
+
+async function loadPhasePlans() {
+  const phases = window.TRIP_CONFIG?.phases || [];
+  const token = localStorage.getItem('trip-token');
+  if (!token) return;
+  await Promise.all(phases.map(async p => {
+    try {
+      const h = { Authorization: `Bearer ${token}` };
+      const [items, days] = await Promise.all([
+        fetch(`/api/phases/${p.id}/plan`, { headers: h }),
+        fetch(`/api/phases/${p.id}/plan/days`, { headers: h }),
+      ]);
+      if (items.ok) PHASE_PLAN[p.id] = await items.json();
+      if (days.ok) {
+        PHASE_PLAN_DAYS[p.id] = Object.fromEntries((await days.json()).map(d => [d.date, d]));
+      }
+    } catch {}
+  }));
 }
 
 // Pre-auth "pick yourself" data for the login screen. /api/config now
@@ -2965,6 +3124,29 @@ function buildGlobalsFromConfig(cfg) {
    CONFIG-DRIVEN RENDER FUNCTIONS
    ========================================================= */
 /* RENDER_FUNS_BEGIN */
+
+// Escaping helpers live inside the render region because that is the only
+// place that uses them (32 call sites, all below) — and because the region is
+// what tests/helpers/dom.js extracts, so leaving them outside made the render
+// code untestable in isolation.
+//
+// escapeHtml() elsewhere only ever fed element text, so it leaves quotes alone
+// and assumes a string. Plan items come from the DB and the AI extraction path,
+// where a value can land in an attribute and can be a number or object — so
+// this one escapes quotes too and coerces first.
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Only ever emit an http(s) href. A stored `javascript:` location_url would
+// otherwise execute for every family member who opens the phase tab.
+function safeUrl(u) {
+  const s = String(u ?? '').trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
 
 function applyBrandFromConfig(cfg) {
   if (!cfg?.meta) return;
@@ -3365,19 +3547,453 @@ function telegramLoginErrorMessage(code, tr) {
   return messages[code] || tr.err_wrong;
 }
 
+/* ── PHASE PLAN ITEM HELPERS ─────────────────────────────────────────────── */
+
+function _authHeaders() {
+  const token = localStorage.getItem('trip-token');
+  return token ? { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' };
+}
+
+async function savePlanItem(phaseId, payload) {
+  const res = await fetch(`/api/phases/${phaseId}/plan`, { method: 'POST', headers: _authHeaders(), body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(await res.text());
+  const item = await res.json();
+  PHASE_PLAN[phaseId] = [...(PHASE_PLAN[phaseId] || []), item];
+  return item;
+}
+
+async function updatePlanItem(phaseId, id, payload) {
+  const res = await fetch(`/api/phases/${phaseId}/plan/${id}`, { method: 'PATCH', headers: _authHeaders(), body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(await res.text());
+  const updated = await res.json();
+  PHASE_PLAN[phaseId] = (PHASE_PLAN[phaseId] || []).map(x => x.id === id ? updated : x);
+  return updated;
+}
+
+async function deletePlanItem(phaseId, id) {
+  const res = await fetch(`/api/phases/${phaseId}/plan/${id}`, { method: 'DELETE', headers: _authHeaders() });
+  if (!res.ok) throw new Error(await res.text());
+  PHASE_PLAN[phaseId] = (PHASE_PLAN[phaseId] || []).filter(x => x.id !== id);
+}
+
+// NOTE: a per-day weather badge was dropped here. It read WX_CACHE, which is
+// only ever written by _loadPoiWeather() — reachable exclusively from the POI
+// click handler whose backing data (POI_DATA) was intentionally removed. So the
+// badge always rendered ''. Restoring it needs its own forecast fetch keyed on
+// phase.accommodation.weatherKey, not a read of that cache.
+
+// Rough-time tokens mirror ROUGH_TIMES in server.js. Kept as tokens rather than
+// free text so they stay translatable and sortable.
+const PLAN_ROUGH_TIMES = ['morning', 'noon', 'afternoon', 'evening'];
+
+function _planTimeLabel(t, tr) {
+  if (!t) return '';
+  return PLAN_ROUGH_TIMES.includes(t) ? (tr[`plan_rough_${t}`] || t) : t;
+}
+
+// The enrichment strip: a collapsed line per item that opens to the links the
+// model found. Reuses the existing loc-panel pattern rather than inventing a
+// second collapsible. Renders nothing at all when there is nothing to show and
+// nothing pending, so an un-enrichable item ("pack the suitcases") stays clean.
+function _buildEnrichPanel(item, tr) {
+  // Parsed first so a link the organizer named ("Podmore") keeps that name even
+  // when it is also the item's location_url — otherwise the place with a name
+  // is the one that renders as a generic "Google Maps".
+  let authored = [];
+  try {
+    const p = typeof item.extra_links === 'string' ? JSON.parse(item.extra_links) : item.extra_links;
+    if (Array.isArray(p)) authored = p.filter(l => l && safeUrl(l.url) && l.label);
+  } catch { /* malformed json is simply no authored links */ }
+  const namedFor = new Map(authored.map(l => [l.url, l.label]));
+
+  const links = [
+    ['🗺️', tr.plan_link_maps,    item.location_url],
+    ['🔵', tr.plan_link_waze,    item.waze_url],
+    ['🌐', tr.plan_link_website, item.website_url],
+    ['🎟️', tr.plan_link_tickets, item.ticket_url],
+  ].filter(([, , url]) => safeUrl(url))
+   .map(([icon, label, url]) => [icon, namedFor.get(url) || label, url]);
+
+  // Places the organizer linked by hand in the original schedule. An item may
+  // name several, and each keeps its own name as the button label.
+  // The enrichment buttons above already carry these URLs (now under their
+  // authored names), so only the remaining places need their own button.
+  const extra = authored.filter(l => !links.some(([, , u]) => u === l.url));
+
+  const pending = item.enrichment_status === 'pending';
+  if (!links.length && !extra.length && !pending) return '';
+
+  if (!links.length && !extra.length) {
+    return `<div class="plan-enrich plan-enrich-pending">${esc(tr.plan_enriching)}</div>`;
+  }
+  const row = links.map(([icon, label, url]) =>
+    `<a class="btn plan-enrich-link" href="${esc(safeUrl(url))}" target="_blank" rel="noopener">${icon} ${esc(label)}</a>`
+  ).join('') + extra.map(l =>
+    `<a class="btn plan-enrich-link plan-place-link" href="${esc(safeUrl(l.url))}" target="_blank" rel="noopener">📍 ${esc(l.label)}</a>`
+  ).join('');
+  return `<div class="loc-panel plan-enrich">
+    <button class="loc-panel-hdr" type="button" data-plan-enrich-toggle>
+      <span>📍 ${esc(tr.plan_enrich_hdr)}${pending ? ` · ${esc(tr.plan_enriching)}` : ''}</span>
+      <span class="loc-panel-chevron">▼</span>
+    </button>
+    <div class="loc-panel-body">
+      <div class="loc-nav-row">${row}</div>
+      <div class="plan-enrich-note">${esc(tr.plan_enrich_note)}</div>
+    </div>
+  </div>`;
+}
+
+function _buildPlanItemRow(item, phaseId, tr) {
+  // Ticket state, in the same green/red pill vocabulary the rest of the site
+  // uses: green once a real booking backs it, red while money still has to
+  // change hands. Nothing at all when the place needs no ticket, so the
+  // schedule doesn't fill up with reassurances.
+  const ticket = item.booking
+    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)}${
+        item.booking.confirmation ? ` · ${esc(item.booking.confirmation)}` : ''}</span>`
+    : item.needs_tickets
+      ? `<span class="tag r plan-tag">⚠️ ${esc(item.advance_booking ? tr.plan_tickets_advance : tr.plan_tickets_needed)}</span>`
+      : '';
+  const conf = ticket;
+  const review = item.status === 'needs_review'
+    ? `<span class="plan-needs-review">${esc(tr.plan_needs_review)}</span>`
+    : '';
+  // Handlers are bound by delegation off these data-* attributes rather than a
+  // string-built onclick — an apostrophe in a stored value used to break out of
+  // the attribute and execute.
+  const del = isOrganizer
+    ? `<button class="plan-del-btn" data-plan-del="${esc(item.id)}" data-plan-phase="${esc(phaseId)}" title="${esc(tr.plan_delete_confirm)}">✕</button>`
+    : '';
+  // The maps link used to be a bare 📍 next to the text; it now lives in the
+  // enrichment panel below alongside Waze/site/tickets, so it isn't repeated.
+  const when = _planTimeLabel(item.time, tr);
+  return `<li class="plan-item" data-id="${esc(item.id)}">
+    ${when ? `<strong>${esc(when)}</strong> — ` : ''}${_biSpan({ he: esc(item.text_he), en: esc(item.text_en) })}${conf}${review}${del}
+    ${_buildCorrection(item.correction, { he: item.text_he_prev, en: item.text_en_prev }, tr)}
+    <span class="plan-err" hidden></span>
+    ${_buildEnrichPanel(item, tr)}
+  </li>`;
+}
+
+// A line the post-reorder review rewrote shows what it used to say, struck
+// through, with the reason. Silently swapping words an organizer wrote is how
+// a family stops trusting the schedule — the change has to be legible as a
+// change, and attributable.
+function _buildCorrection(correction, prev, tr) {
+  if (!correction) return '';
+  const was = _biSpan({ he: prev?.he ? esc(prev.he) : '', en: prev?.en ? esc(prev.en) : '' });
+  if (!prev?.he && !prev?.en) return '';
+  return `<div class="plan-correction">
+    <s class="plan-correction-was">${was}</s>
+    <span class="plan-correction-note">✏️ ${esc(correction.note || tr.plan_corrected)}</span>
+  </div>`;
+}
+
+function _buildAddItemRow(phaseId, date, tr) {
+  if (!isOrganizer) return '';
+  return `<li class="plan-add-row">
+    <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
+      <option value="">${esc(tr.plan_rough_none)}</option>
+      ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
+    </select>
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
+    <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
+    <button class="btn plan-save-btn" data-plan-add="${esc(phaseId)}" data-plan-date="${esc(date || '')}">${esc(tr.plan_save)}</button>
+    <span class="plan-err" hidden></span>
+  </li>`;
+}
+
+// Rendered in two different branches below (with and without existing items);
+// keeping it in one place so the two copies can't drift.
+function _buildNewDateRow(phaseId, tr) {
+  return `<div class="plan-new-date-row">
+    <input class="plan-date-in" type="date" placeholder="YYYY-MM-DD">
+    <select class="plan-rough-in" title="${esc(tr.plan_rough_hint)}">
+      <option value="">${esc(tr.plan_rough_none)}</option>
+      ${PLAN_ROUGH_TIMES.map(k => `<option value="${k}">${esc(tr['plan_rough_' + k])}</option>`).join('')}
+    </select>
+    <input class="plan-time-in" type="time" placeholder="${esc(tr.plan_time_ph)}" style="width:110px">
+    <input class="plan-text-in" placeholder="${esc(tr.plan_text_ph)}" style="flex:1">
+    <button class="btn" data-plan-add-new="${esc(phaseId)}">${esc(tr.plan_save)}</button>
+    <button class="btn plan-enrich-all" data-plan-enrich-all="1" title="${esc(tr.plan_enrich_all_hint)}">${esc(tr.plan_enrich_all)}</button>
+    <button class="btn plan-promote" data-plan-promote="1" title="${esc(tr.plan_promote_hint)}">${esc(tr.plan_promote)}</button>
+    <span class="plan-err" hidden></span>
+  </div>`;
+}
+
+// <input type="time"> already refuses bad input wherever it's supported, but a
+// browser that falls back to a plain text box would post whatever was typed and
+// get back a bare 400. Same shape the server enforces.
+const PLAN_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+// Enrichment lands seconds after the save returns, so the row that was just
+// added would otherwise sit link-less until the next page load. Re-fetch a few
+// times, backing off, and stop as soon as nothing is pending. Bounded on
+// purpose — Hermes may be unreachable, and the server keeps retrying anyway.
+const PLAN_REFRESH_DELAYS = [4000, 8000, 15000, 30000];
+const _planRefreshTimers = {};
+
+function scheduleEnrichRefresh(phaseId, step = 0) {
+  if (step >= PLAN_REFRESH_DELAYS.length) return;
+  clearTimeout(_planRefreshTimers[phaseId]);
+  _planRefreshTimers[phaseId] = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/phases/${encodeURIComponent(phaseId)}/plan`, { headers: _authHeaders() });
+      if (!res.ok) return;
+      PHASE_PLAN[phaseId] = await res.json();
+      const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+      if (phase) renderDays(phase);
+      if ((PHASE_PLAN[phaseId] || []).some(i => i.enrichment_status === 'pending')) {
+        scheduleEnrichRefresh(phaseId, step + 1);
+      }
+    } catch { /* transient; the next save or reload will pick it up */ }
+  }, PLAN_REFRESH_DELAYS[step]);
+}
+
+// Copies the read-only config schedule into the editable plan layer, once.
+// Confirmed first because it visibly duplicates the schedule on screen — the
+// promoted copy on top, the original still below the separator.
+window.handlePromoteConfigDays = async function(btn) {
+  const tr = T[currentLang] || T.he;
+  if (!confirm(tr.plan_promote_confirm)) return;
+  try {
+    btn.disabled = true;
+    const res = await fetch('/api/phase-plan/promote-config-days', { method: 'POST', headers: _authHeaders() });
+    if (!res.ok) throw new Error(`${res.status}`);
+    const { created, skipped } = await res.json();
+    btn.textContent = created ? `${tr.plan_promote} · ${created}` : tr.plan_promote_none;
+    await loadPhasePlans();
+    for (const p of (window.TRIP_CONFIG?.phases || [])) {
+      renderDays(p);
+      scheduleEnrichRefresh(p.id);
+    }
+    if (!created && skipped) console.info(`[plan] nothing promoted; ${skipped} already present`);
+  } catch (e) {
+    _planErr(btn, e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+window.handleEnrichAll = async function(btn) {
+  const tr = T[currentLang] || T.he;
+  try {
+    btn.disabled = true;
+    const res = await fetch('/api/phase-plan/enrich-pending', { method: 'POST', headers: _authHeaders() });
+    if (!res.ok) throw new Error(`${res.status}`);
+    const { in_flight, hermes_configured } = await res.json();
+    // "queued 0" is the normal answer when items are already being worked on,
+    // so report what the worker will actually process rather than what this
+    // click changed — otherwise a working button looks dead.
+    btn.textContent = !hermes_configured ? tr.plan_enrich_unavailable
+      : in_flight > 0 ? `${tr.plan_enrich_working} (${in_flight})`
+      : tr.plan_enrich_nothing;
+    for (const p of (window.TRIP_CONFIG?.phases || [])) scheduleEnrichRefresh(p.id);
+  } catch (e) {
+    _planErr(btn, e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// A failed save used to go to console.error only, so the organizer's typed text
+// sat in the input looking exactly like a pending save. Show it on the row.
+function _planErr(el, e) {
+  const box = el?.closest('li, .plan-new-date-row')?.querySelector('.plan-err');
+  if (box) { box.textContent = (e && e.message) || String(e); box.hidden = false; }
+  console.error('plan item action failed', e);
+}
+
+window.handleDeletePlanItem = async function(phaseId, id, btn) {
+  const tr = T[currentLang];
+  if (!confirm(tr.plan_delete_confirm)) return;
+  try {
+    await deletePlanItem(phaseId, id);
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+  } catch(e) { _planErr(btn, e); }
+};
+
+// An explicit clock time and a rough slot are mutually exclusive; the rough
+// choice wins so picking "afternoon" doesn't silently keep a stale 09:00.
+function _planTimeFrom(row) {
+  const rough = row.querySelector('.plan-rough-in')?.value || '';
+  return rough || (row.querySelector('.plan-time-in')?.value || '').trim();
+}
+
+// The clock input only means anything under "exact time"; any rough slot
+// disables and clears it, so the row can't show 09:00 next to "afternoon" and
+// leave you guessing which one was saved.
+function _syncPlanTimeInput(select) {
+  const row = select.closest('li, .plan-new-date-row');
+  const input = row?.querySelector('.plan-time-in');
+  if (!input) return;
+  const rough = !!select.value;
+  input.disabled = rough;
+  if (rough) input.value = '';
+}
+
+// Delegated: renderDays() replaces innerHTML, so a listener bound to the
+// element itself would not survive a re-render.
+document.addEventListener('change', (ev) => {
+  const sel = ev.target.closest?.('.plan-rough-in');
+  if (sel) _syncPlanTimeInput(sel);
+});
+
+window.handleAddPlanItem = async function(phaseId, date, btn) {
+  const row = btn.closest('li');
+  const time = _planTimeFrom(row);
+  const text = row.querySelector('.plan-text-in').value.trim();
+  if (!text) return;
+  if (time && !PLAN_TIME_RE.test(time) && !PLAN_ROUGH_TIMES.includes(time)) {
+    return _planErr(btn, new Error((T[currentLang] || T.he).plan_time_invalid));
+  }
+  try {
+    btn.disabled = true;
+    await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+    // The item saves as enrichment_status 'pending'; this pulls the links in
+    // once the worker has them, without the organizer reloading.
+    scheduleEnrichRefresh(phaseId);
+  } catch(e) { btn.disabled = false; _planErr(btn, e); }
+};
+
+// One delegated listener for every plan control. renderDays() replaces
+// innerHTML wholesale, so per-element listeners would be lost on each render.
+document.addEventListener('click', (ev) => {
+  const t = ev.target.closest?.(
+    '[data-plan-del],[data-plan-add],[data-plan-add-new],[data-plan-enrich-toggle],' +
+    '[data-plan-enrich-all],[data-plan-promote]');
+  if (!t) return;
+  if (t.dataset.planPromote !== undefined) return void handlePromoteConfigDays(t);
+  if (t.dataset.planDel !== undefined) {
+    handleDeletePlanItem(t.dataset.planPhase, Number(t.dataset.planDel), t);
+  } else if (t.dataset.planAdd !== undefined) {
+    handleAddPlanItem(t.dataset.planAdd, t.dataset.planDate || '', t);
+  } else if (t.dataset.planAddNew !== undefined) {
+    handleAddPlanItemNewDate(t.dataset.planAddNew, t);
+  } else if (t.dataset.planEnrichToggle !== undefined) {
+    // Same collapsible the location panels use; with no data-wxkey it just
+    // opens and closes without trying to fetch a forecast.
+    toggleLocPanel(t);
+  } else {
+    handleEnrichAll(t);
+  }
+});
+
 function renderDays(phase) {
   const el = document.getElementById(`sched-${phase.id}`);
-  if (!el || !phase.days?.length) return;
-  el.innerHTML = phase.days.map(day => {
-    const items = (day.items || []).map(item =>
-      `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
-    ).join('');
-    return `<div class="day-block">
-      <div class="day-label">${_biSpan(day.label)}</div>
-      <ul>${items}</ul>
-    </div>`;
-  }).join('');
+  if (!el) return;
+  const tr = T[currentLang] || T['he'];
+  const dbItems = PHASE_PLAN[phase.id] || [];
+  let html = '';
+
+  // ── DB plan items (organizer's current plan — higher precedence) ──
+  if (dbItems.length) {
+    // group by date; items with no date go into '' bucket
+    const buckets = {};
+    for (const item of dbItems) {
+      const key = item.date || '';
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(item);
+    }
+    // unscheduled first, then sorted dates
+    const keys = [
+      ...(buckets[''] ? [''] : []),
+      ...Object.keys(buckets).filter(k => k).sort(),
+    ];
+    for (const key of keys) {
+      // The date alone doesn't say what the day IS. Prefer the stored headline
+      // (carried over from the config schedule, or written by enrichment) and
+      // fall back to the formatted date only when there isn't one yet.
+      const label = key
+        ? (() => {
+            const d = new Date(key + 'T12:00:00');
+            const he = d.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
+            const en = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+            const meta = PHASE_PLAN_DAYS[phase.id]?.[key];
+            const hl = { he: meta?.label_he || '', en: meta?.label_en || meta?.label_he || '' };
+            const pendingHl = meta?.enrichment_status === 'pending' && !hl.he && !hl.en;
+            // esc(), like the item text below: _biSpan emits raw HTML so that
+            // hand-authored config markup renders, but a stored headline is
+            // model output and must never be trusted with that.
+            const suffix = hl.he || hl.en
+              ? _biSpan({ he: hl.he ? ` — ${esc(hl.he)}` : '', en: hl.en ? ` — ${esc(hl.en)}` : '' })
+              : (pendingHl ? `<span class="plan-hl-pending"> · ${esc(tr.plan_enriching)}</span>` : '');
+            // A headline the review rewrote carries the same struck-through
+            // trail as an item, so a renamed day is never a silent rename.
+            const corrected = _buildCorrection(
+              meta?.correction, { he: meta?.label_he_prev, en: meta?.label_en_prev }, tr);
+            return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}${corrected}`;
+          })()
+        : _biSpan({ he: T.he.plan_unscheduled, en: T.en.plan_unscheduled });
+      const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');
+      const addRow = _buildAddItemRow(phase.id, key, tr);
+      html += `<div class="day-block db-plan-block">
+        <div class="day-label">${label}</div>
+        <ul>${itemsHtml}${addRow}</ul>
+      </div>`;
+    }
+    // organizer: show an "add to a new date" row
+    if (isOrganizer) html += _buildNewDateRow(phase.id, tr);
+  } else if (isOrganizer) {
+    // no DB items yet — show a single add row so organizer can start the plan
+    html += _buildNewDateRow(phase.id, tr);
+  }
+
+  // ── Config days (original schedule — lower precedence) ──
+  // Once the plan layer has content it IS the schedule, and showing the static
+  // copy underneath just reads as a duplicate. So it collapses, and is shown
+  // only to the organizer — who needs it to compare against. With no plan items
+  // it's the only schedule there is, so everyone still sees it, expanded.
+  if (phase.days?.length) {
+    const supersededByPlan = dbItems.length > 0;
+    if (!supersededByPlan || isOrganizer) {
+      const daysHtml = phase.days.map(day => {
+        const items = (day.items || []).map(item =>
+          `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
+        ).join('');
+        return `<div class="day-block">
+          <div class="day-label">${_biSpan(day.label)}</div>
+          <ul>${items}</ul>
+        </div>`;
+      }).join('');
+
+      html += supersededByPlan
+        ? `<div class="loc-panel plan-orig-panel">
+             <button class="loc-panel-hdr" type="button" data-plan-enrich-toggle>
+               <span>${_biSpan({ he: T.he.plan_original_sched, en: T.en.plan_original_sched })}</span>
+               <span class="loc-panel-chevron">▼</span>
+             </button>
+             <div class="loc-panel-body">${daysHtml}</div>
+           </div>`
+        : daysHtml;
+    }
+  }
+
+  el.innerHTML = html;
 }
+
+window.handleAddPlanItemNewDate = async function(phaseId, btn) {
+  const row = btn.closest('.plan-new-date-row');
+  const date = row.querySelector('.plan-date-in').value.trim();
+  const time = _planTimeFrom(row);
+  const text = row.querySelector('.plan-text-in').value.trim();
+  if (!text) return;
+  if (time && !PLAN_TIME_RE.test(time) && !PLAN_ROUGH_TIMES.includes(time)) {
+    return _planErr(btn, new Error((T[currentLang] || T.he).plan_time_invalid));
+  }
+  try {
+    btn.disabled = true;
+    await savePlanItem(phaseId, { date: date || null, time: time || null, text_he: text, text_en: text });
+    const phase = (window.TRIP_CONFIG?.phases || []).find(p => p.id === phaseId);
+    if (phase) renderDays(phase);
+    // The item saves as enrichment_status 'pending'; this pulls the links in
+    // once the worker has them, without the organizer reloading.
+    scheduleEnrichRefresh(phaseId);
+  } catch(e) { btn.disabled = false; _planErr(btn, e); }
+};
 
 /* RENDER_FUNS_END */
 /* =========================================================
@@ -3406,6 +4022,7 @@ window.addEventListener('load', async () => {
   }
 
   await loadTripConfig();
+  await loadPhasePlans();
   buildGlobalsFromConfig(window.TRIP_CONFIG);
 
   loadUsersCache();

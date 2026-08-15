@@ -299,6 +299,44 @@ Rules:
 
 This is a major source of trust: users remember details they corrected repeatedly, especially reservations, split-group arrangements, departure times, and food sequencing.
 
+### 7.6 The original plan and the active plan
+
+A trip holds two plans, and they are not interchangeable:
+
+- The **original plan** is the schedule as authored at trip setup (`trip.config.json`). It is a read-only reference. It is shown to the organizer only, collapsed, for comparison.
+- The **active plan** is the live schedule: the original plan promoted in, plus AI enrichment and every edit the organizer has made since. This is what the family sees.
+
+**Every itinerary change edits the active plan.** Nothing edits the original plan in response to a change request. A correction written anywhere else — a booking, most easily — succeeds, reports success, and changes nothing the family sees.
+
+Rules:
+
+- A request to change a day's route, move a day, swap two days, or fix "today's" or "tomorrow's" plan is an **active-plan** edit (`get_phase_plan`, `add_plan_item`, `update_plan_item`, `delete_plan_item`, `swap_plan_days`, `set_plan_day_label`).
+- A request about a supplier, confirmation number, cost, passengers, voucher, or the dates a reservation covers is a **booking** edit (`update_booking`).
+- Exchanging two days is one operation (`swap_plan_days`), not a sequence of per-item date edits: partway through a manual sequence both days share a date and the site shows them merged, and per-item edits cannot move the day headlines at all.
+- A day's items and its headline are separate records. Move the items and the headline still announces the old plan — move both.
+- The active plan takes over a phase on its first item, not per day. If a phase's active plan is empty, seed it from the original plan wholesale before editing; adding one item leaves participants seeing only that item.
+
+### 7.7 Reordering days invalidates what the schedule says about itself
+
+Moving a day does not only move items. The prose around them was written against the old order and quietly stops being true: a headline that names its own date, "tomorrow we climb Diamond Head" sitting on the day before, "unlike Thursday, this beach is calm". None of it is visible on the day that moved, which is why it gets missed.
+
+After any reorder the whole phase is re-checked out of band, and wording that contradicts the new order is corrected. Corrections are applied, not merely proposed — but never silently: the superseded wording is kept and shown struck through on the site, with the reason.
+
+The agent's duty after a schedule change:
+
+- Re-read `get_phase_plan` a short while after the change (the check takes up to a couple of minutes).
+- Report every `correction` to the organizer in chat: what it said before, what it says now, and why. An organizer who does not open the site would otherwise never learn that a sentence they wrote was changed.
+- If `review.status` is `unavailable`, the descriptions were **not** checked. Say so plainly rather than implying the schedule was verified.
+- Corrections are the reviewer's judgement, not the organizer's. If one looks wrong, raise it — the original text is kept, so reverting is always possible.
+
+### 7.8 What counts as verifying a change
+
+"Updated on the site" is a claim about what the family will see, so a write returning success is not evidence for it. Before saying a change is live:
+
+- Read the active plan back (`get_phase_plan`) and check the dates, the items and the day headlines say what was intended.
+- A successful `update_booking` is never evidence that the active plan changed — the site does not render bookings as the schedule.
+- If the read-back disagrees with the request, say so plainly and fix it. Do not report success, and do not suggest the user clear their cache; a stale-looking site is far more often a write to the wrong layer.
+
 ### 7.6 Constraint-first recommendations
 
 Avoid generic ranked lists once the family gives a real deciding constraint.

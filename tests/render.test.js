@@ -284,3 +284,39 @@ describe('telegramLoginErrorMessage()', () => {
     assert.equal(ctx.telegramLoginErrorMessage('some_future_code', tr), 'generic wrong');
   });
 });
+
+// ── Day headline escaping ────────────────────────────────────────────────────
+// renderDays() puts a day headline through _biSpan(), which emits raw HTML on
+// purpose so hand-authored config markup keeps working. Headlines are model
+// output summarising booking notes, and POST /api/bookings is only
+// authRequired — so a family member's note can reach this string. It must be
+// escaped here even though the server also strips tags on the way in.
+describe('renderDays — stored day headline', () => {
+  const cfg = { phases: [{ id: 'ny', days: [] }] };
+
+  function renderWithHeadline(label) {
+    const { document, ctx } = createRenderContext('<div id="sched-ny"></div>', cfg);
+    ctx.isOrganizer = false;
+    ctx.PHASE_PLAN = { ny: [{
+      id: 1, date: '2027-03-11', time: '09:00',
+      text_he: 'פריט', text_en: 'Item', status: 'confirmed', enrichment_status: 'done',
+    }] };
+    ctx.PHASE_PLAN_DAYS = { ny: { '2027-03-11': { label_he: label, label_en: label, enrichment_status: 'done' } } };
+    ctx.renderDays(cfg.phases[0]);
+    return document.getElementById('sched-ny');
+  }
+
+  test('markup in a headline renders as inert text, not as elements', () => {
+    const el = renderWithHeadline('<img src=x onerror=alert(1)>Diamond Head');
+    assert.equal(el.querySelectorAll('img').length, 0, 'headline injected a real <img>');
+    assert.equal(el.querySelectorAll('script').length, 0, 'headline injected a real <script>');
+    assert.ok(el.textContent.includes('Diamond Head'), 'the readable part should still show');
+    assert.ok(el.textContent.includes('<img'), 'the markup should appear as literal text');
+  });
+
+  test('a plain headline still renders normally', () => {
+    const el = renderWithHeadline('Diamond Head + Waikiki');
+    assert.ok(el.textContent.includes('Diamond Head + Waikiki'));
+    assert.equal(el.querySelectorAll('img, script').length, 0);
+  });
+});

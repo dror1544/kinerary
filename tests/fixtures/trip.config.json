@@ -83,7 +83,19 @@
       "venues": [{ "id": "ny-tms", "name": "Times Square", "url": "" }],
       "rsvp_activities": [],
       "packing": [],
-      "days": []
+      "days": [
+        {
+          "date": "2027-03-11",
+          "label": { "he": "א׳ 11/3 — ניו יורק", "en": "Sun 11/3 — New York" },
+          "items": [
+            { "time": "09:00", "text": { "he": "ארוחת בוקר", "en": "Breakfast" } },
+            { "time": "11:00", "text": {
+              "he": "ביקור ב־<a href=\"https://www.google.com/maps/search/Central+Park\" target=\"_blank\" rel=\"noopener\">Central Park</a>",
+              "en": "Visit <a href=\"https://www.google.com/maps/search/Central+Park\" target=\"_blank\" rel=\"noopener\">Central Park</a>" } },
+            { "time": "06:30–07:00", "text": { "he": "יציאה מוקדמת", "en": "Early departure" } }
+          ]
+        }
+      ]
     },
     {
       "id": "colorado",

@@ -30,6 +30,8 @@ const { z }                  = require('zod');
 const express                = require('express');
 const fetch                  = require('node-fetch');
 const crypto                 = require('crypto');
+const { execFile }           = require('child_process');
+const pdfParse               = require('pdf-parse');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -297,7 +299,10 @@ mcp.tool('get_bookings', 'Get trip bookings (flights, hotels, cars, attractions)
   return ok(await apiGet(`/api/bookings${qs.toString() ? '?' + qs : ''}`));
 });
 
-mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
+mcp.tool('add_booking',
+  'Record a reservation — a flight, hotel, car or ticketed attraction with a confirmation to keep. ' +
+  'A booking is not part of the active plan and does not put anything on the family\'s day-by-day schedule: to make something ' +
+  'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline).', {
   phase:        z.string().describe('Phase id from trip.config.json (see get_config), plus "intl_flights" for international flights'),
   type:         z.enum(['flight','hotel','car','attraction','other']).describe('Booking type'),
   name:         z.string().describe('Booking name / description'),
@@ -313,7 +318,15 @@ mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
   location_url:      z.string().url().optional().describe('Location URL (Google Maps, Waze, etc.)'),
 }, async (args) => ok(await apiPost('/api/bookings', args)));
 
-mcp.tool('update_booking', 'Update an existing booking by ID', {
+mcp.tool('update_booking',
+  'Update the booking record itself — supplier, confirmation number, PIN, cost, passengers, the dates the reservation covers, voucher/wallet links. ' +
+  'This is NOT how the itinerary is changed. A trip holds two plans: the ORIGINAL PLAN (authored in trip.config.json, a read-only ' +
+  'reference) and the ACTIVE PLAN (get_phase_plan — the live schedule, including AI enrichment and the organizer\'s own edits). ' +
+  'The site renders the ACTIVE PLAN IN PREFERENCE TO both the original plan and bookings, so a booking edit made to change what a ' +
+  'day looks like returns 200, changes the booking, and changes nothing anyone sees. ' +
+  'Every itinerary change goes to the active plan — a day\'s route, moving or swapping two days, fixing "today\'s" or "tomorrow\'s" ' +
+  'plan: use swap_plan_days, update_plan_item, add_plan_item, delete_plan_item. Never edit the original plan to satisfy one. ' +
+  'Use update_booking when what is actually wrong is the reservation.', {
   id:           z.number().describe('Booking ID from get_bookings'),
   name:         z.string().optional(),
   date_from:    z.string().optional(),
@@ -406,6 +419,149 @@ mcp.tool('add_trivia_question',
   },
   async (args) => ok(await apiPost('/api/trivia/questions', args)));
 
+// ── Phase plan items ──────────────────────────────────────────────────────────
+
+mcp.tool('get_phase_plan',
+  'THE ACTIVE PLAN for a phase — the live day-by-day schedule the family actually sees, including AI enrichment and every organizer ' +
+  'edit. Read this before answering or changing anything about what happens on a given day. ' +
+  'A trip also has an ORIGINAL PLAN (trip.config.json phases[].days), kept as a read-only reference; the site renders the active ' +
+  'plan in preference to it and to bookings, so "the itinerary" means the active plan, and every change is made here. ' +
+  'Returns { phase_id, days, items }: `items` sorted by date, time and sort_order (each may carry a linked booking for confirmation display), ' +
+  'and `days` the per-date headlines that say what each day IS ("Diamond Head + Waikiki") — the two are edited separately, ' +
+  'so a day whose items moved keeps its old headline until set_plan_day_label or swap_plan_days moves that too. ' +
+  'An item or day may carry `correction` — wording the post-reorder review rewrote because it referred to the old day order. ' +
+  'It holds the note (why) and previous (what it said before, shown struck through on the site). ' +
+  'These are what you relay to the organizer after a schedule change; do not silently pass over them. ' +
+  'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
+  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
+  {
+    phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
+  },
+  async ({ phase_id }) => {
+    // Items and headlines are two tables and two endpoints, but one answer to
+    // "what does this day look like" — an agent given only the items cannot see
+    // that the headline still names the old plan.
+    const load = async (id) => {
+      const [items, days] = await Promise.all([
+        apiGet(`/api/phases/${id}/plan`),
+        apiGet(`/api/phases/${id}/plan/days`),
+      ]);
+      return { phase_id: id, days, items };
+    };
+    if (phase_id) return ok(await load(phase_id));
+    const cfg = await apiGet('/api/config');
+    const phases = cfg.phases || [];
+    // Fetched together rather than awaited one at a time — an 8-phase trip was
+    // paying 8 sequential round trips for reads that don't depend on each other.
+    const plans = await Promise.all(phases.map(p => load(p.id)));
+    const results = {};
+    phases.forEach((p, i) => { results[p.id] = plans[i]; });
+    return ok(results);
+  });
+
+mcp.tool('swap_plan_days',
+  'Exchange two dates in the ACTIVE PLAN — every item on both dates, plus both day headlines, trade places in one atomic write. ' +
+  'This is the right tool for "move today\'s plan to tomorrow", "swap Thursday and Friday", "today should be what tomorrow was", ' +
+  'and any correction that exchanges two days\' routes. It never touches the original plan in trip.config.json. ' +
+  'Use it rather than a sequence of update_plan_item calls: those render the two days merged into one date partway through, ' +
+  'leave the schedule wrong if any call fails, and cannot move the headlines at all. ' +
+  'If one of the dates has no items this is simply a move. ' +
+  'Returns the resulting items and headlines for both dates — read them to confirm the swap landed, rather than trusting the success status. ' +
+  'It also returns `review`. Reordering days makes the schedule\'s own prose stale — a headline naming its own date, ' +
+  '"tomorrow we climb Diamond Head" written on the day before, "unlike Thursday, this beach is calm" — so a check over the whole ' +
+  'phase is queued. It runs out of band and takes up to a couple of minutes. ' +
+  'AFTER A SWAP YOU MUST: re-read get_phase_plan a short while later, look for items or days carrying a `correction`, and TELL THE ' +
+  'ORGANIZER what was rewritten — quote correction.previous (what it said before) and the current text, and give correction.note as ' +
+  'the reason. The site shows these struck through, so an organizer who reads the schedule will see them; one who only reads your ' +
+  'message will not, unless you say so. If review.status is "unavailable" the descriptions were NOT checked — say that instead of implying they were.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date_a:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('First date YYYY-MM-DD'),
+    date_b:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Second date YYYY-MM-DD'),
+  },
+  async ({ phase_id, date_a, date_b }) =>
+    ok(await apiPost(`/api/phases/${phase_id}/plan/swap-days`, { date_a, date_b })));
+
+mcp.tool('set_plan_day_label',
+  'Set a day\'s headline in the ACTIVE PLAN — the line that says what that date IS ("Diamond Head + Waikiki / Ala Moana"), shown above the day\'s items. ' +
+  'Needed because moving items with update_plan_item does not move the headline: change a day\'s route without this and the site ' +
+  'shows the new plan under the old day\'s name. swap_plan_days already handles the headlines for a two-day exchange; use this when ' +
+  'you rewrite a single day, or when a headline is simply wrong. ' +
+  'Send only the language you mean to change; the other is left as-is. Sending an empty string clears it and re-queues the day for an AI-written headline.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Date YYYY-MM-DD'),
+    label_he: z.string().optional().describe('Headline in Hebrew'),
+    label_en: z.string().optional().describe('Headline in English'),
+  },
+  async ({ phase_id, date, ...body }) =>
+    ok(await apiPatch(`/api/phases/${phase_id}/plan/days/${date}`, body)));
+
+mcp.tool('add_plan_item',
+  'Add an item to the ACTIVE PLAN for a phase — the schedule the family sees, so adding an activity here is how something appears ' +
+  'on the site. (Adding a booking does not put anything on the schedule.) ' +
+  'Use this to record activities, meals, transfers, or any scheduled event. ' +
+  'NOTE: the active plan takes over a phase as soon as it holds a single item — if this phase\'s active plan is still empty, the ' +
+  'original plan stops being shown to participants and they will see only what you add. Check get_phase_plan first; a phase whose ' +
+  'active plan is empty should be seeded from the original plan wholesale, not one item at a time. ' +
+  'Set location_url to a Waze or Google Maps link after a web search. ' +
+  'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
+  'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
+  {
+    phase_id:     z.string().describe('Phase id from get_config'),
+    text_he:      z.string().describe('Activity description in Hebrew (required)'),
+    text_en:      z.string().optional().describe('Activity description in English'),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional().describe('Date YYYY-MM-DD — groups this item into a day block'),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional().describe('Time in 24-hour HH:MM, e.g. "09:00". The server rejects any other shape.'),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL for this location'),
+    booking_id:   z.number().optional().describe('Booking ID from get_bookings to link confirmation details'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Default: confirmed'),
+    sort_order:   z.number().optional().describe('Ordering within a day block (lower = earlier in list)'),
+  },
+  async ({ phase_id, ...body }) => ok(await apiPost(`/api/phases/${phase_id}/plan`, body)));
+
+mcp.tool('update_plan_item',
+  'Update one item of the ACTIVE PLAN by ID — the way to change what the family sees for a given day: correct its text, move it to ' +
+  'another date or time, enrich it with location_url, link a booking, or confirm a needs_review item. ' +
+  'Changing `date` moves this ONE item; it does not move the day\'s headline, and it is not how two days are exchanged — ' +
+  'for that use swap_plan_days, which moves items and headlines together and atomically. ' +
+  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings.',
+  {
+    phase_id:     z.string().describe('Phase id the item belongs to'),
+    id:           z.number().describe('Plan item ID from get_phase_plan'),
+    text_he:      z.string().optional(),
+    text_en:      z.string().optional(),
+    date:         z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional(),
+    time:         z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24-hour)').optional(),
+    location_url: z.string().url().optional().describe('Waze or Google Maps URL'),
+    booking_id:   z.number().optional().describe('Link to a booking (shows confirmation inline)'),
+    status:       z.enum(['confirmed','needs_review']).optional().describe('Set to "confirmed" after organizer review'),
+    sort_order:   z.number().optional(),
+  },
+  async ({ phase_id, id, ...fields }) => ok(await apiPatch(`/api/phases/${phase_id}/plan/${id}`, fields)));
+
+mcp.tool('delete_plan_item',
+  'Delete an item from the ACTIVE PLAN by ID. The original plan in trip.config.json is unaffected — a deletion here removes the item ' +
+  'from what the family sees, and the organizer can still see the original for comparison.',
+  {
+    phase_id: z.string().describe('Phase id the item belongs to'),
+    id:       z.number().describe('Plan item ID from get_phase_plan'),
+  },
+  async ({ phase_id, id }) => ok(await apiDelete(`/api/phases/${phase_id}/plan/${id}`)));
+
+mcp.tool('import_plan_from_bookings',
+  'Migration tool: scan all bookings that have long notes (>80 chars) and create phase_plan_items from them. ' +
+  'Idempotent — each booking is imported at most once, and that stays true after you delete an imported item, ' +
+  'so re-running never resurrects something the organizer removed. ' +
+  'Returns {created, skipped}; every skip carries a reason ("already imported", or "phase not in trip config" ' +
+  'for a booking whose phase is absent from trip.config.json and so cannot be represented). ' +
+  'Imported items keep the booking\'s own date and get status="needs_review" so you can enrich and confirm them. ' +
+  'Note the >80-char filter is a heuristic — a genuine booking with long notes (a car rental voucher, say) will ' +
+  'match too, so review what came back before confirming it. ' +
+  'Use this once after deploying the plan feature to recover content an organizer stored in booking notes.',
+  {},
+  async () => ok(await apiPost('/api/phase-plan/import-from-bookings', {})));
+
 return mcp;
 }
 
@@ -431,9 +587,12 @@ async function disposeSession(sessionId, { closeTransport = false } = {}) {
 }
 
 // ── /extract — AI booking data extraction ────────────────────────────────────
-// Built fresh per request from the live trip config — phase ids and dates are
-// never the same across trips, so this can't be a static prompt.
-async function buildExtractSystem() {
+// Built fresh per request from the live trip config/roster/bookings — phase
+// ids, participants and what's already booked are never the same across
+// trips, so this can't be a static prompt. `bookings` is passed in (rather
+// than fetched here too) so the caller can reuse the same list for the
+// deterministic duplicate-confirmation check below.
+async function buildExtractSystem(bookings) {
   let title = 'this trip', phaseLines = '- intl_flights: international flights';
   try {
     const cfg = await apiGet('/api/config');
@@ -445,11 +604,25 @@ async function buildExtractSystem() {
     if (lines.length) phaseLines = ['- intl_flights: international flights', ...lines].join('\n');
   } catch (_) { /* fall back to the generic defaults above */ }
 
+  let rosterLine = '';
+  try {
+    const { participants: roster } = await apiGet('/api/config/roster');
+    if (Array.isArray(roster) && roster.length) {
+      rosterLine = roster.map(p => p.name_en || p.name || p.username).filter(Boolean).join(', ');
+    }
+  } catch (_) { /* roster context is a nice-to-have, not required */ }
+
+  const bookingsSummary = (bookings || []).length
+    ? bookings.map(b => `- [${b.phase}] ${b.name} (${b.date_from || '?'}${b.date_to && b.date_to !== b.date_from ? `–${b.date_to}` : ''}), confirmation: ${b.confirmation || '—'}`).join('\n')
+    : '';
+
   return `You are a travel booking data extractor for "${title}".
 Extract structured booking data from the provided content and return ONLY a valid JSON object.
 
 Trip phase date ranges:
 ${phaseLines}
+${rosterLine ? `\nTrip participants: ${rosterLine}` : ''}
+${bookingsSummary ? `\nAlready-booked items on this trip (context for spotting conflicts only — do not repeat these back as your answer):\n${bookingsSummary}` : ''}
 
 JSON fields (omit any field you cannot determine):
 {
@@ -461,8 +634,9 @@ JSON fields (omit any field you cannot determine):
   "passengers": "passenger or guest names",
   "confirmation": "confirmation / reservation number",
   "pin": "PIN code if present",
-  "cost": numeric USD amount,
-  "notes": "any relevant notes"
+  "cost_amount": numeric amount exactly as it appears in the document — do not convert or do any math yourself, just report the number,
+  "cost_currency": the ISO 4217 3-letter code for whatever currency that amount is in (e.g. "USD", "JPY", "EUR") — infer it from a symbol or context if the document doesn't spell it out. Use "USD" if the document is already in dollars,
+  "notes": "any relevant notes from the document itself, plus — only if applicable — one short line starting with '⚠️' for a genuine mismatch with this trip: dates outside the matched phase's range above, or a passenger name that matches nobody in the trip participants list above. Don't invent doubts or nitpick; only flag a real, visible mismatch. Most bookings will have nothing to flag — that's normal, not a failure."
 }
 
 Return ONLY the JSON object, no commentary.`;
@@ -474,36 +648,130 @@ Return ONLY the JSON object, no commentary.`;
 // no Hermes profile can use this server through its normal setup path at
 // all, not just a scripted one (confirmed against hermes_cli/mcp_config.py's
 // _bearer_auth_headers()).
-function requireKey(req, res, next) {
+function presentedKey(req) {
   const authHeader = req.headers['authorization'] || '';
   const bearerKey = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const key = req.headers['x-api-key'] || req.query.key || bearerKey;
-  // Constant-time compare — matches provision.js's requireKey. This server
-  // is the one meant to be public, so its key deserves the same treatment.
-  const a = Buffer.from(String(key || ''));
-  const b = Buffer.from(API_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  return req.headers['x-api-key'] || req.query.key || bearerKey || '';
+}
+
+// Constant-time compare — matches provision.js's requireKey. This server is
+// the one meant to be public, so its key deserves the same treatment.
+function keyMatches(presented, expected) {
+  const a = Buffer.from(String(presented || ''));
+  const b = Buffer.from(String(expected || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requireKey(req, res, next) {
+  if (!keyMatches(presentedKey(req), API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
 
-app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, res) => {
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY not set for trip-mcp' });
+// /extract is called by the trip site itself (server.js's /api/bookings/extract
+// proxy), not by an agent — it has no MCP_API_KEY to present, only the
+// TRIP_API_KEY it already shares with this server (the same value setup-mcp.sh
+// syncs as the site's own HERMES_API_KEY). Accept either: an agent hitting this
+// route directly still works, and the site doesn't need a third secret minted
+// and kept in sync just to unlock one HTTP route.
+function requireSiteOrAgentKey(req, res, next) {
+  const key = presentedKey(req);
+  if (!keyMatches(key, API_KEY) && !keyMatches(key, TRIP_API_KEY)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+// Dedicated, no-skills, all-toolsets-disabled Hermes profile (see
+// mcp/README.md's "Extract Details with AI" section for how to create one) —
+// not any trip's interviewer/companion profile. Those hold real tool access
+// (terminal, file, memory, MCP servers); reusing one here would mean a
+// stranger's uploaded "confirmation PDF" gets a shot at a full agent via
+// prompt injection. Left unset, the feature is simply off — no default
+// profile name is assumed.
+const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || '';
+const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
+
+async function extractPdfText(buf) {
+  const { text } = await pdfParse(buf);
+  return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
+}
+
+// One-shot, non-interactive call: -q for the single query, -Q for
+// script-friendly output (no banner/spinner), --safe-mode to also strip
+// AGENTS.md/memory/plugin injection on top of the profile's own
+// already-disabled toolsets, --reasoning none so stdout is bare JSON instead
+// of a reasoning-trace panel. No shell involved (execFile, not exec) — the
+// extracted document text reaches this as a single argv entry, never
+// interpolated into a command string.
+function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      HERMES_BIN,
+      ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (!err) return resolve(stdout);
+        if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));
+        // execFile's own message is just "Command failed:" plus the entire
+        // prompt, which buries the cause in a screenful of echoed text. Lead
+        // with what actually went wrong — a kill signal means the timeout
+        // fired, and stderr carries anything the CLI itself reported.
+        const why = err.killed || err.signal
+          ? `timed out after ${timeoutMs}ms (signal ${err.signal || 'none'})`
+          : `exit ${err.code}`;
+        const tail = String(stderr || '').trim().slice(-300);
+        reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ''}`));
+      }
+    );
+  });
+}
+
+// Deterministic currency conversion — the model only reports the raw amount
+// and its currency (buildExtractSystem asks for cost_amount/cost_currency,
+// never cost directly); the actual math runs here against a real, free,
+// keyless exchange-rate API (frankfurter.dev, ECB-backed) instead of an LLM
+// guessing "a reasonable current exchange rate". On any failure (network,
+// unsupported currency code, timeout), cost is left unset with an
+// explanatory note rather than ever guessing a number.
+async function resolveCost(parsed) {
+  const rawAmount = parsed.cost_amount;
+  const currency = String(parsed.cost_currency || '').toUpperCase();
+  delete parsed.cost_amount;
+  delete parsed.cost_currency;
+  if (rawAmount === undefined || rawAmount === null || rawAmount === '') return;
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount)) return;
+
+  if (!currency || currency === 'USD') {
+    parsed.cost = amount;
+    return;
+  }
+
+  try {
+    const r = await fetch(`https://api.frankfurter.dev/v1/latest?amount=${amount}&from=${currency}&to=USD`, { timeout: 8000 });
+    if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
+    const data = await r.json();
+    const usd = data.rates?.USD;
+    if (typeof usd !== 'number') throw new Error('no USD rate in response');
+    parsed.cost = Math.round(usd * 100) / 100;
+    const flag = `${amount} ${currency} ≈ $${parsed.cost} USD (rate as of ${data.date})`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  } catch (e) {
+    const flag = `⚠️ Found ${amount} ${currency} but couldn't fetch a live conversion rate (${e.message}) — enter the USD cost manually.`;
+    parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+  }
+}
+
+app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
 
   const { url, pdf_base64, pdf_name } = req.body || {};
   if (!url && !pdf_base64) return res.status(400).json({ error: 'Provide url or pdf_base64' });
 
-  const Anthropic = require('@anthropic-ai/sdk');
-  const client = new Anthropic({ apiKey: ANTHROPIC_KEY });
-
   try {
-    let userContent;
+    let content;
 
     if (pdf_base64) {
-      userContent = [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdf_base64 } },
-        { type: 'text', text: `Extract booking details from this PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}.` },
-      ];
+      const text = await extractPdfText(Buffer.from(pdf_base64, 'base64'));
+      content = `Content to extract from — PDF confirmation${pdf_name ? ` (${pdf_name})` : ''}:\n\n${text}`;
     } else {
       const r = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TripBot/1.0)' },
@@ -511,31 +779,230 @@ app.post('/extract', requireKey, express.json({ limit: '30mb' }), async (req, re
       });
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('application/pdf')) {
-        const buf = await r.buffer();
-        userContent = [
-          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: buf.toString('base64') } },
-          { type: 'text', text: 'Extract booking details from this PDF confirmation.' },
-        ];
+        const text = await extractPdfText(await r.buffer());
+        content = `Content to extract from — PDF confirmation:\n\n${text}`;
       } else {
         const html = await r.text();
         const plain = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 10000);
-        userContent = [{ type: 'text', text: `URL: ${url}\n\nPage content:\n${plain}\n\nExtract the booking information.` }];
+        content = `URL: ${url}\n\nContent to extract from — page content:\n\n${plain}`;
       }
     }
 
-    const msg = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
-      system: await buildExtractSystem(),
-      messages: [{ role: 'user', content: userContent }],
-    });
+    let bookings = [];
+    try { bookings = await apiGet('/api/bookings'); } catch (_) { /* prompt still works without it */ }
 
-    const text = (msg.content[0]?.text || '').trim();
-    const m = text.match(/\{[\s\S]*\}/);
+    const system = await buildExtractSystem(bookings);
+    const stdout = await runHermesExtract(`${system}\n\n---\n\n${content}`);
+    const m = stdout.match(/\{[\s\S]*\}/);
     if (!m) throw new Error('No JSON in response');
-    res.json(JSON.parse(m[0]));
+    const parsed = JSON.parse(m[0]);
+    // Seen in practice: an occasional cold-start call returns `{}` — valid
+    // JSON, HTTP 200, but nothing usable. Treat "no name" as a failed
+    // extraction rather than a false-success empty form.
+    if (!parsed.name) throw new Error('Extraction returned no usable data — try again');
+
+    await resolveCost(parsed);
+
+    // Deterministic duplicate-confirmation check — exact string match isn't
+    // something worth leaving to the model's judgment when the data to check
+    // it against is already sitting right here.
+    if (parsed.confirmation) {
+      const dup = bookings.find(b => b.confirmation && b.confirmation === parsed.confirmation);
+      if (dup) {
+        const flag = `⚠️ Confirmation ${parsed.confirmation} matches existing booking #${dup.id} (${dup.name}) — check this isn't a duplicate.`;
+        parsed.notes = parsed.notes ? `${parsed.notes}\n${flag}` : flag;
+      }
+    }
+
+    res.json(parsed);
   } catch (e) {
     console.error('[extract]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── /enrich — links for a plan item ──────────────────────────────────────────
+// Called by the trip site's enrichment worker (server.js), not by an agent
+// directly. Returns links only; it never rewrites the organizer's own text.
+//
+// The model is told to omit anything it isn't sure of rather than guess a URL,
+// for the same reason resolveCost() refuses to let it invent exchange rates —
+// a plausible-looking wrong link is worse than no link, because nobody checks
+// a link that looks right until they're standing outside a closed building.
+function buildEnrichPrompt({ text, text_he, date, context }) {
+  return [
+    'You are enriching a single item on a family trip itinerary with useful links.',
+    'Reply with ONE JSON object and nothing else. Keys, all optional:',
+    '  maps_url    — a Google Maps link for the place',
+    '  waze_url    — a Waze navigation link for the same place',
+    '  website_url — the official website of the place',
+    '  ticket_url  — the official ticketing/booking page, if the place needs tickets',
+    '  needs_tickets   — true/false: does entry require buying a ticket at all?',
+    '  advance_booking — true/false: does it typically sell out or require booking a',
+    '                    timed slot ahead of the day? Only true when that is genuinely',
+    '                    normal for this place, not merely possible.',
+    '',
+    'Rules:',
+    '- Omit any key you are not confident about. Never invent or guess a URL.',
+    '- Omit needs_tickets/advance_booking rather than guessing — "unknown" is a',
+    '  useful answer, a wrong "no tickets needed" strands someone at the gate.',
+    '- Prefer official sites over aggregators, blogs, or review sites.',
+    '- If the item is not a place (e.g. "pack the suitcases", "relaxed morning"),',
+    '  return {} — an empty object is the correct answer for a non-place.',
+    '- For maps_url use https://www.google.com/maps/search/?api=1&query=<url-encoded place>',
+    '- For waze_url use https://waze.com/ul?q=<url-encoded place>&navigate=yes',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    `Itinerary item: ${text || text_he || ''}`,
+    text_he && text_he !== text ? `Same item in Hebrew: ${text_he}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+// A day headline summarises what the day IS ("Diamond Head + Waikiki"), so the
+// schedule reads as a plan rather than a list of rows. Written only from the
+// day's own items — no lookups, nothing invented.
+function buildDayLabelPrompt({ date, context, items }) {
+  return [
+    'You are writing a short headline for one day of a family trip itinerary.',
+    'Reply with ONE JSON object and nothing else: {"label_he": "...", "label_en": "..."}',
+    '',
+    'Rules:',
+    '- Name the 1–3 defining places or activities of the day, e.g. "Diamond Head + Waikiki".',
+    '- Max 8 words per language. No date, no weekday, no trailing punctuation.',
+    '- Summarise ONLY what is listed below. Do not add places that are not there.',
+    '- label_he must be Hebrew, label_en must be English. Keep proper place names in Latin script.',
+    '',
+    context ? `Trip area / phase: ${typeof context === 'object' ? JSON.stringify(context) : context}` : '',
+    date ? `Date: ${date}` : '',
+    'Items on this day:',
+    ...(items || []).map(i => `- ${i.time ? `${i.time} ` : ''}${i.text}`),
+  ].filter(Boolean).join('\n');
+}
+
+// After a day moves, the schedule's own prose is what goes stale — "tomorrow we
+// climb Diamond Head" written on the day before, a headline naming its own date,
+// "unlike Thursday, this beach is calm". The model sees the WHOLE phase as it
+// now stands and is asked only for lines that contradict it. Deliberately
+// conservative: a false correction rewrites something a person wrote by hand.
+function buildScheduleReviewPrompt({ context, days }) {
+  return [
+    'A family trip itinerary was just reordered — one or more days changed date.',
+    'Some descriptions were written when the order was different and are now wrong or confusing.',
+    '',
+    'THE ITEMS ON A DATE ARE THE TRUTH. They were just moved deliberately and are exactly where they belong.',
+    'Never rewrite an item to match a headline, never move descriptive content from one day to another, and never',
+    'try to restore a previous order. A headline must describe the items listed under ITS OWN date below — if it',
+    'describes a different day\'s activities, that headline is the thing that is wrong, not the items.',
+    '',
+    'The leading date stamp on a headline ("Thu 13/8 — …") is ALREADY corrected in code before you see this.',
+    'Do not touch it, do not comment on it, and never propose a correction whose only change is a date or weekday.',
+    '',
+    'Find ONLY lines whose wording contradicts the schedule as it now stands. Typical cases:',
+    '  - a day headline describing activities that are no longer on that date',
+    '  - "today" / "tomorrow" / "yesterday" / "the day before" pointing at the wrong day',
+    '  - a cross-reference to another day\'s activity that has moved ("after tomorrow\'s hike")',
+    '  - a date or weekday written INSIDE a sentence that no longer matches ("we land on Tuesday")',
+    '',
+    'When you fix a line, change the smallest thing that is wrong and keep the rest word for word.',
+    '',
+    'Do NOT touch anything else. Not style, not grammar, not detail you think is missing,',
+    'not opening hours, not advice. If a line reads correctly against the schedule below,',
+    'leave it alone. Returning an empty list is the correct answer far more often than not.',
+    '',
+    'Keep every correction minimal: change only the words that became wrong, keep the',
+    'original language (Hebrew stays Hebrew), keep the author\'s voice and any markup.',
+    '',
+    'Reply with ONE JSON object and nothing else:',
+    '{"corrections":[{"kind":"item"|"day","id":<item id>,"date":"YYYY-MM-DD",',
+    '  "text_he":"...","text_en":"...","label_he":"...","label_en":"...",',
+    '  "note":"<short reason, in English, why this line was wrong>"}]}',
+    'Use id for kind "item" and date for kind "day". Include only the language fields you changed.',
+    '',
+    context ? `Trip phase: ${JSON.stringify(context)}` : '',
+    '',
+    'The schedule as it now stands:',
+    JSON.stringify(days, null, 1),
+  ].filter(Boolean).join('\n');
+}
+
+app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
+  if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
+  const { kind, text, text_he, date, context, items, days } = req.body || {};
+  const isDay    = kind === 'day';
+  const isReview = kind === 'schedule_review';
+  if (isReview ? !(days && days.length)
+               : isDay ? !(items && items.length)
+                       : (!text && !text_he)) {
+    return res.status(400).json({
+      error: isReview ? 'Provide days for a schedule review'
+           : isDay    ? 'Provide items for a day headline'
+                      : 'Provide text or text_he',
+    });
+  }
+
+  try {
+    const prompt = isReview
+      ? buildScheduleReviewPrompt({ context, days })
+      : isDay
+      ? buildDayLabelPrompt({ date, context, items })
+      : buildEnrichPrompt({ text, text_he, date, context });
+    // Enrichment runs many calls back to back, and a single lookup routinely
+    // takes ~30s — close enough to the 45s extract default that slower ones
+    // were being killed mid-flight and logged as an opaque "Command failed".
+    const stdout = await runHermesExtract(prompt, { timeoutMs: 90000 });
+    const m = stdout.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('No JSON in response');
+    const parsed = JSON.parse(m[0]);
+
+    const out = {};
+    if (isReview) {
+      // Every correction is validated here before it can reach a family's
+      // schedule: a malformed entry is dropped rather than written back as a
+      // rewrite of something a person authored.
+      const str = (v, max) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, max) : undefined;
+      out.corrections = (Array.isArray(parsed.corrections) ? parsed.corrections : [])
+        .map(c => {
+          const isItem = c?.kind === 'item';
+          const entry = { kind: isItem ? 'item' : 'day', note: str(c?.note, 200) || null };
+          if (isItem) {
+            if (!Number.isInteger(c.id)) return null;
+            entry.id = c.id;
+            for (const k of ['text_he', 'text_en']) { const v = str(c[k], 2000); if (v) entry[k] = v; }
+            if (!entry.text_he && !entry.text_en) return null;
+          } else {
+            const d = str(c?.date, 10);
+            if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+            entry.date = d;
+            for (const k of ['label_he', 'label_en']) { const v = str(c[k], 120); if (v) entry[k] = v; }
+            if (!entry.label_he && !entry.label_en) return null;
+          }
+          return entry;
+        })
+        .filter(Boolean)
+        // A "correction" for every line means the model rewrote the schedule
+        // rather than repairing it. Cap it: a reorder invalidates a handful of
+        // sentences, not all of them.
+        .slice(0, 25);
+    } else if (isDay) {
+      for (const k of ['label_he', 'label_en']) {
+        if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
+      }
+    } else {
+      // Only http(s) links survive the boundary. server.js re-checks this before
+      // storing, and the renderer escapes regardless — but a bad link should not
+      // travel this far in the first place.
+      for (const k of ['maps_url', 'waze_url', 'website_url', 'ticket_url']) {
+        const v = parsed[k];
+        if (typeof v === 'string' && /^https?:\/\//i.test(v.trim())) out[k] = v.trim();
+      }
+      for (const k of ['needs_tickets', 'advance_booking']) {
+        if (typeof parsed[k] === 'boolean') out[k] = parsed[k];
+      }
+    }
+    res.json(out);
+  } catch (e) {
+    process.stderr.write(`[trip-mcp] /enrich failed: ${e.message}\n`);
     res.status(500).json({ error: e.message });
   }
 });
