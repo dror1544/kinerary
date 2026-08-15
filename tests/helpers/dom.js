@@ -25,12 +25,12 @@ function getRenderCode() {
  * @param {string} html  - innerHTML to seed into document.body
  * @param {object} cfg   - window.TRIP_CONFIG value
  * @param {string} lang  - 'he' | 'en'
- * @param {object} extra - additional globals to define in the context. Some
- *   render functions read module-level state that lives outside the
- *   RENDER_FUNS block (renderDays needs PHASE_PLAN, PHASE_PLAN_DAYS and
- *   isOrganizer), so a caller exercising those has to supply them. `T` is
- *   merged per-language rather than replaced, so passing a few plan strings
- *   doesn't drop the defaults every other test relies on.
+ * @param {object} extra - additional globals to define in the context (e.g.
+ *   fetch, localStorage). Some render functions read module-level state that
+ *   lives outside the RENDER_FUNS block (renderDays needs PHASE_PLAN,
+ *   PHASE_PLAN_DAYS and isOrganizer), so a caller exercising those has to
+ *   supply them. `T` is merged per-language rather than replaced, so passing
+ *   a few plan strings doesn't drop the defaults every other test relies on.
  */
 export function createRenderContext(html = '', cfg = {}, lang = 'he', extra = {}) {
   const win = new Window({ url: 'http://localhost/' });

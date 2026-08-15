@@ -692,7 +692,62 @@ function sanitizeConfig(cfg) {
 app.get('/api/config', authRequired, (_req, res) => {
   const safe = sanitizeConfig(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
+  // Every reload must see this deploy's config, not a stale copy some
+  // intermediary (browser, Cloudflare, a reverse proxy in front of it)
+  // decided a GET response was safe to hold onto.
+  res.setHeader('Cache-Control', 'no-store');
   res.json(safe);
+});
+
+// ── CURRENCY RATES — Info tab: each destination currency vs USD / home ──────
+// One shared, server-side cache refreshed at most once/day, not a per-visitor
+// fetch — a dozen family members opening the Info tab the same afternoon
+// should cost one external call, not a dozen.
+// "USD" means the same thing whether it's explicit or just the unset
+// default — normalize both to null so the home-currency line never
+// duplicates the USD line below.
+const HOME_CURRENCY = (() => {
+  const c = (TRIP_CONFIG.meta?.homeCurrency || '').toUpperCase();
+  return c && c !== 'USD' ? c : null;
+})();
+const CURRENCY_CACHE_MS = 24 * 60 * 60 * 1000;
+let currencyRatesCache = null; // { base, home, rates, date, fetchedAt }
+
+function destinationCurrencyCodes() {
+  const countries = TRIP_CONFIG.travel_info?.countries || {};
+  return [...new Set(Object.values(countries).map(c => c.currency?.code).filter(Boolean))];
+}
+
+async function getCurrencyRates() {
+  if (currencyRatesCache && (Date.now() - currencyRatesCache.fetchedAt) < CURRENCY_CACHE_MS) {
+    return currencyRatesCache;
+  }
+  const codes = destinationCurrencyCodes();
+  if (HOME_CURRENCY && !codes.includes(HOME_CURRENCY)) codes.push(HOME_CURRENCY);
+  if (!codes.length) return { base: 'USD', home: HOME_CURRENCY, rates: {}, date: null };
+
+  const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=USD&to=${codes.join(',')}`, { timeout: 8000 });
+  if (!r.ok) throw new Error(`rate lookup → ${r.status}`);
+  const data = await r.json();
+  currencyRatesCache = { base: 'USD', home: HOME_CURRENCY, rates: data.rates || {}, date: data.date, fetchedAt: Date.now() };
+  return currencyRatesCache;
+}
+
+app.get('/api/currency-rates', authRequired, async (_req, res) => {
+  // The 24h reuse window below is an intentional in-process cache — that's
+  // the point of this endpoint. This header stops anything in front of the
+  // server (browser, Cloudflare, a reverse proxy) from ALSO caching the
+  // response and shadowing that logic with a copy of its own.
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    res.json(await getCurrencyRates());
+  } catch (e) {
+    console.error('[currency-rates]', e.message);
+    // A stale cached rate is still more useful than none on a transient
+    // network blip — only a genuine first-ever failure returns nothing.
+    if (currencyRatesCache) return res.json(currencyRatesCache);
+    res.status(502).json({ error: 'currency rate lookup failed' });
+  }
 });
 
 // Deliberately public and deliberately minimal: the login screen needs to

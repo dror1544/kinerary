@@ -3434,6 +3434,39 @@ function renderPhotoUploads(cfg) {
   }).join('');
 }
 
+// Filled in by loadCurrencyRates() (below) once /api/currency-rates
+// resolves — null until then, so the country cards render immediately with
+// whatever they already have and pick up live rates a moment later rather
+// than blocking on them.
+let CURRENCY_RATES = null;
+
+async function loadCurrencyRates() {
+  const token = localStorage.getItem('trip-token');
+  if (!token) return;
+  try {
+    const r = await fetch('/api/currency-rates', { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return;
+    CURRENCY_RATES = await r.json();
+    renderInfo(window.TRIP_CONFIG);
+  } catch { /* Info tab just keeps showing currency name/symbol without rates */ }
+}
+
+// "1 USD ≈ 150.2 JPY · 1 ILS ≈ 40.6 JPY" — the home-currency side is a cross
+// rate (both sides already came from the same from=USD lookup), not a
+// second API call.
+function formatCurrencyRateLine(code) {
+  if (!CURRENCY_RATES?.rates || typeof CURRENCY_RATES.rates[code] !== 'number') return '';
+  const perUsd = CURRENCY_RATES.rates[code];
+  const fmt = n => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const parts = [`1 USD ≈ ${fmt(perUsd)} ${code}`];
+  const home = CURRENCY_RATES.home;
+  const perHome = home && home !== code ? CURRENCY_RATES.rates[home] : null;
+  if (typeof perHome === 'number' && perHome > 0) {
+    parts.push(`1 ${home} ≈ ${fmt(perUsd / perHome)} ${code}`);
+  }
+  return parts.join(' · ');
+}
+
 function renderInfo(cfg) {
   const ti = cfg?.travel_info;
   if (!ti) return;
@@ -3448,10 +3481,12 @@ function renderInfo(cfg) {
         ? `${e.general}${e.unified112 ? ' · 112' : ''}`
         : (e ? `👮 ${e.police || '—'} · 🚑 ${e.ambulance || '—'} · 🚒 ${e.fire || '—'}` : '—');
       const currencyLine = c.currency ? `${c.currency.symbol || ''} ${c.currency.name}`.trim() : '';
+      const rateLine = c.currency?.code ? formatCurrencyRateLine(c.currency.code) : '';
       return `<div class="mini">
         <h4>${c.flag ? c.flag + ' ' : ''}${name}</h4>
         <p>📞 <strong class="ltr">${emergencyLine}</strong></p>
         <p>${[currencyLine, c.callingCode].filter(Boolean).join(' · ')}</p>
+        ${rateLine ? `<p class="ltr" style="font-size:12px;color:var(--ink-2)">${rateLine}</p>` : ''}
       </div>`;
     }).join('') + emergencyContacts.map(c => `<div class="mini"><h4>${_biSpan(c.name)}</h4><p>📞 <a class="ltr" href="tel:${c.phone}">${c.phone}</a></p></div>`).join('');
   }
@@ -4024,6 +4059,7 @@ window.addEventListener('load', async () => {
   renderTasks(cfg);
   renderTaskDeadlines(currentLang);
   renderInfo(cfg);
+  loadCurrencyRates(); // fire-and-forget; re-renders the Info tab once live rates arrive
   // Config-driven render: phase hotel cards + day-by-day schedule
   (cfg?.phases || []).forEach(p => { renderPhaseHotelCard(p); renderDays(p); });
   // Config-driven render: photos tab upload areas

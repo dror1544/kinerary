@@ -3,7 +3,19 @@
     "title": "Test Trip 2027",
     "brand": "TEST",
     "departure": "2027-03-10T06:00:00+03:00",
-    "defaultLang": "he"
+    "defaultLang": "he",
+    "homeCurrency": "ILS"
+  },
+  "travel_info": {
+    "countries": {
+      "Japan": {
+        "capital": "Tokyo",
+        "flag": "🇯🇵",
+        "currency": { "code": "JPY", "name": "Japanese yen", "symbol": "¥" },
+        "callingCode": "+81",
+        "emergency": { "police": "110", "ambulance": "119", "fire": "119", "general": null, "unified112": false }
+      }
+    }
   },
   "participants": [
     { "username": "alice", "name": "אליס", "name_en": "Alice", "age": 35, "family": "family-a", "color": "#3B82F6" },

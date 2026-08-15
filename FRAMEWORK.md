@@ -98,7 +98,8 @@ Everything trip-specific lives in **`trip/trip.config.json`**. The framework cod
     "defaultLang": "he",
     "departure": "2027-03-10T06:00:00+03:00",
     "returnDate": "2027-03-24",
-    "totalDays": 15
+    "totalDays": 15,
+    "homeCurrency": "ILS"
   },
   "participants": [
     { "username": "alex", "name": "אלכס", "name_en": "Alex",
@@ -328,6 +329,18 @@ trip-specific content (altitude warnings, which hospital is near which
 hotel) that can't be sourced from an API. All optional: the Info tab hides
 each block entirely when its list is empty, rather than showing an empty
 heading.
+
+Each country card also shows a live exchange rate — `1 USD ≈ 150.2 JPY`,
+and `1 <homeCurrency> ≈ ... JPY` too if `meta.homeCurrency` is set — sourced
+from `GET /api/currency-rates` (`server/server.js`), which fetches every
+destination currency from `travel_info.countries` plus `homeCurrency`
+against [frankfurter.dev](https://frankfurter.dev) (free, keyless,
+ECB-backed) and caches the result server-side for 24h. One shared fetch a
+day regardless of how many family members open the Info tab, not one per
+visitor. No `homeCurrency` set → the USD side still shows, just not the
+home-currency comparison. `homeCurrency: "USD"` is treated the same as
+unset (no duplicate USD-vs-USD line) — the dollar is the implicit default
+home currency either way.
 
 ---
 
