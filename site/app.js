@@ -3455,11 +3455,21 @@ async function loadCurrencyRates() {
 // rate (both sides already came from the same from=USD lookup), not a
 // second API call.
 function formatCurrencyRateLine(code) {
+  const fmt = n => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  const home = CURRENCY_RATES?.home;
+  // A USD destination (e.g. a domestic US trip) never has its own entry in
+  // rates — the server deliberately never asks the exchange-rate API to
+  // convert USD to itself. "1 USD ≈ 1 USD" isn't worth a line either way;
+  // only the home-currency side (if any) is — quoted the same way every
+  // other line here is, 1 USD as the fixed side, never inverted.
+  if (code === 'USD') {
+    const perHome = home ? CURRENCY_RATES.rates?.[home] : null;
+    if (typeof perHome !== 'number' || perHome <= 0) return '';
+    return `1 USD ≈ ${fmt(perHome)} ${home}`;
+  }
   if (!CURRENCY_RATES?.rates || typeof CURRENCY_RATES.rates[code] !== 'number') return '';
   const perUsd = CURRENCY_RATES.rates[code];
-  const fmt = n => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   const parts = [`1 USD ≈ ${fmt(perUsd)} ${code}`];
-  const home = CURRENCY_RATES.home;
   const perHome = home && home !== code ? CURRENCY_RATES.rates[home] : null;
   if (typeof perHome === 'number' && perHome > 0) {
     parts.push(`1 ${home} ≈ ${fmt(perUsd / perHome)} ${code}`);

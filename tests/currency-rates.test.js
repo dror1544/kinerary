@@ -50,63 +50,102 @@ describe('GET /api/currency-rates', () => {
   });
 });
 
+// The two tests below each need a trip.config.json patched before boot
+// (homeCurrency, travel_info.countries) — not possible against the shared
+// fixture server above, which other test files also read unmodified. Each
+// gets its own throwaway trip dir and port.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FIXTURES_DIR = join(HERE, 'fixtures');
+const SERVER_JS = join(HERE, '..', 'server', 'server.js');
+
+async function spawnPatchedServer(port, mutateConfig) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'trip-currency-data-'));
+  const tripDir = mkdtempSync(join(tmpdir(), 'trip-currency-trip-'));
+  cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+  const cfgPath = join(tripDir, 'trip.config.json');
+  const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  mutateConfig(cfg);
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+
+  const proc = spawn('node', [SERVER_JS], {
+    cwd: join(HERE, '..', 'server'),
+    env: {
+      ...process.env, PORT: String(port), TRIP_DIR: tripDir, DATA_DIR: dataDir,
+      AVATARS_DIR: join(dataDir, 'avatars'), JWT_SECRET: 'test-secret-000',
+      IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: 'test-hermes-key', SEED_PASSWORD: '1234',
+    },
+  });
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('boot timeout')), 10_000);
+    proc.stdout.on('data', chunk => {
+      if (chunk.toString().includes('Trip server running on')) { clearTimeout(timeout); resolve(); }
+    });
+  });
+  let loginToken;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const res = await fetch(`http://localhost:${port}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: '1234' }),
+    });
+    if (res.ok) { loginToken = (await res.json()).token; break; }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return { proc, dataDir, tripDir, token: loginToken };
+}
+
+async function stopPatchedServer({ proc, dataDir, tripDir }) {
+  await new Promise(resolve => { proc.once('exit', resolve); proc.kill('SIGTERM'); });
+  rmSync(dataDir, { recursive: true, force: true });
+  rmSync(tripDir, { recursive: true, force: true });
+}
+
 // An organizer explicitly setting homeCurrency to "USD" means the same
 // thing as leaving it unset — both are "the organizer's home currency is
-// the dollar". Needs its own trip dir/server since it patches
-// meta.homeCurrency before boot, unlike the shared fixture above (ILS).
+// the dollar".
 describe('GET /api/currency-rates — explicit homeCurrency: "USD"', () => {
-  const HERE = dirname(fileURLToPath(import.meta.url));
-  const FIXTURES_DIR = join(HERE, 'fixtures');
-  const SERVER_JS = join(HERE, '..', 'server', 'server.js');
   const PORT = 3111; // 3095-3110 already claimed by other test files
-
-  let dataDir, tripDir, proc, usdToken;
+  let server;
 
   before(async () => {
-    dataDir = mkdtempSync(join(tmpdir(), 'trip-currency-usd-data-'));
-    tripDir = mkdtempSync(join(tmpdir(), 'trip-currency-usd-trip-'));
-    cpSync(FIXTURES_DIR, tripDir, { recursive: true });
-    const cfgPath = join(tripDir, 'trip.config.json');
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
-    cfg.meta.homeCurrency = 'USD';
-    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-
-    proc = spawn('node', [SERVER_JS], {
-      cwd: join(HERE, '..', 'server'),
-      env: {
-        ...process.env, PORT: String(PORT), TRIP_DIR: tripDir, DATA_DIR: dataDir,
-        AVATARS_DIR: join(dataDir, 'avatars'), JWT_SECRET: 'test-secret-000',
-        IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: 'test-hermes-key', SEED_PASSWORD: '1234',
-      },
-    });
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('boot timeout')), 10_000);
-      proc.stdout.on('data', chunk => {
-        if (chunk.toString().includes('Trip server running on')) { clearTimeout(timeout); resolve(); }
-      });
-    });
-    for (let attempt = 0; attempt < 30; attempt++) {
-      const res = await fetch(`http://localhost:${PORT}/api/auth/login`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'alice', password: '1234' }),
-      });
-      if (res.ok) { usdToken = (await res.json()).token; break; }
-      await new Promise(r => setTimeout(r, 100));
-    }
+    server = await spawnPatchedServer(PORT, cfg => { cfg.meta.homeCurrency = 'USD'; });
   });
-
-  after(async () => {
-    await new Promise(resolve => { proc.once('exit', resolve); proc.kill('SIGTERM'); });
-    rmSync(dataDir, { recursive: true, force: true });
-    rmSync(tripDir, { recursive: true, force: true });
-  });
+  after(() => stopPatchedServer(server));
 
   test('normalizes to no home currency, not a USD-vs-USD line', async () => {
     const res = await fetch(`http://localhost:${PORT}/api/currency-rates`, {
-      headers: { Authorization: `Bearer ${usdToken}` },
+      headers: { Authorization: `Bearer ${server.token}` },
     });
     assert.equal(res.status, 200);
     const data = await res.json();
     assert.equal(data.home, null);
+  });
+});
+
+// frankfurter.dev 422s on a request to convert USD to itself — the one
+// pair it can't do. A domestic-US trip (destination currency USD, no
+// distinct home currency) used to send exactly that request and get a 502
+// on every single view, never able to populate its cache. USD must be
+// filtered out before the request goes out, not just handled in the error path.
+describe('GET /api/currency-rates — USD-only destination, no home currency', () => {
+  const PORT = 3112; // 3095-3111 already claimed by other test files
+  let server;
+
+  before(async () => {
+    server = await spawnPatchedServer(PORT, cfg => {
+      delete cfg.meta.homeCurrency; // fixture default is 'ILS' — this test needs none set
+      cfg.travel_info.countries = {
+        'United States of America': { currency: { code: 'USD', name: 'United States dollar', symbol: '$' } },
+      };
+    });
+  });
+  after(() => stopPatchedServer(server));
+
+  test('returns 200 with no rates instead of 502ing on a USD-to-USD request', async () => {
+    const res = await fetch(`http://localhost:${PORT}/api/currency-rates`, {
+      headers: { Authorization: `Bearer ${server.token}` },
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.deepEqual(data.rates, {});
   });
 });

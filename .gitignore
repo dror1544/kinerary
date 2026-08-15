@@ -1,5 +1,6 @@
 .env
-node_modules/
+# No trailing slash: must also match a node_modules *symlink*, not just a real dir (see 8aae012).
+node_modules
 .DS_Store
 .fastembed_cache/
 server/data/
