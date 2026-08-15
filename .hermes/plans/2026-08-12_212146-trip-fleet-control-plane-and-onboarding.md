@@ -19,7 +19,7 @@ Automate the complete trip lifecycle:
 ```text
 website signup
 → super-admin signup approval (MVP)
-→ authorized interview-bot handoff
+→ authorized Trip Bot interviewer handoff
 → confirmed, versioned intake
 → enrichment and reviewed provisioning plan
 → isolated trip runtime from a versioned release artifact
@@ -99,33 +99,56 @@ worker design. Move or adapt its validation, profile isolation, duplicate
 protection, allowlists, and MCP verification into a supervised Proxmox-hosted
 agent-runtime service; do not build a competing profile provisioner.
 
-### Shared Telegram routing by default
+### Shared Trip Bot, private Super Bot, and organizer-scoped profiles
 
-The design must not require a new bot merely because a new trip exists.
+The design uses two Telegram bot identities and does not require a new bot
+merely because a new trip exists.
 
-- one platform bot may handle website Telegram login and onboarding;
-- one shared interviewer bot issues database-authorized intake sessions;
-- one shared companion bot is the preferred group-facing default when a
-  gateway/router can map an authorized Telegram chat to exactly one trip and
-  dispatch it to that trip's isolated Hermes profile;
-- a dedicated per-trip bot remains an optional policy tier when branding,
-  customer isolation, platform constraints, or premium packaging justifies it.
+- a shared **Trip Bot** handles approved onboarding DMs and active trip groups
+  through a deterministic router;
+- before a trip is established, a signed enrollment routes the organizer to
+  the shared intake-only interviewer context;
+- after establishment, each group binding selects exactly one trip context;
+- each organizer has one long-lived Hermes companion profile that evolves
+  across trips, while every message receives a server-issued, trip-scoped
+  execution context;
+- a separate private **Super Bot**, restricted to the configured application
+  owner, reports incidents and exposes narrow plan/approve/execute control-plane
+  operations;
+- a dedicated per-trip Telegram bot remains an optional policy tier only when
+  branding, contractual isolation, platform constraints, or premium packaging
+  justifies it.
 
-The messaging provider is an adapter. Trip lifecycle state records a logical
-`messaging_binding`, not assumptions about BotFather, managed-child bots, or a
-specific token layout. This reduces Telegram-specific provisioning steps and
-keeps future chat providers possible.
+In a private Trip Bot DM, `/select` lists only trips the organizer owns and
+updates one selected conversation context. Group routing ignores that private
+selection and always uses the group's durable binding. An organizer may plan a
+future trip while a current group continues to use its active trip. Reassigning
+a group is a signed, reviewed operation that closes the old binding without
+erasing its history.
+
+The router performs identity resolution, lifecycle gating, authorization,
+command filtering, rate limiting, exact trip-context selection, and audit
+emission before Hermes. Hermes profiles never hold the shared Telegram token
+or choose a trip/MCP endpoint from message content. The messaging provider is
+an adapter, and lifecycle state records logical bindings rather than BotFather
+or token-layout assumptions.
 
 ### Data and secret ownership
 
 - `trips/<slug>/` owns confirmed trip content, versioned configuration,
   provenance, and personalization inputs.
 - PostgreSQL owns identities, ownership, lifecycle, jobs, approvals, release
-  selection, allocated resources, monitoring summaries, and audit records.
+  selection, allocated resources, messaging/trip-context bindings, connected-
+  service metadata, monitoring summaries, and audit records.
 - an external environment/secret store owns architecture settings and all
-  credentials. The database stores opaque secret references only.
+  credentials. User OAuth grants are tenant-scoped connections in the secret
+  store, not architecture settings or trip files. The database stores opaque
+  secret references only.
 - VMIDs, IPs, domains, provider endpoints, keys, and ports do not belong in a
   trip folder or per-trip wrapper script.
+- photos, videos, booking documents, and other binaries live in approved media
+  or object storage; trip content stores reviewed metadata and provenance
+  references, never binary payloads or OAuth tokens.
 
 ## Component architecture
 
@@ -144,8 +167,9 @@ Public ingress
 Private provisioning worker
   ├─ release-artifact adapter ────────────► provider artifact catalog
   ├─ trip-runtime adapter ────────────────► selected isolation runtime
-  ├─ Hermes adapter ──────────────────────► isolated profile per trip
+  ├─ Hermes adapter ──────────────────────► long-lived profile per organizer
   ├─ messaging adapter/router ────────────► shared or dedicated bot binding
+  ├─ connected-service adapters ──────────► consented import/search/publish APIs
   ├─ ingress adapter ─────────────────────► selected edge/ingress provider
   └─ verification/monitoring adapters
 
@@ -154,6 +178,10 @@ Per-trip isolated runtime
   ├─ private trip MCP
   ├─ persistent trip state/data mount
   └─ supervised services and health endpoints
+
+Trip Context Gateway
+  └─ server-issued trip + role + channel + lifecycle capability
+       └─ exactly one permitted trip MCP operation
 ```
 
 The public API and private worker may share code and a database, but they must
@@ -172,7 +200,7 @@ cloud migration materially more expensive:
 | LXC-only release identity | A Proxmox template cannot run on cloud container/VM services | Generic release manifest + digest; Proxmox template ID is provider metadata only |
 | Host paths/bind mounts as canonical data | Local volumes and `/Users/...` paths do not migrate or scale | Logical data/backup/secret references; database/object-store interfaces |
 | systemd/LAN/IP as product contracts | Containers, managed runtimes and service meshes use different lifecycle/network models | Provider-neutral start, readiness, endpoint and ingress contracts |
-| Mac-local Hermes profiles | Filesystem profiles and launchd do not provide cloud HA | Agent-runtime API with portable policy/personalization bundles |
+| Mac-local Hermes profiles | Filesystem profiles and launchd do not provide cloud HA | Agent-runtime API with an organizer profile plus portable policy, memory and trip-context bundles |
 | In-memory sessions/router state | Multiple public/API/gateway replicas cause replay and misrouting | PostgreSQL/Redis-backed enrollment, bindings, leases and idempotency |
 | Per-trip physical LXC as the only isolation model | Cost and scheduling grow linearly with customer count | `isolation_tier` policy; logical trip isolation remains mandatory |
 | RPi/NPM/Cloudflare assumptions | Cloud ingress has different TLS, DNS, routing and identity primitives | Ingress adapter exposes hostname/TLS/upstream intent, not IP-specific commands |
@@ -201,6 +229,12 @@ Any non-terminal state → failed/remediation_required
 active → suspended → active | completed
 ```
 
+`active` is a trip lifecycle state; it is not the same as the organizer's
+selected private-DM context. One organizer profile has one selected context at
+a time, but may own a current trip, future drafts and completed history.
+`completed` is sealed read-only. `archived` changes retention/visibility and
+runtime policy, not the immutability of the completed trip record.
+
 Before `draft`, a verified website identity may be in
 `pending_signup_approval` (MVP). This is a signup-request state, not a trip
 with interview or provisioning authority. Only a configured super-admin's
@@ -227,9 +261,10 @@ profile, messaging binding, group binding, domain, and routes.
 
 ## Task 0 — Reconcile contracts and safety boundaries
 
-- Mark this plan and the two supporting docs WIP and cross-link them.
+- Mark this plan and its supporting docs WIP and cross-link them.
 - Define versioned schemas for environment configuration, trip content,
-  releases, plans, events, and provider adapter results.
+  releases, plans, events, connected-service capabilities, organizer memory,
+  trip contexts, and provider adapter results.
 - Define provider contracts for release rendering, isolated runtime,
   persistent data/backup, secrets, ingress, agent runtime and messaging;
   prove the Proxmox/RPi/Mac replacements implement those contracts without
@@ -283,7 +318,8 @@ Every query is scoped by membership even while there is only one real admin.
 
 Only after signup approval and draft creation, issue a signed, opaque,
 expiring, single-use deep link to
-the shared interviewer bot. At `/start`, verify that the inbound Telegram ID:
+the shared Trip Bot's interviewer route. At `/start`, verify that the inbound
+Telegram ID:
 
 - belongs to a registered website identity;
 - matches the link's user and trip;
@@ -337,22 +373,27 @@ After a confirmed intake and approved plan:
 The deploy package uses a positive allowlist of files. Do not copy an entire
 trip directory and try to exclude every secret or operator artifact.
 
-## Task 6 — Hermes profile and personalized agent bundle
+## Task 6 — Organizer Hermes profile, memory, and Trip Context Gateway
 
 Evolve the existing FamilyTrip provisioner into a private agent-runtime
-adapter. A request is idempotently bound to one trip and includes references
-to:
+adapter that creates one long-lived profile per organizer, not one profile per
+trip. The profile owns a versioned global policy/persona bundle and references
+structured, consented organizer preferences and recurring-traveler records.
+It does not hold unrestricted credentials for every historical trip.
 
-- the verified private MCP endpoint;
-- the logical messaging binding;
-- a versioned global policy bundle;
-- per-trip language, name, tone, timezone and traveler-context bundle;
-- analytics emitter configuration and secret reference.
+Add a deterministic Trip Context Gateway. Every dispatch carries a
+server-issued capability containing the organizer/profile, exact trip,
+channel, requester role, lifecycle state and permitted action family. The
+gateway selects one private trip MCP, enforces read/write policy, rejects
+caller-supplied trip substitutions, and records safe audit evidence. Group and
+organizer-private sessions are isolated so private memory cannot enter a group
+response.
 
-The global bundle enforces the product's private-organizer versus family-group
-permission boundary, source precedence, state preservation, typed actions,
-and confirmation rules. Profile verification proves the profile can reach
-only its own trip MCP and that default/interviewer profiles cannot.
+Remembered preferences are suggestions with provenance, not automatic input.
+Copying a preference or recurring traveler into a new trip requires organizer
+confirmation. Raw transcripts and sensitive personal facts are not durable
+profile memory. Verification proves cross-trip reads/writes and private-to-
+group memory leakage fail.
 
 ## Task 7 — Messaging routing and group binding
 
@@ -360,18 +401,29 @@ Build a provider-neutral messaging adapter with Telegram first.
 
 For shared-bot mode:
 
+- distinguish the shared Trip Bot from the owner-only Super Bot;
 - store a signed, single-use binding invitation;
 - verify organizer identity and Telegram group context;
 - map `provider + bot_identity + chat_id` to exactly one trip;
-- dispatch accepted messages to exactly that trip's Hermes profile;
+- route onboarding DMs to an intake-only session and established group turns
+  to the organizer profile with an exact server-issued trip context;
+- support private `/select` using signed, expiring callbacks over owned trips;
+- keep private selected context independent from durable group bindings;
+- allow reviewed group reassignment while retaining binding history;
 - keep group and organizer-private contexts distinct in routing and policy;
 - ensure ordinary group chatter is ignored unless the trigger policy accepts
   it;
 - verify the shared bot's permissions are no broader than needed.
 
+The Super Bot accepts private updates only from the configured application
+owner. It may show redacted incidents and create/approve/retry/suspend/archive
+plans, but it has no arbitrary shell, provider-action or secret-retrieval
+surface. Profile refinement means a reviewed personalization-bundle update;
+it cannot weaken global authorization/privacy policy.
+
 For optional dedicated-bot mode, reuse the same logical interface and lifecycle
 states. Do not make managed-bot creation or per-trip BotFather domain setup a
-global activation prerequisite when the shared platform bot can satisfy the
+global activation prerequisite when the shared Trip Bot can satisfy the
 feature safely.
 
 ## Task 8 — Private verification and activation
@@ -414,7 +466,7 @@ consent, provenance or retention policy.
 
 Add `docs/trip-bot-analytics-and-metrics-design.md` as the detailed telemetry
 contract. Analytics covers both control-plane lifecycle/product events and
-companion-bot operational events. It is not a transcript archive.
+Trip Bot operational events. It is not a transcript archive.
 
 Capture at minimum:
 
@@ -426,6 +478,41 @@ Capture at minimum:
 - upgrade/rollback success and support burden;
 - bounded usage and cost events needed for future entitlements/monetization.
 
+## Task 10A — Connected services and external integrations
+
+Define connected services as optional, consented product capabilities, not
+provisioning prerequisites. Foundational records include user-owned service
+connections, trip bindings, granted capability levels, opaque secret
+references, sync cursors, import jobs, source artifacts, extracted candidates,
+publish drafts and review/approval receipts.
+
+Capabilities are separately granted for `select/import`, `continuous_read`,
+`write/organize`, `publish`, and `transaction`. Revoking an optional connection
+degrades that feature without taking the trip offline. Provider adapters must
+use official APIs and preserve source, retrieval time, consent and review
+state. Never use scraping, CAPTCHA bypass, browser credential automation, or
+undocumented private APIs.
+
+Planned adapter tracks:
+
+- Google Photos Picker and native OS photo pickers for explicitly selected
+  media; broader/background gallery behavior waits for the mobile app and
+  separate consent;
+- Immich albums/assets/search through fine-grained API keys;
+- Google Drive Picker for selected booking documents, with Gmail mailbox
+  access deferred behind restricted-scope verification and security review;
+- Google Places/Maps URLs for place normalization and context; personal Saved
+  lists require user export/share/import rather than Maps scraping;
+- social-media draft generation first, then explicit preview/approval and
+  official publish APIs;
+- Booking.com, Agoda, Priceline or other inventory adapters only after partner
+  access; start with expiring search offers and provider checkout redirects,
+  not autonomous purchase/payment.
+
+Imported booking/place/photo facts are reviewable candidates before they alter
+trip content. Media and documents stay outside Git; the trip stores portable
+metadata and provenance references.
+
 ## Task 11 — Upgrade, rollback, completion, and archive
 
 - Active trips stay pinned until an approved upgrade plan selects another
@@ -433,11 +520,14 @@ Capture at minimum:
 - Upgrade rehearses data migration, health and rendered UI before cutover.
 - Rollback uses an available compatible prior image and a verified data
   checkpoint; it never assumes database downgrades are safe.
-- Completion stops proactive live-trip automation but preserves authorized
-  history and post-trip features.
+- Completion stops proactive live-trip automation, seals a final trip-data
+  digest and makes trip-domain mutations fail at the API/gateway layer, not
+  merely by prompt. Historical corrections are separate annotations or
+  reviewed knowledge candidates.
 - Archive revokes runtime credentials/routes according to policy while
   retaining or deleting trip data according to organizer consent and legal
-  requirements.
+  requirements. Revisiting or unarchiving changes visibility/access, never the
+  completed trip's read-only status.
 
 After completion, offer a separate organizer-authorized debrief. It collects
 choice-first ratings and review outcomes for sites, corrections/additional
@@ -485,8 +575,10 @@ production hostname or real family group.
    runtime state, yet a Japan deployment from it passes the full test suite.
 4. Repeating a job does not duplicate a runtime, profile, messaging binding,
    route, domain or secret.
-5. A shared Telegram bot can route two test groups to two isolated profiles
-   without cross-trip access; dedicated-bot mode is optional, not assumed.
+5. A shared Trip Bot can route two test groups through one organizer profile
+   with different server-issued trip contexts and isolated sessions, without
+   cross-trip access or private-memory leakage. Private `/select` does not
+   change either group binding. Dedicated-bot mode is optional, not assumed.
 6. A trip cannot become `active` before private verification and separate
    activation approval both succeed.
 7. Registry, logs, analytics and dashboards contain no plaintext secrets or
@@ -497,12 +589,20 @@ production hostname or real family group.
    newer release; a compatible Japan upgrade and rollback are demonstrated.
 10. Super-admin queries are globally authorized and organizer queries are
     membership-scoped from the first schema version.
+11. Connected-service tokens never enter trip folders, plans, logs or database
+    values; revocation, cross-trip binding attempts, stale imports and
+    unapproved publish/transaction actions fail safely without disabling the
+    core trip.
 
 ## Explicitly deferred, without blocking the schema
 
 - billing provider and pricing plans;
 - organizer-facing historical insights and Traveler DNA UX;
 - additional messaging providers;
+- connected-service implementations beyond the foundational capability,
+  consent, provenance and secret-reference schemas;
+- broad Gmail synchronization, automatic photo-library scanning, social
+  publishing and travel purchases;
 - high-volume queue/analytics infrastructure;
 - fully automatic release promotion;
 - cross-trip recommendations beyond consented, provenance-aware aggregates.

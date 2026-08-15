@@ -60,7 +60,8 @@ dashboard/email workflow can use that contract without changing signup state.
 | Planner/workflow | confirmed intake + release ID | immutable plan, jobs and audit trail | actual runtime creation |
 | Release catalog | source revision | verified release manifest + local artifact reference | real organizer data |
 | Runtime adapter | approved plan | private runtime/resource records | public DNS/TLS |
-| Agent/messaging adapter | trip binding + policy bundle | isolated profile and group binding | public activation |
+| Agent/messaging adapter | organizer binding + policy/memory bundle | organizer profile, Trip Context Gateway and group binding | public activation |
+| Connected services | user consent + trip binding + capability | reviewed imports/drafts/provider receipts | core trip activation |
 | Verification/activation | private readiness evidence | active trip and scoped status | a new provisioning run |
 
 No public API, Telegram update, or Hermes tool invokes provider actions
@@ -78,8 +79,10 @@ Build these once in Sprint 0; every later sprint uses them.
   identity, a second unauthorized identity, Japan intake data, an incompatible
   release, and a controlled provider error.
 - Adapter fakes implement compute, ingress, Hermes, Telegram, clock and secret
-  interfaces for deterministic unit/contract tests. A separate integration
-  profile uses real local adapters only against the test allocation.
+  interfaces for deterministic unit/contract tests. Connected-service fakes
+  cover OAuth revocation, stale cursors/offers, import provenance and approval
+  gates. A separate integration profile uses real local adapters only against
+  the test allocation.
 - Each operation writes a correlation ID, plan digest, job ID and redacted
   audit event. Tests assert state and evidence, not only a successful HTTP
   response.
@@ -114,7 +117,9 @@ gate with direct database edits or shell commands.
 Build:
 
 - Define versioned schemas for user, trip, enrollment, intake version, release,
-  plan, job, resource, verification evidence, activation and audit event.
+  plan, job, resource, verification evidence, activation, organizer profile,
+  trip context, messaging/group binding, connected-service capability/consent,
+  import provenance and audit event.
 - Create the TypeScript control API skeleton and Python worker skeleton with a
   shared provider-neutral request/result schema. Keep workers on a private
   listener/queue path.
@@ -129,7 +134,8 @@ Automated tests:
   fails before any provider call;
 - state-machine tests reject skipped lifecycle states and direct activation;
 - secret redaction and canonical-record tests prove paths, IPs and secret
-  values are not stored in trip content or public responses;
+  values, OAuth grants and provider tokens are not stored in trip content,
+  plans, database values or public responses;
 - fake adapter contract tests prove request IDs and idempotency keys propagate.
 
 Manual tests:
@@ -317,41 +323,56 @@ Manual tests:
 Exit gate: one Japan deployment reaches `ready_private` only after stored
 release, runtime, persistence, website and private-MCP evidence exists.
 
-### Sprint 5 — Hermes profile, shared Telegram routing, and group binding
+### Sprint 5 — Organizer profile, Trip Context Gateway, and Telegram routing
 
-**Goal:** connect one isolated companion profile and one test group without
-creating a per-trip bot by default.
+**Goal:** connect one long-lived organizer companion profile to isolated trip
+contexts and test groups without creating a per-trip Telegram bot.
 
 Build:
 
 - Convert reusable `familytrip-provisioner` validation/profile logic into a
-  private agent-runtime adapter using policy and personalization bundles.
-- Create provider-neutral messaging bindings and a shared Telegram router.
+  private adapter that creates one profile per organizer using versioned
+  policy, memory and personalization bundles.
+- Add a deterministic Trip Context Gateway. It accepts only a router-issued
+  organizer/trip/channel/role/lifecycle capability and selects one permitted
+  trip MCP; the model/message cannot choose a trip or endpoint.
+- Create provider-neutral messaging bindings and the shared Trip Bot router.
   Bind `provider + bot identity + chat ID` to exactly one trip only after a
   signed organizer action and permission verification.
-- Keep interviewer DM, organizer-private commands and group-chat commands as
-  separate routes/policies. Dedicated-bot support remains an optional adapter
-  path, not a Sprint 5 dependency.
+- Implement private `/select` over owned trips with signed callbacks. Private
+  selection is independent from group routing, and reviewed reassignment
+  preserves binding history.
+- Keep intake, organizer-private and group-chat sessions/policies separate.
+  Add the private owner-only Super Bot for redacted alerts and narrow
+  plan/approve/execute operations. Dedicated-bot support remains optional.
 
 Automated tests:
 
-- profile bundle versioning and private MCP endpoint scoping;
-- two-trip router matrix: each accepted group message reaches only its own
-  profile; unknown/moved/replayed chats and ordinary chatter are rejected or
-  ignored according to policy;
+- organizer-profile bundle versioning, structured memory consent and Trip
+  Context Gateway scoping;
+- two-trip router matrix: two groups may reach the same organizer profile, but
+  use isolated sessions and different server-issued trip contexts; cross-trip
+  reads/writes and private-memory leakage fail;
+- private `/select` changes only the DM context; neither group binding changes;
 - group-binding invitation replay/expiry/organizer mismatch and insufficient
   bot permissions fail safely;
+- reassignment requires confirmation, closes rather than overwrites the old
+  binding, and cannot silently retarget another active group;
+- Super Bot rejects every sender except the configured owner and never exposes
+  shell/provider/secret primitives;
 - agent/messaging adapter failures leave the trip non-active and retryable.
 
 Manual tests:
 
 - bind a disposable Telegram group using the test organizer; verify the shared
   bot sees only allowed behavior and the companion uses the Japan identity;
-- send the same trigger from a second test group and verify no cross-trip
-  response or MCP access occurs.
+- create/select a second draft in private DM and verify the Japan group remains
+  bound to Japan; then send a trigger from a second test group and verify no
+  cross-trip response, memory or MCP access occurs.
 
 Exit gate: private verification demonstrates one group, one logical binding,
-one profile and one trip MCP identity, with a two-trip isolation test passing.
+one organizer profile and one exact trip context/MCP identity, with a two-trip
+isolation test passing.
 
 ### Sprint 6 — Verification, explicit activation, dashboard, and demo rehearsal
 
@@ -361,8 +382,8 @@ observe, pause and recover it.
 Build:
 
 - Implement a verification aggregator requiring release compatibility,
-  runtime/service health, rendered trip data, MCP/profile isolation, messaging
-  binding and backup checkpoint before `ready_private`.
+  runtime/service health, rendered trip data, MCP/context/profile isolation,
+  messaging binding and backup checkpoint before `ready_private`.
 - Generate a separate, expiring activation plan with the exact logical
   hostname/TLS/upstream intent. Apply it only from a distinct approval.
 - Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
@@ -403,6 +424,16 @@ trip and, only with explicit consent, future-trip suggestions.
 
 Build:
 
+- Seal the completed trip data/version and enforce read-only behavior in both
+  the trip API and Trip Context Gateway. Archiving changes normal visibility
+  and runtime policy, never completed-trip immutability.
+- Let the organizer explicitly select a completed trip in private Telegram for
+  read-only memories; archived trips remain available from the personal
+  dashboard and an explicit archive-selection path.
+- Maintain structured, consented organizer preferences and recurring-traveler
+  references separately from trip records. Suggest reuse with provenance and
+  require confirmation before copying anything into a new trip.
+
 - Issue a separate, owner-authorized debrief session after completion. Use the
   same choice-first Telegram pattern for ratings, whether a site was visited,
   recommendation confidence and reuse intent; each prompt offers `other` and
@@ -422,6 +453,10 @@ Build:
 
 Automated tests:
 
+- completed-trip mutation fails through both direct API and agent gateway;
+  selecting/unarchiving it permits read-only access only;
+- organizer memory never crosses into a group response, and an old preference
+  or traveler is not copied into a new draft without confirmation;
 - debrief enrollment is scoped to a completed trip and authorized organizer;
   a different member/trip cannot read or modify feedback;
 - choice and `other` answer handling mirrors intake validation and stores
@@ -493,7 +528,25 @@ ad-hoc commands.
 Defer until the MVP is stable: cloud renderer, managed database/queue,
 Kubernetes, multi-region operation, organizer self-service history/insights,
 billing, automated release promotion, additional messaging providers, and
-dedicated per-trip bots. Do not defer their interfaces: release manifests,
-resource IDs, secret references, `isolation_tier`, memberships, messaging
-bindings, consent/provenance-labelled feedback and lifecycle events are
-required in the first schema.
+dedicated per-trip bots. Also defer broad Gmail synchronization, automatic
+photo-library scanning, social publishing and travel purchases. Do not defer
+their interfaces: release manifests, resource IDs, secret references,
+`isolation_tier`, memberships, messaging bindings, organizer trip-context
+selection, service-connection capabilities, consent/provenance-labelled
+imports/feedback and lifecycle events are required in the first schema.
+
+After the MVP, connected services should arrive in separately reviewed tracks:
+
+1. manual booking uploads/forwarding, Google Drive Picker, Maps Place IDs/URLs
+   and scoped Immich access;
+2. Google Photos Picker and reviewed Gmail extraction after OAuth verification
+   and security requirements are understood;
+3. native selected-gallery access, with broader background access requiring a
+   new mobile consent decision;
+4. hotel inventory search after formal supplier access, returning timestamped,
+   expiring offers and provider checkout links before any booking capability;
+5. social drafts followed by explicit preview/approval through official APIs.
+
+Provider fakes and schema tests land before real credentials. No track may use
+scraping, CAPTCHA bypass, browser credential automation or undocumented APIs,
+and revoking an optional connection must not make the core trip unavailable.

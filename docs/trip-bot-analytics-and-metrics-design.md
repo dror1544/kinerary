@@ -90,13 +90,14 @@ Shared messaging gateway or optional dedicated gateway
   ├─ derives channel/role/trigger without exporting raw identifiers
   └─ local durable outbox (non-blocking)
 
-Trip-specific Hermes profile
+Organizer-scoped Hermes profile
   ├─ plugin observes accepted turn/tool/response lifecycle
+  ├─ receives a server-issued trip context per accepted turn
   └─ local durable outbox (non-blocking)
               │ private authenticated batches
               ▼
 Analytics Ingest Service (on control-plane private network)
-  ├─ authenticates per-trip emitter
+  ├─ authenticates organizer emitter and trip-context capability
   ├─ validates schema and event idempotency
   ├─ writes event store and rollups
   ├─ queues low-confidence classifications
@@ -119,8 +120,9 @@ Analytics database/schema              │
 - **Messaging emitter:** observes the shared Telegram router or optional
   dedicated gateway after authorization and trip resolution. A single shared
   bot must still emit the resolved logical trip/profile identity.
-- **Hermes emitter:** a standalone plugin installed per isolated trip profile
-  in the agent-runtime service. It observes only that profile's accepted turns.
+- **Hermes emitter:** a standalone plugin installed per organizer profile in
+  the agent-runtime service. It observes accepted turns only after the router
+  and Trip Context Gateway resolve an exact trip/channel/role capability.
 - **Ingest service/database:** private services on the onboarding/control
   network, logically separate from the public API. They must not run directly
   on the Proxmox host or inside an individual trip LXC.
@@ -166,31 +168,43 @@ Also use Hermes lifecycle hooks that are already available for agent/tool observ
 
 During implementation, inspect the exact hook payloads in the deployed Hermes version and add contract tests. Do not assume undocumented fields beyond the public plugin contract.
 
-### 4.2 Trip identity resolution
+### 4.2 Organizer profile and trip-context resolution
 
-Each isolated trip profile must declare a **non-secret static trip identity**
-in plugin configuration. The messaging gateway independently resolves its
-logical binding from the control plane before dispatch. Example profile
-configuration:
+Each long-lived organizer profile declares a **non-secret static organizer and
+profile identity**. Trip identity is not static profile configuration: the
+messaging router resolves it from a private DM selection or durable group
+binding, and the Trip Context Gateway issues an immutable capability before
+dispatch. Example profile configuration:
 
 ```yaml
 trip_analytics:
   enabled: true
-  trip_id: "usa2026"
+  organizer_id: "opaque-organizer-id"
+  profile_id: "familytrip-organizer-01"
   environment: "production"
   ingest_url: "https://analytics.internal.example/v1/events"
-  secret_ref: "secret://kinerary/analytics/usa2026-emitter"
+  secret_ref: "secret://kinerary/analytics/organizer-01-emitter"
 ```
 
-Use Hermes configuration mechanisms for non-secret settings and a secret reference/provider for credentials. Do not hard-code the trip ID or token in plugin code; do not put a token in a repository file.
+Use Hermes configuration mechanisms for non-secret settings and a secret
+reference/provider for credentials. Do not hard-code a trip ID or token in
+plugin code and do not put a token in a repository file. The plugin accepts a
+trip ID only from the authenticated router/gateway context, never from message
+text, tool arguments or model output. It emits both the durable organizer
+profile ID and resolved trip/deployment IDs.
 
-The control plane should create this configuration only when it creates the corresponding isolated trip profile, then verify that the emitter identity matches the profile/trip binding.
+The control plane creates this configuration with the organizer profile and
+verifies that each event's trip context matches the active router capability.
+Group and private sessions are distinct, and analytics must not copy organizer-
+private memory or its contents into events.
 
-For shared-bot mode, `bot_identity + provider_chat_id` must resolve to exactly
-one active `messaging_binding`. Raw provider IDs remain inside the routing
-service. Analytics receives `trip_id`, `profile_id`, `messaging_mode=shared`
-and a rotating pseudonym only after authorization. A routing miss or ambiguous
-binding is a safe operational event and must not dispatch to Hermes.
+For shared-Trip-Bot group mode, `bot_identity + provider_chat_id` resolves to
+exactly one active `messaging_binding`. Private DMs resolve from the organizer's
+explicit selected trip or signed intake session. Raw provider IDs remain
+inside the routing service. Analytics receives `trip_id`, organizer-scoped
+`profile_id`, `messaging_mode=shared` and a rotating pseudonym only after
+authorization. A routing miss or ambiguous/stale binding is a safe operational
+event and must not dispatch to Hermes.
 
 ### 4.3 Channel and requester role resolution
 
@@ -254,7 +268,8 @@ Store only the minimum data needed for analysis. Example logical schema:
   "deployment_id": "opaque-deployment-id",
   "release_id": "kinerary-2026.08.1",
   "environment": "production",
-  "profile_id": "familytrip-usa2026",
+  "profile_id": "organizer-opaque-profile-id",
+  "context_source": "group_binding",
   "source_service": "messaging_gateway",
   "messaging_mode": "shared",
   "event_type": "bot_request_accepted",
@@ -452,7 +467,8 @@ Do not derive trip location from raw text when the configured active phase alrea
 
 - public onboarding API, workflow worker, PostgreSQL and scheduler health;
 - release builder and provider-artifact inventory consistency;
-- per-trip site/MCP/Hermes/messaging/ingress health and restart recovery;
+- per-trip site/MCP/messaging/ingress health plus per-organizer Hermes-profile
+  health and restart recovery;
 - shared-router binding misses, ambiguous routes and cross-trip policy blocks;
 - plugin emission successes/failures/dropped events;
 - outbox event count, bytes, oldest pending age, retry count;
@@ -460,7 +476,10 @@ Do not derive trip location from raw text when the configured active phase alrea
 - classification queue depth and latency;
 - Hermes bot response failures/timeouts;
 - tool failures grouped by bounded tool family;
-- per-trip profile health and collector health.
+- per-organizer profile, Trip Context Gateway and collector health;
+- connected-service authorization/revocation, import/sync freshness and
+  bounded provider outcomes without external account IDs or document/media
+  content.
 
 ### 7.4 Derived quality indicators (clearly labeled as heuristics)
 
@@ -691,15 +710,19 @@ Do not call the analytics system ready until all of the following are demonstrat
   events, and dashboard state reconciles with the authoritative registry.
 - Image build, Japan qualification, deployment, upgrade and rollback events
   retain the correct release ID.
-- Two groups using the shared bot emit different logical trip/profile IDs and
-  a routing miss emits no Hermes turn.
+- Two groups using the shared Trip Bot may emit the same organizer profile ID
+  but must emit different logical trip/context IDs; a routing miss emits no
+  Hermes turn, and private `/select` changes neither group binding.
+- A completed trip emits read-only access outcomes and every attempted
+  mutation is blocked at the gateway/API rather than classified as success.
 - An organizer DM, a participant group mention, a bot reply, and a slash command are classified into correct channel/role/trigger dimensions.
 - The emitter can be stopped or the ingest endpoint can be unavailable without impacting a bot response.
 - Retried delivery produces one stored event due to ingest idempotency.
 - No raw message text, names, chat IDs, Telegram IDs, tokens, tool arguments, tool results, or secret-looking values appear in emitted payloads, logs, Prometheus labels, or default Grafana views.
 - The event taxonomy handles Hebrew and English examples and yields `unclassified` rather than inventing a category when uncertain.
 - One full agent turn accurately produces accepted/request, response outcome, latency, and safe tool-family metrics.
-- Default and intake Hermes profiles do not emit trip-bot analytics for a trip they do not operate.
+- Default/intake contexts and organizer profiles do not emit trip analytics
+  without an authenticated server-issued trip capability.
 - Grafana numbers reconcile with the event database for a fixed test time window.
 - Data deletion/retention jobs remove expired event rows and diagnostic samples.
 - Prometheus cardinality remains within a reviewed bound under a synthetic multi-trip load test.
@@ -750,12 +773,13 @@ analytics/
     taxonomy.md
 ```
 
-The Hermes emitter plugin may be installed into the profile-specific plugin
+The Hermes emitter plugin may be installed into the organizer-profile plugin
 location during provisioning, but its source, tests and deployment
 configuration remain centrally managed. The messaging emitter belongs at the
 gateway/router so shared-bot traffic is labeled only after a successful
-logical trip binding. The control plane attaches emitters using approved
-static IDs and secret references; it never embeds credentials in trip content.
+logical trip/intake binding. The control plane attaches emitters using approved
+static organizer/profile IDs, dynamic authenticated trip contexts and secret
+references; it never embeds credentials in trip content.
 
 ---
 
