@@ -7,6 +7,7 @@
     "departure": "2026-09-05T20:00:00+03:00",
     "returnDate": "2026-09-16",
     "totalDays": 11,
+    "homeCurrency": "ILS",
     "homePhoto": "https://images.unsplash.com/photo-1751203659321-f46cdea69bde?w=2400&q=80&auto=format&fit=crop",
     "mapPhoto": "https://images.unsplash.com/photo-1741230127615-8334deb6b463?w=2400&q=80&auto=format&fit=crop"
   },

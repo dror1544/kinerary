@@ -692,6 +692,10 @@ function sanitizeConfig(cfg) {
 app.get('/api/config', authRequired, (_req, res) => {
   const safe = sanitizeConfig(TRIP_CONFIG);
   safe.trivia_available = TRIVIA_QUESTIONS.length > 0;
+  // Every reload must see this deploy's config, not a stale copy some
+  // intermediary (browser, Cloudflare, a reverse proxy in front of it)
+  // decided a GET response was safe to hold onto.
+  res.setHeader('Cache-Control', 'no-store');
   res.json(safe);
 });
 
@@ -699,7 +703,13 @@ app.get('/api/config', authRequired, (_req, res) => {
 // One shared, server-side cache refreshed at most once/day, not a per-visitor
 // fetch — a dozen family members opening the Info tab the same afternoon
 // should cost one external call, not a dozen.
-const HOME_CURRENCY = (TRIP_CONFIG.meta?.homeCurrency || '').toUpperCase() || null;
+// "USD" means the same thing whether it's explicit or just the unset
+// default — normalize both to null so the home-currency line never
+// duplicates the USD line below.
+const HOME_CURRENCY = (() => {
+  const c = (TRIP_CONFIG.meta?.homeCurrency || '').toUpperCase();
+  return c && c !== 'USD' ? c : null;
+})();
 const CURRENCY_CACHE_MS = 24 * 60 * 60 * 1000;
 let currencyRatesCache = null; // { base, home, rates, date, fetchedAt }
 
@@ -724,6 +734,11 @@ async function getCurrencyRates() {
 }
 
 app.get('/api/currency-rates', authRequired, async (_req, res) => {
+  // The 24h reuse window below is an intentional in-process cache — that's
+  // the point of this endpoint. This header stops anything in front of the
+  // server (browser, Cloudflare, a reverse proxy) from ALSO caching the
+  // response and shadowing that logic with a copy of its own.
+  res.setHeader('Cache-Control', 'no-store');
   try {
     res.json(await getCurrencyRates());
   } catch (e) {

@@ -338,7 +338,9 @@ against [frankfurter.dev](https://frankfurter.dev) (free, keyless,
 ECB-backed) and caches the result server-side for 24h. One shared fetch a
 day regardless of how many family members open the Info tab, not one per
 visitor. No `homeCurrency` set → the USD side still shows, just not the
-home-currency comparison.
+home-currency comparison. `homeCurrency: "USD"` is treated the same as
+unset (no duplicate USD-vs-USD line) — the dollar is the implicit default
+home currency either way.
 
 ---
 

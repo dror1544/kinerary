@@ -10,6 +10,11 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'child_process';
+import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
 
 let token;
@@ -42,5 +47,66 @@ describe('GET /api/currency-rates', () => {
     const first = await (await api('/api/currency-rates', { token })).json();
     const second = await (await api('/api/currency-rates', { token })).json();
     assert.equal(first.fetchedAt, second.fetchedAt, 'expected the cached value, not a re-fetch');
+  });
+});
+
+// An organizer explicitly setting homeCurrency to "USD" means the same
+// thing as leaving it unset — both are "the organizer's home currency is
+// the dollar". Needs its own trip dir/server since it patches
+// meta.homeCurrency before boot, unlike the shared fixture above (ILS).
+describe('GET /api/currency-rates — explicit homeCurrency: "USD"', () => {
+  const HERE = dirname(fileURLToPath(import.meta.url));
+  const FIXTURES_DIR = join(HERE, 'fixtures');
+  const SERVER_JS = join(HERE, '..', 'server', 'server.js');
+  const PORT = 3111; // 3095-3110 already claimed by other test files
+
+  let dataDir, tripDir, proc, usdToken;
+
+  before(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'trip-currency-usd-data-'));
+    tripDir = mkdtempSync(join(tmpdir(), 'trip-currency-usd-trip-'));
+    cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+    const cfgPath = join(tripDir, 'trip.config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.meta.homeCurrency = 'USD';
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+
+    proc = spawn('node', [SERVER_JS], {
+      cwd: join(HERE, '..', 'server'),
+      env: {
+        ...process.env, PORT: String(PORT), TRIP_DIR: tripDir, DATA_DIR: dataDir,
+        AVATARS_DIR: join(dataDir, 'avatars'), JWT_SECRET: 'test-secret-000',
+        IMMICH_URL: '', IMMICH_API_KEY: '', HERMES_API_KEY: 'test-hermes-key', SEED_PASSWORD: '1234',
+      },
+    });
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('boot timeout')), 10_000);
+      proc.stdout.on('data', chunk => {
+        if (chunk.toString().includes('Trip server running on')) { clearTimeout(timeout); resolve(); }
+      });
+    });
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const res = await fetch(`http://localhost:${PORT}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'alice', password: '1234' }),
+      });
+      if (res.ok) { usdToken = (await res.json()).token; break; }
+      await new Promise(r => setTimeout(r, 100));
+    }
+  });
+
+  after(async () => {
+    await new Promise(resolve => { proc.once('exit', resolve); proc.kill('SIGTERM'); });
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(tripDir, { recursive: true, force: true });
+  });
+
+  test('normalizes to no home currency, not a USD-vs-USD line', async () => {
+    const res = await fetch(`http://localhost:${PORT}/api/currency-rates`, {
+      headers: { Authorization: `Bearer ${usdToken}` },
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.home, null);
   });
 });
