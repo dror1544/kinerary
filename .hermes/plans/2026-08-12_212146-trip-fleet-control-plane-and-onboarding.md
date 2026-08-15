@@ -1,353 +1,477 @@
-# Trip Fleet Control Plane and Onboarding Pipeline — Implementation Plan
+# Trip Lifecycle, Control Plane, and Automated Onboarding — WIP Plan
 
-> **Read first:** `docs/kinerary-trip-platform-handoff.md` (last reconciled
-> 2026-08-07 — the authoritative architecture/status doc) and
-> `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
-> (the enrichment + Python provisioning task breakdown this plan depends on
-> and does not duplicate). This plan is the third leg: the durable
-> registry/control-plane service the handoff doc's §6 calls for, plus the
-> pieces needed to close the loop from a confirmed intake to a live,
-> organizer-usable trip.
+> **Status: WIP architecture and implementation plan.** This document records
+> the intended product direction; it does not authorize a deployment, a live
+> infrastructure mutation, or a commit. Refine provider details and acceptance
+> evidence as the implementation progresses.
+>
+> Read with `docs/control-plane-implementation-guide.md`,
+> `docs/trip-bot-analytics-and-metrics-design.md`,
+> `docs/onboarding-mvp-sprint-plan.md`,
+> `docs/kinerary-trip-platform-handoff.md`, and the post-interview enrichment
+> plan. Where the older handoff assumes a fixed golden LXC, Mac-hosted control
+> plane, or one Telegram bot per trip, this plan records the newer target.
 
-**Goal:** Turn the pieces that already exist — the interview flow, the
-`provisioning/` Python adapters, `telegram_manager/`, Telegram SSO, the
-external FamilyTrip profile provisioner — into one deterministic,
-audited pipeline: confirmed intake → LXC provisioned from the golden
-template → site verified → per-trip Hermes companion + Telegram bot
-created → organizer approves public activation → organizer adds the bot
-to their group. Plus a small always-on service (not an LLM) that owns
-this state machine, gives a super-admin visibility into every trip's
-runtime health, and can reset/rotate/administer any of them.
+## Goal
 
-**Architecture** (per `docs/kinerary-trip-platform-handoff.md` §1, §6 —
-supersedes any Docker-Compose-per-trip design):
+Automate the complete trip lifecycle:
 
 ```text
-Mac — Hermes control plane
-  ├─ interviewer profile (DM-only, no provisioning/trip-data MCP access)
-  └─ one isolated Hermes companion profile per confirmed trip
-
-Proxmox (192.168.0.40)
-  ├─ golden-trip LXC template — 192.168.0.202
-  ├─ one LXC per real trip, cloned from that template
-  └─ this plan's control-plane service — its own small LXC, NOT installed
-     directly on the Proxmox host
-
-RPi4 (192.168.0.41) — unchanged, out of this plan's scope
-  Cloudflare Tunnel → Nginx Proxy Manager → the target trip LXC
+website signup
+→ authorized interview-bot handoff
+→ confirmed, versioned intake
+→ enrichment and reviewed provisioning plan
+→ isolated trip runtime from a versioned release artifact
+→ website + private MCP + Hermes profile + Telegram routing
+→ private verification
+→ explicit activation
+→ active-trip monitoring and administration
+→ completion, insights, upgrade/rollback, and archive
 ```
 
-**Tech Stack:** Node.js (control-plane service, matching the rest of the
-repo's server code; `better-sqlite3` for the registry DB); Python (reuse,
-don't duplicate — `provisioning/`'s adapters and `telegram_manager/`); the
-existing external `/Users/elul/familytrip-provisioner/` Hermes-profile
-worker, evolved rather than replaced (see Task 6).
+The first dashboard is super-admin-only. The same ownership model must later
+support organizer dashboards, multiple current and historical trips, reusable
+traveler preferences with consent, usage insights, entitlements, and billing.
+Do not postpone tenant boundaries in the database merely because the first UI
+has only one administrator.
 
----
+## Decisions carried by this revision
 
-## Reconciliation notes — what this supersedes
+### Public product, private authority
 
-An earlier draft of this plan assumed a Docker-Compose-per-trip model
-(`docker-compose -p trip-<slug>`, a `docker-socket-proxy`, per-trip host
-ports). **That's wrong for this repo's actual target.** The agreed model is
-per-trip Proxmox LXCs cloned from the golden template at `192.168.0.202`,
-provisioned via the `provisioning/` Python package (`ProxmoxLxcAdapter`,
-`NpmProxyHostAdapter`, `CloudflareTunnelDnsAdapter`) — already implemented
-with dry-run-by-default `plan`/`apply --execute`/`verify` and rollback
-snapshots, just not yet aligned to actually clone CT 202 (see Task 2). Every
-part of this plan that talks about "resetting a trip server" or "checking
-uptime" means an LXC + its supervised service, not a container.
+The onboarding website and its narrow signup/trip APIs are public. Provider
+credentials and infrastructure operations are not. A private worker consumes
+approved, idempotent jobs from the control-plane database. No public request,
+Telegram message, Hermes tool, or family-group action can invoke arbitrary
+shell, Proxmox, DNS, secret, or profile operations.
 
-Two more things the handoff doc makes explicit that an isolated dashboard
-design would have missed:
+### Versioned release artifacts; Proxmox is the local MVP renderer
 
-- **The control-plane service must not live directly on the Proxmox host**
-  (`docs/kinerary-trip-platform-handoff.md:431`). Give it its own LXC (or
-  run it on the Mac next to Hermes) — this is a placement constraint on
-  Task 1, not a detail to leave to deploy time.
-- **An external, already-working profile provisioner exists**
-  (`/Users/elul/familytrip-provisioner/` — outside this repo, on the Mac,
-  not reachable from this checkout's environment to inspect directly).
-  It already does isolated Hermes profile + workspace creation, a
-  restrictive local/LAN HTTP API (`POST /v1/trips`, `/healthz`), and
-  duplicate rejection. **Do not rebuild this from scratch.** Task 6 is to
-  evolve it into (or wire it as) this plan's companion-profile worker; only
-  write a fresh implementation if inspecting it (next session, on that Mac)
-  shows it can't be adapted.
-
-## Confirmed product/process decisions carried forward
-
-- "SSL tokens" the super-admin service issues = per-trip API access keys,
-  not TLS certs. TLS/ingress stays Cloudflare + NPM, unchanged.
-- **Confirmation gate uses the literal keyword `CONFIRM`**, not a loosely
-  "explicit yes" — this is what `docs/kinerary-trip-platform-handoff.md`
-  §4.2 and the live interviewer persona already implement
-  (`~/.hermes/profiles/trip-intake/SOUL.md`, external to this repo).
-  `docs/hermes-interviewer-agent.md`'s current wording ("an explicit yes...
-  in their own words") is looser than this and should be reconciled to
-  match `CONFIRM` as part of Task 7 — don't silently keep two different
-  standards live at once.
-- Enrichment (fill missing informational text + source photos, never invent
-  organizer-owned facts) is fully specified by the existing enrichment plan
-  (Tasks 1-8 there). This plan does not re-specify it — Task 4 here is only
-  about wiring the control-plane's state transitions around it.
-- Companion Hermes agent + per-trip Telegram bot creation should be fully
-  automated once `CONFIRM` + a separate explicit public-activation approval
-  have both happened — automation target unchanged, mechanism changed (see
-  Task 6, Task 8).
-
-## Real-world status — handle with care
-
-- **Japan (`trips/japan-2025/`) is the only safe end-to-end test target** —
-  explicitly `approved_replay_test`, never routed publicly.
-- **Shiran's Hawaii/USA2026 trip is a real, live, in-progress interview.**
-  She has not sent `CONFIRM` yet. Nothing built or run under this plan may
-  treat her current `intakes/shiran-usa-2026/answers.json` as confirmed,
-  auto-enrich it, or provision anything from it without that explicit
-  `CONFIRM` first, followed by a separate explicit public-activation
-  approval. Do not use her real data as a test fixture.
-
----
-
-## Task 1: Control-plane registry service
-
-**Files:**
-- Create: `control-plane/` (new service — `package.json`, `Dockerfile` or
-  LXC-install script, `src/server.js`, `src/db.js`, `src/registry.js`)
-- Create: `control-plane/data/registry.db` (gitignored)
-- Test: `tests/control-plane/registry.test.js`
-
-Implements the state machine from `docs/kinerary-trip-platform-handoff.md`
-§6 exactly (adopt these names, don't invent new ones):
+There is no single forever-mutated "golden trip" container. Every approved
+Kinerary release produces a provider-neutral immutable release manifest plus
+one or more provider-specific rendered artifacts. The local MVP renderer is a
+Proxmox LXC template/image:
 
 ```text
-invited → interviewing → awaiting_organizer_confirmation → confirmed
-  → provisioning → verified → awaiting_activation → active
-  (or → failed, from any state)
+source release
+→ clean runtime build
+→ inject Japan fake-trip fixture
+→ server/render/MCP/migration/smoke verification
+→ remove Japan data, secrets, logs, DB and test state
+→ seal release manifest and local Proxmox template/image
+→ register release metadata and evidence
 ```
 
-Registry row fields per §6: intake ID, trip slug, organizer reference,
-interview session reference, confirmed-answer version/time, LXC ID/IP/
-hostname, profile name, site/MCP endpoint references,
-verification/activation state, audit timestamps. **No secrets in this
-table** — those stay in profile-local files / a secret manager, referenced
-by name only.
+Japan is the qualification fixture for every artifact, not production content
+baked into it. Each trip deployment is pinned to a release ID and an artifact
+digest. Old rendered artifacts remain available for compatible rollback and
+older active trips until a reviewed retention policy retires them.
 
-Auth: session cookie for a human super-admin UI (bcrypt, matching
-`server/server.js`'s existing pattern), a separate LAN-only API key for the
-interviewer/notifier side to post state transitions (`confirmed`,
-verification results) — timing-safe compare, same pattern as
-`mcp/provision.js`'s `requireKey`.
+The release record must not make an LXC template ID its sole identity. It
+contains a generic runtime contract (source revision, dependency lock, schema
+range, health/start contract, artifact digest and compatibility evidence),
+then records Proxmox template IDs as one provider rendering. A future cloud
+renderer may produce an OCI image, VM image or managed-runtime revision for
+the same release ID.
 
-**Placement**: its own LXC on Proxmox, or Mac-hosted next to Hermes — never
-installed directly on the Proxmox host. Decide which when this task is
-picked up; either way it has no public ingress (matches `mcp/provision.js`'s
-LAN-only posture, stricter given its broader blast radius).
+Trip data, mutable runtime data, and secrets must be separable from the image
+root filesystem so a trip can be rebuilt on a new or previous image without
+losing its state. Schema migrations declare forward and rollback compatibility.
 
-## Task 2: Make CT 202 cloning real (unblocks everything downstream)
+### Local Proxmox MVP; portable control-plane contract
 
-**Files:**
-- Modify: `provisioning/adapters.py` (`ProxmoxLxcAdapter.create()`)
-- Modify: `tests/provisioning/` (adjust/extend fixtures for the clone path)
+Provisioning moves off the developer Mac. The MVP target is a dedicated
+onboarding/control-plane LXC on Proxmox, never a service installed directly on
+the hypervisor. It hosts the public application/API and private worker as
+separately bound processes. PostgreSQL may initially share the LXC but must
+have tested backups, standard migrations and a migration path to a managed or
+separate PostgreSQL service.
 
-This is `docs/kinerary-trip-platform-handoff.md`'s Phase B, already
-scoped there in detail (§7 Phase B, §5.3's "important gap"). Do not start
-Task 3+ before this lands — everything else assumes a real per-trip LXC
-exists. Requires read-only Proxmox inventory of CT 202 first (`pct list`,
-`pct config`, storage/mount layout) before writing the clone/copy path;
-the handoff doc is explicit that a generic `POST /lxc` ostemplate-create is
-**not** equivalent and must not be treated as a stand-in.
+The general architecture does not require Proxmox. It requires a public API,
+durable registry, private job runner, secret resolver, release catalog,
+compute adapter, ingress adapter, agent-runtime adapter and messaging adapter.
+Proxmox/LXC, RPi/NPM/Cloudflare, and local service supervision are the initial
+adapter implementations.
 
-## Task 3: Registry-driven provisioning trigger
+The existing `/Users/elul/familytrip-provisioner/` is input to the Hermes
+worker design. Move or adapt its validation, profile isolation, duplicate
+protection, allowlists, and MCP verification into a supervised Proxmox-hosted
+agent-runtime service; do not build a competing profile provisioner.
 
-**Files:**
-- Modify: `control-plane/src/registry.js` (state transition handlers)
-- Create: `control-plane/src/provisioning-client.js` — shells out to
-  `python3 -m provisioning plan|apply|verify` (Task 2's fixed adapter),
-  parses the JSON plan/rollback snapshot, stores only non-secret references
-  back into the registry row.
+### Shared Telegram routing by default
 
-On `confirmed` → `provisioning`: run `provisioning plan`, then (only after
-this plan's own separate human confirmation, mirroring `provisioning/`'s
-own `--execute` gate — two independent "are you sure"s is intentional
-here, not redundant) `apply --execute`, capturing the rollback snapshot
-path in the registry row (not its contents — those may reference live
-resource IDs but no secrets, per the existing adapter design). On success,
-`provisioning` → `verified` runs `provisioning verify` plus the existing
-ingress-hop checklist from `docs/kinerary-trip-platform-handoff.md` §2.2
-(loopback → LAN → NPM Host-header → public HTTPS → rendered page, not just
-HTTP 200).
+The design must not require a new bot merely because a new trip exists.
 
-## Task 4: Enrichment wiring (no new enrichment logic)
+- one platform bot may handle website Telegram login and onboarding;
+- one shared interviewer bot issues database-authorized intake sessions;
+- one shared companion bot is the preferred group-facing default when a
+  gateway/router can map an authorized Telegram chat to exactly one trip and
+  dispatch it to that trip's isolated Hermes profile;
+- a dedicated per-trip bot remains an optional policy tier when branding,
+  customer isolation, platform constraints, or premium packaging justifies it.
 
-**Files:**
-- Modify: `control-plane/src/registry.js` — call the enrichment CLI from
-  the existing plan (`scripts/enrich_trip.py`, once built there) between
-  `confirmed` and `provisioning`, store its report's `needs_review` count
-  in the registry row, surface it in the super-admin UI.
+The messaging provider is an adapter. Trip lifecycle state records a logical
+`messaging_binding`, not assumptions about BotFather, managed-child bots, or a
+specific token layout. This reduces Telegram-specific provisioning steps and
+keeps future chat providers possible.
 
-Depends entirely on `.hermes/plans/2026-08-06_063428-...`'s Tasks 1-8
-landing first. This task is just the state-machine glue — do not
-reimplement geocoding/weather/hero-media logic here.
+### Data and secret ownership
 
-## Task 5: Fleet visibility + admin actions (LXC-adapted)
+- `trips/<slug>/` owns confirmed trip content, versioned configuration,
+  provenance, and personalization inputs.
+- PostgreSQL owns identities, ownership, lifecycle, jobs, approvals, release
+  selection, allocated resources, monitoring summaries, and audit records.
+- an external environment/secret store owns architecture settings and all
+  credentials. The database stores opaque secret references only.
+- VMIDs, IPs, domains, provider endpoints, keys, and ports do not belong in a
+  trip folder or per-trip wrapper script.
 
-**Files:**
-- Create: `control-plane/src/health.js` — polls each `verified`/`active`
-  trip's `/api/health` over its LXC's LAN IP (from the registry row), same
-  shape as the site's existing unauthenticated health route; add a
-  `boot_time` field to `server/server.js`'s `/api/health` handler
-  (additive only) so uptime is computable.
-- Create: `control-plane/src/actions.js` — reset = SSH to the trip LXC and
-  restart its supervised service (systemd unit, per
-  `docs/kinerary-trip-platform-handoff.md`'s "local service supervision"
-  requirement — **not** `docker compose --force-recreate`, there is no
-  compose project per trip in this architecture). Key rotation and
-  organizer change reuse `mcp/provision.js`'s existing confirm-token
-  pattern (`get_activation_plan`/`activate_trip` shape:
-  `crypto.randomBytes` token, in-memory single-use store, 5-minute TTL) —
-  extract that pattern into `mcp/lib/fleet-core.js` once, shared by
-  `provision.js` and `control-plane/`.
-- Test: `tests/control-plane/actions.test.js` — proof-not-description for
-  every destructive action, same bar as the rest of this repo's security
-  tests: a stale/reused/mismatched-slug token must fail, and the SSH
-  restart call must not fire until a valid token is redeemed (inject a spy
-  in place of the SSH client in tests).
+## Component architecture
 
-Every mutating action writes one audit-log row (actor, action, target
-slug, result, timestamp) — closes the gap that `mcp/provision.js` has no
-audit trail today.
-
-## Task 6: Companion Hermes profile automation
-
-**Files:**
-- Investigate first (next session, on the Mac where it actually lives):
-  `/Users/elul/familytrip-provisioner/` — confirm current behavior against
-  `docs/kinerary-trip-platform-handoff.md` §5.5's description before
-  changing anything.
-- Likely modify (pending that investigation): its manifest schema to
-  accept a trip LXC's verified MCP endpoint (per §7 Phase C.3 — the
-  profile provisioner must only be handed the endpoint after LXC/site
-  readiness has passed, never before) and its allowlist (currently
-  hardcoded to the old `.200` assumption per §5.5, must become
-  per-trip-dynamic).
-- `control-plane/src/companion-profile-client.js` — calls this worker's
-  authenticated local/LAN `POST /v1/trips` (already implemented, per the
-  handoff doc) on `verified` → the profile-creation half of
-  `awaiting_activation`.
-
-Do not write a parallel from-scratch implementation unless the
-investigation step shows the existing worker genuinely can't be adapted —
-the handoff doc is explicit that duplicating this would create two
-competing sources of truth (§7 Phase C.2).
-
-## Task 7: Interviewer reconciliation
-
-**Files:**
-- Modify: `docs/hermes-interviewer-agent.md` — replace "explicit yes... in
-  their own words" with the literal `CONFIRM` standard already live in
-  `~/.hermes/profiles/trip-intake/SOUL.md` (external), so this repo's
-  documented contract matches what's actually running. Also reconcile the
-  tool-list section: the live interviewer has **no** `create_trip`/
-  `activate_trip`/trip-data MCP access at all (§4.2) — stricter than what
-  this doc currently describes for the "full access model." Mark that
-  model as superseded, not just as an alternative.
-- Modify: `mcp/PROVISIONING.md` — cross-reference this plan and the
-  handoff doc so the "two ways to wire provisioning" section reflects
-  which one is actually in production use.
-
-No code change here — this task is closing a docs/reality gap, which
-matters because the next person (or agent) picking up this repo should not
-rediscover the same divergence.
-
-## Task 8: Telegram group handoff + login-widget domain (MTProto adapter)
-
-**Files:**
-- Create: `telegram_manager/mtproto_adapter.py` — a narrowly scoped,
-  explicitly allowlisted BotFather-operation client (Login Widget domain
-  read/set/verify for one specific newly-created child bot only — nothing
-  else). Per `docs/kinerary-trip-platform-handoff.md` §4.7: dedicated
-  authorized user account/session, never a bot token; secrets in a secret
-  manager or `0600` local files, never in this repo, trip config, MCP
-  responses, or logs; require a per-trip reviewed operation plan and
-  idempotent read-back verification before any write; only after confirmed
-  intake and child-bot creation; never invoked from a family group or an
-  untrusted MCP request.
-- Test: `tests/telegram/test_mtproto_adapter.py` — mock the MTProto client
-  entirely; assert the allowlist rejects any operation outside
-  Login-domain read/set/verify for the specific bot, and that no write
-  happens without the reviewed-operation-plan record.
-
-This is genuinely new scope (`"planned, not implemented"` per §4.7) and
-sits on the critical path for the Telegram Login Widget ever actually
-rendering on a real domain — without it, Telegram SSO stays server-side
-tested but never browser-verified (§4.5's current implementation-status
-gap).
-
-## Task 9: Login-method security hardening (pre-`active` gate)
-
-**Files:**
-- Modify: `server/server.js` — password fallback: replace the shared
-  default `1234` seed with an organizer-approved first-password
-  enrollment flow (signed, expiring, routed to the organizer's private
-  Telegram); Google link: gate `google-link` behind the same organizer
-  approval-callback pattern (one-time, expiring, auditable, bound to trip +
-  participant + Google `sub`; rejection creates no link).
-- Test: `tests/server.test.js` — extend to cover the new approval-gated
-  paths; keep the existing Telegram-login forged/expired/non-member test
-  coverage intact (`docs/kinerary-trip-platform-handoff.md` §4.5 says this
-  part already has solid test coverage — don't regress it).
-
-The handoff doc is explicit these are **not currently production-ready**
-(§4.5). A trip reaching `active` in this plan's state machine should not
-be possible while these gaps stand — treat this task as a gate on the
-`awaiting_activation` → `active` transition, not an independent nice-to-have.
-
-## Task 10: End-to-end pipeline verification
-
-**Files:**
-- Create: `tests/control-plane/e2e-onboarding-smoke.sh` (manual/separate
-  from `npm test`, mirrors the existing `provisioning/` tests' "no real
-  infrastructure contacted by the unit suite" rule — this script is the
-  one place real infra gets touched, and only against Japan/non-production
-  targets).
-
-Run only against the Japan replay trip, non-public:
 ```text
-confirmed intake (literal CONFIRM, Task 7)
-→ enrichment (existing plan) → provisioning plan/apply (Task 2/3)
-→ verify (Task 3) → companion profile created (Task 6)
-→ per-trip bot created + Login domain set (Task 8, mocked MTProto in test)
-→ awaiting_activation, login gates satisfied (Task 9)
-→ manual explicit activation approval → active
+Public ingress
+  └─ onboarding web/API
+       ├─ Telegram login verification
+       ├─ user + trip ownership APIs
+       ├─ signed interview enrollment links
+       └─ organizer/super-admin dashboard APIs
+             │ narrow DB operations only
+             ▼
+       PostgreSQL control-plane registry
+             │ approved/idempotent jobs
+             ▼
+Private provisioning worker
+  ├─ release-artifact adapter ────────────► provider artifact catalog
+  ├─ trip-runtime adapter ────────────────► selected isolation runtime
+  ├─ Hermes adapter ──────────────────────► isolated profile per trip
+  ├─ messaging adapter/router ────────────► shared or dedicated bot binding
+  ├─ ingress adapter ─────────────────────► selected edge/ingress provider
+  └─ verification/monitoring adapters
+
+Per-trip isolated runtime
+  ├─ version-pinned website runtime
+  ├─ private trip MCP
+  ├─ persistent trip state/data mount
+  └─ supervised services and health endpoints
 ```
-Confirm every ingress hop from `docs/kinerary-trip-platform-handoff.md`
-§2.2, not just HTTP 200. Confirm the registry never contains a secret
-(grep the raw `registry.db` bytes in the test, don't just trust the code).
 
----
+The public API and private worker may share code and a database, but they must
+not share network exposure or route arbitrary provider actions through the
+public process. In the local MVP, the adapters resolve respectively to
+Proxmox LXC templates, a dedicated trip LXC, NPM/Cloudflare on the RPi, and a
+Proxmox-hosted agent runtime.
 
-## Verification and acceptance criteria
+## Portability guardrails and hard-to-remove constraints
 
-1. Task 2 lands and is proven against a real (non-production) LXC clone of
-   CT 202 before any later task depends on it.
-2. The control-plane service runs off the Proxmox host, with no public
-   ingress, and its registry never stores a secret.
-3. Every destructive/administrative action (reset, rotate, organizer
-   change) is a plan/confirm pair with a single-use, time-boxed,
-   slug-bound token, and every one is audit-logged.
-4. `/Users/elul/familytrip-provisioner/` is either evolved into this
-   pipeline's companion-profile worker or explicitly, deliberately
-   superseded with a documented migration — never silently duplicated.
-5. `docs/hermes-interviewer-agent.md` and the live interviewer persona
-   agree on one confirmation standard (`CONFIRM`) and one tool-access
-   model (no provisioning/trip-data MCP access for the interviewer).
-6. The MTProto adapter's operation allowlist is proven narrow in tests —
-   nothing beyond Login-domain read/set/verify for one bot is reachable.
-7. A trip cannot reach `active` while the password/Google login gaps from
-   Task 9 are open.
-8. Japan completes the full state machine end to end without public
-   routing before Shiran's trip (or any real trip) is run through it.
-9. Shiran's in-progress intake is untouched by any of this until she sends
-   `CONFIRM`, and public activation still requires a separate explicit
-   approval after that.
+These are design constraints to satisfy in the MVP. Deferring them would make
+cloud migration materially more expensive:
+
+| Constraint | Why it becomes hard later | Required MVP boundary |
+|---|---|---|
+| LXC-only release identity | A Proxmox template cannot run on cloud container/VM services | Generic release manifest + digest; Proxmox template ID is provider metadata only |
+| Host paths/bind mounts as canonical data | Local volumes and `/Users/...` paths do not migrate or scale | Logical data/backup/secret references; database/object-store interfaces |
+| systemd/LAN/IP as product contracts | Containers, managed runtimes and service meshes use different lifecycle/network models | Provider-neutral start, readiness, endpoint and ingress contracts |
+| Mac-local Hermes profiles | Filesystem profiles and launchd do not provide cloud HA | Agent-runtime API with portable policy/personalization bundles |
+| In-memory sessions/router state | Multiple public/API/gateway replicas cause replay and misrouting | PostgreSQL/Redis-backed enrollment, bindings, leases and idempotency |
+| Per-trip physical LXC as the only isolation model | Cost and scheduling grow linearly with customer count | `isolation_tier` policy; logical trip isolation remains mandatory |
+| RPi/NPM/Cloudflare assumptions | Cloud ingress has different TLS, DNS, routing and identity primitives | Ingress adapter exposes hostname/TLS/upstream intent, not IP-specific commands |
+| `.env`/local files as secret source | Secret rotation/audit differ across providers | Secret-reference interface; no values in registry, trip content or plans |
+
+## Lifecycle model
+
+Do not force signup, interview, resource creation, and long-running external
+actions into one overloaded status column.
+
+### Trip lifecycle
+
+```text
+draft
+→ interviewing
+→ awaiting_confirmation
+→ confirmed
+→ provisioning
+→ ready_private
+→ awaiting_activation
+→ active
+→ completed
+→ archived
+
+Any non-terminal state → failed/remediation_required
+active → suspended → active | completed
+```
+
+### Provisioning job lifecycle
+
+```text
+queued
+→ planning
+→ awaiting_approval
+→ running
+→ waiting_for_user_action | verifying
+→ succeeded
+
+or → failed → remediation_required → queued with a new plan
+```
+
+`waiting_for_user_action` covers unavoidable external steps such as pressing
+Start on Telegram or creating/choosing a group. It is not an infrastructure
+failure. Resource records independently track the LXC, site, MCP, Hermes
+profile, messaging binding, group binding, domain, and routes.
+
+## Task 0 — Reconcile contracts and safety boundaries
+
+- Mark this plan and the two supporting docs WIP and cross-link them.
+- Define versioned schemas for environment configuration, trip content,
+  releases, plans, events, and provider adapter results.
+- Define provider contracts for release rendering, isolated runtime,
+  persistent data/backup, secrets, ingress, agent runtime and messaging;
+  prove the Proxmox/RPi/Mac replacements implement those contracts without
+  persisting local paths or provider-specific assumptions in canonical records.
+- Decide the persistent-data mount and backup/restore contract before building
+  replaceable runtime images.
+- Inventory Proxmox storage/template capabilities read-only. Never infer a
+  VMID from an IP address.
+- Confirm the target Hermes deployment/runtime topology and the supported
+  gateway dispatch hooks before moving profile creation off the Mac.
+- Classify the current scripts and `familytrip-provisioner` as reusable logic,
+  transitional compatibility, or migration input.
+
+## Task 1 — Release image builder and registry
+
+Create a release pipeline that accepts an immutable source revision, builds a
+clean runtime artifact, exercises it with Japan, strips test/runtime material,
+seals a generic manifest plus the local Proxmox rendering, and registers:
+
+- release ID, semantic/product version, Git commit and build time;
+- provider-neutral artifact digest and runtime contract;
+- provider renderings such as Proxmox template/storage identifiers;
+- application and persistent-data schema versions;
+- compatibility and rollback constraints;
+- Japan verification report digest;
+- status: `candidate`, `verified`, `available`, `deprecated`, `retired`.
+
+New-trip provisioning must accept a release ID. `available` promotion and
+retirement require explicit administrative actions. A failed build never
+changes the default release.
+
+## Task 2 — Identity, ownership, and signup
+
+Create PostgreSQL migrations and public APIs for:
+
+- `users` and provider-neutral `user_identities`;
+- Telegram login signature/freshness verification and unique Telegram IDs;
+- `trips` and `trip_memberships` with owner/organizer/member roles;
+- creation of a draft trip owned by the authenticated user;
+- future entitlements/subscription references without implementing billing.
+
+The first UI exposes super-admin access and the organizer's own draft/status.
+Every query is scoped by membership even while there is only one real admin.
+
+## Task 3 — Authorized interview handoff
+
+On draft creation, issue a signed, opaque, expiring, single-use deep link to
+the shared interviewer bot. At `/start`, verify that the inbound Telegram ID:
+
+- belongs to a registered website identity;
+- matches the link's user and trip;
+- is still eligible to start/resume that intake;
+- has not reused or replayed an expired enrollment token.
+
+The interviewer gets only intake-session APIs/MCP capabilities. It cannot
+provision, activate, retrieve secrets, or read another user's trip. Literal
+`CONFIRM` writes an immutable normalized intake version and digest; later
+corrections create a new version rather than rewriting history.
+
+## Task 4 — Durable workflow engine and private worker
+
+Implement:
+
+- PostgreSQL-backed jobs and steps with leases, heartbeats, retries, and
+  idempotency keys;
+- plan generation and approval bound to the exact plan digest;
+- append-only audit events and structured secret-redacted logs;
+- bounded retry policies and explicit `waiting_for_user_action`;
+- reconciliation after process/container restart;
+- no automatic destructive rollback.
+
+Use Node.js/TypeScript for the public/control API if it best matches the web
+application. Reuse Python for provisioning and Telegram adapters instead of
+porting proven provider logic merely to enforce one language.
+
+## Task 5 — Per-trip runtime provisioning
+
+After a confirmed intake and approved plan:
+
+1. select an available release compatible with the trip data schema and
+   deployment provider;
+2. allocate provider-specific runtime/network resources plus logical hostname,
+   persistent-data and secret references;
+3. instantiate the selected isolation runtime from the provider rendering;
+4. attach/restore persistent trip data and inject only approved trip content;
+5. inject runtime secrets without copying them into trip data or logs;
+6. start the site and private MCP under supervision;
+7. verify loopback, LAN, persistent storage, service restart and MCP tool
+   isolation before any public route exists.
+
+The deploy package uses a positive allowlist of files. Do not copy an entire
+trip directory and try to exclude every secret or operator artifact.
+
+## Task 6 — Hermes profile and personalized agent bundle
+
+Evolve the existing FamilyTrip provisioner into a private agent-runtime
+adapter. A request is idempotently bound to one trip and includes references
+to:
+
+- the verified private MCP endpoint;
+- the logical messaging binding;
+- a versioned global policy bundle;
+- per-trip language, name, tone, timezone and traveler-context bundle;
+- analytics emitter configuration and secret reference.
+
+The global bundle enforces the product's private-organizer versus family-group
+permission boundary, source precedence, state preservation, typed actions,
+and confirmation rules. Profile verification proves the profile can reach
+only its own trip MCP and that default/interviewer profiles cannot.
+
+## Task 7 — Messaging routing and group binding
+
+Build a provider-neutral messaging adapter with Telegram first.
+
+For shared-bot mode:
+
+- store a signed, single-use binding invitation;
+- verify organizer identity and Telegram group context;
+- map `provider + bot_identity + chat_id` to exactly one trip;
+- dispatch accepted messages to exactly that trip's Hermes profile;
+- keep group and organizer-private contexts distinct in routing and policy;
+- ensure ordinary group chatter is ignored unless the trigger policy accepts
+  it;
+- verify the shared bot's permissions are no broader than needed.
+
+For optional dedicated-bot mode, reuse the same logical interface and lifecycle
+states. Do not make managed-bot creation or per-trip BotFather domain setup a
+global activation prerequisite when the shared platform bot can satisfy the
+feature safely.
+
+## Task 8 — Private verification and activation
+
+Private readiness requires stored evidence for:
+
+- selected release and schema compatibility;
+- runtime/service health and restart recovery;
+- site rendering against the correct trip data;
+- MCP readiness/tool discovery and trip isolation;
+- Hermes profile isolation and personalization version;
+- messaging and group binding;
+- required login methods and authorization behavior;
+- backup/restore checkpoint.
+
+Only then transition to `ready_private`. Generate a separate activation plan
+containing the exact hostname, NPM/Cloudflare changes, verification requests,
+and rollback constraints. Activation requires a separate, expiring approval.
+Publish only the website; never publish provisioning, admin, secret, SSH, or
+private MCP endpoints.
+
+## Task 9 — Dashboard, monitoring, and administrative operations
+
+The super-admin dashboard initially shows:
+
+- signup/interview/provisioning/activation funnels;
+- trip and resource state, release version and schema compatibility;
+- job history, blocked user actions and safe error summaries;
+- site/MCP/profile/messaging health and incidents;
+- usage, latency, provider and infrastructure cost summaries;
+- plan/confirm operations for retry, suspend, upgrade, rollback, secret
+  rotation and archive.
+
+Organizer dashboards later use the same membership model to show only their
+trips, history, preferences/Traveler DNA with consent, reusable intake data,
+and entitled features. Cross-trip insights must never bypass ownership,
+consent, provenance or retention policy.
+
+## Task 10 — Lifecycle analytics
+
+Add `docs/trip-bot-analytics-and-metrics-design.md` as the detailed telemetry
+contract. Analytics covers both control-plane lifecycle/product events and
+companion-bot operational events. It is not a transcript archive.
+
+Capture at minimum:
+
+- signup-to-interview and interview-to-confirmation conversion;
+- provisioning duration/failure/manual-intervention rates by step/release;
+- activation and group-binding completion;
+- active-trip site, MCP, Hermes and messaging reliability;
+- privacy-preserving bot adoption/category/outcome signals;
+- upgrade/rollback success and support burden;
+- bounded usage and cost events needed for future entitlements/monetization.
+
+## Task 11 — Upgrade, rollback, completion, and archive
+
+- Active trips stay pinned until an approved upgrade plan selects another
+  compatible image.
+- Upgrade rehearses data migration, health and rendered UI before cutover.
+- Rollback uses an available compatible prior image and a verified data
+  checkpoint; it never assumes database downgrades are safe.
+- Completion stops proactive live-trip automation but preserves authorized
+  history and post-trip features.
+- Archive revokes runtime credentials/routes according to policy while
+  retaining or deleting trip data according to organizer consent and legal
+  requirements.
+
+## Task 12 — Japan end-to-end release and lifecycle rehearsal
+
+Japan is the only initial full-system fixture. Test both image creation and a
+fresh deployment from the sealed image:
+
+```text
+website test signup
+→ authorized interview link and replay
+→ literal CONFIRM
+→ plan/approval
+→ new runtime from candidate image
+→ private website/MCP/Hermes/messaging verification
+→ test group binding
+→ activation against a non-production hostname
+→ monitoring/analytics reconciliation
+→ upgrade to a second candidate image
+→ compatible rollback
+→ completion/archive rehearsal
+```
+
+Do not use an unconfirmed real intake as a fixture and do not route Japan to a
+production hostname or real family group.
+
+## Acceptance criteria
+
+1. A registered Telegram identity can access only its own interview/trips;
+   replayed or mismatched enrollment links fail.
+2. Public endpoints cannot invoke provider actions or retrieve secrets.
+3. A verified release image contains no Japan data, credentials, logs, DB or
+   runtime state, yet a Japan deployment from it passes the full test suite.
+4. Repeating a job does not duplicate a runtime, profile, messaging binding,
+   route, domain or secret.
+5. A shared Telegram bot can route two test groups to two isolated profiles
+   without cross-trip access; dedicated-bot mode is optional, not assumed.
+6. A trip cannot become `active` before private verification and separate
+   activation approval both succeed.
+7. Registry, logs, analytics and dashboards contain no plaintext secrets or
+   raw message transcripts by default.
+8. Restarting the onboarding worker resumes or reconciles work without losing
+   durable state or claiming false success.
+9. A trip can remain pinned to an older artifact while another trip uses a
+   newer release; a compatible Japan upgrade and rollback are demonstrated.
+10. Super-admin queries are globally authorized and organizer queries are
+    membership-scoped from the first schema version.
+
+## Explicitly deferred, without blocking the schema
+
+- billing provider and pricing plans;
+- organizer-facing historical insights and Traveler DNA UX;
+- additional messaging providers;
+- high-volume queue/analytics infrastructure;
+- fully automatic release promotion;
+- cross-trip recommendations beyond consented, provenance-aware aggregates.
+
+These are deferred product features, not permission to omit user ownership,
+release IDs, usage events, entitlements references, or privacy boundaries from
+the foundational model.
