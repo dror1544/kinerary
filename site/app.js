@@ -3009,7 +3009,9 @@ function buildGlobalsFromConfig(cfg) {
       blurb: p.hero.blurb?.he || p.hero.blurb,
       meta:  p.hero.meta,
       cta:   p.hero.cta?.he   || p.hero.cta,
-      countdown: p.hero.countdown || false,
+      // Every phase page shows the same live trip clock as home — no per-phase
+      // opt-in; there's no case for a phase page without it.
+      countdown: true,
       _i18n: p.hero, // store bilingual source for setHero
     };
   });
