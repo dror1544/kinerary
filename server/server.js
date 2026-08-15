@@ -715,7 +715,13 @@ let currencyRatesCache = null; // { base, home, rates, date, fetchedAt }
 
 function destinationCurrencyCodes() {
   const countries = TRIP_CONFIG.travel_info?.countries || {};
-  return [...new Set(Object.values(countries).map(c => c.currency?.code).filter(Boolean))];
+  // "USD" is always excluded — it's the API's own `from`, and asking it to
+  // convert USD to itself is the one pair frankfurter.dev 422s on (a
+  // domestic-US trip like a USD destination with no distinct home
+  // currency would otherwise fail every request instead of just having
+  // nothing worth showing).
+  return [...new Set(Object.values(countries).map(c => c.currency?.code).filter(Boolean))]
+    .filter(code => code !== 'USD');
 }
 
 async function getCurrencyRates() {
