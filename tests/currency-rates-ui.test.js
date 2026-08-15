@@ -70,4 +70,59 @@ describe('renderInfo() currency rate line', () => {
     });
     await ctx.loadCurrencyRates();
   });
+
+  // A domestic-US trip (destination currency USD): the server never fetches
+  // a USD rate (frankfurter.dev can't convert USD to itself), so rates
+  // never has a USD entry. The home-currency line must still show — only
+  // the meaningless "1 USD ≈ 1 USD" line is skipped.
+  test('a USD destination shows the home-currency line, not a blank one', async () => {
+    const usaCfg = {
+      travel_info: {
+        countries: {
+          'United States of America': {
+            flag: '🇺🇸',
+            currency: { code: 'USD', name: 'United States dollar', symbol: '$' },
+          },
+        },
+      },
+    };
+    const { document, ctx } = createRenderContext(HTML, usaCfg, 'he', {
+      localStorage: { getItem: () => 'fake-token' },
+      fetch: async () => ({
+        ok: true,
+        json: async () => ({ base: 'USD', home: 'ILS', rates: { ILS: 3.7 }, date: '2026-08-10' }),
+      }),
+    });
+    ctx.window.TRIP_CONFIG = usaCfg;
+    await ctx.loadCurrencyRates();
+    const html = document.getElementById('info-countries').innerHTML;
+    assert.ok(!html.includes('1 USD ≈'), 'no self-referential USD line');
+    // 1 / 3.7 ≈ 0.27
+    assert.match(html, /1 ILS ≈ 0\.2\d USD/);
+  });
+
+  test('a USD destination with no home currency shows no rate line at all', async () => {
+    const usaCfg = {
+      travel_info: {
+        countries: {
+          'United States of America': {
+            flag: '🇺🇸',
+            currency: { code: 'USD', name: 'United States dollar', symbol: '$' },
+          },
+        },
+      },
+    };
+    const { document, ctx } = createRenderContext(HTML, usaCfg, 'he', {
+      localStorage: { getItem: () => 'fake-token' },
+      fetch: async () => ({
+        ok: true,
+        json: async () => ({ base: 'USD', home: null, rates: {}, date: '2026-08-10' }),
+      }),
+    });
+    ctx.window.TRIP_CONFIG = usaCfg;
+    await ctx.loadCurrencyRates();
+    const html = document.getElementById('info-countries').innerHTML;
+    assert.ok(html.includes('United States dollar'));
+    assert.ok(!html.includes('≈'));
+  });
 });
