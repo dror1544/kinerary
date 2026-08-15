@@ -41,8 +41,9 @@ it does not receive infrastructure authority.
    usable draft or issue an interview link. Only a private worker may execute
    provider operations.
 2. **The control plane runs on dedicated compute, never directly on a
-   hypervisor.** The local MVP uses a Proxmox LXC; a cloud deployment may use
-   other private compute. Provider credentials are scoped to named actions.
+   hypervisor.** The local MVP uses a small Proxmox VM running Docker Compose;
+   a cloud deployment may use other private compute. Provider credentials are
+   scoped to named actions.
 3. **Every real trip gets an isolated logical runtime and private MCP
    identity.** The local MVP uses one LXC per trip. One long-lived Hermes
    profile may serve an organizer across trips only through server-issued,
@@ -132,7 +133,7 @@ The general architecture requires these roles, not a named local technology:
 
 | General role | Local MVP adapter | Future cloud adapter examples |
 |---|---|---|
-| control-plane compute | dedicated Proxmox LXC | private VM, container service, Kubernetes workload |
+| control-plane compute | dedicated Proxmox VM running Docker Compose | private VM, container service, Kubernetes workload |
 | release artifact | immutable release manifest + Proxmox template | OCI image, VM image, managed revision |
 | trip isolation runtime | one LXC per trip | dedicated workload/namespace or approved shared runtime tier |
 | ingress | RPi Cloudflare Tunnel + NPM | cloud load balancer, CDN/edge, managed DNS/TLS |
@@ -181,9 +182,9 @@ or a public provider-action API for the first milestone.
 | High-cardinality analytics keyed by person/chat/runtime IDs | Cost and observability failures rise sharply with tenants | Bounded metrics, opaque event IDs, tenant-scoped access and lifecycle rollups from day one |
 
 These are architecture contracts, not requirements to deploy cloud services in
-the MVP. The local adapter may use LXC, systemd, LAN addresses, local files and
-one control-plane LXC, provided those choices do not leak into canonical trip,
-release, user, job or authorization records.
+the MVP. The local adapter may use a Compose-managed control-plane VM,
+one-per-trip LXCs, LAN addresses and local files, provided those choices do not
+leak into canonical trip, release, user, job or authorization records.
 
 ## 5. Versioned release-artifact model
 

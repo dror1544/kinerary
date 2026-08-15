@@ -1,0 +1,29 @@
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: control-plane/api/Dockerfile
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+    volumes:
+      - type: bind
+        source: ${CONTROL_PLANE_ARCHITECTURE_PROFILE_FILE:?set an external profile path}
+        target: /run/config/architecture.json
+        read_only: true
+    expose: ["4310"]
+    networks: [ingress, private]
+
+  worker:
+    build: ../worker
+    command: ["python", "-m", "control_plane_worker", "run"]
+    networks: [private]
+
+  postgres:
+    image: postgres:16-alpine
+    networks: [private]
+
+networks:
+  ingress:
+    external: true
+  private:
+    internal: true

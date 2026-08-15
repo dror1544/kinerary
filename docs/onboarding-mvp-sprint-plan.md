@@ -16,11 +16,12 @@ or a production group as test input.
 
 ## 1. MVP scope and operating model
 
-The first implementation runs locally on Proxmox, with a dedicated
-control-plane LXC, PostgreSQL, a private provisioning worker, a Proxmox runtime
-adapter, local ingress adapter, private Hermes-agent runtime, and Telegram as
-the first messaging adapter. Those are **adapters**, not canonical product
-assumptions.
+The first implementation runs locally on Proxmox, with a small dedicated
+control-plane VM running PostgreSQL, migrations, the API and a private
+provisioning worker under Docker Compose. Trip runtimes remain one-per-trip
+LXCs behind a Proxmox runtime adapter, local ingress adapter, private
+Hermes-agent runtime, and Telegram as the first messaging adapter. Those are
+**adapters**, not canonical product assumptions.
 
 The first release deliberately supports one happy-path organizer and one demo
 trip at a time, but it must use durable IDs, membership scoping, idempotency,

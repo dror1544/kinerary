@@ -22,7 +22,7 @@ Mac (Hermes control plane)
 Proxmox hypervisor (192.168.0.40)
   ├─ generalized golden-trip LXC at 192.168.0.202
   ├─ one separate LXC for every real trip
-  └─ eventually a separate, non-trip control-plane LXC/service for durable registry/jobs
+  └─ a separate control-plane VM for onboarding, durable registry and jobs
 
 Each trip LXC
   ├─ one trip website/runtime
@@ -428,7 +428,10 @@ Do not delete it. Either evolve it into the control-plane worker/client or clear
 
 ## 6. Recommended target control plane
 
-A durable registry/provisioner should run outside every trip LXC, ideally as a small dedicated control-plane service/LXC on Proxmox or as a carefully restricted service on the Mac. Do **not** install this web/service layer directly on the Proxmox host.
+A durable registry/provisioner should run outside every trip LXC as a small
+dedicated control-plane VM on Proxmox. Docker Compose provides the service
+boundary inside the VM; do **not** install this web/service layer directly on
+the Proxmox host.
 
 It is not an LLM. It should record state and run deterministic jobs.
 
