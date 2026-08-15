@@ -96,9 +96,8 @@ describe('renderInfo() currency rate line', () => {
     ctx.window.TRIP_CONFIG = usaCfg;
     await ctx.loadCurrencyRates();
     const html = document.getElementById('info-countries').innerHTML;
-    assert.ok(!html.includes('1 USD ≈'), 'no self-referential USD line');
-    // 1 / 3.7 ≈ 0.27
-    assert.match(html, /1 ILS ≈ 0\.2\d USD/);
+    // Dollar-anchored like every other line here, not inverted to "1 ILS ≈ ... USD"
+    assert.match(html, /1 USD ≈ 3\.7 ILS/);
   });
 
   test('a USD destination with no home currency shows no rate line at all', async () => {
