@@ -18,6 +18,7 @@ Automate the complete trip lifecycle:
 
 ```text
 website signup
+→ super-admin signup approval (MVP)
 → authorized interview-bot handoff
 → confirmed, versioned intake
 → enrichment and reviewed provisioning plan
@@ -200,6 +201,12 @@ Any non-terminal state → failed/remediation_required
 active → suspended → active | completed
 ```
 
+Before `draft`, a verified website identity may be in
+`pending_signup_approval` (MVP). This is a signup-request state, not a trip
+with interview or provisioning authority. Only a configured super-admin's
+signed, expiring, one-time Telegram decision can approve it. Rejection or
+expiry creates no usable draft, enrollment, provider resource or job.
+
 ### Provisioning job lifecycle
 
 ```text
@@ -260,8 +267,13 @@ Create PostgreSQL migrations and public APIs for:
 
 - `users` and provider-neutral `user_identities`;
 - Telegram login signature/freshness verification and unique Telegram IDs;
+- a minimal, rate-limited `pending_signup_approval` request plus transactional
+  notification outbox; notify only the configured super-admin Telegram
+  identity with signed, expiring, single-use Approve/Reject actions;
+- approval atomically creates/unlocks the draft and owner membership; reject,
+  expiry, incorrect admin identity and replay are terminal/no-op paths;
 - `trips` and `trip_memberships` with owner/organizer/member roles;
-- creation of a draft trip owned by the authenticated user;
+- creation of a draft trip owned by the authenticated, approved user;
 - future entitlements/subscription references without implementing billing.
 
 The first UI exposes super-admin access and the organizer's own draft/status.
@@ -269,7 +281,8 @@ Every query is scoped by membership even while there is only one real admin.
 
 ## Task 3 — Authorized interview handoff
 
-On draft creation, issue a signed, opaque, expiring, single-use deep link to
+Only after signup approval and draft creation, issue a signed, opaque,
+expiring, single-use deep link to
 the shared interviewer bot. At `/start`, verify that the inbound Telegram ID:
 
 - belongs to a registered website identity;
@@ -281,6 +294,14 @@ The interviewer gets only intake-session APIs/MCP capabilities. It cannot
 provision, activate, retrieve secrets, or read another user's trip. Literal
 `CONFIRM` writes an immutable normalized intake version and digest; later
 corrections create a new version rather than rewriting history.
+
+For known-answer questions, the Telegram interviewer uses small,
+versioned choice sets rather than asking for free text first. For example,
+trip type offers `family`, `group of families`, `couple`, and `other`; `other`
+opens a bounded free-text follow-up and is summarized back to the organizer.
+Every choice question has an appropriate `other`/`not sure yet` escape hatch.
+Persist option ID and schema version plus the literal free-text answer when
+used; do not silently force it into an enum.
 
 ## Task 4 — Durable workflow engine and private worker
 
@@ -418,6 +439,16 @@ Capture at minimum:
   retaining or deleting trip data according to organizer consent and legal
   requirements.
 
+After completion, offer a separate organizer-authorized debrief. It collects
+choice-first ratings and review outcomes for sites, corrections/additional
+site facts, and discovered or recommended locations. Every item is versioned
+with trip, source, author role, consent, confidence and review status.
+Chat-derived discoveries require explicit per-trip organizer consent and are
+stored only as redacted, reviewable candidates; they never automatically
+change current-trip data, a shared catalog, or cross-trip recommendations.
+Organizer approval is required before promotion, and consent revocation
+governs unreviewed-candidate deletion/retention.
+
 ## Task 12 — Japan end-to-end release and lifecycle rehearsal
 
 Japan is the only initial full-system fixture. Test both image creation and a
@@ -425,6 +456,7 @@ fresh deployment from the sealed image:
 
 ```text
 website test signup
+→ super-admin test approval
 → authorized interview link and replay
 → literal CONFIRM
 → plan/approval
@@ -443,8 +475,11 @@ production hostname or real family group.
 
 ## Acceptance criteria
 
-1. A registered Telegram identity can access only its own interview/trips;
-   replayed or mismatched enrollment links fail.
+1. A registered Telegram identity cannot create a usable draft or access an
+   interview until the configured super-admin approves its signed, expiring,
+   single-use signup request. Wrong-admin, replayed, expired and rate-limited
+   requests fail; after approval it can access only its own interview/trips,
+   and replayed or mismatched enrollment links fail.
 2. Public endpoints cannot invoke provider actions or retrieve secrets.
 3. A verified release image contains no Japan data, credentials, logs, DB or
    runtime state, yet a Japan deployment from it passes the full test suite.

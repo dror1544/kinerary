@@ -24,14 +24,37 @@ assumptions.
 
 The first release deliberately supports one happy-path organizer and one demo
 trip at a time, but it must use durable IDs, membership scoping, idempotency,
-and per-trip records from the beginning. A manual approval is expected at
-two safe gates: provision and public activation.
+and per-trip records from the beginning. For the local MVP, a super-admin
+approval is required before a verified signup becomes a usable draft. Manual
+approval is also expected at the later provision and public-activation gates.
+
+### MVP signup-approval gate
+
+A successful Telegram login proves an identity; it does not authorize
+onboarding. It creates a minimal `pending_signup_approval` request and a
+transactional notification-outbox event. The notification goes only to the
+configured super-admin Telegram identity, with opaque Approve and Reject
+actions. It must not include secrets, intake data, or a reusable public URL.
+
+The callback handler verifies the bot identity, the configured super-admin
+Telegram ID, the signed opaque action, its expiry, and one-time use. Approval
+atomically creates (or unlocks) the owner membership and `draft` trip, then
+allows the interview handoff. Rejection/expiry leaves no usable draft,
+enrollment link, worker job, or provider resource. Duplicate signup attempts
+reuse the pending request and do not create a notification storm. Rate limits
+and approval expiry are configuration, not hard-coded values.
+
+Telegram is only the local notification/decision adapter. The canonical
+record is a provider-neutral `signup_approval_request` with actor, decision,
+timestamps, opaque notification/action IDs and audit evidence. A future
+dashboard/email workflow can use that contract without changing signup state.
 
 ### Component seams
 
 | Component | Input | Output | Must be testable without |
 |---|---|---|---|
-| Signup and ownership | verified provider identity | user, draft trip, membership | Telegram interview or Proxmox |
+| Signup approval | verified provider identity | approved draft trip or terminal rejection | Telegram interview or Proxmox |
+| Signup and ownership | approved signup request | user, draft trip, membership | Telegram interview or Proxmox |
 | Interview enrollment | user + draft trip | expiring single-use enrollment | real provisioning |
 | Intake service | authorized Telegram messages | versioned confirmed intake | provider credentials |
 | Planner/workflow | confirmed intake + release ID | immutable plan, jobs and audit trail | actual runtime creation |
@@ -51,8 +74,9 @@ Build these once in Sprint 0; every later sprint uses them.
 - A `test` architecture profile selects separate Proxmox resource ranges,
   non-production hostnames, test-only Telegram bot/chat IDs, and distinct
   secret references. No real values appear in source control or trip folders.
-- Seed fixtures create an organizer identity, a second unauthorized identity,
-  Japan intake data, an incompatible release, and a controlled provider error.
+- Seed fixtures create an approved organizer identity, a pending organizer
+  identity, a second unauthorized identity, Japan intake data, an incompatible
+  release, and a controlled provider error.
 - Adapter fakes implement compute, ingress, Hermes, Telegram, clock and secret
   interfaces for deterministic unit/contract tests. A separate integration
   profile uses real local adapters only against the test allocation.
@@ -120,35 +144,56 @@ external side effect.
 
 ### Sprint 1 — Signup, identity, ownership, and draft trip
 
-**Goal:** an organizer creates and resumes only their own draft.
+**Goal:** a verified identity needs your Telegram approval before it can create
+or resume its own draft.
 
 Build:
 
-- Implement provider-neutral `users`, `user_identities`, `trips`, and
-  `trip_memberships`; enforce membership scoping in every query.
+- Implement provider-neutral `users`, `user_identities`, `trips`,
+  `trip_memberships`, and `signup_approval_requests`; enforce membership
+  scoping in every query.
 - Implement Telegram login verification as the first identity adapter, with
   signature freshness and unique Telegram identity constraints.
-- Create a small public signup/status UI: authenticate, create a draft name,
-  view own draft state, and obtain an interview handoff. Super-admin views are
-  separately authorized.
+- On first verified signup, create a minimal pending request and transactional
+  notification-outbox record. A private Telegram approval adapter sends only
+  the configured super-admin an expiring one-time action keyboard.
+- Implement private callback processing: require the configured super-admin
+  identity and signed action; approve atomically creates/unlocks the draft and
+  membership; reject/expire blocks onboarding. The public UI shows only
+  `awaiting approval`, approved draft state, or a generic declined/expired
+  result.
+- Create a small public signup/status UI: authenticate, request a draft name,
+  view only their own status, and obtain an interview handoff only after
+  approval. Super-admin views are separately authorized.
 
 Automated tests:
 
 - valid, stale, tampered and duplicate Telegram-login payloads;
-- owner can read/create their draft; a second user, unauthenticated caller and
-  forged trip ID cannot read or mutate it;
-- repeat submit is idempotent and creates one draft/membership;
+- verified signup creates one pending request and one outbox notification; a
+  repeated request reuses it without notification fan-out;
+- approval callback rejects a wrong chat/user, altered action, replay or
+  expiry; a valid approval creates one draft/membership exactly once;
+- rejected/expired requests cannot obtain an enrollment link, create a job, or
+  become a draft through public APIs;
+- owner can read their approved draft; a second user, unauthenticated caller
+  and forged trip ID cannot read or mutate it;
+- notification payload/logs are redacted and rate limits protect the
+  super-admin from repeated signup attempts;
 - API responses and logs omit Telegram tokens and numeric identity values where
   not needed.
 
 Manual tests:
 
-- sign in with a test organizer, create a draft, refresh/relogin and confirm
-  the same draft is visible;
-- sign in with the second test identity and confirm the first draft is absent.
+- sign in with a pending test organizer and verify the website remains in
+  `awaiting approval`; approve it from the allowlisted super-admin Telegram
+  account and verify the same draft is then visible;
+- reject a second test request and verify it cannot receive an interview link;
+- sign in with the unauthorized identity and confirm the approved draft is
+  absent.
 
-Exit gate: a real test Telegram login produces a durable draft, while all
-authorization cases pass using only public API access.
+Exit gate: a real test Telegram login produces a durable pending request and
+only the allowlisted super-admin can turn it into a draft; public API access
+cannot bypass, replay or flood that decision.
 
 ### Sprint 2 — Authorized interview and immutable intake
 
@@ -162,6 +207,14 @@ Build:
 - Implement a narrow interview-session API for the Hermes interviewer. It can
   read/write its one intake session and validate answers; it has no provider,
   activation, secret, or cross-trip capability.
+- Design Telegram prompts as small, structured choices whenever the answer has
+  a known taxonomy. For example, trip type offers `family`, `group of
+  families`, `couple`, and `other`; choosing `other` explicitly opens a
+  free-text follow-up. Every choice question also supports an appropriate
+  `other`/`not sure yet` path rather than forcing a wrong enum.
+- Store both a stable option ID and its schema version; for `other`, store the
+  organizer's free text as a bounded answer with provenance. The interview
+  must summarize that answer back before `CONFIRM`, not silently classify it.
 - Normalize/validate the collected answers. Literal `CONFIRM` creates an
   immutable intake version and digest; corrections create a new version.
 - Add status UI for `interviewing` and `awaiting_confirmation` without showing
@@ -175,12 +228,18 @@ Automated tests:
   substitute another trip ID;
 - partial answers validate predictably; `CONFIRM` is required; a second
   confirmation is idempotent; version history/digests are immutable;
+- each choice prompt renders the approved options, rejects an unknown callback
+  value, and accepts `other` only through its bounded free-text follow-up;
+- an intake retains option ID/schema version and the literal `other` answer;
+  recap shows both without an invented classification;
 - API and audit assertions confirm no raw transcript is emitted.
 
 Manual tests:
 
 - complete a short interview from the test organizer's Telegram DM, confirm
   the bot refuses a message from the unauthorized identity, then confirm;
+- answer the trip-type question once with a preset and once with `other`; in
+  both cases verify the recap is understandable and requires confirmation;
 - edit one answer via the approved correction path and verify a new intake
   version, not in-place mutation.
 
@@ -337,49 +396,104 @@ Manual tests:
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.
 
+### Sprint 7 — Post-trip debrief and reviewed learning
+
+**Goal:** turn a completed trip into organizer-controlled knowledge for that
+trip and, only with explicit consent, future-trip suggestions.
+
+Build:
+
+- Issue a separate, owner-authorized debrief session after completion. Use the
+  same choice-first Telegram pattern for ratings, whether a site was visited,
+  recommendation confidence and reuse intent; each prompt offers `other` and
+  free-text context where appropriate.
+- Record versioned feedback items for site ratings/corrections, discovered or
+  recommended locations, and additional facts that improve existing site
+  information. Each item has source, trip, author role, confidence, consent,
+  status and evidence reference.
+- Treat chat-derived discoveries as **candidates**, not facts: extract only
+  under an explicit per-trip organizer consent setting, redact/minimize text,
+  and require organizer review before a candidate updates trip content or any
+  reusable location catalog. Never auto-promote an LLM inference.
+- Provide a private review queue with approve, edit, reject and revoke actions.
+  Approved trip-local facts may update that trip's knowledge; cross-trip reuse
+  requires a separate consent/provenance policy and is deferred from automatic
+  behavior.
+
+Automated tests:
+
+- debrief enrollment is scoped to a completed trip and authorized organizer;
+  a different member/trip cannot read or modify feedback;
+- choice and `other` answer handling mirrors intake validation and stores
+  provenance/versioning;
+- no chat extraction occurs without consent; consent revocation stops future
+  extraction and removes/revokes unapproved candidates according to retention
+  policy;
+- candidate review is idempotent and auditable; rejected or unreviewed items
+  cannot alter site content, the location catalog, or future recommendations;
+- analytics contains aggregate outcome/category signals, never raw debrief or
+  chat text by default.
+
+Manual tests:
+
+- complete a Japan debrief with one high-rated site, one correction, and one
+  discovered location entered through `other`; review/edit/approve each item;
+- enable then revoke chat-candidate consent and verify only reviewed,
+  consented, provenance-labelled items are visible to the organizer.
+
+Exit gate: the Japan trip produces reviewed, provenance-labelled feedback that
+improves only the intended trip by default; no raw chat transcript or
+unreviewed suggestion becomes shared knowledge.
+
 ## 4. Demo-trip acceptance script
 
 Run this only after Sprint 6 automated gates are green. Record the IDs,
 timestamps, approvals and redacted evidence in the release/demo record.
 
 1. Select a verified release and create a unique test-run ID.
-2. Sign in as the test organizer on the onboarding website and create a draft.
-3. Open the enrollment link from that organizer's Telegram account; prove the
-   other test identity is refused.
-4. Complete the Japan fixture interview, inspect the normalized summary, and
+2. Sign in as the test organizer and submit a draft request. Verify it remains
+   `awaiting approval` and has no enrollment link.
+3. Approve it from the allowlisted super-admin Telegram account. Verify that
+   an unauthorized identity and a replayed approval action are refused, then
+   open the organizer's enrollment link.
+4. Prove the other test identity is refused by the interviewer.
+5. Complete the Japan fixture interview, inspect the normalized summary, and
    send literal `CONFIRM`.
-5. Generate and manually approve the provisioning plan. Verify the plan is
+6. Generate and manually approve the provisioning plan. Verify the plan is
    bound to its intake digest and selected release.
-6. Observe the worker create the isolated test runtime, restore/attach its
+7. Observe the worker create the isolated test runtime, restore/attach its
    persistent data, configure its private MCP, and store private-readiness
    evidence. Confirm no public route exists yet.
-7. Bind the disposable test Telegram group to the shared companion router and
+8. Bind the disposable test Telegram group to the shared companion router and
    prove a second group does not route to this trip.
-8. Review and separately approve the activation plan. Verify the
+9. Review and separately approve the activation plan. Verify the
    non-production hostname, TLS and website only; verify worker/admin/MCP
    endpoints remain private.
-9. Use the active Japan site and one safe companion interaction. Check the
+10. Use the active Japan site and one safe companion interaction. Check the
    dashboard's lifecycle, health and redacted analytics evidence.
-10. Rehearse one controlled failure (worker restart or failed readiness),
+11. Rehearse one controlled failure (worker restart or failed readiness),
     recover through the dashboard, then suspend/archive the demo and run the
     labelled cleanup. Preserve only approved audit/release evidence.
 
 The demo is successful only if the evidence demonstrates both success and the
-refusal paths: unauthorized identity, replayed enrollment, unapproved plan,
-missing verification evidence and failed activation must all be unable to
-produce an active trip.
+refusal paths: unauthorized identity, replayed signup approval or enrollment,
+unapproved plan, missing verification evidence and failed activation must all
+be unable to produce an active trip.
 
 ## 5. MVP completion criteria and deferrals
 
 The MVP onboarding milestone is complete when the Sprint 6 demo is repeatable
 from a clean test allocation, and the automated test suite covers every
-component seam plus the major refusal paths. A human may still approve
-provisioning and activation; automation means those approvals trigger a
-durable, repeatable workflow rather than an operator's ad-hoc commands.
+component seam plus the major refusal paths. Sprint 7 is the first
+post-trip-learning milestone and can begin once a completed Japan demo exists.
+A human may still approve provisioning and activation; automation means those
+approvals trigger a durable, repeatable workflow rather than an operator's
+ad-hoc commands.
 
 Defer until the MVP is stable: cloud renderer, managed database/queue,
 Kubernetes, multi-region operation, organizer self-service history/insights,
 billing, automated release promotion, additional messaging providers, and
 dedicated per-trip bots. Do not defer their interfaces: release manifests,
 resource IDs, secret references, `isolation_tier`, memberships, messaging
-bindings and lifecycle events are required in the first schema.
+bindings, consent/provenance-labelled feedback and lifecycle events are
+required in the first schema.

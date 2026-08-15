@@ -332,6 +332,14 @@ data, not analytics identity. If implemented, they require explicit consent,
 provenance, membership checks and their own retention/revocation model. Never
 join rotating analytics pseudonyms across trips to synthesize that profile.
 
+Post-trip ratings, site corrections and discovered-location suggestions are
+also product data rather than analytics text. Analytics may count a bounded
+event such as `debrief_completed`, `rating_submitted`, or
+`knowledge_candidate_reviewed`; it must not carry the rating comment, chat
+excerpt, exact hidden-location detail, or Telegram identity. Any chat-derived
+candidate requires explicit organizer consent and human review before product
+use.
+
 ### 5.4 Text retention
 
 Default policy: **do not persist message text** in the analytics database.
@@ -407,7 +415,9 @@ Do not derive trip location from raw text when the configured active phase alrea
 
 ### 7.1 Lifecycle and onboarding metrics
 
-1. Verified signup → trip draft conversion.
+1. Verified signup → pending-super-admin-approval → approved/rejected/expired
+   → trip draft conversion. Measure decisions and elapsed time without storing
+   the applicant's Telegram ID or approval-message content in analytics.
 2. Interview enrollment issued/opened/authorized/expired/rejected counts.
 3. Interview started → recap → literal confirmation conversion and elapsed
    time, without exporting answer text.
@@ -534,8 +544,9 @@ Filters: time range, environment, release, lifecycle state.
 
 Panels:
 
-1. Signup → draft → interview start → confirmation → ready-private → active
-   funnel.
+1. Signup → pending super-admin approval → draft → interview start →
+   confirmation → ready-private → active funnel, with approved/rejected/expired
+   signup decisions as separate bounded outcomes.
 2. Median/p95 time in each lifecycle state and job wait.
 3. Provisioning step success/failure/retry/manual-intervention rates.
 4. Release builds, Japan qualification, active deployment count and
@@ -618,8 +629,9 @@ Implement deletion jobs and verify them. Keep the analytics database, Grafana, a
 
 1. Write versioned schemas for control-plane lifecycle, resource/health and
    trip-companion events.
-2. Emit signup/interview/job/release transitions from a transactional
-   PostgreSQL outbox in the onboarding service.
+2. Emit signup-approval, interview, job and release transitions from a
+   transactional PostgreSQL outbox in the onboarding service; approval-message
+   payloads and Telegram IDs are never analytics fields.
 3. Define the bounded category/tag/outcome taxonomy and initial Hebrew/English
    rule dictionaries.
 4. Build local-only messaging/Hermes emitters that capture normalized metadata

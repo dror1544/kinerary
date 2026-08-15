@@ -36,8 +36,10 @@ it does not receive infrastructure authority.
 ## 2. Non-negotiable boundaries
 
 1. **Public and privileged surfaces are different services.** The public API
-   may verify identity, create a draft, issue an interview link and read scoped
-   status. Only a private worker may execute provider operations.
+   may verify identity, submit a signup request and read scoped status. In the
+   MVP, only a configured super-admin's private Telegram approval may create a
+   usable draft or issue an interview link. Only a private worker may execute
+   provider operations.
 2. **The control plane runs on dedicated compute, never directly on a
    hypervisor.** The local MVP uses a Proxmox LXC; a cloud deployment may use
    other private compute. Provider credentials are scoped to named actions.
@@ -53,8 +55,8 @@ it does not receive infrastructure authority.
    Replacement, upgrade and rollback must not depend on copying a mutable
    container root filesystem.
 7. **Interview access is database-authorized.** A Telegram ID must first be
-   verified by website signup and then matched to a signed, expiring,
-   single-use trip enrollment.
+   verified by website signup, pass the MVP super-admin signup-approval gate,
+   and then match a signed, expiring, single-use trip enrollment.
 8. **The interviewer is intake-only.** It has no Proxmox, DNS, activation,
    cross-trip MCP, secret, or arbitrary filesystem capabilities.
 9. **Messaging topology is a policy choice.** Shared-bot routing is preferred
@@ -65,6 +67,15 @@ it does not receive infrastructure authority.
     analytics, plan snapshots or MCP responses.** Store opaque references.
 12. **A failed or waiting job is never reported as active.** External user
     actions are durable wait states, not invisible manual instructions.
+13. **Known-answer interview and debrief prompts are choice-first.** Telegram
+    buttons use stable, versioned option IDs and always provide an appropriate
+    `other`/free-text path. The system stores what the organizer selected; it
+    does not silently coerce free text into a product category.
+14. **Post-trip learning is reviewed product data, not transcript mining.**
+    Ratings, corrections and discovered-location suggestions carry trip,
+    provenance, consent and review state. Chat extraction is opt-in and yields
+    candidates only; an unreviewed inference never changes trip or shared
+    knowledge.
 
 ## 3. General architecture and local MVP mapping
 
@@ -73,7 +84,7 @@ Internet
   │
   ├─ public onboarding domain
   │    └─ Onboarding Web/API (public listener)
-  │         ├─ Telegram login verification
+  │         ├─ Telegram login verification + signup-request status
   │         ├─ user/trip membership endpoints
   │         ├─ interview enrollment links
   │         └─ scoped dashboard/status APIs
@@ -257,11 +268,19 @@ Foundational tables/records:
 
 - `users`: account lifecycle and non-secret profile fields;
 - `user_identities`: provider, immutable provider subject, verification time;
+- `signup_approval_requests`: minimal verified signup, decision, expiry,
+  opaque notification/action references and audit evidence; no secret action
+  value;
 - `trips`: immutable ID, slug, lifecycle state, current deployment;
 - `trip_memberships`: user, trip, owner/organizer/member role and status;
 - `interview_enrollments`: hashed token, trip/user binding, expiry/use state;
 - `intake_sessions` and `intake_versions`: draft state, confirmed artifact
   reference/digest, schema, provenance and confirmation evidence;
+- `debrief_sessions` and `feedback_items`: completed-trip feedback, stable
+  choice/free-text answer provenance, consent, review status and retention;
+- `knowledge_candidates`: proposed site/location facts from a debrief or
+  explicitly consented chat extraction; source/evidence/review status are
+  required before any trip-local or reusable use;
 - `releases`: source/artifact digest/schema/compatibility/evidence/status;
 - `release_artifacts`: release, provider, provider artifact ID and retention;
 - `deployments`: trip, release, provider, isolation tier, persistent-data
@@ -276,28 +295,36 @@ Foundational tables/records:
 - `entitlement_references`: future plan/feature limits without billing details;
 - `audit_events`: actor, action, target, before/after, request/job correlation.
 
-Raw interview transcripts, Telegram IDs in analytics, tokens/passwords/keys,
+Raw interview/debrief transcripts, Telegram IDs in analytics, tokens/passwords/keys,
 MTProto sessions, provider credentials and full private trip payloads do not
 belong in the operational registry unless a separately documented product
-store and retention policy requires them.
+store and retention policy requires them. A chat-derived candidate stores a
+minimal, redacted evidence reference—not a permanent transcript mirror.
 
 ## 8. Signup and interview authorization
 
 1. Verify the Telegram Login payload signature, age and configured domain.
 2. Upsert the Telegram identity only after successful verification; enforce a
    unique provider subject.
-3. Create a draft trip and owner membership in one transaction.
-4. Issue an opaque, signed, expiring, single-use interview enrollment deep
-   link. Store only its hash/nonce and binding.
-5. When the shared interviewer receives `/start`, send the token plus verified
+3. Create a minimal `signup_approval_request` and transactional notification
+   outbox record. Do not create a usable draft, membership, enrollment or job.
+4. The MVP notification adapter sends signed opaque Approve/Reject actions
+   only to the configured super-admin Telegram identity. Its callback verifies
+   bot, actor, action expiry and one-time consumption.
+5. Approval atomically creates the draft trip and owner membership; rejection
+   or expiry remains terminal for that request. Repeated signup submits reuse
+   the live request and are rate-limited.
+6. Only after approval, issue an opaque, signed, expiring, single-use
+   interview enrollment deep link. Store only its hash/nonce and binding.
+7. When the shared interviewer receives `/start`, send the token plus verified
    inbound Telegram ID to the onboarding API over a private/authenticated
    channel.
-6. Atomically validate identity, trip, state, expiry and replay; bind or resume
+8. Atomically validate identity, trip, state, expiry and replay; bind or resume
    one intake session.
-7. Scope every interviewer call to that session/trip/user. Reject all other
+9. Scope every interviewer call to that session/trip/user. Reject all other
    Telegram users rather than relying on a static allowlist.
-8. Present a recap; literal `CONFIRM` creates a new immutable intake version.
-9. Confirmation queues planning. It does not approve provisioning or public
+10. Present a recap; literal `CONFIRM` creates a new immutable intake version.
+11. Confirmation queues planning. It does not approve provisioning or public
    activation by itself.
 
 ## 9. Workflow and approval rules
@@ -467,7 +494,8 @@ retrieval or arbitrary profile-configuration endpoints.
 ## 16. Required tests
 
 - Telegram signup signature/freshness, identity uniqueness and enrollment
-  replay/mismatch rejection.
+  replay/mismatch rejection, plus super-admin signup-approval callback
+  authorization, expiry, replay protection, deduplication and rate limiting.
 - Cross-user and cross-trip authorization failures on every public/dashboard
   query.
 - Plan digest, expiry, single-use approval and idempotency behavior.
