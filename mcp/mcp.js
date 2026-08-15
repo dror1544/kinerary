@@ -299,7 +299,10 @@ mcp.tool('get_bookings', 'Get trip bookings (flights, hotels, cars, attractions)
   return ok(await apiGet(`/api/bookings${qs.toString() ? '?' + qs : ''}`));
 });
 
-mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
+mcp.tool('add_booking',
+  'Record a reservation — a flight, hotel, car or ticketed attraction with a confirmation to keep. ' +
+  'A booking is not part of the active plan and does not put anything on the family\'s day-by-day schedule: to make something ' +
+  'appear on a day, use add_plan_item (optionally passing booking_id to show this confirmation inline).', {
   phase:        z.string().describe('Phase id from trip.config.json (see get_config), plus "intl_flights" for international flights'),
   type:         z.enum(['flight','hotel','car','attraction','other']).describe('Booking type'),
   name:         z.string().describe('Booking name / description'),
@@ -315,7 +318,15 @@ mcp.tool('add_booking', 'Add a new booking entry to the trip site', {
   location_url:      z.string().url().optional().describe('Location URL (Google Maps, Waze, etc.)'),
 }, async (args) => ok(await apiPost('/api/bookings', args)));
 
-mcp.tool('update_booking', 'Update an existing booking by ID', {
+mcp.tool('update_booking',
+  'Update the booking record itself — supplier, confirmation number, PIN, cost, passengers, the dates the reservation covers, voucher/wallet links. ' +
+  'This is NOT how the itinerary is changed. A trip holds two plans: the ORIGINAL PLAN (authored in trip.config.json, a read-only ' +
+  'reference) and the ACTIVE PLAN (get_phase_plan — the live schedule, including AI enrichment and the organizer\'s own edits). ' +
+  'The site renders the ACTIVE PLAN IN PREFERENCE TO both the original plan and bookings, so a booking edit made to change what a ' +
+  'day looks like returns 200, changes the booking, and changes nothing anyone sees. ' +
+  'Every itinerary change goes to the active plan — a day\'s route, moving or swapping two days, fixing "today\'s" or "tomorrow\'s" ' +
+  'plan: use swap_plan_days, update_plan_item, add_plan_item, delete_plan_item. Never edit the original plan to satisfy one. ' +
+  'Use update_booking when what is actually wrong is the reservation.', {
   id:           z.number().describe('Booking ID from get_bookings'),
   name:         z.string().optional(),
   date_from:    z.string().optional(),
@@ -411,27 +422,88 @@ mcp.tool('add_trivia_question',
 // ── Phase plan items ──────────────────────────────────────────────────────────
 
 mcp.tool('get_phase_plan',
-  'Get the organizer\'s editable day-by-day plan items for a trip phase. ' +
-  'Returns items sorted by date, time, and sort_order. Each item may include a linked booking (for confirmation display). ' +
-  'status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review).',
+  'THE ACTIVE PLAN for a phase — the live day-by-day schedule the family actually sees, including AI enrichment and every organizer ' +
+  'edit. Read this before answering or changing anything about what happens on a given day. ' +
+  'A trip also has an ORIGINAL PLAN (trip.config.json phases[].days), kept as a read-only reference; the site renders the active ' +
+  'plan in preference to it and to bookings, so "the itinerary" means the active plan, and every change is made here. ' +
+  'Returns { phase_id, days, items }: `items` sorted by date, time and sort_order (each may carry a linked booking for confirmation display), ' +
+  'and `days` the per-date headlines that say what each day IS ("Diamond Head + Waikiki") — the two are edited separately, ' +
+  'so a day whose items moved keeps its old headline until set_plan_day_label or swap_plan_days moves that too. ' +
+  'An item or day may carry `correction` — wording the post-reorder review rewrote because it referred to the old day order. ' +
+  'It holds the note (why) and previous (what it said before, shown struck through on the site). ' +
+  'These are what you relay to the organizer after a schedule change; do not silently pass over them. ' +
+  'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
+  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
   {
     phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
   },
   async ({ phase_id }) => {
-    if (phase_id) return ok(await apiGet(`/api/phases/${phase_id}/plan`));
+    // Items and headlines are two tables and two endpoints, but one answer to
+    // "what does this day look like" — an agent given only the items cannot see
+    // that the headline still names the old plan.
+    const load = async (id) => {
+      const [items, days] = await Promise.all([
+        apiGet(`/api/phases/${id}/plan`),
+        apiGet(`/api/phases/${id}/plan/days`),
+      ]);
+      return { phase_id: id, days, items };
+    };
+    if (phase_id) return ok(await load(phase_id));
     const cfg = await apiGet('/api/config');
     const phases = cfg.phases || [];
     // Fetched together rather than awaited one at a time — an 8-phase trip was
     // paying 8 sequential round trips for reads that don't depend on each other.
-    const plans = await Promise.all(phases.map(p => apiGet(`/api/phases/${p.id}/plan`)));
+    const plans = await Promise.all(phases.map(p => load(p.id)));
     const results = {};
     phases.forEach((p, i) => { results[p.id] = plans[i]; });
     return ok(results);
   });
 
+mcp.tool('swap_plan_days',
+  'Exchange two dates in the ACTIVE PLAN — every item on both dates, plus both day headlines, trade places in one atomic write. ' +
+  'This is the right tool for "move today\'s plan to tomorrow", "swap Thursday and Friday", "today should be what tomorrow was", ' +
+  'and any correction that exchanges two days\' routes. It never touches the original plan in trip.config.json. ' +
+  'Use it rather than a sequence of update_plan_item calls: those render the two days merged into one date partway through, ' +
+  'leave the schedule wrong if any call fails, and cannot move the headlines at all. ' +
+  'If one of the dates has no items this is simply a move. ' +
+  'Returns the resulting items and headlines for both dates — read them to confirm the swap landed, rather than trusting the success status. ' +
+  'It also returns `review`. Reordering days makes the schedule\'s own prose stale — a headline naming its own date, ' +
+  '"tomorrow we climb Diamond Head" written on the day before, "unlike Thursday, this beach is calm" — so a check over the whole ' +
+  'phase is queued. It runs out of band and takes up to a couple of minutes. ' +
+  'AFTER A SWAP YOU MUST: re-read get_phase_plan a short while later, look for items or days carrying a `correction`, and TELL THE ' +
+  'ORGANIZER what was rewritten — quote correction.previous (what it said before) and the current text, and give correction.note as ' +
+  'the reason. The site shows these struck through, so an organizer who reads the schedule will see them; one who only reads your ' +
+  'message will not, unless you say so. If review.status is "unavailable" the descriptions were NOT checked — say that instead of implying they were.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date_a:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('First date YYYY-MM-DD'),
+    date_b:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Second date YYYY-MM-DD'),
+  },
+  async ({ phase_id, date_a, date_b }) =>
+    ok(await apiPost(`/api/phases/${phase_id}/plan/swap-days`, { date_a, date_b })));
+
+mcp.tool('set_plan_day_label',
+  'Set a day\'s headline in the ACTIVE PLAN — the line that says what that date IS ("Diamond Head + Waikiki / Ala Moana"), shown above the day\'s items. ' +
+  'Needed because moving items with update_plan_item does not move the headline: change a day\'s route without this and the site ' +
+  'shows the new plan under the old day\'s name. swap_plan_days already handles the headlines for a two-day exchange; use this when ' +
+  'you rewrite a single day, or when a headline is simply wrong. ' +
+  'Send only the language you mean to change; the other is left as-is. Sending an empty string clears it and re-queues the day for an AI-written headline.',
+  {
+    phase_id: z.string().describe('Phase id from get_config'),
+    date:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').describe('Date YYYY-MM-DD'),
+    label_he: z.string().optional().describe('Headline in Hebrew'),
+    label_en: z.string().optional().describe('Headline in English'),
+  },
+  async ({ phase_id, date, ...body }) =>
+    ok(await apiPatch(`/api/phases/${phase_id}/plan/days/${date}`, body)));
+
 mcp.tool('add_plan_item',
-  'Add a new item to the day-by-day plan for a trip phase. ' +
+  'Add an item to the ACTIVE PLAN for a phase — the schedule the family sees, so adding an activity here is how something appears ' +
+  'on the site. (Adding a booking does not put anything on the schedule.) ' +
   'Use this to record activities, meals, transfers, or any scheduled event. ' +
+  'NOTE: the active plan takes over a phase as soon as it holds a single item — if this phase\'s active plan is still empty, the ' +
+  'original plan stops being shown to participants and they will see only what you add. Check get_phase_plan first; a phase whose ' +
+  'active plan is empty should be seeded from the original plan wholesale, not one item at a time. ' +
   'Set location_url to a Waze or Google Maps link after a web search. ' +
   'Set booking_id to link an existing booking (confirmation will appear inline on the site). ' +
   'Set status to "needs_review" when content is auto-derived and not yet organizer-confirmed.',
@@ -449,7 +521,11 @@ mcp.tool('add_plan_item',
   async ({ phase_id, ...body }) => ok(await apiPost(`/api/phases/${phase_id}/plan`, body)));
 
 mcp.tool('update_plan_item',
-  'Update an existing plan item by ID — use to enrich with location_url, link a booking, confirm needs_review items, or correct text.',
+  'Update one item of the ACTIVE PLAN by ID — the way to change what the family sees for a given day: correct its text, move it to ' +
+  'another date or time, enrich it with location_url, link a booking, or confirm a needs_review item. ' +
+  'Changing `date` moves this ONE item; it does not move the day\'s headline, and it is not how two days are exchanged — ' +
+  'for that use swap_plan_days, which moves items and headlines together and atomically. ' +
+  'Never reach for update_booking to correct the itinerary; the site renders the active plan over bookings.',
   {
     phase_id:     z.string().describe('Phase id the item belongs to'),
     id:           z.number().describe('Plan item ID from get_phase_plan'),
@@ -465,7 +541,8 @@ mcp.tool('update_plan_item',
   async ({ phase_id, id, ...fields }) => ok(await apiPatch(`/api/phases/${phase_id}/plan/${id}`, fields)));
 
 mcp.tool('delete_plan_item',
-  'Delete a plan item by ID.',
+  'Delete an item from the ACTIVE PLAN by ID. The original plan in trip.config.json is unaffected — a deletion here removes the item ' +
+  'from what the family sees, and the organizer can still see the original for comparison.',
   {
     phase_id: z.string().describe('Phase id the item belongs to'),
     id:       z.number().describe('Plan item ID from get_phase_plan'),
@@ -803,16 +880,71 @@ function buildDayLabelPrompt({ date, context, items }) {
   ].filter(Boolean).join('\n');
 }
 
+// After a day moves, the schedule's own prose is what goes stale — "tomorrow we
+// climb Diamond Head" written on the day before, a headline naming its own date,
+// "unlike Thursday, this beach is calm". The model sees the WHOLE phase as it
+// now stands and is asked only for lines that contradict it. Deliberately
+// conservative: a false correction rewrites something a person wrote by hand.
+function buildScheduleReviewPrompt({ context, days }) {
+  return [
+    'A family trip itinerary was just reordered — one or more days changed date.',
+    'Some descriptions were written when the order was different and are now wrong or confusing.',
+    '',
+    'THE ITEMS ON A DATE ARE THE TRUTH. They were just moved deliberately and are exactly where they belong.',
+    'Never rewrite an item to match a headline, never move descriptive content from one day to another, and never',
+    'try to restore a previous order. A headline must describe the items listed under ITS OWN date below — if it',
+    'describes a different day\'s activities, that headline is the thing that is wrong, not the items.',
+    '',
+    'The leading date stamp on a headline ("Thu 13/8 — …") is ALREADY corrected in code before you see this.',
+    'Do not touch it, do not comment on it, and never propose a correction whose only change is a date or weekday.',
+    '',
+    'Find ONLY lines whose wording contradicts the schedule as it now stands. Typical cases:',
+    '  - a day headline describing activities that are no longer on that date',
+    '  - "today" / "tomorrow" / "yesterday" / "the day before" pointing at the wrong day',
+    '  - a cross-reference to another day\'s activity that has moved ("after tomorrow\'s hike")',
+    '  - a date or weekday written INSIDE a sentence that no longer matches ("we land on Tuesday")',
+    '',
+    'When you fix a line, change the smallest thing that is wrong and keep the rest word for word.',
+    '',
+    'Do NOT touch anything else. Not style, not grammar, not detail you think is missing,',
+    'not opening hours, not advice. If a line reads correctly against the schedule below,',
+    'leave it alone. Returning an empty list is the correct answer far more often than not.',
+    '',
+    'Keep every correction minimal: change only the words that became wrong, keep the',
+    'original language (Hebrew stays Hebrew), keep the author\'s voice and any markup.',
+    '',
+    'Reply with ONE JSON object and nothing else:',
+    '{"corrections":[{"kind":"item"|"day","id":<item id>,"date":"YYYY-MM-DD",',
+    '  "text_he":"...","text_en":"...","label_he":"...","label_en":"...",',
+    '  "note":"<short reason, in English, why this line was wrong>"}]}',
+    'Use id for kind "item" and date for kind "day". Include only the language fields you changed.',
+    '',
+    context ? `Trip phase: ${JSON.stringify(context)}` : '',
+    '',
+    'The schedule as it now stands:',
+    JSON.stringify(days, null, 1),
+  ].filter(Boolean).join('\n');
+}
+
 app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), async (req, res) => {
   if (!HERMES_EXTRACT_PROFILE) return res.status(503).json({ error: 'HERMES_EXTRACT_PROFILE not set for trip-mcp' });
-  const { kind, text, text_he, date, context, items } = req.body || {};
-  const isDay = kind === 'day';
-  if (isDay ? !(items && items.length) : (!text && !text_he)) {
-    return res.status(400).json({ error: isDay ? 'Provide items for a day headline' : 'Provide text or text_he' });
+  const { kind, text, text_he, date, context, items, days } = req.body || {};
+  const isDay    = kind === 'day';
+  const isReview = kind === 'schedule_review';
+  if (isReview ? !(days && days.length)
+               : isDay ? !(items && items.length)
+                       : (!text && !text_he)) {
+    return res.status(400).json({
+      error: isReview ? 'Provide days for a schedule review'
+           : isDay    ? 'Provide items for a day headline'
+                      : 'Provide text or text_he',
+    });
   }
 
   try {
-    const prompt = isDay
+    const prompt = isReview
+      ? buildScheduleReviewPrompt({ context, days })
+      : isDay
       ? buildDayLabelPrompt({ date, context, items })
       : buildEnrichPrompt({ text, text_he, date, context });
     // Enrichment runs many calls back to back, and a single lookup routinely
@@ -824,7 +956,35 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
     const parsed = JSON.parse(m[0]);
 
     const out = {};
-    if (isDay) {
+    if (isReview) {
+      // Every correction is validated here before it can reach a family's
+      // schedule: a malformed entry is dropped rather than written back as a
+      // rewrite of something a person authored.
+      const str = (v, max) => (typeof v === 'string' && v.trim()) ? v.trim().slice(0, max) : undefined;
+      out.corrections = (Array.isArray(parsed.corrections) ? parsed.corrections : [])
+        .map(c => {
+          const isItem = c?.kind === 'item';
+          const entry = { kind: isItem ? 'item' : 'day', note: str(c?.note, 200) || null };
+          if (isItem) {
+            if (!Number.isInteger(c.id)) return null;
+            entry.id = c.id;
+            for (const k of ['text_he', 'text_en']) { const v = str(c[k], 2000); if (v) entry[k] = v; }
+            if (!entry.text_he && !entry.text_en) return null;
+          } else {
+            const d = str(c?.date, 10);
+            if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+            entry.date = d;
+            for (const k of ['label_he', 'label_en']) { const v = str(c[k], 120); if (v) entry[k] = v; }
+            if (!entry.label_he && !entry.label_en) return null;
+          }
+          return entry;
+        })
+        .filter(Boolean)
+        // A "correction" for every line means the model rewrote the schedule
+        // rather than repairing it. Cap it: a reorder invalidates a handful of
+        // sentences, not all of them.
+        .slice(0, 25);
+    } else if (isDay) {
       for (const k of ['label_he', 'label_en']) {
         if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
       }

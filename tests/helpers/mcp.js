@@ -64,6 +64,94 @@ export function stopTestMcp() {
   mcpProcess = null;
 }
 
+/**
+ * Complete an MCP session against the running server and return its advertised
+ * tools, as `{ name: {description, inputSchema} }`.
+ *
+ * Speaks the SSE transport by hand rather than pulling in the SDK client: the
+ * point of the routing tests is to assert on exactly what an agent is told,
+ * which is the tools/list payload on the wire, and this stays readable across
+ * SDK versions.
+ */
+export async function mcpListTools({ apiKey = MCP_API_KEY, timeoutMs = 10_000 } = {}) {
+  const ctrl = new AbortController();
+  const stream = await fetch(`${BASE_URL}/sse`, {
+    headers: { 'X-API-Key': apiKey, Accept: 'text/event-stream' },
+    signal:  ctrl.signal,
+  });
+  if (!stream.ok) throw new Error(`GET /sse failed: ${stream.status}`);
+
+  const messages = [];
+  let endpoint = null;
+  const reader  = stream.body.getReader();
+  const decoder = new TextDecoder();
+
+  (async () => {
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let split;
+        // SSE frames are separated by a blank line; \r\n\r\n is equally legal.
+        while ((split = buf.search(/\r?\n\r?\n/)) !== -1) {
+          const frame = buf.slice(0, split);
+          buf = buf.slice(split + buf.slice(split).match(/^\r?\n\r?\n/)[0].length);
+          let event = 'message';
+          const data = [];
+          for (const line of frame.split(/\r?\n/)) {
+            if (line.startsWith('event:'))     event = line.slice(6).trim();
+            else if (line.startsWith('data:')) data.push(line.slice(5).trim());
+          }
+          const payload = data.join('\n');
+          if (event === 'endpoint') endpoint = payload;
+          else if (payload) { try { messages.push(JSON.parse(payload)); } catch { /* keepalive */ } }
+        }
+      }
+    } catch { /* aborted on close */ }
+  })();
+
+  const deadline = Date.now() + timeoutMs;
+  const waitFor = async (pred, what) => {
+    for (;;) {
+      const hit = pred();
+      if (hit) return hit;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise(r => setTimeout(r, 20));
+    }
+  };
+
+  const send = async (msg) => {
+    const res = await fetch(`${BASE_URL}${endpoint}`, {
+      method:  'POST',
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body:    JSON.stringify(msg),
+    });
+    if (!res.ok) throw new Error(`POST ${endpoint} failed: ${res.status}`);
+  };
+
+  try {
+    await waitFor(() => endpoint, 'the endpoint event');
+    await send({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities:    {},
+        clientInfo:      { name: 'kinerary-tests', version: '1.0.0' },
+      },
+    });
+    await waitFor(() => messages.find(m => m.id === 1), 'the initialize result');
+    await send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    await send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    const listed = await waitFor(() => messages.find(m => m.id === 2), 'the tools/list result');
+    if (listed.error) throw new Error(`tools/list error: ${JSON.stringify(listed.error)}`);
+    return Object.fromEntries((listed.result?.tools || []).map(t => [t.name, t]));
+  } finally {
+    ctrl.abort();
+  }
+}
+
 export async function mcpApi(path, { method = 'GET', body, apiKey } = {}) {
   const headers = {};
   if (apiKey) headers['X-API-Key'] = apiKey;

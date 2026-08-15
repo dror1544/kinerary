@@ -2280,6 +2280,13 @@ footer .sep { color: var(--ink-3); margin: 0 6px; }
 
 .plan-hl-pending { font-weight: 400; font-style: italic; color: var(--ink-3); }
 
+/* A line the post-reorder review rewrote: what it used to say, struck through,
+   with the reason. Muted and small — this is provenance, not the schedule. */
+.plan-correction { margin-top: 4px; font-size: .82em; line-height: 1.45; }
+.plan-correction-was { color: var(--ink-3); text-decoration-thickness: 1px; opacity: .85; }
+.plan-correction-note { display: block; color: var(--ink-3); font-style: italic; }
+.day-label .plan-correction { font-weight: 400; }
+
 /* Ticket state, reusing the site's .tag.g / .tag.r pills. */
 .plan-tag { font-size: 11.5px; }
 
