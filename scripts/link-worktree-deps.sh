@@ -43,6 +43,9 @@ for pkg in server tests mcp; do
   fi
   if [ ! -f "$main_pkg/package-lock.json" ]; then
     warn "$pkg: main has no package-lock.json yet, installing in worktree instead"
+    if [ -L "$wt_pkg/node_modules" ]; then
+      rm "$wt_pkg/node_modules"        # drop stale link before a real install — otherwise npm
+    fi                                 # install follows it and writes into main's node_modules
     ( cd "$wt_pkg" && npm install )
     ok "$pkg: installed"
     continue
