@@ -35,4 +35,10 @@ test("readiness reflects the database and fails closed without leaking an error"
   assert.deepEqual(failure.json(), { status: "not_ready", reason: "database_unavailable" });
   assert.doesNotMatch(failure.body, /password|do-not-leak/);
   await unavailable.close();
+
+  const unconfigured = buildApp(profile);
+  const missing = await unconfigured.inject({ method: "GET", url: "/readyz" });
+  assert.equal(missing.statusCode, 503);
+  assert.deepEqual(missing.json(), { status: "not_ready", reason: "readiness_unconfigured" });
+  await unconfigured.close();
 });

@@ -6,7 +6,8 @@ import re
 from typing import Any, Mapping
 
 
-_OPAQUE_ID = re.compile(r"^[a-z]{2,8}_[A-Za-z0-9]{8,64}$")
+# Must match the v1 JSON contract schemas' opaque ID pattern.
+_OPAQUE_ID = re.compile(r"^[a-z]{2,12}_[A-Za-z0-9]{8,64}$")
 _OPERATIONS = {"inspect", "create", "verify", "delete", "inventory"}
 
 

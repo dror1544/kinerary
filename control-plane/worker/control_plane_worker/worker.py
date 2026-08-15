@@ -48,9 +48,7 @@ class Worker:
                 payload=job.payload,
                 test_run_id=job.test_run_id,
             )
-            adapter = self.adapters[job.adapter]
-            result = adapter.execute(request)
-        except (KeyError, ValueError):
+        except ValueError:
             result = AdapterResult(
                 request_id=job.request_id,
                 correlation_id=job.correlation_id,
@@ -61,6 +59,36 @@ class Worker:
                 changed=False,
                 safe_error_code="INVALID_JOB_CONTRACT",
             )
+        else:
+            adapter = self.adapters.get(job.adapter)
+            if adapter is None:
+                result = AdapterResult(
+                    request_id=job.request_id,
+                    correlation_id=job.correlation_id,
+                    idempotency_key=job.idempotency_key,
+                    adapter=job.adapter,
+                    operation=job.operation,
+                    status="failed",
+                    changed=False,
+                    safe_error_code="UNKNOWN_ADAPTER",
+                )
+            else:
+                try:
+                    result = adapter.execute(request)
+                except Exception:
+                    # Adapters must normally return a controlled AdapterResult.
+                    # An unexpected provider/parser exception is durable but is
+                    # never misreported as an invalid control-plane contract.
+                    result = AdapterResult(
+                        request_id=job.request_id,
+                        correlation_id=job.correlation_id,
+                        idempotency_key=job.idempotency_key,
+                        adapter=job.adapter,
+                        operation=job.operation,
+                        status="failed",
+                        changed=False,
+                        safe_error_code="ADAPTER_EXECUTION_FAILED",
+                    )
         if result.status == "failed":
             self.repository.fail(job.id, result)
         else:

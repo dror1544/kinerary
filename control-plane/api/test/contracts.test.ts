@@ -20,9 +20,37 @@ test("every v1 JSON schema compiles under draft 2020-12", async () => {
 test("the shared request/result schemas require propagation identities", async () => {
   const ajv = new Ajv2020({ strict: true, strictTypes: false, strictRequired: false, allErrors: true });
   const requestSchema = JSON.parse(await readFile(`${contractsDir}/adapter-request.schema.json`, "utf8"));
-  const validate = ajv.compile(requestSchema);
-  assert.equal(validate({ schema_version: 1, adapter: "fake", operation: "inspect", payload: {} }), false);
-  assert.match(JSON.stringify(validate.errors), /request_id|correlation_id|idempotency_key/);
+  const resultSchema = JSON.parse(await readFile(`${contractsDir}/adapter-result.schema.json`, "utf8"));
+  const validateRequest = ajv.compile(requestSchema);
+  const validateResult = ajv.compile(resultSchema);
+  assert.equal(validateRequest({ schema_version: 1, adapter: "fake", operation: "inspect", payload: {} }), false);
+  assert.match(JSON.stringify(validateRequest.errors), /request_id|correlation_id|idempotency_key/);
+
+  const twelveCharacterPrefix = "abcdefghijkl_abcdefgh";
+  const thirteenCharacterPrefix = "abcdefghijklm_abcdefgh";
+  const request = {
+    schema_version: 1,
+    request_id: twelveCharacterPrefix,
+    correlation_id: "corr_abcdefgh",
+    idempotency_key: "inspect-example",
+    adapter: "fake",
+    operation: "inspect",
+    payload: {},
+  };
+  const result = {
+    schema_version: 1,
+    request_id: twelveCharacterPrefix,
+    correlation_id: "corr_abcdefgh",
+    idempotency_key: "inspect-example",
+    adapter: "fake",
+    operation: "inspect",
+    status: "succeeded",
+    changed: false,
+  };
+  assert.equal(validateRequest(request), true, JSON.stringify(validateRequest.errors));
+  assert.equal(validateResult(result), true, JSON.stringify(validateResult.errors));
+  assert.equal(validateRequest({ ...request, request_id: thirteenCharacterPrefix }), false);
+  assert.equal(validateResult({ ...result, request_id: thirteenCharacterPrefix }), false);
 });
 
 test("canonical trip records reject unknown/provider-specific fields", async () => {

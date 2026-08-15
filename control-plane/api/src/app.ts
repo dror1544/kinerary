@@ -15,8 +15,11 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   }));
   app.get("/healthz", async () => ({ status: "ok", service: "control-plane-api" }));
   app.get("/readyz", async (_request, reply) => {
+    if (!dependencies.readiness) {
+      return reply.code(503).send({ status: "not_ready", reason: "readiness_unconfigured" });
+    }
     try {
-      const details = dependencies.readiness ? await dependencies.readiness() : {};
+      const details = await dependencies.readiness();
       return { status: "ready", profile_version: profile.version, ...details };
     } catch {
       return reply.code(503).send({ status: "not_ready", reason: "database_unavailable" });

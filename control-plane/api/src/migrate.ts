@@ -1,13 +1,12 @@
-import { fileURLToPath } from "node:url";
 import { createDatabasePool, readRequiredSecretFile } from "./database.js";
-import { applyMigrations } from "./migrations.js";
+import { applyMigrations, defaultMigrationsDirectory } from "./migrations.js";
 
 const connectionString = await readRequiredSecretFile(
   process.env.CONTROL_PLANE_DATABASE_URL_FILE,
   "CONTROL_PLANE_DATABASE_URL",
 );
 const migrationsDir = process.env.CONTROL_PLANE_MIGRATIONS_DIR
-  ?? fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+  ?? defaultMigrationsDirectory(import.meta.url);
 const pool = createDatabasePool(connectionString);
 const client = await pool.connect();
 try {

@@ -7,8 +7,8 @@
   "required": ["schema_version", "request_id", "correlation_id", "idempotency_key", "adapter", "operation", "status", "changed"],
   "properties": {
     "schema_version": { "const": 1 },
-    "request_id": { "type": "string", "pattern": "^[a-z]{2,8}_[A-Za-z0-9]{8,64}$" },
-    "correlation_id": { "type": "string", "pattern": "^[a-z]{2,8}_[A-Za-z0-9]{8,64}$" },
+    "request_id": { "type": "string", "pattern": "^[a-z]{2,12}_[A-Za-z0-9]{8,64}$" },
+    "correlation_id": { "type": "string", "pattern": "^[a-z]{2,12}_[A-Za-z0-9]{8,64}$" },
     "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 200 },
     "adapter": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$" },
     "operation": { "enum": ["inspect", "create", "verify", "delete", "inventory"] },

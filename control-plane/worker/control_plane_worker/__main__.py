@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from .cleanup import UnsafeCleanupError, select_test_resources
+from .cleanup import UnsafeCleanupError, load_test_resource_name_prefix, select_test_resources
 from .inventory import ProxmoxHttpTransport, ProxmoxInventory
 
 
@@ -25,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
     cleanup = subparsers.add_parser("cleanup", help="select labelled test resources; Sprint 0 is dry-run only")
     cleanup.add_argument("--inventory", required=True)
     cleanup.add_argument("--test-run-id", required=True)
+    cleanup.add_argument(
+        "--architecture-profile",
+        default=os.environ.get("CONTROL_PLANE_ARCHITECTURE_PROFILE"),
+    )
     cleanup.add_argument("--dry-run", action="store_true", required=True)
     worker = subparsers.add_parser("run", help="observe the private PostgreSQL queue")
     worker.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
@@ -47,13 +51,15 @@ def main(argv: list[str] | None = None) -> int:
             transport = ProxmoxHttpTransport(_required_env("PROXMOX_URL"), authorization)
             print(json.dumps(ProxmoxInventory(transport, args.node).inspect(), indent=2, sort_keys=True))
             return 0
+        if not args.architecture_profile:
+            raise ValueError("--architecture-profile or CONTROL_PLANE_ARCHITECTURE_PROFILE is required")
         resources = json.loads(Path(args.inventory).read_text(encoding="utf-8"))
-        selected = select_test_resources(resources, args.test_run_id)
+        allowed_name_prefix = load_test_resource_name_prefix(args.architecture_profile)
+        selected = select_test_resources(resources, args.test_run_id, allowed_name_prefix)
         print(json.dumps({"dry_run": True, "test_run_id": args.test_run_id, "selected": selected}, indent=2, sort_keys=True))
         return 0
     except (OSError, ValueError, UnsafeCleanupError, json.JSONDecodeError) as exc:
         parser.error(str(exc))
-    return 2
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { readRequiredSecretFile } from "../src/database.js";
+import { createDatabasePool, readRequiredSecretFile } from "../src/database.js";
+import { defaultMigrationsDirectory } from "../src/migrations.js";
 
 test("database credentials are read from a non-empty secret file", async () => {
   const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-"));
@@ -16,4 +17,16 @@ test("database credentials are read from a non-empty secret file", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("database pools consume idle client errors instead of crashing the process", async () => {
+  let observed = 0;
+  const pool = createDatabasePool("postgresql://example.invalid/database", () => { observed += 1; });
+  assert.equal(pool.emit("error", new Error("password=must-not-escape")), true);
+  assert.equal(observed, 1);
+  await pool.end();
+});
+
+test("the built migration CLI defaults to the image migration directory", () => {
+  assert.equal(defaultMigrationsDirectory("file:///app/dist/migrate.js"), "/app/migrations/");
 });

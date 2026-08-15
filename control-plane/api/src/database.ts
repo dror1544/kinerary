@@ -8,8 +8,12 @@ export async function readRequiredSecretFile(path: string | undefined, name: str
   return value;
 }
 
-export function createDatabasePool(connectionString: string): pg.Pool {
-  return new pg.Pool({ connectionString, max: 10, idleTimeoutMillis: 30_000 });
+export function createDatabasePool(connectionString: string, onIdleError: () => void = () => {}): pg.Pool {
+  const pool = new pg.Pool({ connectionString, max: 10, idleTimeoutMillis: 30_000 });
+  // node-postgres emits idle-client errors on the Pool EventEmitter. Without a
+  // listener Node treats them as unhandled "error" events and exits.
+  pool.on("error", () => onIdleError());
+  return pool;
 }
 
 export async function databaseReadiness(pool: pg.Pool): Promise<Record<string, unknown>> {

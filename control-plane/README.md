@@ -9,8 +9,9 @@ live trip.
 - `contracts/v1/`: closed JSON Schema contracts for canonical records and the
   provider-neutral adapter request/result envelope.
 - `api/`: TypeScript/Fastify public API skeleton, architecture validation,
-  lifecycle guards, canonical-data checks, redacted logs, fake adapters and a
-  transactional migration runner.
+  lifecycle guards, safe operational logs, fake adapters and a transactional
+  migration runner. PostgreSQL constraints are the authoritative canonical
+  JSON write guard in this stage.
 - `worker/`: private Python queue worker skeleton. It has no public HTTP action
   listener; its operator CLI provides read-only Proxmox inventory and dry-run
   test cleanup only.
@@ -56,7 +57,9 @@ Cleanup is selection-only in Sprint 0 and requires an exact test-run label:
 
 ```bash
 PYTHONPATH=control-plane/worker python3 -m control_plane_worker cleanup \
-  --inventory /private/test-inventory.json --test-run-id tr_example123 --dry-run
+  --inventory /private/test-inventory.json \
+  --architecture-profile control-plane/config/architecture.example.json \
+  --test-run-id tr_example123 --dry-run
 ```
 
 No execute/delete option exists in this stage.
@@ -67,6 +70,11 @@ The local stack runs PostgreSQL with persistent storage, a one-shot migration
 container, the database-aware API and a private queue-observer worker. Only the
 API is published, on loopback by default; PostgreSQL and the worker have no
 host port.
+
+The `run` command deliberately does not instantiate the executable `Worker`
+class in Sprint 0. That class is contract-test scaffolding for the later
+durable claim/execute sprint; the deployed worker only observes queue and
+migration health and has no provider-mutation path.
 
 ```bash
 control-plane/deployment/prepare-local.sh

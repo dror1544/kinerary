@@ -16,6 +16,6 @@
     "payload": { "type": "object" }
   },
   "$defs": {
-    "opaqueId": { "type": "string", "pattern": "^[a-z]{2,8}_[A-Za-z0-9]{8,64}$" }
+    "opaqueId": { "type": "string", "pattern": "^[a-z]{2,12}_[A-Za-z0-9]{8,64}$" }
   }
 }

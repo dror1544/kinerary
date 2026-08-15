@@ -36,6 +36,11 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual([], adapter.requests)
         self.assertEqual("INVALID_JOB_CONTRACT", repository.failed["job_abcdefgh"].safe_error_code)
 
+    def test_unknown_adapter_is_distinct_from_an_invalid_contract(self) -> None:
+        repository = MemoryJobRepository([job(adapter="missing_adapter")])
+        Worker(repository, {}).run_once()
+        self.assertEqual("UNKNOWN_ADAPTER", repository.failed["job_abcdefgh"].safe_error_code)
+
     def test_controlled_provider_failure_is_recorded_without_change(self) -> None:
         repository = MemoryJobRepository([job()])
         adapter = FakeAdapter(fail=True)
@@ -43,6 +48,32 @@ class WorkerTests(unittest.TestCase):
         result = repository.failed["job_abcdefgh"]
         self.assertFalse(result.changed)
         self.assertEqual("FAKE_CONTROLLED_FAILURE", result.safe_error_code)
+
+    def test_adapter_value_and_key_errors_are_not_mislabelled_as_contract_errors(self) -> None:
+        class BrokenAdapter:
+            def execute(self, _request: object) -> object:
+                raise ValueError("provider parser failed")
+
+        repository = MemoryJobRepository([job()])
+        Worker(repository, {"fake_compute": BrokenAdapter()}).run_once()  # type: ignore[arg-type]
+        self.assertEqual("ADAPTER_EXECUTION_FAILED", repository.failed["job_abcdefgh"].safe_error_code)
+
+        class MissingFieldAdapter:
+            def execute(self, _request: object) -> object:
+                raise KeyError("provider response field")
+
+        repository = MemoryJobRepository([job()])
+        Worker(repository, {"fake_compute": MissingFieldAdapter()}).run_once()  # type: ignore[arg-type]
+        self.assertEqual("ADAPTER_EXECUTION_FAILED", repository.failed["job_abcdefgh"].safe_error_code)
+
+    def test_opaque_id_prefix_length_matches_the_shared_contract(self) -> None:
+        repository = MemoryJobRepository([job(request_id="abcdefghijkl_abcdefgh")])
+        Worker(repository, {"fake_compute": FakeAdapter()}).run_once()
+        self.assertIn("job_abcdefgh", repository.completed)
+
+        repository = MemoryJobRepository([job(request_id="abcdefghijklm_abcdefgh")])
+        Worker(repository, {"fake_compute": FakeAdapter()}).run_once()
+        self.assertEqual("INVALID_JOB_CONTRACT", repository.failed["job_abcdefgh"].safe_error_code)
 
 
 if __name__ == "__main__":

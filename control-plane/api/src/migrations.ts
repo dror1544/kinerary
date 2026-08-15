@@ -1,6 +1,11 @@
 import { readdir, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import type { PoolClient } from "pg";
+
+export function defaultMigrationsDirectory(moduleUrl: string): string {
+  return fileURLToPath(new URL("../migrations/", moduleUrl));
+}
 
 export async function applyMigrations(client: PoolClient, migrationsDir: string): Promise<string[]> {
   await client.query("SELECT pg_advisory_lock(hashtext('kinerary_control_plane_migrations'))");
