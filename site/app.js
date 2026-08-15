@@ -2563,11 +2563,15 @@ function bookingRefBadges(b) {
   const appleWalletBadge = b.pkpass_file
     ? `<a href="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
     : '';
-  const googleWalletUrl = bkSafeUrl(b.google_wallet_url);
+  // bkSafeUrl() only validates the scheme — the rest of an attacker-chosen
+  // URL (e.g. a literal " character) still needs HTML-escaping before it's
+  // safe to sit inside a quoted href attribute, same as esc(safeUrl(x)) is
+  // already used for URLs elsewhere in this file (itinerary plan items).
+  const googleWalletUrl = bkEsc(bkSafeUrl(b.google_wallet_url));
   const googleWalletBadge = googleWalletUrl
     ? `<a href="${googleWalletUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
     : '';
-  const locationUrl = bkSafeUrl(b.location_url);
+  const locationUrl = bkEsc(bkSafeUrl(b.location_url));
   const locationBadge = locationUrl
     ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
     : '';
@@ -2577,7 +2581,9 @@ function bookingRefBadges(b) {
 function buildBookingRow(b, canEdit) {
   const icon = TYPE_ICONS[b.type] || '📌';
   const cancelled = b.name.startsWith('❌');
-  const dates = [b.date_from, b.date_to].filter(Boolean).join(' → ');
+  // date_from/date_to are accepted by POST/PATCH /api/bookings with no
+  // format validation, so they're just as attacker-controlled as name.
+  const dates = bkEsc([b.date_from, b.date_to].filter(Boolean).join(' → '));
   const pinBadge = b.pin ? `<span style="margin-right:6px;font-size:12px;color:var(--ink-2)">PIN: ${b.pin}</span>` : '';
   const costStr = b.cost ? `$${Number(b.cost).toLocaleString()}` : '–';
   const editBtn = canEdit
@@ -3357,7 +3363,10 @@ function renderHomeOverview(cfg, anchors) {
   const tr = T[currentLang] || T['he'];
   const sorted = anchors.slice().sort((a, b) => (a.date_from || '').localeCompare(b.date_from || ''));
   const rows = sorted.map(a => {
-    const dates = [a.date_from, a.date_to].filter(Boolean).join(' → ') || '–';
+    // date_from/date_to on a booking-derived anchor are accepted by
+    // POST/PATCH /api/bookings with no format validation — just as
+    // attacker-controlled as name.
+    const dates = esc([a.date_from, a.date_to].filter(Boolean).join(' → ') || '–');
     const icon = TYPE_ICONS[a.type] || '📌';
     return `<tr>
       <td style="white-space:nowrap">${dates}</td>
@@ -3377,6 +3386,24 @@ function renderHomeOverview(cfg, anchors) {
   </table></div>`;
 }
 
+// True only when a hotel booking plausibly IS the phase's accommodation
+// placeholder, not just another hotel booking that happens to share a phase
+// (e.g. a one-night airport stopover shouldn't hide the main stay). A
+// matching confirmation code is authoritative on its own; short of that,
+// require the stay dates to overlap AND the names to loosely agree
+// (case/whitespace-insensitive substring, so "Hotel Meridian" still matches
+// a booking named "Hotel Meridian (confirmed)").
+function sameStay(acc, booking) {
+  if (acc.confirmation && booking.confirmation) return acc.confirmation === booking.confirmation;
+  const accFrom = acc.date_from, accTo = acc.date_to || acc.date_from;
+  const bkFrom = booking.date_from, bkTo = booking.date_to || booking.date_from;
+  const overlaps = !!(accFrom && bkFrom && bkFrom <= accTo && bkTo >= accFrom);
+  if (!overlaps) return false;
+  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const a = norm(acc.name), b = norm(booking.name);
+  return !!a && !!b && (a.includes(b) || b.includes(a));
+}
+
 async function loadHomeOverview(cfg) {
   if (!cfg?.phases?.length) return;
   const token = localStorage.getItem('trip-token');
@@ -3386,11 +3413,13 @@ async function loadHomeOverview(cfg) {
     if (res.ok) bookings = await res.json();
   } catch { /* renders hotel-only anchors below if bookings can't be reached */ }
   const bkAnchors = bookingAnchors(cfg, bookings);
+  const bkHotels = bkAnchors.filter(b => b.type === 'hotel');
   // A phase whose hotel is already a real booking shouldn't also show the
   // accommodation placeholder — prefer the booking record (it carries the
-  // actual confirmation/PDF/wallet) over trip.config.json's authored stand-in.
-  const bookedHotelPhases = new Set(bkAnchors.filter(b => b.type === 'hotel').map(b => b.phase));
-  const accAnchors = accommodationAnchors(cfg).filter(a => !bookedHotelPhases.has(a.phaseId));
+  // actual confirmation/PDF/wallet) over trip.config.json's authored
+  // stand-in — but only for the SAME stay, not any hotel booking on the phase.
+  const accAnchors = accommodationAnchors(cfg)
+    .filter(acc => !bkHotels.some(bk => bk.phase === acc.phaseId && sameStay(acc, bk)));
   renderHomeOverview(cfg, [...accAnchors, ...bkAnchors]);
 }
 

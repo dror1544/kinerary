@@ -147,6 +147,15 @@ describe('renderHomeOverview()', () => {
     assert.equal(el.querySelectorAll('img').length, 0, 'no live <img> element should be created from the payload');
     assert.ok(el.textContent.includes('<img src=x onerror=alert(1)>'), 'the payload should still be visible as inert text');
   });
+
+  test('escapes an XSS payload in date_from (accepted by the API with no format validation)', () => {
+    const { document, ctx } = createRenderContext(HTML, cfg, 'he', EXTRA);
+    ctx.renderHomeOverview(cfg, [
+      { type: 'attraction', name: 'ok', date_from: '<img src=x onerror=alert(1)>', phaseLabel: '🗽' },
+    ]);
+    const el = document.getElementById('home-overview');
+    assert.equal(el.querySelectorAll('img').length, 0, 'no live <img> element should be created from the date_from payload');
+  });
 });
 
 describe('loadHomeOverview()', () => {
@@ -180,14 +189,16 @@ describe('loadHomeOverview()', () => {
     assert.ok(html.includes('Meridian') || html.includes('מרידיאן'), 'hotel anchors should still render');
   });
 
-  test('a real hotel booking on a phase replaces that phase\'s accommodation placeholder, not duplicates it', async () => {
+  test('a hotel booking matching the accommodation\'s confirmation code replaces the placeholder, not duplicates it', async () => {
     const { document, ctx } = createRenderContext(HTML, cfg, 'he', {
       ...EXTRA,
       localStorage: { getItem: () => null },
       fetch: async () => ({
         ok: true,
         json: async () => [
-          { id: 1, phase: 'ny', type: 'hotel', name: 'Hotel Meridian (confirmed)', date_from: '2027-03-11', confirmation: 'RES-1' },
+          // ny's fixture accommodation.confirmation is 'TEST-001' — a matching
+          // confirmation is the authoritative "same stay" signal.
+          { id: 1, phase: 'ny', type: 'hotel', name: 'Hotel Meridian (confirmed)', date_from: '2027-03-11', confirmation: 'TEST-001' },
         ],
       }),
     });
@@ -202,5 +213,27 @@ describe('loadHomeOverview()', () => {
     assert.ok(!document.getElementById('home-overview').innerHTML.includes('מרידיאן'), 'the bare accommodation-name placeholder for ny should not also appear');
     // colorado has no booking, so its accommodation placeholder is untouched
     assert.ok(document.getElementById('home-overview').innerHTML.includes('Alpine') || document.getElementById('home-overview').innerHTML.includes('אלפים'));
+  });
+
+  test('a hotel booking with a different confirmation and name on the same phase does NOT hide the accommodation (e.g. a separate one-night airport stopover)', async () => {
+    const { document, ctx } = createRenderContext(HTML, cfg, 'he', {
+      ...EXTRA,
+      localStorage: { getItem: () => null },
+      fetch: async () => ({
+        ok: true,
+        json: async () => [
+          { id: 1, phase: 'ny', type: 'hotel', name: 'Narita Airport Hotel', date_from: '2027-03-10', date_to: '2027-03-11', confirmation: 'AIRPORT-1' },
+        ],
+      }),
+    });
+    await ctx.loadHomeOverview(cfg);
+    const rows = [...document.querySelectorAll('#home-overview tr')].slice(1);
+    // 3 rows: ny's own accommodation placeholder (untouched), ny's separate
+    // airport-hotel booking, and colorado's placeholder — the airport
+    // booking must not suppress the real ny stay.
+    assert.equal(rows.length, 3, 'a different, non-matching hotel booking must not suppress the phase\'s own accommodation');
+    const html = document.getElementById('home-overview').innerHTML;
+    assert.ok(html.includes('מרידיאן'), 'ny\'s accommodation placeholder should still appear');
+    assert.ok(html.includes('Narita'), 'the separate airport-hotel booking should also appear');
   });
 });

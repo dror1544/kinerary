@@ -69,6 +69,22 @@ describe('bookingRefBadges() — escaping and URL sanitization', () => {
     const html = ctx.bookingRefBadges({ pkpass_file: '"><script>alert(1)</script>' });
     assert.ok(!html.includes('<script>'), 'must not produce a live <script> tag');
   });
+
+  test('a location_url with an embedded quote cannot break out of the href attribute', () => {
+    const ctx = makeContext();
+    // Passes the http(s)-scheme check, but the raw quote would otherwise
+    // close the href="..." attribute early and let the rest become new
+    // attributes on the <a> tag.
+    const html = ctx.bookingRefBadges({ location_url: 'https://maps.example/" autofocus onfocus="alert(1)' });
+    assert.ok(!html.includes('" autofocus'), 'the quote must be escaped, not left to close the href attribute');
+    assert.ok(html.includes('href="https://maps.example/&quot;'), 'the quote should appear HTML-escaped inside the attribute');
+  });
+
+  test('a google_wallet_url with an embedded quote cannot break out of the href attribute', () => {
+    const ctx = makeContext();
+    const html = ctx.bookingRefBadges({ google_wallet_url: 'https://wallet.example/" onmouseover="alert(1)' });
+    assert.ok(!html.includes('" onmouseover'), 'the quote must be escaped, not left to close the href attribute');
+  });
 });
 
 describe('buildBookingRow() — escaping', () => {
@@ -83,5 +99,12 @@ describe('buildBookingRow() — escaping', () => {
     const ctx = makeContext();
     const html = ctx.buildBookingRow({ type: 'flight', name: 'TLV → JFK' }, false);
     assert.ok(html.includes('TLV'));
+  });
+
+  test('escapes an XSS payload in date_from (accepted by the API with no format validation)', () => {
+    const ctx = makeContext();
+    const html = ctx.buildBookingRow({ type: 'flight', name: 'ok', date_from: '<img src=x onerror=alert(1)>' }, false);
+    assert.ok(!html.includes('<img'), 'raw <img> tag must not appear');
+    assert.ok(html.includes('&lt;img'), 'date_from should be HTML-escaped');
   });
 });
