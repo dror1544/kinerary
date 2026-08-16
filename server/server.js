@@ -1794,7 +1794,7 @@ app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file
 });
 
 // Serve confirmation PDFs — uploaded ones from CONF_DIR; static ones from site/confirmations/ via Nginx
-app.get('/api/bookings/confirmation/:fn', (req, res) => {
+app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
@@ -1818,7 +1818,7 @@ app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('fi
   res.json({ ok: true, pkpass_file: req.file.filename });
 });
 
-app.get('/api/bookings/wallet-apple/:fn', (req, res) => {
+app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });

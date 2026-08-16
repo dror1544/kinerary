@@ -2525,10 +2525,76 @@ const PHASE_LABELS = {};
 function bkConfUrls(confFile) {
   if (!confFile) return null;
   if (confFile.startsWith('booking-')) {
+    // Uploaded confirmations are served by Express behind authRequired. A
+    // plain <a href> can't carry an Authorization header, and putting the
+    // session JWT in the query string instead would leak a 30-day, full-
+    // account-privilege token into nginx access logs and browser history —
+    // worse than the unauthenticated hole this was meant to close. So these
+    // are fetched with the header and opened/downloaded as a blob: URL
+    // instead (see openAuthedBlob/downloadAuthedBlob below).
     const url = `/api/bookings/confirmation/${confFile}`;
-    return { view: url, download: url };
+    return { view: url, download: url, authed: true };
   }
-  return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}` };
+  // Static/seed confirmations are served directly by nginx with no auth at
+  // all (a separate, known gap — not covered by this pass), so a plain link
+  // still works here.
+  return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}`, authed: false };
+}
+
+// Fetches an authRequired file with the session's Authorization header and
+// opens it as a blob: URL — never puts the JWT in a URL. Opens the tab with
+// the blob URL already in hand, rather than opening a blank tab first and
+// filling it in after the async fetch — that earlier approach made Chrome
+// hand the PDF off to a second, genuinely separate tab while leaving the
+// pre-opened one blank and focused. Standalone (home-screen PWA) mode gets
+// no new tab at all, since a blob: URL set on a window opened from a
+// standalone context has a history of silently failing to render there.
+//
+// Deliberately does NOT branch on window.open()'s return value to detect a
+// blocked popup — with the noopener flag, window.open() returns null
+// unconditionally, on success or failure alike (that's the point of
+// noopener: no reference back to the new window), so that was never a
+// valid signal. Checks navigator.userActivation instead, *before* calling
+// window.open(): confirmation PDFs can be up to 50MB, and a fetch that
+// slow can outlast the browser's few-second "transient activation" window
+// that window.open() needs — once that expires the popup is silently
+// blocked with no way to detect it after the fact. Same-tab navigation
+// isn't gated by activation at all, so it's the fallback whenever we can't
+// positively confirm activation is still active (including when the API
+// itself isn't supported).
+async function openAuthedBlob(url) {
+  const token = localStorage.getItem('trip-token');
+  try {
+    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) throw new Error(String(res.status));
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const canPopup = !isStandaloneAppMode() && (navigator.userActivation?.isActive ?? false);
+    if (canPopup) window.open(blobUrl, '_blank', 'noopener');
+    else window.location.href = blobUrl;
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  } catch (e) {
+    console.error('Failed to open file', e);
+  }
+}
+
+async function downloadAuthedBlob(url, filename) {
+  const token = localStorage.getItem('trip-token');
+  try {
+    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) throw new Error(String(res.status));
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  } catch (e) {
+    console.error('Failed to download file', e);
+  }
 }
 
 // Local to this section rather than reusing esc()/safeUrl() from the
@@ -2557,11 +2623,15 @@ function bkSafeUrl(u) {
 function bookingRefBadges(b) {
   const urls = bkConfUrls(b.conf_file);
   const pdfLink = urls
-    ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}" target="_blank" title="View">👁</a><a class="conf-pdf" href="${urls.download}" download title="Download">⬇</a></span>`
+    ? (urls.authed
+        ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" onclick="openAuthedBlob('${urls.view}');return false;" title="View">👁</a><a class="conf-pdf" href="#" onclick="downloadAuthedBlob('${urls.download}','${b.conf_file}');return false;" title="Download">⬇</a></span>`
+        : `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}" target="_blank" title="View">👁</a><a class="conf-pdf" href="${urls.download}" download title="Download">⬇</a></span>`)
     : '';
   const confBadge = b.confirmation ? `<span class="conf">${bkEsc(b.confirmation)}</span>` : '';
+  // Also served by Express behind authRequired, same as the PDF above —
+  // opened via openAuthedBlob rather than a plain href for the same reason.
   const appleWalletBadge = b.pkpass_file
-    ? `<a href="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
+    ? `<a href="#" onclick="openAuthedBlob('/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}');return false;" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
     : '';
   // bkSafeUrl() only validates the scheme — the rest of an attacker-chosen
   // URL (e.g. a literal " character) still needs HTML-escaping before it's

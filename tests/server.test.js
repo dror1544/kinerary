@@ -368,6 +368,66 @@ describe('GET /api/bookings — auth', () => {
   });
 });
 
+// ── GET /api/bookings/confirmation/:fn — auth ─────────────────────────────────
+describe('GET /api/bookings/confirmation/:fn — auth', () => {
+  let confFile;
+
+  before(async () => {
+    const all = await (await api('/api/bookings', { token })).json();
+    const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
+    const form = new FormData();
+    form.append('file', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), 'test.pdf');
+    const uploadRes = await api(`/api/bookings/${seed.id}/confirmation`, { method: 'POST', token, body: form });
+    assert.equal(uploadRes.status, 200);
+    ({ conf_file: confFile } = await uploadRes.json());
+  });
+
+  test('returns 401 without any auth', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`);
+    assert.equal(res.status, 401);
+  });
+
+  test('returns 200 with a valid Bearer token', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`, { token });
+    assert.equal(res.status, 200);
+  });
+
+  test('returns 200 with a ?_t= query token (shared authRequired path, used by SSE — not by the booking-file links, which fetch with a header instead)', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}?_t=${token}`);
+    assert.equal(res.status, 200);
+  });
+
+  test('returns 200 with the agent API key (what the MCP server uses)', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`, { apiKey: 'test-hermes-key' });
+    assert.equal(res.status, 200);
+  });
+});
+
+// ── GET /api/bookings/wallet-apple/:fn — auth ─────────────────────────────────
+describe('GET /api/bookings/wallet-apple/:fn — auth', () => {
+  let pkpassFile;
+
+  before(async () => {
+    const all = await (await api('/api/bookings', { token })).json();
+    const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
+    const form = new FormData();
+    form.append('file', new Blob([Buffer.from([0])], { type: 'application/vnd.apple.pkpass' }), 'test.pkpass');
+    const uploadRes = await api(`/api/bookings/${seed.id}/wallet-apple`, { method: 'POST', token, body: form });
+    assert.equal(uploadRes.status, 200);
+    ({ pkpass_file: pkpassFile } = await uploadRes.json());
+  });
+
+  test('returns 401 without any auth', async () => {
+    const res = await api(`/api/bookings/wallet-apple/${pkpassFile}`);
+    assert.equal(res.status, 401);
+  });
+
+  test('returns 200 with a valid Bearer token', async () => {
+    const res = await api(`/api/bookings/wallet-apple/${pkpassFile}`, { token });
+    assert.equal(res.status, 200);
+  });
+});
+
 // ── /api/bookings — CRUD ──────────────────────────────────────────────────────
 describe('/api/bookings CRUD', () => {
   test('GET returns the seeded booking from bookings.json', async () => {
