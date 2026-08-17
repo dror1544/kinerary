@@ -23,7 +23,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
     )`);
     await client.query(await readFile(`${migrationsDir}/0001_foundation.sql`, "utf8"));
     await client.query("INSERT INTO public.control_plane_schema_migrations(version) VALUES ('0001_foundation.sql')");
-    assert.deepEqual(await applyMigrations(client, migrationsDir), ["0002_canonical_guardrails.sql", "0003_sprint0_review_hardening.sql"]);
+    assert.deepEqual(await applyMigrations(client, migrationsDir), [
+      "0002_canonical_guardrails.sql",
+      "0003_sprint0_review_hardening.sql",
+      "0004_canonical_guardrail_key_matching.sql",
+    ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
     assert.equal(tables.rows[0].count >= 18, true);
@@ -32,6 +36,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0001_foundation.sql",
       "0002_canonical_guardrails.sql",
       "0003_sprint0_review_hardening.sql",
+      "0004_canonical_guardrail_key_matching.sql",
     ]);
   } finally {
     await reset(client);
@@ -111,6 +116,82 @@ test("failed job steps require a formatted safe error code", { skip: !databaseUr
     await assert.rejects(client.query("INSERT INTO control_plane.job_steps(id,job_id,step_key,state,idempotency_key) VALUES ('step_abcdefgh','job_abcdefgh','allocate','failed','step-allocate-v1')"));
     await assert.rejects(client.query("INSERT INTO control_plane.job_steps(id,job_id,step_key,state,idempotency_key,safe_error_code) VALUES ('step_badcode01','job_abcdefgh','allocate','failed','step-allocate-v2','bad code')"));
     await client.query("INSERT INTO control_plane.job_steps(id,job_id,step_key,state,idempotency_key,safe_error_code) VALUES ('step_safeerr01','job_abcdefgh','allocate','failed','step-allocate-v3','CONTROLLED_PROVIDER_FAILURE')");
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+// Sensitive-key matching must not depend on snake_case word boundaries, a
+// *_secret_ref key must actually hold a reference rather than being exempt,
+// and the private-address check must need a whole dotted quad so that ordinary
+// version strings and dates survive.
+const unsafeDocuments: Record<string, unknown> = {
+  "camelCase token key": { accessToken: "ghp_RAWSECRET123" },
+  "camelCase api key": { apiKey: "sk-live-RAWKEY" },
+  "snake_case api key": { api_key: "RAWKEY" },
+  "credential substring": { userCredential: "RAWVALUE" },
+  "passphrase key": { passphrase: "RAWVALUE" },
+  "secret_ref holding a literal": { secret_ref: "hunter2-not-a-reference" },
+  "secret_ref holding a connection string": { db_secret_ref: "postgresql://u:PASSWORD@h/db" },
+  "secret_ref holding a non-string": { secret_ref: { inline: "value" } },
+  "private class C address": { upstream: "192.168.1.10" },
+  "private class A address": { node: "10.0.0.5" },
+  "loopback address": { loopback: "127.0.0.1" },
+  "private class B address": { vpn: "172.16.0.9" },
+  "nested camelCase secret": { runtime: { agent: { chatId: "8100200300" } } },
+};
+
+const safeDocuments: Record<string, unknown> = {
+  "semver that starts like a private range": { app_version: "10.15.7" },
+  "dotted date": { departure: "10.11.2025" },
+  "public address": { dns: "8.8.8.8" },
+  "file secret reference": { connection_secret_ref: "file:///run/secrets/database_url" },
+  "env secret reference": { db_secret_ref: "env://CONTROL_PLANE_DATABASE_URL" },
+  "nested camelCase vault reference": { nested: { deep: { secretRef: "vault://kv/data/trip" } } },
+};
+
+test("canonical guardrail matches sensitive keys regardless of case style", { skip: !databaseUrl }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    await applyMigrations(client, migrationsDir);
+    for (const [label, document] of Object.entries(unsafeDocuments)) {
+      const result = await client.query("SELECT control_plane.canonical_json_is_safe($1::jsonb) AS safe", [JSON.stringify(document)]);
+      assert.equal(result.rows[0].safe, false, `expected rejection: ${label}`);
+    }
+    for (const [label, document] of Object.entries(safeDocuments)) {
+      const result = await client.query("SELECT control_plane.canonical_json_is_safe($1::jsonb) AS safe", [JSON.stringify(document)]);
+      assert.equal(result.rows[0].safe, true, `expected acceptance: ${label}`);
+    }
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("canonical guardrail is enforced by the table constraints it backs", { skip: !databaseUrl }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    await applyMigrations(client, migrationsDir);
+    await client.query("INSERT INTO control_plane.trips(id,slug,lifecycle_state) VALUES ('trip_abcdefgh','japan-demo','draft')");
+    await assert.rejects(client.query(
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_camelcase','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
+      [`sha256:${"f".repeat(64)}`, JSON.stringify({ accessToken: "ghp_RAWSECRET123" })],
+    ));
+    await assert.rejects(client.query(
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_fakeref','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
+      [`sha256:${"1".repeat(64)}`, JSON.stringify({ db_secret_ref: "postgresql://u:PASSWORD@h/db" })],
+    ));
+    await client.query(
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_version01','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
+      [`sha256:${"2".repeat(64)}`, JSON.stringify({ app_version: "10.15.7", departure: "10.11.2025" })],
+    );
   } finally {
     await reset(client);
     client.release();

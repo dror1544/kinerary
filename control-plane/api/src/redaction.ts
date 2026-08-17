@@ -1,4 +1,5 @@
-const sensitiveKey = /(?:token|password|secret|authorization|cookie|api[_-]?key|private[_-]?key|telegram[_-]?id|chat[_-]?id)/i;
+// Kept in sync with control_plane.canonical_json_is_safe (db/migrations/0004).
+const sensitiveKey = /(?:token|password|passphrase|credential|secret|authorization|cookie|api[_-]?key|private[_-]?key|telegram[_-]?id|chat[_-]?id)/i;
 
 export function redact(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redact);
