@@ -403,16 +403,23 @@ Build:
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
 - Emit the assistant-experience **outcome** events defined in
-  `assistant-experience-control-plane-metrics.md` — grounded, partial and
+  `trip-assistant-experience-control-plan-metrics.md` — grounded, partial and
   missing-data answers, unanswered group mentions, organizer follow-up
   requested/answered, post-write verification passed/failed — inside the base
   event schema in `trip-bot-analytics-and-metrics-design.md` §5, not as a
   second vocabulary. Derive response rate, grounded-answer rate, missing-data
-  rate, traveler self-service rate and post-write trust rate from them.
-- Add the daily control-plane report to the dashboard: usage, value delivered,
+  rate, traveler self-service rate and post-write trust rate from them, grouped
+  by trip, phase, day, channel, user role and topic so a quality problem can be
+  attributed to platform reliability, website data gaps, organizer workflow
+  friction or assistant behaviour.
+- Add the daily control-plan report to the dashboard: usage, value delivered,
   information quality, learning and enrichment, and organizer enablement —
   including the top missing items to request and the traveler value each one
   unlocks.
+- Implement the missing-information control loop: detect a missing fact while
+  answering, convert it into a focused organizer request naming the smallest
+  artifact that unlocks the most value, and track whether the request was
+  fulfilled.
 
 Automated tests:
 
@@ -474,12 +481,16 @@ Build:
   Approved trip-local facts may update that trip's knowledge; cross-trip reuse
   requires a separate consent/provenance policy and is deferred from automatic
   behavior.
-- Score the completed trip against the rubric in
-  `assistant-experience-control-plane-metrics.md`: each area carries a score,
-  the evidence behind it, an owner and the next improvement. Honour the scoring
-  notes — availability is not scored on configuration but on responses
-  travellers actually received, and a fluent explanation of missing data scores
-  low when the system should have held that data.
+- Score the completed trip against the six weighted dimensions in
+  `trip-assistant-experience-control-plan-metrics.md` — availability, website
+  data completeness, accuracy and cross-channel consistency, operational value,
+  group experience, and learning/enrichment — producing the 1–5 top-level score
+  from the documented weights. Each row carries the evidence behind it, an owner
+  and the next improvement.
+- Attribute every dimension to what the system controlled, what the organizer
+  controlled and what travellers experienced, per the document's Core Principle.
+  A score must not blame the platform for an artifact the organizer never
+  supplied, nor credit it for one the organizer supplied unprompted.
 - Measure repeated-question reduction across the trip: once a fact, link or
   document enters the source of truth, the rate of the questions it answers
   should fall. This is the enrichment loop's outcome measure and needs the
@@ -491,7 +502,8 @@ Automated tests:
   selecting/unarchiving it permits read-only access only;
 - a configured-but-undelivering assistant cannot score well on availability,
   and an answer that explains missing data the system should have held is not
-  scored as accurate; repeated-question reduction is computed from recorded
+  scored as accurate; a dimension the organizer owns does not lower the
+  platform's score; repeated-question reduction is computed from recorded
   events and is absent, not zero, when the trip has too little traffic;
 - organizer memory never crosses into a group response, and an old preference
   or traveler is not copied into a new draft without confirmation;
