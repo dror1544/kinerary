@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kinerary.invalid/contracts/v1/adapter-request.schema.json",
+  "title": "Provider-neutral adapter request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "correlation_id", "idempotency_key", "adapter", "operation", "payload"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "request_id": { "$ref": "#/$defs/opaqueId" },
+    "correlation_id": { "$ref": "#/$defs/opaqueId" },
+    "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 200 },
+    "adapter": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$" },
+    "operation": { "enum": ["inspect", "create", "verify", "delete", "inventory"] },
+    "test_run_id": { "type": "string", "pattern": "^tr_[a-z0-9]{8,64}$" },
+    "payload": { "type": "object" }
+  },
+  "$defs": {
+    "opaqueId": { "type": "string", "pattern": "^[a-z]{2,12}_[A-Za-z0-9]{8,64}$" }
+  }
+}

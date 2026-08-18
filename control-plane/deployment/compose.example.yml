@@ -1,0 +1,85 @@
+name: kinerary-control-plane
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kinerary_control_plane
+      POSTGRES_USER: kinerary_control_plane
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - control_plane_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kinerary_control_plane -d kinerary_control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [private]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: control-plane/api/Dockerfile
+    command: ["node", "dist/migrate.js"]
+    environment:
+      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+    secrets: [control_plane_database_url]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [private]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: control-plane/api/Dockerfile
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+    secrets: [control_plane_database_url]
+    volumes:
+      - type: bind
+        source: ${CONTROL_PLANE_ARCHITECTURE_PROFILE_FILE:?set an external profile path}
+        target: /run/config/architecture.json
+        read_only: true
+    expose: ["4310"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4310/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [ingress, private]
+
+  worker:
+    build: ../worker
+    command: ["python", "-m", "control_plane_worker", "run"]
+    environment:
+      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+    secrets: [control_plane_database_url]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [private]
+
+secrets:
+  postgres_password:
+    file: ${CONTROL_PLANE_POSTGRES_PASSWORD_FILE:?set a root-readable PostgreSQL password file}
+  control_plane_database_url:
+    file: ${CONTROL_PLANE_DATABASE_URL_FILE:?set a root-readable PostgreSQL URL file}
+
+volumes:
+  control_plane_postgres_data:
+
+networks:
+  ingress:
+    external: true
+  private:
+    internal: true

@@ -1,0 +1,19 @@
+[
+  {
+    "name": "kinerary-test-japan-runtime",
+    "environment": "test",
+    "test_run_id": "tr_abcdefgh",
+    "provider_resource_ref": "prv_abcdefgh"
+  },
+  {
+    "name": "kinerary-test-other-runtime",
+    "environment": "test",
+    "test_run_id": "tr_other1234",
+    "provider_resource_ref": "prv_other1234"
+  },
+  {
+    "name": "production-runtime",
+    "environment": "production",
+    "provider_resource_ref": "prv_prod12345"
+  }
+]

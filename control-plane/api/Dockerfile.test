@@ -1,0 +1,10 @@
+FROM node:20-alpine
+WORKDIR /workspace/control-plane/api
+COPY control-plane/api/package.json control-plane/api/package-lock.json ./
+RUN npm ci
+COPY control-plane/api/tsconfig.json ./
+COPY control-plane/api/src ./src
+COPY control-plane/api/test ./test
+COPY control-plane/contracts ../contracts
+COPY control-plane/db ../db
+CMD ["npm", "run", "test:migrations"]

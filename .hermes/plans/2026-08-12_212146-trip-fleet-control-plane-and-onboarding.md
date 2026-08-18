@@ -81,12 +81,13 @@ losing its state. Schema migrations declare forward and rollback compatibility.
 
 ### Local Proxmox MVP; portable control-plane contract
 
-Provisioning moves off the developer Mac. The MVP target is a dedicated
-onboarding/control-plane LXC on Proxmox, never a service installed directly on
-the hypervisor. It hosts the public application/API and private worker as
-separately bound processes. PostgreSQL may initially share the LXC but must
-have tested backups, standard migrations and a migration path to a managed or
-separate PostgreSQL service.
+Provisioning moves off the developer Mac. The MVP target is a small dedicated
+onboarding/control-plane VM on Proxmox, never a service installed directly on
+the hypervisor. Docker Compose runs the public application/API, private worker,
+one-shot migrations and PostgreSQL as separately networked containers.
+PostgreSQL may initially share the VM but must have tested backups, standard
+migrations and a migration path to a managed or separate PostgreSQL service.
+Trip runtimes remain isolated one-per-trip LXCs.
 
 The general architecture does not require Proxmox. It requires a public API,
 durable registry, private job runner, secret resolver, release catalog,

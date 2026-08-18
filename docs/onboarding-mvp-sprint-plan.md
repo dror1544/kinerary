@@ -16,11 +16,12 @@ or a production group as test input.
 
 ## 1. MVP scope and operating model
 
-The first implementation runs locally on Proxmox, with a dedicated
-control-plane LXC, PostgreSQL, a private provisioning worker, a Proxmox runtime
-adapter, local ingress adapter, private Hermes-agent runtime, and Telegram as
-the first messaging adapter. Those are **adapters**, not canonical product
-assumptions.
+The first implementation runs locally on Proxmox, with a small dedicated
+control-plane VM running PostgreSQL, migrations, the API and a private
+provisioning worker under Docker Compose. Trip runtimes remain one-per-trip
+LXCs behind a Proxmox runtime adapter, local ingress adapter, private
+Hermes-agent runtime, and Telegram as the first messaging adapter. Those are
+**adapters**, not canonical product assumptions.
 
 The first release deliberately supports one happy-path organizer and one demo
 trip at a time, but it must use durable IDs, membership scoping, idempotency,
@@ -142,7 +143,16 @@ Manual tests:
 
 - inspect service network bindings: only the public API is reachable through
   ingress; worker, database, MCP, provider and secret endpoints are private;
-- dry-run test-resource cleanup and verify it selects only labelled test data.
+- dry-run test-resource cleanup and verify it selects only labelled test data;
+- **open action item — run the Proxmox inventory command against the real
+  cluster during the first live test.** `ProxmoxHttpTransport` pins the scheme
+  to `https` and never disables certificate verification, so Proxmox's default
+  self-signed certificate requires `PROXMOX_CA_BUNDLE` to point at the issuing
+  CA. Nothing in the automated suite reaches a live Proxmox — the unit tests
+  only prove that unsafe schemes are refused and that verification stays on —
+  so this manual run is the only thing that proves the transport works at all.
+  Until a live run has passed, treat it as this open item rather than reporting
+  it as missing test coverage.
 
 Exit gate: schema migration succeeds on a blank test database, all component
 interfaces have fakes, and a failed job is represented durably without an
