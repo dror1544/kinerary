@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { isCanonicalRecordSafe } from "../src/canonical.js";
 import { applyMigrations } from "../src/migrations.js";
+import { loadCanonicalFixtures } from "./canonical-fixtures.js";
 
 const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
@@ -228,6 +230,32 @@ test("canonical guardrail is enforced by the table constraints it backs", { skip
       "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_version01','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
       [`sha256:${"2".repeat(64)}`, JSON.stringify({ app_version: "10.15.7", departure: "10.11.2025" })],
     );
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("the SQL guardrail and the application guard agree on every shared fixture", { skip: !databaseUrl }, async () => {
+  // The previous application-layer copy was transliterated by hand and drifted
+  // from the SQL, carrying the same three defects. Both are now driven from one
+  // fixture file, and disagreement on any single case fails here.
+  const { unsafe, safe } = await loadCanonicalFixtures();
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    await applyMigrations(client, migrationsDir);
+    for (const [expected, fixtures] of [[false, unsafe], [true, safe]] as const) {
+      for (const { label, document } of fixtures) {
+        const result = await client.query("SELECT control_plane.canonical_json_is_safe($1::jsonb) AS safe", [JSON.stringify(document)]);
+        const sql: boolean = result.rows[0].safe;
+        const app = isCanonicalRecordSafe(document);
+        assert.equal(sql, expected, `SQL disagrees with the fixture: ${label}`);
+        assert.equal(app, sql, `application guard disagrees with SQL: ${label}`);
+      }
+    }
   } finally {
     await reset(client);
     client.release();
