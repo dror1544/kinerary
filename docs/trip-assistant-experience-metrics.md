@@ -16,19 +16,19 @@ exists to avoid one.
 
 ## Deployment to Hermes profiles
 
-The skill runs inside a Hermes profile, but the profile copy is a **deployment
-artifact**, not the original:
+The skill runs inside a Hermes profile. Traffic goes both ways:
 
 ```bash
+scripts/install-hermes-skill.sh trip-assistant-experience-evaluation <profile> --capture
 scripts/install-hermes-skill.sh trip-assistant-experience-evaluation <profile>
 scripts/install-hermes-skill.sh trip-assistant-experience-evaluation <profile> --check
 ```
 
-Edit the repo and re-install. Never edit
-`~/.hermes/profiles/<profile>/skills/travel/…` directly: `~/.hermes` is not
-version controlled, so an edit made there has no history and is silently
-overwritten by the next install. `--check` reports drift without changing
-anything.
+The profile is where the agent works, so it is where insight shows up first — a
+scoring note that proved wrong, a metric worth adding, a takeaway worth reusing.
+That content has no history where it sits, so **capture it into the repo before
+deploying over it**, then commit. Deploy refuses when the profile has diverged,
+so the ordering is enforced rather than remembered.
 
 ## What the skill covers
 
