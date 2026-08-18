@@ -403,7 +403,7 @@ Build:
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
 - Emit the assistant-experience **outcome** events defined in
-  `trip-assistant-experience-control-plan-metrics.md` — grounded, partial and
+  `trip-assistant-experience-metrics.md` — grounded, partial and
   missing-data answers, unanswered group mentions, organizer follow-up
   requested/answered, post-write verification passed/failed — inside the base
   event schema in `trip-bot-analytics-and-metrics-design.md` §5, not as a
@@ -482,14 +482,14 @@ Build:
   requires a separate consent/provenance policy and is deferred from automatic
   behavior.
 - Score the completed trip against the six weighted dimensions in
-  `trip-assistant-experience-control-plan-metrics.md` — availability, website
+  `trip-assistant-experience-metrics.md` — availability, website
   data completeness, accuracy and cross-channel consistency, operational value,
   group experience, and learning/enrichment — producing the 1–5 top-level score
   from the documented weights. Each row carries the evidence behind it, an owner
   and the next improvement.
 - Attribute every dimension to what the system controlled, what the organizer
-  controlled and what travellers experienced, per the document's Core Principle.
-  A score must not blame the platform for an artifact the organizer never
+  controlled and what travellers experienced, per the skill's Core Principle. A
+  score must not blame the platform for an artifact the organizer never
   supplied, nor credit it for one the organizer supplied unprompted.
 - Measure repeated-question reduction across the trip: once a fact, link or
   document enters the source of truth, the rate of the questions it answers
