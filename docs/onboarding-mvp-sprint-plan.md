@@ -143,7 +143,16 @@ Manual tests:
 
 - inspect service network bindings: only the public API is reachable through
   ingress; worker, database, MCP, provider and secret endpoints are private;
-- dry-run test-resource cleanup and verify it selects only labelled test data.
+- dry-run test-resource cleanup and verify it selects only labelled test data;
+- **open action item — run the Proxmox inventory command against the real
+  cluster during the first live test.** `ProxmoxHttpTransport` pins the scheme
+  to `https` and never disables certificate verification, so Proxmox's default
+  self-signed certificate requires `PROXMOX_CA_BUNDLE` to point at the issuing
+  CA. Nothing in the automated suite reaches a live Proxmox — the unit tests
+  only prove that unsafe schemes are refused and that verification stays on —
+  so this manual run is the only thing that proves the transport works at all.
+  Until a live run has passed, treat it as this open item rather than reporting
+  it as missing test coverage.
 
 Exit gate: schema migration succeeds on a blank test database, all component
 interfaces have fakes, and a failed job is represented durably without an

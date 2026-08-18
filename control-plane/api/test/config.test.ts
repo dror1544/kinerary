@@ -22,6 +22,24 @@ test("missing or invalid architecture fails before a provider is constructed", (
   assert.equal(providerCalls, 0);
 });
 
+test("a secret reference cannot traverse out of its allocation", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  for (const traversal of [
+    "file://../../etc/passwd",
+    "file:///run/secrets/../../etc/shadow",
+    "vault://kv/../../root",
+  ]) {
+    assert.throws(
+      () => validateArchitectureProfile({ ...raw, database: { connection_secret_ref: traversal } }),
+      `expected rejection: ${traversal}`,
+    );
+  }
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "file:///run/secrets/control_plane_database_url" },
+  }));
+});
+
 test("worker health is private and production cannot select the test allocation", async () => {
   const raw = JSON.parse(await readFile(examplePath, "utf8"));
   assert.throws(() => validateArchitectureProfile({

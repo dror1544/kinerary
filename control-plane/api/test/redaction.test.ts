@@ -20,6 +20,19 @@ test("structured logs redact connection-string userinfo", () => {
   assert.match(line, /postgresql:\/\/\[REDACTED\]@db\.internal/);
 });
 
+test("caller fields cannot forge the level or event of a line", () => {
+  const line = structuredLog("error", "adapter.failed", {
+    level: "info",
+    event: "adapter.succeeded",
+    detail: "visible",
+  });
+  assert.deepEqual(JSON.parse(line), {
+    level: "error",
+    event: "adapter.failed",
+    detail: "visible",
+  });
+});
+
 test("structured logs redact keys regardless of case style", () => {
   const line = structuredLog("info", "adapter.call", {
     accessToken: "ghp_RAWSECRET123",

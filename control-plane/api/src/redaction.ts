@@ -20,5 +20,10 @@ export function redact(value: unknown): unknown {
 }
 
 export function structuredLog(level: "info" | "warn" | "error", event: string, fields: Record<string, unknown>): string {
-  return JSON.stringify({ level, event, ...redact(fields) as Record<string, unknown> });
+  const safe = redact(fields) as Record<string, unknown>;
+  // level and event are the log reader's index into a line, so a caller field
+  // of the same name must not be able to forge them.
+  delete safe.level;
+  delete safe.event;
+  return JSON.stringify({ level, event, ...safe });
 }

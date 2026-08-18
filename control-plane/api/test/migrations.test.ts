@@ -27,6 +27,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0002_canonical_guardrails.sql",
       "0003_sprint0_review_hardening.sql",
       "0004_canonical_guardrail_key_matching.sql",
+      "0005_opaque_id_format.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -37,6 +38,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0002_canonical_guardrails.sql",
       "0003_sprint0_review_hardening.sql",
       "0004_canonical_guardrail_key_matching.sql",
+      "0005_opaque_id_format.sql",
     ]);
   } finally {
     await reset(client);
@@ -173,6 +175,40 @@ test("canonical guardrail matches sensitive keys regardless of case style", { sk
   }
 });
 
+test("every canonical record carries an opaque identifier", { skip: !databaseUrl }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    await applyMigrations(client, migrationsDir);
+    // 0001 constrained only users.id and trips.id; the shape now holds across
+    // the schema, including the identifiers that cross the API/worker boundary.
+    await assert.rejects(client.query("INSERT INTO control_plane.trips(id,slug,lifecycle_state) VALUES ('nope','japan-demo','draft')"));
+    await client.query("INSERT INTO control_plane.trips(id,slug,lifecycle_state) VALUES ('trip_abcdefgh','japan-demo','draft')");
+    await assert.rejects(client.query(
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status) VALUES ('short','trip_abcdefgh','provision',$1,'draft')",
+      [`sha256:${"3".repeat(64)}`],
+    ));
+    await client.query(
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status) VALUES ('plan_abcdefgh','trip_abcdefgh','provision',$1,'approved')",
+      [`sha256:${"4".repeat(64)}`],
+    );
+    await assert.rejects(client.query(
+      "INSERT INTO control_plane.jobs(id,trip_id,plan_id,job_type,idempotency_key,correlation_id,state) VALUES ('job_abcdefgh','trip_abcdefgh','plan_abcdefgh','provision','opaque-v1','not-opaque','queued')",
+    ));
+    await client.query(
+      "INSERT INTO control_plane.jobs(id,trip_id,plan_id,job_type,idempotency_key,correlation_id,state) VALUES ('job_abcdefgh','trip_abcdefgh','plan_abcdefgh','provision','opaque-v2','corr_abcdefgh','queued')",
+    );
+    await assert.rejects(client.query(
+      "INSERT INTO control_plane.audit_events(id,actor_ref,action,target_ref,correlation_id,occurred_at) VALUES ('audit_abcdefgh','user_abcdefgh','test.recorded','trip_abcdefgh','bare',now())",
+    ));
+  } finally {
+    await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
 test("canonical guardrail is enforced by the table constraints it backs", { skip: !databaseUrl }, async () => {
   const pool = new pg.Pool({ connectionString: databaseUrl });
   const client = await pool.connect();
@@ -185,7 +221,7 @@ test("canonical guardrail is enforced by the table constraints it backs", { skip
       [`sha256:${"f".repeat(64)}`, JSON.stringify({ accessToken: "ghp_RAWSECRET123" })],
     ));
     await assert.rejects(client.query(
-      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_fakeref','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
+      "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_fakeref01','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
       [`sha256:${"1".repeat(64)}`, JSON.stringify({ db_secret_ref: "postgresql://u:PASSWORD@h/db" })],
     ));
     await client.query(

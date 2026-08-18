@@ -4,6 +4,11 @@ import { z } from "zod";
 const secretReference = z.string().regex(
   /^(?:env:\/\/[A-Z][A-Z0-9_]*|(?:file|vault):\/\/[A-Za-z0-9_./-]+)$/,
   "must be an opaque env://, file://, or vault:// secret reference",
+).refine(
+  // The character class above allows dots, so file://../../etc/passwd would
+  // otherwise satisfy it.
+  (value) => !value.slice(value.indexOf("://") + 3).split("/").includes(".."),
+  "secret reference must not traverse parent directories",
 );
 
 const privateHost = z.enum(["127.0.0.1", "::1"]);
