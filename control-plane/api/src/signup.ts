@@ -3,7 +3,6 @@ import type pg from "pg";
 import { signApprovalAction, verifyApprovalAction } from "./approval-action.js";
 import type { VerifiedTelegramIdentity } from "./identity.js";
 import { structuredLog } from "./redaction.js";
-import { canTransitionTrip } from "./lifecycle.js";
 
 // hex gives 32 lowercase alphanumeric chars, satisfying [A-Za-z0-9]{8,64}
 function generateId(prefix: string): string {
@@ -26,7 +25,7 @@ export interface SignupConfig {
   actionSecret: string;
   actionTtlSeconds: number;
   messagingAdapter: string;
-  /** Seconds the user must wait after rejection before re-requesting. */
+  /** Seconds the user must wait after the most recent rejection before re-requesting. */
   signupRateLimitCooldownSeconds: number;
 }
 
@@ -47,12 +46,16 @@ export type CallbackResult =
 /**
  * Finds or creates a signup approval request for the verified identity.
  *
- * - If a pending (non-expired) request already exists: returns it without
- *   sending a new notification (no fan-out).
- * - If no request exists or the previous one has expired: creates a new
- *   request, inserts an outbox row in the same transaction, then notifies
- *   after commit.
- * - Cooldown after rejection prevents re-attempts within the configured window.
+ * State precedence:
+ *  1. Already approved → return approved (idempotent)
+ *  2. Pending + not expired → reuse without re-notifying (idempotent)
+ *  3. Pending + expired → expire the old row, fall through to create a new one
+ *  4. Recently rejected (within cooldown) → return declined
+ *  5. No active request / cooldown elapsed → create new request + outbox row
+ *
+ * Old rows (rejected/expired) are NEVER deleted — notification_outbox holds a
+ * plain FK to them.  Partial unique indexes on the table enforce "at most one
+ * pending" and "at most one approved" per user without touching history rows.
  */
 export async function startSignup(
   db: pg.Pool,
@@ -66,7 +69,7 @@ export async function startSignup(
   try {
     await client.query("BEGIN");
 
-    // 1. Resolve or create user
+    // 1. Resolve or create the system user for this Telegram identity
     const identityRow = await client.query<{ user_id: string }>(
       "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
       ["telegram", identity.providerSubjectDigest],
@@ -86,64 +89,62 @@ export async function startSignup(
       );
     }
 
-    // 2. Check for an existing request
-    const existing = await client.query<{
-      id: string; state: string; trip_id: string | null; action_expires_at: Date | null; decided_at: Date | null;
-    }>(
-      "SELECT id, state, trip_id, action_expires_at, decided_at FROM control_plane.signup_approval_requests WHERE user_id = $1",
+    // 2a. Already approved? (partial unique index guarantees at most one)
+    const approvedRow = await client.query<{ id: string; trip_id: string | null }>(
+      "SELECT id, trip_id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'approved'",
       [userId],
     );
+    if (approvedRow.rows.length > 0) {
+      await client.query("ROLLBACK");
+      const r = approvedRow.rows[0];
+      return { status: "approved", tripId: r.trip_id ?? undefined, requestId: r.id };
+    }
 
-    if (existing.rows.length > 0) {
-      const row = existing.rows[0];
-
-      if (row.state === "approved") {
+    // 2b. Active pending request? (partial unique index guarantees at most one)
+    const pendingRow = await client.query<{ id: string; action_expires_at: Date | null }>(
+      "SELECT id, action_expires_at FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'pending'",
+      [userId],
+    );
+    if (pendingRow.rows.length > 0) {
+      const pr = pendingRow.rows[0];
+      const tokenExpired = pr.action_expires_at !== null && pr.action_expires_at.getTime() < Date.now();
+      if (!tokenExpired) {
+        // Reuse — do not send a second notification
         await client.query("ROLLBACK");
-        return { status: "approved", tripId: row.trip_id ?? undefined, requestId: row.id };
+        log(structuredLog("info", "signup.reused_pending", { request_id: pr.id }));
+        return { status: "awaiting_approval", requestId: pr.id };
       }
+      // Transition to 'expired' so the partial unique index frees the 'pending'
+      // slot for the new request.  The row and its outbox child are preserved.
+      await client.query(
+        "UPDATE control_plane.signup_approval_requests SET state = 'expired', decided_at = now(), updated_at = now() WHERE id = $1",
+        [pr.id],
+      );
+      await client.query(
+        "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE signup_request_id = $1 AND state IN ('pending', 'failed')",
+        [pr.id],
+      );
+      // Fall through to create a new pending request
+    }
 
-      if (row.state === "rejected") {
-        // Enforce cooldown: if decision was recent, block re-attempt
-        const decidedAt = row.decided_at ? row.decided_at.getTime() : 0;
-        const cooldownMs = config.signupRateLimitCooldownSeconds * 1000;
-        if (Date.now() - decidedAt < cooldownMs) {
+    // 2c. Rate limit: check most recent rejection (there may be several historical rows)
+    if (config.signupRateLimitCooldownSeconds > 0) {
+      const recentRejection = await client.query<{ decided_at: Date }>(
+        `SELECT decided_at FROM control_plane.signup_approval_requests
+         WHERE user_id = $1 AND state = 'rejected'
+         ORDER BY decided_at DESC NULLS LAST LIMIT 1`,
+        [userId],
+      );
+      if (recentRejection.rows.length > 0) {
+        const decidedMs = recentRejection.rows[0].decided_at.getTime();
+        if (Date.now() - decidedMs < config.signupRateLimitCooldownSeconds * 1000) {
           await client.query("ROLLBACK");
-          return { status: "declined", requestId: row.id };
+          return { status: "declined" };
         }
-        // Cooldown passed — fall through to create a new request
-        await client.query(
-          "DELETE FROM control_plane.signup_approval_requests WHERE id = $1",
-          [row.id],
-        );
-      } else if (row.state === "pending") {
-        const expired = row.action_expires_at && row.action_expires_at.getTime() < Date.now();
-        if (!expired) {
-          // Active pending request: reuse without sending a new notification
-          await client.query("ROLLBACK");
-          log(structuredLog("info", "signup.reused_pending", { request_id: row.id }));
-          return { status: "awaiting_approval", requestId: row.id };
-        }
-        // Token expired while still pending — mark expired and allow a new attempt
-        await client.query(
-          "UPDATE control_plane.signup_approval_requests SET state = 'expired', decided_at = now(), updated_at = now() WHERE id = $1",
-          [row.id],
-        );
-        await client.query(
-          "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE signup_request_id = $1 AND state = 'pending'",
-          [row.id],
-        );
-        // Remove the decided row so the UNIQUE(user_id) constraint allows a new insert.
-        // The history of the expired request is preserved via its decided_at timestamp.
-        // We keep the row for audit trail — UNIQUE constraint only blocks inserts when
-        // a row already exists, regardless of state, so we must DELETE or use UPSERT.
-        await client.query(
-          "DELETE FROM control_plane.signup_approval_requests WHERE id = $1",
-          [row.id],
-        );
       }
     }
 
-    // 3. Create new request + outbox row in one transaction
+    // 3. Create a new pending request + outbox row in one transaction
     const requestId = generateId("sreq");
     const nowMs = Date.now();
     const approveToken = signApprovalAction(requestId, "approve", config.actionSecret, {
@@ -167,7 +168,7 @@ export async function startSignup(
 
     await client.query("COMMIT");
 
-    // 4. Send notification after commit (best-effort)
+    // 4. Send notification after commit (best-effort; failure preserved in outbox)
     try {
       await notification.sendApprovalRequest({
         requestId,
@@ -215,12 +216,10 @@ export async function processApprovalCallback(
   senderSubjectDigest: string,
   config: SignupConfig,
 ): Promise<CallbackResult> {
-  // 1. Verify sender is the configured super-admin
   if (senderSubjectDigest !== config.superAdminSubjectDigest) {
     return { outcome: "error", reason: "WRONG_SENDER" };
   }
 
-  // 2. Verify token signature and expiry
   const verification = verifyApprovalAction(token, config.actionSecret);
   if (!verification.valid) {
     return {
@@ -234,10 +233,8 @@ export async function processApprovalCallback(
   try {
     await client.query("BEGIN");
 
-    // 3. Load request with a row-level lock (prevents concurrent callbacks)
-    const row = await client.query<{
-      id: string; user_id: string; state: string; trip_id: string | null;
-    }>(
+    // Row-level lock prevents two concurrent callbacks from both seeing 'pending'
+    const row = await client.query<{ id: string; user_id: string; state: string; trip_id: string | null }>(
       "SELECT id, user_id, state, trip_id FROM control_plane.signup_approval_requests WHERE id = $1 FOR UPDATE",
       [requestId],
     );
@@ -254,9 +251,8 @@ export async function processApprovalCallback(
     }
 
     if (action === "approve") {
-      // Create draft trip + membership atomically with the approval
       const tripId = generateId("trip");
-      // slug must match ^[a-z0-9]+(-[a-z0-9]+)*$ — replace underscore separators with dashes
+      // slug must match ^[a-z0-9]+(-[a-z0-9]+)*$ — underscores → dashes
       const slug = `draft-${requestId.replace(/_/g, "-")}`;
       await client.query(
         "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
@@ -291,8 +287,9 @@ export async function processApprovalCallback(
 }
 
 /**
- * Returns the public-facing status for a user identified by their
- * provider subject digest. Enforces: a user can only read their own status.
+ * Returns the public-facing status for a user identified by their provider
+ * subject digest.  With multiple historical rows per user, priority is:
+ * approved > pending > most-recently-decided (rejected/expired).
  */
 export async function getSignupStatus(
   db: pg.Pool,
@@ -303,20 +300,35 @@ export async function getSignupStatus(
     [providerSubjectDigest],
   );
   if (identity.rows.length === 0) return { status: "not_found" };
-
   const userId = identity.rows[0].user_id;
-  const req = await db.query<{ id: string; state: string; trip_id: string | null }>(
-    "SELECT id, state, trip_id FROM control_plane.signup_approval_requests WHERE user_id = $1",
+
+  // Approved row (at most one, enforced by partial unique index)
+  const approved = await db.query<{ id: string; trip_id: string | null }>(
+    "SELECT id, trip_id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'approved'",
     [userId],
   );
-  if (req.rows.length === 0) return { status: "not_found" };
-
-  const row = req.rows[0];
-  if (row.state === "approved") {
-    return { status: "approved", tripId: row.trip_id ?? undefined, requestId: row.id };
+  if (approved.rows.length > 0) {
+    const r = approved.rows[0];
+    return { status: "approved", tripId: r.trip_id ?? undefined, requestId: r.id };
   }
-  if (row.state === "pending") return { status: "awaiting_approval", requestId: row.id };
-  return { status: "declined", requestId: row.id };
+
+  // Pending row (at most one, enforced by partial unique index)
+  const pending = await db.query<{ id: string }>(
+    "SELECT id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'pending'",
+    [userId],
+  );
+  if (pending.rows.length > 0) {
+    return { status: "awaiting_approval", requestId: pending.rows[0].id };
+  }
+
+  // Any historical row at all?
+  const any = await db.query<{ id: string }>(
+    "SELECT id FROM control_plane.signup_approval_requests WHERE user_id = $1 LIMIT 1",
+    [userId],
+  );
+  if (any.rows.length === 0) return { status: "not_found" };
+
+  return { status: "declined" };
 }
 
 /**

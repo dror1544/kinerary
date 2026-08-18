@@ -585,6 +585,119 @@ test("GET /v1/signup/status reflects current state without starting a new reques
   }
 });
 
+test("rejected request FK integrity: re-signup after cooldown preserves old rows", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    // testConfig has signupRateLimitCooldownSeconds: 0, so no cooldown block
+    const identity = makeIdentity("200000011");
+
+    const r1 = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
+    assert.ok(r1.requestId);
+    const firstRequestId = r1.requestId!;
+
+    // Reject the request
+    const { token } = signApprovalAction(firstRequestId, "reject", ACTION_SECRET);
+    const rejection = await processApprovalCallback(pool, token, SUPER_ADMIN_DIGEST, testConfig);
+    assert.equal(rejection.outcome, "rejected");
+
+    // Old request row and outbox row still intact
+    const oldReq = await pool.query("SELECT state FROM control_plane.signup_approval_requests WHERE id = $1", [firstRequestId]);
+    assert.equal(oldReq.rows[0].state, "rejected");
+    const oldOutbox = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox WHERE signup_request_id = $1", [firstRequestId]);
+    assert.equal(oldOutbox.rows[0].c, 1);
+
+    // Re-signup with cooldown=0 (always allowed): must not throw FK violation
+    const r2 = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
+    assert.equal(r2.status, "awaiting_approval");
+    assert.ok(r2.requestId);
+    assert.notEqual(r2.requestId, firstRequestId);
+
+    // Old rows preserved after re-signup (FK integrity)
+    const stillOldReq = await pool.query("SELECT state FROM control_plane.signup_approval_requests WHERE id = $1", [firstRequestId]);
+    assert.equal(stillOldReq.rows[0].state, "rejected");
+    const stillOldOutbox = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox WHERE signup_request_id = $1", [firstRequestId]);
+    assert.equal(stillOldOutbox.rows[0].c, 1);
+
+    // Two requests and two outbox rows total
+    const totalRequests = await pool.query("SELECT count(*)::int AS c FROM control_plane.signup_approval_requests");
+    assert.equal(totalRequests.rows[0].c, 2);
+    const totalOutbox = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox");
+    assert.equal(totalOutbox.rows[0].c, 2);
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("expired pending request FK integrity: re-signup after expiry preserves old rows", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    // Use a failing notification so the first outbox row ends up in 'failed' state,
+    // verifying that both 'pending' and 'failed' outbox rows are transitioned to 'skipped'
+    // when the pending request expires and is superseded.
+    const failing = new FailingNotification();
+    const identity = makeIdentity("200000012");
+
+    const r1 = await startSignup(pool, identity, "Japan 2025", testConfig, failing);
+    assert.ok(r1.requestId);
+    const firstRequestId = r1.requestId!;
+
+    // Outbox is in 'failed' state (notification was not delivered)
+    const firstOutbox = await pool.query("SELECT state FROM control_plane.notification_outbox WHERE signup_request_id = $1", [firstRequestId]);
+    assert.equal(firstOutbox.rows[0].state, "failed");
+
+    // Force the action token to appear expired by backdating action_expires_at
+    await pool.query(
+      "UPDATE control_plane.signup_approval_requests SET action_expires_at = now() - interval '1 hour' WHERE id = $1",
+      [firstRequestId],
+    );
+
+    // Re-signup: expired pending → new request; must not throw FK violation
+    const capturing = new CapturingNotification();
+    const r2 = await startSignup(pool, identity, "Japan 2025", testConfig, capturing);
+    assert.equal(r2.status, "awaiting_approval");
+    assert.ok(r2.requestId);
+    assert.notEqual(r2.requestId, firstRequestId);
+
+    // Old request transitioned to 'expired' (not deleted)
+    const oldReq = await pool.query("SELECT state FROM control_plane.signup_approval_requests WHERE id = $1", [firstRequestId]);
+    assert.equal(oldReq.rows[0].state, "expired");
+
+    // Old outbox transitioned from 'failed' → 'skipped' (not deleted)
+    const oldOutboxAfter = await pool.query("SELECT state FROM control_plane.notification_outbox WHERE signup_request_id = $1", [firstRequestId]);
+    assert.equal(oldOutboxAfter.rows[0].state, "skipped");
+
+    // New request is pending; new notification was sent
+    const newReq = await pool.query("SELECT state FROM control_plane.signup_approval_requests WHERE id = $1", [r2.requestId]);
+    assert.equal(newReq.rows[0].state, "pending");
+    assert.equal(capturing.calls.length, 1);
+
+    // Two requests and two outbox rows total
+    const totalRequests = await pool.query("SELECT count(*)::int AS c FROM control_plane.signup_approval_requests");
+    assert.equal(totalRequests.rows[0].c, 2);
+    const totalOutbox = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox");
+    assert.equal(totalOutbox.rows[0].c, 2);
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
 test("POST /v1/signup without signup config returns 503", async () => {
   const profile = validateArchitectureProfile({
     version: 1,
