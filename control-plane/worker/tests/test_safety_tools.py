@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import ssl
 from tempfile import TemporaryDirectory
 import unittest
 
+from control_plane_worker.__main__ import safe_failure_message
 from control_plane_worker.cleanup import (
     UnsafeCleanupError,
     load_test_resource_name_prefix,
     select_test_resources,
 )
-from control_plane_worker.inventory import ProxmoxInventory
+from control_plane_worker.inventory import ProxmoxHttpTransport, ProxmoxInventory
 
 
 class FakeTransport:
@@ -31,6 +33,31 @@ class SafetyToolTests(unittest.TestCase):
             "/api2/json/nodes/test-node/storage",
         ], transport.paths)
         self.assertNotIn("ignored_secret", str(result))
+
+    def test_transport_pins_https_and_keeps_verification_on(self) -> None:
+        # PROXMOX_URL is operator-supplied, so urlopen must never be reachable
+        # by a local handler or an unencrypted scheme.
+        for unsafe in ("file:///etc/passwd", "http://proxmox.example", "ftp://proxmox.example", "/api2/json"):
+            with self.assertRaises(ValueError):
+                ProxmoxHttpTransport(unsafe, "PVEAPIToken=id=secret")
+        transport = ProxmoxHttpTransport("https://proxmox.example/", "PVEAPIToken=id=secret")
+        self.assertEqual("https://proxmox.example", transport.base_url)
+        self.assertTrue(transport.context.check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, transport.context.verify_mode)
+
+    def test_driver_failures_are_reported_without_the_connection_string(self) -> None:
+        class FakeDriverError(Exception):
+            sqlstate = "08006"
+
+        leaky = "connection to postgresql://kinerary:SUPERSECRET@10.0.0.5:5432/db failed"
+        classified = safe_failure_message(FakeDriverError(leaky))
+        self.assertNotIn("SUPERSECRET", classified)
+        self.assertIn("FakeDriverError", classified)
+        self.assertIn("08006", classified)
+
+        unclassified = safe_failure_message(RuntimeError(leaky))
+        self.assertNotIn("SUPERSECRET", unclassified)
+        self.assertIn("RuntimeError", unclassified)
 
     def test_cleanup_selects_only_the_exact_labelled_test_run(self) -> None:
         resources = [

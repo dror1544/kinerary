@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 
 from .cleanup import UnsafeCleanupError, load_test_resource_name_prefix, select_test_resources
 from .inventory import ProxmoxHttpTransport, ProxmoxInventory
@@ -15,6 +16,19 @@ def _required_env(name: str) -> str:
     if not value:
         raise ValueError(f"environment variable {name} is required")
     return value
+
+
+def safe_failure_message(exc: BaseException) -> str:
+    """Describe an unexpected failure without echoing driver text.
+
+    Database drivers embed the connection string, password included, in both
+    ``str(exc)`` and the traceback, so neither may reach stderr. The exception
+    class and SQLSTATE are enough to act on and cannot carry a credential.
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
+        return f"{type(exc).__name__} (sqlstate {sqlstate})"
+    return f"{type(exc).__name__}: operation failed, details suppressed"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "inventory":
             authorization = "PVEAPIToken=" + _required_env("PROXMOX_TOKEN_ID") + "=" + _required_env("PROXMOX_TOKEN_SECRET")
-            transport = ProxmoxHttpTransport(_required_env("PROXMOX_URL"), authorization)
+            transport = ProxmoxHttpTransport(
+                _required_env("PROXMOX_URL"), authorization, os.environ.get("PROXMOX_CA_BUNDLE")
+            )
             print(json.dumps(ProxmoxInventory(transport, args.node).inspect(), indent=2, sort_keys=True))
             return 0
         if not args.architecture_profile:
@@ -60,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (OSError, ValueError, UnsafeCleanupError, json.JSONDecodeError) as exc:
         parser.error(str(exc))
+    except Exception as exc:  # psycopg and any other driver land here
+        parser.error(safe_failure_message(exc))
 
 
 if __name__ == "__main__":
