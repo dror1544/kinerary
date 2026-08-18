@@ -46,6 +46,19 @@ rm -rf .claude/skills/create-trip
 ln -s ../../.agents/skills/create-trip .claude/skills/create-trip
 ```
 
+### Hermes skills deploy out of `.agents/skills/`, never back in
+
+`~/.hermes` is not version controlled. A skill edited directly in a profile has
+no history and is silently overwritten by the next install, so `.agents/skills/`
+is the source and the profile copy is a build artifact:
+```bash
+scripts/install-hermes-skill.sh <skill-name> <profile>            # deploy
+scripts/install-hermes-skill.sh <skill-name> <profile> --check    # report drift, exit 1
+```
+If you find content in a profile that is not in the repo, promote it into
+`.agents/skills/` rather than editing around it — that is how
+`trip-assistant-experience-evaluation` nearly lost its scoring notes.
+
 ## Two MCP servers — different trust levels
 
 | | `mcp/mcp.js` | `mcp/provision.js` |

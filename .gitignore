@@ -23,8 +23,10 @@ site/*.ogg
 site/confirmations/
 scripts/__pycache__/
 
-# Design references — local only, not committed
-references/
+# Design references — local only, not committed.
+# Anchored: unanchored this matched any references/ at any depth, and silently
+# swallowed .agents/skills/*/references/, which is committed skill content.
+/references/
 scripts/hermes-pipeline/.last-answers.json
 .venv-telegram-manager/
 provisioning/__pycache__/

@@ -1,24 +1,36 @@
 # Trip Assistant Experience Metrics — pointer
 
 **This document intentionally holds no requirements.** The metrics that decide
-whether the trip assistant is actually creating value are defined by the Hermes
-skill, which is the single source of truth:
+whether the trip assistant is actually creating value are defined by the skill:
 
 ```
-skill: trip-assistant-experience-evaluation
-path:  ~/.hermes/profiles/<profile>/skills/travel/trip-assistant-experience-evaluation/
-       SKILL.md                          scorecard, evaluation workflow, dimension details
-       references/control-plan-metrics.md  weighted model, ownership, control loop, events
+.agents/skills/trip-assistant-experience-evaluation/
+  SKILL.md                            scorecard, evaluation workflow, dimension details
+  references/control-plan-metrics.md  weighted model, ownership, control loop, events
 ```
 
-Find it by skill name rather than by path — the profile segment varies, and at
-the time of writing only the `shiranusa2026` profile carries it.
+That directory is the source of truth. Read it before implementing anything in
+this area, and do not restate its scoring model, weights or thresholds here or
+in the sprint plan — a second copy is how the last drift started, and this file
+exists to avoid one.
 
-Read that skill before implementing anything in this area. Do not restate its
-scoring model, weights or thresholds here or in the sprint plan: a second copy
-is how the last drift started, and this file exists specifically to avoid one.
+## Deployment to Hermes profiles
 
-## What it covers
+The skill runs inside a Hermes profile, but the profile copy is a **deployment
+artifact**, not the original:
+
+```bash
+scripts/install-hermes-skill.sh trip-assistant-experience-evaluation <profile>
+scripts/install-hermes-skill.sh trip-assistant-experience-evaluation <profile> --check
+```
+
+Edit the repo and re-install. Never edit
+`~/.hermes/profiles/<profile>/skills/travel/…` directly: `~/.hermes` is not
+version controlled, so an edit made there has no history and is silently
+overwritten by the next install. `--check` reports drift without changing
+anything.
+
+## What the skill covers
 
 Enough to know whether you need it, not enough to work from:
 
@@ -29,7 +41,9 @@ Enough to know whether you need it, not enough to work from:
 - the missing-information control loop, turning a gap found while answering
   into a focused organizer request;
 - a daily control-plan report and an evaluation rubric;
-- outcome event types and the rates derived from them.
+- outcome event types and the rates derived from them;
+- scoring notes naming the traps that produce a flattering score for a service
+  travelers did not actually receive.
 
 ## Relationship to the analytics design
 
@@ -49,11 +63,3 @@ Scheduled across two sprints in `onboarding-mvp-sprint-plan.md`: Sprint 6 takes
 the outcome events, the daily report and the control loop alongside the
 dashboard; Sprint 7 takes the weighted scoring and repeated-question reduction
 with reviewed learning.
-
-## Known risk
-
-The Hermes profile directory is **not version controlled** — no history, no
-branch, no backup through git — and lives on one machine in one profile. If the
-skill is missing when Sprint 6 begins, that is this risk landing, not an
-oversight. Preserving or versioning it is a deliberate open decision; see the
-carried-forward items on the control-plane integration PR.
