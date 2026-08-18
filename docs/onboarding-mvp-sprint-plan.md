@@ -402,6 +402,24 @@ Build:
 - Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
+- Emit the assistant-experience **outcome** events defined in
+  `trip-assistant-experience-metrics.md` — grounded, partial and
+  missing-data answers, unanswered group mentions, organizer follow-up
+  requested/answered, post-write verification passed/failed — inside the base
+  event schema in `trip-bot-analytics-and-metrics-design.md` §5, not as a
+  second vocabulary. Derive response rate, grounded-answer rate, missing-data
+  rate, traveler self-service rate and post-write trust rate from them, grouped
+  by trip, phase, day, channel, user role and topic so a quality problem can be
+  attributed to platform reliability, website data gaps, organizer workflow
+  friction or assistant behaviour.
+- Add the daily control-plan report to the dashboard: usage, value delivered,
+  information quality, learning and enrichment, and organizer enablement —
+  including the top missing items to request and the traveler value each one
+  unlocks.
+- Implement the missing-information control loop: detect a missing fact while
+  answering, convert it into a focused organizer request naming the smallest
+  artifact that unlocks the most value, and track whether the request was
+  fulfilled.
 
 Automated tests:
 
@@ -409,6 +427,9 @@ Automated tests:
 - activation approval replay/expiry and failed ingress verification leave the
   route unpublished and state non-active;
 - health/analytics events are tenant-scoped, bounded and transcript-free;
+- the daily report and every derived rate are computed from recorded bounded
+  events, never from sampled transcript text, and a trip with no traffic
+  renders an empty report rather than a divide-by-zero or a fabricated rate;
 - restart reconciliation, suspend/retry authorization, upgrade compatibility
   and compatible rollback use the recorded release/data checkpoint;
 - full sandbox E2E executes the demo script below using fakes, then a selected
@@ -460,11 +481,30 @@ Build:
   Approved trip-local facts may update that trip's knowledge; cross-trip reuse
   requires a separate consent/provenance policy and is deferred from automatic
   behavior.
+- Score the completed trip against the six weighted dimensions in
+  `trip-assistant-experience-metrics.md` — availability, website
+  data completeness, accuracy and cross-channel consistency, operational value,
+  group experience, and learning/enrichment — producing the 1–5 top-level score
+  from the documented weights. Each row carries the evidence behind it, an owner
+  and the next improvement.
+- Attribute every dimension to what the system controlled, what the organizer
+  controlled and what travellers experienced, per the skill's Core Principle. A
+  score must not blame the platform for an artifact the organizer never
+  supplied, nor credit it for one the organizer supplied unprompted.
+- Measure repeated-question reduction across the trip: once a fact, link or
+  document enters the source of truth, the rate of the questions it answers
+  should fall. This is the enrichment loop's outcome measure and needs the
+  Sprint 6 outcome events to compute.
 
 Automated tests:
 
 - completed-trip mutation fails through both direct API and agent gateway;
   selecting/unarchiving it permits read-only access only;
+- a configured-but-undelivering assistant cannot score well on availability,
+  and an answer that explains missing data the system should have held is not
+  scored as accurate; a dimension the organizer owns does not lower the
+  platform's score; repeated-question reduction is computed from recorded
+  events and is absent, not zero, when the trip has too little traffic;
 - organizer memory never crosses into a group response, and an old preference
   or traveler is not copied into a new draft without confirmation;
 - debrief enrollment is scoped to a completed trip and authorized organizer;
