@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies } from "./app.js";
+import { buildApp, type SignupDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -48,23 +48,9 @@ if (profile.signup) {
   };
 }
 
-// Sprint 2: interview is active whenever signup is configured. The enrollment
-// TTL comes from the signup block; a separate interview block in the profile
-// would be added if the TTL ever needs to be tuned independently.
-let interview: InterviewDependencies | undefined;
-if (profile.signup) {
-  interview = {
-    db: pool,
-    config: {
-      enrollmentTtlSeconds: profile.signup.enrollment_ttl_seconds ?? 86400,
-    },
-  };
-}
-
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
   signup,
-  interview,
 });
 await app.listen({ host: profile.public_api.bind_host, port: profile.public_api.port });
