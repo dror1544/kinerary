@@ -217,4 +217,30 @@ describe("enrollment", () => {
       await teardownFixture(fix);
     }
   });
+
+  test("issueEnrollment: expired enrollment does not block re-issue", { skip: SKIP }, async () => {
+    // An enrollment issued with ttl=-1 expires immediately. A second issue must
+    // succeed rather than returning ACTIVE_ENROLLMENT_EXISTS, because the expiry
+    // cleanup step transitions the old row to 'expired' before inserting the new one.
+    const fix = await setupFixture(pool);
+    try {
+      const expired = await issueEnrollment(fix.pool, fix.ownerId, fix.draftTripId, { enrollmentTtlSeconds: -1 });
+      assert.equal(expired.ok, true);
+
+      const fresh = await issueEnrollment(fix.pool, fix.ownerId, fix.draftTripId, { enrollmentTtlSeconds: 3600 });
+      assert.equal(fresh.ok, true);
+      if (!fresh.ok) throw new Error("unreachable");
+      assert.ok(fresh.expiresAt > new Date());
+
+      // Old enrollment is now 'expired' in the DB
+      if (!expired.ok) throw new Error("unreachable");
+      const oldRow = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.interview_enrollments WHERE token_digest = $1",
+        [`sha256:${(await import("node:crypto")).createHash("sha256").update(expired.token).digest("hex")}`],
+      );
+      assert.equal(oldRow.rows[0]?.state, "expired");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
 });

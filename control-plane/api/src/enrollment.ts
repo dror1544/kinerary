@@ -66,28 +66,37 @@ export async function issueEnrollment(
       return { ok: false, reason: "TRIP_NOT_DRAFT" };
     }
 
-    // Reject if there is already an active ('issued') enrollment for this trip.
-    const existing = await client.query<{ id: string }>(
-      "SELECT id FROM control_plane.interview_enrollments WHERE trip_id = $1 AND state = 'issued'",
+    // Expire any issued enrollments for this trip that are past their deadline.
+    // Without this step, a single expired enrollment would block re-issue forever
+    // because the partial unique index (0009) prevents two 'issued' rows per trip.
+    await client.query(
+      "UPDATE control_plane.interview_enrollments SET state = 'expired' WHERE trip_id = $1 AND state = 'issued' AND expires_at < now()",
       [tripId],
     );
-    if (existing.rows.length > 0) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "ACTIVE_ENROLLMENT_EXISTS" };
-    }
 
-    // Generate token. The raw token is returned to the caller; only its digest
-    // is stored so the database does not become a token oracle.
+    // Generate token before the INSERT so that a unique-violation rollback does
+    // not cause us to waste a DB round-trip generating a token we can't use.
     const rawToken = randomBytes(32).toString("base64url");
     const digest = tokenDigest(rawToken);
     const expiresAt = new Date(Date.now() + config.enrollmentTtlSeconds * 1000);
     const enrollmentId = generateId("enrl");
 
-    await client.query(
-      `INSERT INTO control_plane.interview_enrollments(id, trip_id, user_id, token_digest, state, expires_at)
-       VALUES ($1, $2, $3, $4, 'issued', $5)`,
-      [enrollmentId, tripId, userId, digest, expiresAt],
-    );
+    try {
+      await client.query(
+        `INSERT INTO control_plane.interview_enrollments(id, trip_id, user_id, token_digest, state, expires_at)
+         VALUES ($1, $2, $3, $4, 'issued', $5)`,
+        [enrollmentId, tripId, userId, digest, expiresAt],
+      );
+    } catch (err) {
+      // SQLSTATE 23505 = unique_violation — the partial unique index on (trip_id)
+      // WHERE state = 'issued' fired, meaning a concurrent call won the race.
+      const code = (err as { code?: unknown }).code;
+      if (code === "23505") {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "ACTIVE_ENROLLMENT_EXISTS" };
+      }
+      throw err;
+    }
 
     await client.query("COMMIT");
 

@@ -86,7 +86,23 @@ describe("validateAnswer (unit)", () => {
     assert.equal(result.answer.text, "Japan");
   });
 
-  test("text question: empty string accepted (optional questions can be skipped)", () => {
+  test("required text question: blank input rejected with TEXT_REQUIRED", () => {
+    // 'destination' is required; blank text must not advance the session
+    const result = validateAnswer("destination", "", null);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "TEXT_REQUIRED");
+  });
+
+  test("required text question: whitespace-only input rejected with TEXT_REQUIRED", () => {
+    const result = validateAnswer("destination", "   ", null);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "TEXT_REQUIRED");
+  });
+
+  test("optional text question: empty string accepted (can be skipped)", () => {
+    // 'trip_interests' is optional; skipping with "" is intentional
     const result = validateAnswer("trip_interests", "", null);
     assert.equal(result.ok, true);
   });
@@ -673,6 +689,60 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       const serialized = JSON.stringify(statusResult);
       assert.ok(!serialized.includes("secret family details"), "status must not leak answer text");
       assert.ok(!serialized.includes("Hidden destination"), "status must not leak answer text");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("submitAnswer: required text question with blank input rejected", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      // 'destination' is required; blank must not become a confirmed answer
+      const result = await submitAnswer(fix.pool, started.sessionToken, "destination", "");
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "TEXT_REQUIRED");
+
+      // Whitespace-only is also rejected
+      const wsResult = await submitAnswer(fix.pool, started.sessionToken, "destination", "   ");
+      assert.equal(wsResult.ok, false);
+      if (wsResult.ok) throw new Error("unreachable");
+      assert.equal(wsResult.reason, "TEXT_REQUIRED");
+
+      // Session did not advance: destination is still unanswered
+      const row = await fix.pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [started.sessionId],
+      );
+      assert.equal(row.rows[0]?.answers?.["destination"], undefined);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirmIntake: returns sessionId so callers can verify path match", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+      const { sessionToken, sessionId } = started;
+
+      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
+      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
+      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
+      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+
+      const result = await confirmIntake(fix.pool, sessionToken);
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("unreachable");
+      assert.equal(result.sessionId, sessionId);
     } finally {
       await teardownFixture(fix);
     }

@@ -126,7 +126,7 @@ export type AnswerStore = Record<string, IntakeAnswer>;
 
 export type AnswerValidationResult =
   | { ok: true; answer: IntakeAnswer }
-  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" };
+  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" };
 
 export function validateAnswer(
   questionId: string,
@@ -161,6 +161,7 @@ export function validateAnswer(
   // type === "text"
   const text = (optionId === null ? otherText : optionId) ?? "";
   const trimmed = text.trim();
+  if (question.required && trimmed.length === 0) return { ok: false, reason: "TEXT_REQUIRED" };
   const max = question.maxLength ?? 500;
   if (trimmed.length > max) return { ok: false, reason: "TEXT_TOO_LONG" };
   return {
@@ -255,10 +256,10 @@ export type GetSessionResult =
 
 export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "CHOICE_REQUIRED" };
+  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" };
 
 export type ConfirmIntakeResult =
-  | { ok: true; intakeVersionId: string; digest: string; versionNumber: number }
+  | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
   | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" };
 
 /**
@@ -492,7 +493,7 @@ export async function confirmIntake(
       await client.query("ROLLBACK");
       const [ver] = existing.rows;
       if (!ver) return { ok: false, reason: "NOT_FOUND" };
-      return { ok: true, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version };
+      return { ok: true, sessionId: session.id, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version };
     }
 
     // All required questions must be answered.
@@ -540,7 +541,7 @@ export async function confirmIntake(
       version: nextVersion,
     }));
 
-    return { ok: true, intakeVersionId: versionId, digest: intakeDigest, versionNumber: nextVersion };
+    return { ok: true, sessionId: session.id, intakeVersionId: versionId, digest: intakeDigest, versionNumber: nextVersion };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
     throw error;

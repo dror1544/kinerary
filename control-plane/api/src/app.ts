@@ -366,6 +366,10 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
     }
 
+    const params = request.params as Record<string, unknown>;
+    const sessionId = params?.sessionId;
+    if (typeof sessionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
     const authHeader = (request.headers as Record<string, unknown>)["authorization"];
     const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
       ? authHeader.slice(7) : null;
@@ -395,6 +399,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(status).send({ error: result.reason });
     }
 
+    // Verify path sessionId matches the token's session (prevents cross-session confusion).
+    if (result.view.sessionId !== sessionId) return reply.code(404).send({ error: "NOT_FOUND" });
+
     return reply.code(200).send({
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
@@ -409,6 +416,10 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
     }
 
+    const params = request.params as Record<string, unknown>;
+    const sessionId = params?.sessionId;
+    if (typeof sessionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
     const authHeader = (request.headers as Record<string, unknown>)["authorization"];
     const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
       ? authHeader.slice(7) : null;
@@ -420,6 +431,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       const status = result.reason === "NOT_FOUND" ? 404 : 422;
       return reply.code(status).send({ error: result.reason });
     }
+
+    // Verify path sessionId matches the token's session (prevents cross-session confusion).
+    if (result.sessionId !== sessionId) return reply.code(404).send({ error: "NOT_FOUND" });
 
     return reply.code(200).send({
       intakeVersionId: result.intakeVersionId,
