@@ -24,8 +24,15 @@ services:
       dockerfile: control-plane/api/Dockerfile
     command: ["node", "dist/migrate.js"]
     environment:
-      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+      # Resolves database.connection_secret_ref from the same profile the API
+      # uses, so both cannot end up pointed at different databases.
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
     secrets: [control_plane_database_url]
+    volumes:
+      - type: bind
+        source: ${CONTROL_PLANE_ARCHITECTURE_PROFILE_FILE:?set an external profile path}
+        target: /run/config/architecture.json
+        read_only: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,7 +45,8 @@ services:
       dockerfile: control-plane/api/Dockerfile
     environment:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
-      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+    # The secret is still mounted: the profile's file:// database reference
+    # resolves to this path.
     secrets: [control_plane_database_url]
     volumes:
       - type: bind

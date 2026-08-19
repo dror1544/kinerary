@@ -1,23 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
-import { createDatabasePool, readRequiredSecretFile } from "../src/database.js";
+import { createDatabasePool } from "../src/database.js";
 import { defaultMigrationsDirectory } from "../src/migrations.js";
 
-test("database credentials are read from a non-empty secret file", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-"));
-  const path = join(directory, "database-url");
-  try {
-    await writeFile(path, "postgresql://example.invalid/database\n", { mode: 0o600 });
-    assert.equal(await readRequiredSecretFile(path, "CONTROL_PLANE_DATABASE_URL"), "postgresql://example.invalid/database");
-    await writeFile(path, "\n", { mode: 0o600 });
-    await assert.rejects(readRequiredSecretFile(path, "CONTROL_PLANE_DATABASE_URL"), /is empty/);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+// Reading the database credential is no longer a database.ts concern: both
+// entrypoints resolve profile.database.connection_secret_ref through
+// resolveSecretRef, so the file case is covered by secrets.test.ts alongside
+// every other scheme rather than by a second, near-duplicate helper here.
 
 test("database pools consume idle client errors instead of crashing the process", async () => {
   let observed = 0;

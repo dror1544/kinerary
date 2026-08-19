@@ -1,12 +1,4 @@
-import { readFile } from "node:fs/promises";
 import pg from "pg";
-
-export async function readRequiredSecretFile(path: string | undefined, name: string): Promise<string> {
-  if (!path) throw new Error(`${name}_FILE is required`);
-  const value = (await readFile(path, "utf8")).trim();
-  if (!value) throw new Error(`${name}_FILE is empty`);
-  return value;
-}
 
 export function createDatabasePool(connectionString: string, onIdleError: () => void = () => {}): pg.Pool {
   const pool = new pg.Pool({ connectionString, max: 10, idleTimeoutMillis: 30_000 });

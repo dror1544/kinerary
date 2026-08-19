@@ -53,6 +53,19 @@ network in cleartext. Nothing is read from the environment unless a `vault://`
 reference is actually resolved, so an installation using only `env://` and
 `file://` needs no Vault at all.
 
+### Who resolves what
+
+The TypeScript entrypoints — the API (`src/server.ts`) and the migration job
+(`src/migrate.ts`) — resolve every reference in the profile they are given,
+including `database.connection_secret_ref`. Both are handed the same profile so
+they cannot end up pointed at different databases.
+
+The Python worker is the exception. It takes `CONTROL_PLANE_DATABASE_URL_FILE`,
+a plain path with no scheme, and has no resolver of its own — so a deployment
+whose database reference is `env://` or `vault://` must still supply that file
+to the worker separately. Only `file://` is consistent across all three
+processes today; giving the worker a resolver twin is tracked in PR #10.
+
 ## Tests
 
 Install API dependencies once, then run the unit/contract suites:

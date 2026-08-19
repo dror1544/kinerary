@@ -1,7 +1,7 @@
 import { buildApp, type SignupDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
-import { createDatabasePool, databaseReadiness, readRequiredSecretFile } from "./database.js";
+import { createDatabasePool, databaseReadiness } from "./database.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 
@@ -9,10 +9,11 @@ const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
 
 const profile = await loadArchitectureProfile(profilePath);
-const connectionString = await readRequiredSecretFile(
-  process.env.CONTROL_PLANE_DATABASE_URL_FILE,
-  "CONTROL_PLANE_DATABASE_URL",
-);
+// The profile is authoritative for the database too, not only for signup.
+// Reading CONTROL_PLANE_DATABASE_URL_FILE directly here would leave
+// database.connection_secret_ref validated but never resolved — an env:// or
+// vault:// value would pass validation and then be silently ignored.
+const connectionString = await resolveSecretRef(profile.database.connection_secret_ref);
 const pool = createDatabasePool(connectionString, () => {
   process.stderr.write(`${structuredLog("error", "database.pool_idle_error", {
     safe_error_code: "DATABASE_POOL_IDLE_ERROR",
