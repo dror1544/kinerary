@@ -390,6 +390,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       questionId,
       optionId as string | null,
       otherText as string | undefined,
+      sessionId,
     );
 
     if (!result.ok) {
@@ -398,9 +399,6 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
         : 400;
       return reply.code(status).send({ error: result.reason });
     }
-
-    // Verify path sessionId matches the token's session (prevents cross-session confusion).
-    if (result.view.sessionId !== sessionId) return reply.code(404).send({ error: "NOT_FOUND" });
 
     return reply.code(200).send({
       state: result.view.state,
@@ -425,15 +423,12 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       ? authHeader.slice(7) : null;
     if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
 
-    const result = await confirmIntake(dependencies.interview.db, rawToken, log);
+    const result = await confirmIntake(dependencies.interview.db, rawToken, log, sessionId);
 
     if (!result.ok) {
       const status = result.reason === "NOT_FOUND" ? 404 : 422;
       return reply.code(status).send({ error: result.reason });
     }
-
-    // Verify path sessionId matches the token's session (prevents cross-session confusion).
-    if (result.sessionId !== sessionId) return reply.code(404).send({ error: "NOT_FOUND" });
 
     return reply.code(200).send({
       intakeVersionId: result.intakeVersionId,

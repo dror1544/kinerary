@@ -401,6 +401,7 @@ export async function submitAnswer(
   questionId: string,
   optionId: string | "other" | null,
   otherText?: string,
+  expectedSessionId?: string,
 ): Promise<SubmitAnswerResult> {
   const digest = sessionTokenDigest(rawSessionToken);
   const client = await db.connect();
@@ -416,9 +417,9 @@ export async function submitAnswer(
     }>(
       `SELECT id, trip_id, user_id, state, answers
        FROM control_plane.intake_sessions
-       WHERE session_token_digest = $1
+       WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
        FOR UPDATE`,
-      [digest],
+      [digest, expectedSessionId ?? null],
     );
     const [session] = row.rows;
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
@@ -462,6 +463,7 @@ export async function confirmIntake(
   db: pg.Pool,
   rawSessionToken: string,
   log: (line: string) => void = () => {},
+  expectedSessionId?: string,
 ): Promise<ConfirmIntakeResult> {
   const digest = sessionTokenDigest(rawSessionToken);
   const client = await db.connect();
@@ -477,9 +479,9 @@ export async function confirmIntake(
     }>(
       `SELECT id, trip_id, user_id, state, answers
        FROM control_plane.intake_sessions
-       WHERE session_token_digest = $1
+       WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
        FOR UPDATE`,
-      [digest],
+      [digest, expectedSessionId ?? null],
     );
     const [session] = row.rows;
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }

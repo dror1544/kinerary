@@ -725,6 +725,68 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
     }
   });
 
+  test("submitAnswer: mismatched expectedSessionId returns NOT_FOUND without writing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      // Pass a sessionId that does not match the token's session.
+      const result = await submitAnswer(fix.pool, started.sessionToken, "trip_type", "family", undefined, "sess_wrongsessionid");
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "NOT_FOUND");
+
+      // The session must be unchanged — no answer was written.
+      const row = await fix.pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [started.sessionId],
+      );
+      assert.equal(row.rows[0]?.answers?.["trip_type"], undefined);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("confirmIntake: mismatched expectedSessionId returns NOT_FOUND without writing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+      const { sessionToken, sessionId } = started;
+
+      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
+      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
+      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
+      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+
+      // Pass the wrong sessionId — mismatch must prevent the confirm write.
+      const result = await confirmIntake(fix.pool, sessionToken, () => {}, "sess_wrongsessionid");
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "NOT_FOUND");
+
+      // No intake_versions row should exist, and session state must be unchanged.
+      const versionCount = await fix.pool.query<{ count: string }>(
+        "SELECT count(*) FROM control_plane.intake_versions WHERE trip_id = $1",
+        [fix.draftTripId],
+      );
+      assert.equal(versionCount.rows[0]?.count, "0");
+
+      const sessionRow = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.intake_sessions WHERE id = $1",
+        [sessionId],
+      );
+      assert.equal(sessionRow.rows[0]?.state, "awaiting_confirmation");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("confirmIntake: returns sessionId so callers can verify path match", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {
