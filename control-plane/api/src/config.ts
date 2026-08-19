@@ -2,8 +2,11 @@ import { readFile } from "node:fs/promises";
 import { z } from "zod";
 
 const secretReference = z.string().regex(
-  /^(?:env:\/\/[A-Z][A-Z0-9_]*|(?:file|vault):\/\/[A-Za-z0-9_./-]+)$/,
-  "must be an opaque env://, file://, or vault:// secret reference",
+  // vault:// carries a #field selector because a KV secret holds several
+  // pairs — without it the reference would not say which one it means, and
+  // "the only field" is not a property the schema can enforce.
+  /^(?:env:\/\/[A-Z][A-Z0-9_]*|file:\/\/[A-Za-z0-9_./-]+|vault:\/\/[A-Za-z0-9_./-]+#[A-Za-z0-9_.-]+)$/,
+  "must be an opaque env://, file://, or vault://<path>#<field> secret reference",
 ).refine(
   // The character class above allows dots, so file://../../etc/passwd would
   // otherwise satisfy it.

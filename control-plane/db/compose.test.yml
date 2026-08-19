@@ -12,6 +12,25 @@ services:
       retries: 30
     networks: [control_plane_private]
 
+  # Dev-mode Vault for the vault:// secret-reference tests. It keeps everything
+  # in memory and ships a fixed root token, so it is only ever safe as a test
+  # fixture. The port is published because the resolver refuses plain http
+  # except on loopback — the tests reach it at http://127.0.0.1:8200 from the
+  # host rather than over the internal network, which keeps the https pin
+  # intact for every deployed path.
+  vault:
+    image: hashicorp/vault:1.18
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: kinerary-test-root-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add: [IPC_LOCK]
+    ports: ["8200:8200"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   migration-tests:
     build:
       context: ../..

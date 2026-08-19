@@ -28,6 +28,9 @@ test("a secret reference cannot traverse out of its allocation", async () => {
     "file://../../etc/passwd",
     "file:///run/secrets/../../etc/shadow",
     "vault://kv/../../root",
+    // With a #field selector the reference satisfies the vault:// pattern, so
+    // the traversal refinement is the only thing rejecting it.
+    "vault://secret/data/../../sys/mounts#token",
   ]) {
     assert.throws(
       () => validateArchitectureProfile({ ...raw, database: { connection_secret_ref: traversal } }),
@@ -37,6 +40,23 @@ test("a secret reference cannot traverse out of its allocation", async () => {
   assert.doesNotThrow(() => validateArchitectureProfile({
     ...raw,
     database: { connection_secret_ref: "file:///run/secrets/control_plane_database_url" },
+  }));
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database#url" },
+  }));
+});
+
+test("a vault reference must name the field it means", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // A KV secret holds several pairs, so a bare path does not identify a value.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database" },
+  }));
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database#" },
   }));
 });
 
