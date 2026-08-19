@@ -24,5 +24,13 @@
     "enabled": true,
     "label_key": "kinerary.test_run_id",
     "allowed_name_prefix": "kinerary-test-local"
+  },
+  "signup": {
+    "telegram_bot_token_secret_ref": "env://CONTROL_PLANE_TELEGRAM_CREDS",
+    "super_admin_subject_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "action_secret_ref": "env://CONTROL_PLANE_APPROVAL_SIGNING_KEY",
+    "action_ttl_seconds": 3600,
+    "signup_rate_limit_cooldown_seconds": 3600,
+    "webhook_secret_ref": "env://CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET"
   }
 }

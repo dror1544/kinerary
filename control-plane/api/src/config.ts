@@ -43,6 +43,21 @@ export const architectureProfileSchema = z.object({
     }).strict(),
     z.object({ enabled: z.literal(false) }).strict(),
   ]),
+  signup: z.object({
+    telegram_bot_token_secret_ref: secretReference,
+    /** SHA256 digest of the super-admin's Telegram numeric ID — not the raw ID. */
+    super_admin_subject_digest: z.string().regex(
+      /^sha256:[a-f0-9]{64}$/,
+      "must be sha256:hex of the super-admin Telegram numeric ID",
+    ),
+    action_secret_ref: secretReference,
+    action_ttl_seconds: z.number().int().min(60).max(86400).default(3600),
+    signup_rate_limit_cooldown_seconds: z.number().int().min(0).max(86400).default(3600),
+    // Registered with Telegram via setWebhook's secret_token param. The
+    // callback route verifies this header instead of trusting a client-
+    // supplied sender identity — see identity.ts's verifyTelegramWebhookSecret.
+    webhook_secret_ref: secretReference,
+  }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.environment === "production" && profile.test_resources.enabled) {
     ctx.addIssue({ code: "custom", path: ["test_resources"], message: "test resource selection must be disabled in production" });

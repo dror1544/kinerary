@@ -22,5 +22,13 @@
   },
   "test_resources": {
     "enabled": false
+  },
+  "signup": {
+    "telegram_bot_token_secret_ref": "file:///run/secrets/telegram_creds",
+    "super_admin_subject_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "action_secret_ref": "file:///run/secrets/approval_signing_key",
+    "action_ttl_seconds": 3600,
+    "signup_rate_limit_cooldown_seconds": 3600,
+    "webhook_secret_ref": "file:///run/secrets/telegram_webhook_secret"
   }
 }

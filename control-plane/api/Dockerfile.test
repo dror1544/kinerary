@@ -6,5 +6,6 @@ COPY control-plane/api/tsconfig.json ./
 COPY control-plane/api/src ./src
 COPY control-plane/api/test ./test
 COPY control-plane/contracts ../contracts
+COPY control-plane/config ../config
 COPY control-plane/db ../db
 CMD ["npm", "run", "test:migrations"]

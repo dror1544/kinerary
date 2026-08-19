@@ -30,10 +30,12 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0003_sprint0_review_hardening.sql",
       "0004_canonical_guardrail_key_matching.sql",
       "0005_opaque_id_format.sql",
+      "0006_sprint1_signup.sql",
+      "0007_sprint1_signup_unique_fix.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
-    assert.equal(tables.rows[0].count >= 18, true);
+    assert.equal(tables.rows[0].count >= 20, true);
     await reset(client);
     assert.deepEqual(await applyMigrations(client, migrationsDir), [
       "0001_foundation.sql",
@@ -41,6 +43,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0003_sprint0_review_hardening.sql",
       "0004_canonical_guardrail_key_matching.sql",
       "0005_opaque_id_format.sql",
+      "0006_sprint1_signup.sql",
+      "0007_sprint1_signup_unique_fix.sql",
     ]);
   } finally {
     await reset(client);
