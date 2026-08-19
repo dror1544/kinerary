@@ -1,7 +1,9 @@
 import Fastify from "fastify";
 import type pg from "pg";
 import type { ArchitectureProfile } from "./config.js";
+import { issueEnrollment, verifyEnrollmentToken, type EnrollmentConfig } from "./enrollment.js";
 import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
+import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
 import { structuredLog } from "./redaction.js";
 import {
   startSignup,
@@ -23,12 +25,19 @@ export interface SignupDependencies {
   notification: NotificationAdapter;
 }
 
+export interface InterviewDependencies {
+  db: pg.Pool;
+  config: EnrollmentConfig;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
   log?: (line: string) => void;
   /** Optional: mount signup routes. Absent in Sprint 0 deployments and unit tests. */
   signup?: SignupDependencies;
+  /** Optional: mount enrollment + interview routes (Sprint 2+). */
+  interview?: InterviewDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -45,8 +54,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   app.get("/", async () => ({
     service: "kinerary-control-plane",
-    sprint: 1,
-    endpoints: ["/healthz", "/readyz", "/v1/signup", "/v1/signup/callback", "/v1/trips/:id"],
+    sprint: 2,
+    endpoints: [
+      "/healthz", "/readyz",
+      "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
+      "/v1/trips/:id/enrollment",
+      "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
+    ],
   }));
 
   app.get("/healthz", async () => ({ status: "ok", service: "control-plane-api" }));
@@ -232,6 +246,227 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(404).send({ error: "NOT_FOUND" });
     }
     return reply.code(200).send(trip);
+  });
+
+  // ── Sprint 2: Enrollment + Interview routes ───────────────────────────────
+
+  // ── Sprint 2: Enrollment + Interview routes ───────────────────────────────
+
+  // POST /v1/trips/:id/enrollment — issue an enrollment link for the trip owner.
+  // The organizer sends this link to the Hermes interviewer to start the interview.
+  // Header: X-Telegram-Login: <base64url-encoded-json>
+  app.post("/v1/trips/:id/enrollment", async (request, reply) => {
+    if (!dependencies.interview || !dependencies.signup) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+    const { interview, signup } = dependencies;
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    // Authenticate via Telegram login and resolve the internal user id.
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [loginResult.identity.providerSubjectDigest],
+    );
+    const [identity] = identityRow.rows;
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    const result = await issueEnrollment(interview.db, identity.user_id, tripId, interview.config, log);
+    if (!result.ok) {
+      const status = result.reason === "NOT_OWNER" ? 403 : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(201).send({
+      enrollmentId: result.enrollmentId,
+      token: result.token,
+      expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // POST /v1/interview — start an interview session by exchanging an enrollment token.
+  // Header: Authorization: Bearer <enrollment-token>
+  // This is the narrow entry point for the Hermes interviewer agent.
+  app.post("/v1/interview", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    // Pre-validate before taking side effects (gives a clearer error reason).
+    const check = await verifyEnrollmentToken(dependencies.interview.db, rawToken);
+    if (!check.ok) {
+      const status = check.reason === "ALREADY_CONSUMED" || check.reason === "REVOKED" ? 409 : 401;
+      return reply.code(status).send({ error: check.reason });
+    }
+
+    const result = await startSession(dependencies.interview.db, rawToken, log);
+    if (!result.ok) {
+      return reply.code(result.reason === "TRIP_NOT_DRAFT" ? 409 : 401).send({ error: result.reason });
+    }
+
+    return reply.code(201).send({
+      sessionId: result.sessionId,
+      sessionToken: result.sessionToken,
+      state: result.view.state,
+      nextQuestion: result.view.nextQuestion,
+    });
+  });
+
+  // GET /v1/interview/:sessionId — get the current session view (no answer transcript).
+  // Header: Authorization: Bearer <session-token>
+  app.get("/v1/interview/:sessionId", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+
+    const params = request.params as Record<string, unknown>;
+    const sessionId = params?.sessionId;
+    if (typeof sessionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const result = await getSession(dependencies.interview.db, rawToken);
+    if (!result.ok) return reply.code(401).send({ error: result.reason });
+
+    // The path's sessionId must match the token's session (prevents probing other sessions).
+    if (result.view.sessionId !== sessionId) return reply.code(404).send({ error: "NOT_FOUND" });
+
+    return reply.code(200).send({
+      sessionId: result.view.sessionId,
+      state: result.view.state,
+      nextQuestion: result.view.nextQuestion,
+      recap: result.view.recap,
+    });
+  });
+
+  // POST /v1/interview/:sessionId/answer — submit or correct an answer.
+  // Header: Authorization: Bearer <session-token>
+  // Body: { questionId, optionId?, otherText? }
+  app.post("/v1/interview/:sessionId/answer", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
+    const optionId = body?.optionId ?? null;
+    const otherText = body?.otherText;
+
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await submitAnswer(
+      dependencies.interview.db,
+      rawToken,
+      questionId,
+      optionId as string | null,
+      otherText as string | undefined,
+    );
+
+    if (!result.ok) {
+      const status = result.reason === "NOT_FOUND" ? 404
+        : result.reason === "SESSION_CONFIRMED" ? 409
+        : 400;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(200).send({
+      state: result.view.state,
+      nextQuestion: result.view.nextQuestion,
+      recap: result.view.recap,
+    });
+  });
+
+  // POST /v1/interview/:sessionId/confirm — CONFIRM: produce an immutable intake version.
+  // Header: Authorization: Bearer <session-token>
+  app.post("/v1/interview/:sessionId/confirm", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const result = await confirmIntake(dependencies.interview.db, rawToken, log);
+
+    if (!result.ok) {
+      const status = result.reason === "NOT_FOUND" ? 404 : 422;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(200).send({
+      intakeVersionId: result.intakeVersionId,
+      digest: result.digest,
+      versionNumber: result.versionNumber,
+    });
+  });
+
+  // GET /v1/interview/:sessionId/status — lifecycle status for the organizer status UI.
+  // Does not expose any answer or transcript content.
+  // Header: X-Telegram-Login (identifies the organizer without the session token)
+  app.get("/v1/interview/:sessionId/status", async (request, reply) => {
+    if (!dependencies.interview || !dependencies.signup) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+    const { interview, signup } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const sessionId = params?.sessionId;
+    if (typeof sessionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [loginResult.identity.providerSubjectDigest],
+    );
+    const [identity] = identityRow.rows;
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    const result = await getSessionStatus(interview.db, sessionId, identity.user_id);
+    if (!result.ok) {
+      return reply.code(result.reason === "NOT_FOUND" ? 404 : 403).send({ error: result.reason });
+    }
+
+    return reply.code(200).send({
+      state: result.state,
+      ...(result.intakeVersionId ? { intakeVersionId: result.intakeVersionId, digest: result.digest } : {}),
+    });
   });
 
   if (dependencies.close) app.addHook("onClose", dependencies.close);
