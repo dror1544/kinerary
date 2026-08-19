@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { test } from "node:test";
-import { verifyTelegramLogin, digestTelegramId } from "../src/identity.js";
+import { verifyTelegramLogin, digestTelegramId, verifyTelegramWebhookSecret } from "../src/identity.js";
 
 // Test fixtures — production bot tokens must never appear here.
 const TEST_BOT_TOKEN = "12345678:AAFakeBotTokenForTestingPurposesOnly";
@@ -152,4 +152,27 @@ test("non-hex hash value is rejected cleanly", () => {
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error, "TELEGRAM_LOGIN_INVALID_HASH");
+});
+
+test("verifyTelegramWebhookSecret accepts an exact match", () => {
+  assert.equal(verifyTelegramWebhookSecret("correct-secret-value", "correct-secret-value"), true);
+});
+
+test("verifyTelegramWebhookSecret rejects a mismatched value", () => {
+  assert.equal(verifyTelegramWebhookSecret("wrong-value", "correct-secret-value"), false);
+});
+
+test("verifyTelegramWebhookSecret rejects a value that differs only in length", () => {
+  assert.equal(verifyTelegramWebhookSecret("correct-secret-value-extra", "correct-secret-value"), false);
+});
+
+test("verifyTelegramWebhookSecret fails closed on missing or non-string header", () => {
+  assert.equal(verifyTelegramWebhookSecret(undefined, "correct-secret-value"), false);
+  assert.equal(verifyTelegramWebhookSecret(null, "correct-secret-value"), false);
+  assert.equal(verifyTelegramWebhookSecret(12345, "correct-secret-value"), false);
+  assert.equal(verifyTelegramWebhookSecret(["correct-secret-value"], "correct-secret-value"), false);
+});
+
+test("verifyTelegramWebhookSecret rejects an empty header even against an empty configured secret", () => {
+  assert.equal(verifyTelegramWebhookSecret("", ""), false);
 });

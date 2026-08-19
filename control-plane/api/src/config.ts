@@ -53,6 +53,10 @@ export const architectureProfileSchema = z.object({
     action_secret_ref: secretReference,
     action_ttl_seconds: z.number().int().min(60).max(86400).default(3600),
     signup_rate_limit_cooldown_seconds: z.number().int().min(0).max(86400).default(3600),
+    // Registered with Telegram via setWebhook's secret_token param. The
+    // callback route verifies this header instead of trusting a client-
+    // supplied sender identity — see identity.ts's verifyTelegramWebhookSecret.
+    webhook_secret_ref: secretReference,
   }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.environment === "production" && profile.test_resources.enabled) {

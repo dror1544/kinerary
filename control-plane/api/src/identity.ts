@@ -91,3 +91,20 @@ export function verifyTelegramLogin(
 export function digestTelegramId(telegramId: string): string {
   return "sha256:" + createHash("sha256").update(telegramId).digest("hex");
 }
+
+/**
+ * Verifies the `X-Telegram-Bot-Api-Secret-Token` header Telegram attaches to
+ * every webhook delivery once the webhook is registered with a secret via
+ * `setWebhook`. This is the only thing standing between the public callback
+ * endpoint and an attacker who supplies their own `callback_query.from.id` —
+ * so the comparison must be constant-time and must fail closed on any
+ * malformed input rather than throwing.
+ */
+export function verifyTelegramWebhookSecret(headerValue: unknown, configuredSecret: string): boolean {
+  if (typeof headerValue !== "string" || headerValue.length === 0) return false;
+  if (configuredSecret.length === 0) return false;
+  const provided = Buffer.from(headerValue, "utf8");
+  const expected = Buffer.from(configuredSecret, "utf8");
+  if (provided.length !== expected.length) return false;
+  return timingSafeEqual(provided, expected);
+}

@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import type pg from "pg";
 import type { ArchitectureProfile } from "./config.js";
-import { verifyTelegramLogin } from "./identity.js";
+import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
 import { structuredLog } from "./redaction.js";
 import {
   startSignup,
@@ -18,6 +18,8 @@ export interface SignupDependencies {
   config: SignupConfig;
   /** Resolved bot token for Telegram login verification. */
   botToken: string;
+  /** Resolved secret registered with Telegram's setWebhook secret_token param. */
+  webhookSecret: string;
   notification: NotificationAdapter;
 }
 
@@ -103,27 +105,52 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send(result);
   });
 
-  // POST /v1/signup/callback — called by the Telegram bot webhook when the
-  // super-admin clicks Approve or Reject. The signed action token was embedded
-  // in the Telegram keyboard button's callback_data.
-  // Body: { token: string, sender_subject_digest: string }
+  // POST /v1/signup/callback — Telegram's webhook target, called directly by
+  // Telegram when the super-admin clicks Approve or Reject. The signed action
+  // token was embedded in the keyboard button's callback_data.
+  //
+  // The sender identity is NEVER taken from request-body input: it is derived
+  // from callback_query.from.id on a request that first passes the
+  // X-Telegram-Bot-Api-Secret-Token check. That header is only ever sent by
+  // Telegram itself (configured via setWebhook's secret_token), and
+  // digestTelegramId has no server-side key, so trusting a client-supplied
+  // digest here would let anyone who obtains a valid action token approve or
+  // reject requests directly.
+  //
+  // Body (Telegram Update object): { callback_query: { from: { id }, data } }
   app.post("/v1/signup/callback", async (request, reply) => {
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
     }
-    const body = request.body as Record<string, unknown>;
-    const token = body?.token;
-    const senderDigest = body?.sender_subject_digest;
+    const { signup } = dependencies;
 
-    if (typeof token !== "string" || typeof senderDigest !== "string") {
+    const secretHeader = (request.headers as Record<string, unknown>)["x-telegram-bot-api-secret-token"];
+    if (!verifyTelegramWebhookSecret(secretHeader, signup.webhookSecret)) {
+      log(structuredLog("warn", "signup.callback_webhook_unauthorized", { safe_error_code: "WEBHOOK_SECRET_INVALID" }));
+      return reply.code(401).send({ error: "WEBHOOK_SECRET_INVALID" });
+    }
+
+    const body = request.body as Record<string, unknown>;
+    const callbackQuery = body?.callback_query as Record<string, unknown> | undefined;
+    const from = callbackQuery?.from as Record<string, unknown> | undefined;
+    const token = callbackQuery?.data;
+    const fromId = from?.id;
+
+    if (
+      !callbackQuery
+      || typeof token !== "string"
+      || (typeof fromId !== "number" && typeof fromId !== "string")
+    ) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
+    const senderDigest = digestTelegramId(String(fromId));
+
     const result = await processApprovalCallback(
-      dependencies.signup.db,
+      signup.db,
       token,
       senderDigest,
-      dependencies.signup.config,
+      signup.config,
     );
 
     if (result.outcome === "error") {

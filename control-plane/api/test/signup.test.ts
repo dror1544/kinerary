@@ -14,7 +14,7 @@ import {
   type NotificationAdapter,
   type SignupConfig,
 } from "../src/signup.js";
-import { buildApp } from "../src/app.js";
+import { buildApp, type SignupDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 
 const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
@@ -22,9 +22,40 @@ const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
 const TEST_BOT_TOKEN = "12345678:AAFakeSignupTestBotTokenForTesting0";
+const TEST_WEBHOOK_SECRET = "test-webhook-secret-sprint1-signup";
 const SUPER_ADMIN_ID = "100000001";
 const SUPER_ADMIN_DIGEST = digestTelegramId(SUPER_ADMIN_ID);
 const ACTION_SECRET = "test-action-secret-sprint1-signup";
+
+/** Builds the `signup` dependency block shared by nearly every HTTP-route test. */
+function signupDeps(
+  db: pg.Pool,
+  notification: NotificationAdapter,
+  overrides: Partial<SignupDependencies> = {},
+): { signup: SignupDependencies } {
+  return {
+    signup: {
+      db,
+      config: testConfig,
+      botToken: TEST_BOT_TOKEN,
+      webhookSecret: TEST_WEBHOOK_SECRET,
+      notification,
+      ...overrides,
+    },
+  };
+}
+
+/** Builds a Telegram Update body for a callback_query, as Telegram's webhook would send it. */
+function buildCallbackUpdate(token: string, fromTelegramId: string): Record<string, unknown> {
+  return {
+    update_id: 1,
+    callback_query: {
+      id: "cbq_1",
+      from: { id: Number(fromTelegramId), is_bot: false, first_name: "Admin" },
+      data: token,
+    },
+  };
+}
 
 const testConfig: SignupConfig = {
   superAdminSubjectDigest: SUPER_ADMIN_DIGEST,
@@ -377,6 +408,7 @@ const testArchitectureProfile = validateArchitectureProfile({
     action_secret_ref: "env://CONTROL_PLANE_ACTION_SECRET",
     action_ttl_seconds: 3600,
     signup_rate_limit_cooldown_seconds: 0,
+    webhook_secret_ref: "env://CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET",
   },
 });
 
@@ -389,9 +421,7 @@ test("POST /v1/signup returns awaiting_approval for a fresh valid login", { skip
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const payload = buildValidTelegramPayload("300000001", TEST_BOT_TOKEN);
     const response = await app.inject({
@@ -422,9 +452,7 @@ test("POST /v1/signup rejects a tampered Telegram payload", { skip }, async () =
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const payload = buildValidTelegramPayload("300000002", TEST_BOT_TOKEN);
     payload.first_name = "Hacker"; // tamper after signing
@@ -453,9 +481,7 @@ test("POST /v1/signup/callback approves request and is idempotent on replay", { 
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const identity = makeIdentity("300000003");
     const { requestId } = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
@@ -466,8 +492,8 @@ test("POST /v1/signup/callback approves request and is idempotent on replay", { 
     const r1 = await app.inject({
       method: "POST",
       url: "/v1/signup/callback",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token, sender_subject_digest: SUPER_ADMIN_DIGEST }),
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate(token, SUPER_ADMIN_ID)),
     });
     assert.equal(r1.statusCode, 200);
     assert.equal(r1.json().outcome, "approved");
@@ -475,11 +501,106 @@ test("POST /v1/signup/callback approves request and is idempotent on replay", { 
     const r2 = await app.inject({
       method: "POST",
       url: "/v1/signup/callback",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token, sender_subject_digest: SUPER_ADMIN_DIGEST }),
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate(token, SUPER_ADMIN_ID)),
     });
     assert.equal(r2.statusCode, 200);
     assert.equal(r2.json().outcome, "already_decided");
+
+    await app.close();
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("POST /v1/signup/callback is refused without a valid webhook secret header", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
+
+    const identity = makeIdentity("300000008");
+    const { requestId } = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
+    assert.ok(requestId);
+    const { token } = signApprovalAction(requestId, "approve", ACTION_SECRET);
+
+    // No header at all
+    const missing = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(buildCallbackUpdate(token, SUPER_ADMIN_ID)),
+    });
+    assert.equal(missing.statusCode, 401);
+
+    // Wrong secret value
+    const wrong = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": "not-the-configured-secret" },
+      body: JSON.stringify(buildCallbackUpdate(token, SUPER_ADMIN_ID)),
+    });
+    assert.equal(wrong.statusCode, 401);
+
+    // Request is still pending — neither attempt was processed
+    const status = await getSignupStatus(pool, identity.providerSubjectDigest);
+    assert.equal(status.status, "awaiting_approval");
+
+    await app.close();
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("POST /v1/signup/callback derives the sender from the verified webhook payload, not from client input", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
+
+    const identity = makeIdentity("300000009");
+    const { requestId } = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
+    assert.ok(requestId);
+    const { token } = signApprovalAction(requestId, "approve", ACTION_SECRET);
+
+    // A caller who passes the webhook-secret check but is not the super-admin's
+    // Telegram account (from.id belongs to a different user) must still be refused,
+    // even though nothing in the current route reads a body-supplied digest anymore.
+    const impostorId = "999999999";
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate(token, impostorId)),
+    });
+    assert.equal(res.statusCode, 403);
+    assert.equal(res.json().error, "WRONG_SENDER");
+
+    // The legitimate super-admin's from.id still works
+    const legit = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate(token, SUPER_ADMIN_ID)),
+    });
+    assert.equal(legit.statusCode, 200);
+    assert.equal(legit.json().outcome, "approved");
 
     await app.close();
   } finally {
@@ -499,9 +620,7 @@ test("GET /v1/trips/:id is membership-scoped", { skip }, async () => {
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const owner = makeIdentity("300000004");
     const { requestId } = await startSignup(pool, owner, "Japan 2025", testConfig, notification);
@@ -555,9 +674,7 @@ test("GET /v1/signup/status reflects current state without starting a new reques
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const telegramId = "300000006";
     const identity = makeIdentity(telegramId);
@@ -728,9 +845,7 @@ test("API responses do not expose Telegram numeric IDs or raw action secrets", {
     client.release();
 
     const notification = new CapturingNotification();
-    const app = buildApp(testArchitectureProfile, {
-      signup: { db: pool, config: testConfig, botToken: TEST_BOT_TOKEN, notification },
-    });
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
 
     const telegramId = "300000007";
     const payload = buildValidTelegramPayload(telegramId, TEST_BOT_TOKEN);
