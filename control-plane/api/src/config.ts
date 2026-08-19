@@ -62,6 +62,13 @@ export const architectureProfileSchema = z.object({
   if (profile.environment === "production" && profile.test_resources.enabled) {
     ctx.addIssue({ code: "custom", path: ["test_resources"], message: "test resource selection must be disabled in production" });
   }
+  if (profile.environment === "production" && profile.signup && profile.adapters.messaging === "fake") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["adapters", "messaging"],
+      message: "a production profile with signup configured must not select the fake messaging adapter — the super-admin would never receive a real approval notification",
+    });
+  }
 });
 
 export type ArchitectureProfile = z.infer<typeof architectureProfileSchema>;
