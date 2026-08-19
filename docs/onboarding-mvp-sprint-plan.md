@@ -105,6 +105,29 @@ The existing Kinerary test suite remains a release prerequisite. New
 control-plane tests must be runnable without a Telegram account, a Proxmox
 server, or secrets; real-adapter tests are explicitly selected by environment.
 
+### Standing requirement — reachable through the real entrypoint
+
+**No sprint is complete while its feature exists only under test.** A suite
+that builds the application itself, injecting its own dependencies, proves the
+feature works but not that anything assembles it in the process that actually
+runs. Sprint 1 passed 81 tests with every signup route returning `503` in a
+real deployment, because `server.ts` never constructed the signup dependency
+block; nothing in the suite looked at the real entrypoint, so nothing failed.
+
+Every sprint that adds a route, adapter or startup dependency therefore owes:
+
+- wiring in the real entrypoint (`api/src/server.ts` or the worker's `__main__`),
+  resolving whatever secrets and adapters it needs from the architecture
+  profile — not just in a test's dependency object;
+- a boot-level test that spawns that entrypoint as a process and asserts the
+  new surface answers (`api/test/server-boot.test.ts` is the pattern), together
+  with the negative case proving the assertion can fail;
+- a startup failure, not a request-time failure, when a required secret or
+  adapter is missing — a half-configured process must not accept traffic.
+
+Sprint exit gates below are read as including this requirement; it is stated
+once here rather than repeated in each.
+
 ## 3. Sprints
 
 Each sprint ends with a demonstrable vertical slice, automated evidence, and a

@@ -23,6 +23,49 @@ Architecture-specific values and credentials come from an external profile
 and opaque secret references. `config/architecture.example.json` contains
 only test adapter names and validation-safe references.
 
+## Secret references
+
+The profile never holds a credential, only a reference to one. Three schemes
+are accepted, all resolved by `api/src/secrets.ts`:
+
+| Reference | Resolves to |
+|---|---|
+| `env://NAME` | the `NAME` environment variable |
+| `file:///run/secrets/thing` | the file's contents, trimmed |
+| `vault://secret/data/kinerary/telegram#bot_token` | the `bot_token` field of that Vault KV secret |
+
+A `vault://` reference must name its field with `#`, because a KV secret holds
+several pairs and a bare path would not say which one it means. Both KV v1 and
+KV v2 mounts work — the path is the Vault API path, so `secret/data/...` is v2
+while a v1 mount is addressed directly.
+
+Vault access comes from the environment, not from the profile, so the profile
+stays free of environment-specific addressing:
+
+```bash
+export VAULT_ADDR=https://vault.internal:8200
+export VAULT_TOKEN=...          # or VAULT_TOKEN_FILE=/run/secrets/vault_token
+```
+
+`VAULT_ADDR` must be `https://`. Plain `http://` is refused unless the host is
+loopback, since the Vault token unlocks every other secret and must not cross a
+network in cleartext. Nothing is read from the environment unless a `vault://`
+reference is actually resolved, so an installation using only `env://` and
+`file://` needs no Vault at all.
+
+### Who resolves what
+
+The TypeScript entrypoints — the API (`src/server.ts`) and the migration job
+(`src/migrate.ts`) — resolve every reference in the profile they are given,
+including `database.connection_secret_ref`. Both are handed the same profile so
+they cannot end up pointed at different databases.
+
+The Python worker is the exception. It takes `CONTROL_PLANE_DATABASE_URL_FILE`,
+a plain path with no scheme, and has no resolver of its own — so a deployment
+whose database reference is `env://` or `vault://` must still supply that file
+to the worker separately. Only `file://` is consistent across all three
+processes today; giving the worker a resolver twin is tracked in PR #10.
+
 ## Tests
 
 Install API dependencies once, then run the unit/contract suites:
@@ -32,13 +75,19 @@ cd control-plane/api && npm install
 cd ../.. && scripts/test-control-plane.sh
 ```
 
-Exercise fresh and upgrade migrations against the isolated PostgreSQL fixture:
+Exercise fresh and upgrade migrations against the isolated PostgreSQL fixture,
+and the `vault://` resolver against a dev-mode Vault:
 
 ```bash
 docker compose -f control-plane/db/compose.test.yml up -d --wait
 docker compose -f control-plane/db/compose.test.yml --profile test run --rm migration-tests
+CONTROL_PLANE_TEST_VAULT_ADDR=http://127.0.0.1:8200 npm --prefix control-plane/api test
 docker compose -f control-plane/db/compose.test.yml down
 ```
+
+The Vault fixture is dev-mode with a fixed root token and in-memory storage —
+only ever a test fixture. Without `CONTROL_PLANE_TEST_VAULT_ADDR` those tests
+skip and the rest of the suite is unaffected.
 
 The database constraint suite rejects raw secrets, host paths, private IPs and
 unlabelled test resources. A controlled failure is stored as a failed job with

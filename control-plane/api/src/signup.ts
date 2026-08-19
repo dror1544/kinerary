@@ -75,8 +75,9 @@ export async function startSignup(
       ["telegram", identity.providerSubjectDigest],
     );
     let userId: string;
-    if (identityRow.rows.length > 0) {
-      userId = identityRow.rows[0].user_id;
+    const [existingIdentity] = identityRow.rows;
+    if (existingIdentity) {
+      userId = existingIdentity.user_id;
     } else {
       userId = generateId("user");
       await client.query(
@@ -94,10 +95,10 @@ export async function startSignup(
       "SELECT id, trip_id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'approved'",
       [userId],
     );
-    if (approvedRow.rows.length > 0) {
+    const [approvedByUser] = approvedRow.rows;
+    if (approvedByUser) {
       await client.query("ROLLBACK");
-      const r = approvedRow.rows[0];
-      return { status: "approved", tripId: r.trip_id ?? undefined, requestId: r.id };
+      return { status: "approved", tripId: approvedByUser.trip_id ?? undefined, requestId: approvedByUser.id };
     }
 
     // 2b. Active pending request? (partial unique index guarantees at most one)
@@ -105,8 +106,8 @@ export async function startSignup(
       "SELECT id, action_expires_at FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'pending'",
       [userId],
     );
-    if (pendingRow.rows.length > 0) {
-      const pr = pendingRow.rows[0];
+    const [pr] = pendingRow.rows;
+    if (pr) {
       const tokenExpired = pr.action_expires_at !== null && pr.action_expires_at.getTime() < Date.now();
       if (!tokenExpired) {
         // Reuse — do not send a second notification
@@ -135,8 +136,9 @@ export async function startSignup(
          ORDER BY decided_at DESC NULLS LAST LIMIT 1`,
         [userId],
       );
-      if (recentRejection.rows.length > 0) {
-        const decidedMs = recentRejection.rows[0].decided_at.getTime();
+      const [rejection] = recentRejection.rows;
+      if (rejection) {
+        const decidedMs = rejection.decided_at.getTime();
         if (Date.now() - decidedMs < config.signupRateLimitCooldownSeconds * 1000) {
           await client.query("ROLLBACK");
           return { status: "declined" };
@@ -239,12 +241,12 @@ export async function processApprovalCallback(
       [requestId],
     );
 
-    if (row.rows.length === 0) {
+    const [req] = row.rows;
+    if (!req) {
       await client.query("ROLLBACK");
       return { outcome: "error", reason: "REQUEST_NOT_FOUND" };
     }
 
-    const req = row.rows[0];
     if (req.state !== "pending") {
       await client.query("ROLLBACK");
       return { outcome: "already_decided" };
@@ -299,17 +301,18 @@ export async function getSignupStatus(
     "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
     [providerSubjectDigest],
   );
-  if (identity.rows.length === 0) return { status: "not_found" };
-  const userId = identity.rows[0].user_id;
+  const [userRow] = identity.rows;
+  if (!userRow) return { status: "not_found" };
+  const userId = userRow.user_id;
 
   // Approved row (at most one, enforced by partial unique index)
   const approved = await db.query<{ id: string; trip_id: string | null }>(
     "SELECT id, trip_id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'approved'",
     [userId],
   );
-  if (approved.rows.length > 0) {
-    const r = approved.rows[0];
-    return { status: "approved", tripId: r.trip_id ?? undefined, requestId: r.id };
+  const [approvedRequest] = approved.rows;
+  if (approvedRequest) {
+    return { status: "approved", tripId: approvedRequest.trip_id ?? undefined, requestId: approvedRequest.id };
   }
 
   // Pending row (at most one, enforced by partial unique index)
@@ -317,8 +320,9 @@ export async function getSignupStatus(
     "SELECT id FROM control_plane.signup_approval_requests WHERE user_id = $1 AND state = 'pending'",
     [userId],
   );
-  if (pending.rows.length > 0) {
-    return { status: "awaiting_approval", requestId: pending.rows[0].id };
+  const [pendingRequest] = pending.rows;
+  if (pendingRequest) {
+    return { status: "awaiting_approval", requestId: pendingRequest.id };
   }
 
   // Any historical row at all?
@@ -351,7 +355,7 @@ export async function getTripForMember(
        AND m.status = 'active'`,
     [tripId, providerSubjectDigest],
   );
-  if (result.rows.length === 0) return null;
-  const row = result.rows[0];
+  const [row] = result.rows;
+  if (!row) return null;
   return { id: row.id, slug: row.slug, lifecycleState: row.lifecycle_state };
 }

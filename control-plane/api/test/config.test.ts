@@ -28,6 +28,9 @@ test("a secret reference cannot traverse out of its allocation", async () => {
     "file://../../etc/passwd",
     "file:///run/secrets/../../etc/shadow",
     "vault://kv/../../root",
+    // With a #field selector the reference satisfies the vault:// pattern, so
+    // the traversal refinement is the only thing rejecting it.
+    "vault://secret/data/../../sys/mounts#token",
   ]) {
     assert.throws(
       () => validateArchitectureProfile({ ...raw, database: { connection_secret_ref: traversal } }),
@@ -37,6 +40,23 @@ test("a secret reference cannot traverse out of its allocation", async () => {
   assert.doesNotThrow(() => validateArchitectureProfile({
     ...raw,
     database: { connection_secret_ref: "file:///run/secrets/control_plane_database_url" },
+  }));
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database#url" },
+  }));
+});
+
+test("a vault reference must name the field it means", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // A KV secret holds several pairs, so a bare path does not identify a value.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database" },
+  }));
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    database: { connection_secret_ref: "vault://secret/data/kinerary/database#" },
   }));
 });
 
@@ -49,6 +69,36 @@ test("worker health is private and production cannot select the test allocation"
   assert.throws(() => validateArchitectureProfile({ ...raw, environment: "production" }));
   assert.doesNotThrow(() => validateArchitectureProfile({
     ...raw,
+    environment: "production",
+    test_resources: { enabled: false },
+    adapters: { ...raw.adapters, messaging: "telegram" },
+  }));
+});
+
+test("a production profile with signup configured cannot select the fake messaging adapter", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // The example fixture's adapters.messaging is "fake" and it has a signup
+  // block — both true at once in production must fail, since the
+  // super-admin would never receive a real approval notification.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    environment: "production",
+    test_resources: { enabled: false },
+  }));
+  // Selecting a non-fake messaging adapter clears the block, at the schema
+  // level — whether that adapter is actually implemented yet is a runtime
+  // concern (createNotificationAdapter), not a profile-shape concern.
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    environment: "production",
+    test_resources: { enabled: false },
+    adapters: { ...raw.adapters, messaging: "telegram" },
+  }));
+  // A production profile with no signup block at all is unaffected by this
+  // rule regardless of the messaging adapter it selects.
+  const { signup: _signup, ...withoutSignup } = raw;
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...withoutSignup,
     environment: "production",
     test_resources: { enabled: false },
   }));
