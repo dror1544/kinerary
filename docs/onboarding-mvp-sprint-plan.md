@@ -342,7 +342,19 @@ Build:
 - **Seed a development release record** so `generatePlan` (Sprint 3) can
   select a compatible release and the Sprint 3 exit gate can actually run. One
   migration or seed script is sufficient; no release-build pipeline yet.
-- **Intake transformer** — reads the confirmed `intake_versions` answers and
+- **Complete the minimum usable intake** — extend the interview schema before
+  transformation so it captures exact travel dates and timezone, traveler
+  roster and basic roles, hotels/location changes, flights/reservations/fixed
+  anchors, and important mobility, dietary, budget and family constraints.
+  Keep optional detail out of this gate. A confirmed intake must contain enough
+  information to create a useful initial trip rather than only a deployed
+  shell.
+- **Immutable confirmed-intake snapshot** — store or address the exact
+  normalized answer payload represented by each `intake_versions` row. The
+  transformer must read that immutable version, not mutable
+  `intake_sessions.answers` state indirectly. Its digest must verify before
+  planning or transformation.
+- **Intake transformer** — reads the confirmed immutable intake version and
   produces a valid `trip.config.json` and `trivia_questions.json` using the
   existing Kinerary schema. Validate the output against the existing schema
   before writing. Store only the logical config; no VMIDs, IPs, or paths.
@@ -352,20 +364,30 @@ Build:
   working private URL as part of the job result (non-secret; the URL itself is
   not a credential). Marks the job `succeeded` and the trip `ready_private`.
 - **Organizer notification** — on success, sends the working private URL to the
-  organizer via Telegram (uses the fake adapter in tests; real adapter wired
-  here or in Sprint 5 alongside the real Telegram adapter).
-- **Family access path** — issues initial access for confirmed trip members
-  using the existing Kinerary auth model. Organizer receives a simple invite
-  URL or access instructions; family does not need repository access.
+  organizer via Telegram. Tests use the fake adapter, but a real delivery path
+  is mandatory in this sprint because receipt of the URL is part of its exit
+  gate; it cannot remain deferred to Sprint 5.
+- **Family access path** — create a revocable invite link using the existing
+  Kinerary authentication model. Redeeming it creates or confirms the scoped
+  trip membership; it must not expose another trip or grant organizer/admin
+  authority. The acceptance test must open the site as an invited family
+  member, not only as the organizer.
 - **Intake correction path** — when corrections are needed after confirmation,
   creates a new intake version (never edits the confirmed one) and requires
   re-planning. The existing plan is invalidated; a new plan must be generated
-  and approved. This closes the open item from the PR #10 product comment.
+  and approved. For this gate, provisioning the replacement from the newly
+  approved plan is sufficient; automated in-place upgrade of the existing
+  runtime is explicitly deferred so it cannot delay the first successful
+  family onboarding. This closes the open item from the PR #10 product
+  comment.
 - **Failure recording** — provisioner worker records safe error codes and
   manual-intervention notes on failure so operational gaps are visible.
 
 Automated tests:
 
+- the interview captures the minimum usable dates, timezone, roster, stays,
+  anchors and constraints, and its confirmed immutable snapshot verifies
+  against the stored digest;
 - intake transformer produces a `trip.config.json` that passes the existing
   Kinerary schema validation for each major field type in the Japan fixture;
 - transformer rejects an incomplete intake (missing required fields) rather
@@ -376,7 +398,10 @@ Automated tests:
   `waiting_for_user_action`, trip reverts, URL is not recorded;
 - intake correction path: POST on a confirmed intake creates a new version;
   the old confirmed version is unchanged; the existing plan is invalidated;
-- organizer notification is sent exactly once on success and not on failure.
+- organizer notification is sent exactly once through the real delivery path
+  on the manual acceptance run, and not on failure;
+- a revocable family invite can be redeemed once to open the correct trip as a
+  family member without receiving organizer privileges.
 
 Manual tests / acceptance test:
 
@@ -386,9 +411,13 @@ Manual tests / acceptance test:
   3. Family completes the onboarding interview and sends `CONFIRM`.
   4. Organizer generates a plan, reviews it, and approves it.
   5. Provisioner runs → organizer receives working private URL via Telegram.
-  6. Family opens the URL — trip site loads, no JSON or repo access needed.
-  7. Test one correction: family requests a date change → new intake version →
-     organizer re-plans and re-approves → provisioner updates the deployment.
+  6. An invited family member redeems the revocable invite and opens the URL —
+     the correct trip site loads with family-level access, no JSON or repo
+     access needed.
+  7. Test one correction: family requests a date change → old confirmed version
+     remains unchanged → new intake version → organizer re-plans and
+     re-approves → replacement provisioning succeeds. Automated in-place
+     runtime upgrade is not required for this gate.
 
 Exit gate: **the acceptance test above passes end-to-end against the test
 allocation, with a non-production hostname and test Telegram identities.** A
