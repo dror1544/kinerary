@@ -112,7 +112,7 @@ class ProvisionerWorker:
     approval is consumed only at terminal events (success or exhausted failure).
     """
 
-    LEASE_SECONDS = 300  # 5 minutes; heartbeat not yet implemented (Sprint 5)
+    LEASE_SECONDS = 600  # 10 minutes; deployment timeout is 5 minutes and no heartbeat exists yet
     DEFAULT_WORKER_ID_PREFIX = "provisioner"
 
     def __init__(
