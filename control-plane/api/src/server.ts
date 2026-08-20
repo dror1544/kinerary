@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -73,11 +73,19 @@ if (profile.signup) {
   };
 }
 
+// Provisioner dependency block: intake correction route requires the same
+// pool as the planner. Active whenever signup is configured.
+let provisioner: ProvisionerDependencies | undefined;
+if (profile.signup) {
+  provisioner = { db: pool };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
   signup,
   interview,
   planner,
+  provisioner,
 });
 await app.listen({ host: profile.public_api.bind_host, port: profile.public_api.port });

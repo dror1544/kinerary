@@ -16,7 +16,7 @@ jobs:
   # GitHub Actions service containers expose ports on the runner's localhost,
   # so both PostgreSQL and dev-mode Vault are reachable in the same job.
   # Locally the two services live on separate networks (Postgres internal,
-  # Vault published to loopback), so no single local run covers all 107 tests;
+  # Vault published to loopback), so no single local run covers all 118 tests;
   # CI closes that gap.
   api:
     name: TypeScript API
@@ -69,7 +69,7 @@ jobs:
         run: node_modules/.bin/tsc --noEmit
         working-directory: control-plane/api
 
-      - name: Test (all 107 — PostgreSQL + Vault on localhost)
+      - name: Test (all 118 — PostgreSQL + Vault on localhost)
         run: npm test
         working-directory: control-plane/api
         env:
@@ -78,10 +78,28 @@ jobs:
           VAULT_TOKEN: kinerary-test-root-token
 
   # ── Python worker ────────────────────────────────────────────────────────────
+  #
+  # Provisioner integration tests (test_provisioner.py) require PostgreSQL.
+  # The service container is identical to the one used by the TypeScript API job.
   worker:
     name: Python worker
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: kinerary_control_plane_test
+          POSTGRES_USER: kinerary_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U kinerary_test -d kinerary_control_plane_test"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+        ports:
+          - 5432:5432
 
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +119,7 @@ jobs:
         working-directory: control-plane/worker
         env:
           PYTHONPATH: .
+          CONTROL_PLANE_TEST_DATABASE_URL: postgresql://kinerary_test@localhost:5432/kinerary_control_plane_test
 
   # ── Existing Kinerary suite ──────────────────────────────────────────────────
   #

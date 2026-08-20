@@ -517,9 +517,9 @@ export async function confirmIntake(
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
     await client.query(
-      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at)
-       VALUES ($1, $2, $3, $4, $5, now())`,
-      [versionId, session.trip_id, nextVersion, artifactRef, intakeDigest],
+      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
+       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb)`,
+      [versionId, session.trip_id, nextVersion, artifactRef, intakeDigest, INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers)],
     );
 
     // Transition trip to 'intake_confirmed'.
