@@ -1,0 +1,140 @@
+name: Control plane
+
+on:
+  push:
+    branches:
+      - "sprint/**"
+      - "docs/trip-fleet-control-plane-plan"
+  pull_request:
+    branches:
+      - main
+      - "docs/trip-fleet-control-plane-plan"
+
+jobs:
+  # ── TypeScript API (PostgreSQL + Vault) ──────────────────────────────────────
+  #
+  # GitHub Actions service containers expose ports on the runner's localhost,
+  # so both PostgreSQL and dev-mode Vault are reachable in the same job.
+  # Locally the two services live on separate networks (Postgres internal,
+  # Vault published to loopback), so no single local run covers all 107 tests;
+  # CI closes that gap.
+  api:
+    name: TypeScript API
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: kinerary_control_plane_test
+          POSTGRES_USER: kinerary_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U kinerary_test -d kinerary_control_plane_test"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+        ports:
+          - 5432:5432
+
+      vault:
+        image: hashicorp/vault:1.18
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: kinerary-test-root-token
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+        options: >-
+          --cap-add IPC_LOCK
+          --health-cmd "wget --spider -q http://127.0.0.1:8200/v1/sys/health"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+        ports:
+          - 8200:8200
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: control-plane/api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: control-plane/api
+
+      - name: Type check
+        run: node_modules/.bin/tsc --noEmit
+        working-directory: control-plane/api
+
+      - name: Test (all 107 — PostgreSQL + Vault on localhost)
+        run: npm test
+        working-directory: control-plane/api
+        env:
+          CONTROL_PLANE_TEST_DATABASE_URL: postgresql://kinerary_test@localhost:5432/kinerary_control_plane_test
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: kinerary-test-root-token
+
+  # ── Python worker ────────────────────────────────────────────────────────────
+  worker:
+    name: Python worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: control-plane/worker/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: control-plane/worker
+
+      - name: Test
+        run: python -m unittest discover -s tests -v
+        working-directory: control-plane/worker
+        env:
+          PYTHONPATH: .
+
+  # ── Existing Kinerary suite ──────────────────────────────────────────────────
+  #
+  # This is a release prerequisite: control-plane work must not break the trip
+  # site. Runs on every push/PR so regressions surface immediately.
+  kinerary:
+    name: Kinerary suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            tests/package-lock.json
+            server/package-lock.json
+            mcp/package-lock.json
+
+      - name: Install test dependencies
+        run: npm ci
+        working-directory: tests
+
+      - name: Install trip server dependencies
+        run: npm ci
+        working-directory: server
+
+      - name: Install MCP server dependencies
+        run: npm ci
+        working-directory: mcp
+
+      - name: Test
+        run: npm test
+        working-directory: tests
