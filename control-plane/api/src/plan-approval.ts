@@ -25,15 +25,6 @@ export async function issueApproval(
   actorRef: string,
   ttlSeconds: number,
 ): Promise<IssueApprovalResult> {
-  const planRow = await db.query<{ id: string; trip_id: string; digest: string; status: string }>(
-    "SELECT id, trip_id, digest, status FROM control_plane.plans WHERE id = $1",
-    [planId],
-  );
-  const plan = planRow.rows[0];
-  if (!plan) return { ok: false, reason: "PLAN_NOT_FOUND" };
-  if (plan.status === "approved") return { ok: false, reason: "ALREADY_APPROVED" };
-  if (plan.status !== "pending_approval") return { ok: false, reason: "PLAN_NOT_PENDING" };
-
   const rawToken = randomBytes(32).toString("base64url");
   const digest = tokenDigest(rawToken);
   const approvalId = generateId("appr");
@@ -42,6 +33,26 @@ export async function issueApproval(
   const client = await db.connect();
   try {
     await client.query("BEGIN");
+    // Lock the plan row so concurrent approval calls cannot both pass the
+    // status check before either has committed its INSERT into plan_approvals.
+    const planRow = await client.query<{ id: string; trip_id: string; digest: string; status: string }>(
+      "SELECT id, trip_id, digest, status FROM control_plane.plans WHERE id = $1 FOR UPDATE",
+      [planId],
+    );
+    const plan = planRow.rows[0];
+    if (!plan) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PLAN_NOT_FOUND" };
+    }
+    if (plan.status === "approved") {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "ALREADY_APPROVED" };
+    }
+    if (plan.status !== "pending_approval") {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PLAN_NOT_PENDING" };
+    }
+
     await client.query(
       `INSERT INTO control_plane.plan_approvals(id, plan_id, plan_digest, token_digest, issued_by, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6)`,

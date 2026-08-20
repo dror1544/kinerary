@@ -182,28 +182,14 @@ export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
 /**
  * Re-queues jobs in waiting_for_user_action whose approval has expired.
  * The plan reverts to pending_approval so a fresh approval can be issued.
- * Both updates are atomic: a half-applied state (job reverted, plan still
- * approved, or vice versa) is never visible.
+ * Both updates execute as a single CTE statement so they share one snapshot —
+ * a concurrent fresh approval INSERT cannot slip between the plan revert and
+ * the job revert the way it could with two sequential UPDATE statements.
  */
 export async function recoverExpiredApprovals(db: pg.Pool): Promise<number> {
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
-    const result = await client.query(
-      `UPDATE control_plane.jobs j
-       SET state = 'waiting_for_user_action', updated_at = now()
-       FROM control_plane.plans p
-       JOIN control_plane.plan_approvals pa ON pa.plan_id = p.id
-       WHERE j.plan_id = p.id
-         AND j.state = 'queued'
-         AND pa.used_at IS NULL
-         AND pa.expires_at < now()`,
-    );
-
-    // Revert plans whose only approval has expired.
-    await client.query(
-      `UPDATE control_plane.plans p
+  const result = await db.query(
+    `WITH reverted_plans AS (
+       UPDATE control_plane.plans p
        SET status = 'pending_approval', updated_at = now()
        FROM control_plane.plan_approvals pa
        WHERE pa.plan_id = p.id
@@ -213,17 +199,16 @@ export async function recoverExpiredApprovals(db: pg.Pool): Promise<number> {
          AND NOT EXISTS (
            SELECT 1 FROM control_plane.plan_approvals pa2
            WHERE pa2.plan_id = p.id AND pa2.used_at IS NULL AND pa2.expires_at >= now()
-         )`,
-    );
-
-    await client.query("COMMIT");
-    return result.rowCount ?? 0;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+         )
+       RETURNING p.id AS plan_id
+     )
+     UPDATE control_plane.jobs j
+     SET state = 'waiting_for_user_action', updated_at = now()
+     FROM reverted_plans
+     WHERE j.plan_id = reverted_plans.plan_id
+       AND j.state = 'queued'`,
+  );
+  return result.rowCount ?? 0;
 }
 
 /**
