@@ -432,8 +432,22 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
         "SELECT state, lease_owner FROM control_plane.jobs WHERE id = $1",
         [plan.jobId],
       );
-      assert.equal(jobRow.rows[0]?.state, "queued");
+      // Approval was consumed at claim time, so the job cannot be directly
+      // re-queued — it needs a fresh approval first.
+      assert.equal(jobRow.rows[0]?.state, "waiting_for_user_action");
       assert.equal(jobRow.rows[0]?.lease_owner, null);
+
+      const planRow = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1",
+        [plan.planId],
+      );
+      assert.equal(planRow.rows[0]?.status, "pending_approval");
+
+      const tripRow = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
+        [fix.tripId],
+      );
+      assert.equal(tripRow.rows[0]?.lifecycle_state, "planned");
     } finally {
       await teardownFixture(fix);
     }
@@ -507,9 +521,22 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
         "SELECT state, safe_error_code FROM control_plane.jobs WHERE id = $1",
         [claim.claim.jobId],
       );
-      // attempt (1) < max_attempts (3) → re-queued.
-      assert.equal(jobRow.rows[0]?.state, "queued");
+      // attempt (1) < max_attempts (3) → retryable. The approval was consumed
+      // at claim time so the job needs a fresh approval before re-claim.
+      assert.equal(jobRow.rows[0]?.state, "waiting_for_user_action");
       assert.equal(jobRow.rows[0]?.safe_error_code, null);
+
+      const planRow = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE trip_id = $1",
+        [fix.tripId],
+      );
+      assert.equal(planRow.rows[0]?.status, "pending_approval");
+
+      const tripRow = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
+        [fix.tripId],
+      );
+      assert.equal(tripRow.rows[0]?.lifecycle_state, "planned");
     } finally {
       await teardownFixture(fix);
     }

@@ -44,12 +44,6 @@ export async function generatePlan(
   const intake = intakeRow.rows[0];
   if (!intake) return { ok: false, reason: "NO_INTAKE_VERSION" };
 
-  const pendingRow = await db.query(
-    "SELECT id FROM control_plane.plans WHERE trip_id = $1 AND status IN ('pending_approval', 'approved')",
-    [tripId],
-  );
-  if (pendingRow.rows.length > 0) return { ok: false, reason: "PLAN_ALREADY_PENDING" };
-
   const releaseRow = await db.query<{ id: string }>(
     `SELECT id FROM control_plane.releases
      WHERE status = 'available'
@@ -76,6 +70,9 @@ export async function generatePlan(
   const client = await db.connect();
   try {
     await client.query("BEGIN");
+    // The partial unique index plans_trip_active_idx enforces one active plan
+    // per trip atomically. If a concurrent generatePlan races past the pre-checks
+    // above and inserts first, this INSERT gets SQLSTATE 23505.
     await client.query(
       `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status, desired)
        VALUES ($1, $2, $3, 'provision', $4, 'pending_approval', $5::jsonb)`,
@@ -94,6 +91,8 @@ export async function generatePlan(
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
+    const pgErr = err as { code?: string };
+    if (pgErr.code === "23505") return { ok: false, reason: "PLAN_ALREADY_PENDING" };
     throw err;
   } finally {
     client.release();
