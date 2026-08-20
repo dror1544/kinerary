@@ -1,13 +1,15 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type pg from "pg";
-import { INTAKE_SCHEMA_VERSION } from "./interview.js";
+import {
+  INTAKE_QUESTIONS_V1,
+  INTAKE_SCHEMA_VERSION,
+  computeIntakeDigest,
+  validateAnswer,
+  type AnswerStore,
+} from "./interview.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
-}
-
-function sha256hex(input: string): string {
-  return createHash("sha256").update(input).digest("hex");
 }
 
 export type CorrectIntakeResult =
@@ -18,7 +20,8 @@ export type CorrectIntakeResult =
         | "TRIP_NOT_FOUND"
         | "NOT_AUTHORIZED"
         | "NO_INTAKE_TO_CORRECT"
-        | "INVALID_STATE";
+        | "INVALID_STATE"
+        | "INVALID_ANSWERS";
     };
 
 const CORRECTABLE_STATES = new Set([
@@ -27,13 +30,43 @@ const CORRECTABLE_STATES = new Set([
   "provisioning_approved",
 ]);
 
+function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore | null {
+  const known = new Set(INTAKE_QUESTIONS_V1.map((q) => q.id));
+  if (Object.keys(input).some((id) => !known.has(id))) return null;
+
+  const normalized: AnswerStore = {};
+  for (const question of INTAKE_QUESTIONS_V1) {
+    const raw = input[question.id];
+    if (raw === undefined) {
+      if (question.required) return null;
+      continue;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const answer = raw as Record<string, unknown>;
+
+    let checked;
+    if (question.type === "choice" && answer.kind === "choice") {
+      if (typeof answer.option_id !== "string") return null;
+      checked = validateAnswer(question.id, answer.option_id, null);
+    } else if (question.type === "choice" && answer.kind === "choice_other") {
+      if (typeof answer.other_text !== "string") return null;
+      checked = validateAnswer(question.id, "other", answer.other_text);
+    } else if (question.type === "text" && answer.kind === "text") {
+      if (typeof answer.text !== "string") return null;
+      checked = validateAnswer(question.id, answer.text, null);
+    } else {
+      return null;
+    }
+    if (!checked.ok) return null;
+    normalized[question.id] = checked.answer;
+  }
+  return normalized;
+}
+
 /**
- * Creates a new confirmed intake version from updated answers, supersedes
- * any active plan, cancels associated jobs, and reverts the trip to
- * 'intake_confirmed'. The previous confirmed version is never modified.
- *
- * actorRef identifies the caller for audit (e.g. "user:trip_xxx"). The caller
- * must be the trip owner; ownership verification happens before this function.
+ * Creates a new confirmed intake version from updated, schema-validated
+ * answers, supersedes any active plan, cancels associated jobs, and reverts
+ * the trip to 'intake_confirmed'. The previous confirmed version is immutable.
  */
 export async function correctIntake(
   db: pg.Pool,
@@ -41,11 +74,13 @@ export async function correctIntake(
   actorRef: string,
   newAnswers: Record<string, unknown>,
 ): Promise<CorrectIntakeResult> {
+  const normalized = normalizeCorrectionAnswers(newAnswers);
+  if (!normalized) return { ok: false, reason: "INVALID_ANSWERS" };
+
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    // Lock the trip row.
     const tripRow = await client.query<{ lifecycle_state: string }>(
       "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [tripId],
@@ -60,7 +95,6 @@ export async function correctIntake(
       return { ok: false, reason: "INVALID_STATE" };
     }
 
-    // Require at least one existing confirmed intake version.
     const existingRow = await client.query<{ max_version: number | null }>(
       "SELECT MAX(version) AS max_version FROM control_plane.intake_versions WHERE trip_id = $1",
       [tripId],
@@ -71,9 +105,7 @@ export async function correctIntake(
       return { ok: false, reason: "NO_INTAKE_TO_CORRECT" };
     }
 
-    // Compute new digest and create the corrected version.
-    const dataJson = JSON.stringify(newAnswers);
-    const digest = `sha256:${sha256hex(`${tripId}:v${previousVersion + 1}:${dataJson}`)}`;
+    const digest = computeIntakeDigest(tripId, normalized);
     const versionId = generateId("intk");
     const nextVersion = previousVersion + 1;
     const artifactRef = `intake:correction:${tripId}:v${nextVersion}:${actorRef}`;
@@ -82,36 +114,29 @@ export async function correctIntake(
       `INSERT INTO control_plane.intake_versions
          (id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
        VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb)`,
-      [versionId, tripId, nextVersion, artifactRef, digest, INTAKE_SCHEMA_VERSION, dataJson],
+      [versionId, tripId, nextVersion, artifactRef, digest, INTAKE_SCHEMA_VERSION, JSON.stringify(normalized)],
     );
 
-    // Supersede any active plan (pending_approval or approved) and cancel jobs.
-    // The plans_trip_active_idx only covers these two statuses, so the UPDATE
-    // automatically removes the plan from the uniqueness domain.
     const planRow = await client.query<{ id: string }>(
       `UPDATE control_plane.plans
-       SET    status = 'superseded', updated_at = now()
-       WHERE  trip_id = $1
-         AND  status IN ('pending_approval', 'approved')
+       SET status = 'superseded', updated_at = now()
+       WHERE trip_id = $1 AND status IN ('pending_approval', 'approved')
        RETURNING id`,
       [tripId],
     );
     if (planRow.rowCount && planRow.rowCount > 0) {
-      const planIds = planRow.rows.map((r) => r.id);
+      const planIds = planRow.rows.map((row) => row.id);
       await client.query(
         `UPDATE control_plane.jobs
-         SET    state = 'cancelled', updated_at = now()
-         WHERE  plan_id = ANY($1)
-           AND  state NOT IN ('succeeded', 'failed', 'cancelled')`,
+         SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+         WHERE plan_id = ANY($1)
+           AND state NOT IN ('succeeded', 'failed', 'cancelled')`,
         [planIds],
       );
     }
 
-    // Revert trip to intake_confirmed so the organizer can generate a new plan.
     await client.query(
-      `UPDATE control_plane.trips
-       SET    lifecycle_state = 'intake_confirmed', updated_at = now()
-       WHERE  id = $1`,
+      "UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1",
       [tripId],
     );
 
