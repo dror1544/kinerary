@@ -130,6 +130,10 @@ def setup_fixture(conn: psycopg.Connection) -> dict:
 
 
 def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
+    # Assertions use the shared connection and may leave a read transaction
+    # open. Roll it back before starting cleanup so the worker's separate
+    # connection can see the next fixture.
+    conn.rollback()
     trip_id = fix["trip_id"]
     with conn.transaction():
         with conn.cursor() as cur:
