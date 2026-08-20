@@ -31,7 +31,7 @@ interface TestFixture {
 }
 
 async function setupFixture(pool: pg.Pool): Promise<TestFixture> {
-  const testRunId = `tr_${Date.now().toString(36)}`;
+  const testRunId = `tr${Date.now().toString(36)}`;
   const ownerId = generateTestId("user");
   const nonOwnerId = generateTestId("user");
   const draftTripId = generateTestId("trip");
