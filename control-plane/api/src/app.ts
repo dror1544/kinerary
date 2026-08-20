@@ -1,9 +1,12 @@
+import { randomBytes } from "node:crypto";
 import Fastify from "fastify";
 import type pg from "pg";
 import type { ArchitectureProfile } from "./config.js";
 import { issueEnrollment, verifyEnrollmentToken, type EnrollmentConfig } from "./enrollment.js";
 import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
 import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
+import { issueApproval } from "./plan-approval.js";
+import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
 import {
   startSignup,
@@ -30,6 +33,13 @@ export interface InterviewDependencies {
   config: EnrollmentConfig;
 }
 
+export interface PlannerDependencies {
+  db: pg.Pool;
+  config: {
+    approvalTtlSeconds: number;
+  };
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -38,6 +48,8 @@ export interface AppDependencies {
   signup?: SignupDependencies;
   /** Optional: mount enrollment + interview routes (Sprint 2+). */
   interview?: InterviewDependencies;
+  /** Optional: mount planner + approval routes (Sprint 3+). */
+  planner?: PlannerDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -54,12 +66,14 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   app.get("/", async () => ({
     service: "kinerary-control-plane",
-    sprint: 2,
+    sprint: 3,
     endpoints: [
       "/healthz", "/readyz",
       "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
-      "/v1/trips/:id/enrollment",
+      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan",
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
+      "/v1/plans/:planId", "/v1/plans/:planId/approve",
+      "/v1/releases",
     ],
   }));
 
@@ -475,6 +489,200 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send({
       state: result.state,
       ...(result.intakeVersionId ? { intakeVersionId: result.intakeVersionId, digest: result.digest } : {}),
+    });
+  });
+
+  // ── Sprint 3: Planner + Approval routes ──────────────────────────────────
+
+  // GET /v1/releases — list available releases (Telegram auth required).
+  app.get("/v1/releases", async (request, reply) => {
+    if (!dependencies.planner || !dependencies.signup) {
+      return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    }
+
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, dependencies.signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    const releases = await listAvailableReleases(dependencies.planner.db);
+    return reply.code(200).send({ releases });
+  });
+
+  // POST /v1/trips/:id/plan — generate a provisioning plan from confirmed intake.
+  // Header: X-Telegram-Login
+  app.post("/v1/trips/:id/plan", async (request, reply) => {
+    if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
+      return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    }
+    const { planner, signup, interview } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    // Verify the caller is an owner of this trip.
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [loginResult.identity.providerSubjectDigest],
+    );
+    const identity = identityRow.rows[0];
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    const memberRow = await planner.db.query(
+      "SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND role = 'owner' AND status = 'active'",
+      [tripId, identity.user_id],
+    );
+    if (!memberRow.rows[0]) return reply.code(403).send({ error: "NOT_OWNER" });
+
+    const correlationId = `corr_${randomBytes(12).toString("hex")}`;
+    const result = await generatePlan(planner.db, tripId, correlationId);
+
+    if (!result.ok) {
+      const status = result.reason === "PLAN_ALREADY_PENDING" ? 409
+        : result.reason === "NO_COMPATIBLE_RELEASE" ? 422
+        : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(201).send({
+      planId: result.planId,
+      planDigest: result.planDigest,
+      releaseId: result.releaseId,
+      jobId: result.jobId,
+    });
+  });
+
+  // GET /v1/plans/:planId — get plan details (owner or super-admin).
+  // Header: X-Telegram-Login
+  app.get("/v1/plans/:planId", async (request, reply) => {
+    if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
+      return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    }
+    const { planner, signup, interview } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const planId = params?.planId;
+    if (typeof planId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    // Resolve caller's user_id.
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [loginResult.identity.providerSubjectDigest],
+    );
+    const identity = identityRow.rows[0];
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    // Resolve the plan and its trip.
+    const planRow = await planner.db.query<{ trip_id: string }>(
+      "SELECT trip_id FROM control_plane.plans WHERE id = $1",
+      [planId],
+    );
+    const planMeta = planRow.rows[0];
+    if (!planMeta) return reply.code(404).send({ error: "NOT_FOUND" });
+
+    // Caller must be a member of the trip.
+    const memberRow = await planner.db.query(
+      "SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND status = 'active'",
+      [planMeta.trip_id, identity.user_id],
+    );
+    if (!memberRow.rows[0]) return reply.code(404).send({ error: "NOT_FOUND" });
+
+    const result = await getPlan(planner.db, planId, planMeta.trip_id);
+    if (!result.ok) return reply.code(404).send({ error: "NOT_FOUND" });
+
+    const { plan } = result;
+    return reply.code(200).send({
+      id: plan.id,
+      tripId: plan.tripId,
+      releaseId: plan.releaseId,
+      kind: plan.kind,
+      digest: plan.digest,
+      status: plan.status,
+    });
+  });
+
+  // POST /v1/plans/:planId/approve — approve a pending plan.
+  // Header: X-Telegram-Login (trip owner only for Sprint 3)
+  app.post("/v1/plans/:planId/approve", async (request, reply) => {
+    if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
+      return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    }
+    const { planner, signup, interview } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const planId = params?.planId;
+    if (typeof planId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
+
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [loginResult.identity.providerSubjectDigest],
+    );
+    const identity = identityRow.rows[0];
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    // Caller must be the trip owner.
+    const planRow = await planner.db.query<{ trip_id: string }>(
+      "SELECT trip_id FROM control_plane.plans WHERE id = $1",
+      [planId],
+    );
+    const planMeta = planRow.rows[0];
+    if (!planMeta) return reply.code(404).send({ error: "NOT_FOUND" });
+
+    const memberRow = await planner.db.query(
+      "SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND role = 'owner' AND status = 'active'",
+      [planMeta.trip_id, identity.user_id],
+    );
+    if (!memberRow.rows[0]) return reply.code(403).send({ error: "NOT_OWNER" });
+
+    const actorRef = `user:${identity.user_id}`;
+    const result = await issueApproval(planner.db, planId, actorRef, planner.config.approvalTtlSeconds);
+
+    if (!result.ok) {
+      const status = result.reason === "PLAN_NOT_FOUND" ? 404
+        : result.reason === "ALREADY_APPROVED" ? 409
+        : 422;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(200).send({
+      approvalId: result.approvalId,
+      expiresAt: result.expiresAt.toISOString(),
     });
   });
 

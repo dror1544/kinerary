@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -48,9 +48,36 @@ if (profile.signup) {
   };
 }
 
+// Interview is active whenever signup is configured. The enrollment TTL comes
+// from the signup block; a separate interview block would only be needed if the
+// TTL ever needs independent tuning.
+let interview: InterviewDependencies | undefined;
+if (profile.signup) {
+  interview = {
+    db: pool,
+    config: {
+      enrollmentTtlSeconds: profile.signup.enrollment_ttl_seconds ?? 86400,
+    },
+  };
+}
+
+// Planner is active whenever signup is configured. Approval TTL defaults to
+// 24 hours; add a planner block to the profile to tune it independently.
+let planner: PlannerDependencies | undefined;
+if (profile.signup) {
+  planner = {
+    db: pool,
+    config: {
+      approvalTtlSeconds: 86400,
+    },
+  };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
   signup,
+  interview,
+  planner,
 });
 await app.listen({ host: profile.public_api.bind_host, port: profile.public_api.port });

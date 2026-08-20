@@ -158,6 +158,18 @@ test("the real server entrypoint mounts the signup routes when the profile confi
       body: JSON.stringify({ callback_query: { from: { id: 1 }, data: "x" } }),
     });
     assert.equal(callback.status, 401);
+
+    // Sprint 2: the interview routes are also mounted when the signup block is
+    // configured. A missing enrollment token is 401, not 503.
+    const interview = await fetch(`http://127.0.0.1:${port}/v1/interview`, { method: "POST" });
+    assert.notEqual(interview.status, 503, "interview route is not wired into the real server entrypoint");
+    assert.equal(interview.status, 401);
+
+    // Sprint 3: the planner routes are also mounted when signup is configured.
+    // A missing Telegram login header is 401, not 503.
+    const releases = await fetch(`http://127.0.0.1:${port}/v1/releases`);
+    assert.notEqual(releases.status, 503, "planner routes are not wired into the real server entrypoint");
+    assert.equal(releases.status, 401);
   } finally {
     await server.stop();
   }
