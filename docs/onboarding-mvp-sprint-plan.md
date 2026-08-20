@@ -7,8 +7,11 @@ not authorize deployment, live provisioning, or a commit.
 
 **Outcome:** a registered organizer can sign up, complete a protected Telegram
 interview, explicitly confirm the intake, approve a provisioning plan, and
-receive an active demo trip. Each boundary is independently testable before it
-is connected to the next one.
+receive a working private trip URL — without editing JSON, accessing the
+repository, or running deployment commands. Each boundary is independently
+testable before it is connected to the next one. Sprint 4 is the sprint whose
+exit gate proves this end-to-end. Sprints 5–7 extend the live trip experience
+after the provisioning path is proven.
 
 The demo uses the Japan fake-trip fixture and a non-production hostname and
 test Telegram identities/groups only. It must never use a real family's data
@@ -321,40 +324,86 @@ Manual tests:
 Exit gate: an approved Japan plan has a complete audit trail and exactly one
 queued private provisioning job, while an unapproved plan has none.
 
-### Sprint 4 — Release qualification and private trip runtime
+### Sprint 4 — Provisioner: intake-to-trip and end-to-end onboarding
 
-**Goal:** create a clean, repeatable local runtime from a verified artifact,
-with no public route.
+**Goal:** complete the vertical acceptance test — transform a confirmed,
+approved intake into a running private trip, with a working URL delivered to
+the organizer and basic family access. No JSON editing, no repository access,
+no deployment commands required from the organizer or family.
+
+This is the sprint whose exit gate is the product-alignment acceptance test
+from the PR #10 comment (2026-08-20). Release-artifact hardening (immutable
+build pipeline, sanitation scans, sealed manifests, promotion rules) is
+deliberately deferred past this gate; the first provisioning run uses the
+existing Kinerary deploy infrastructure against a test allocation.
 
 Build:
 
-- Implement the local Proxmox release-artifact renderer: build from immutable
-  source, qualify with Japan, sanitize test state, seal manifest plus template
-  reference, and register it as `candidate` then `available` after review.
-- Implement compute/persistent-data/secret adapters for a dedicated test LXC.
-  Provisioner attaches data by logical reference, injects approved trip content
-  through an allowlist, and starts website/private MCP under supervision.
-- Record allocated resource IDs as adapter metadata; never put VMIDs, IPs or
-  paths in the intake or trip folder.
+- **Seed a development release record** so `generatePlan` (Sprint 3) can
+  select a compatible release and the Sprint 3 exit gate can actually run. One
+  migration or seed script is sufficient; no release-build pipeline yet.
+- **Intake transformer** — reads the confirmed `intake_versions` answers and
+  produces a valid `trip.config.json` and `trivia_questions.json` using the
+  existing Kinerary schema. Validate the output against the existing schema
+  before writing. Store only the logical config; no VMIDs, IPs, or paths.
+- **Provisioner worker** — implements the job worker that claims an approved
+  provisioning job, invokes the intake transformer, and deploys a private trip
+  instance using the existing `kinerary-deploy` infrastructure. Records the
+  working private URL as part of the job result (non-secret; the URL itself is
+  not a credential). Marks the job `succeeded` and the trip `ready_private`.
+- **Organizer notification** — on success, sends the working private URL to the
+  organizer via Telegram (uses the fake adapter in tests; real adapter wired
+  here or in Sprint 5 alongside the real Telegram adapter).
+- **Family access path** — issues initial access for confirmed trip members
+  using the existing Kinerary auth model. Organizer receives a simple invite
+  URL or access instructions; family does not need repository access.
+- **Intake correction path** — when corrections are needed after confirmation,
+  creates a new intake version (never edits the confirmed one) and requires
+  re-planning. The existing plan is invalidated; a new plan must be generated
+  and approved. This closes the open item from the PR #10 product comment.
+- **Failure recording** — provisioner worker records safe error codes and
+  manual-intervention notes on failure so operational gaps are visible.
 
 Automated tests:
 
-- release manifest compatibility, artifact immutability and promotion rules;
-- sanitation scan proves Japan content, database, logs, credentials and
-  machine identity are absent from the sealed artifact;
-- fake compute contract tests cover create/read/delete/idempotent retry;
-- sandbox integration verifies health, render, MCP discovery, persistent-data
-  restart and a controlled create failure with no leaked partial success.
+- intake transformer produces a `trip.config.json` that passes the existing
+  Kinerary schema validation for each major field type in the Japan fixture;
+- transformer rejects an incomplete intake (missing required fields) rather
+  than producing a schema-invalid config;
+- provisioner worker happy path: approved job → intake transformed → deploy
+  called → job marked `succeeded`, trip marked `ready_private`, URL recorded;
+- provisioner failure path: deploy step fails → job moves to
+  `waiting_for_user_action`, trip reverts, URL is not recorded;
+- intake correction path: POST on a confirmed intake creates a new version;
+  the old confirmed version is unchanged; the existing plan is invalidated;
+- organizer notification is sent exactly once on success and not on failure.
 
-Manual tests:
+Manual tests / acceptance test:
 
-- build one release candidate and inspect its evidence; launch a disposable
-  Japan runtime on the isolated test allocation;
-- restart its services, confirm state persists, then inspect that no public
-  DNS/TLS route, provisioning endpoint or private MCP endpoint is exposed.
+  Run the full acceptance test defined in PR #10 (2026-08-20):
+  1. Unknown family signs up via Telegram → organizer receives approval request.
+  2. Organizer approves → family receives enrollment link.
+  3. Family completes the onboarding interview and sends `CONFIRM`.
+  4. Organizer generates a plan, reviews it, and approves it.
+  5. Provisioner runs → organizer receives working private URL via Telegram.
+  6. Family opens the URL — trip site loads, no JSON or repo access needed.
+  7. Test one correction: family requests a date change → new intake version →
+     organizer re-plans and re-approves → provisioner updates the deployment.
 
-Exit gate: one Japan deployment reaches `ready_private` only after stored
-release, runtime, persistence, website and private-MCP evidence exists.
+Exit gate: **the acceptance test above passes end-to-end against the test
+allocation, with a non-production hostname and test Telegram identities.** A
+previously unknown family completes onboarding, the organizer approves both
+gates, a valid Kinerary trip is generated from the intake, an isolated instance
+is provisioned using the existing deploy infrastructure, and the family
+receives a working private URL without editing JSON, accessing the repository,
+or running deployment commands. Failure and correction paths are both
+demonstrated and recorded.
+
+_Deferred past this gate (original Sprint 4 scope):_ immutable release-artifact
+renderer, sanitation scans, sealed manifests, release promotion pipeline
+(`candidate` → `available`), and dedicated compute/persistent-data/secret
+adapters. These belong in a hardening sprint after the first successful
+end-to-end run proves the vertical path.
 
 ### Sprint 5 — Organizer profile, Trip Context Gateway, and Telegram routing
 
@@ -607,6 +656,14 @@ their interfaces: release manifests, resource IDs, secret references,
 `isolation_tier`, memberships, messaging bindings, organizer trip-context
 selection, service-connection capabilities, consent/provenance-labelled
 imports/feedback and lifecycle events are required in the first schema.
+
+Defer also the release-hardening work originally scoped for Sprint 4: the
+immutable release-artifact renderer (build pipeline, sanitation scan, sealed
+manifest), release promotion rules (`candidate` → `available`), and dedicated
+compute/persistent-data/secret adapter abstractions. The acceptance test in
+Sprint 4 uses the existing `kinerary-deploy` infrastructure and a seeded
+development release record. The hardening sprint belongs after the first
+successful end-to-end run proves the vertical path — not before it.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 
