@@ -309,8 +309,10 @@ class ProvisionerWorker:
                 cur.execute(
                     """
                     INSERT INTO control_plane.notification_outbox
-                      (id, trip_id, kind, recipient, payload)
-                    VALUES (%s, %s, 'provisioning_complete', 'organizer', %s::jsonb)
+                      (id, trip_id, kind, recipient, payload, signup_request_id,
+                       notification_type, adapter, state)
+                    VALUES (%s, %s, 'provisioning_complete', 'organizer', %s::jsonb,
+                            NULL, 'provisioning_complete', 'provisioner', 'pending')
                     """,
                     (_generate_notif_id(), trip_id, notif_payload),
                 )
@@ -363,10 +365,12 @@ class ProvisionerWorker:
                     cur.execute(
                         """
                         INSERT INTO control_plane.notification_outbox
-                          (id, trip_id, kind, recipient, payload)
+                          (id, trip_id, kind, recipient, payload, signup_request_id,
+                           notification_type, adapter, state)
                         VALUES (%s,
                                 (SELECT trip_id FROM control_plane.jobs WHERE id = %s),
-                                'provisioning_failed', 'organizer', %s::jsonb)
+                                'provisioning_failed', 'organizer', %s::jsonb,
+                                NULL, 'provisioning_failed', 'provisioner', 'pending')
                         """,
                         (_generate_notif_id(), job_id, notif_payload),
                     )
