@@ -195,6 +195,34 @@ describe("generatePlan", () => {
       await teardownFixture(fix);
     }
   });
+
+  test("concurrent generatePlan: exactly one succeeds, one returns PLAN_ALREADY_PENDING", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const [a, b] = await Promise.all([
+        generatePlan(fix.pool, fix.tripId, fix.correlationId),
+        generatePlan(fix.pool, fix.tripId, `${fix.correlationId}_b`),
+      ]);
+      const results = [a, b];
+      const successes = results.filter((r) => r.ok);
+      const failures = results.filter((r) => !r.ok);
+      assert.equal(successes.length, 1, "exactly one generatePlan should succeed");
+      assert.equal(failures.length, 1, "exactly one generatePlan should return PLAN_ALREADY_PENDING");
+      assert.ok(!failures[0]!.ok && failures[0]!.reason === "PLAN_ALREADY_PENDING");
+
+      // Confirm exactly one plan and one job exist for the trip.
+      const planCount = await fix.pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM control_plane.plans WHERE trip_id = $1", [fix.tripId],
+      );
+      assert.equal(planCount.rows[0]?.count, "1");
+      const jobCount = await fix.pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM control_plane.jobs WHERE trip_id = $1", [fix.tripId],
+      );
+      assert.equal(jobCount.rows[0]?.count, "1");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
 });
 
 describe("issueApproval", () => {
@@ -263,6 +291,34 @@ describe("issueApproval", () => {
       assert.equal(result.ok, false);
       if (result.ok) throw new Error("unreachable");
       assert.equal(result.reason, "PLAN_NOT_FOUND");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("concurrent issueApproval: exactly one succeeds, one returns ALREADY_APPROVED", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const plan = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(plan.ok, true);
+      if (!plan.ok) throw new Error("unreachable");
+
+      const [a, b] = await Promise.all([
+        issueApproval(fix.pool, plan.planId, "user:test_a", 3600),
+        issueApproval(fix.pool, plan.planId, "user:test_b", 3600),
+      ]);
+      const results = [a, b];
+      const successes = results.filter((r) => r.ok);
+      const failures = results.filter((r) => !r.ok);
+      assert.equal(successes.length, 1, "exactly one issueApproval should succeed");
+      assert.equal(failures.length, 1, "exactly one issueApproval should return ALREADY_APPROVED");
+      assert.ok(!failures[0]!.ok && failures[0]!.reason === "ALREADY_APPROVED");
+
+      // Confirm exactly one approval row exists.
+      const approvalCount = await fix.pool.query<{ count: string }>(
+        "SELECT COUNT(*) AS count FROM control_plane.plan_approvals WHERE plan_id = $1", [plan.planId],
+      );
+      assert.equal(approvalCount.rows[0]?.count, "1");
     } finally {
       await teardownFixture(fix);
     }
@@ -401,28 +457,24 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
     }
   });
 
-  test("stale lease recovery: re-queues expired leased job", { skip: SKIP }, async () => {
+  test("stale lease recovery: re-queues expired leased job without requiring reapproval", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {
       const plan = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
       assert.equal(plan.ok, true);
       if (!plan.ok) throw new Error("unreachable");
 
-      // Issue a long-lived approval (so the approval does not expire).
+      // Issue a long-lived approval (so the approval does not expire during the test).
       const approval = await issueApproval(fix.pool, plan.planId, "user:test", 3600);
       assert.equal(approval.ok, true);
 
-      // Force an already-expired lease directly in the DB.
+      // Simulate a worker crash: set the job to leased with an expired lease.
+      // The approval is NOT consumed — that only happens at terminal events.
       await fix.pool.query(
         `UPDATE control_plane.jobs
          SET state = 'leased', lease_owner = 'dead_worker', lease_expires_at = now() - interval '1 second'
          WHERE id = $1`,
         [plan.jobId],
-      );
-      // Also mark approval as used so it looks like the worker started.
-      await fix.pool.query(
-        "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1",
-        [plan.planId],
       );
 
       const recovered = await recoverStaleLeases(fix.pool);
@@ -432,22 +484,25 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
         "SELECT state, lease_owner FROM control_plane.jobs WHERE id = $1",
         [plan.jobId],
       );
-      // Approval was consumed at claim time, so the job cannot be directly
-      // re-queued — it needs a fresh approval first.
-      assert.equal(jobRow.rows[0]?.state, "waiting_for_user_action");
+      // Approval survives the retry, so the job goes directly back to 'queued'.
+      assert.equal(jobRow.rows[0]?.state, "queued");
       assert.equal(jobRow.rows[0]?.lease_owner, null);
 
       const planRow = await fix.pool.query<{ status: string }>(
         "SELECT status FROM control_plane.plans WHERE id = $1",
         [plan.planId],
       );
-      assert.equal(planRow.rows[0]?.status, "pending_approval");
+      assert.equal(planRow.rows[0]?.status, "approved");
 
       const tripRow = await fix.pool.query<{ lifecycle_state: string }>(
         "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
         [fix.tripId],
       );
-      assert.equal(tripRow.rows[0]?.lifecycle_state, "planned");
+      assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
+
+      // The re-queued job is immediately claimable without a new approval.
+      const reclaim = await claimJob(fix.pool, "worker_02", 60);
+      assert.equal(reclaim.ok, true);
     } finally {
       await teardownFixture(fix);
     }
@@ -504,7 +559,7 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
     }
   });
 
-  test("failJob with remaining attempts: re-queues the job", { skip: SKIP }, async () => {
+  test("failJob with remaining attempts: re-queues without requiring reapproval", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {
       await setupApprovedJob(fix);
@@ -521,22 +576,66 @@ describe("claimJob / heartbeat / completeJob / failJob", () => {
         "SELECT state, safe_error_code FROM control_plane.jobs WHERE id = $1",
         [claim.claim.jobId],
       );
-      // attempt (1) < max_attempts (3) → retryable. The approval was consumed
-      // at claim time so the job needs a fresh approval before re-claim.
-      assert.equal(jobRow.rows[0]?.state, "waiting_for_user_action");
+      // attempt (1) < max_attempts (3) → retryable. Approval survives, so the
+      // job goes directly back to 'queued' without plan/trip reversion.
+      assert.equal(jobRow.rows[0]?.state, "queued");
       assert.equal(jobRow.rows[0]?.safe_error_code, null);
 
       const planRow = await fix.pool.query<{ status: string }>(
         "SELECT status FROM control_plane.plans WHERE trip_id = $1",
         [fix.tripId],
       );
-      assert.equal(planRow.rows[0]?.status, "pending_approval");
+      assert.equal(planRow.rows[0]?.status, "approved");
 
       const tripRow = await fix.pool.query<{ lifecycle_state: string }>(
         "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
         [fix.tripId],
       );
-      assert.equal(tripRow.rows[0]?.lifecycle_state, "planned");
+      assert.equal(tripRow.rows[0]?.lifecycle_state, "provisioning_approved");
+
+      // The re-queued job is immediately claimable without a new approval.
+      const reclaim = await claimJob(fix.pool, "worker_02", 60);
+      assert.equal(reclaim.ok, true);
+      assert.equal(reclaim.ok && reclaim.claim.jobId, claim.claim.jobId);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("retry path: claim → transient fail → re-claim → complete without reapproval", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { planId, jobId } = await setupApprovedJob(fix);
+
+      // First attempt: claim and fail transiently.
+      const first = await claimJob(fix.pool, "worker_01", 60);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      assert.equal(first.claim.attempt, 1);
+
+      await failJob(fix.pool, jobId, "worker_01", "TRANSIENT_ERROR");
+
+      // Second attempt: re-claim using the same approval — no new approval needed.
+      const second = await claimJob(fix.pool, "worker_02", 60);
+      assert.equal(second.ok, true);
+      if (!second.ok) throw new Error("unreachable");
+      assert.equal(second.claim.jobId, jobId);
+      assert.equal(second.claim.attempt, 2);
+
+      // Complete successfully.
+      const completed = await completeJob(fix.pool, jobId, "worker_02", { output: "ok" });
+      assert.equal(completed, true);
+
+      const jobRow = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [jobId],
+      );
+      assert.equal(jobRow.rows[0]?.state, "succeeded");
+
+      // Approval is consumed after terminal success.
+      const approvalRow = await fix.pool.query<{ used_at: Date | null }>(
+        "SELECT used_at FROM control_plane.plan_approvals WHERE plan_id = $1", [planId],
+      );
+      assert.ok(approvalRow.rows[0]?.used_at !== null);
     } finally {
       await teardownFixture(fix);
     }

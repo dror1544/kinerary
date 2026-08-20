@@ -68,11 +68,10 @@ export async function claimJob(
        WHERE id = $3`,
       [workerId, leaseExpiresAt, job.job_id],
     );
-    // Mark the approval used — one-time use.
-    await client.query(
-      "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL",
-      [job.plan_id],
-    );
+    // Approval is NOT consumed here — it stays valid across retries so the
+    // organizer does not need to re-approve a transient failure. It is
+    // consumed only at terminal success (completeJob) or failure (failJob /
+    // recoverStaleLeases when attempt >= max_attempts).
 
     await client.query("COMMIT");
 
@@ -120,10 +119,10 @@ export async function heartbeat(
 
 /**
  * Re-queues jobs whose leases expired without a successful completion.
- * Jobs that have exhausted max_attempts are moved to failed instead.
- * Jobs with remaining attempts move to waiting_for_user_action and their
- * plan/trip are reverted so the organizer can issue a fresh approval before
- * the next claim attempt (the prior approval was consumed at claim time).
+ * Jobs with remaining attempts go back to 'queued' — the existing approval
+ * covers the retry so the organizer does not need to re-approve a transient
+ * failure. Jobs that have exhausted max_attempts are moved to 'failed' and
+ * their approval is consumed so it cannot authorize a future attempt.
  * Returns the number of jobs recovered.
  */
 export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
@@ -132,12 +131,12 @@ export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
     await client.query("BEGIN");
 
     const result = await client.query<{
-      plan_id: string; trip_id: string; attempt: number; max_attempts: number;
+      plan_id: string; attempt: number; max_attempts: number;
     }>(
       `UPDATE control_plane.jobs
        SET state = CASE
              WHEN attempt >= max_attempts THEN 'failed'
-             ELSE 'waiting_for_user_action'
+             ELSE 'queued'
            END,
            safe_error_code = CASE
              WHEN attempt >= max_attempts THEN 'LEASE_EXHAUSTED'
@@ -148,24 +147,17 @@ export async function recoverStaleLeases(db: pg.Pool): Promise<number> {
            updated_at = now()
        WHERE state = 'leased'
          AND lease_expires_at < now()
-       RETURNING plan_id, trip_id, attempt, max_attempts`,
+       RETURNING plan_id, attempt, max_attempts`,
     );
 
-    // For retriable jobs: revert plan + trip so the organizer can re-approve.
-    const retriable = result.rows.filter((r) => r.attempt < r.max_attempts);
-    if (retriable.length > 0) {
-      const planIds = [...new Set(retriable.map((r) => r.plan_id))];
-      const tripIds = [...new Set(retriable.map((r) => r.trip_id))];
+    // Terminal jobs only: consume the approval so it cannot authorize a new run.
+    // Retriable jobs leave the approval intact; claimJob will re-use it.
+    const terminal = result.rows.filter((r) => r.attempt >= r.max_attempts);
+    if (terminal.length > 0) {
+      const planIds = [...new Set(terminal.map((r) => r.plan_id))];
       await client.query(
-        "UPDATE control_plane.plans SET status = 'pending_approval', updated_at = now() WHERE id = ANY($1)",
+        "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = ANY($1) AND used_at IS NULL",
         [planIds],
-      );
-      // Only revert trips still in provisioning_approved; a trip that has moved
-      // further along should not be wound back.
-      await client.query(
-        `UPDATE control_plane.trips SET lifecycle_state = 'planned', updated_at = now()
-         WHERE id = ANY($1) AND lifecycle_state = 'provisioning_approved'`,
-        [tripIds],
       );
     }
 
@@ -212,7 +204,8 @@ export async function recoverExpiredApprovals(db: pg.Pool): Promise<number> {
 }
 
 /**
- * Marks a job as succeeded and records the result.
+ * Marks a job as succeeded and records the result. Atomically consumes the
+ * plan approval so it cannot authorize a future run after terminal success.
  */
 export async function completeJob(
   db: pg.Pool,
@@ -220,25 +213,43 @@ export async function completeJob(
   workerId: string,
   result: unknown,
 ): Promise<boolean> {
-  const updateResult = await db.query(
-    `UPDATE control_plane.jobs
-     SET state = 'succeeded',
-         result = $1::jsonb,
-         lease_owner = NULL,
-         lease_expires_at = NULL,
-         updated_at = now()
-     WHERE id = $2 AND lease_owner = $3 AND state = 'leased'`,
-    [JSON.stringify(result), jobId, workerId],
-  );
-  return (updateResult.rowCount ?? 0) > 0;
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const updateResult = await client.query<{ plan_id: string }>(
+      `UPDATE control_plane.jobs
+       SET state = 'succeeded',
+           result = $1::jsonb,
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           updated_at = now()
+       WHERE id = $2 AND lease_owner = $3 AND state = 'leased'
+       RETURNING plan_id`,
+      [JSON.stringify(result), jobId, workerId],
+    );
+    if ((updateResult.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    await client.query(
+      "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL",
+      [updateResult.rows[0]!.plan_id],
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**
  * Fails a job step with a safe error code. If the job has remaining attempts
- * it moves to waiting_for_user_action and the plan/trip are reverted so the
- * organizer can issue a fresh approval (the prior approval was consumed at
- * claim time and cannot be reused). If attempts are exhausted the job is
- * marked failed.
+ * it moves back to 'queued' so the existing approval can authorize the next
+ * claim — the organizer does not need to re-approve a transient failure. If
+ * attempts are exhausted the job is marked failed and the approval is consumed.
  */
 export async function failJob(
   db: pg.Pool,
@@ -251,12 +262,12 @@ export async function failJob(
     await client.query("BEGIN");
 
     const result = await client.query<{
-      plan_id: string; trip_id: string; attempt: number; max_attempts: number;
+      plan_id: string; attempt: number; max_attempts: number;
     }>(
       `UPDATE control_plane.jobs
        SET state = CASE
              WHEN attempt >= max_attempts THEN 'failed'
-             ELSE 'waiting_for_user_action'
+             ELSE 'queued'
            END,
            safe_error_code = CASE
              WHEN attempt >= max_attempts THEN $1
@@ -266,7 +277,7 @@ export async function failJob(
            lease_expires_at = NULL,
            updated_at = now()
        WHERE id = $2 AND lease_owner = $3 AND state = 'leased'
-       RETURNING plan_id, trip_id, attempt, max_attempts`,
+       RETURNING plan_id, attempt, max_attempts`,
       [safeErrorCode, jobId, workerId],
     );
 
@@ -276,18 +287,14 @@ export async function failJob(
     }
 
     const row = result.rows[0]!;
-    if (row.attempt < row.max_attempts) {
-      // Retryable: revert plan + trip so the organizer can re-approve.
+    if (row.attempt >= row.max_attempts) {
+      // Terminal: consume the approval so it cannot authorize a future run.
       await client.query(
-        "UPDATE control_plane.plans SET status = 'pending_approval', updated_at = now() WHERE id = $1",
+        "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL",
         [row.plan_id],
       );
-      await client.query(
-        `UPDATE control_plane.trips SET lifecycle_state = 'planned', updated_at = now()
-         WHERE id = $1 AND lifecycle_state = 'provisioning_approved'`,
-        [row.trip_id],
-      );
     }
+    // Retriable: approval stays valid; claimJob will re-use it on the next attempt.
 
     await client.query("COMMIT");
     return true;
