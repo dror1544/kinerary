@@ -19,6 +19,10 @@ WHERE iv.data = '{}'::jsonb
   AND s.answers <> '{}'::jsonb;
 
 ALTER TABLE control_plane.notification_outbox
+  ALTER COLUMN signup_request_id DROP NOT NULL,
+  DROP CONSTRAINT IF EXISTS notification_outbox_notification_type_check;
+
+ALTER TABLE control_plane.notification_outbox
   ADD COLUMN trip_id text REFERENCES control_plane.trips(id),
   ADD COLUMN kind text,
   ADD COLUMN recipient text,
