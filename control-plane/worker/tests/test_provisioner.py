@@ -147,28 +147,29 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
+def run_test_migrations() -> None:
+    from pathlib import Path
+    conn = psycopg.connect(DB_URL, autocommit=True)
+    migrations_dir = Path(__file__).parent.parent.parent / "db" / "migrations"
+    conn.autocommit = False
+    conn.execute("CREATE TABLE IF NOT EXISTS public.control_plane_schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+    conn.commit()
+    for sql_file in sorted(migrations_dir.glob("*.sql")):
+        version = sql_file.name
+        row = conn.execute("SELECT 1 FROM public.control_plane_schema_migrations WHERE version = %s", (version,)).fetchone()
+        if row:
+            continue
+        conn.execute(sql_file.read_text(encoding="utf-8"))
+        conn.execute("INSERT INTO public.control_plane_schema_migrations(version) VALUES (%s)", (version,))
+        conn.commit()
+    conn.close()
+
+
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
 class ProvisionerHappyPathTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        from pathlib import Path
-        from control_plane_worker.provisioner import ProvisionerWorker as _W
-        # Apply migrations before tests run.
-        conn = psycopg.connect(DB_URL, autocommit=True)
-        # Reuse the TS migration system indirectly by running them via psql-like loop.
-        migrations_dir = Path(__file__).parent.parent.parent / "db" / "migrations"
-        conn.autocommit = False
-        conn.execute("CREATE TABLE IF NOT EXISTS public.control_plane_schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
-        conn.commit()
-        for sql_file in sorted(migrations_dir.glob("*.sql")):
-            version = sql_file.name
-            row = conn.execute("SELECT 1 FROM public.control_plane_schema_migrations WHERE version = %s", (version,)).fetchone()
-            if row:
-                continue
-            conn.execute(sql_file.read_text(encoding="utf-8"))
-            conn.execute("INSERT INTO public.control_plane_schema_migrations(version) VALUES (%s)", (version,))
-            conn.commit()
-        conn.close()
+        run_test_migrations()
         cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
 
     @classmethod
@@ -272,6 +273,7 @@ class ProvisionerHappyPathTests(unittest.TestCase):
 class ProvisionerFailureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        run_test_migrations()
         cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
 
     @classmethod
