@@ -26,6 +26,17 @@ export async function generatePlan(
   tripId: string,
   correlationId: string,
 ): Promise<GeneratePlanResult> {
+  // Return the stable duplicate-request result before checking lifecycle. Once a
+  // plan is created the trip advances from intake_confirmed to planned, so doing
+  // the lifecycle check first made later calls report TRIP_NOT_CONFIRMED instead
+  // of PLAN_ALREADY_PENDING. The partial unique index still closes the race when
+  // two requests both pass this read before either inserts.
+  const activePlanRow = await db.query(
+    "SELECT id FROM control_plane.plans WHERE trip_id = $1 AND status IN ('pending_approval', 'approved') LIMIT 1",
+    [tripId],
+  );
+  if (activePlanRow.rows.length > 0) return { ok: false, reason: "PLAN_ALREADY_PENDING" };
+
   const tripRow = await db.query<{ lifecycle_state: string }>(
     "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
     [tripId],
