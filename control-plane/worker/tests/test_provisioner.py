@@ -156,7 +156,7 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # Apply migrations before tests run.
         conn = psycopg.connect(DB_URL, autocommit=True)
         # Reuse the TS migration system indirectly by running them via psql-like loop.
-        migrations_dir = Path(__file__).parent.parent.parent.parent / "db" / "migrations"
+        migrations_dir = Path(__file__).parent.parent.parent / "db" / "migrations"
         conn.autocommit = False
         conn.execute("CREATE TABLE IF NOT EXISTS public.control_plane_schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
         conn.commit()
