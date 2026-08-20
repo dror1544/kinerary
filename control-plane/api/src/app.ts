@@ -757,6 +757,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!result.ok) {
       const status = result.reason === "TRIP_NOT_FOUND" ? 404
         : result.reason === "INVALID_STATE" ? 409
+        : result.reason === "INVALID_ANSWERS" ? 422
         : 400;
       return reply.code(status).send({ error: result.reason });
     }
