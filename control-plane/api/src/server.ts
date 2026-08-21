@@ -23,16 +23,21 @@ const pool = createDatabasePool(connectionString, () => {
 let signup: SignupDependencies | undefined;
 if (profile.signup) {
   const signupConfig = profile.signup;
-  const [botToken, actionSecret, webhookSecret] = await Promise.all([
+  const [botToken, actionSecret, webhookSecret, superAdminChatId] = await Promise.all([
     resolveSecretRef(signupConfig.telegram_bot_token_secret_ref),
     resolveSecretRef(signupConfig.action_secret_ref),
     resolveSecretRef(signupConfig.webhook_secret_ref),
+    signupConfig.super_admin_chat_id_secret_ref
+      ? resolveSecretRef(signupConfig.super_admin_chat_id_secret_ref)
+      : Promise.resolve(undefined),
   ]);
   // validateBeforeProvider re-checks the already-loaded profile immediately
   // before this build's first provider construction, per the ordering
   // guarantee its own test asserts: an invalid profile must never reach a
   // constructed provider.
-  const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging));
+  const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
+    telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`) } : undefined,
+  }));
   signup = {
     db: pool,
     config: {

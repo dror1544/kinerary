@@ -10,6 +10,8 @@ services:
     secrets: [postgres_password]
     volumes:
       - control_plane_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U kinerary_control_plane -d kinerary_control_plane"]
       interval: 2s
@@ -46,7 +48,7 @@ services:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
-    secrets: [control_plane_database_url]
+    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]
     configs:
       - source: architecture_profile
         target: /run/config/architecture.json
@@ -85,6 +87,14 @@ secrets:
     file: ./.local-secrets/postgres_password
   control_plane_database_url:
     file: ./.local-secrets/control_plane_database_url
+  telegram_creds:
+    file: ./.local-secrets/telegram_creds
+  approval_signing_key:
+    file: ./.local-secrets/approval_signing_key
+  telegram_webhook_secret:
+    file: ./.local-secrets/telegram_webhook_secret
+  telegram_super_admin_chat_id:
+    file: ./.local-secrets/telegram_super_admin_chat_id
 
 configs:
   architecture_profile:
@@ -95,5 +105,4 @@ volumes:
 
 networks:
   ingress: {}
-  private:
-    internal: true
+  private: {}

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import Fastify from "fastify";
 import type pg from "pg";
 import type { ArchitectureProfile } from "./config.js";
+import { resolveTelegramCallbackRef, answerTelegramCallbackQuery } from "./adapters/telegram.js";
 import { issueEnrollment, verifyEnrollmentToken, type EnrollmentConfig } from "./enrollment.js";
 import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
 import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
@@ -168,24 +169,52 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const body = request.body as Record<string, unknown>;
     const callbackQuery = body?.callback_query as Record<string, unknown> | undefined;
     const from = callbackQuery?.from as Record<string, unknown> | undefined;
-    const token = callbackQuery?.data;
+    const callbackData = callbackQuery?.data;
+    const callbackQueryId = callbackQuery?.id;
     const fromId = from?.id;
 
     if (
       !callbackQuery
-      || typeof token !== "string"
+      || typeof callbackData !== "string"
+      || typeof callbackQueryId !== "string"
       || (typeof fromId !== "number" && typeof fromId !== "string")
     ) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
+    // A real Telegram button only ever carries a short callback_data ref
+    // (see db/migrations/0014 — the actual signed token is too long for
+    // Telegram's 64-byte limit and never appears in the request at all).
+    // Resolving it back to the real token here is a pure transport-layer
+    // expansion; verifyApprovalAction below still does the exact same HMAC
+    // and expiry check it always has, on the exact same token shape.
+    //
+    // Existing tests that hand this route a raw signed token directly
+    // (bypassing an actual Telegram round trip) keep working unmodified: a
+    // full token never matches a stored ref, so resolution falls through
+    // and the value is used as-is, same as before this indirection existed.
+    const resolvedToken = await resolveTelegramCallbackRef(signup.db, callbackData) ?? callbackData;
+
     const senderDigest = digestTelegramId(String(fromId));
 
     const result = await processApprovalCallback(
       signup.db,
-      token,
+      resolvedToken,
       senderDigest,
       signup.config,
+    );
+
+    // Best-effort: Telegram shows a loading spinner on the tapped button
+    // until this is called. A failure here must never mask the real
+    // approve/reject outcome already computed above.
+    void answerTelegramCallbackQuery(
+      signup.botToken,
+      callbackQueryId,
+      result.outcome === "approved" ? "Approved"
+        : result.outcome === "rejected" ? "Rejected"
+        : result.outcome === "already_decided" ? "Already decided"
+        : "Could not process this action",
+      log,
     );
 
     if (result.outcome === "error") {

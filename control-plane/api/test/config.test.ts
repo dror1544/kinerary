@@ -71,7 +71,10 @@ test("worker health is private and production cannot select the test allocation"
     ...raw,
     environment: "production",
     test_resources: { enabled: false },
-    adapters: { ...raw.adapters, messaging: "telegram" },
+    // A generic stand-in for "not fake" — deliberately not "telegram",
+    // which since Sprint 5 carries its own schema requirement
+    // (super_admin_chat_id_secret_ref) unrelated to what this test checks.
+    adapters: { ...raw.adapters, messaging: "not-fake" },
   }));
 });
 
@@ -87,12 +90,13 @@ test("a production profile with signup configured cannot select the fake messagi
   }));
   // Selecting a non-fake messaging adapter clears the block, at the schema
   // level — whether that adapter is actually implemented yet is a runtime
-  // concern (createNotificationAdapter), not a profile-shape concern.
+  // concern (createNotificationAdapter), not a profile-shape concern. Uses
+  // the same generic stand-in as the test above, for the same reason.
   assert.doesNotThrow(() => validateArchitectureProfile({
     ...raw,
     environment: "production",
     test_resources: { enabled: false },
-    adapters: { ...raw.adapters, messaging: "telegram" },
+    adapters: { ...raw.adapters, messaging: "not-fake" },
   }));
   // A production profile with no signup block at all is unaffected by this
   // rule regardless of the messaging adapter it selects.
@@ -102,4 +106,23 @@ test("a production profile with signup configured cannot select the fake messagi
     environment: "production",
     test_resources: { enabled: false },
   }));
+});
+
+test("the telegram messaging adapter needs super_admin_chat_id_secret_ref", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // The digest in super_admin_subject_digest cannot be reversed to find
+  // where to send the outbound approval DM — a separate raw-ID reference is
+  // required whenever "telegram" is actually selected.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    adapters: { ...raw.adapters, messaging: "telegram" },
+  }));
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    adapters: { ...raw.adapters, messaging: "telegram" },
+    signup: { ...raw.signup, super_admin_chat_id_secret_ref: "env://CONTROL_PLANE_SUPER_ADMIN_CHAT_ID" },
+  }));
+  // Not required for adapters other than "telegram" — including "fake",
+  // which never sends anything and so never needs a destination.
+  assert.doesNotThrow(() => validateArchitectureProfile(raw));
 });
