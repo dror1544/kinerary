@@ -2506,6 +2506,18 @@ window.saveBudgetEdit   = saveBudgetEdit;
    BOOKINGS
    ========================================================= */
 const TYPE_ICONS = { flight: '✈️', hotel: '🏨', car: '🚗', attraction: '⚡', other: '📌' };
+// Booking types that "can't be moved" once they exist — the anchor events
+// the Home Full Overview is built from. attraction bookings are filtered
+// further at call sites: a loose idea with no date isn't an anchor yet.
+const ANCHOR_TYPES = ['flight', 'hotel', 'attraction'];
+
+// Fallback for anywhere a Maps link is expected but no explicit mapsUrl was
+// authored — builds a search link from whatever free-text address exists,
+// so a still-TBD hotel is at least clickable to its area.
+function googleMapsUrl(query) {
+  if (!query) return null;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+}
 // Empty by default — unlisted phase ids just fall back to showing the raw id
 // (see usage below), which is fine; no hardcoded per-trip phase list needed.
 const PHASE_LABELS = {};
@@ -2519,27 +2531,61 @@ function bkConfUrls(confFile) {
   return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}` };
 }
 
-function buildBookingRow(b, canEdit) {
-  const tr = T[currentLang] || T['he'];
-  const icon = TYPE_ICONS[b.type] || '📌';
-  const cancelled = b.name.startsWith('❌');
-  const dates = [b.date_from, b.date_to].filter(Boolean).join(' → ');
+// Local to this section rather than reusing esc()/safeUrl() from the
+// RENDER_FUNS region below: those are already relied on by ~30 call sites in
+// the itinerary-plan-item renderers, and moving them out would drag that
+// unrelated, separately-tested code along for the ride. Same escaping rules,
+// scoped to booking-derived markup specifically.
+function bkEsc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+// Only ever emit an http(s) href — a stored `javascript:` URL in a booking's
+// location/wallet field would otherwise execute for every viewer.
+function bkSafeUrl(u) {
+  const s = String(u ?? '').trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
+// Shared by the Bookings tab (buildBookingRow) and the Home "Full Overview"
+// anchor list — the clickable-reference badges (confirmation, PDF, wallet,
+// location→Maps) are the same "review it" affordance in both places, so
+// there's exactly one place that builds that markup. Every field here can be
+// set by any authenticated participant via the booking form, so it's all
+// escaped/sanitized before it reaches innerHTML.
+function bookingRefBadges(b) {
   const urls = bkConfUrls(b.conf_file);
   const pdfLink = urls
     ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}" target="_blank" title="View">👁</a><a class="conf-pdf" href="${urls.download}" download title="Download">⬇</a></span>`
     : '';
-  const confBadge = b.confirmation ? `<span class="conf">${b.confirmation}</span>` : '';
+  const confBadge = b.confirmation ? `<span class="conf">${bkEsc(b.confirmation)}</span>` : '';
+  const appleWalletBadge = b.pkpass_file
+    ? `<a href="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
+    : '';
+  // bkSafeUrl() only validates the scheme — the rest of an attacker-chosen
+  // URL (e.g. a literal " character) still needs HTML-escaping before it's
+  // safe to sit inside a quoted href attribute, same as esc(safeUrl(x)) is
+  // already used for URLs elsewhere in this file (itinerary plan items).
+  const googleWalletUrl = bkEsc(bkSafeUrl(b.google_wallet_url));
+  const googleWalletBadge = googleWalletUrl
+    ? `<a href="${googleWalletUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
+    : '';
+  const locationUrl = bkEsc(bkSafeUrl(b.location_url));
+  const locationBadge = locationUrl
+    ? `<a href="${locationUrl}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
+    : '';
+  return `${confBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}`;
+}
+
+function buildBookingRow(b, canEdit) {
+  const icon = TYPE_ICONS[b.type] || '📌';
+  const cancelled = b.name.startsWith('❌');
+  // date_from/date_to are accepted by POST/PATCH /api/bookings with no
+  // format validation, so they're just as attacker-controlled as name.
+  const dates = bkEsc([b.date_from, b.date_to].filter(Boolean).join(' → '));
   const pinBadge = b.pin ? `<span style="margin-right:6px;font-size:12px;color:var(--ink-2)">PIN: ${b.pin}</span>` : '';
   const costStr = b.cost ? `$${Number(b.cost).toLocaleString()}` : '–';
-  const appleWalletBadge = b.pkpass_file
-    ? `<a href="/api/bookings/wallet-apple/${b.pkpass_file}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
-    : '';
-  const googleWalletBadge = b.google_wallet_url
-    ? `<a href="${b.google_wallet_url}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/google-wallet-badge.svg" alt="Add to Google Wallet" style="height:52px;display:block"></a>`
-    : '';
-  const locationBadge = b.location_url
-    ? `<a href="${b.location_url}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:2px;color:var(--accent);font-size:12px;text-decoration:none;vertical-align:middle;margin-right:4px" title="Location">📍</a>`
-    : '';
   const editBtn = canEdit
     ? `<button onclick="editBooking(${b.id})" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--accent);padding:0 4px" title="Edit">✏️</button>`
     : '';
@@ -2547,10 +2593,10 @@ function buildBookingRow(b, canEdit) {
     ? `<button onclick="deleteBooking(${b.id})" style="border:none;background:none;cursor:pointer;font-size:13px;color:var(--warn);padding:0 4px" title="Delete">🗑️</button>`
     : '';
   return `<tr style="${cancelled ? 'opacity:0.55;text-decoration:line-through' : ''}">
-    <td>${icon} ${b.name}</td>
+    <td>${icon} ${bkEsc(b.name)}</td>
     <td style="white-space:nowrap">${dates || '–'}</td>
     <td>${b.passengers || '–'}</td>
-    <td>${confBadge}${pinBadge}${pdfLink}${appleWalletBadge}${googleWalletBadge}${locationBadge}</td>
+    <td>${bookingRefBadges(b)}${pinBadge}</td>
     <td style="white-space:nowrap">${costStr}</td>
     <td style="white-space:nowrap">${editBtn}${delBtn}</td>
   </tr>`;
@@ -2765,6 +2811,7 @@ async function submitBooking() {
     hideBookingForm();
     loadBookings();
     if (body.phase) loadPhaseBookings(body.phase);
+    loadHomeOverview(window.TRIP_CONFIG);
   } catch {
     errEl.textContent = tr.bk_err_server;
   }
@@ -2776,6 +2823,7 @@ async function deleteBooking(id) {
   const token = localStorage.getItem('trip-token');
   await fetch(`/api/bookings/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
   loadBookings();
+  loadHomeOverview(window.TRIP_CONFIG);
 }
 
 async function editBooking(id) {
@@ -3009,7 +3057,9 @@ function buildGlobalsFromConfig(cfg) {
       blurb: p.hero.blurb?.he || p.hero.blurb,
       meta:  p.hero.meta,
       cta:   p.hero.cta?.he   || p.hero.cta,
-      countdown: p.hero.countdown || false,
+      // Every phase page shows the same live trip clock as home — no per-phase
+      // opt-in; there's no case for a phase page without it.
+      countdown: true,
       _i18n: p.hero, // store bilingual source for setHero
     };
   });
@@ -3147,7 +3197,6 @@ function safeUrl(u) {
   return /^https?:\/\//i.test(s) ? s : '';
 }
 
-
 function applyBrandFromConfig(cfg) {
   if (!cfg?.meta) return;
   const title = cfg.meta.title || 'Family Trip';
@@ -3238,7 +3287,7 @@ function renderHomePhases(cfg) {
         ? `${p.dates.start.slice(5).replace('-','/')} — ${p.dates.end.slice(5).replace('-','/')}`
         : '');
     const count = p.participants?.length;
-    return `<div class="phase">
+    return `<div class="phase" data-tab="${p.id}" role="button" tabindex="0">
       <div class="ph-date">${display}</div>
       <div class="ph-place">${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}</div>
       ${count ? `<div class="ph-people"><span class="lang-he">${count} נפשות</span><span class="lang-en">${count} people</span></div>` : ''}
@@ -3246,43 +3295,132 @@ function renderHomePhases(cfg) {
   }).join('');
 }
 
-function renderHomeOverview(cfg) {
+// Delegated so it survives renderHomePhases() re-rendering the cards on
+// language switch, rather than needing to re-wire listeners every time.
+document.getElementById('home-phases')?.addEventListener('click', e => {
+  const card = e.target.closest('[data-tab]');
+  if (card) switchTab(card.dataset.tab);
+});
+document.getElementById('home-phases')?.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const card = e.target.closest('[data-tab]');
+  if (card) { e.preventDefault(); switchTab(card.dataset.tab); }
+});
+
+// One hotel anchor per phase, from the same accommodation field
+// renderPhaseHotelCard() already reads — not a second hand-authored source.
+function accommodationAnchors(cfg) {
+  return (cfg.phases || []).map(p => {
+    const acc = p.accommodation;
+    if (!acc) return null;
+    const rawName = acc.name || acc.note;
+    const name = typeof rawName === 'string' ? rawName : (rawName?.he || rawName?.en || '');
+    if (!name) return null;
+    return {
+      type: 'hotel',
+      phaseId: p.id,
+      name,
+      phaseLabel: `${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}`,
+      date_from: p.dates?.start || null,
+      date_to: p.dates?.end || null,
+      confirmation: acc.confirmation || null,
+      conf_file: acc.pdf || null,
+      location_url: acc.mapsUrl || acc.maps || (acc.address ? googleMapsUrl(acc.address) : null),
+    };
+  }).filter(Boolean);
+}
+
+// Anchor = an event that can't be moved once it exists. A cancelled booking
+// (the Bookings tab's own convention: name starts with ❌) no longer is one —
+// exclude it rather than show a dead reservation as if it were locked in.
+// flight/hotel are otherwise unconditional (a booking of that type is
+// inherently date-bound); an attraction is only an anchor once it has a
+// fixed date — a loose idea with no date is still a wishlist entry, not
+// something locked in.
+// A later pass could send borderline attractions (dated but no
+// confirmation/conf_file yet) through an LLM to read notes/PDF text and
+// catch what this deterministic check gets wrong; not built here.
+function isAnchorBooking(b) {
+  if (b.name?.startsWith('❌')) return false;
+  if (!ANCHOR_TYPES.includes(b.type)) return false;
+  if (b.type === 'attraction') return !!b.date_from;
+  return true;
+}
+
+function bookingAnchors(cfg, bookings) {
+  return bookings.filter(isAnchorBooking).map(b => {
+    const phase = (cfg.phases || []).find(p => p.id === b.phase);
+    const phaseLabel = phase
+      ? `${phase.emoji || ''} ${_biSpan(phase.title || { he: phase.tabLabel, en: phase.tabLabel })}`
+      : esc((PHASE_LABELS[b.phase] || {})[currentLang] || b.phase);
+    return { ...b, phaseLabel };
+  });
+}
+
+function renderHomeOverview(cfg, anchors) {
   const el = document.getElementById('home-overview');
   if (!el || !cfg?.phases?.length) return;
   const tr = T[currentLang] || T['he'];
-  const rows = cfg.phases.map(p => {
-    const dates = p.dates?.display ||
-      (p.dates?.start ? `${p.dates.start.slice(5).replace('-','/')} – ${(p.dates.end || '').slice(5).replace('-','/')}` : '–');
-    const count = p.participants?.length;
-    const countHtml = count
-      ? `<span class="lang-he">${count} נפשות</span><span class="lang-en">${count} people</span>`
-      : '–';
-    const acc = p.accommodation;
-    let accHtml = '–';
-    if (acc) {
-      const rawName = acc.name || acc.note;
-      const name = typeof rawName === 'string' ? rawName : (rawName?.he || rawName?.en || '');
-      if (name) {
-        accHtml = acc.mapsUrl ? `<a class="map-link" href="${acc.mapsUrl}" target="_blank">${name}</a>` : name;
-        if (acc.confirmation) accHtml += ` <span class="bk-chip">${acc.confirmation}</span>`;
-      }
-    }
+  const sorted = anchors.slice().sort((a, b) => (a.date_from || '').localeCompare(b.date_from || ''));
+  const rows = sorted.map(a => {
+    // date_from/date_to on a booking-derived anchor are accepted by
+    // POST/PATCH /api/bookings with no format validation — just as
+    // attacker-controlled as name.
+    const dates = esc([a.date_from, a.date_to].filter(Boolean).join(' → ') || '–');
+    const icon = TYPE_ICONS[a.type] || '📌';
     return `<tr>
-      <td>${dates}</td>
-      <td>${p.emoji || ''} ${_biSpan(p.title || { he: p.tabLabel, en: p.tabLabel })}</td>
-      <td>${countHtml}</td>
-      <td>${accHtml}</td>
+      <td style="white-space:nowrap">${dates}</td>
+      <td>${icon} ${esc(a.name)}</td>
+      <td>${a.phaseLabel || '–'}</td>
+      <td>${bookingRefBadges(a) || '–'}</td>
     </tr>`;
   }).join('');
   el.innerHTML = `<div class="tbl-wrap"><table>
     <tr>
       <th data-i18n="th_dates">${tr.th_dates || 'תאריכים'}</th>
+      <th data-i18n="th_anchor">${tr.th_anchor || 'אירוע'}</th>
       <th data-i18n="th_dest">${tr.th_dest || 'יעד'}</th>
-      <th data-i18n="th_people">${tr.th_people || 'משתתפים'}</th>
-      <th data-i18n="th_stay">${tr.th_stay || 'לינה'}</th>
+      <th data-i18n="th_ref">${tr.th_ref || 'הפניות'}</th>
     </tr>
-    ${rows}
+    ${rows || `<tr><td colspan="4" style="text-align:center;color:var(--ink-2);padding:20px 0">–</td></tr>`}
   </table></div>`;
+}
+
+// True only when a hotel booking plausibly IS the phase's accommodation
+// placeholder, not just another hotel booking that happens to share a phase
+// (e.g. a one-night airport stopover shouldn't hide the main stay). A
+// matching confirmation code is authoritative on its own; short of that,
+// require the stay dates to overlap AND the names to loosely agree
+// (case/whitespace-insensitive substring, so "Hotel Meridian" still matches
+// a booking named "Hotel Meridian (confirmed)").
+function sameStay(acc, booking) {
+  if (acc.confirmation && booking.confirmation) return acc.confirmation === booking.confirmation;
+  const accFrom = acc.date_from, accTo = acc.date_to || acc.date_from;
+  const bkFrom = booking.date_from, bkTo = booking.date_to || booking.date_from;
+  const overlaps = !!(accFrom && bkFrom && bkFrom <= accTo && bkTo >= accFrom);
+  if (!overlaps) return false;
+  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const a = norm(acc.name), b = norm(booking.name);
+  return !!a && !!b && (a.includes(b) || b.includes(a));
+}
+
+async function loadHomeOverview(cfg) {
+  if (!cfg?.phases?.length) return;
+  const token = localStorage.getItem('trip-token');
+  let bookings = [];
+  try {
+    const res = await fetch('/api/bookings', { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (res.ok) bookings = await res.json();
+  } catch { /* renders hotel-only anchors below if bookings can't be reached */ }
+  const bkAnchors = bookingAnchors(cfg, bookings);
+  const bkHotels = bkAnchors.filter(b => b.type === 'hotel');
+  // A phase whose hotel is already a real booking shouldn't also show the
+  // accommodation placeholder — prefer the booking record (it carries the
+  // actual confirmation/PDF/wallet) over trip.config.json's authored
+  // stand-in — but only for the SAME stay, not any hotel booking on the phase.
+  const accAnchors = accommodationAnchors(cfg)
+    .filter(acc => !bkHotels.some(bk => bk.phase === acc.phaseId && sameStay(acc, bk)));
+  renderHomeOverview(cfg, [...accAnchors, ...bkAnchors]);
 }
 
 function _bi(obj, lang) {
@@ -3380,7 +3518,7 @@ function renderPhaseHotelCard(phase) {
   const guests = acc.guests;
   const rooms = acc.rooms;
   const phone = acc.phone;
-  const mapsUrl = acc.mapsUrl || acc.maps;
+  const mapsUrl = acc.mapsUrl || acc.maps || (addr ? googleMapsUrl(addr) : null);
   const wazeUrl = acc.waze;
   const weatherKey = acc.weatherKey;
   const pdfFile = acc.pdf;
@@ -4064,7 +4202,7 @@ window.addEventListener('load', async () => {
   renderStats(cfg);
   renderAlerts(cfg);
   renderHomePhases(cfg);
-  renderHomeOverview(cfg);
+  loadHomeOverview(cfg);
   renderFamilies(cfg);
   renderTasks(cfg);
   renderTaskDeadlines(currentLang);

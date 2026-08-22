@@ -120,8 +120,7 @@
         "cta": {
           "he": "פרטי טוקיו",
           "en": "Tokyo details"
-        },
-        "countdown": false
+        }
       },
       "accommodation": {
         "name": "מלון טוקיו (TBD)",
@@ -559,8 +558,7 @@
         "cta": {
           "he": "פרטי האקונה",
           "en": "Hakone details"
-        },
-        "countdown": false
+        }
       },
       "accommodation": {
         "name": "ריוקאן האקונה (TBD)",
@@ -719,8 +717,7 @@
         "cta": {
           "he": "פרטי קיוטו",
           "en": "Kyoto details"
-        },
-        "countdown": false
+        }
       },
       "accommodation": {
         "name": "מלון / מינשוקו קיוטו (TBD)",
@@ -948,8 +945,7 @@
         "cta": {
           "he": "פרטי אוסקה",
           "en": "Osaka details"
-        },
-        "countdown": false
+        }
       },
       "accommodation": {
         "name": "מלון Namba / Umeda, אוסקה",

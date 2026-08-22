@@ -124,8 +124,8 @@ const T = {
     /* overview table headers */
     th_dates:       'תאריכים',
     th_dest:        'יעד',
-    th_people:      'משתתפים',
-    th_stay:        'לינה',
+    th_anchor:      'אירוע',
+    th_ref:         'הפניות',
 
     /* tasks table headers */
     th_task:        'משימה',
@@ -444,8 +444,8 @@ const T = {
 
     th_dates:       'Dates',
     th_dest:        'Destination',
-    th_people:      'Participants',
-    th_stay:        'Accommodation',
+    th_anchor:      'Event',
+    th_ref:         'References',
 
     th_task:        'Task',
     th_owner:       'Owner',

@@ -149,7 +149,6 @@ function buildConfig(answers) {
         blurb: bi(hero.blurb_he, hero.blurb_en),
         meta: display,
         cta: bi('צפה בפרטים', 'View details'),
-        countdown: false,
       },
       // {he,en} object — renderPhaseHotelCard() reads it via _bi(acc.name, lang), which also
       // accepts a plain string (same text both languages). Use the bilingual form so a

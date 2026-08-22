@@ -483,7 +483,8 @@ html[dir="ltr"] .alert-i { border-inline-start-color: var(--info); }
   font-size: 11px;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  opacity: 0.85;
+  opacity: 0.95;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);
   margin-bottom: 10px;
 }
 .hero-left h3 {
@@ -491,9 +492,10 @@ html[dir="ltr"] .alert-i { border-inline-start-color: var(--info); }
   font-size: 22px;
   font-weight: 800;
   line-height: 1.25;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);
   margin-bottom: 8px;
 }
-.hero-left p { opacity: 0.92; line-height: 1.55; }
+.hero-left p { opacity: 0.95; line-height: 1.55; text-shadow: 0 1px 3px rgba(0,0,0,0.55); }
 
 /* Countdown card sits in the middle of the hero bottom */
 .hero-countdown {
@@ -524,6 +526,11 @@ html[dir="ltr"] .alert-i { border-inline-start-color: var(--info); }
   font-size: 32px;
   line-height: 1;
   letter-spacing: 0.01em;
+  /* The global `strong { color: var(--ink) }` rule matches this element
+     directly, which beats the merely-inherited white from .hero-countdown
+     regardless of specificity — without this, the countdown digits render
+     in dark ink on the card's dark scrim and disappear. */
+  color: #fff;
 }
 .cu small {
   font-family: var(--font-mono);
@@ -562,7 +569,8 @@ html[dir="ltr"] .hero-right.meta-centered {
   font-size: 11.5px;
   letter-spacing: 0.18em;
   text-transform: uppercase;
-  opacity: 0.85;
+  opacity: 0.95;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.55);
   text-align: end;
 }
 .cta-pill {
@@ -671,13 +679,6 @@ a.inline {
   transition: border-color .2s;
 }
 a.inline:hover { border-color: var(--ink); }
-a.map-link {
-  color: var(--ink); text-decoration: none;
-  border-bottom: 1px dashed var(--ink-3);
-  padding-bottom: 1px;
-  transition: border-color .2s;
-}
-a.map-link:hover { border-bottom-style: solid; border-color: var(--accent); color: var(--accent); }
 
 /* =========================================================
    Cards & grids
@@ -1351,8 +1352,12 @@ a.album-share-btn:hover { background: var(--bg-band); border-color: var(--accent
 .phase {
   padding: 18px;
   border-inline-start: 1px solid var(--line);
+  cursor: pointer;
+  transition: background .15s ease;
 }
 .phase:first-child { border-inline-start: none; }
+.phase:hover, .phase:focus-visible { background: var(--bg-hover, rgba(0,0,0,0.03)); }
+.phase:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .phase .ph-date {
   font-family: var(--font-mono);
   font-size: 10.5px;

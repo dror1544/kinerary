@@ -12,6 +12,14 @@ import { createRenderContext, RENDER_TARGETS_HTML } from './helpers/dom.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const cfg  = JSON.parse(readFileSync(join(HERE, 'fixtures', 'trip.config.json'), 'utf8'));
 
+// googleMapsUrl lives outside the RENDER_FUNS block in site/app.js (shared
+// with the Bookings tab, which isn't part of that block) — render functions
+// that call it need it supplied via extra, per createRenderContext's docstring.
+function googleMapsUrl(query) {
+  if (!query) return null;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+}
+
 // ── renderStats ───────────────────────────────────────────────────────────────
 describe('renderStats()', () => {
   test('fills #stat-strip with one div per stat', () => {
@@ -134,7 +142,7 @@ describe('renderTasks()', () => {
 // ── renderPhaseHotelCard ──────────────────────────────────────────────────────
 describe('renderPhaseHotelCard()', () => {
   test('fills #hotel-{phase.id} with a .hotel-card div', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const el = document.getElementById('hotel-ny');
@@ -142,7 +150,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('hotel card contains the hotel name', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const html = document.getElementById('hotel-ny').innerHTML;
@@ -150,7 +158,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('hotel icon is 🏨 for type=hotel, 🏠 for type=private', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
 
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
@@ -162,7 +170,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('renders phone link when phone is present', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const html = document.getElementById('hotel-ny').innerHTML;
@@ -170,7 +178,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('does not render pin in hotel card HTML', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg);
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     // Pin may appear as a label (that's intentional on-screen) — but should not be hardcoded
