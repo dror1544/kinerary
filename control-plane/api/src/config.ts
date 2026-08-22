@@ -53,6 +53,14 @@ export const architectureProfileSchema = z.object({
       /^sha256:[a-f0-9]{64}$/,
       "must be sha256:hex of the super-admin Telegram numeric ID",
     ),
+    /**
+     * The super-admin's raw Telegram numeric ID, used only as the outbound
+     * sendMessage chat_id — the digest above cannot be reversed to find where
+     * to deliver the DM. Independent of super_admin_subject_digest: this
+     * value is never used to authenticate an inbound sender, only to address
+     * an outbound one. Required when adapters.messaging is "telegram".
+     */
+    super_admin_chat_id_secret_ref: secretReference.optional(),
     action_secret_ref: secretReference,
     action_ttl_seconds: z.number().int().min(60).max(86400).default(3600),
     signup_rate_limit_cooldown_seconds: z.number().int().min(0).max(86400).default(3600),
@@ -72,6 +80,13 @@ export const architectureProfileSchema = z.object({
       code: "custom",
       path: ["adapters", "messaging"],
       message: "a production profile with signup configured must not select the fake messaging adapter — the super-admin would never receive a real approval notification",
+    });
+  }
+  if (profile.adapters.messaging === "telegram" && profile.signup && !profile.signup.super_admin_chat_id_secret_ref) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["signup", "super_admin_chat_id_secret_ref"],
+      message: "the telegram messaging adapter needs super_admin_chat_id_secret_ref to know where to send the approval DM",
     });
   }
 });

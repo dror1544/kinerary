@@ -17,7 +17,7 @@
     "compute": "fake",
     "ingress": "fake",
     "agent_runtime": "fake",
-    "messaging": "fake",
+    "messaging": "telegram",
     "secrets": "file"
   },
   "test_resources": {
@@ -25,7 +25,8 @@
   },
   "signup": {
     "telegram_bot_token_secret_ref": "file:///run/secrets/telegram_creds",
-    "super_admin_subject_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "super_admin_subject_digest": "sha256:c9a2902fe9b1d10e1c0fbf586f6b6bc72c1b8d50b9ab974245d35ec499c1f318",
+    "super_admin_chat_id_secret_ref": "file:///run/secrets/telegram_super_admin_chat_id",
     "action_secret_ref": "file:///run/secrets/approval_signing_key",
     "action_ttl_seconds": 3600,
     "signup_rate_limit_cooldown_seconds": 3600,

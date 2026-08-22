@@ -2,9 +2,11 @@ import { randomBytes } from "node:crypto";
 import Fastify from "fastify";
 import type pg from "pg";
 import type { ArchitectureProfile } from "./config.js";
+import { resolveTelegramCallbackRef, answerTelegramCallbackQuery } from "./adapters/telegram.js";
 import { issueEnrollment, verifyEnrollmentToken, type EnrollmentConfig } from "./enrollment.js";
 import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
 import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
+import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
@@ -40,6 +42,10 @@ export interface PlannerDependencies {
   };
 }
 
+export interface ProvisionerDependencies {
+  db: pg.Pool;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -50,6 +56,8 @@ export interface AppDependencies {
   interview?: InterviewDependencies;
   /** Optional: mount planner + approval routes (Sprint 3+). */
   planner?: PlannerDependencies;
+  /** Optional: mount intake correction route (Sprint 4+). */
+  provisioner?: ProvisionerDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -66,11 +74,11 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   app.get("/", async () => ({
     service: "kinerary-control-plane",
-    sprint: 3,
+    sprint: 4,
     endpoints: [
       "/healthz", "/readyz",
       "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
-      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan",
+      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/intake/correct",
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
@@ -161,24 +169,52 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const body = request.body as Record<string, unknown>;
     const callbackQuery = body?.callback_query as Record<string, unknown> | undefined;
     const from = callbackQuery?.from as Record<string, unknown> | undefined;
-    const token = callbackQuery?.data;
+    const callbackData = callbackQuery?.data;
+    const callbackQueryId = callbackQuery?.id;
     const fromId = from?.id;
 
     if (
       !callbackQuery
-      || typeof token !== "string"
+      || typeof callbackData !== "string"
+      || typeof callbackQueryId !== "string"
       || (typeof fromId !== "number" && typeof fromId !== "string")
     ) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
+    // A real Telegram button only ever carries a short callback_data ref
+    // (see db/migrations/0014 — the actual signed token is too long for
+    // Telegram's 64-byte limit and never appears in the request at all).
+    // Resolving it back to the real token here is a pure transport-layer
+    // expansion; verifyApprovalAction below still does the exact same HMAC
+    // and expiry check it always has, on the exact same token shape.
+    //
+    // Existing tests that hand this route a raw signed token directly
+    // (bypassing an actual Telegram round trip) keep working unmodified: a
+    // full token never matches a stored ref, so resolution falls through
+    // and the value is used as-is, same as before this indirection existed.
+    const resolvedToken = await resolveTelegramCallbackRef(signup.db, callbackData) ?? callbackData;
+
     const senderDigest = digestTelegramId(String(fromId));
 
     const result = await processApprovalCallback(
       signup.db,
-      token,
+      resolvedToken,
       senderDigest,
       signup.config,
+    );
+
+    // Best-effort: Telegram shows a loading spinner on the tapped button
+    // until this is called. A failure here must never mask the real
+    // approve/reject outcome already computed above.
+    void answerTelegramCallbackQuery(
+      signup.botToken,
+      callbackQueryId,
+      result.outcome === "approved" ? "Approved"
+        : result.outcome === "rejected" ? "Rejected"
+        : result.outcome === "already_decided" ? "Already decided"
+        : "Could not process this action",
+      log,
     );
 
     if (result.outcome === "error") {
@@ -374,7 +410,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // POST /v1/interview/:sessionId/answer — submit or correct an answer.
   // Header: Authorization: Bearer <session-token>
-  // Body: { questionId, optionId?, otherText? }
+  // Body: { questionId, optionId?, otherText?, data? }
+  // `data` carries the payload for "structured" questions (e.g. travelers,
+  // phases) — a JSON array/object rather than a string.
   app.post("/v1/interview/:sessionId/answer", async (request, reply) => {
     if (!dependencies.interview) {
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
@@ -393,6 +431,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const questionId = body?.questionId;
     const optionId = body?.optionId ?? null;
     const otherText = body?.otherText;
+    const structuredData = body?.data;
 
     if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
@@ -405,6 +444,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       optionId as string | null,
       otherText as string | undefined,
       sessionId,
+      structuredData,
     );
 
     if (!result.ok) {
@@ -683,6 +723,82 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send({
       approvalId: result.approvalId,
       expiresAt: result.expiresAt.toISOString(),
+    });
+  });
+
+  // ── Sprint 4: Intake correction route ────────────────────────────────────────
+
+  // POST /v1/trips/:id/intake/correct — create a new confirmed intake version,
+  // supersede the active plan, and revert the trip to intake_confirmed so the
+  // organizer can generate a new plan. Requires the trip owner.
+  // Header: X-Telegram-Login (trip owner only)
+  // Body: { answers: { [questionId]: answer } }
+  app.post("/v1/trips/:id/intake/correct", async (request, reply) => {
+    if (!dependencies.provisioner || !dependencies.signup) {
+      return reply.code(503).send({ error: "PROVISIONER_NOT_CONFIGURED" });
+    }
+    const { provisioner, signup } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    // Authenticate the caller.
+    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
+    if (typeof loginHeader !== "string") {
+      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    }
+    let telegramPayload: Record<string, unknown>;
+    try {
+      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
+    } catch {
+      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    }
+    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    if (!loginResult.ok) {
+      return reply.code(401).send({ error: loginResult.error });
+    }
+
+    // Verify the caller is the trip owner.
+    const membership = await provisioner.db.query<{ role: string }>(
+      `SELECT tm.role FROM control_plane.trip_memberships tm
+       JOIN   control_plane.user_identities ui ON ui.user_id = tm.user_id
+       WHERE  tm.trip_id = $1
+         AND  tm.status = 'active'
+         AND  tm.role = 'owner'
+         AND  ui.provider_subject_digest = $2`,
+      [tripId, loginResult.identity.providerSubjectDigest],
+    );
+    if (membership.rowCount === 0) {
+      return reply.code(403).send({ error: "FORBIDDEN" });
+    }
+
+    const body = request.body as Record<string, unknown>;
+    const answers = body?.answers;
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const actorRef = `user:${loginResult.identity.providerSubjectDigest}`;
+    const result = await correctIntake(
+      provisioner.db,
+      tripId,
+      actorRef,
+      answers as Record<string, unknown>,
+    );
+
+    if (!result.ok) {
+      const status = result.reason === "TRIP_NOT_FOUND" ? 404
+        : result.reason === "INVALID_STATE" ? 409
+        : result.reason === "INVALID_ANSWERS" ? 422
+        : 400;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(200).send({
+      versionId: result.versionId,
+      version: result.version,
+      digest: result.digest,
     });
   });
 

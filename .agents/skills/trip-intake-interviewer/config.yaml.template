@@ -1,0 +1,24 @@
+# MCP entry for the trip-intake Hermes profile. This is a template, not a
+# live config — it holds no secrets. To reconcile the real profile
+# (~/.hermes/profiles/trip-intake/config.yaml) from this:
+#
+#   1. Copy this mcp_servers.interview block into the real config.yaml,
+#      merging rather than overwriting (the real file also has model/
+#      provider/onboarding sections this template doesn't touch).
+#   2. Replace <INTERVIEW_MCP_KEY> with the real value of
+#      INTERVIEW_MCP_KEY the interview-mcp.ts process was started with.
+#   3. chmod 600 the real config.yaml — it now holds a real credential.
+#
+# url assumes interview-mcp.ts runs on the same Mac as the Hermes gateway,
+# matching how mcp.js's own trip-site MCP entries are configured
+# (127.0.0.1, not a LAN/public address) — this MCP server is not meant to
+# be reachable from anywhere but this host.
+
+mcp_servers:
+  interview:
+    transport: sse
+    url: http://127.0.0.1:4311/sse
+    timeout: 180
+    connect_timeout: 60
+    headers:
+      X-API-Key: <INTERVIEW_MCP_KEY>

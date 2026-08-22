@@ -21,7 +21,10 @@ test("createNotificationAdapter selects the fake adapter for adapters.messaging 
   assert.ok(adapter instanceof FakeNotificationAdapter);
 });
 
+test("createNotificationAdapter refuses telegram messaging without its deps", () => {
+  assert.throws(() => createNotificationAdapter("telegram"), /requires telegram deps/);
+});
+
 test("createNotificationAdapter refuses an adapter it has no implementation for", () => {
-  assert.throws(() => createNotificationAdapter("telegram"), /no notification adapter implementation yet/);
   assert.throws(() => createNotificationAdapter("unknown-adapter"), /no notification adapter implementation yet/);
 });

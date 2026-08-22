@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { test, beforeEach } from "node:test";
+import { test, before, after, mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
@@ -90,6 +90,20 @@ async function resetDb(client: pg.PoolClient) {
   await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
   await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
 }
+
+// Every /v1/signup/callback route test below exercises a real HTTP request
+// through buildApp(), and that route now calls answerTelegramCallbackQuery
+// (best-effort, fire-and-forget) on every outcome. Without this stub each of
+// those tests would make a live call to api.telegram.org with a fake bot
+// token — slow, network-dependent, and a bad idea in CI. Nothing else in
+// this file touches fetch, so a single blanket stub for the whole file is
+// safe and keeps the suite hermetic.
+before(() => {
+  mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+});
+after(() => {
+  mock.restoreAll();
+});
 
 // ── Service-layer tests ─────────────────────────────────────────────────────
 
@@ -506,6 +520,83 @@ test("POST /v1/signup/callback approves request and is idempotent on replay", { 
     });
     assert.equal(r2.statusCode, 200);
     assert.equal(r2.json().outcome, "already_decided");
+
+    await app.close();
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("POST /v1/signup/callback resolves a short telegram_callback_refs ref to the real token", { skip }, async () => {
+  // Exercises the path a REAL Telegram button click takes: the button's
+  // callback_data is never the raw signed token (too long for Telegram's
+  // 64-byte limit — see db/migrations/0014) but a short ref that the real
+  // TelegramNotificationAdapter would have written when it sent the message.
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+
+    const notification = new CapturingNotification();
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
+
+    const identity = makeIdentity("300000009");
+    const { requestId } = await startSignup(pool, identity, "Japan 2025", testConfig, notification);
+    assert.ok(requestId);
+
+    const { token, expiresAt } = signApprovalAction(requestId, "approve", ACTION_SECRET);
+    const ref = "cbk_" + "a".repeat(16);
+    await client.query(
+      "INSERT INTO control_plane.telegram_callback_refs (ref, token, expires_at) VALUES ($1, $2, $3)",
+      [ref, token, expiresAt.toISOString()],
+    );
+    client.release();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate(ref, SUPER_ADMIN_ID)),
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().outcome, "approved");
+
+    await app.close();
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("POST /v1/signup/callback rejects an unknown ref the same way it rejects a garbage token", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/signup/callback",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": TEST_WEBHOOK_SECRET },
+      body: JSON.stringify(buildCallbackUpdate("cbk_" + "b".repeat(16), SUPER_ADMIN_ID)),
+    });
+    assert.equal(response.statusCode, 400);
+    // processApprovalCallback collapses INVALID_TOKEN and INVALID_SIGNATURE
+    // into the same outward reason (signup.ts) — an unresolved ref falls
+    // through to being treated as a malformed token, same as any garbage
+    // string would be.
+    assert.equal(response.json().error, "INVALID_SIGNATURE");
 
     await app.close();
   } finally {

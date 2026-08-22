@@ -170,6 +170,11 @@ test("the real server entrypoint mounts the signup routes when the profile confi
     const releases = await fetch(`http://127.0.0.1:${port}/v1/releases`);
     assert.notEqual(releases.status, 503, "planner routes are not wired into the real server entrypoint");
     assert.equal(releases.status, 401);
+
+    // Sprint 4: intake correction route is also mounted when signup is configured.
+    const correction = await fetch(`http://127.0.0.1:${port}/v1/trips/trip_test/intake/correct`, { method: "POST" });
+    assert.notEqual(correction.status, 503, "intake correction route is not wired into the real server entrypoint");
+    assert.equal(correction.status, 401);
   } finally {
     await server.stop();
   }

@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -23,16 +23,21 @@ const pool = createDatabasePool(connectionString, () => {
 let signup: SignupDependencies | undefined;
 if (profile.signup) {
   const signupConfig = profile.signup;
-  const [botToken, actionSecret, webhookSecret] = await Promise.all([
+  const [botToken, actionSecret, webhookSecret, superAdminChatId] = await Promise.all([
     resolveSecretRef(signupConfig.telegram_bot_token_secret_ref),
     resolveSecretRef(signupConfig.action_secret_ref),
     resolveSecretRef(signupConfig.webhook_secret_ref),
+    signupConfig.super_admin_chat_id_secret_ref
+      ? resolveSecretRef(signupConfig.super_admin_chat_id_secret_ref)
+      : Promise.resolve(undefined),
   ]);
   // validateBeforeProvider re-checks the already-loaded profile immediately
   // before this build's first provider construction, per the ordering
   // guarantee its own test asserts: an invalid profile must never reach a
   // constructed provider.
-  const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging));
+  const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
+    telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`) } : undefined,
+  }));
   signup = {
     db: pool,
     config: {
@@ -73,11 +78,19 @@ if (profile.signup) {
   };
 }
 
+// Provisioner dependency block: intake correction route requires the same
+// pool as the planner. Active whenever signup is configured.
+let provisioner: ProvisionerDependencies | undefined;
+if (profile.signup) {
+  provisioner = { db: pool };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
   signup,
   interview,
   planner,
+  provisioner,
 });
 await app.listen({ host: profile.public_api.bind_host, port: profile.public_api.port });
