@@ -122,6 +122,52 @@ describe("validateAnswer (unit)", () => {
     if (result.ok) throw new Error("unreachable");
     assert.equal(result.reason, "UNKNOWN_QUESTION");
   });
+
+  test("structured question (array shape): valid array accepted", () => {
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS_V1, [{ name: "Alex", age: 30, family: "Smith" }]);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.answer.kind, "structured");
+    if (result.answer.kind !== "structured") throw new Error("unreachable");
+    assert.deepEqual(result.answer.data, [{ name: "Alex", age: 30, family: "Smith" }]);
+  });
+
+  test("structured question (array shape): object payload rejected", () => {
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS_V1, { name: "Alex" });
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "DATA_WRONG_SHAPE");
+  });
+
+  test("structured question (object shape): valid object accepted", () => {
+    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS_V1, { dietary: "vegetarian" });
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.answer.kind, "structured");
+  });
+
+  test("structured question (object shape): array payload rejected", () => {
+    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS_V1, ["not", "an", "object"]);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "DATA_WRONG_SHAPE");
+  });
+
+  test("required structured question: missing data rejected with DATA_REQUIRED", () => {
+    const result = validateAnswer("travelers", null, null);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "DATA_REQUIRED");
+  });
+
+  test("optional structured question: missing data accepted as empty", () => {
+    const result = validateAnswer("constraints", null, null);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.answer.kind, "structured");
+    if (result.answer.kind !== "structured") throw new Error("unreachable");
+    assert.deepEqual(result.answer.data, {});
+  });
 });
 
 describe("buildRecap (unit)", () => {
@@ -226,6 +272,22 @@ async function issuedEnrollmentToken(fix: TestFixture): Promise<string> {
   assert.equal(result.ok, true);
   if (!result.ok) throw new Error("unreachable");
   return result.token;
+}
+
+/** Answers every required question (post-Sprint-4-gap-closing schema) in one call. */
+async function answerAllRequiredQuestions(pool: pg.Pool, sessionToken: string): Promise<void> {
+  await submitAnswer(pool, sessionToken, "trip_type", "family");
+  await submitAnswer(pool, sessionToken, "destination", "Japan");
+  await submitAnswer(pool, sessionToken, "group_size", "3_to_5");
+  await submitAnswer(pool, sessionToken, "trip_duration", "two_weeks");
+  await submitAnswer(pool, sessionToken, "departure_date", "2026-09-06");
+  await submitAnswer(pool, sessionToken, "return_date", "2026-09-20");
+  await submitAnswer(pool, sessionToken, "travelers", null, undefined, undefined, [
+    { name: "Test Traveler", age: 30, family: "Test" },
+  ]);
+  await submitAnswer(pool, sessionToken, "phases", null, undefined, undefined, [
+    { name: "Test City", start: "2026-09-06", end: "2026-09-20" },
+  ]);
 }
 
 describe("startSession (DB)", () => {
@@ -446,7 +508,11 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
       await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
       await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      const last = await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await submitAnswer(fix.pool, sessionToken, "departure_date", "2026-09-06");
+      await submitAnswer(fix.pool, sessionToken, "return_date", "2026-09-20");
+      await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [{ name: "Test", age: 30, family: "Test" }]);
+      const last = await submitAnswer(fix.pool, sessionToken, "phases", null, undefined, undefined, [{ name: "Test City", start: "2026-09-06", end: "2026-09-20" }]);
 
       assert.equal(last.ok, true);
       if (!last.ok) throw new Error("unreachable");
@@ -510,10 +576,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
 
       const result = await confirmIntake(fix.pool, sessionToken);
       assert.equal(result.ok, true);
@@ -551,10 +614,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
 
       const first = await confirmIntake(fix.pool, sessionToken);
       assert.equal(first.ok, true);
@@ -588,10 +648,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
       await confirmIntake(fix.pool, sessionToken);
 
       const result = await submitAnswer(fix.pool, sessionToken, "destination", "Korea");
@@ -612,10 +669,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "couple");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Italy");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "2");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "week");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
 
       const confirmed = await confirmIntake(fix.pool, sessionToken);
       assert.equal(confirmed.ok, true);
@@ -759,10 +813,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken, sessionId } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
 
       // Pass the wrong sessionId — mismatch must prevent the confirm write.
       const result = await confirmIntake(fix.pool, sessionToken, () => {}, "sess_wrongsessionid");
@@ -796,10 +847,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
       const { sessionToken, sessionId } = started;
 
-      await submitAnswer(fix.pool, sessionToken, "trip_type", "family");
-      await submitAnswer(fix.pool, sessionToken, "destination", "Japan");
-      await submitAnswer(fix.pool, sessionToken, "group_size", "3_to_5");
-      await submitAnswer(fix.pool, sessionToken, "trip_duration", "two_weeks");
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
 
       const result = await confirmIntake(fix.pool, sessionToken);
       assert.equal(result.ok, true);

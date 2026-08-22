@@ -19,6 +19,10 @@ def _text(value: str) -> dict:
     return {"kind": "text", "schema_version": 1, "text": value}
 
 
+def _structured(value) -> dict:
+    return {"kind": "structured", "schema_version": 1, "data": value}
+
+
 JAPAN_INTAKE = {
     "trip_type": _choice("family"),
     "destination": _text("Japan"),
@@ -159,6 +163,121 @@ class TransformerTests(unittest.TestCase):
     def test_phases_is_empty_list(self) -> None:
         config = transform_intake(JAPAN_INTAKE)
         self.assertEqual(config["phases"], [])
+
+    # ── Sprint 4 gap-closing fields ──────────────────────────────────────────
+
+    def test_explicit_dates_override_the_placeholder_logic(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "departure_date": _text("2026-09-06"),
+            "return_date": _text("2026-09-20"),
+        }
+        config = transform_intake(intake, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-09-06")
+        self.assertEqual(config["meta"]["returnDate"], "2026-09-20")
+        self.assertEqual(config["meta"]["totalDays"], 14)
+
+    def test_missing_explicit_dates_falls_back_to_duration_placeholder(self) -> None:
+        config = transform_intake(JAPAN_INTAKE, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-11-18")
+
+    def test_invalid_explicit_dates_fall_back_to_placeholder(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "departure_date": _text("not-a-date"),
+            "return_date": _text("2026-09-20"),
+        }
+        config = transform_intake(intake, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-11-18")
+
+    def test_return_before_departure_falls_back_to_placeholder(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "departure_date": _text("2026-09-20"),
+            "return_date": _text("2026-09-06"),
+        }
+        config = transform_intake(intake, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["departure"][:10], "2026-11-18")
+
+    def test_travelers_populate_participants_and_families(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "travelers": _structured([
+                {"name": "Eitan", "age": 52, "family": "Sagi"},
+                {"name": "Noa", "age": 19, "family": "Sagi"},
+                {"name": "Dana", "age": 41, "family": "Cohen"},
+            ]),
+        }
+        config = transform_intake(intake)
+        self.assertEqual(len(config["participants"]), 3)
+        self.assertEqual(len(config["families"]), 2)
+        eitan = next(p for p in config["participants"] if p["name"] == "Eitan")
+        self.assertEqual(eitan["username"], "eitan")
+        self.assertEqual(eitan["age"], 52)
+        sagi_family = next(f for f in config["families"] if f["id"] == eitan["family"])
+        self.assertIn("eitan", sagi_family["members"])
+        self.assertIn("noa", sagi_family["members"])
+
+    def test_duplicate_traveler_usernames_are_disambiguated(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "travelers": _structured([
+                {"name": "Alex", "family": "Smith"},
+                {"name": "Alex", "family": "Jones"},
+            ]),
+        }
+        config = transform_intake(intake)
+        usernames = {p["username"] for p in config["participants"]}
+        self.assertEqual(len(usernames), 2)
+
+    def test_travelers_missing_or_malformed_yields_empty_participants(self) -> None:
+        config = transform_intake(JAPAN_INTAKE)
+        self.assertEqual(config["participants"], [])
+        self.assertEqual(config["families"], [])
+
+    def test_phases_populate_id_title_dates_accommodation(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-06", "end": "2026-09-10",
+                    "accommodation": {"name": "Tokyo Hotel", "confirmation": "ABC123"},
+                },
+                {"name": "Kyoto", "start": "2026-09-10", "end": "2026-09-14"},
+            ]),
+        }
+        config = transform_intake(intake)
+        self.assertEqual(len(config["phases"]), 2)
+        tokyo = config["phases"][0]
+        self.assertEqual(tokyo["id"], "tokyo")
+        self.assertEqual(tokyo["title"]["en"], "Tokyo")
+        self.assertEqual(tokyo["dates"], {"start": "2026-09-06", "end": "2026-09-10"})
+        self.assertEqual(tokyo["accommodation"]["confirmation"], "ABC123")
+        self.assertNotIn("accommodation", config["phases"][1])
+
+    def test_travel_anchors_appear_in_stats_when_present(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "travel_anchors": _structured([{"type": "flight", "confirmation": "XYZ"}]),
+        }
+        config = transform_intake(intake)
+        descriptions = " ".join(s["description"]["en"] for s in config["stats"])
+        self.assertIn("booking(s)", descriptions)
+
+    def test_constraints_appear_in_stats_when_present(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "constraints": _structured({"dietary": "vegetarian", "mobility": "wheelchair access needed"}),
+        }
+        config = transform_intake(intake)
+        descriptions = " ".join(s["description"]["en"] for s in config["stats"])
+        self.assertIn("vegetarian", descriptions)
+
+    def test_empty_constraints_object_omitted_from_stats(self) -> None:
+        intake = {**JAPAN_INTAKE, "constraints": _structured({})}
+        config = transform_intake(intake)
+        for stat in config["stats"]:
+            self.assertNotIn("!", stat["number"])
 
 
 if __name__ == "__main__":

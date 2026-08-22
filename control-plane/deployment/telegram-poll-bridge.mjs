@@ -25,12 +25,18 @@
 // itself.
 //
 // Usage:
-//   TELEGRAM_BOT_TOKEN=... CONTROL_PLANE_WEBHOOK_SECRET=... node telegram-poll-bridge.mjs
+//   TELEGRAM_BOT_TOKEN=... CONTROL_PLANE_WEBHOOK_SECRET=... \
+//     TELEGRAM_POLL_BRIDGE_CONFIRM=yes-delete-webhook node telegram-poll-bridge.mjs
 //
 // Env:
 //   TELEGRAM_BOT_TOKEN             required
 //   CONTROL_PLANE_WEBHOOK_SECRET   required — must match the profile's
 //                                  signup.webhook_secret_ref value
+//   TELEGRAM_POLL_BRIDGE_CONFIRM   required, must equal "yes-delete-webhook" —
+//                                  see the guard below; this is not a real
+//                                  secret, just a deliberate opt-in so this
+//                                  can't run unattended against a production
+//                                  bot token by accident.
 //   CONTROL_PLANE_CALLBACK_URL     default http://127.0.0.1:4310/v1/signup/callback
 //   TELEGRAM_POLL_TIMEOUT_SECONDS  default 30 (long-poll duration per request)
 
@@ -38,6 +44,7 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBHOOK_SECRET = process.env.CONTROL_PLANE_WEBHOOK_SECRET;
 const CALLBACK_URL = process.env.CONTROL_PLANE_CALLBACK_URL ?? "http://127.0.0.1:4310/v1/signup/callback";
 const POLL_TIMEOUT_SECONDS = Number(process.env.TELEGRAM_POLL_TIMEOUT_SECONDS ?? "30");
+const CONFIRM = process.env.TELEGRAM_POLL_BRIDGE_CONFIRM;
 
 if (!BOT_TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN is required");
@@ -45,6 +52,22 @@ if (!BOT_TOKEN) {
 }
 if (!WEBHOOK_SECRET) {
   console.error("CONTROL_PLANE_WEBHOOK_SECRET is required");
+  process.exit(1);
+}
+if (CONFIRM !== "yes-delete-webhook") {
+  // deleteWebhook() below is unconditional and unscoped — it disables
+  // whatever webhook is currently registered for TELEGRAM_BOT_TOKEN. If
+  // that token is a production bot's, this silently kills production
+  // Telegram delivery until setWebhook is called again. This bridge is
+  // test-only by design (see file header), so refuse to run without an
+  // explicit, deliberate opt-in rather than trusting the caller noticed.
+  console.error(
+    "Refusing to start: this deletes whatever webhook is currently registered\n" +
+      "for TELEGRAM_BOT_TOKEN. If that token is a production bot's, this disables\n" +
+      "production webhook delivery until setWebhook is called again.\n" +
+      "Set TELEGRAM_POLL_BRIDGE_CONFIRM=yes-delete-webhook to proceed — only do\n" +
+      "this for a local/dev bot token, never a production one.",
+  );
   process.exit(1);
 }
 

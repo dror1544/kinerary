@@ -26,12 +26,17 @@ export interface ChoiceOption {
 
 export interface IntakeQuestion {
   id: string;
-  type: "choice" | "text";
+  type: "choice" | "text" | "structured";
   prompt: string;
   options?: ChoiceOption[];  // present for 'choice' questions
   allowsOther?: boolean;     // choice only: enables the 'other' follow-up
   otherPrompt?: string;      // follow-up prompt shown when 'other' is chosen
   maxLength?: number;        // max chars for text/other answers
+  // structured only: the interviewer submits a JSON payload rather than a
+  // string; this only checks the JSON's top-level shape (list vs. object),
+  // not a full schema — the interviewer is a capable LLM assembling this
+  // from conversation, not a form validating untrusted input.
+  dataShape?: "array" | "object";
   required: boolean;
 }
 
@@ -94,6 +99,55 @@ export const INTAKE_QUESTIONS_V1: readonly IntakeQuestion[] = [
     maxLength: 500,
     required: false,
   },
+  {
+    id: "departure_date",
+    type: "text",
+    prompt: "What's the departure date? (YYYY-MM-DD)",
+    maxLength: 40,
+    required: true,
+  },
+  {
+    id: "return_date",
+    type: "text",
+    prompt: "What's the return date? (YYYY-MM-DD)",
+    maxLength: 40,
+    required: true,
+  },
+  {
+    id: "timezone",
+    type: "text",
+    prompt: "What timezone should times be shown in? (e.g. Asia/Tokyo, or just the destination city — optional, we can infer it)",
+    maxLength: 100,
+    required: false,
+  },
+  {
+    id: "travelers",
+    type: "structured",
+    prompt: "Who's coming? List each person's name, age, and family/household group.",
+    dataShape: "array",
+    required: true,
+  },
+  {
+    id: "phases",
+    type: "structured",
+    prompt: "Where are you going, and when? List each stop: place name, date range, and accommodation (with confirmation number) if already booked.",
+    dataShape: "array",
+    required: true,
+  },
+  {
+    id: "travel_anchors",
+    type: "structured",
+    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers. (optional — skip if nothing's booked yet)",
+    dataShape: "array",
+    required: false,
+  },
+  {
+    id: "constraints",
+    type: "structured",
+    prompt: "Anything the group needs to know about — mobility needs, dietary restrictions, budget expectations, or family dynamics? (optional)",
+    dataShape: "object",
+    required: false,
+  },
 ] as const;
 
 // ── Answer store ─────────────────────────────────────────────────────────────
@@ -118,7 +172,13 @@ export interface TextAnswer {
   text: string;
 }
 
-export type IntakeAnswer = ChoiceAnswer | OtherAnswer | TextAnswer;
+export interface StructuredAnswer {
+  kind: "structured";
+  schema_version: number;
+  data: unknown;
+}
+
+export type IntakeAnswer = ChoiceAnswer | OtherAnswer | TextAnswer | StructuredAnswer;
 
 export type AnswerStore = Record<string, IntakeAnswer>;
 
@@ -126,16 +186,29 @@ export type AnswerStore = Record<string, IntakeAnswer>;
 
 export type AnswerValidationResult =
   | { ok: true; answer: IntakeAnswer }
-  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" };
+  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" };
 
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
   otherText: string | null | undefined,
   questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS_V1,
+  structuredData?: unknown,
 ): AnswerValidationResult {
   const question = questions.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "UNKNOWN_QUESTION" };
+
+  if (question.type === "structured") {
+    if (structuredData === undefined || structuredData === null) {
+      if (question.required) return { ok: false, reason: "DATA_REQUIRED" };
+      return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: question.dataShape === "array" ? [] : {} } };
+    }
+    const isArray = Array.isArray(structuredData);
+    const isPlainObject = typeof structuredData === "object" && !isArray;
+    if (question.dataShape === "array" && !isArray) return { ok: false, reason: "DATA_WRONG_SHAPE" };
+    if (question.dataShape === "object" && !isPlainObject) return { ok: false, reason: "DATA_WRONG_SHAPE" };
+    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: structuredData } };
+  }
 
   if (question.type === "choice") {
     if (optionId === "other") {
@@ -213,6 +286,9 @@ export function buildRecap(answers: AnswerStore, questions: readonly IntakeQuest
         answerLabel = q.options?.find((o) => o.id === ans.option_id)?.label ?? ans.option_id;
       } else if (ans.kind === "choice_other") {
         answerLabel = `Other: ${ans.other_text}`;
+      } else if (ans.kind === "structured") {
+        const count = Array.isArray(ans.data) ? ans.data.length : Object.keys(ans.data as Record<string, unknown>).length;
+        answerLabel = count > 0 ? `${count} item(s) recorded` : "(none)";
       } else {
         answerLabel = ans.text || "(skipped)";
       }
@@ -256,7 +332,7 @@ export type GetSessionResult =
 
 export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" };
+  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" };
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
@@ -402,6 +478,7 @@ export async function submitAnswer(
   optionId: string | "other" | null,
   otherText?: string,
   expectedSessionId?: string,
+  structuredData?: unknown,
 ): Promise<SubmitAnswerResult> {
   const digest = sessionTokenDigest(rawSessionToken);
   const client = await db.connect();
@@ -425,7 +502,7 @@ export async function submitAnswer(
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
 
-    const validation = validateAnswer(questionId, optionId, otherText);
+    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS_V1, structuredData);
     if (!validation.ok) {
       await client.query("ROLLBACK");
       return { ok: false, reason: validation.reason };

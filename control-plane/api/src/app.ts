@@ -410,7 +410,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // POST /v1/interview/:sessionId/answer — submit or correct an answer.
   // Header: Authorization: Bearer <session-token>
-  // Body: { questionId, optionId?, otherText? }
+  // Body: { questionId, optionId?, otherText?, data? }
+  // `data` carries the payload for "structured" questions (e.g. travelers,
+  // phases) — a JSON array/object rather than a string.
   app.post("/v1/interview/:sessionId/answer", async (request, reply) => {
     if (!dependencies.interview) {
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
@@ -429,6 +431,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const questionId = body?.questionId;
     const optionId = body?.optionId ?? null;
     const otherText = body?.otherText;
+    const structuredData = body?.data;
 
     if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
@@ -441,6 +444,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       optionId as string | null,
       otherText as string | undefined,
       sessionId,
+      structuredData,
     );
 
     if (!result.ok) {

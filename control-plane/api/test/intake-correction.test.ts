@@ -39,6 +39,10 @@ const JAPAN_ANSWERS = {
   destination: { kind: "text", schema_version: 1, text: "Japan" },
   group_size: { kind: "choice", option_id: "2", schema_version: 1, other_text: null },
   trip_duration: { kind: "choice", option_id: "two_weeks", schema_version: 1, other_text: null },
+  departure_date: { kind: "text", schema_version: 1, text: "2026-09-06" },
+  return_date: { kind: "text", schema_version: 1, text: "2026-09-20" },
+  travelers: { kind: "structured", schema_version: 1, data: [{ name: "Eitan", age: 52, family: "Sagi" }] },
+  phases: { kind: "structured", schema_version: 1, data: [{ name: "Tokyo", start: "2026-09-06", end: "2026-09-20" }] },
 };
 
 const CORRECTED_ANSWERS = {

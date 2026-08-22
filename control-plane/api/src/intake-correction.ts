@@ -54,6 +54,8 @@ function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore
     } else if (question.type === "text" && answer.kind === "text") {
       if (typeof answer.text !== "string") return null;
       checked = validateAnswer(question.id, answer.text, null);
+    } else if (question.type === "structured" && answer.kind === "structured") {
+      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS_V1, answer.data);
     } else {
       return null;
     }
