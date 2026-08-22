@@ -250,6 +250,12 @@ test("canonical guardrail is enforced by the table constraints it backs", { skip
       "INSERT INTO control_plane.plans(id,trip_id,kind,digest,status,desired) VALUES ('plan_version01','trip_abcdefgh','provision',$1,'draft',$2::jsonb)",
       [`sha256:${"2".repeat(64)}`, JSON.stringify({ app_version: "10.15.7", departure: "10.11.2025" })],
     );
+    await assert.rejects(client.query(
+      `INSERT INTO control_plane.intake_versions
+         (id,trip_id,version,artifact_ref,digest,confirmed_at,schema_version,data)
+       VALUES ('intk_unsafe01','trip_abcdefgh',1,'intake:test:unsafe',$1,now(),1,$2::jsonb)`,
+      [`sha256:${"3".repeat(64)}`, JSON.stringify({ destination: { text: "Private endpoint 192.168.1.10" } })],
+    ));
   } finally {
     await reset(client);
     client.release();

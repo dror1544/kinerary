@@ -133,6 +133,35 @@ describe("correctIntake", () => {
     }
   });
 
+  test("rejects unsafe corrected content without creating a new version", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const unsafeAnswers = {
+        ...CORRECTED_ANSWERS,
+        destination: {
+          kind: "text",
+          schema_version: 1,
+          text: "Private endpoint 192.168.1.10",
+        },
+      };
+
+      const result = await correctIntake(pool, fix.tripId, "user:test", unsafeAnswers);
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "UNSAFE_ANSWER_CONTENT");
+      if (result.reason !== "UNSAFE_ANSWER_CONTENT") throw new Error("unreachable");
+      assert.match(result.unsafePath, /destination/);
+
+      const versionCount = await fix.pool.query<{ count: string }>(
+        "SELECT count(*) FROM control_plane.intake_versions WHERE trip_id = $1",
+        [fix.tripId],
+      );
+      assert.equal(versionCount.rows[0]?.count, "1");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("previous confirmed version is unchanged", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {

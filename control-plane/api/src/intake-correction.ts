@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
+import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import {
   INTAKE_QUESTIONS_V1,
   INTAKE_SCHEMA_VERSION,
@@ -14,6 +15,7 @@ function generateId(prefix: string): string {
 
 export type CorrectIntakeResult =
   | { ok: true; versionId: string; version: number; digest: string }
+  | { ok: false; reason: "UNSAFE_ANSWER_CONTENT"; unsafePath: string }
   | {
       ok: false;
       reason:
@@ -78,6 +80,20 @@ export async function correctIntake(
 ): Promise<CorrectIntakeResult> {
   const normalized = normalizeCorrectionAnswers(newAnswers);
   if (!normalized) return { ok: false, reason: "INVALID_ANSWERS" };
+
+  // Corrections write the same immutable intake_versions.data record as the
+  // initial confirmation path. Reject unsafe content before opening a
+  // transaction so callers receive a stable validation error instead of an
+  // opaque PostgreSQL CHECK-constraint failure. Migration 0015 remains the
+  // final backstop for every writer.
+  try {
+    assertCanonicalRecordSafe(normalized);
+  } catch (error) {
+    if (error instanceof UnsafeCanonicalRecordError) {
+      return { ok: false, reason: "UNSAFE_ANSWER_CONTENT", unsafePath: error.path };
+    }
+    throw error;
+  }
 
   const client = await db.connect();
   try {
