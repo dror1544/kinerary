@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
+import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
 import { structuredLog } from "./redaction.js";
 
@@ -336,7 +337,7 @@ export type SubmitAnswerResult =
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" };
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
 
 /**
  * Exchanges a valid enrollment token for a session, atomically:
@@ -581,6 +582,22 @@ export async function confirmIntake(
     if (!allAnswered) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_ALL_REQUIRED_ANSWERED" };
+    }
+
+    // Answers are organizer-controlled free-form content (free text, "other"
+    // follow-ups, and structured travelers/phases/travel_anchors/constraints
+    // payloads) about to become an immutable, durable record. Check it here
+    // for a named field path in the error; the database CHECK constraint on
+    // intake_versions.data (migration 0015) is the actual backstop, same
+    // relationship validateBeforeProvider has to its own profile checks.
+    try {
+      assertCanonicalRecordSafe(session.answers);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (error instanceof UnsafeCanonicalRecordError) {
+        return { ok: false, reason: "UNSAFE_ANSWER_CONTENT", unsafePath: error.path };
+      }
+      throw error;
     }
 
     // Compute the digest and determine the next version number.

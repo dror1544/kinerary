@@ -567,6 +567,43 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
     }
   });
 
+  test("confirmIntake: rejects an answer containing credential/private-address content, without writing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+      const { sessionToken, sessionId } = started;
+
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
+      // Overwrite one required answer with something the canonical guard
+      // must catch — same regression this migration/guard exists for.
+      await submitAnswer(fix.pool, sessionToken, "destination", "Authorization: Bearer sk-should-not-be-here");
+
+      const result = await confirmIntake(fix.pool, sessionToken);
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "UNSAFE_ANSWER_CONTENT");
+      assert.match(result.unsafePath ?? "", /destination/);
+
+      // Nothing durable was written, and the session is still answerable.
+      const versionCount = await fix.pool.query<{ count: string }>(
+        "SELECT count(*) FROM control_plane.intake_versions WHERE trip_id = $1",
+        [fix.draftTripId],
+      );
+      assert.equal(versionCount.rows[0]?.count, "0");
+
+      const sessionRow = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.intake_sessions WHERE id = $1",
+        [sessionId],
+      );
+      assert.equal(sessionRow.rows[0]?.state, "awaiting_confirmation");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("confirmIntake: creates immutable intake version with correct digest", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {

@@ -481,7 +481,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
     if (!result.ok) {
       const status = result.reason === "NOT_FOUND" ? 404 : 422;
-      return reply.code(status).send({ error: result.reason });
+      // unsafePath names the offending field, never its value — same rule
+      // UnsafeCanonicalRecordError itself follows.
+      return reply.code(status).send(
+        result.reason === "UNSAFE_ANSWER_CONTENT"
+          ? { error: result.reason, unsafePath: result.unsafePath }
+          : { error: result.reason },
+      );
     }
 
     return reply.code(200).send({
