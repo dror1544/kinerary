@@ -365,7 +365,7 @@ mcp.tool('upload_booking_confirmation',
 const MAX_INLINE_PDF_BYTES = 4 * 1024 * 1024;
 
 mcp.tool('get_booking_confirmation',
-  'Fetch a booking\'s uploaded PDF confirmation — as base64 (small enough to relay into a chat, e.g. Telegram sendDocument) when it fits comfortably in a tool result, or as extracted text when it does not. ' +
+  'Fetch a booking\'s uploaded or bundled PDF confirmation through the trip site\'s authenticated document API — as base64 (small enough to relay into a chat, e.g. Telegram sendDocument) when it fits comfortably in a tool result, or as extracted text when it does not. ' +
   'The site now requires a logged-in session to view this file directly, so this tool is the way an agent retrieves it. ' +
   'Returns conf_file: null (no pdf_base64/pdf_text) if nothing has been uploaded for this booking yet.', {
   id: z.number().describe('Booking ID from get_bookings'),
@@ -374,7 +374,7 @@ mcp.tool('get_booking_confirmation',
   const booking = bookings.find(b => b.id === id);
   if (!booking) throw new Error(`Booking ${id} not found`);
   if (!booking.conf_file) return ok({ id, name: booking.name, conf_file: null });
-  const buf = await apiGetBuffer(`/api/bookings/confirmation/${booking.conf_file}`);
+  const buf = await apiGetBuffer(`/api/bookings/confirmation/${encodeURIComponent(booking.conf_file)}`);
   if (buf.length <= MAX_INLINE_PDF_BYTES) {
     return ok({ id, name: booking.name, conf_file: booking.conf_file, pdf_base64: buf.toString('base64') });
   }

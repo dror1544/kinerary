@@ -19,6 +19,17 @@ function googleMapsUrl(query) {
   if (!query) return null;
   return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
 }
+function bkConfUrls(confFile) {
+  if (!confFile) return null;
+  const url = `/api/bookings/confirmation/${encodeURIComponent(confFile)}`;
+  return { view: url, download: url };
+}
+function bkEsc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+const HOTEL_EXTRAS = { googleMapsUrl, bkConfUrls, bkEsc };
 
 // ── renderStats ───────────────────────────────────────────────────────────────
 describe('renderStats()', () => {
@@ -142,7 +153,7 @@ describe('renderTasks()', () => {
 // ── renderPhaseHotelCard ──────────────────────────────────────────────────────
 describe('renderPhaseHotelCard()', () => {
   test('fills #hotel-{phase.id} with a .hotel-card div', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const el = document.getElementById('hotel-ny');
@@ -150,7 +161,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('hotel card contains the hotel name', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const html = document.getElementById('hotel-ny').innerHTML;
@@ -158,7 +169,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('hotel icon is 🏨 for type=hotel, 🏠 for type=private', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
 
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
@@ -170,7 +181,7 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('renders phone link when phone is present', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     const html = document.getElementById('hotel-ny').innerHTML;
@@ -178,13 +189,24 @@ describe('renderPhaseHotelCard()', () => {
   });
 
   test('does not render pin in hotel card HTML', () => {
-    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', { googleMapsUrl });
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
     const nyPhase = cfg.phases.find(p => p.id === 'ny');
     ctx.renderPhaseHotelCard(nyPhase);
     // Pin may appear as a label (that's intentional on-screen) — but should not be hardcoded
     // Here we check that the card renders without error and has the confirmation number
     const html = document.getElementById('hotel-ny').innerHTML;
     assert.ok(html.includes('TEST-001'), 'confirmation number not shown');
+  });
+
+  test('renders accommodation documents only through the authenticated endpoint', () => {
+    const { document, ctx } = createRenderContext(RENDER_TARGETS_HTML, cfg, 'he', HOTEL_EXTRAS);
+    const source = cfg.phases.find(p => p.id === 'ny');
+    const phase = { ...source, accommodation: { ...source.accommodation, pdf: 'hotel-confirmation.pdf' } };
+    ctx.renderPhaseHotelCard(phase);
+    const html = document.getElementById('hotel-ny').innerHTML;
+    assert.ok(html.includes('/api/bookings/confirmation/hotel-confirmation.pdf'));
+    assert.ok(html.includes('data-authed-document='));
+    assert.ok(!html.includes('href="/confirmations/'));
   });
 });
 

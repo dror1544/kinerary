@@ -83,6 +83,12 @@ async function verifyGoogleToken(idToken) {
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
+// Nginx must never serve documents directly: unlike images/scripts, a PDF,
+// DOCX, or Markdown file can contain confirmation numbers, passenger names,
+// PINs, or other trip-private material. In Docker this is the read-only
+// ./site mount; locally it resolves to the repository's site/ directory.
+const SITE_DIR = process.env.SITE_DIR || path.join(__dirname, '..', 'site');
+const STATIC_CONFIRMATIONS_DIR = path.join(SITE_DIR, 'confirmations');
 // Not under DATA_DIR: nginx serves this directory as static content directly
 // (docker-compose mounts ./site/avatars to /app/avatars here), so it has to
 // live where the web server can reach it, not in the app's private data
@@ -1793,15 +1799,47 @@ app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file
   res.json({ ok: true, conf_file: req.file.filename });
 });
 
-// Serve confirmation PDFs — uploaded ones from CONF_DIR; static ones from site/confirmations/ via Nginx
+function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
+  let stat;
+  try { stat = fs.statSync(filePath); } catch { return res.status(404).json({ error: 'not found' }); }
+  if (!stat.isFile()) return res.status(404).json({ error: 'not found' });
+  const filename = path.basename(filePath).replace(/["\\\r\n]/g, '_');
+  const contentTypes = {
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.md': 'text/markdown; charset=utf-8',
+    '.pkpass': 'application/vnd.apple.pkpass',
+  };
+  res.setHeader('Content-Type', contentTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `${disposition}; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  return fs.createReadStream(filePath).pipe(res);
+}
+
+function confirmationPath(filename, { staticOnly = false } = {}) {
+  const safeName = path.basename(filename);
+  const candidates = staticOnly
+    ? [path.join(STATIC_CONFIRMATIONS_DIR, safeName)]
+    : [path.join(CONF_DIR, safeName), path.join(STATIC_CONFIRMATIONS_DIR, safeName)];
+  return candidates.find(candidate => {
+    try { return fs.statSync(candidate).isFile(); } catch { return false; }
+  }) || candidates[0];
+}
+
+// One authenticated endpoint serves both files uploaded through the booking
+// form and older/seed files stored under site/confirmations. This lets every
+// UI call site use the same Authorization-header blob flow.
 app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
-  const fn = path.basename(req.params.fn);
-  const filePath = path.join(CONF_DIR, fn);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `inline; filename="${fn}"`);
-  fs.createReadStream(filePath).pipe(res);
+  return protectedDocumentResponse(res, confirmationPath(req.params.fn), 'inline');
 });
+
+// Preserve old bookmarks/links, but route them through the same authentication
+// boundary instead of allowing Nginx to read the files from disk directly.
+app.get('/confirmations/view/:fn', authRequired, (req, res) =>
+  protectedDocumentResponse(res, confirmationPath(req.params.fn, { staticOnly: true }), 'inline'));
+app.get('/confirmations/:fn', authRequired, (req, res) =>
+  protectedDocumentResponse(res, confirmationPath(req.params.fn, { staticOnly: true }), 'attachment'));
 
 const pkpassUpload = multer({
   storage: multer.diskStorage({
@@ -1820,11 +1858,7 @@ app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('fi
 
 app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
   const fn = path.basename(req.params.fn);
-  const filePath = path.join(CONF_DIR, fn);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
-  res.setHeader('Content-Type', 'application/vnd.apple.pkpass');
-  res.setHeader('Content-Disposition', `attachment; filename="${fn}"`);
-  fs.createReadStream(filePath).pipe(res);
+  return protectedDocumentResponse(res, path.join(CONF_DIR, fn), 'attachment');
 });
 
 // ── PHASE PLAN ITEMS ──────────────────────────────────────────────────────────
@@ -3458,6 +3492,19 @@ app.post('/api/trivia/questions', authRequired, (req, res) => {
   }
 
   res.json({ ok: true, id: newId, total: TRIVIA_QUESTIONS.length });
+});
+
+// Defense in depth for any document placed elsewhere under site/. Nginx
+// proxies these extensions here, and this route authenticates before checking
+// whether the path exists so unauthenticated callers cannot probe filenames.
+app.get(/^\/(?!api\/|confirmations\/).+\.(?:md|txt|rtf|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|pkpass)$/i, authRequired, (req, res) => {
+  let decodedPath;
+  try { decodedPath = decodeURIComponent(req.path); }
+  catch { return res.status(400).json({ error: 'invalid path' }); }
+  const siteRoot = path.resolve(SITE_DIR);
+  const filePath = path.resolve(siteRoot, decodedPath.replace(/^\/+/, ''));
+  if (!filePath.startsWith(siteRoot + path.sep)) return res.status(400).json({ error: 'invalid path' });
+  return protectedDocumentResponse(res, filePath, 'attachment');
 });
 
 // Catches what body-parser throws on a still-too-large or malformed body
