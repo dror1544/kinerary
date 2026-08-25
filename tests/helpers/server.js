@@ -44,6 +44,7 @@ export async function startTestServer(extraEnv = {}) {
         IMMICH_URL: '',
         IMMICH_API_KEY: '',
         HERMES_API_KEY: 'test-hermes-key',
+        CONTROL_PLANE_EXCHANGE_KEY: 'test-control-plane-exchange-key',
         SEED_PASSWORD: '1234',
         ...extraEnv,
       },

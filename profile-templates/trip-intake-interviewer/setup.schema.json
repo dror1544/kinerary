@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portable Hermes interviewer setup v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_type",
+    "profile",
+    "interviewer",
+    "backend",
+    "messaging",
+    "notifications",
+    "privacy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "record_type": {
+      "const": "hermes_interviewer_profile_input"
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{2,31}$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        }
+      }
+    },
+    "interviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "service_name",
+        "subject_label",
+        "default_language",
+        "supported_languages"
+      ],
+      "properties": {
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "service_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject_label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default_language": {
+          "type": "string",
+          "minLength": 2
+        },
+        "supported_languages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 2
+          }
+        }
+      }
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_name",
+        "url",
+        "auth_mode",
+        "enrollment_required"
+      ],
+      "properties": {
+        "connection_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,40}$"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https?://"
+        },
+        "auth_mode": {
+          "enum": [
+            "header",
+            "oauth",
+            "none"
+          ]
+        },
+        "enrollment_required": {
+          "const": true
+        }
+      }
+    },
+    "messaging": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "private_only",
+        "allow_group_chats",
+        "authorization_mode"
+      ],
+      "properties": {
+        "platform": {
+          "enum": [
+            "telegram",
+            "other"
+          ]
+        },
+        "private_only": {
+          "const": true
+        },
+        "allow_group_chats": {
+          "const": false
+        },
+        "authorization_mode": {
+          "const": "enrollment_token"
+        }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "event_files",
+            "disabled"
+          ]
+        },
+        "event_directory": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$"
+        }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pii_redaction",
+        "secret_redaction",
+        "sensitive_default",
+        "retention"
+      ],
+      "properties": {
+        "pii_redaction": {
+          "const": true
+        },
+        "secret_redaction": {
+          "const": true
+        },
+        "sensitive_default": {
+          "const": "private"
+        },
+        "retention": {
+          "enum": [
+            "service_managed",
+            "minimal"
+          ]
+        }
+      }
+    }
+  }
+}

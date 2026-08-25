@@ -40,6 +40,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0013_sprint4.sql",
       "0014_telegram_callback_refs.sql",
       "0015_intake_versions_canonical_guard.sql",
+      "0016_sprint4_seed_development_release.sql",
+      "0017_telegram_chat_id.sql",
+      "0018_release_accepts_intake_schema_v2.sql",
+      "0019_telegram_chat_bindings.sql",
+      "0020_web_portal.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -61,6 +66,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0013_sprint4.sql",
       "0014_telegram_callback_refs.sql",
       "0015_intake_versions_canonical_guard.sql",
+      "0016_sprint4_seed_development_release.sql",
+      "0017_telegram_chat_id.sql",
+      "0018_release_accepts_intake_schema_v2.sql",
+      "0019_telegram_chat_bindings.sql",
+      "0020_web_portal.sql",
     ]);
   } finally {
     await reset(client);

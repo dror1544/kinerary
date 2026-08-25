@@ -2,8 +2,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 export interface VerifiedTelegramIdentity {
   provider: "telegram";
-  /** sha256:hex — the Telegram numeric ID is never stored or returned directly */
+  /** sha256:hex — used for identity lookups; the raw ID below is never used for comparisons */
   providerSubjectDigest: string;
+  /** Raw Telegram numeric ID as a string. Only for sending messages back — never for identity checks (use the digest) or for returning in any API response. */
+  providerSubjectId: string;
   displayName: string;
 }
 
@@ -26,7 +28,10 @@ export type TelegramLoginResult =
  *   data_check_string = sorted("key=value\n" for each field except "hash")
  *   expected_hash = HMAC-SHA256(secret_key, data_check_string).hex()
  *
- * The raw Telegram numeric ID is never returned — only a SHA256 digest of it.
+ * Returns both a SHA256 digest of the Telegram numeric ID (the identity
+ * comparison key, used everywhere else in this codebase) and the raw ID
+ * itself (`providerSubjectId`, needed only to send the user a message back —
+ * callers must not use it for identity checks or return it in a response).
  */
 export function verifyTelegramLogin(
   payload: Record<string, unknown>,
@@ -82,6 +87,7 @@ export function verifyTelegramLogin(
     identity: {
       provider: "telegram",
       providerSubjectDigest: digestTelegramId(String(payload.id)),
+      providerSubjectId: String(payload.id),
       displayName,
     },
   };

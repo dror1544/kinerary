@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "record_type": "hermes_interviewer_profile_input",
+  "profile": {
+    "name": "intakebot",
+    "description": "Private intake interviewer"
+  },
+  "interviewer": {
+    "display_name": "Intake Guide",
+    "service_name": "Travel Setup",
+    "subject_label": "trip setup request",
+    "default_language": "en",
+    "supported_languages": [
+      "en",
+      "he"
+    ]
+  },
+  "backend": {
+    "connection_name": "interview",
+    "url": "http://127.0.0.1:4311/sse",
+    "auth_mode": "header",
+    "enrollment_required": true
+  },
+  "messaging": {
+    "platform": "telegram",
+    "private_only": true,
+    "allow_group_chats": false,
+    "authorization_mode": "enrollment_token"
+  },
+  "notifications": {
+    "mode": "event_files",
+    "event_directory": "notes-rw/notifications"
+  },
+  "privacy": {
+    "pii_redaction": true,
+    "secret_redaction": true,
+    "sensitive_default": "private",
+    "retention": "service_managed"
+  }
+}

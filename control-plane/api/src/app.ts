@@ -10,6 +10,7 @@ import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
+import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -46,6 +47,12 @@ export interface ProvisionerDependencies {
   db: pg.Pool;
 }
 
+export interface ChatRoutingDependencies {
+  db: pg.Pool;
+  /** Shared secret Hermes's gateway presents as X-API-Key. Same trust tier as INTERVIEW_MCP_KEY. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -58,6 +65,10 @@ export interface AppDependencies {
   planner?: PlannerDependencies;
   /** Optional: mount intake correction route (Sprint 4+). */
   provisioner?: ProvisionerDependencies;
+  /** Optional: mount the internal chat-routing lookup Hermes's gateway calls. */
+  chatRouting?: ChatRoutingDependencies;
+  /** Optional: mount Google-session organizer portal routes. */
+  portal?: PortalDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -72,6 +83,26 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   const log = dependencies.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const app = Fastify({ logger: false });
 
+  // A web-enabled deployment uses Google-backed browser sessions exclusively.
+  // Keep the historical handlers available to non-web control-plane profiles
+  // during rollout, but make them unreachable on the SPA origin. Telegram is
+  // still accepted by the private shared-bot binding below, never as web auth.
+  if (profile.web) {
+    const retiredTelegramOrganizerRoutes = [
+      /^\/v1\/signup(?:\/|$)/,
+      /^\/v1\/trips\/[^/]+\/(?:enrollment|plan|intake\/correct)\/?$/,
+      /^\/v1\/interview\/[^/]+\/status\/?$/,
+      /^\/v1\/releases\/?$/,
+      /^\/v1\/plans\/[^/]+(?:\/approve)?\/?$/,
+    ];
+    app.addHook("onRequest", async (request, reply) => {
+      const path = request.url.split("?", 1)[0] ?? "";
+      if (retiredTelegramOrganizerRoutes.some((pattern) => pattern.test(path))) {
+        return reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" });
+      }
+    });
+  }
+
   app.get("/", async () => ({
     service: "kinerary-control-plane",
     sprint: 4,
@@ -82,6 +113,8 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
+      "/v1/auth/google/start", "/v1/me", "/v1/trips", "/v1/ops/provisioning-requests",
+      "/internal/telegram-interviews/bind",
     ],
   }));
 
@@ -260,7 +293,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // GET /v1/trips/:id — read a trip the authenticated user is a member of.
   // Header: X-Telegram-Login: <base64url-encoded-json of Telegram login data>
-  app.get("/v1/trips/:id", async (request, reply) => {
+  if (!dependencies.portal) app.get("/v1/trips/:id", async (request, reply) => {
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
     }
@@ -375,6 +408,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       sessionToken: result.sessionToken,
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
     });
   });
 
@@ -404,15 +438,17 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       sessionId: result.view.sessionId,
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
       recap: result.view.recap,
     });
   });
 
   // POST /v1/interview/:sessionId/answer — submit or correct an answer.
   // Header: Authorization: Bearer <session-token>
-  // Body: { questionId, optionId?, otherText?, data? }
+  // Body: { questionId, optionId?, otherText?, data?, optionIds? }
   // `data` carries the payload for "structured" questions (e.g. travelers,
   // phases) — a JSON array/object rather than a string.
+  // `optionIds` carries every selected id for a "multi_choice" question.
   app.post("/v1/interview/:sessionId/answer", async (request, reply) => {
     if (!dependencies.interview) {
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
@@ -432,10 +468,17 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const optionId = body?.optionId ?? null;
     const otherText = body?.otherText;
     const structuredData = body?.data;
+    const optionIds = body?.optionIds;
 
     if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Reject a non-string element here rather than letting validateAnswer's
+    // option lookup coerce it — an id must be a literal option id, and a
+    // number or object that stringifies into one is not that.
+    if (optionIds !== undefined && (!Array.isArray(optionIds) || optionIds.some((id) => typeof id !== "string"))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
 
     const result = await submitAnswer(
       dependencies.interview.db,
@@ -445,6 +488,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       otherText as string | undefined,
       sessionId,
       structuredData,
+      optionIds as string[] | undefined,
     );
 
     if (!result.ok) {
@@ -457,6 +501,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send({
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
       recap: result.view.recap,
     });
   });
@@ -811,6 +856,72 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       digest: result.digest,
     });
   });
+
+  // Internal only — never exposed to organizers/families, never routed
+  // through Telegram-login auth. Trust is a single shared key, same tier as
+  // interview-mcp.ts's INTERVIEW_MCP_KEY: the caller is Hermes's gateway
+  // process deciding which profile's HERMES_HOME serves an inbound chat, not
+  // a human. Returns only a trip id and a profile name — no trip content, no
+  // credentials — so a leaked response is low-value on its own.
+  app.get("/internal/telegram-chat-bindings/:chatId", async (request, reply) => {
+    if (!dependencies.chatRouting) {
+      return reply.code(503).send({ error: "CHAT_ROUTING_NOT_CONFIGURED" });
+    }
+    const { db, apiKey } = dependencies.chatRouting;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    if (typeof providedKey !== "string" || providedKey.length === 0 || providedKey !== apiKey) {
+      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    }
+    const params = request.params as Record<string, unknown>;
+    const chatId = params?.chatId;
+    if (typeof chatId !== "string" || chatId.length === 0) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await db.query<{ trip_id: string; hermes_profile: string }>(
+      "SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+      [chatId],
+    );
+    const [row] = result.rows;
+    if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(200).send({ tripId: row.trip_id, hermesProfile: row.hermes_profile });
+  });
+
+  // The shared Telegram bot exchanges a deep-link token for an interview and
+  // binds only that verified chat to the resulting session. No web-login
+  // identity is created or modified by this path.
+  app.post("/internal/telegram-interviews/bind", async (request, reply) => {
+    if (!dependencies.chatRouting || !dependencies.interview) return reply.code(503).send({ error: "INTERVIEW_BINDING_NOT_CONFIGURED" });
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    if (providedKey !== dependencies.chatRouting.apiKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const body = request.body as Record<string, unknown>;
+    const chatId = typeof body.chatId === "string" && /^-?[0-9]{1,20}$/.test(body.chatId) ? body.chatId : null;
+    const enrollmentToken = typeof body.enrollmentToken === "string" ? body.enrollmentToken : null;
+    if (!chatId || !enrollmentToken) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const active = await dependencies.interview.db.query("SELECT 1 FROM control_plane.telegram_interview_bindings WHERE chat_id = $1 AND state = 'active'", [chatId]);
+    if (active.rows[0]) return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
+    const started = await startSession(dependencies.interview.db, enrollmentToken, log);
+    if (!started.ok) return reply.code(started.reason === "TRIP_NOT_DRAFT" ? 409 : 401).send({ error: started.reason });
+    try {
+      await dependencies.interview.db.query(
+        `INSERT INTO control_plane.telegram_interview_bindings(chat_id, trip_id, session_id, state)
+         VALUES ($1, $2, $3, 'active')`, [chatId, started.view.tripId, started.sessionId]);
+    } catch (error) {
+      // A chat binding race must not reveal the newly minted bearer. Remove
+      // the losing session and return the trip to draft so the organizer can
+      // issue a fresh one-time link.
+      const client = await dependencies.interview.db.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("DELETE FROM control_plane.intake_sessions WHERE id = $1", [started.sessionId]);
+        await client.query("UPDATE control_plane.trips SET lifecycle_state = 'draft', updated_at = now() WHERE id = $1 AND lifecycle_state = 'intake_in_progress'", [started.view.tripId]);
+        await client.query("COMMIT");
+      } catch { await client.query("ROLLBACK"); } finally { client.release(); }
+      return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
+    }
+    return reply.code(201).send({ sessionId: started.sessionId, sessionToken: started.sessionToken, tripId: started.view.tripId });
+  });
+
+  if (dependencies.portal) registerPortalRoutes(app, dependencies.portal);
 
   if (dependencies.close) app.addHook("onClose", dependencies.close);
   return app;

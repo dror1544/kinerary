@@ -18,6 +18,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Brand } from "../components/Brand";
 import { SiteHeader } from "../components/SiteHeader";
+import { api } from "../api";
 
 type ScenarioKey = "rain" | "tired" | "dinner";
 
@@ -58,6 +59,10 @@ const scenarios: Record<ScenarioKey, {
     protectedAnchor: "Dinner · 20:30",
   },
 };
+
+function trackLandingCta() {
+  void api("/v1/events", { method: "POST", body: JSON.stringify({ event: "landing_cta" }) }).catch(() => {});
+}
 
 function HeroStage() {
   const [approved, setApproved] = useState(false);
@@ -191,7 +196,7 @@ export default function LandingPage() {
             <h1 id="hero-title">Keep your family trip moving—even when plans change.</h1>
             <p>One private place for plans, bookings, questions, and changes. The organizer stays in control; everyone else gets the simple answer they need.</p>
             <div className="hero-actions">
-              <Link className="button button-coral" to="/trips/new">Start a trip <ArrowRight size={18} /></Link>
+              <Link className="button button-coral" to="/trips/new" onClick={trackLandingCta}>Start a trip <ArrowRight size={18} /></Link>
               <a className="button button-quiet" href="#how-it-works">See how it works</a>
             </div>
             <div className="trust-line">
@@ -232,7 +237,7 @@ export default function LandingPage() {
           <Sparkles />
           <h2>Less repeating.<br />More being there.</h2>
           <p>Start the family trip everyone can actually follow.</p>
-          <div><Link className="button button-coral" to="/trips/new">Start a trip <ArrowRight size={18} /></Link><Link className="button button-dark-quiet" to="/sign-in">Sign in</Link></div>
+          <div><Link className="button button-coral" to="/trips/new" onClick={trackLandingCta}>Start a trip <ArrowRight size={18} /></Link><Link className="button button-dark-quiet" to="/sign-in">Sign in</Link></div>
         </section>
       </main>
 

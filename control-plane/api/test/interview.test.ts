@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { issueEnrollment } from "../src/enrollment.js";
 import {
-  INTAKE_QUESTIONS_V1,
+  INTAKE_QUESTIONS,
   INTAKE_SCHEMA_VERSION,
   validateAnswer,
   buildRecap,
@@ -69,7 +69,7 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("choice question: 'other' text exceeding maxLength rejected", () => {
-    const q = INTAKE_QUESTIONS_V1.find((q) => q.id === "trip_type")!;
+    const q = INTAKE_QUESTIONS.find((q) => q.id === "trip_type")!;
     const longText = "x".repeat((q.maxLength ?? 120) + 1);
     const result = validateAnswer("trip_type", "other", longText);
     assert.equal(result.ok, false);
@@ -108,7 +108,7 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("text question: text exceeding maxLength rejected", () => {
-    const q = INTAKE_QUESTIONS_V1.find((q) => q.id === "destination")!;
+    const q = INTAKE_QUESTIONS.find((q) => q.id === "destination")!;
     const longText = "x".repeat((q.maxLength ?? 200) + 1);
     const result = validateAnswer("destination", longText, null);
     assert.equal(result.ok, false);
@@ -124,7 +124,7 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("structured question (array shape): valid array accepted", () => {
-    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS_V1, [{ name: "Alex", age: 30, family: "Smith" }]);
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "Alex", age: 30, family: "Smith" }]);
     assert.equal(result.ok, true);
     if (!result.ok) throw new Error("unreachable");
     assert.equal(result.answer.kind, "structured");
@@ -133,21 +133,21 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("structured question (array shape): object payload rejected", () => {
-    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS_V1, { name: "Alex" });
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, { name: "Alex" });
     assert.equal(result.ok, false);
     if (result.ok) throw new Error("unreachable");
     assert.equal(result.reason, "DATA_WRONG_SHAPE");
   });
 
   test("structured question (object shape): valid object accepted", () => {
-    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS_V1, { dietary: "vegetarian" });
+    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS, { dietary: "vegetarian" });
     assert.equal(result.ok, true);
     if (!result.ok) throw new Error("unreachable");
     assert.equal(result.answer.kind, "structured");
   });
 
   test("structured question (object shape): array payload rejected", () => {
-    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS_V1, ["not", "an", "object"]);
+    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS, ["not", "an", "object"]);
     assert.equal(result.ok, false);
     if (result.ok) throw new Error("unreachable");
     assert.equal(result.reason, "DATA_WRONG_SHAPE");
@@ -167,6 +167,83 @@ describe("validateAnswer (unit)", () => {
     assert.equal(result.answer.kind, "structured");
     if (result.answer.kind !== "structured") throw new Error("unreachable");
     assert.deepEqual(result.answer.data, {});
+  });
+
+  test("multi_choice question: several valid options accepted", () => {
+    const result = validateAnswer("dietary", null, null, INTAKE_QUESTIONS, undefined, ["vegetarian", "gluten_free"]);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.answer.kind, "multi_choice");
+    if (result.answer.kind !== "multi_choice") throw new Error("unreachable");
+    assert.deepEqual(result.answer.option_ids, ["gluten_free", "vegetarian"]);
+    assert.equal(result.answer.schema_version, INTAKE_SCHEMA_VERSION);
+  });
+
+  test("multi_choice question: one unknown option rejects the whole answer", () => {
+    const result = validateAnswer("dietary", null, null, INTAKE_QUESTIONS, undefined, ["vegetarian", "pescatarian"]);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "UNKNOWN_OPTION");
+  });
+
+  test("multi_choice question: order and repeats are normalized away", () => {
+    // Both are artifacts of however the chat UI serialised the taps, and both
+    // would otherwise perturb the intake digest for an identical answer.
+    const a = validateAnswer("dietary", null, null, INTAKE_QUESTIONS, undefined, ["vegan", "kosher", "vegan"]);
+    const b = validateAnswer("dietary", null, null, INTAKE_QUESTIONS, undefined, ["kosher", "vegan"]);
+    assert.equal(a.ok && b.ok, true);
+    if (!a.ok || !b.ok) throw new Error("unreachable");
+    assert.deepEqual(a.answer, b.answer);
+  });
+
+  test("multi_choice question: omitting optionIds entirely is rejected", () => {
+    const result = validateAnswer("dietary", null, null);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "OPTIONS_REQUIRED");
+  });
+
+  test("multi_choice question: an explicit empty selection is a valid optional answer", () => {
+    const result = validateAnswer("dietary", null, null, INTAKE_QUESTIONS, undefined, []);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.answer.kind, "multi_choice");
+    if (result.answer.kind !== "multi_choice") throw new Error("unreachable");
+    assert.deepEqual(result.answer.option_ids, []);
+  });
+
+  test("date questions never state a format to the organizer", () => {
+    // Organizers' own date conventions vary (DD/MM vs MM/DD vs written out);
+    // the interviewer resolves whatever they say and confirms its reading back
+    // in words. Naming a format just leaks an implementation detail.
+    for (const id of ["departure_date", "return_date"]) {
+      const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
+      assert.ok(q, `${id} must exist`);
+      assert.ok(!/YYYY|MM-DD|DD\/MM/i.test(q.prompt), `${id} prompt leaks a date format: ${q.prompt}`);
+    }
+  });
+
+  test("no new choice question offers a free-text 'other'", () => {
+    // Their answers become bilingual {he,en} strings in trip.config.json, and
+    // organizer free text would only ever be the one language they typed.
+    for (const id of ["trip_pace", "dietary", "bot_gender", "bot_tone", "bot_proactive"]) {
+      const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
+      assert.ok(q, `${id} must exist`);
+      assert.ok(!q.allowsOther, `${id} must not allow free-text other`);
+    }
+  });
+
+  test("every question added in schema v2 is optional", () => {
+    // A required question here would block confirmation for an organizer who
+    // simply doesn't want an assistant yet.
+    for (const id of [
+      "trip_pace", "dietary", "dietary_scope", "organizer_identity",
+      "bot_name", "bot_gender", "bot_tone", "bot_proactive", "bot_limits",
+    ]) {
+      const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
+      assert.ok(q, `${id} must exist`);
+      assert.equal(q.required, false, `${id} must be optional`);
+    }
   });
 });
 
@@ -200,6 +277,26 @@ describe("buildRecap (unit)", () => {
     const entry = recap.find((r) => r.questionId === "destination");
     assert.ok(entry);
     assert.equal(entry!.answerLabel, "Japan");
+  });
+
+  test("multi_choice answer shows every selected label, not ids", () => {
+    const answers = {
+      dietary: { kind: "multi_choice" as const, option_ids: ["kosher", "vegan"], schema_version: 2, other_text: null },
+    };
+    const recap = buildRecap(answers);
+    const entry = recap.find((r) => r.questionId === "dietary");
+    assert.ok(entry);
+    assert.ok(entry!.answerLabel.includes("Kosher"), entry!.answerLabel);
+    assert.ok(entry!.answerLabel.includes("Vegan"), entry!.answerLabel);
+    assert.ok(!entry!.answerLabel.includes("undefined"), "must not fall through to the text branch");
+  });
+
+  test("empty multi_choice answer reads as (none), not blank", () => {
+    const answers = {
+      dietary: { kind: "multi_choice" as const, option_ids: [], schema_version: 2, other_text: null },
+    };
+    const recap = buildRecap(answers);
+    assert.equal(recap.find((r) => r.questionId === "dietary")!.answerLabel, "(none)");
   });
 });
 
@@ -396,6 +493,84 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!view.ok) throw new Error("unreachable");
       assert.equal(view.view.sessionId, started.sessionId);
       assert.equal(view.view.state, "interviewing");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("optionalRemaining exposes the optional questions nextQuestion never reaches", { skip: SKIP }, async () => {
+    // nextQuestion only ever walks *required* questions. Without this list the
+    // interviewer has no way to learn an optional question exists, which is
+    // why dietary, pace and the whole assistant block would otherwise be
+    // collected from every organizer exactly never.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      const ids = started.view.optionalRemaining.map((q) => q.id);
+      for (const expected of ["dietary", "trip_pace", "bot_name", "bot_limits", "timezone"]) {
+        assert.ok(ids.includes(expected), `optionalRemaining must include ${expected}, got ${ids.join(", ")}`);
+      }
+      assert.ok(!ids.includes("destination"), "required questions belong to nextQuestion, not this list");
+
+      // Answering one drops it from the list.
+      const after = await submitAnswer(
+        fix.pool, started.sessionToken, "dietary", null, undefined, undefined, undefined, ["vegetarian"],
+      );
+      assert.equal(after.ok, true);
+      if (!after.ok) throw new Error("unreachable");
+      assert.ok(!after.view.optionalRemaining.map((q) => q.id).includes("dietary"));
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("optional questions never gate confirmation", { skip: SKIP }, async () => {
+    // The whole point of optionalRemaining being advisory: an organizer who
+    // wants no assistant at all must still be able to finish.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+      const view = await getSession(fix.pool, started.sessionToken);
+      assert.equal(view.ok, true);
+      if (!view.ok) throw new Error("unreachable");
+      assert.equal(view.view.state, "awaiting_confirmation");
+      assert.ok(view.view.optionalRemaining.length > 0, "still offering the unanswered optional questions");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("submitAnswer: multi_choice answer stored as an option_ids array", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token);
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      const result = await submitAnswer(
+        fix.pool, started.sessionToken, "bot_proactive", null, undefined, undefined, undefined,
+        ["morning_briefing", "flight_changes"],
+      );
+      assert.equal(result.ok, true);
+
+      const row = await fix.pool.query<{ answers: Record<string, any> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [started.sessionId],
+      );
+      const stored = row.rows[0].answers.bot_proactive;
+      assert.equal(stored.kind, "multi_choice");
+      assert.deepEqual(stored.option_ids, ["flight_changes", "morning_briefing"]);
+      assert.equal(stored.schema_version, INTAKE_SCHEMA_VERSION);
     } finally {
       await teardownFixture(fix);
     }

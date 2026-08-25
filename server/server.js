@@ -27,6 +27,9 @@ const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
+// Shared only with the fixed-origin runtime gateway. It is deliberately
+// independent from the Hermes service credential and has no browser path.
+const CONTROL_PLANE_EXCHANGE_KEY = process.env.CONTROL_PLANE_EXCHANGE_KEY || '';
 // Optional shared onboarding password for a fresh DB's seeded users. Leave
 // unset in production once Telegram/Google login is live — each participant
 // then gets an independent random password instead of one shared, guessable
@@ -323,6 +326,13 @@ db.exec(`
     content    TEXT NOT NULL,
     hash       TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS control_plane_enrollments (
+    invite_id   TEXT PRIMARY KEY,
+    username    TEXT NOT NULL REFERENCES users(username),
+    method      TEXT NOT NULL CHECK(method IN ('google','password')),
+    created_at  TEXT DEFAULT (datetime('now'))
   );
 `);
 
@@ -659,6 +669,60 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+function controlPlaneExchangeRequired(req, res, next) {
+  if (!CONTROL_PLANE_EXCHANGE_KEY || req.headers['x-api-key'] !== CONTROL_PLANE_EXCHANGE_KEY) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
+}
+
+// The runtime gateway exchanges a consumed control-plane grant for the
+// runtime's normal JWT. Browsers can neither call nor authenticate this route.
+app.post('/api/internal/control-plane/session', controlPlaneExchangeRequired, (req, res) => {
+  const role = typeof req.body?.role === 'string' ? req.body.role : '';
+  const requestedUsername = typeof req.body?.runtimeUsername === 'string' ? req.body.runtimeUsername : '';
+  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
+  const username = requestedUsername || (['owner', 'organizer'].includes(role) ? organizers[0] : '');
+  if (!username || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
+    return res.status(404).json({ error: 'runtime_participant_not_found' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: jwt.sign({ username }, JWT_SECRET, { expiresIn: '12h' }) });
+});
+
+// Idempotent by invite_id: a retry after an uncertain network response never
+// rotates credentials twice or enrolls a different runtime participant.
+app.post('/api/internal/control-plane/participants', controlPlaneExchangeRequired, async (req, res) => {
+  const { inviteId, runtimeUsername, method, password } = req.body || {};
+  if (typeof inviteId !== 'string' || !/^invite_[A-Za-z0-9]{8,64}$/.test(inviteId)
+      || typeof runtimeUsername !== 'string' || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)
+      || !['google', 'password'].includes(method)) {
+    return res.status(400).json({ error: 'invalid_request' });
+  }
+  const prior = db.prepare('SELECT username, method FROM control_plane_enrollments WHERE invite_id = ?').get(inviteId);
+  if (prior) {
+    if (prior.username !== runtimeUsername || prior.method !== method) return res.status(409).json({ error: 'invite_binding_conflict' });
+    return res.json({ ok: true, username: prior.username });
+  }
+  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(runtimeUsername)) {
+    return res.status(404).json({ error: 'runtime_participant_not_found' });
+  }
+  if (method === 'password' && (typeof password !== 'string' || password.length < 8 || password.length > 128)) {
+    return res.status(400).json({ error: 'password_invalid' });
+  }
+  const hash = await bcrypt.hash(method === 'password' ? password : crypto.randomBytes(32).toString('base64url'), 12);
+  try {
+    db.transaction(() => {
+      db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, runtimeUsername);
+      db.prepare('INSERT INTO control_plane_enrollments(invite_id, username, method) VALUES (?, ?, ?)').run(inviteId, runtimeUsername, method);
+    })();
+  } catch (error) {
+    if (String(error.message).includes('UNIQUE')) return res.status(409).json({ error: 'invite_binding_conflict' });
+    throw error;
+  }
+  res.json({ ok: true, username: runtimeUsername });
+});
+
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
 // Strip PIN codes, organizer-only needs, and organizer-only agent standing
 // instructions before serving to clients — every family member is authed,
@@ -763,7 +827,7 @@ app.get('/api/currency-rates', authRequired, async (_req, res) => {
 // here — rather than reusing sanitizeConfig() — keeps the public surface
 // obvious at a glance instead of depending on a general-purpose sanitizer
 // that could grow more fields later.
-app.get('/api/config/roster', (_req, res) => {
+app.get('/api/config/roster', authRequired, (_req, res) => {
   const roster = (TRIP_CONFIG.participants || []).map(p => ({
     username: p.username,
     name: p.name,
@@ -1057,7 +1121,7 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
-app.get('/api/trip/logo', (_req, res) => {
+app.get('/api/trip/logo', authRequired, (_req, res) => {
   const logoFile = TRIP_CONFIG.meta?.logo;
   if (!logoFile) return res.status(404).end();
   const logoPath = path.join(TRIP_DIR, logoFile);
@@ -1228,7 +1292,7 @@ app.post('/api/auth/avatar/upload', authRequired,
 );
 
 // ── RATINGS ───────────────────────────────────────────────────────────────────
-app.get('/api/ratings', (_req, res) => {
+app.get('/api/ratings', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
   const result = {};
   for (const r of rows) {
@@ -1311,7 +1375,7 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   }
 });
 
-app.get('/api/photos', (req, res) => {
+app.get('/api/photos', authRequired, (req, res) => {
   const { phase } = req.query;
   const rows = phase
     ? db.prepare('SELECT * FROM photos WHERE phase = ? ORDER BY uploaded_at DESC').all(phase)
@@ -1330,7 +1394,7 @@ app.get('/api/photos', (req, res) => {
   res.json(photos);
 });
 
-app.get('/api/photos/file/:filename', (req, res) => {
+app.get('/api/photos/file/:filename', authRequired, (req, res) => {
   const filePath = path.join(UPLOADS_DIR, path.basename(req.params.filename));
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not_found' });
   res.sendFile(filePath);
@@ -1366,7 +1430,7 @@ app.delete('/api/photos/:id', authRequired, async (req, res) => {
 });
 
 // ── VENUE COMMENTS ────────────────────────────────────────────────────────────
-app.get('/api/comments/venue/:venueId', (req, res) => {
+app.get('/api/comments/venue/:venueId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM venue_comments WHERE venue = ? ORDER BY created_at ASC').all(req.params.venueId);
   const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
   res.json(comments);
@@ -1391,7 +1455,7 @@ app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
 });
 
 // ── RSVPs ─────────────────────────────────────────────────────────────────────
-app.get('/api/rsvps/:activityId', (req, res) => {
+app.get('/api/rsvps/:activityId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM rsvps WHERE activity = ?').all(req.params.activityId);
   const rsvps = rows.map(r => ({ ...r, user: getUser(r.username) || { username: r.username } }));
   res.json(rsvps);
@@ -1408,7 +1472,7 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 
 // ── PHOTO REACTIONS ───────────────────────────────────────────────────────────
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
-app.get('/api/reactions', (req, res) => {
+app.get('/api/reactions', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
   const grouped = {};
   for (const r of rows) {
@@ -1419,7 +1483,7 @@ app.get('/api/reactions', (req, res) => {
   res.json(grouped);
 });
 
-app.get('/api/reactions/:photoId', (req, res) => {
+app.get('/api/reactions/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
   // Group by emoji: { '❤️': [{ username, user }], ... }
   const grouped = {};
@@ -1445,7 +1509,7 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 
 // ── PHOTO COMMENTS ────────────────────────────────────────────────────────────
 // Bulk fetch — all photo comments (for gallery preload)
-app.get('/api/comments/photo', (req, res) => {
+app.get('/api/comments/photo', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
   const grouped = {};
   for (const c of rows) {
@@ -1455,7 +1519,7 @@ app.get('/api/comments/photo', (req, res) => {
   res.json(grouped);
 });
 
-app.get('/api/comments/photo/:photoId', (req, res) => {
+app.get('/api/comments/photo/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments WHERE photo_id = ? ORDER BY created_at ASC').all(req.params.photoId);
   const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
   res.json(comments);
@@ -1480,7 +1544,7 @@ app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
 });
 
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
-app.get('/api/tasks/done', (req, res) => {
+app.get('/api/tasks/done', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM task_done ORDER BY done_at ASC').all();
   res.json(rows.map(r => ({ ...r, user: getUser(r.done_by) })));
 });
@@ -1794,7 +1858,7 @@ app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file
 });
 
 // Serve confirmation PDFs — uploaded ones from CONF_DIR; static ones from site/confirmations/ via Nginx
-app.get('/api/bookings/confirmation/:fn', (req, res) => {
+app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
@@ -1818,7 +1882,7 @@ app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('fi
   res.json({ ok: true, pkpass_file: req.file.filename });
 });
 
-app.get('/api/bookings/wallet-apple/:fn', (req, res) => {
+app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
@@ -3237,7 +3301,7 @@ app.get('/api/trivia/events', authRequired, (req, res) => {
 });
 
 // GET /api/trivia/public-events — unauthenticated SSE for TV/projector screen display
-app.get('/api/trivia/public-events', (req, res) => {
+app.get('/api/trivia/public-events', authRequired, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');

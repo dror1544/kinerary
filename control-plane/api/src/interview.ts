@@ -18,7 +18,13 @@ function sessionTokenDigest(token: string): string {
 
 // ── Question schema (versioned) ──────────────────────────────────────────────
 
-export const INTAKE_SCHEMA_VERSION = 1;
+// Bumped to 2 when the persona/dietary/pace questions and the 'multi_choice'
+// type landed. Nothing branches on this at read time — a stored answer's
+// schema_version records which question set produced it, and an answer of
+// kind 'multi_choice' could not have come from v1. Releases advertise the
+// range they accept via releases.data_schema_min/max, so a bump here needs a
+// matching widening there or generatePlan finds no eligible release.
+export const INTAKE_SCHEMA_VERSION = 2;
 
 export interface ChoiceOption {
   id: string;
@@ -27,9 +33,9 @@ export interface ChoiceOption {
 
 export interface IntakeQuestion {
   id: string;
-  type: "choice" | "text" | "structured";
+  type: "choice" | "multi_choice" | "text" | "structured";
   prompt: string;
-  options?: ChoiceOption[];  // present for 'choice' questions
+  options?: ChoiceOption[];  // present for 'choice' and 'multi_choice' questions
   allowsOther?: boolean;     // choice only: enables the 'other' follow-up
   otherPrompt?: string;      // follow-up prompt shown when 'other' is chosen
   maxLength?: number;        // max chars for text/other answers
@@ -41,7 +47,7 @@ export interface IntakeQuestion {
   required: boolean;
 }
 
-export const INTAKE_QUESTIONS_V1: readonly IntakeQuestion[] = [
+export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "trip_type",
     type: "choice",
@@ -100,17 +106,22 @@ export const INTAKE_QUESTIONS_V1: readonly IntakeQuestion[] = [
     maxLength: 500,
     required: false,
   },
+  // No date format in either prompt, deliberately. The interviewer resolves
+  // whatever the organizer says into YYYY-MM-DD before submitting, and
+  // confirms its reading back in words ("so departure September 6th?") —
+  // that is what catches DD/MM vs MM/DD ambiguity. Naming a format here just
+  // leaks an implementation detail at a non-technical organizer.
   {
     id: "departure_date",
     type: "text",
-    prompt: "What's the departure date? (YYYY-MM-DD)",
+    prompt: "What day does the trip start?",
     maxLength: 40,
     required: true,
   },
   {
     id: "return_date",
     type: "text",
-    prompt: "What's the return date? (YYYY-MM-DD)",
+    prompt: "What day does everyone head home?",
     maxLength: 40,
     required: true,
   },
@@ -131,7 +142,7 @@ export const INTAKE_QUESTIONS_V1: readonly IntakeQuestion[] = [
   {
     id: "phases",
     type: "structured",
-    prompt: "Where are you going, and when? List each stop: place name, date range, and accommodation (with confirmation number) if already booked.",
+    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
     required: true,
   },
@@ -145,8 +156,114 @@ export const INTAKE_QUESTIONS_V1: readonly IntakeQuestion[] = [
   {
     id: "constraints",
     type: "structured",
-    prompt: "Anything the group needs to know about — mobility needs, dietary restrictions, budget expectations, or family dynamics? (optional)",
+    prompt: "Anything the group needs to know about — mobility needs, budget expectations, or family dynamics? (optional)",
     dataShape: "object",
+    required: false,
+  },
+
+  // ── Everything below is optional and tap-answerable ───────────────────────
+  // These restore what the older human-driven interview
+  // (.agents/skills/create-trip/INTERVIEW.md §9) collected and this one had
+  // dropped. None of them block confirmation; they surface to the interviewer
+  // through SessionView.optionalRemaining, not nextQuestion.
+  //
+  // None of the choice questions below set allowsOther. Their answers become
+  // bilingual {he,en} strings in trip.config.json (participants[].needs[].text,
+  // agent.standing_instructions[].text), and a free-text 'other' would only
+  // ever be in the one language the organizer typed. Anything off-menu belongs
+  // in bot_limits, which is structured and bilingual by construction.
+  {
+    id: "trip_pace",
+    type: "choice",
+    prompt: "What pace suits this group?",
+    options: [
+      { id: "easygoing", label: "Easygoing — late starts, few things a day" },
+      { id: "balanced", label: "Balanced — a main plan a day, room to drift" },
+      { id: "intense", label: "Intense — early starts, pack it in" },
+    ],
+    required: false,
+  },
+  {
+    id: "dietary",
+    type: "multi_choice",
+    prompt: "Does any of this apply to anyone travelling? (tap all that apply)",
+    options: [
+      { id: "none", label: "None of these" },
+      { id: "kosher", label: "Kosher" },
+      { id: "kosher_style", label: "Kosher-style — no pork or shellfish, regular beef and chicken is fine" },
+      { id: "vegetarian", label: "Vegetarian" },
+      { id: "vegan", label: "Vegan" },
+      { id: "lactose_free", label: "Lactose intolerant" },
+      { id: "gluten_free", label: "Gluten-free / celiac" },
+      { id: "nut_allergy", label: "Nut allergy" },
+    ],
+    required: false,
+  },
+  {
+    id: "dietary_scope",
+    type: "structured",
+    prompt: "For each thing ticked above: everyone, or specific people? Keys are the option ids, values are \"everyone\" or a list of traveler names.",
+    dataShape: "object",
+    required: false,
+  },
+  {
+    id: "organizer_identity",
+    type: "text",
+    prompt: "Which of the travelers are you? (this sets up your private organizer channel with the trip assistant)",
+    maxLength: 80,
+    required: false,
+  },
+  {
+    id: "bot_name",
+    type: "text",
+    prompt: "What should the trip assistant be called? Give the name the family would actually type.",
+    maxLength: 80,
+    required: false,
+  },
+  {
+    // Hebrew conjugates verbs by gender, so the assistant cannot form a
+    // sentence without this. It is grammatical, not social — 'neutral' means
+    // "prefer gender-avoidant phrasing", which reads slightly stiffer.
+    id: "bot_gender",
+    type: "choice",
+    prompt: "How should the assistant refer to itself?",
+    options: [
+      { id: "male", label: "Male" },
+      { id: "female", label: "Female" },
+      { id: "neutral", label: "Neither — avoid gendered phrasing" },
+    ],
+    required: false,
+  },
+  {
+    id: "bot_tone",
+    type: "choice",
+    prompt: "What tone should it take?",
+    options: [
+      { id: "warm", label: "Warm" },
+      { id: "playful", label: "Playful" },
+      { id: "dry", label: "Dry" },
+    ],
+    required: false,
+  },
+  {
+    id: "bot_proactive",
+    type: "multi_choice",
+    prompt: "What should it send on its own, without being asked? (tap all that apply)",
+    options: [
+      { id: "none", label: "Nothing — only answer when asked" },
+      { id: "morning_briefing", label: "Morning briefing — today's plan" },
+      { id: "tomorrow_preview", label: "Evening look-ahead at tomorrow" },
+      { id: "photo_recap", label: "Photo recap when people upload" },
+      { id: "flight_changes", label: "Flight changes" },
+      { id: "packing_reminders", label: "Packing reminders the day before" },
+    ],
+    required: false,
+  },
+  {
+    id: "bot_limits",
+    type: "structured",
+    prompt: "Anything it should keep in mind about these people, or stay away from? One entry per thing, each as {he, en}.",
+    dataShape: "array",
     required: false,
   },
 ] as const;
@@ -179,7 +296,20 @@ export interface StructuredAnswer {
   data: unknown;
 }
 
-export type IntakeAnswer = ChoiceAnswer | OtherAnswer | TextAnswer | StructuredAnswer;
+/**
+ * A multi-select answer. `option_ids` is deliberately a real array rather than
+ * a delimited or JSON-encoded string stuffed into ChoiceAnswer.option_id:
+ * encoding it would sail past the length/option validation below and reach the
+ * transformer as an opaque blob it would have to re-parse.
+ */
+export interface MultiChoiceAnswer {
+  kind: "multi_choice";
+  option_ids: string[];
+  schema_version: number;
+  other_text: null;
+}
+
+export type IntakeAnswer = ChoiceAnswer | OtherAnswer | TextAnswer | StructuredAnswer | MultiChoiceAnswer;
 
 export type AnswerStore = Record<string, IntakeAnswer>;
 
@@ -187,17 +317,33 @@ export type AnswerStore = Record<string, IntakeAnswer>;
 
 export type AnswerValidationResult =
   | { ok: true; answer: IntakeAnswer }
-  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" };
+  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" };
 
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
   otherText: string | null | undefined,
-  questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS_V1,
+  questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
   structuredData?: unknown,
+  optionIds?: readonly string[],
 ): AnswerValidationResult {
   const question = questions.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "UNKNOWN_QUESTION" };
+
+  if (question.type === "multi_choice") {
+    if (!optionIds) return { ok: false, reason: "OPTIONS_REQUIRED" };
+    // Order and repeats come from however the chat UI serialised the taps;
+    // neither is meaningful, and both would perturb the intake digest.
+    const unique = [...new Set(optionIds)];
+    for (const id of unique) {
+      if (!question.options?.some((o) => o.id === id)) return { ok: false, reason: "UNKNOWN_OPTION" };
+    }
+    if (question.required && unique.length === 0) return { ok: false, reason: "CHOICE_REQUIRED" };
+    return {
+      ok: true,
+      answer: { kind: "multi_choice", option_ids: unique.sort(), schema_version: INTAKE_SCHEMA_VERSION, other_text: null },
+    };
+  }
 
   if (question.type === "structured") {
     if (structuredData === undefined || structuredData === null) {
@@ -248,7 +394,7 @@ export function validateAnswer(
 
 /** Canonical JSON serialisation of the intake for digest computation. */
 function canonicalIntakePayload(tripId: string, answers: AnswerStore): string {
-  const questionIds = INTAKE_QUESTIONS_V1.map((q) => q.id);
+  const questionIds = INTAKE_QUESTIONS.map((q) => q.id);
   const orderedAnswers: Record<string, unknown> = {};
   for (const qid of questionIds) {
     if (answers[qid] !== undefined) orderedAnswers[qid] = answers[qid];
@@ -277,7 +423,7 @@ export interface RecapEntry {
  * Returns a human-readable recap of the current answers. For 'other' answers
  * the literal organizer text is shown; it is never reclassified or summarized.
  */
-export function buildRecap(answers: AnswerStore, questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS_V1): RecapEntry[] {
+export function buildRecap(answers: AnswerStore, questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS): RecapEntry[] {
   return questions
     .filter((q) => answers[q.id] !== undefined)
     .map((q) => {
@@ -287,6 +433,10 @@ export function buildRecap(answers: AnswerStore, questions: readonly IntakeQuest
         answerLabel = q.options?.find((o) => o.id === ans.option_id)?.label ?? ans.option_id;
       } else if (ans.kind === "choice_other") {
         answerLabel = `Other: ${ans.other_text}`;
+      } else if (ans.kind === "multi_choice") {
+        answerLabel = ans.option_ids.length === 0
+          ? "(none)"
+          : ans.option_ids.map((id) => q.options?.find((o) => o.id === id)?.label ?? id).join(", ");
       } else if (ans.kind === "structured") {
         const count = Array.isArray(ans.data) ? ans.data.length : Object.keys(ans.data as Record<string, unknown>).length;
         answerLabel = count > 0 ? `${count} item(s) recorded` : "(none)";
@@ -307,12 +457,27 @@ export interface SessionView {
   state: SessionState;
   /** The next unanswered required question, or null when all required questions are answered. */
   nextQuestion: IntakeQuestion | null;
+  /**
+   * Unanswered *optional* questions, in question order.
+   *
+   * `nextQuestion` only ever walks required questions, so without this the
+   * interviewer had no way to learn an optional question existed — it could
+   * only ask the ones it happened to remember from its reference doc, which
+   * meant timezone, interests, anchors, dietary and the whole assistant block
+   * were silently never asked. This is advisory: it does not gate
+   * confirmation, and the organizer can decline any of it.
+   */
+  optionalRemaining: IntakeQuestion[];
   /** Set when state is 'awaiting_confirmation': the recap for the organizer to review. */
   recap: RecapEntry[] | null;
 }
 
 function nextUnansweredQuestion(answers: AnswerStore, questions: readonly IntakeQuestion[]): IntakeQuestion | null {
   return questions.find((q) => q.required && answers[q.id] === undefined) ?? null;
+}
+
+function unansweredOptionalQuestions(answers: AnswerStore, questions: readonly IntakeQuestion[]): IntakeQuestion[] {
+  return questions.filter((q) => !q.required && answers[q.id] === undefined);
 }
 
 function deriveSessionState(answers: AnswerStore, questions: readonly IntakeQuestion[]): SessionState {
@@ -333,7 +498,7 @@ export type GetSessionResult =
 
 export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" };
+  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" };
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
@@ -366,8 +531,8 @@ export async function startSession(
 
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
-    const tripRow = await client.query<{ lifecycle_state: string }>(
-      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    const tripRow = await client.query<{ lifecycle_state: string; draft_inputs: Record<string, unknown> }>(
+      "SELECT lifecycle_state, draft_inputs FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
@@ -382,6 +547,25 @@ export async function startSession(
       [enrollment.tripId],
     );
 
+    // Carry starter values from the web form into the normalized answer store.
+    // The interview recap still asks the organizer to confirm or correct them;
+    // it simply avoids repeating questions they have already answered.
+    const initialAnswers: AnswerStore = {};
+    const draft = trip.draft_inputs ?? {};
+    const starterValues: Array<[string, string | null, string | undefined]> = [
+      ["trip_type", draft.trip_type === "group" ? "group_of_families" : typeof draft.trip_type === "string" ? draft.trip_type : null, draft.trip_type === "other" ? "Other" : undefined],
+      ["destination", typeof draft.destination === "string" ? draft.destination : null, undefined],
+      ["departure_date", typeof draft.departure_date === "string" ? draft.departure_date : null, undefined],
+      ["return_date", typeof draft.return_date === "string" ? draft.return_date : null, undefined],
+    ];
+    for (const [questionId, optionId, otherText] of starterValues) {
+      if (!optionId) continue;
+      const value = questionId === "trip_type" && optionId === "other"
+        ? validateAnswer(questionId, "other", otherText)
+        : validateAnswer(questionId, optionId, undefined);
+      if (value.ok) initialAnswers[questionId] = value.answer;
+    }
+
     // Create session with a fresh token.
     const rawSessionToken = randomBytes(32).toString("base64url");
     const digest = sessionTokenDigest(rawSessionToken);
@@ -390,21 +574,16 @@ export async function startSession(
     await client.query(
       `INSERT INTO control_plane.intake_sessions
          (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest],
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest,
+        deriveSessionState(initialAnswers, INTAKE_QUESTIONS), JSON.stringify(initialAnswers)],
     );
 
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
 
-    const view: SessionView = {
-      sessionId,
-      tripId: enrollment.tripId,
-      state: "interviewing",
-      nextQuestion: INTAKE_QUESTIONS_V1.find((q) => q.required) ?? null,
-      recap: null,
-    };
+    const view = buildSessionView(sessionId, enrollment.tripId, deriveSessionState(initialAnswers, INTAKE_QUESTIONS), initialAnswers);
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
@@ -449,14 +628,19 @@ function buildSessionView(
   answers: AnswerStore,
 ): SessionView {
   if (storedState === "confirmed") {
-    return { sessionId, tripId, state: "confirmed", nextQuestion: null, recap: null };
+    return { sessionId, tripId, state: "confirmed", nextQuestion: null, optionalRemaining: [], recap: null };
   }
-  const state = deriveSessionState(answers, INTAKE_QUESTIONS_V1);
+  const state = deriveSessionState(answers, INTAKE_QUESTIONS);
   return {
     sessionId,
     tripId,
     state,
-    nextQuestion: state === "interviewing" ? nextUnansweredQuestion(answers, INTAKE_QUESTIONS_V1) : null,
+    nextQuestion: state === "interviewing" ? nextUnansweredQuestion(answers, INTAKE_QUESTIONS) : null,
+    // Listed in both states, unlike nextQuestion/recap: an optional question is
+    // still worth offering once the required ones are done, and in practice
+    // that's when the good answers arrive — the organizer is warmed up and the
+    // roster is already on the table.
+    optionalRemaining: unansweredOptionalQuestions(answers, INTAKE_QUESTIONS),
     recap: state === "awaiting_confirmation" ? buildRecap(answers) : null,
   };
 }
@@ -466,6 +650,7 @@ function buildSessionView(
  *
  * For choice questions: pass the option id (e.g. "family") or "other" plus
  * the free-text follow-up in otherText.
+ * For multi_choice questions: pass every selected option id in optionIds.
  * For text questions: pass the text in optionId (the same parameter slot,
  * since it's the primary answer value).
  *
@@ -480,6 +665,7 @@ export async function submitAnswer(
   otherText?: string,
   expectedSessionId?: string,
   structuredData?: unknown,
+  optionIds?: readonly string[],
 ): Promise<SubmitAnswerResult> {
   const digest = sessionTokenDigest(rawSessionToken);
   const client = await db.connect();
@@ -503,14 +689,14 @@ export async function submitAnswer(
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
 
-    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS_V1, structuredData);
+    const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
     if (!validation.ok) {
       await client.query("ROLLBACK");
       return { ok: false, reason: validation.reason };
     }
 
     const updatedAnswers = { ...session.answers, [questionId]: validation.answer };
-    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS_V1);
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS);
 
     await client.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, updated_at = now() WHERE id = $3",
@@ -577,7 +763,7 @@ export async function confirmIntake(
     }
 
     // All required questions must be answered.
-    const allRequired = INTAKE_QUESTIONS_V1.filter((q) => q.required);
+    const allRequired = INTAKE_QUESTIONS.filter((q) => q.required);
     const allAnswered = allRequired.every((q) => session.answers[q.id] !== undefined);
     if (!allAnswered) {
       await client.query("ROLLBACK");
@@ -626,6 +812,12 @@ export async function confirmIntake(
     await client.query(
       "UPDATE control_plane.intake_sessions SET state = 'confirmed', updated_at = now() WHERE id = $1",
       [session.id],
+    );
+
+    await client.query(
+      `INSERT INTO control_plane.funnel_events(id, event_name, trip_id)
+       VALUES ($1, 'interview_confirmed', $2)`,
+      [generateId("event"), session.trip_id],
     );
 
     await client.query("COMMIT");

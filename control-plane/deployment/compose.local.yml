@@ -46,6 +46,13 @@ services:
       dockerfile: control-plane/api/Dockerfile
     environment:
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      # Shared secret Hermes's gateway presents to resolve chat_id -> trip
+      # profile routing. Same tier/pattern as interview-mcp.ts's
+      # INTERVIEW_MCP_KEY — a bare env var, not a profile secret_ref, because
+      # it's a process-to-process key for an already-trusted local caller,
+      # not part of the provider-neutral architecture profile. Empty default
+      # leaves the route unmounted (503) rather than failing startup.
+      CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
     secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]
@@ -66,7 +73,9 @@ services:
     networks: [ingress, private]
 
   worker:
-    build: ../worker
+    build:
+      context: ../..
+      dockerfile: control-plane/worker/Dockerfile
     command: ["python", "-m", "control_plane_worker", "run", "--poll-seconds", "10"]
     environment:
       CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url

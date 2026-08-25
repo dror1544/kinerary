@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import {
-  INTAKE_QUESTIONS_V1,
+  INTAKE_QUESTIONS,
   INTAKE_SCHEMA_VERSION,
   computeIntakeDigest,
   validateAnswer,
@@ -33,11 +33,11 @@ const CORRECTABLE_STATES = new Set([
 ]);
 
 function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore | null {
-  const known = new Set(INTAKE_QUESTIONS_V1.map((q) => q.id));
+  const known = new Set(INTAKE_QUESTIONS.map((q) => q.id));
   if (Object.keys(input).some((id) => !known.has(id))) return null;
 
   const normalized: AnswerStore = {};
-  for (const question of INTAKE_QUESTIONS_V1) {
+  for (const question of INTAKE_QUESTIONS) {
     const raw = input[question.id];
     if (raw === undefined) {
       if (question.required) return null;
@@ -57,7 +57,10 @@ function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore
       if (typeof answer.text !== "string") return null;
       checked = validateAnswer(question.id, answer.text, null);
     } else if (question.type === "structured" && answer.kind === "structured") {
-      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS_V1, answer.data);
+      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS, answer.data);
+    } else if (question.type === "multi_choice" && answer.kind === "multi_choice") {
+      if (!Array.isArray(answer.option_ids) || answer.option_ids.some((id) => typeof id !== "string")) return null;
+      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS, undefined, answer.option_ids as string[]);
     } else {
       return null;
     }

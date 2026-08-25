@@ -69,19 +69,27 @@ function makeIdentity(telegramId: string, name = "Test Organizer"): VerifiedTele
   return {
     provider: "telegram",
     providerSubjectDigest: digestTelegramId(telegramId),
+    providerSubjectId: telegramId,
     displayName: name,
   };
 }
 
 class CapturingNotification implements NotificationAdapter {
   readonly calls: Array<Parameters<NotificationAdapter["sendApprovalRequest"]>[0]> = [];
+  readonly messageCalls: Array<Parameters<NotificationAdapter["sendMessage"]>[0]> = [];
   async sendApprovalRequest(params: Parameters<NotificationAdapter["sendApprovalRequest"]>[0]) {
     this.calls.push(params);
+  }
+  async sendMessage(params: Parameters<NotificationAdapter["sendMessage"]>[0]) {
+    this.messageCalls.push(params);
   }
 }
 
 class FailingNotification implements NotificationAdapter {
   async sendApprovalRequest() {
+    throw new Error("notification adapter error");
+  }
+  async sendMessage() {
     throw new Error("notification adapter error");
   }
 }
@@ -130,6 +138,32 @@ test("verified signup creates one pending request and one outbox notification", 
     const outboxRows = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox");
     assert.equal(requestsRows.rows[0].c, 1);
     assert.equal(outboxRows.rows[0].c, 1);
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("signup persists a real, sendable chat id alongside the identity digest", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const identity = makeIdentity("200000099");
+    await startSignup(pool, identity, "Chat Id Trip", testConfig, notification);
+
+    const row = await pool.query(
+      "SELECT provider_subject_digest, provider_subject_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
+      [identity.providerSubjectDigest],
+    );
+    assert.equal(row.rows.length, 1);
+    assert.equal(row.rows[0].provider_subject_id, "200000099");
   } finally {
     const c2 = await pool.connect();
     await resetDb(c2);

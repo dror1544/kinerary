@@ -2,11 +2,7 @@ import { lazy, Suspense, useEffect } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 const LandingPage = lazy(() => import("./pages/LandingPage"));
-const SignInPage = lazy(() => import("./pages/SignInPage"));
-const SignUpPage = lazy(() => import("./pages/SignUpPage"));
-const ForgotPasswordPage = lazy(() => import("./pages/ForgotPasswordPage"));
-const NewTripPage = lazy(() => import("./pages/NewTripPage"));
-const TripsPage = lazy(() => import("./pages/TripsPage"));
+const ProductApp = lazy(() => import("./pages/ProductApp"));
 const NotFoundPage = lazy(() => import("./pages/NotFoundPage"));
 
 function RouteFallback() {
@@ -41,11 +37,16 @@ export function App() {
       <Suspense fallback={<RouteFallback />}>
         <Routes>
           <Route path="/" element={<LandingPage />} />
-          <Route path="/sign-in" element={<SignInPage />} />
-          <Route path="/sign-up" element={<SignUpPage />} />
-          <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-          <Route path="/trips" element={<TripsPage />} />
-          <Route path="/trips/new" element={<NewTripPage />} />
+          <Route path="/sign-in" element={<ProductApp view="sign-in" />} />
+          <Route path="/sign-up" element={<Navigate to="/sign-in" replace />} />
+          <Route path="/forgot-password" element={<Navigate to="/sign-in" replace />} />
+          <Route path="/trips" element={<ProductApp view="trips" />} />
+          <Route path="/trips/new" element={<ProductApp view="new-trip" />} />
+          <Route path="/trips/:tripId/setup" element={<ProductApp view="trip" />} />
+          <Route path="/trips/:tripId" element={<ProductApp view="trip" />} />
+          <Route path="/trips/:tripId/app" element={<ProductApp view="runtime" />} />
+          <Route path="/join" element={<ProductApp view="join" />} />
+          <Route path="/ops/provisioning" element={<ProductApp view="ops" />} />
           <Route path="/new-trip" element={<Navigate to="/trips/new" replace />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

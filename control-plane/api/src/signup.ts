@@ -18,6 +18,8 @@ export interface NotificationAdapter {
     rejectToken: string;
     expiresAt: Date;
   }): Promise<void>;
+  /** A plain, unstructured DM to an arbitrary chat id — e.g. the outbox dispatcher's trip notifications. */
+  sendMessage(params: { chatId: string; text: string }): Promise<void>;
 }
 
 export interface SignupConfig {
@@ -85,8 +87,8 @@ export async function startSignup(
         [userId, identity.displayName],
       );
       await client.query(
-        "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1, $2, 'telegram', $3, now())",
-        [generateId("idnt"), userId, identity.providerSubjectDigest],
+        "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at) VALUES ($1, $2, 'telegram', $3, $4, now())",
+        [generateId("idnt"), userId, identity.providerSubjectDigest, identity.providerSubjectId],
       );
     }
 
