@@ -22,6 +22,6 @@ npm:
   forward_host: ${LXC_NAME}
   forward_port: 8080
 cloudflare:
-  tunnel_name: ${CLOUDFLARE_TUNNEL_NAME}
+  tunnel_id: ${CLOUDFLARE_TUNNEL_ID}
   hostname: ${PUBLIC_HOSTNAME}
   service: ${CLOUDFLARE_TUNNEL_SERVICE}

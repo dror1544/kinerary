@@ -166,12 +166,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(9, existing["id"])
         self.assertEqual(1, len(transport.calls))
 
-    def test_cloudflare_create_creates_tunnel_then_dns_record(self) -> None:
+    def test_cloudflare_create_writes_ingress_rule_then_dns_record(self) -> None:
         transport = FakeTransport([
-            {"result": []}, {"result": []},                       # inspect(): no tunnel, no dns
-            {"result": []},                                        # create(): tunnel lookup, still none
-            {"result": {"id": "tunnel-id"}},                       # POST tunnel
-            {"result": []}, {"result": {"id": "dns-id"}},          # dns lookup, then create
+            {"result": []},                                        # inspect(): no dns
+            {"result": []}, {"result": {"id": "dns-id"}},          # create(): dns lookup, then create
         ])
         ssh = FakeSshTransport(
             "/etc/cloudflared/config.yml",
@@ -179,21 +177,20 @@ class AdapterTests(unittest.TestCase):
             "  - hostname: other.example.invalid\n    service: http://127.0.0.1:8081\n"
             "  - service: http_status:404\n",
         )
-        adapter = CloudflareTunnelDnsAdapter(transport, "account", "zone", ssh, restart_timeout=0)
-        spec = CloudflareSpec("tunnel", "site.example.invalid", "http://127.0.0.1:8080")
+        adapter = CloudflareTunnelDnsAdapter(transport, "zone", ssh, restart_timeout=0)
+        spec = CloudflareSpec("tunnel-id", "site.example.invalid", "http://127.0.0.1:8080")
 
         self.assertIsNone(adapter.inspect(spec))
         adapter.create(spec)
 
-        self.assertEqual("POST", transport.calls[3][0])
-        self.assertEqual("/client/v4/accounts/account/cfd_tunnel", transport.calls[3][1])
-        self.assertEqual("POST", transport.calls[5][0])
-        self.assertEqual("/client/v4/zones/zone/dns_records", transport.calls[5][1])
-        self.assertEqual("tunnel-id.cfargotunnel.com", transport.calls[5][2]["content"])
+        self.assertEqual("POST", transport.calls[-1][0])
+        self.assertEqual("/client/v4/zones/zone/dns_records", transport.calls[-1][1])
+        self.assertEqual("tunnel-id.cfargotunnel.com", transport.calls[-1][2]["content"])
 
-        # No API call ever attempts to push tunnel ingress config remotely —
-        # this tunnel is locally-managed.
-        self.assertFalse(any("configurations" in call[1] for call in transport.calls))
+        # No API call is ever made against the tunnel resource itself — this
+        # tunnel is locally-managed and pre-existing, never created/deleted
+        # by this adapter.
+        self.assertFalse(any("cfd_tunnel" in call[1] for call in transport.calls))
 
         # The new ingress rule landed BEFORE the catch-all, and the existing
         # unrelated rule survived untouched.
@@ -210,11 +207,10 @@ class AdapterTests(unittest.TestCase):
         # A backup was taken before the write.
         self.assertTrue(any(f.startswith("/etc/cloudflared/config.yml.bak-") for f in ssh.files))
 
-    def test_cloudflare_existing_tunnel_without_dns_only_creates_dns(self) -> None:
+    def test_cloudflare_existing_ingress_rule_without_dns_only_creates_dns(self) -> None:
         transport = FakeTransport([
-            {"result": [{"id": "tunnel-id", "name": "tunnel"}]}, {"result": []},  # inspect: tunnel yes, dns no
-            {"result": [{"id": "tunnel-id", "name": "tunnel"}]},                  # create(): tunnel lookup
-            {"result": []}, {"result": {"id": "dns-id"}},                        # dns lookup, then create
+            {"result": []},                                        # inspect(): dns no
+            {"result": []}, {"result": {"id": "dns-id"}},          # create(): dns lookup, then create
         ])
         ssh = FakeSshTransport(
             "/etc/cloudflared/config.yml",
@@ -222,38 +218,33 @@ class AdapterTests(unittest.TestCase):
             "  - hostname: site.example.invalid\n    service: http://127.0.0.1:8080\n"
             "  - service: http_status:404\n",
         )
-        adapter = CloudflareTunnelDnsAdapter(transport, "account", "zone", ssh, restart_timeout=0)
-        spec = CloudflareSpec("tunnel", "site.example.invalid", "http://127.0.0.1:8080")
+        adapter = CloudflareTunnelDnsAdapter(transport, "zone", ssh, restart_timeout=0)
+        spec = CloudflareSpec("tunnel-id", "site.example.invalid", "http://127.0.0.1:8080")
 
         self.assertIsNone(adapter.inspect(spec))  # dns still missing, so not fully provisioned
         adapter.create(spec)
 
         # Ingress rule was already present — no config write, no restart.
         self.assertEqual(0, ssh.restart_count)
-        self.assertEqual(0, sum(call[0] == "POST" and "cfd_tunnel" in call[1] for call in transport.calls))
         self.assertEqual("/client/v4/zones/zone/dns_records", transport.calls[-1][1])
 
     def test_cloudflare_inspect_is_not_satisfied_by_dns_alone(self) -> None:
         transport = FakeTransport([
-            {"result": [{"id": "tunnel-id", "name": "tunnel"}]},
             {"result": [{"name": "site.example.invalid"}]},
         ])
         ssh = FakeSshTransport("/etc/cloudflared/config.yml", "tunnel: t\ningress:\n  - service: http_status:404\n")
-        adapter = CloudflareTunnelDnsAdapter(transport, "account", "zone", ssh)
-        spec = CloudflareSpec("tunnel", "site.example.invalid", "http://127.0.0.1:8080")
+        adapter = CloudflareTunnelDnsAdapter(transport, "zone", ssh)
+        spec = CloudflareSpec("tunnel-id", "site.example.invalid", "http://127.0.0.1:8080")
 
         # DNS record exists but the ingress rule doesn't — not fully provisioned.
         self.assertIsNone(adapter.inspect(spec))
 
     def test_cloudflare_create_rolls_back_when_cloudflared_fails_to_come_back_active(self) -> None:
-        transport = FakeTransport([
-            {"result": []},                      # tunnel lookup: not found
-            {"result": {"id": "tunnel-id"}},     # POST tunnel: created
-        ])
+        transport = FakeTransport([])
         original = "tunnel: t\ningress:\n  - service: http_status:404\n"
         ssh = FakeSshTransport("/etc/cloudflared/config.yml", original, fail_restart=True)
-        adapter = CloudflareTunnelDnsAdapter(transport, "account", "zone", ssh, restart_timeout=0, restart_poll_interval=0)
-        spec = CloudflareSpec("tunnel", "site.example.invalid", "http://127.0.0.1:8080")
+        adapter = CloudflareTunnelDnsAdapter(transport, "zone", ssh, restart_timeout=0, restart_poll_interval=0)
+        spec = CloudflareSpec("tunnel-id", "site.example.invalid", "http://127.0.0.1:8080")
 
         with self.assertRaises(RuntimeError):
             adapter.create(spec)
@@ -263,7 +254,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(original, ssh.files["/etc/cloudflared/config.yml"])
         self.assertEqual(2, ssh.restart_count)
         # DNS creation never happened — the ingress write failed first.
-        self.assertEqual(2, len(transport.calls))
+        self.assertEqual(0, len(transport.calls))
 
     def test_cloudflare_delete_removes_only_the_matching_dns_and_ingress_rule_never_the_tunnel(self) -> None:
         transport = FakeTransport([
@@ -277,8 +268,8 @@ class AdapterTests(unittest.TestCase):
             "  - hostname: other.example.invalid\n    service: http://127.0.0.1:8081\n"
             "  - service: http_status:404\n",
         )
-        adapter = CloudflareTunnelDnsAdapter(transport, "account", "zone", ssh, restart_timeout=0)
-        spec = CloudflareSpec("tunnel", "site.example.invalid", "http://127.0.0.1:8080")
+        adapter = CloudflareTunnelDnsAdapter(transport, "zone", ssh, restart_timeout=0)
+        spec = CloudflareSpec("tunnel-id", "site.example.invalid", "http://127.0.0.1:8080")
 
         adapter.delete(spec)
 

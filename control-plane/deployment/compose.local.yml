@@ -76,9 +76,23 @@ services:
     build:
       context: ../..
       dockerfile: control-plane/worker/Dockerfile
-    command: ["python", "-m", "control_plane_worker", "run", "--poll-seconds", "10"]
+    # "run" only observes the queue — it never calls the deploy/companion/
+    # mcp_bridge adapters, so an approved job sat here forever. "provision"
+    # is the subcommand that actually drains it (see __main__.py).
+    command: ["python", "-m", "control_plane_worker", "provision", "--poll-seconds", "10"]
     environment:
       CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+      # Both required by "provision". Left unset here on purpose: this repo
+      # doesn't decide where your kinerary-deploy checkout lives or which
+      # slugs already have a real container, and deploy.sh does a REAL
+      # deploy the moment a signup gets approved. Unconfigured, the worker
+      # exits with a clear config error every poll cycle instead of either
+      # silently queuing forever (the old bug) or reaching real infra by
+      # accident. Set these — and mount PROVISIONER_DEPLOY_ROOT as a volume
+      # pointing at your kinerary-deploy checkout — once you actually want
+      # this stack to provision for real.
+      PROVISIONER_DEPLOY_ROOT: ${PROVISIONER_DEPLOY_ROOT:-}
+      PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-}
     secrets: [control_plane_database_url]
     healthcheck:
       test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]

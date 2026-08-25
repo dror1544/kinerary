@@ -69,8 +69,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "from --vmid-map — pct over SSH into Proxmox, real NPM/Cloudflare API calls — "
                                 "requires PROXMOX_NODE/PROXMOX_LXC_TEMPLATE/PROXMOX_STORAGE/PROXMOX_BRIDGE, "
                                 "NPM_URL/NPM_API_TOKEN, "
-                                "CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_ZONE_ID/CLOUDFLARE_API_TOKEN, and "
-                                "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_NAME "
+                                "CLOUDFLARE_ZONE_ID/CLOUDFLARE_API_TOKEN, and "
+                                "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_ID "
                                 "(PROVISIONER_COMPUTE_ENABLED=1)")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
@@ -108,10 +108,9 @@ def main(argv: list[str] | None = None) -> int:
                     bridge=_required_env("PROXMOX_BRIDGE"),
                     ip_pool=ip_pool,
                     hostname_domain=_required_env("PROVISIONER_LXC_HOSTNAME_DOMAIN"),
-                    tunnel_name=_required_env("PROVISIONER_LXC_TUNNEL_NAME"),
+                    tunnel_id=_required_env("PROVISIONER_LXC_TUNNEL_ID"),
                     npm_url=_required_env("NPM_URL"),
                     npm_api_token=_required_env("NPM_API_TOKEN"),
-                    cloudflare_account_id=_required_env("CLOUDFLARE_ACCOUNT_ID"),
                     cloudflare_zone_id=_required_env("CLOUDFLARE_ZONE_ID"),
                     cloudflare_api_token=_required_env("CLOUDFLARE_API_TOKEN"),
                     # Proxmox itself and the RPi4 that runs cloudflared —

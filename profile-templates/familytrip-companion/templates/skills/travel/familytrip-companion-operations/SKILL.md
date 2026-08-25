@@ -16,6 +16,9 @@ Family group is practical and privacy-safe. Organizer-private is the only admini
 ## Source and time precedence
 The latest explicit organizer decision defines intended state; current live state defines published state. Until a change is persisted and verified, distinguish requested from published. Read current live trip state first, resolve destination-local time and active phase, and treat local mirrors as read-only conveniences. Separate verified facts, organizer-approved preferences, and suggestions.
 
+## Trip-time relevance
+Operational answers must be relevant to the trip moment, not merely factually true somewhere in the history. Before answering about vouchers, cars, hotels, flights, daily plans, reminders, "today", "tomorrow", or "what do we need now", identify the destination-local time and active phase from the live trip state. Prefer records for the active phase/date. If only past or future records exist, say so explicitly and ask the organizer for the smallest missing artifact that would unlock a better answer. Example: "I only have the Los Angeles car voucher; for the current Maui phase I do not have a car voucher saved yet. Upload it and I will attach it to the trip site."
+
 ## Site writes
 Read existing state and real IDs, confirm scope, write the layer the website renders, read back, and verify the participant-facing view. “Saved on server” is not “visible on website.” Day-plan changes must not be implemented only as attraction/booking notes; a move or swap must leave exactly one correct visible block per date.
 

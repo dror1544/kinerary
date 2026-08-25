@@ -3032,7 +3032,7 @@ function buildPhaseNav(cfg) {
     sec.innerHTML = `<div class="sec-body"><div class="sec-inner">` +
       `<h2 class="section-h2"><span class="lang-he">${p.title?.he || p.tabLabel}</span>` +
       `<span class="lang-en">${p.title?.en || p.tabLabel}</span></h2>` +
-      (p.note ? `<p class="phase-note">${_biSpan(p.note)}</p>` : '') +
+      (p.note ? `<p class="phase-note">${esc(p.note)}</p>` : '') +
       `<div id="hotel-${p.id}"></div>` +
       `<div id="sched-${p.id}"></div>` +
       `<div id="rsvp-${p.id}"></div>` +

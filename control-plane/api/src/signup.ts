@@ -80,6 +80,15 @@ export async function startSignup(
     const [existingIdentity] = identityRow.rows;
     if (existingIdentity) {
       userId = existingIdentity.user_id;
+      // provider_subject_id (migration 0017) postdates this row for anyone
+      // who signed up before it existed — the only other place it's ever
+      // written is the INSERT below, so a returning user's row would stay
+      // NULL forever without this, leaving provisioner.py's completion
+      // notification with no chat id to send to.
+      await client.query(
+        "UPDATE control_plane.user_identities SET provider_subject_id = $1 WHERE provider = 'telegram' AND provider_subject_digest = $2 AND provider_subject_id IS DISTINCT FROM $1",
+        [identity.providerSubjectId, identity.providerSubjectDigest],
+      );
     } else {
       userId = generateId("user");
       await client.query(
@@ -99,7 +108,9 @@ export async function startSignup(
     );
     const [approvedByUser] = approvedRow.rows;
     if (approvedByUser) {
-      await client.query("ROLLBACK");
+      // COMMIT, not ROLLBACK — step 1 may have just backfilled
+      // provider_subject_id on this identity row.
+      await client.query("COMMIT");
       return { status: "approved", tripId: approvedByUser.trip_id ?? undefined, requestId: approvedByUser.id };
     }
 
@@ -112,8 +123,9 @@ export async function startSignup(
     if (pr) {
       const tokenExpired = pr.action_expires_at !== null && pr.action_expires_at.getTime() < Date.now();
       if (!tokenExpired) {
-        // Reuse — do not send a second notification
-        await client.query("ROLLBACK");
+        // Reuse — do not send a second notification. COMMIT, not ROLLBACK:
+        // step 1 may have just backfilled provider_subject_id.
+        await client.query("COMMIT");
         log(structuredLog("info", "signup.reused_pending", { request_id: pr.id }));
         return { status: "awaiting_approval", requestId: pr.id };
       }
@@ -142,7 +154,9 @@ export async function startSignup(
       if (rejection) {
         const decidedMs = rejection.decided_at.getTime();
         if (Date.now() - decidedMs < config.signupRateLimitCooldownSeconds * 1000) {
-          await client.query("ROLLBACK");
+          // COMMIT, not ROLLBACK — step 1 may have just backfilled
+          // provider_subject_id on this identity row.
+          await client.query("COMMIT");
           return { status: "declined" };
         }
       }

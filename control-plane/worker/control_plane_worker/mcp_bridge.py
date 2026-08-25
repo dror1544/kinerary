@@ -67,13 +67,17 @@ class ShellMcpBridgeAdapter:
         self._timeout = timeout
 
     def setup(self, slug: str, profile_name: str) -> bool:
-        vmid = self._vmid_map.get(slug)
-        if not vmid:
-            return False
-
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
         local_url = self._local_url(trip_dir)
         if not local_url:
+            return False
+
+        # The static map only ever covers the two hand-provisioned legacy
+        # trips; a Phase-G auto-created trip's vmid instead lives in
+        # topology.yaml, written there by compute.LxcProvisionAdapter once
+        # Proxmox assigns it.
+        vmid = self._vmid_map.get(slug) or self._topology_vmid(trip_dir)
+        if not vmid:
             return False
 
         setup_mcp_sh = os.path.join(self._deploy_root, "setup-mcp.sh")
@@ -111,3 +115,21 @@ class ShellMcpBridgeAdapter:
         if not ipv4 or not port:
             return None
         return f"http://{ipv4}:{port}"
+
+    def _topology_vmid(self, trip_dir: str) -> str | None:
+        """Same deliberately-minimal line scan as _local_url, for the
+        proxmox.vmid line compute.LxcProvisionAdapter writes back into
+        topology.yaml once it's known (absent for the two legacy trips,
+        which never go through that adapter)."""
+        topology_path = os.path.join(trip_dir, "topology.yaml")
+        try:
+            with open(topology_path, encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.startswith("vmid:"):
+                        # yaml.safe_dump quotes a numeric-looking string
+                        # value (vmid: '205') to preserve it as text.
+                        return stripped.split(":", 1)[1].strip().strip("'\"") or None
+        except FileNotFoundError:
+            return None
+        return None

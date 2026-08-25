@@ -27,6 +27,23 @@ npm:
   forward_port: 8080
 """
 
+# What compute.LxcProvisionAdapter writes once Proxmox assigns a vmid — no
+# entry in any static vmid_map, since the slug was auto-created.
+TOPOLOGY_YAML_WITH_VMID = """\
+version: 1
+name: osaka-2026
+proxmox:
+  node: pve
+  vmid: '210'
+  lxc:
+    name: trip-osaka-2026
+    ipv4: 192.168.0.211/24
+npm:
+  hostname: osaka-2026.example.com
+  forward_host: trip-osaka-2026
+  forward_port: 8080
+"""
+
 
 class NullMcpBridgeAdapterTests(unittest.TestCase):
     def test_setup_always_returns_false(self) -> None:
@@ -34,17 +51,44 @@ class NullMcpBridgeAdapterTests(unittest.TestCase):
 
 
 class ShellMcpBridgeAdapterTests(unittest.TestCase):
-    def _write_topology(self, deploy_root: str, slug: str) -> None:
+    def _write_topology(self, deploy_root: str, slug: str, contents: str = TOPOLOGY_YAML) -> None:
         trip_dir = os.path.join(deploy_root, "trips", slug)
         os.makedirs(trip_dir, exist_ok=True)
         with open(os.path.join(trip_dir, "topology.yaml"), "w", encoding="utf-8") as fh:
-            fh.write(TOPOLOGY_YAML)
+            fh.write(contents)
 
     def test_setup_returns_false_without_a_vmid(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:
             self._write_topology(deploy_root, "tokyo-2026")
             adapter = ShellMcpBridgeAdapter(deploy_root=deploy_root, vmid_map={})
             self.assertFalse(adapter.setup("tokyo-2026", "tokyo2026"))
+
+    def test_setup_falls_back_to_the_topology_vmid_when_the_static_map_has_no_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            self._write_topology(deploy_root, "osaka-2026", TOPOLOGY_YAML_WITH_VMID)
+            adapter = ShellMcpBridgeAdapter(deploy_root=deploy_root, vmid_map={})
+            with patch("control_plane_worker.mcp_bridge.subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stderr = ""
+                mock_run.return_value.stdout = ""
+                result = adapter.setup("osaka-2026", "osaka2026")
+            self.assertTrue(result)
+            args = mock_run.call_args.args[0]
+            self.assertIn("--vmid", args)
+            self.assertIn("210", args)
+
+    def test_setup_prefers_the_static_map_over_the_topology_vmid(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            self._write_topology(deploy_root, "osaka-2026", TOPOLOGY_YAML_WITH_VMID)
+            adapter = ShellMcpBridgeAdapter(deploy_root=deploy_root, vmid_map={"osaka-2026": "999"})
+            with patch("control_plane_worker.mcp_bridge.subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stderr = ""
+                mock_run.return_value.stdout = ""
+                adapter.setup("osaka-2026", "osaka2026")
+            args = mock_run.call_args.args[0]
+            self.assertIn("999", args)
+            self.assertNotIn("210", args)
 
     def test_setup_returns_false_without_a_topology_file(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:

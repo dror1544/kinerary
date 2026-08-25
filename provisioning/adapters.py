@@ -142,34 +142,24 @@ class CloudflareTunnelDnsAdapter:
     def __init__(
         self,
         transport: JsonTransport,
-        account_id: str,
         zone_id: str,
         ssh: SshTransport,
         config_path: str = "/etc/cloudflared/config.yml",
         restart_poll_interval: float = 1.0,
         restart_timeout: float = 15.0,
     ) -> None:
-        self.transport, self.account_id, self.zone_id = transport, account_id, zone_id
+        self.transport, self.zone_id = transport, zone_id
         self.ssh = ssh
         self.config_path = config_path
         self._restart_poll_interval = restart_poll_interval
         self._restart_timeout = restart_timeout
 
-    @property
-    def _tunnels_path(self) -> str:
-        return f"/client/v4/accounts/{self.account_id}/cfd_tunnel"
-
     def inspect(self, spec: CloudflareSpec) -> dict[str, Any] | None:
-        tunnel = self._tunnel(spec)
         records = self._dns_records(spec)
-        dns_present = bool(tunnel) and any(record.get("name") == spec.hostname for record in records)
+        dns_present = any(record.get("name") == spec.hostname for record in records)
         if dns_present and self._ingress_rule_present(spec):
-            return tunnel
+            return {"hostname": spec.hostname, "tunnel_id": spec.tunnel_id}
         return None
-
-    def _tunnel(self, spec: CloudflareSpec) -> dict[str, Any] | None:
-        records = _result(self.transport.request("GET", self._tunnels_path, params={"name": spec.tunnel_name}))
-        return next((item for item in records if item.get("name") == spec.tunnel_name), None)
 
     def _dns_records(self, spec: CloudflareSpec) -> list[dict[str, Any]]:
         return _result(self.transport.request(
@@ -185,10 +175,6 @@ class CloudflareTunnelDnsAdapter:
         return any(rule.get("hostname") == spec.hostname for rule in config.get("ingress", []))
 
     def create(self, spec: CloudflareSpec) -> None:
-        tunnel = self._tunnel(spec)
-        if tunnel is None:
-            tunnel = _result(self.transport.request("POST", self._tunnels_path, payload={"name": spec.tunnel_name}))
-
         if not self._ingress_rule_present(spec):
             config = self._read_config()
             ingress = list(config.get("ingress", []))
@@ -207,7 +193,7 @@ class CloudflareTunnelDnsAdapter:
         if not any(record.get("name") == spec.hostname for record in records):
             self.transport.request("POST", f"/client/v4/zones/{self.zone_id}/dns_records", payload={
                 "type": "CNAME", "name": spec.hostname,
-                "content": f"{tunnel['id']}.cfargotunnel.com", "proxied": True,
+                "content": f"{spec.tunnel_id}.cfargotunnel.com", "proxied": True,
             })
 
     def delete(self, spec: CloudflareSpec) -> None:

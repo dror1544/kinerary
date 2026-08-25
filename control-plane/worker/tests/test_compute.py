@@ -38,9 +38,9 @@ def _adapter(deploy_root: str, ip_pool=None, provisioner: FakeProvisioner | None
         deploy_root=deploy_root,
         node="pve", template="local:vztmpl/debian.tar.zst", storage="local-lvm", bridge="vmbr0",
         ip_pool=ip_pool or ["192.168.0.210", "192.168.0.211"],
-        hostname_domain="ara-united.store", tunnel_name="kinerary",
+        hostname_domain="ara-united.store", tunnel_id="edd0b94a-ecce-48b1-b3a5-33d15d0f5f8c",
         npm_url="https://npm.example", npm_api_token="npm-token",
-        cloudflare_account_id="acct", cloudflare_zone_id="zone", cloudflare_api_token="cf-token",
+        cloudflare_zone_id="zone", cloudflare_api_token="cf-token",
         provisioner_factory=lambda: provisioner,
     )
 
@@ -81,6 +81,17 @@ class LxcProvisionAdapterTests(unittest.TestCase):
 
             topology_path = os.path.join(deploy_root, "trips", "tokyo-2026", "topology.yaml")
             self.assertTrue(os.path.exists(topology_path))
+
+    def test_create_container_writes_the_assigned_vmid_back_to_topology_yaml(self) -> None:
+        # mcp_bridge.ShellMcpBridgeAdapter has no static vmid_map entry for a
+        # slug this adapter created, so it reads the vmid from here instead.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = _adapter(deploy_root, provisioner=FakeProvisioner(vmid="205"))
+            adapter.create_container("tokyo-2026")
+
+            topology_path = os.path.join(deploy_root, "trips", "tokyo-2026", "topology.yaml")
+            contents = open(topology_path, encoding="utf-8").read()
+            self.assertIn("vmid: '205'", contents)
 
     def test_a_retry_reuses_the_already_written_topology_instead_of_reallocating(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:

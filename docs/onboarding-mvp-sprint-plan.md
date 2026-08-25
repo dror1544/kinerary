@@ -434,6 +434,92 @@ renderer, sanitation scans, sealed manifests, release promotion pipeline
 adapters. These belong in a hardening sprint after the first successful
 end-to-end run proves the vertical path.
 
+### Sprint 4.5 — Trip content enrichment (destination data + phase narrative)
+
+**Goal:** close the gap found reviewing the first real control-plane-provisioned
+trip (2026-08-23): `transform_intake()` produces a valid but visually thin
+config — no destination info (currency/emergency numbers), and organizer prose
+that named a sub-group or a specific event inside a phase name (a live example:
+"Dallas (boys; Mavericks game September 6)") had nowhere structured to go. This
+was patched same-day with a hardcoded 15-country currency dict and a raw-text
+`phase.note` field — a stopgap, not the fix. This sprint is that fix, defined
+but **not yet built or scheduled**.
+
+This is not a new idea invented from scratch: `.agents/skills/create-trip/`
+(the older, human-driven scaffolding path) already does the deterministic half
+of this for real, every time it's used — see `INTERVIEW.md` §4 ("Country info
+— always do this, don't ask, just run it"), backed by `scripts/country-info.js`
+(live, keyless lookups against `countries.dev` + `emergencynumberapi.com`,
+already producing exactly `travel_info.countries[name]`'s real shape). The
+control-plane pipeline (Sprint 1-4, the Telegram-interview path) never got the
+equivalent. `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
+(a different, earlier initiative, never implemented) scoped the deterministic
+geocoding/weather/hero-photo half of this more thoroughly — reuse its task
+breakdown for that part rather than re-designing it, but note its "Confirmed
+product decisions" explicitly forbade inventing itinerary content; the
+anchor/narrative half below is new territory that plan didn't cover, and needs
+its own product sign-off on where the line is.
+
+Two genuinely different kinds of work, and they don't belong in the same
+function:
+
+- **Deterministic destination data** (no judgment required — port, don't
+  rebuild): for each distinct destination country in the confirmed intake, get
+  currency/emergency numbers/calling code the same way `country-info.js`
+  already does, and populate `travel_info.countries[*]`. This replaces
+  `transformer.py`'s `_KNOWN_COUNTRY_CURRENCY` stopgap. Pure Python
+  stdlib HTTP calls against the same two free APIs is enough; no new
+  dependency needed. Geocoding/weather/hero-photo verification from the
+  `.hermes` plan belong here too, once scoped.
+- **AI-driven phase content pass** — this is the part that genuinely needs
+  judgment, not a lookup, and needs a product decision on where it runs and
+  under what authority:
+  - **Anchor extraction**: read each phase's raw organizer text (name +
+    accommodation + any free-form notes) and identify concrete, dated,
+    already-decided events mentioned inside it — a booked flight, a sports
+    game, a reservation — and promote them into `travel_anchors[]` as
+    first-class entries instead of leaving them buried in a phase name. This
+    is restructuring what the organizer already said, not inventing new facts
+    — consistent with the `.hermes` plan's constraint, just applied to intake
+    prose instead of external search results.
+  - **Phase narrative**: turn what's left of the trimmed context (the part
+    that isn't a discrete anchor — "boys only", "all travelers", general
+    color) into a short, readable blurb for the site's phase detail view,
+    replacing the current same-day stopgap (`phase.note`, which just
+    concatenates the raw original text verbatim).
+  - **Open questions, not yet decided:** does this run as one more step inside
+    the existing interview conversation (the Hermes profile already reasons
+    over this exact text once, right before `CONFIRM`), as a separate
+    short-lived agent invocation the provisioner triggers after
+    `confirm_intake` and before `generatePlan`, or inside `ProvisionerWorker`
+    itself alongside `transform_intake()`? Whichever it is, its output needs
+    somewhere durable to land — a new field on `intake_versions`, a sibling
+    "enrichment" version, or a transformer input alongside the raw answers —
+    and that storage decision should be made deliberately, not backed into.
+
+Automated tests (once built):
+
+- a known destination gets a `travel_info.countries[*]` entry with real
+  currency/emergency data, sourced the same way as `country-info.js` (fake the
+  HTTP layer in tests, the way `country-info.js` itself is never tested against
+  the live APIs);
+- an unrecognized/unreachable destination degrades to no `travel_info` entry,
+  not a failed provisioning run — enrichment failure must never block
+  deployment;
+- a phase whose raw name mentions a dated, concrete event produces a
+  `travel_anchors[]` entry for it, not just a `phase.note`;
+- a phase with only a sub-group/context qualifier (no discrete anchor) produces
+  a narrative `phase.note`/blurb, not an empty one;
+- the anchor/narrative pass never fabricates a destination, date, or booking
+  status the organizer didn't provide.
+
+Exit gate: a confirmed intake with an unremarkable free-text phase name (real
+organizer language, not a clean "Tokyo"/"Kyoto" one-word example) produces a
+`trip.config.json` with populated `travel_info`, at least one correctly
+extracted `travel_anchors[]` entry, and phase titles that stay short while the
+trimmed context is genuinely readable elsewhere on the site — without a human
+manually patching the output afterward, the way this session did.
+
 ### Sprint 5 — Organizer profile, Trip Context Gateway, and Telegram routing
 
 **Goal:** connect one long-lived organizer companion profile to isolated trip

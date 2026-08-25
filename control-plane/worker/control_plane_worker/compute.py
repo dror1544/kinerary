@@ -90,10 +90,9 @@ class LxcProvisionAdapter:
         bridge: str,
         ip_pool: Sequence[str],
         hostname_domain: str,
-        tunnel_name: str,
+        tunnel_id: str,
         npm_url: str,
         npm_api_token: str,
-        cloudflare_account_id: str,
         cloudflare_zone_id: str,
         cloudflare_api_token: str,
         proxmox_host: str = "192.168.0.40",
@@ -122,10 +121,9 @@ class LxcProvisionAdapter:
         for candidate in self._ip_pool:
             ipaddress.ip_address(candidate)  # fail fast on a malformed pool entry
         self._hostname_domain = hostname_domain
-        self._tunnel_name = tunnel_name
+        self._tunnel_id = tunnel_id
         self._npm_url = npm_url
         self._npm_api_token = npm_api_token
-        self._cloudflare_account_id = cloudflare_account_id
         self._cloudflare_zone_id = cloudflare_zone_id
         self._cloudflare_api_token = cloudflare_api_token
         self._proxmox_host = proxmox_host
@@ -168,7 +166,13 @@ class LxcProvisionAdapter:
                 f"Proxmox reports no container named {topology.lxc.name!r} on "
                 f"{self._node} after apply — cannot determine its vmid"
             )
-        return str(record["vmid"])
+        vmid = str(record["vmid"])
+        # Only known after apply(), so this rewrites the file _write_topology
+        # already wrote pre-apply — same fields, plus vmid. mcp_bridge.py
+        # reads it back for slugs that (unlike the two legacy trips) have no
+        # entry in the operator-supplied --vmid-map.
+        self._write_topology(topology_path, topology, slug, vmid=vmid)
+        return vmid
 
     # ── topology construction ────────────────────────────────────────────
 
@@ -198,7 +202,7 @@ class LxcProvisionAdapter:
             ),
             proxy=ProxySpec(hostname=hostname, forward_host=name, forward_port=self._forward_port),
             cloudflare=CloudflareSpec(
-                tunnel_name=self._tunnel_name, hostname=hostname,
+                tunnel_id=self._tunnel_id, hostname=hostname,
                 # NOT the trip's own LXC address — every trip's ingress rule
                 # points at NPM's local listener on the RPi4 itself. NPM is
                 # what does the per-Host-header routing to the actual LXC
@@ -248,13 +252,14 @@ class LxcProvisionAdapter:
                     claimed.add(stripped.split(":", 1)[1].strip().split("/")[0])
         return claimed
 
-    def _write_topology(self, path: Path, topology: Topology, slug: str) -> None:
+    def _write_topology(self, path: Path, topology: Topology, slug: str, vmid: str | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
             "name": topology.name,
             "proxmox": {
                 "node": topology.lxc.node,
+                **({"vmid": vmid} if vmid else {}),
                 "lxc": {
                     "name": topology.lxc.name, "template": topology.lxc.template,
                     "storage": topology.lxc.storage, "cores": topology.lxc.cores,
@@ -269,7 +274,7 @@ class LxcProvisionAdapter:
                 "forward_port": topology.proxy.forward_port,
             },
             "cloudflare": {
-                "tunnel_name": topology.cloudflare.tunnel_name, "hostname": topology.cloudflare.hostname,
+                "tunnel_id": topology.cloudflare.tunnel_id, "hostname": topology.cloudflare.hostname,
                 "service": topology.cloudflare.service,
             },
         }
@@ -294,5 +299,5 @@ class LxcProvisionAdapter:
         return Provisioner(
             ProxmoxLxcAdapter(proxmox_ssh),
             NpmProxyHostAdapter(npm_transport),
-            CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_account_id, self._cloudflare_zone_id, rpi_ssh),
+            CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_zone_id, rpi_ssh),
         )

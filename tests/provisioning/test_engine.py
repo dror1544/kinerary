@@ -29,7 +29,7 @@ class ProvisionerTests(unittest.TestCase):
     def test_plan_is_empty_when_all_resources_already_match(self) -> None:
         self.proxmox.inspect.return_value = {"name": "app"}
         self.npm.inspect.return_value = {"hostname": "site.example.invalid"}
-        self.cloudflare.inspect.return_value = {"tunnel_name": "tunnel", "hostname": "site.example.invalid"}
+        self.cloudflare.inspect.return_value = {"tunnel_id": "tunnel", "hostname": "site.example.invalid"}
 
         plan = self.provisioner.plan(TOPOLOGY)
 

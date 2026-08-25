@@ -19,7 +19,8 @@ class TopologyValidationTests(unittest.TestCase):
             "PROXMOX_STORAGE": "storage", "PROXMOX_BRIDGE": "bridge",
             "PROXMOX_GATEWAY": "192.168.0.1", "PROXMOX_NAMESERVER": "192.168.0.41",
             "NFS_HOST_DIR": "/mnt/pve/truenas-nfs/app", "NFS_MOUNT_PATH": "/nfs/app",
-            "PUBLIC_HOSTNAME": "site.example.invalid", "CLOUDFLARE_TUNNEL_NAME": "tunnel",
+            "PUBLIC_HOSTNAME": "site.example.invalid",
+            "CLOUDFLARE_TUNNEL_ID": "edd0b94a-ecce-48b1-b3a5-33d15d0f5f8c",
             "CLOUDFLARE_TUNNEL_SERVICE": "http://app:8080",
         }
         with patch.dict("os.environ", environment, clear=True):

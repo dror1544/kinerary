@@ -55,7 +55,7 @@ def build_provisioner(topology: Topology) -> Provisioner:
     return Provisioner(
         ProxmoxLxcAdapter(proxmox_ssh),
         NpmProxyHostAdapter(npm),
-        CloudflareTunnelDnsAdapter(cloudflare, _required_env("CLOUDFLARE_ACCOUNT_ID"), _required_env("CLOUDFLARE_ZONE_ID"), rpi_ssh),
+        CloudflareTunnelDnsAdapter(cloudflare, _required_env("CLOUDFLARE_ZONE_ID"), rpi_ssh),
     )
 
 
