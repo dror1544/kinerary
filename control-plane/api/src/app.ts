@@ -10,7 +10,6 @@ import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
-import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -67,8 +66,6 @@ export interface AppDependencies {
   provisioner?: ProvisionerDependencies;
   /** Optional: mount the internal chat-routing lookup Hermes's gateway calls. */
   chatRouting?: ChatRoutingDependencies;
-  /** Optional: mount Google-session organizer portal routes. */
-  portal?: PortalDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -93,7 +90,6 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
-      "/v1/auth/google/start", "/v1/me", "/v1/trips", "/v1/ops/provisioning-requests",
     ],
   }));
 
@@ -864,8 +860,6 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
     return reply.code(200).send({ tripId: row.trip_id, hermesProfile: row.hermes_profile });
   });
-
-  if (dependencies.portal) registerPortalRoutes(app, dependencies.portal);
 
   if (dependencies.close) app.addHook("onClose", dependencies.close);
   return app;

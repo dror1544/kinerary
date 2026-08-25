@@ -73,6 +73,31 @@ async function setupFixture(pool: pg.Pool): Promise<PlannerFixture> {
   return { pool, ownerId, tripId, releaseId, intakeVersionId, intakeDigest, correlationId };
 }
 
+// Deprecates every 'available' release other than the fixture's own —
+// including the permanent dev-seed release from migration 0016 — so a test
+// can construct a genuine "no compatible release" scenario. Returns the ids
+// to restore afterward.
+async function withOtherAvailableReleasesDeprecated(fix: PlannerFixture): Promise<string[]> {
+  const { rows } = await fix.pool.query<{ id: string }>(
+    "SELECT id FROM control_plane.releases WHERE status = 'available' AND id <> $1",
+    [fix.releaseId],
+  );
+  if (rows.length === 0) return [];
+  await fix.pool.query(
+    "UPDATE control_plane.releases SET status = 'deprecated' WHERE id = ANY($1)",
+    [rows.map((r) => r.id)],
+  );
+  return rows.map((r) => r.id);
+}
+
+async function restoreAvailableReleases(fix: PlannerFixture, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await fix.pool.query(
+    "UPDATE control_plane.releases SET status = 'available' WHERE id = ANY($1)",
+    [ids],
+  );
+}
+
 async function teardownFixture(fix: PlannerFixture) {
   const { pool, tripId, ownerId, releaseId } = fix;
   await pool.query("DELETE FROM control_plane.plan_approvals WHERE plan_id IN (SELECT id FROM control_plane.plans WHERE trip_id = $1)", [tripId]);
@@ -151,6 +176,10 @@ describe("generatePlan", () => {
 
   test("rejects when no compatible release is available", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
+    // The dev-seed migration (0016) inserts a permanently 'available' release
+    // so generatePlan has something to select against outside tests. Neutralize
+    // every other available release so this scenario is genuinely release-less.
+    const others = await withOtherAvailableReleasesDeprecated(fix);
     try {
       // Mark the release as deprecated so no available release exists.
       await fix.pool.query("UPDATE control_plane.releases SET status = 'deprecated' WHERE id = $1", [fix.releaseId]);
@@ -159,12 +188,16 @@ describe("generatePlan", () => {
       if (result.ok) throw new Error("unreachable");
       assert.equal(result.reason, "NO_COMPATIBLE_RELEASE");
     } finally {
+      await restoreAvailableReleases(fix, others);
       await teardownFixture(fix);
     }
   });
 
   test("rejects a release with incompatible schema range", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
+    // Same interference as above: neutralize the dev-seed release so it
+    // cannot mask the fixture release's now-incompatible schema range.
+    const others = await withOtherAvailableReleasesDeprecated(fix);
     try {
       // Reconfigure the release to support only schema version 2+.
       await fix.pool.query(
@@ -177,6 +210,7 @@ describe("generatePlan", () => {
       if (result.ok) throw new Error("unreachable");
       assert.equal(result.reason, "NO_COMPATIBLE_RELEASE");
     } finally {
+      await restoreAvailableReleases(fix, others);
       await teardownFixture(fix);
     }
   });
