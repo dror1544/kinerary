@@ -10,6 +10,7 @@ import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
+import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -46,6 +47,12 @@ export interface ProvisionerDependencies {
   db: pg.Pool;
 }
 
+export interface ChatRoutingDependencies {
+  db: pg.Pool;
+  /** Shared secret Hermes's gateway presents as X-API-Key. Same trust tier as INTERVIEW_MCP_KEY. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -58,6 +65,10 @@ export interface AppDependencies {
   planner?: PlannerDependencies;
   /** Optional: mount intake correction route (Sprint 4+). */
   provisioner?: ProvisionerDependencies;
+  /** Optional: mount the internal chat-routing lookup Hermes's gateway calls. */
+  chatRouting?: ChatRoutingDependencies;
+  /** Optional: mount Google-session organizer portal routes. */
+  portal?: PortalDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -82,6 +93,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
+      "/v1/auth/google/start", "/v1/me", "/v1/trips", "/v1/ops/provisioning-requests",
     ],
   }));
 
@@ -375,6 +387,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       sessionToken: result.sessionToken,
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
     });
   });
 
@@ -404,15 +417,17 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       sessionId: result.view.sessionId,
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
       recap: result.view.recap,
     });
   });
 
   // POST /v1/interview/:sessionId/answer — submit or correct an answer.
   // Header: Authorization: Bearer <session-token>
-  // Body: { questionId, optionId?, otherText?, data? }
+  // Body: { questionId, optionId?, otherText?, data?, optionIds? }
   // `data` carries the payload for "structured" questions (e.g. travelers,
   // phases) — a JSON array/object rather than a string.
+  // `optionIds` carries every selected id for a "multi_choice" question.
   app.post("/v1/interview/:sessionId/answer", async (request, reply) => {
     if (!dependencies.interview) {
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
@@ -432,10 +447,17 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const optionId = body?.optionId ?? null;
     const otherText = body?.otherText;
     const structuredData = body?.data;
+    const optionIds = body?.optionIds;
 
     if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
     if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Reject a non-string element here rather than letting validateAnswer's
+    // option lookup coerce it — an id must be a literal option id, and a
+    // number or object that stringifies into one is not that.
+    if (optionIds !== undefined && (!Array.isArray(optionIds) || optionIds.some((id) => typeof id !== "string"))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
 
     const result = await submitAnswer(
       dependencies.interview.db,
@@ -445,6 +467,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       otherText as string | undefined,
       sessionId,
       structuredData,
+      optionIds as string[] | undefined,
     );
 
     if (!result.ok) {
@@ -457,6 +480,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send({
       state: result.view.state,
       nextQuestion: result.view.nextQuestion,
+      optionalRemaining: result.view.optionalRemaining,
       recap: result.view.recap,
     });
   });
@@ -811,6 +835,37 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       digest: result.digest,
     });
   });
+
+  // Internal only — never exposed to organizers/families, never routed
+  // through Telegram-login auth. Trust is a single shared key, same tier as
+  // interview-mcp.ts's INTERVIEW_MCP_KEY: the caller is Hermes's gateway
+  // process deciding which profile's HERMES_HOME serves an inbound chat, not
+  // a human. Returns only a trip id and a profile name — no trip content, no
+  // credentials — so a leaked response is low-value on its own.
+  app.get("/internal/telegram-chat-bindings/:chatId", async (request, reply) => {
+    if (!dependencies.chatRouting) {
+      return reply.code(503).send({ error: "CHAT_ROUTING_NOT_CONFIGURED" });
+    }
+    const { db, apiKey } = dependencies.chatRouting;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    if (typeof providedKey !== "string" || providedKey.length === 0 || providedKey !== apiKey) {
+      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    }
+    const params = request.params as Record<string, unknown>;
+    const chatId = params?.chatId;
+    if (typeof chatId !== "string" || chatId.length === 0) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await db.query<{ trip_id: string; hermes_profile: string }>(
+      "SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+      [chatId],
+    );
+    const [row] = result.rows;
+    if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
+    return reply.code(200).send({ tripId: row.trip_id, hermesProfile: row.hermes_profile });
+  });
+
+  if (dependencies.portal) registerPortalRoutes(app, dependencies.portal);
 
   if (dependencies.close) app.addHook("onClose", dependencies.close);
   return app;

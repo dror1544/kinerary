@@ -235,6 +235,14 @@ export async function completeJob(
       "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL",
       [updateResult.rows[0]!.plan_id],
     );
+    // Retire the plan out of 'approved'. plans_trip_active_idx is a partial
+    // unique index over (pending_approval, approved), so a plan left in
+    // 'approved' after its job reached a terminal state permanently blocks
+    // re-planning and correction for the trip.
+    await client.query(
+      "UPDATE control_plane.plans SET status = 'executed', updated_at = now() WHERE id = $1 AND status = 'approved'",
+      [updateResult.rows[0]!.plan_id],
+    );
     await client.query("COMMIT");
     return true;
   } catch (err) {
@@ -291,6 +299,14 @@ export async function failJob(
       // Terminal: consume the approval so it cannot authorize a future run.
       await client.query(
         "UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1 AND used_at IS NULL",
+        [row.plan_id],
+      );
+      // ...and retire the plan, for the same reason completeJob does. Without
+      // this the trip is left with a spent approval, an unclaimable job and a
+      // plan still occupying plans_trip_active_idx — no re-plan, no
+      // correction, no way forward short of manual database surgery.
+      await client.query(
+        "UPDATE control_plane.plans SET status = 'superseded', updated_at = now() WHERE id = $1 AND status = 'approved'",
         [row.plan_id],
       );
     }

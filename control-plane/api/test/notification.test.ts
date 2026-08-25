@@ -16,6 +16,13 @@ test("FakeNotificationAdapter records calls instead of sending anything", async 
   assert.deepEqual(adapter.calls, [params]);
 });
 
+test("FakeNotificationAdapter records sendMessage calls separately from sendApprovalRequest calls", async () => {
+  const adapter = new FakeNotificationAdapter();
+  await adapter.sendMessage({ chatId: "12345", text: "hello" });
+  assert.deepEqual(adapter.messageCalls, [{ chatId: "12345", text: "hello" }]);
+  assert.equal(adapter.calls.length, 0);
+});
+
 test("createNotificationAdapter selects the fake adapter for adapters.messaging = fake", () => {
   const adapter = createNotificationAdapter("fake");
   assert.ok(adapter instanceof FakeNotificationAdapter);

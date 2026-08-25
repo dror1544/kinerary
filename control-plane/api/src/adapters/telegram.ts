@@ -88,6 +88,23 @@ export class TelegramNotificationAdapter implements NotificationAdapter {
       throw new Error(`telegram sendMessage failed: HTTP ${response.status}`);
     }
   }
+
+  /** A plain DM to an arbitrary chat id — no callback refs, no approval-flow bookkeeping. */
+  async sendMessage(params: { chatId: string; text: string }): Promise<void> {
+    const response = await fetch(`${TELEGRAM_API_ROOT}/bot${this.config.botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: params.chatId, text: params.text }),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      this.config.log?.(structuredLog("error", "telegram.send_message_failed", {
+        status: response.status,
+        detail: detail.slice(0, 300),
+      }));
+      throw new Error(`telegram sendMessage failed: HTTP ${response.status}`);
+    }
+  }
 }
 
 /**

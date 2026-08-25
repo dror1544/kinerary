@@ -55,6 +55,23 @@ def main(argv: list[str] | None = None) -> int:
                            help="path to kinerary repo (REPO_ROOT / PROVISIONER_REPO_ROOT)")
     provision.add_argument("--vmid-map", default=os.environ.get("PROVISIONER_VMID_MAP"),
                            help='JSON dict of slug→vmid e.g. {"japan-2025":"201"} (PROVISIONER_VMID_MAP)')
+    provision.add_argument("--companion-templates-dir", default=os.environ.get("PROVISIONER_COMPANION_TEMPLATES_DIR"),
+                           help="path to profile-templates/familytrip-companion — omit to skip companion-profile "
+                                "creation entirely (PROVISIONER_COMPANION_TEMPLATES_DIR)")
+    provision.add_argument("--enable-mcp-bridge", action="store_true",
+                           default=os.environ.get("PROVISIONER_MCP_BRIDGE_ENABLED") == "1",
+                           help="wire each new companion profile to its trip-mcp bridge via setup-mcp.sh — a real "
+                                "SSH/Proxmox/hermes-CLI action, requires --companion-templates-dir "
+                                "(PROVISIONER_MCP_BRIDGE_ENABLED=1)")
+    provision.add_argument("--enable-compute", action="store_true",
+                           default=os.environ.get("PROVISIONER_COMPUTE_ENABLED") == "1",
+                           help="create a fresh LXC (+ NPM proxy host + Cloudflare tunnel DNS) for any slug missing "
+                                "from --vmid-map — pct over SSH into Proxmox, real NPM/Cloudflare API calls — "
+                                "requires PROXMOX_NODE/PROXMOX_LXC_TEMPLATE/PROXMOX_STORAGE/PROXMOX_BRIDGE, "
+                                "NPM_URL/NPM_API_TOKEN, "
+                                "CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_ZONE_ID/CLOUDFLARE_API_TOKEN, and "
+                                "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_NAME "
+                                "(PROVISIONER_COMPUTE_ENABLED=1)")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
     check.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
@@ -70,15 +87,78 @@ def main(argv: list[str] | None = None) -> int:
             vmid_map = json.loads(args.vmid_map)
             if not isinstance(vmid_map, dict):
                 raise ValueError("--vmid-map must be a JSON object of slug→vmid")
+            from .companion_profile import NullCompanionProfileAdapter, RenderProfileAdapter
+            from .compute import LxcProvisionAdapter, NullComputeAdapter
+            from .mcp_bridge import NullMcpBridgeAdapter, ShellMcpBridgeAdapter
             from .provisioner import ProvisionerWorker, ShellDeployAdapter
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
+            # Off by default: an unconfigured deployment keeps the pre-Phase-G
+            # behavior exactly (a slug missing from --vmid-map fails loudly
+            # instead of a real LXC/NPM/Cloudflare create happening).
+            if args.enable_compute:
+                ip_pool = json.loads(_required_env("PROVISIONER_LXC_IP_POOL"))
+                if not isinstance(ip_pool, list) or not ip_pool:
+                    raise ValueError("PROVISIONER_LXC_IP_POOL must be a non-empty JSON array of IPv4 addresses")
+                compute_adapter = LxcProvisionAdapter(
+                    deploy_root=args.deploy_root,
+                    node=_required_env("PROXMOX_NODE"),
+                    template=_required_env("PROXMOX_LXC_TEMPLATE"),
+                    storage=_required_env("PROXMOX_STORAGE"),
+                    bridge=_required_env("PROXMOX_BRIDGE"),
+                    ip_pool=ip_pool,
+                    hostname_domain=_required_env("PROVISIONER_LXC_HOSTNAME_DOMAIN"),
+                    tunnel_name=_required_env("PROVISIONER_LXC_TUNNEL_NAME"),
+                    npm_url=_required_env("NPM_URL"),
+                    npm_api_token=_required_env("NPM_API_TOKEN"),
+                    cloudflare_account_id=_required_env("CLOUDFLARE_ACCOUNT_ID"),
+                    cloudflare_zone_id=_required_env("CLOUDFLARE_ZONE_ID"),
+                    cloudflare_api_token=_required_env("CLOUDFLARE_API_TOKEN"),
+                    # Proxmox itself and the RPi4 that runs cloudflared —
+                    # confirmed live (2026-08-25) at these defaults; override
+                    # via env only if either box ever changes. No Proxmox API
+                    # token: pct over the same SSH key kinerary-deploy's
+                    # scripts already use for pct exec/pct config.
+                    proxmox_host=os.environ.get("PROXMOX_HOST", "192.168.0.40"),
+                    proxmox_ssh_user=os.environ.get("PROXMOX_SSH_USER", "root"),
+                    proxmox_ssh_key=os.environ.get("PROXMOX_SSH_KEY", "~/.ssh/id_ed25519_proxmox_hermes"),
+                    rpi_host=os.environ.get("RPI_HOST", "192.168.0.41"),
+                    rpi_ssh_user=os.environ.get("RPI_SSH_USER", "dror"),
+                    rpi_ssh_key=os.environ.get("RPI_SSH_KEY", "~/.ssh/id_ed25519_rpi4_hermes"),
+                    cloudflare_ingress_service=os.environ.get(
+                        "PROVISIONER_CLOUDFLARE_INGRESS_SERVICE", "http://127.0.0.1:8080"
+                    ),
+                    gateway=os.environ.get("PROXMOX_GATEWAY", "192.168.0.1"),
+                    nameserver=os.environ.get("PROXMOX_NAMESERVER", "192.168.0.41"),
+                    nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
+                    nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
+                )
+            else:
+                compute_adapter = NullComputeAdapter()
             deploy_adapter = ShellDeployAdapter(
                 deploy_root=args.deploy_root,
                 vmid_map=vmid_map,
                 repo_root=args.repo_root,
+                compute=compute_adapter,
             )
-            worker_obj = ProvisionerWorker(db_url=db_url, deploy=deploy_adapter)
+            # Both default OFF: an unconfigured deployment gets exactly the
+            # old behavior (deploy the site, skip the companion profile).
+            # --enable-mcp-bridge additionally requires a templates dir,
+            # since wiring trip-mcp for a profile that was never created
+            # makes no sense.
+            if args.companion_templates_dir:
+                companion_adapter = RenderProfileAdapter(templates_dir=args.companion_templates_dir)
+                mcp_bridge_adapter = (
+                    ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
+                    if args.enable_mcp_bridge else NullMcpBridgeAdapter()
+                )
+            else:
+                companion_adapter = NullCompanionProfileAdapter()
+                mcp_bridge_adapter = NullMcpBridgeAdapter()
+            worker_obj = ProvisionerWorker(
+                db_url=db_url, deploy=deploy_adapter,
+                companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
+            )
             import signal, time as _time
             stopping = False
             def _stop(_sig: int, _frame: object) -> None:

@@ -5,8 +5,12 @@ import { TelegramNotificationAdapter } from "./telegram.js";
 /** Records calls instead of sending anything. Selected by adapters.messaging === "fake". */
 export class FakeNotificationAdapter implements NotificationAdapter {
   readonly calls: Array<Parameters<NotificationAdapter["sendApprovalRequest"]>[0]> = [];
+  readonly messageCalls: Array<Parameters<NotificationAdapter["sendMessage"]>[0]> = [];
   async sendApprovalRequest(params: Parameters<NotificationAdapter["sendApprovalRequest"]>[0]): Promise<void> {
     this.calls.push(params);
+  }
+  async sendMessage(params: Parameters<NotificationAdapter["sendMessage"]>[0]): Promise<void> {
+    this.messageCalls.push(params);
   }
 }
 

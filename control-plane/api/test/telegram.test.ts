@@ -123,6 +123,40 @@ describe("TelegramNotificationAdapter + resolveTelegramCallbackRef", () => {
     assert.equal(result, null);
   });
 
+  test("sendMessage POSTs a plain DM to the given chat id, no callback refs involved", { skip: SKIP }, async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    try {
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "391627336", db: pool });
+      await adapter.sendMessage({ chatId: "777000111", text: "Your trip site is ready: https://example.test" });
+
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /\/botbot-token\/sendMessage$/);
+      assert.equal(calls[0].body.chat_id, "777000111");
+      assert.equal(calls[0].body.text, "Your trip site is ready: https://example.test");
+      assert.equal(calls[0].body.reply_markup, undefined);
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
+  test("sendMessage throws on a non-2xx response, same as sendApprovalRequest", { skip: SKIP }, async () => {
+    mock.method(globalThis, "fetch", async () => new Response("Bad Request: chat not found", { status: 400 }));
+    try {
+      const adapter = new TelegramNotificationAdapter({ botToken: "bot-token", superAdminChatId: "391627336", db: pool });
+      await assert.rejects(
+        () => adapter.sendMessage({ chatId: "777000111", text: "hi" }),
+        /telegram sendMessage failed: HTTP 400/,
+      );
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
   test("sendApprovalRequest throws and logs when Telegram returns a non-2xx response", { skip: SKIP }, async () => {
     mock.method(globalThis, "fetch", async () => new Response("Bad Request: chat not found", { status: 400 }));
 

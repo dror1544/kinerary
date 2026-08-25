@@ -32,7 +32,7 @@ function buildValidPayload(
   return { ...base, hash };
 }
 
-test("valid payload returns verified identity with digest, not raw id", () => {
+test("valid payload returns verified identity with both a digest and the raw sendable id", () => {
   const payload = buildValidPayload();
   const result = verifyTelegramLogin(payload, TEST_BOT_TOKEN, { nowMs: TEST_AUTH_DATE_S * 1000 + 100 });
   assert.equal(result.ok, true);
@@ -40,8 +40,10 @@ test("valid payload returns verified identity with digest, not raw id", () => {
   assert.equal(result.identity.provider, "telegram");
   assert.match(result.identity.providerSubjectDigest, /^sha256:[a-f0-9]{64}$/);
   assert.equal(result.identity.displayName, "Test Organizer");
-  // The raw numeric ID must not appear in any field
-  assert.doesNotMatch(JSON.stringify(result.identity), new RegExp(String(TEST_TELEGRAM_ID)));
+  // providerSubjectId exists solely so callers can message the user back —
+  // it must equal the raw payload id and must never be used for identity
+  // comparisons (that's what providerSubjectDigest is for).
+  assert.equal(result.identity.providerSubjectId, String(TEST_TELEGRAM_ID));
 });
 
 test("display name is first_name alone when last_name is absent", () => {

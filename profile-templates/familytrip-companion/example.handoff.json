@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "name": "sampletrip2027",
+    "description": "Trip companion for Sample Coast 2027"
+  },
+  "trip": {
+    "id": "sample-coast-2027",
+    "title": "Sample Coast 2027",
+    "default_language": "he",
+    "timezone": "Europe/Athens",
+    "canonical_site_url": "https://trip.example.test/",
+    "site_connection_name": "trip-site",
+    "date_start": "2027-06-10",
+    "date_end": "2027-06-18"
+  },
+  "assistant": {
+    "name": "ריו",
+    "name_en": "Rio",
+    "gender": "neutral",
+    "tone": "warm",
+    "proactive": {
+      "morning_briefing": "07:30",
+      "tomorrow_preview": false,
+      "photo_recap": false,
+      "flight_changes": true,
+      "packing_reminders": true
+    }
+  },
+  "organizer": {
+    "person_ref": "person-sample-owner",
+    "display_name": "Alex",
+    "co_organizer_refs": []
+  },
+  "interview": {
+    "confirmed": true,
+    "group_safe": {
+      "trip_pace": "balanced",
+      "interests": [
+        "beaches",
+        "local food"
+      ],
+      "recommendation_preferences": [
+        "Lead with one recommendation and one fallback"
+      ],
+      "communication_preferences": [
+        "Keep group replies short"
+      ],
+      "standing_instructions": [
+        {
+          "he": "להציע הפסקה באמצע יום עמוס",
+          "en": "Suggest a break during a busy day"
+        }
+      ]
+    },
+    "organizer_private": {
+      "goals": [
+        "Reduce repeated logistics questions"
+      ],
+      "budget_notes": [
+        "Prefer mid-range options"
+      ],
+      "family_dynamics": [],
+      "topics_to_avoid": [],
+      "standing_instructions": [
+        {
+          "he": "לבקש אישור לפני שינוי המסלול",
+          "en": "Ask for approval before changing the itinerary"
+        }
+      ],
+      "private_alerts": [
+        "Alert the organizer privately when a site action fails"
+      ]
+    },
+    "participant_needs": [
+      {
+        "type": "dietary",
+        "severity": "firm",
+        "visibility": "organizer",
+        "text": {
+          "he": "צמחוני/ת",
+          "en": "Vegetarian"
+        },
+        "person_ref": "person-sample-owner",
+        "status": "confirmed",
+        "source_answer_ref": "dietary"
+      }
+    ]
+  },
+  "record_type": "trip_assistant_profile_input",
+  "handoff_id": "handoff-sample-001",
+  "trip_ref": "trip-sample-001",
+  "source": {
+    "intake_version_ref": "intake-sample-001",
+    "intake_schema_version": 2,
+    "intake_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "confirmed_at": "2027-01-15T10:00:00Z"
+  }
+}

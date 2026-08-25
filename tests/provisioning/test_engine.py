@@ -10,7 +10,10 @@ from provisioning.models import CloudflareSpec, LxcSpec, ProxySpec, Topology
 TOPOLOGY = Topology(
     version=1,
     name="test-onboarding",
-    lxc=LxcSpec("app", "node", "template", "storage", 2, 1024, 8, "bridge", "dhcp"),
+    lxc=LxcSpec(
+        "app", "node", "template", "storage", 2, 1024, 8, "bridge", "dhcp",
+        "192.168.0.1", "192.168.0.41", "/mnt/pve/truenas-nfs/app", "/nfs/app",
+    ),
     proxy=ProxySpec("site.example.invalid", "app", 8080),
     cloudflare=CloudflareSpec("tunnel", "site.example.invalid", "http://app:8080"),
 )
