@@ -314,11 +314,12 @@ export async function processApprovalCallback(
  */
 export async function getSignupStatus(
   db: pg.Pool,
+  provider: VerifiedTelegramIdentity["provider"],
   providerSubjectDigest: string,
 ): Promise<SignupResult> {
   const identity = await db.query<{ user_id: string }>(
-    "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-    [providerSubjectDigest],
+    "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+    [provider, providerSubjectDigest],
   );
   const [userRow] = identity.rows;
   if (!userRow) return { status: "not_found" };
@@ -361,6 +362,7 @@ export async function getSignupStatus(
 export async function getTripForMember(
   db: pg.Pool,
   tripId: string,
+  provider: VerifiedTelegramIdentity["provider"],
   providerSubjectDigest: string,
 ): Promise<{ id: string; slug: string; lifecycleState: string } | null> {
   const result = await db.query<{ id: string; slug: string; lifecycle_state: string }>(
@@ -369,10 +371,10 @@ export async function getTripForMember(
      JOIN control_plane.trip_memberships m ON m.trip_id = t.id
      JOIN control_plane.user_identities ui ON ui.user_id = m.user_id
      WHERE t.id = $1
-       AND ui.provider = 'telegram'
-       AND ui.provider_subject_digest = $2
+       AND ui.provider = $2
+       AND ui.provider_subject_digest = $3
        AND m.status = 'active'`,
-    [tripId, providerSubjectDigest],
+    [tripId, provider, providerSubjectDigest],
   );
   const [row] = result.rows;
   if (!row) return null;

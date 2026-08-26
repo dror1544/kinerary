@@ -253,7 +253,7 @@ test("rejection callback blocks enrollment; no draft trip created", { skip }, as
     const trips = await pool.query("SELECT count(*)::int AS c FROM control_plane.trips");
     assert.equal(trips.rows[0].c, 0);
 
-    const status = await getSignupStatus(pool, identity.providerSubjectDigest);
+    const status = await getSignupStatus(pool, identity.provider, identity.providerSubjectDigest);
     assert.equal(status.status, "declined");
   } finally {
     const c2 = await pool.connect();
@@ -284,7 +284,7 @@ test("callback with wrong sender identity is refused", { skip }, async () => {
     assert.equal(result.reason, "WRONG_SENDER");
 
     // Request is still pending
-    const status = await getSignupStatus(pool, identity.providerSubjectDigest);
+    const status = await getSignupStatus(pool, identity.provider, identity.providerSubjectDigest);
     assert.equal(status.status, "awaiting_approval");
   } finally {
     const c2 = await pool.connect();
@@ -376,17 +376,17 @@ test("owner reads approved draft; different user and unauthenticated cannot", { 
     const tripId = approval.tripId;
 
     // Owner can read the trip
-    const ownerView = await getTripForMember(pool, tripId, owner.providerSubjectDigest);
+    const ownerView = await getTripForMember(pool, tripId, owner.provider, owner.providerSubjectDigest);
     assert.ok(ownerView);
     assert.equal(ownerView.id, tripId);
     assert.equal(ownerView.lifecycleState, "draft");
 
     // Second user cannot
-    const otherView = await getTripForMember(pool, tripId, other.providerSubjectDigest);
+    const otherView = await getTripForMember(pool, tripId, other.provider, other.providerSubjectDigest);
     assert.equal(otherView, null);
 
     // Forged trip ID returns null
-    const forged = await getTripForMember(pool, "trip_forgedXXXXXXXX", owner.providerSubjectDigest);
+    const forged = await getTripForMember(pool, "trip_forgedXXXXXXXX", owner.provider, owner.providerSubjectDigest);
     assert.equal(forged, null);
   } finally {
     const c2 = await pool.connect();
@@ -676,7 +676,7 @@ test("POST /v1/signup/callback is refused without a valid webhook secret header"
     assert.equal(wrong.statusCode, 401);
 
     // Request is still pending — neither attempt was processed
-    const status = await getSignupStatus(pool, identity.providerSubjectDigest);
+    const status = await getSignupStatus(pool, identity.provider, identity.providerSubjectDigest);
     assert.equal(status.status, "awaiting_approval");
 
     await app.close();
@@ -817,6 +817,76 @@ test("GET /v1/signup/status reflects current state without starting a new reques
 
     // Still only one notification sent (status check didn't create a new one)
     assert.equal(notification.calls.length, 1);
+
+    await app.close();
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("password-authenticated signups can poll status and read their trip", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const app = buildApp(testArchitectureProfile, signupDeps(pool, notification));
+
+    const passwordPayload = { email: "organizer@example.com", password: "correct-horse-battery" };
+    const encoded = Buffer.from(JSON.stringify(passwordPayload)).toString("base64url");
+
+    const signupRes = await app.inject({
+      method: "POST",
+      url: "/v1/signup",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: passwordPayload, trip_name_request: "Japan 2025" }),
+    });
+    assert.equal(signupRes.statusCode, 200);
+    assert.equal(signupRes.json().status, "awaiting_approval");
+
+    // Before approval: status must reflect the pending request, not "not_found"
+    // (a regression here means getSignupStatus is still hardcoded to provider = 'telegram')
+    const pendingStatusRes = await app.inject({
+      method: "GET",
+      url: `/v1/signup/status?password=${encoded}`,
+    });
+    assert.equal(pendingStatusRes.statusCode, 200);
+    assert.equal(pendingStatusRes.json().status, "awaiting_approval");
+
+    const pendingReq = await pool.query<{ id: string }>(
+      "SELECT id FROM control_plane.signup_approval_requests WHERE state = 'pending'",
+    );
+    const requestId = pendingReq.rows[0]!.id;
+    const { token } = signApprovalAction(requestId, "approve", ACTION_SECRET);
+    const approval = await processApprovalCallback(pool, token, SUPER_ADMIN_DIGEST, testConfig);
+    assert.equal(approval.outcome, "approved");
+    if (approval.outcome !== "approved") return;
+    const tripId = approval.tripId;
+
+    // After approval: status must report "approved", not "not_found"
+    const approvedStatusRes = await app.inject({
+      method: "GET",
+      url: `/v1/signup/status?password=${encoded}`,
+    });
+    assert.equal(approvedStatusRes.statusCode, 200);
+    assert.equal(approvedStatusRes.json().status, "approved");
+    assert.equal(approvedStatusRes.json().tripId, tripId);
+
+    // GET /v1/trips/:id must find the membership row, not 404
+    // (a regression here means getTripForMember is still hardcoded to provider = 'telegram')
+    const tripRes = await app.inject({
+      method: "GET",
+      url: `/v1/trips/${tripId}`,
+      headers: { "x-portal-password-login": encoded },
+    });
+    assert.equal(tripRes.statusCode, 200);
+    assert.equal(tripRes.json().id, tripId);
 
     await app.close();
   } finally {

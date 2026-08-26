@@ -270,6 +270,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
     const result = await getSignupStatus(
       dependencies.signup.db,
+      loginResult.identity.provider,
       loginResult.identity.providerSubjectDigest,
     );
     return reply.code(200).send(result);
@@ -297,6 +298,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const trip = await getTripForMember(
       dependencies.signup.db,
       tripId,
+      loginResult.identity.provider,
       loginResult.identity.providerSubjectDigest,
     );
     if (!trip) {
