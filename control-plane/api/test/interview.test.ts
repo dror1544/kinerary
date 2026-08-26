@@ -464,6 +464,57 @@ describe("startSession (DB)", () => {
       await teardownFixture(fix);
     }
   });
+
+  test("startSession: well-formed telegramChatIdHint is persisted onto the trip", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const result = await startSession(fix.pool, token, () => {}, "391627336");
+      assert.equal(result.ok, true);
+
+      const tripRow = await fix.pool.query<{ notification_chat_id_hint: string | null }>(
+        "SELECT notification_chat_id_hint FROM control_plane.trips WHERE id = $1",
+        [fix.draftTripId],
+      );
+      assert.equal(tripRow.rows[0]?.notification_chat_id_hint, "391627336");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("startSession: malformed telegramChatIdHint is ignored, not stored", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const result = await startSession(fix.pool, token, () => {}, "not-a-chat-id; DROP TABLE trips;");
+      assert.equal(result.ok, true);
+
+      const tripRow = await fix.pool.query<{ notification_chat_id_hint: string | null }>(
+        "SELECT notification_chat_id_hint FROM control_plane.trips WHERE id = $1",
+        [fix.draftTripId],
+      );
+      assert.equal(tripRow.rows[0]?.notification_chat_id_hint, null);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("startSession: omitted telegramChatIdHint leaves the trip's hint null", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const result = await startSession(fix.pool, token);
+      assert.equal(result.ok, true);
+
+      const tripRow = await fix.pool.query<{ notification_chat_id_hint: string | null }>(
+        "SELECT notification_chat_id_hint FROM control_plane.trips WHERE id = $1",
+        [fix.draftTripId],
+      );
+      assert.equal(tripRow.rows[0]?.notification_chat_id_hint, null);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
 });
 
 describe("getSession / submitAnswer / confirmIntake (DB)", () => {

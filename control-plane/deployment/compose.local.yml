@@ -76,23 +76,75 @@ services:
     build:
       context: ../..
       dockerfile: control-plane/worker/Dockerfile
+    # Overrides the Dockerfile's USER nobody for this local dev stack only.
+    # Two real reasons: (1) kinerary-deploy/deploy.sh hardcodes its SSH key
+    # path as $HOME/.ssh/id_ed25519_proxmox_hermes with no env override, so
+    # $HOME has to resolve to something with a real .ssh dir under it: root's
+    # always does. (2) the mounted SSH key files keep the host's real
+    # permissions (0600, owned by this Mac's user) — nobody (uid 65534)
+    # can't read them, root can. This container already performs real,
+    # privileged infra actions (Proxmox/NPM/Cloudflare) when PROVISIONER_
+    # COMPUTE_ENABLED is on; nobody's isolation wasn't buying much extra
+    # safety over that regardless.
+    user: root
     # "run" only observes the queue — it never calls the deploy/companion/
     # mcp_bridge adapters, so an approved job sat here forever. "provision"
     # is the subcommand that actually drains it (see __main__.py).
     command: ["python", "-m", "control_plane_worker", "provision", "--poll-seconds", "10"]
     environment:
+      HOME: /root
       CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
-      # Both required by "provision". Left unset here on purpose: this repo
-      # doesn't decide where your kinerary-deploy checkout lives or which
-      # slugs already have a real container, and deploy.sh does a REAL
-      # deploy the moment a signup gets approved. Unconfigured, the worker
-      # exits with a clear config error every poll cycle instead of either
-      # silently queuing forever (the old bug) or reaching real infra by
-      # accident. Set these — and mount PROVISIONER_DEPLOY_ROOT as a volume
-      # pointing at your kinerary-deploy checkout — once you actually want
-      # this stack to provision for real.
+      # Both required by "provision", both left empty by default on purpose
+      # (same reasoning as before this file gained real mounts below): an
+      # unconfigured worker must fail loudly every poll cycle, not reach
+      # real infra by accident just because docker compose up was run for
+      # something else. Pass PROVISIONER_DEPLOY_ROOT=/deploy-root REPO_ROOT=/repo
+      # (matching the bind mounts below) at `up` time to actually turn this on.
       PROVISIONER_DEPLOY_ROOT: ${PROVISIONER_DEPLOY_ROOT:-}
       PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-}
+      # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
+      # deploy.sh's own default is a host macOS path that doesn't exist
+      # inside this container, so this must be set (to /repo) whenever
+      # deploy-root is.
+      REPO_ROOT: ${REPO_ROOT:-}
+      # Phase G real compute provisioning — off unless PROVISIONER_COMPUTE_ENABLED
+      # is explicitly passed at `docker compose up` time (see --enable-compute's
+      # help text in __main__.py for the full list this then requires).
+      PROVISIONER_COMPUTE_ENABLED: ${PROVISIONER_COMPUTE_ENABLED:-}
+      PROXMOX_NODE: ${PROXMOX_NODE:-}
+      PROXMOX_STORAGE: ${PROXMOX_STORAGE:-}
+      PROXMOX_BRIDGE: ${PROXMOX_BRIDGE:-}
+      PROXMOX_LXC_TEMPLATE: ${PROXMOX_LXC_TEMPLATE:-}
+      PROXMOX_GATEWAY: ${PROXMOX_GATEWAY:-}
+      PROXMOX_NAMESERVER: ${PROXMOX_NAMESERVER:-}
+      PROXMOX_HOST: ${PROXMOX_HOST:-}
+      PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-}
+      PROXMOX_SSH_KEY: /root/.ssh/id_ed25519_proxmox_hermes
+      RPI_HOST: ${RPI_HOST:-}
+      RPI_SSH_USER: ${RPI_SSH_USER:-}
+      RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
+      PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
+      PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
+      NPM_URL: ${NPM_URL:-}
+      NPM_API_TOKEN: ${NPM_API_TOKEN:-}
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+    # Bind mounts for real provisioning: your kinerary-deploy checkout
+    # (read-write — deploy.sh and the compute adapter both write into it),
+    # this repo (read-only — deploy.sh only ever reads server/site/shared
+    # from it), and your SSH keys (read-only). All three are no-ops for the
+    # queue-observing "run" command; only "provision" (this service's
+    # command) ever touches them, and only once PROVISIONER_COMPUTE_ENABLED/
+    # PROVISIONER_DEPLOY_ROOT above are actually set. Paths match this
+    # developer machine's real checkouts — adjust if yours differ.
+    volumes:
+      - ${WORKER_DEPLOY_ROOT_HOST:-/Users/elul/kinerary-deploy}:/deploy-root
+      - ${WORKER_REPO_ROOT_HOST:-/Users/elul/kinerary}:/repo:ro
+      # Only the two specific keys this needs, not the whole ~/.ssh
+      # directory (which also holds unrelated personal/other-project keys).
+      - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
+      - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_rpi4_hermes:/root/.ssh/id_ed25519_rpi4_hermes:ro
     secrets: [control_plane_database_url]
     healthcheck:
       test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]

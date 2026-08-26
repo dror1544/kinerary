@@ -5,6 +5,7 @@ import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
+import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -128,6 +129,20 @@ if (signup) {
       .finally(() => { dispatching = false; });
   }, OUTBOX_POLL_INTERVAL_MS);
   timer.unref();
+}
+
+// Signup-approval callbacks (the super-admin's Approve/Reject tap) arrive via
+// Telegram long polling, not the /v1/signup/callback webhook route — see
+// telegram-poller.ts's module doc. getUpdates fails while a webhook is still
+// registered for this bot, so clear one if present before the first poll.
+if (signup) {
+  await deleteWebhookIfPresent(signup.botToken, (line) => process.stderr.write(`${line}\n`));
+  startTelegramApprovalPoller({
+    db: pool,
+    botToken: signup.botToken,
+    config: signup.config,
+    log: (line) => process.stderr.write(`${line}\n`),
+  });
 }
 
 await app.listen({ host: profile.public_api.bind_host, port: profile.public_api.port });

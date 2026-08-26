@@ -1,7 +1,10 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 export interface VerifiedTelegramIdentity {
-  provider: "telegram";
+  // "password" is the stopgap web-login path in password-identity.ts — see
+  // its module doc for why /v1/signup and the owner-scoped routes need an
+  // alternative to the Telegram Login Widget.
+  provider: "telegram" | "password";
   /** sha256:hex — used for identity lookups; the raw ID below is never used for comparisons */
   providerSubjectDigest: string;
   /** Raw Telegram numeric ID as a string. Only for sending messages back — never for identity checks (use the digest) or for returning in any API response. */

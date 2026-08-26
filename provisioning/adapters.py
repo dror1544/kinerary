@@ -27,6 +27,16 @@ class SubprocessSshTransport:
     def run(self, command: str) -> str:
         result = subprocess.run(
             ["ssh", "-i", self.identity_file, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+             # These are static, LAN-only, operator-controlled hosts — not
+             # exposed to the internet. A fresh caller (e.g. a freshly built
+             # Docker container, unlike this developer machine's own already
+             # populated known_hosts) has no prior host-key history for them,
+             # and BatchMode=yes refuses rather than prompts on an unknown
+             # host key. accept-new still does the key exchange and pins the
+             # key for the session; it just doesn't require a pre-seeded,
+             # writable known_hosts file (the worker container runs as
+             # `nobody`, which has none).
+             "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=/dev/null",
              "-o", f"ConnectTimeout={self.timeout}", f"{self.user}@{self.host}", command],
             capture_output=True, text=True, timeout=self.timeout + 15,
         )
@@ -95,6 +105,144 @@ class ProxmoxLxcAdapter:
             ]
         )
         self.ssh.run(f"{create_cmd} && pct start {shlex.quote(vmid)}")
+        self._bootstrap_app_environment(vmid, spec)
+
+    def _bootstrap_app_environment(self, vmid: str, spec: LxcSpec) -> None:
+        """Installs everything kinerary-deploy/deploy.sh assumes already
+        exists on the target — nginx, Node, the systemd unit, and a `.env`
+        with a TRIP_DIR matching this trip (deploy.sh refuses to sync onto a
+        container whose TRIP_DIR doesn't match, as a guard against deploying
+        to the wrong box). `pct create` alone only produces a bare Debian
+        template; without this, deploy.sh's first real run on a freshly
+        created container fails outright — found and closed 2026-08-26 while
+        running the first real end-to-end onboarding test against a
+        Phase-G-created container; every earlier real container (CT200-202)
+        had this done by hand.
+
+        Reruns are safe: apt installs are no-ops when already satisfied, and
+        every file this writes is fully overwritten each time, not appended.
+        """
+        trip_slug = spec.nfs_mount_path.rsplit("/", 1)[-1]
+        app_dir = "/opt/kinerary"
+        avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
+        script = f"""#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 30); do pct exec {vmid} -- true 2>/dev/null && break; sleep 2; done
+
+pct exec {vmid} -- bash -s <<'BOOTSTRAP_INNER'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq curl nginx ca-certificates gnupg >/dev/null
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+  apt-get install -y -qq nodejs >/dev/null
+fi
+
+mkdir -p {app_dir}/trips {app_dir}/site
+mkdir -p {avatars_dir}
+ln -sfn {avatars_dir} {app_dir}/site/avatars
+
+if [ ! -f {app_dir}/.env ]; then
+  JWT_SECRET=$(head -c 32 /dev/urandom | base64)
+  cat > {app_dir}/.env <<ENVEOF
+TRIP_DIR={app_dir}/trips/{trip_slug}
+DATA_DIR={spec.nfs_mount_path}/server-data
+PORT=3000
+JWT_SECRET=${{JWT_SECRET}}
+ENVEOF
+fi
+
+cat > /etc/systemd/system/kinerary-server.service <<'UNITEOF'
+[Unit]
+Description=Kinerary Trip Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={app_dir}/server
+EnvironmentFile={app_dir}/.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+cat > /etc/nginx/sites-available/kinerary <<'NGINXEOF'
+server {{
+  listen 8080;
+  server_name _;
+  root {app_dir}/site;
+  index index.html;
+
+  add_header X-Content-Type-Options nosniff;
+  add_header X-Frame-Options DENY;
+  add_header X-XSS-Protection "1; mode=block";
+
+  location ~ ^/api/trivia/(events|public-events) {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Connection '';
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 86400s;
+  }}
+
+  location ^~ /api/ {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 120s;
+    client_max_body_size 500m;
+  }}
+
+  location /photo/ {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }}
+
+  location ~* \\.(html)$ {{
+    add_header Cache-Control "no-cache, must-revalidate";
+    try_files $uri =404;
+  }}
+
+  location /avatars/ {{
+    return 404;
+  }}
+
+  location ^~ /confirmations/ {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }}
+
+  location ~* \\.(md|txt|rtf|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|pkpass)$ {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }}
+
+  location / {{
+    try_files $uri $uri/ =404;
+  }}
+}}
+NGINXEOF
+rm -f /etc/nginx/sites-enabled/default
+ln -sfn /etc/nginx/sites-available/kinerary /etc/nginx/sites-enabled/kinerary
+systemctl daemon-reload
+systemctl enable nginx kinerary-server >/dev/null 2>&1 || true
+systemctl restart nginx
+BOOTSTRAP_INNER
+"""
+        self.ssh.run(script)
 
     def delete(self, spec: LxcSpec) -> None:
         existing = self.inspect(spec)

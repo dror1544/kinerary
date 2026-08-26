@@ -81,8 +81,17 @@ function buildMcpServer() {
     "Start (or resume) an intake interview session by exchanging the organizer's enrollment token. " +
       "Call this once per interview, right after the organizer confirms they're ready to begin. " +
       "Returns sessionId and sessionToken — hold onto both; every later tool call in this conversation needs them.",
-    { enrollmentToken: z.string().describe("The single-use enrollment token from the organizer's deep link") },
-    async ({ enrollmentToken }) => ok(await forward("/v1/interview", "POST", enrollmentToken)),
+    {
+      enrollmentToken: z.string().describe("The single-use enrollment token from the organizer's deep link"),
+      telegramChatId: z.string().optional().describe(
+        "The organizer's own numeric Telegram id, ONLY if you already know it from this conversation's " +
+          "platform context. Used purely as a best-effort hint for where to send the 'your site is ready' " +
+          "notification later — never fabricate or guess a value here; omit the field entirely if you don't " +
+          "have it. This is not an identity check, just a delivery hint.",
+      ),
+    },
+    async ({ enrollmentToken, telegramChatId }) =>
+      ok(await forward("/v1/interview", "POST", enrollmentToken, telegramChatId ? { telegramChatId } : undefined)),
   );
 
   mcp.tool(

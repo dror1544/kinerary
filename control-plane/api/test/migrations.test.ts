@@ -45,6 +45,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0018_release_accepts_intake_schema_v2.sql",
       "0019_telegram_chat_bindings.sql",
       "0020_web_portal.sql",
+      "0021_password_identity.sql",
+      "0022_interview_chat_id_hint.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -71,6 +73,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0018_release_accepts_intake_schema_v2.sql",
       "0019_telegram_chat_bindings.sql",
       "0020_web_portal.sql",
+      "0021_password_identity.sql",
+      "0022_interview_chat_id_hint.sql",
     ]);
   } finally {
     await reset(client);

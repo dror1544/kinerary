@@ -2,8 +2,10 @@ FROM python:3.12-alpine
 WORKDIR /app
 # openssh-client: ComputeAdapter's CloudflareTunnelDnsAdapter shells out to
 # `ssh` to edit the RPi4's locally-managed cloudflared config — not present
-# in the base image by default.
-RUN apk add --no-cache openssh-client
+# in the base image by default. bash: kinerary-deploy/deploy.sh (invoked by
+# ShellDeployAdapter) is a bash script; Alpine's default /bin/sh (busybox
+# ash) doesn't support all of it.
+RUN apk add --no-cache openssh-client bash
 COPY control-plane/worker/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY control-plane/worker/control_plane_worker ./control_plane_worker

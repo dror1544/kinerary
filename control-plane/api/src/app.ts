@@ -8,6 +8,7 @@ import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } fr
 import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
+import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
 import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
 import { structuredLog } from "./redaction.js";
 import {
@@ -116,6 +117,8 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // POST /v1/signup — start or resume the signup approval flow.
   // Body: { telegram: <Telegram Login Widget data>, trip_name_request: string }
+  //    or { password: { email, password }, trip_name_request: string } —
+  //    stopgap path, see password-identity.ts's module doc.
   // Returns: { status, requestId? }
   app.post("/v1/signup", async (request, reply) => {
     if (!dependencies.signup) {
@@ -125,13 +128,16 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
     const body = request.body as Record<string, unknown>;
     const telegramPayload = body?.telegram as Record<string, unknown> | undefined;
+    const passwordPayload = body?.password as Record<string, unknown> | undefined;
     const tripNameRequest = body?.trip_name_request;
 
-    if (!telegramPayload || typeof tripNameRequest !== "string" || tripNameRequest.length < 1 || tripNameRequest.length > 120) {
+    if ((!telegramPayload && !passwordPayload) || typeof tripNameRequest !== "string" || tripNameRequest.length < 1 || tripNameRequest.length > 120) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = telegramPayload
+      ? verifyTelegramLogin(telegramPayload, signup.botToken)
+      : await createOrVerifyPasswordIdentity(signup.db, passwordPayload!);
     if (!loginResult.ok) {
       log(structuredLog("warn", "signup.login_rejected", { safe_error_code: loginResult.error }));
       return reply.code(401).send({ error: loginResult.error });
@@ -236,25 +242,28 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send(result);
   });
 
-  // GET /v1/signup/status — re-authenticate with Telegram to poll status.
-  // Query: ?telegram=<base64url-encoded-json>
+  // GET /v1/signup/status — re-authenticate to poll status.
+  // Query: ?telegram=<base64url-encoded-json> or ?password=<base64url-encoded-json>
   app.get("/v1/signup/status", async (request, reply) => {
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
     }
     const query = request.query as Record<string, unknown>;
     const telegramRaw = query?.telegram;
-    if (typeof telegramRaw !== "string") {
+    const passwordRaw = query?.password;
+    if (typeof telegramRaw !== "string" && typeof passwordRaw !== "string") {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
-    let telegramPayload: Record<string, unknown>;
+    let payload: Record<string, unknown>;
     try {
-      telegramPayload = JSON.parse(Buffer.from(telegramRaw, "base64url").toString()) as Record<string, unknown>;
+      payload = JSON.parse(Buffer.from((telegramRaw ?? passwordRaw) as string, "base64url").toString()) as Record<string, unknown>;
     } catch {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
-    const loginResult = verifyTelegramLogin(telegramPayload, dependencies.signup.botToken);
+    const loginResult = typeof telegramRaw === "string"
+      ? verifyTelegramLogin(payload, dependencies.signup.botToken)
+      : await verifyPasswordLogin(dependencies.signup.db, payload);
     if (!loginResult.ok) {
       return reply.code(401).send({ error: loginResult.error });
     }
@@ -267,7 +276,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   });
 
   // GET /v1/trips/:id — read a trip the authenticated user is a member of.
-  // Header: X-Telegram-Login: <base64url-encoded-json of Telegram login data>
+  // Header: X-Telegram-Login or X-Portal-Password-Login (base64url JSON)
   app.get("/v1/trips/:id", async (request, reply) => {
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
@@ -278,18 +287,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") {
-      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    }
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch {
-      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, dependencies.signup.botToken);
+    const loginResult = await resolveWebAuth(
+      request.headers as Record<string, unknown>, dependencies.signup.db, verifyTelegramLogin, dependencies.signup.botToken,
+    );
     if (!loginResult.ok) {
       return reply.code(401).send({ error: loginResult.error });
     }
@@ -312,7 +312,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // POST /v1/trips/:id/enrollment — issue an enrollment link for the trip owner.
   // The organizer sends this link to the Hermes interviewer to start the interview.
-  // Header: X-Telegram-Login: <base64url-encoded-json>
+  // Header: X-Telegram-Login or X-Portal-Password-Login (base64url JSON)
   app.post("/v1/trips/:id/enrollment", async (request, reply) => {
     if (!dependencies.interview || !dependencies.signup) {
       return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
@@ -322,20 +322,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const tripId = params?.id;
     if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    // Authenticate via Telegram login and resolve the internal user id.
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    // Authenticate and resolve the internal user id.
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     const identityRow = await interview.db.query<{ user_id: string }>(
-      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-      [loginResult.identity.providerSubjectDigest],
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
     );
     const [identity] = identityRow.rows;
     if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
@@ -373,7 +366,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(status).send({ error: check.reason });
     }
 
-    const result = await startSession(dependencies.interview.db, rawToken, log);
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const telegramChatId = typeof body.telegramChatId === "string" ? body.telegramChatId : undefined;
+    const result = await startSession(dependencies.interview.db, rawToken, log, telegramChatId);
     if (!result.ok) {
       return reply.code(result.reason === "TRIP_NOT_DRAFT" ? 409 : 401).send({ error: result.reason });
     }
@@ -530,19 +525,12 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const sessionId = params?.sessionId;
     if (typeof sessionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     const identityRow = await interview.db.query<{ user_id: string }>(
-      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-      [loginResult.identity.providerSubjectDigest],
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
     );
     const [identity] = identityRow.rows;
     if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
@@ -566,14 +554,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
     }
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, dependencies.signup.botToken);
+    const loginResult = await resolveWebAuth(
+      request.headers as Record<string, unknown>, dependencies.signup.db, verifyTelegramLogin, dependencies.signup.botToken,
+    );
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     const releases = await listAvailableReleases(dependencies.planner.db);
@@ -592,20 +575,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const tripId = params?.id;
     if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     // Verify the caller is an owner of this trip.
     const identityRow = await interview.db.query<{ user_id: string }>(
-      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-      [loginResult.identity.providerSubjectDigest],
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
     );
     const identity = identityRow.rows[0];
     if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
@@ -646,20 +622,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const planId = params?.planId;
     if (typeof planId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     // Resolve caller's user_id.
     const identityRow = await interview.db.query<{ user_id: string }>(
-      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-      [loginResult.identity.providerSubjectDigest],
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
     );
     const identity = identityRow.rows[0];
     if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
@@ -705,19 +674,12 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const planId = params?.planId;
     if (typeof planId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch { return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" }); }
-
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
 
     const identityRow = await interview.db.query<{ user_id: string }>(
-      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'telegram' AND provider_subject_digest = $1",
-      [loginResult.identity.providerSubjectDigest],
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
     );
     const identity = identityRow.rows[0];
     if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
@@ -770,17 +732,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
     // Authenticate the caller.
-    const loginHeader = (request.headers as Record<string, unknown>)["x-telegram-login"];
-    if (typeof loginHeader !== "string") {
-      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    }
-    let telegramPayload: Record<string, unknown>;
-    try {
-      telegramPayload = JSON.parse(Buffer.from(loginHeader, "base64url").toString()) as Record<string, unknown>;
-    } catch {
-      return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
-    }
-    const loginResult = verifyTelegramLogin(telegramPayload, signup.botToken);
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
     if (!loginResult.ok) {
       return reply.code(401).send({ error: loginResult.error });
     }

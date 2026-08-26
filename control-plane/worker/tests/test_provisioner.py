@@ -357,6 +357,38 @@ class ChatIdRecipientTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["recipient"], self.chat_id)
 
+    def test_complete_falls_back_to_the_interview_chat_id_hint_when_no_verified_identity(self) -> None:
+        # No _add_owner_telegram_identity() call — the owner has no verified
+        # Telegram identity on file (e.g. today's password-signup stopgap),
+        # only migration 0022's best-effort hint captured at interview start.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = %s WHERE id = %s",
+            (self.chat_id, self.fix["trip_id"]),
+        )
+        self.conn.commit()
+        worker = ProvisionerWorker(db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-chatid-hint")
+        worker.run_once()
+        row = self.conn.execute(
+            "SELECT recipient FROM control_plane.notification_outbox WHERE trip_id = %s AND kind = 'provisioning_complete'",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(row["recipient"], self.chat_id)
+
+    def test_complete_prefers_verified_identity_over_the_hint(self) -> None:
+        self._add_owner_telegram_identity()
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = %s WHERE id = %s",
+            ("999999999", self.fix["trip_id"]),
+        )
+        self.conn.commit()
+        worker = ProvisionerWorker(db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-chatid-pref")
+        worker.run_once()
+        row = self.conn.execute(
+            "SELECT recipient FROM control_plane.notification_outbox WHERE trip_id = %s AND kind = 'provisioning_complete'",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(row["recipient"], self.chat_id)
+
 
 # Answers organizer_identity/bot_name/bot_gender/bot_tone/dietary — enough for
 # transform_intake() to produce an `agent` block, so build_companion_handoff()

@@ -504,11 +504,19 @@ export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
   | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
 
+// A private Telegram chat id is always a positive integer in string form —
+// reject anything else rather than storing whatever an LLM tool-call
+// argument happened to contain (see migration 0022's header on why this
+// value is a best-effort hint, never treated as verified identity).
+const TELEGRAM_CHAT_ID_HINT_PATTERN = /^\d{1,20}$/;
+
 /**
  * Exchanges a valid enrollment token for a session, atomically:
  *   1. Verifies and consumes the enrollment (FOR UPDATE lock)
  *   2. Transitions the trip from 'draft' → 'intake_in_progress'
  *   3. Creates the intake_sessions row with a fresh session token
+ *   4. Records telegramChatIdHint (if present and well-formed) as the
+ *      trip's best-effort notification delivery hint — see migration 0022.
  *
  * Returns the session ID and raw session token. The raw token is not stored —
  * only its SHA-256 digest is. Subsequent session API calls must present this
@@ -518,6 +526,7 @@ export async function startSession(
   db: pg.Pool,
   rawEnrollmentToken: string,
   log: (line: string) => void = () => {},
+  telegramChatIdHint?: string,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -546,6 +555,13 @@ export async function startSession(
       "UPDATE control_plane.trips SET lifecycle_state = 'intake_in_progress', updated_at = now() WHERE id = $1",
       [enrollment.tripId],
     );
+
+    if (telegramChatIdHint && TELEGRAM_CHAT_ID_HINT_PATTERN.test(telegramChatIdHint)) {
+      await client.query(
+        "UPDATE control_plane.trips SET notification_chat_id_hint = $1 WHERE id = $2 AND notification_chat_id_hint IS DISTINCT FROM $1",
+        [telegramChatIdHint, enrollment.tripId],
+      );
+    }
 
     // Create session with a fresh token.
     const rawSessionToken = randomBytes(32).toString("base64url");

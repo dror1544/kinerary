@@ -97,6 +97,8 @@ class FakeProxmoxSsh:
             return ""
         if command.startswith("pct stop "):
             return ""
+        if command.startswith("#!/bin/bash") and "BOOTSTRAP_INNER" in command:
+            return ""
         raise AssertionError(f"FakeProxmoxSsh got an unexpected command: {command!r}")
 
 
@@ -137,6 +139,17 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("--nameserver 192.168.0.41", create_and_start)
         self.assertIn("--mp0 /mnt/pve/truenas-nfs/tokyo-2026,mp=/nfs/tokyo-2026", create_and_start)
         self.assertIn("&& pct start 203", create_and_start)
+
+        # deploy.sh assumes nginx/Node/the systemd unit/.env already exist —
+        # bootstrap installs them so a freshly created container isn't dead
+        # on arrival at the first real deploy.
+        bootstrap = ssh.commands[3]
+        self.assertIn("pct exec 203 -- bash -s", bootstrap)
+        self.assertIn("TRIP_DIR=/opt/kinerary/trips/tokyo-2026", bootstrap)
+        self.assertIn("DATA_DIR=/nfs/tokyo-2026/server-data", bootstrap)
+        self.assertIn("ln -sfn /nfs/tokyo-2026/media/avatars /opt/kinerary/site/avatars", bootstrap)
+        self.assertIn("listen 8080", bootstrap)
+        self.assertIn("systemctl enable nginx kinerary-server", bootstrap)
 
     def test_proxmox_delete_stops_and_destroys_when_found(self) -> None:
         ssh = FakeProxmoxSsh()

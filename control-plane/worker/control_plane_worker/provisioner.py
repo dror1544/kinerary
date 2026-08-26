@@ -414,14 +414,19 @@ class ProvisionerWorker:
                 # sendable Telegram chat id when one is on file (added in
                 # migration 0017 — provider_subject_id, never the identity
                 # digest) so the API's outbox dispatcher can actually deliver
-                # this; NULL if no telegram identity is on file yet, which the
-                # dispatcher treats as unsendable and marks 'skipped' rather
-                # than retrying forever.
+                # this. Falls back to trips.notification_chat_id_hint
+                # (migration 0022 — an UNVERIFIED, best-effort id captured at
+                # interview start, for organizers who signed up via a
+                # non-Telegram identity such as the password stopgap) only
+                # when no verified identity is on file; NULL if neither is
+                # present, which the dispatcher treats as unsendable and marks
+                # 'skipped' rather than retrying forever.
                 cur.execute(
                     """
-                    SELECT ui.provider_subject_id
+                    SELECT ui.provider_subject_id, t.notification_chat_id_hint
                     FROM control_plane.trip_memberships tm
-                    JOIN control_plane.user_identities ui
+                    JOIN control_plane.trips t ON t.id = tm.trip_id
+                    LEFT JOIN control_plane.user_identities ui
                       ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
                     WHERE tm.trip_id = %s AND tm.role = 'owner' AND tm.status = 'active'
                     LIMIT 1
@@ -429,7 +434,10 @@ class ProvisionerWorker:
                     (trip_id,),
                 )
                 owner_row = cur.fetchone()
-                recipient_chat_id = owner_row["provider_subject_id"] if owner_row else None
+                recipient_chat_id = (
+                    (owner_row["provider_subject_id"] or owner_row["notification_chat_id_hint"])
+                    if owner_row else None
+                )
 
                 notif_payload = json.dumps({"private_url": private_url})
                 cur.execute(
@@ -564,16 +572,18 @@ class ProvisionerWorker:
                         (plan_id,),
                     )
 
-                    # Enqueue failure notification. Same real-chat-id lookup as
+                    # Enqueue failure notification. Same real-chat-id lookup
+                    # (with the same notification_chat_id_hint fallback) as
                     # _complete — see its comment for why 'organizer' (a role
                     # string, not an address) was never actually deliverable.
                     cur.execute(
                         """
-                        SELECT ui.provider_subject_id
+                        SELECT ui.provider_subject_id, t.notification_chat_id_hint
                         FROM control_plane.jobs j
                         JOIN control_plane.trip_memberships tm
                           ON tm.trip_id = j.trip_id AND tm.role = 'owner' AND tm.status = 'active'
-                        JOIN control_plane.user_identities ui
+                        JOIN control_plane.trips t ON t.id = j.trip_id
+                        LEFT JOIN control_plane.user_identities ui
                           ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
                         WHERE j.id = %s
                         LIMIT 1
@@ -581,7 +591,10 @@ class ProvisionerWorker:
                         (job_id,),
                     )
                     owner_row = cur.fetchone()
-                    recipient_chat_id = owner_row["provider_subject_id"] if owner_row else None
+                    recipient_chat_id = (
+                        (owner_row["provider_subject_id"] or owner_row["notification_chat_id_hint"])
+                        if owner_row else None
+                    )
 
                     notif_payload = json.dumps({"safe_error_code": error_code})
                     cur.execute(

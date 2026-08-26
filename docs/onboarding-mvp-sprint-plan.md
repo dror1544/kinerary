@@ -542,6 +542,20 @@ Build:
 - Keep intake, organizer-private and group-chat sessions/policies separate.
   Add the private owner-only Super Bot for redacted alerts and narrow
   plan/approve/execute operations. Dedicated-bot support remains optional.
+- **Known gap, surfaced during the Phase H live acceptance test (2026-08-26):**
+  fold the standalone `trip-intake` interviewer profile into the same shared
+  Trip Bot router this sprint already builds, instead of it staying a
+  separate bot/profile. Route an inbound chat to interviewer mode whenever
+  its chat ID isn't yet bound to a trip (`telegram_chat_bindings` — migration
+  0019); once bound, route to that trip's companion as normal. The companion
+  profile for an *existing* organizer must also be able to re-enter interview
+  mode when they start a new trip, rather than requiring a second bot/profile
+  for every additional trip. Until this lands, an organizer's real Telegram
+  chat id for notification delivery can only be captured verified-server-side
+  at `/v1/signup` itself (Telegram Login Widget) — the interview conversation
+  has no reliable, server-verified way to learn its own chat id, so
+  `interview.ts`'s `telegramChatIdHint` (migration 0022) is necessarily an
+  LLM-relayed, unverified value in the meantime, not a substitute for this.
 
 Automated tests:
 

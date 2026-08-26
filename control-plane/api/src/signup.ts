@@ -71,10 +71,13 @@ export async function startSignup(
   try {
     await client.query("BEGIN");
 
-    // 1. Resolve or create the system user for this Telegram identity
+    // 1. Resolve or create the system user for this identity. Provider is
+    // whatever identity.ts/password-identity.ts already verified it as
+    // (telegram or the stopgap password login) — this function doesn't
+    // re-decide trust, only persists what was already proven.
     const identityRow = await client.query<{ user_id: string }>(
       "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
-      ["telegram", identity.providerSubjectDigest],
+      [identity.provider, identity.providerSubjectDigest],
     );
     let userId: string;
     const [existingIdentity] = identityRow.rows;
@@ -86,8 +89,8 @@ export async function startSignup(
       // NULL forever without this, leaving provisioner.py's completion
       // notification with no chat id to send to.
       await client.query(
-        "UPDATE control_plane.user_identities SET provider_subject_id = $1 WHERE provider = 'telegram' AND provider_subject_digest = $2 AND provider_subject_id IS DISTINCT FROM $1",
-        [identity.providerSubjectId, identity.providerSubjectDigest],
+        "UPDATE control_plane.user_identities SET provider_subject_id = $1 WHERE provider = $2 AND provider_subject_digest = $3 AND provider_subject_id IS DISTINCT FROM $1",
+        [identity.providerSubjectId, identity.provider, identity.providerSubjectDigest],
       );
     } else {
       userId = generateId("user");
@@ -96,8 +99,8 @@ export async function startSignup(
         [userId, identity.displayName],
       );
       await client.query(
-        "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at) VALUES ($1, $2, 'telegram', $3, $4, now())",
-        [generateId("idnt"), userId, identity.providerSubjectDigest, identity.providerSubjectId],
+        "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at) VALUES ($1, $2, $3, $4, $5, now())",
+        [generateId("idnt"), userId, identity.provider, identity.providerSubjectDigest, identity.providerSubjectId],
       );
     }
 
