@@ -1315,6 +1315,26 @@ describe('Control-plane runtime exchange', () => {
     assert.equal(config.status, 200);
   });
 
+  test('rejects an owner exchange when no organizer can be mapped', async () => {
+    const exchanged = await api('/api/internal/control-plane/session', {
+      method: 'POST', apiKey: 'test-control-plane-exchange-key',
+      body: { userId: 'user_private', role: 'owner', runtimeUsername: 'missing-user' },
+    });
+    assert.equal(exchanged.status, 404);
+    assert.deepEqual(await exchanged.json(), { error: 'runtime_participant_not_found' });
+  });
+
+  test('reports whether an invite runtime participant exists', async () => {
+    const known = await api('/api/internal/control-plane/participants/bob', {
+      method: 'GET', apiKey: 'test-control-plane-exchange-key',
+    });
+    assert.equal(known.status, 200);
+    const missing = await api('/api/internal/control-plane/participants/missing-user', {
+      method: 'GET', apiKey: 'test-control-plane-exchange-key',
+    });
+    assert.equal(missing.status, 404);
+  });
+
   test('password participant enrollment is invite-bound and idempotent', async () => {
     const payload = {
       inviteId: 'invite_runtimeexchange1', runtimeUsername: 'bob', method: 'password', password: 'new-bob-password',

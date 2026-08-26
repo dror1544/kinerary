@@ -76,9 +76,13 @@ services:
     build:
       context: ../..
       dockerfile: control-plane/worker/Dockerfile
-    command: ["python", "-m", "control_plane_worker", "run", "--poll-seconds", "10"]
+    command: ["python", "-m", "control_plane_worker", "provision", "--poll-seconds", "10"]
     environment:
       CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+      PROVISIONER_DEPLOY_ROOT: /deploy
+      PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-{}}
+    volumes:
+      - ${PROVISIONER_DEPLOY_ROOT:?set PROVISIONER_DEPLOY_ROOT to your kinerary-deploy checkout}:/deploy
     secrets: [control_plane_database_url]
     healthcheck:
       test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]

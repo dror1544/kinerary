@@ -211,7 +211,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "text",
     prompt: "Which of the travelers are you? (this sets up your private organizer channel with the trip assistant)",
     maxLength: 80,
-    required: false,
+    required: true,
   },
   {
     id: "bot_name",
@@ -502,7 +502,25 @@ export type SubmitAnswerResult =
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "ORGANIZER_IDENTITY_UNMATCHED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+
+function answerText(answer: IntakeAnswer | undefined): string {
+  return answer?.kind === "text" ? answer.text.trim() : "";
+}
+
+function organizerIdentityMatchesTraveler(answers: AnswerStore): boolean {
+  const organizer = answerText(answers.organizer_identity).toLocaleLowerCase();
+  const travelers = answers.travelers;
+  if (!organizer || travelers?.kind !== "structured" || !Array.isArray(travelers.data)) return false;
+  return travelers.data.some((traveler) => {
+    if (!traveler || typeof traveler !== "object") return false;
+    const value = traveler as Record<string, unknown>;
+    return ["name", "name_en", "username"].some((key) => {
+      const candidate = value[key];
+      return typeof candidate === "string" && candidate.trim().toLocaleLowerCase() === organizer;
+    });
+  });
+}
 
 /**
  * Exchanges a valid enrollment token for a session, atomically:
@@ -768,6 +786,10 @@ export async function confirmIntake(
     if (!allAnswered) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_ALL_REQUIRED_ANSWERED" };
+    }
+    if (!organizerIdentityMatchesTraveler(session.answers)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "ORGANIZER_IDENTITY_UNMATCHED" };
     }
 
     // Answers are organizer-controlled free-form content (free text, "other"

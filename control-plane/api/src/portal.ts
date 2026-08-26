@@ -1,4 +1,5 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type pg from "pg";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
@@ -18,10 +19,26 @@ function base64url(bytes = 32): string {
   return randomBytes(bytes).toString("base64url");
 }
 
+const scrypt = promisify(scryptCallback);
+
 function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function hashPortalPassword(password: string): Promise<string> {
+  const salt = base64url(16);
+  const derived = await scrypt(password, salt, 32) as Buffer;
+  return `scrypt:${salt}:${derived.toString("base64url")}`;
+}
+
+async function verifyPortalPassword(password: string, stored: string): Promise<boolean> {
+  const [scheme, salt, digest, extra] = stored.split(":");
+  if (scheme !== "scrypt" || !salt || !digest || extra) return false;
+  const derived = await scrypt(password, salt, 32) as Buffer;
+  const expected = Buffer.from(digest, "base64url");
+  return derived.length === expected.length && timingSafeEqual(derived, expected);
 }
 
 function parseCookies(header: unknown): Record<string, string> {
@@ -97,6 +114,10 @@ export class GoogleOidcClient implements GoogleOidcAdapter {
 }
 
 export interface RuntimeAccountAdapter {
+  participantExists(input: {
+    tripId: string;
+    runtimeUsername: string;
+  }): Promise<boolean>;
   provisionParticipant(input: {
     tripId: string;
     inviteId: string;
@@ -110,6 +131,16 @@ export interface RuntimeAccountAdapter {
 
 export class HttpRuntimeAccountAdapter implements RuntimeAccountAdapter {
   constructor(private readonly runtimeOrigin: string, private readonly apiKey: string) {}
+
+  async participantExists(input: { tripId: string; runtimeUsername: string }): Promise<boolean> {
+    const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants/${encodeURIComponent(input.runtimeUsername)}`, {
+      method: "GET",
+      headers: { "x-api-key": this.apiKey },
+    });
+    if (response.status === 404) return false;
+    if (!response.ok) throw new Error("RUNTIME_PARTICIPANT_LOOKUP_FAILED");
+    return true;
+  }
 
   async provisionParticipant(input: Parameters<RuntimeAccountAdapter["provisionParticipant"]>[0]): Promise<void> {
     const response = await fetch(`${this.runtimeOrigin}/internal/t/${encodeURIComponent(input.tripId)}/participants`, {
@@ -364,6 +395,39 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     }
   });
 
+  app.post("/v1/auth/password", async (request, reply) => {
+    const body = request.body as Record<string, unknown>;
+    const tripId = typeof body.tripId === "string" ? body.tripId : "";
+    const runtimeUsername = typeof body.runtimeUsername === "string" ? body.runtimeUsername.toLowerCase().trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId) || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername) || password.length < 8 || password.length > 128) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const result = await deps.db.query<{ user_id: string; password_hash: string }>(
+      `SELECT c.user_id, c.password_hash
+       FROM control_plane.web_password_credentials c
+       JOIN control_plane.users u ON u.id = c.user_id AND u.status = 'active'
+       WHERE c.trip_id = $1 AND c.runtime_username = $2`,
+      [tripId, runtimeUsername],
+    );
+    const credential = result.rows[0];
+    if (!credential || !(await verifyPortalPassword(password, credential.password_hash))) {
+      return reply.code(401).send({ error: "INVALID_CREDENTIALS" });
+    }
+    const client = await deps.db.connect();
+    try {
+      await client.query("BEGIN");
+      const session = await createWebSession(client, credential.user_id, deps.sessionTtlSeconds);
+      await client.query("COMMIT");
+      setWebSessionCookies(reply, deps, session);
+      const appPath = typeof body.returnTo === "string" ? validatedReturnTo(body.returnTo) : `/trips/${tripId}/app`;
+      return { appPath };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  });
+
   app.get("/v1/me", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
@@ -556,6 +620,13 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const displayName = typeof body.displayName === "string" ? body.displayName.trim().slice(0, 120) : "";
     const runtimeUsername = typeof body.runtimeUsername === "string" ? body.runtimeUsername.toLowerCase().trim() : "";
     if (!displayName || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    let participantExists = false;
+    try {
+      participantExists = await deps.runtimeAccounts.participantExists({ tripId, runtimeUsername });
+    } catch {
+      return reply.code(409).send({ error: "RUNTIME_NOT_READY" });
+    }
+    if (!participantExists) return reply.code(409).send({ error: "RUNTIME_PARTICIPANT_NOT_FOUND" });
     const token = base64url(32);
     const inviteId = opaque("invite");
     await deps.db.query(
@@ -598,9 +669,15 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const method = body.method;
     if (typeof token !== "string" || (method !== "google" && method !== "password")) return reply.code(400).send({ error: "INVALID_REQUEST" });
     const signedIn = await portalUser(request, deps);
-    if (method === "google" && !signedIn) return reply.code(401).send({ error: "GOOGLE_SIGN_IN_REQUIRED" });
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
+    const runtimeCredential: { googleSubjectDigest?: string; password?: string } = {};
+    if (method === "google") {
+      if (!signedIn?.googleSubjectDigest) return reply.code(401).send({ error: "GOOGLE_SIGN_IN_REQUIRED" });
+      runtimeCredential.googleSubjectDigest = signedIn.googleSubjectDigest;
+    } else {
+      runtimeCredential.password = password;
+    }
     const invites = await deps.db.query<{
       id: string; trip_id: string; intended_display_name: string; runtime_username: string; state: string; expires_at: Date;
     }>("SELECT id, trip_id, intended_display_name, runtime_username, state, expires_at FROM control_plane.site_invites WHERE token_digest = $1", [sha256(token)]);
@@ -611,6 +688,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       return reply.code(410).send({ error: "INVITE_EXPIRED" });
     }
     const userId = signedIn?.id ?? opaque("user");
+    const portalPasswordHash = method === "password" && password ? await hashPortalPassword(password) : null;
     let passwordSession: { sessionToken: string; csrf: string } | null = null;
     const client = await deps.db.connect();
     try {
@@ -623,8 +701,17 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       // aborts, the same raw invite may safely retry the runtime enrollment.
       await deps.runtimeAccounts.provisionParticipant({
         tripId: invite.trip_id, inviteId: invite.id, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
-        method, ...(signedIn?.googleSubjectDigest ? { googleSubjectDigest: signedIn.googleSubjectDigest } : { password }),
+        method, ...runtimeCredential,
       });
+      if (portalPasswordHash) {
+        await client.query(
+          `INSERT INTO control_plane.web_password_credentials(user_id, trip_id, runtime_username, password_hash)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (user_id, trip_id) DO UPDATE
+             SET runtime_username = EXCLUDED.runtime_username, password_hash = EXCLUDED.password_hash, updated_at = now()`,
+          [userId, invite.trip_id, invite.runtime_username, portalPasswordHash],
+        );
+      }
       await client.query(
         `INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status, dashboard_access, runtime_access)
          VALUES ($1, $2, $3, 'member', 'active', false, true)

@@ -73,6 +73,10 @@ export function signIn(returnTo: string) {
   window.location.assign(`/v1/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);
 }
 
+export function passwordSignIn(input: { tripId: string; runtimeUsername: string; password: string; returnTo: string }) {
+  return api<{ appPath: string }>("/v1/auth/password", { method: "POST", body: JSON.stringify(input) });
+}
+
 export const getMe = () => api<unknown>("/v1/me").then((value) => meSchema.parse(value));
 export const getTrips = () => api<unknown>("/v1/trips").then((value) => z.object({ trips: z.array(tripSchema) }).parse(value));
 export const getTrip = (id: string) => api<unknown>(`/v1/trips/${encodeURIComponent(id)}`).then((value) => tripSchema.parse(value));

@@ -30,7 +30,7 @@ function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
     google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused" }) },
-    runtimeAccounts: { provisionParticipant: async () => {} },
+    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async () => {} },
     publicOrigin: "http://portal.example.test", runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, provisioningAdminSubjectDigests: new Set(),
@@ -65,6 +65,7 @@ before(async () => {
 after(async () => {
   if (skip) return;
   await pool.query("DELETE FROM control_plane.runtime_launch_grants WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.web_password_credentials WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.site_invites WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
@@ -92,6 +93,8 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
 
     const noCsrf = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`, headers: { cookie: owner.cookie }, payload: { displayName: "Guest", runtimeUsername: "guest-user" } });
     assert.equal(noCsrf.statusCode, 403);
+    const unknownRuntimeUser = await app.inject({ method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`, headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf }, payload: { displayName: "Missing", runtimeUsername: "missing-user" } });
+    assert.equal(unknownRuntimeUser.statusCode, 409);
 
     const memberTrips = await app.inject({ method: "GET", url: "/v1/trips", headers: { cookie: member.cookie } });
     assert.deepEqual(memberTrips.json().trips, []);
@@ -141,5 +144,17 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
       headers: { cookie: limitedCookie, "x-csrf-token": csrf },
     });
     assert.equal(limitedLaunch.statusCode, 200);
+
+    const passwordLogin = await app.inject({
+      method: "POST", url: "/v1/auth/password",
+      payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "password-guest-secret", returnTo: `/trips/${ids.ownedTrip}/app` },
+    });
+    assert.equal(passwordLogin.statusCode, 200);
+    assert.equal(passwordLogin.json().appPath, `/trips/${ids.ownedTrip}/app`);
+    const badPassword = await app.inject({
+      method: "POST", url: "/v1/auth/password",
+      payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "wrong-secret" },
+    });
+    assert.equal(badPassword.statusCode, 401);
   } finally { await app.close(); }
 });

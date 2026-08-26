@@ -35,7 +35,7 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
   const portal = {
     db: {} as PortalDependencies["db"],
     google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "sub", displayName: "Name" }) },
-    runtimeAccounts: { provisionParticipant: async () => {} },
+    runtimeAccounts: { participantExists: async () => true, provisionParticipant: async () => {} },
     publicOrigin: profile.web!.public_origin,
     runtimeOrigin: profile.web!.runtime_origin,
     runtimeExchangeKey: "exchange-key",

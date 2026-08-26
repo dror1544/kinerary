@@ -19,6 +19,11 @@ before(async () => {
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ token: "runtime-jwt" }));
     }
+    if (req.url === "/api/internal/control-plane/participants/bob") {
+      assert.equal(req.headers["x-api-key"], "exchange-key");
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ ok: true, username: "bob" }));
+    }
     proxiedAuthorization = req.headers.authorization;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ path: req.url }));
@@ -78,4 +83,10 @@ test("consumes a trip-bound grant once and proxies with the runtime session", as
 test("rejects trip paths without a valid gateway session", async () => {
   const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/config`);
   assert.equal(response.status, 401);
+});
+
+test("forwards internal participant existence checks", async () => {
+  const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/bob`, { headers: { "x-api-key": "exchange-key" } });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, username: "bob" });
 });

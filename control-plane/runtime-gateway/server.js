@@ -112,11 +112,25 @@ async function launch(req, res, tripId) {
 
 async function provisionParticipant(req, res, tripId) {
   if (req.headers["x-api-key"] !== EXCHANGE_KEY) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
   const route = await routeFor(tripId);
   const body = await readJson(req);
   if (body.tripId !== tripId) return json(res, 400, { error: "INVALID_REQUEST" });
   const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY }, body: JSON.stringify(body),
+  });
+  const payload = await response.text();
+  res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
+  res.end(payload);
+}
+
+async function participantExists(req, res, tripId, runtimeUsername) {
+  if (req.headers["x-api-key"] !== EXCHANGE_KEY) return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });
+  if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
+  const route = await routeFor(tripId);
+  const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
+    method: "GET", headers: { "x-api-key": EXCHANGE_KEY },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -149,6 +163,8 @@ export function createRuntimeGateway() {
       if (url.pathname === "/health") return json(res, 200, { ok: true });
       const internal = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants$/);
       if (internal && req.method === "POST") return await provisionParticipant(req, res, decodeURIComponent(internal[1]));
+      const internalParticipant = url.pathname.match(/^\/internal\/t\/([^/]+)\/participants\/([^/]+)$/);
+      if (internalParticipant && req.method === "GET") return await participantExists(req, res, decodeURIComponent(internalParticipant[1]), decodeURIComponent(internalParticipant[2]));
       const match = url.pathname.match(/^\/t\/([^/]+)(\/.*)?$/);
       if (!match) return json(res, 404, { error: "NOT_FOUND" });
       const tripId = decodeURIComponent(match[1]);

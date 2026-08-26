@@ -4,7 +4,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { z } from "zod";
-import { api, getMe, getTrip, getTrips, signIn, type TripSummary } from "../api";
+import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, type TripSummary } from "../api";
 import { Brand } from "../components/Brand";
 
 export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join" | "ops";
@@ -16,8 +16,15 @@ export default function ProductApp({ view }: { view: ProductView }) {
 }
 
 function SignIn() {
+  const navigate = useNavigate();
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   const returnTo = new URLSearchParams(useLocation().search).get("return_to") || "/trips";
+  const tripId = returnTo.match(/^\/trips\/(trip_[A-Za-z0-9]{8,64})(?:\/app)?/)?.[1] ?? "";
+  const passwordForm = useForm<{ runtimeUsername: string; password: string }>({ defaultValues: { runtimeUsername: "", password: "" } });
+  const passwordLogin = useMutation({
+    mutationFn: (values: { runtimeUsername: string; password: string }) => passwordSignIn({ tripId, returnTo, ...values }),
+    onSuccess: ({ appPath }) => navigate(appPath),
+  });
   if (me.data) return <Navigate replace to={returnTo.startsWith("/") ? returnTo : "/trips"} />;
   return (
     <div className="product-shell">
@@ -27,6 +34,12 @@ function SignIn() {
         <h1>Sign in to continue</h1>
         <p>Use Google to create trips, follow setup, and invite the people traveling with you. Telegram is only used for the planning interview.</p>
         <button className="button wide" onClick={() => signIn(returnTo)}>Continue with Google</button>
+        {tripId && <form className="compact-form" onSubmit={passwordForm.handleSubmit((value) => passwordLogin.mutate(value))}>
+          <label>Trip username<input required pattern="[a-z0-9][a-z0-9._-]{1,63}" autoComplete="username" {...passwordForm.register("runtimeUsername")} /></label>
+          <label>Password<input required minLength={8} type="password" autoComplete="current-password" {...passwordForm.register("password")} /></label>
+          <button className="button wide" disabled={passwordLogin.isPending}>{passwordLogin.isPending ? "Signing in…" : "Continue with trip password"}</button>
+          {passwordLogin.isError && <Notice>{passwordLogin.error.message}</Notice>}
+        </form>}
         {me.isError && <p className="subtle">Your session is not active yet.</p>}
       </main>
     </div>

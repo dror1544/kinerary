@@ -690,6 +690,16 @@ app.post('/api/internal/control-plane/session', controlPlaneExchangeRequired, (r
   res.json({ token: jwt.sign({ username }, JWT_SECRET, { expiresIn: '12h' }) });
 });
 
+app.get('/api/internal/control-plane/participants/:username', controlPlaneExchangeRequired, (req, res) => {
+  const runtimeUsername = typeof req.params?.username === 'string' ? req.params.username : '';
+  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return res.status(400).json({ error: 'invalid_request' });
+  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(runtimeUsername)) {
+    return res.status(404).json({ error: 'runtime_participant_not_found' });
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, username: runtimeUsername });
+});
+
 // Idempotent by invite_id: a retry after an uncertain network response never
 // rotates credentials twice or enrolls a different runtime participant.
 app.post('/api/internal/control-plane/participants', controlPlaneExchangeRequired, async (req, res) => {
