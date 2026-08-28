@@ -1,6 +1,7 @@
 """Provider adapters. Transport is injected so tests never contact infrastructure."""
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import time
@@ -21,8 +22,18 @@ class SubprocessSshTransport:
     (reads /etc/cloudflared/config.yml), confirmed by direct inspection
     (2026-08-25), so there is no API to push its ingress config through."""
 
-    def __init__(self, host: str, user: str, identity_file: str, timeout: int = 20) -> None:
+    def __init__(
+        self, host: str, user: str, identity_file: str,
+        timeout: int = 20, command_timeout: int = 900,
+    ) -> None:
         self.host, self.user, self.identity_file, self.timeout = host, user, identity_file, timeout
+        # Deliberately separate from `timeout`. That one bounds establishing the
+        # connection, where 20s already means the host is unreachable. This one
+        # bounds how long the remote command may RUN, and the bootstrap installs
+        # build-essential and a Node toolchain over apt — minutes, not seconds.
+        # Sharing one number (previously `timeout + 15` = 35s) killed every real
+        # container bootstrap partway through apt on 2026-08-28.
+        self.command_timeout = command_timeout
 
     def run(self, command: str) -> str:
         result = subprocess.run(
@@ -38,11 +49,28 @@ class SubprocessSshTransport:
              # `nobody`, which has none).
              "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=/dev/null",
              "-o", f"ConnectTimeout={self.timeout}", f"{self.user}@{self.host}", command],
-            capture_output=True, text=True, timeout=self.timeout + 15,
+            capture_output=True, text=True, timeout=self.command_timeout,
         )
         if result.returncode != 0:
-            raise RuntimeError(f"ssh command failed (exit {result.returncode}): {result.stderr[:500]}")
+            raise RuntimeError(
+                f"ssh command failed (exit {result.returncode}): {_truncate_middle(result.stderr)}"
+            )
         return result.stdout
+
+
+def _truncate_middle(text: str, head: int = 400, tail: int = 600) -> str:
+    """Keep both ends of a failed command's stderr.
+
+    Head-only truncation loses the actual error whenever a script emits
+    warnings before failing: a bootstrap run on 2026-08-28 reported nothing but
+    locale warnings from apt/perl while the real cause — an EACCES several
+    hundred characters later — fell outside the window. The tail is where the
+    failing command's own message lives, so it is the half worth guaranteeing.
+    """
+    text = text.strip()
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[...{len(text) - head - tail} chars omitted...]\n{text[-tail:]}"
 
 
 class JsonTransport(Protocol):
@@ -68,8 +96,20 @@ class ProxmoxLxcAdapter:
     plain `mkdir`, not a separate TrueNAS-side provisioning step.
     """
 
-    def __init__(self, ssh: SshTransport) -> None:
+    def __init__(self, ssh: SshTransport, seed_password: str = "", reset_data: bool = False) -> None:
         self.ssh = ssh
+        # Optional shared onboarding password for the new site's participants.
+        # Deliberately NOT part of LxcSpec/Topology: those are serialized to
+        # kinerary-deploy/trips/<slug>/topology.yaml, which is a tracked file in
+        # a git repository — a secret must not travel that way. Empty keeps
+        # server.js's safe default (independent random per-user passwords).
+        self._seed_password = seed_password
+        # When true, create() wipes the trip's NFS data dir (SQLite DB + media)
+        # before anything else. The control plane sets this only for a first
+        # provision — a container teardown leaves that dir intact, so a failed
+        # earlier attempt can leave a stale users table that server.js will not
+        # re-seed over. Never set on a redeploy of a live trip.
+        self._reset_data = reset_data
 
     def inspect(self, spec: LxcSpec) -> dict[str, Any] | None:
         output = self.ssh.run("pct list")
@@ -80,6 +120,8 @@ class ProxmoxLxcAdapter:
         return None
 
     def create(self, spec: LxcSpec) -> None:
+        if self._reset_data:
+            self._reset_trip_data(spec.nfs_host_dir)
         self.ssh.run(f"mkdir -p {shlex.quote(spec.nfs_host_dir)}")
         vmid = self.ssh.run("pvesh get /cluster/nextid").strip()
         net0 = (
@@ -100,6 +142,16 @@ class ProxmoxLxcAdapter:
                 "--nameserver", spec.nameserver,
                 "--features", "nesting=1,keyctl=1",
                 "--mp0", mp0,
+                # Privileged, matching every real trip container (CT200/201/202
+                # carry no `unprivileged` line at all). `pct create` defaults to
+                # unprivileged=1, where container root is host uid 100000: the
+                # root-owned mp0 NFS directory then appears inside as
+                # nobody:nogroup, and _bootstrap_app_environment's own
+                # `mkdir -p <mount>/media/avatars` fails EACCES under `set -e`,
+                # killing the bootstrap before .env/the systemd unit/the nginx
+                # site are written. Confirmed live 2026-08-28 on CT101, the
+                # first container this adapter ever created.
+                "--unprivileged", "0",
                 "--ostype", "debian",
                 "--tags", "sites",
             ]
@@ -125,6 +177,13 @@ class ProxmoxLxcAdapter:
         trip_slug = spec.nfs_mount_path.rsplit("/", 1)[-1]
         app_dir = "/opt/kinerary"
         avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
+        # Appended with printf rather than written inside the heredoc above:
+        # that heredoc is unquoted (it has to expand ${JWT_SECRET}), so a
+        # password containing $ or ` would be mangled or executed there.
+        seed_password_line = (
+            f"  printf 'SEED_PASSWORD=%s\\n' {shlex.quote(self._seed_password)} >> {app_dir}/.env\n"
+            if self._seed_password else ""
+        )
         script = f"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -133,8 +192,16 @@ for i in $(seq 1 30); do pct exec {vmid} -- true 2>/dev/null && break; sleep 2; 
 pct exec {vmid} -- bash -s <<'BOOTSTRAP_INNER'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+# The template generates only C.utf8; without this every apt/perl invocation
+# emits several lines of "Setting locale failed" warnings, which is what
+# masked a real EACCES behind truncated stderr on 2026-08-28.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 apt-get update -qq
-apt-get install -y -qq curl nginx ca-certificates gnupg >/dev/null
+# build-essential is not optional: server/package.json pulls in better-sqlite3,
+# a native module, and npm falls back to a node-gyp build whenever no prebuilt
+# binary matches the platform. Without a compiler deploy.sh's own
+# `npm install --production` fails and the service never starts.
+apt-get install -y -qq curl nginx ca-certificates gnupg build-essential >/dev/null
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
   apt-get install -y -qq nodejs >/dev/null
@@ -146,13 +213,17 @@ ln -sfn {avatars_dir} {app_dir}/site/avatars
 
 if [ ! -f {app_dir}/.env ]; then
   JWT_SECRET=$(head -c 32 /dev/urandom | base64)
+  # Hex, not base64: setup-mcp.sh copies this value around by
+  # `grep '^HERMES_API_KEY=' | cut -d= -f2-`, so it must not contain '='.
+  HERMES_API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n')
   cat > {app_dir}/.env <<ENVEOF
 TRIP_DIR={app_dir}/trips/{trip_slug}
 DATA_DIR={spec.nfs_mount_path}/server-data
 PORT=3000
 JWT_SECRET=${{JWT_SECRET}}
+HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF
-fi
+{seed_password_line}fi
 
 cat > /etc/systemd/system/kinerary-server.service <<'UNITEOF'
 [Unit]
@@ -243,6 +314,26 @@ systemctl restart nginx
 BOOTSTRAP_INNER
 """
         self.ssh.run(script)
+
+    def _reset_trip_data(self, nfs_host_dir: str) -> None:
+        """Wipe the trip's persisted app state (SQLite DB under server-data/)
+        and uploaded media so a first provision starts clean. The NFS dir
+        outlives a container, so a failed earlier attempt can leave a users
+        table server.js seeds only once and never migrates.
+
+        Only ever reached when the control plane says this trip has never
+        provisioned successfully — a redeploy of a live trip must not lose
+        its family's photos and RSVPs.
+        """
+        base = nfs_host_dir.rstrip("/")
+        # Defence in depth before an `rm -rf`: the last path segment must be a
+        # real slug, never empty (which would target the shared NFS root).
+        segment = base.rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", segment):
+            raise ValueError(f"refusing to reset data for unexpected dir {base!r}")
+        self.ssh.run(
+            f"rm -rf {shlex.quote(base + '/server-data')} {shlex.quote(base + '/media')}"
+        )
 
     def delete(self, spec: LxcSpec) -> None:
         existing = self.inspect(spec)

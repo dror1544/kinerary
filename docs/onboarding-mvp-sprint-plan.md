@@ -355,9 +355,23 @@ Build:
   `intake_sessions.answers` state indirectly. Its digest must verify before
   planning or transformation.
 - **Intake transformer** — reads the confirmed immutable intake version and
-  produces a valid `trip.config.json` and `trivia_questions.json` using the
-  existing Kinerary schema. Validate the output against the existing schema
-  before writing. Store only the logical config; no VMIDs, IPs, or paths.
+  produces a valid `trip.config.json` using the existing Kinerary schema.
+  Validate the output against the existing schema before writing. Store only
+  the logical config; no VMIDs, IPs, or paths.
+  - **`trivia_questions.json` is descoped** (decision 2026-08-28, reviewing the
+    first pipeline-built site): the interview collects nothing that feeds
+    trivia, and generating it deterministically from destination + phase names
+    would be thin filler, not the "who remembers this from the last trip"
+    content the feature is for. The provisioner now writes an empty
+    `trivia_questions.json` (`[]`) so `server.js` stops logging a
+    missing-file error on every boot; real trivia can come from a later
+    enrichment/debrief pass or the `create-trip` path, not this transformer.
+- **`bookings.json` from the intake** (added 2026-08-28) — `travel_anchors[]`
+  (dated activity tickets, a tour proposal) and each phase's accommodation were
+  captured by the interview but dropped by `transform_intake` (anchors became a
+  single Hero stat number). `derive_bookings()` now projects both into a
+  `bookings.json` sidecar, every row `confirmation: null` unless the intake
+  carried one, so the site's Bookings tab has real, if unconfirmed, content.
 - **Provisioner worker** — implements the job worker that claims an approved
   provisioning job, invokes the intake transformer, and deploys a private trip
   instance using the existing `kinerary-deploy` infrastructure. Records the
@@ -471,6 +485,18 @@ function:
   stdlib HTTP calls against the same two free APIs is enough; no new
   dependency needed. Geocoding/weather/hero-photo verification from the
   `.hermes` plan belong here too, once scoped.
+  - **Built 2026-08-28** — `control_plane_worker/enrichment.py`
+    (`enrich_config`), wired into `ProvisionerWorker` (`enrich=` param, live
+    only in `__main__`; a no-op passthrough in tests). It does the country
+    lookup (`countries.dev` + `emergencynumberapi.com`, a direct port of
+    `country-info.js`), plus per-phase geocoding (Nominatim → `phase.mapStop`)
+    and a per-phase hero photo (Wikipedia REST summary → `phase.hero.photo`).
+    Every lookup self-guards: a miss leaves that slice of the config as
+    `transform_intake` produced it, and an enrichment failure never fails the
+    provision job. Weather verification and consular/embassy contacts
+    (`travel_info.emergency_contacts`) are still not covered — no free source
+    was wired for them. `_KNOWN_COUNTRY_CURRENCY` stays as the offline fallback
+    when the live lookup returns nothing.
 - **AI-driven phase content pass** — this is the part that genuinely needs
   judgment, not a lookup, and needs a product decision on where it runs and
   under what authority:

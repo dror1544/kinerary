@@ -125,6 +125,12 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      # Shared onboarding password baked into a new site's .env. Empty (the
+      # default) keeps server.js's independent random per-user passwords —
+      # which today means the site has no usable login at all, since Telegram
+      # SSO is ruled out and Google is unconfigured. Stopgap until a real
+      # member/organizer signup flow exists.
+      PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}

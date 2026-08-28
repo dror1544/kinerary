@@ -47,6 +47,8 @@ Where the trip goes and when, one entry per stop. Ask for: place name, date rang
 
 **Keep `name` to a short location or theme only** — a city, region, or a light label like "Road Trip". The site displays `name` directly as a nav tab and section header, so it must stay light: "Dallas", not "Dallas (boys; Mavericks game September 6)". If the conversation surfaces extra context for a stop — who's on that leg, an event, a scheduling note — that's genuinely useful to know and fine to ask about and reflect back in your confirmation summary, but it does not belong in the structured `name` field; there's no field for it yet, so just leave it out of the submitted data rather than appending it to the name.
 
+If a shared document lists a hotel per stop, fill `accommodation` for that phase from it (name, and confirmation number if the document has one) rather than leaving it blank — each becomes a hotel row on the Bookings tab, shown as unconfirmed when no number is present.
+
 Submit as:
 ```json
 [
@@ -65,13 +67,16 @@ For a single-destination trip this is still an array — just one entry.
 
 Anything already booked and worth recording — flights, a rental car, a specific hotel outside the phases above. Skip this whole question if nothing's booked yet; don't ask "are you sure?" — "nothing yet" is a completely normal answer this early. If they have a confirmation email or ticket for any of this, reading it beats asking them to type out flight numbers and confirmation codes from memory.
 
+**When the organizer shared a document (workflow step 3), mine it, don't skim it.** A tour proposal or itinerary PDF usually lists every dated activity, transfer, and reservation — capture each one as its own entry with its date, not a single "there's a proposal" line. Each becomes a row on the trip site's Bookings tab, so one entry per real thing is the difference between a useful tab and an empty one. Put the date inside `detail` in a form that carries the year ("20 Sep 2026" or "2026-09-20") so it can be placed on the right phase.
+
 Submit as a loose array of whatever the organizer tells you, e.g.:
 ```json
 [
-  { "type": "flight", "detail": "Delta DL123, Sept 6", "confirmation": "XYZ789" }
+  { "type": "flight", "detail": "Delta DL123, 6 Sep 2026", "confirmation": "XYZ789" },
+  { "type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 10:00" }
 ]
 ```
-There's no strict schema here beyond "array of objects" — capture what's useful, don't force a rigid shape onto a free-text answer.
+There's no strict schema here beyond "array of objects" — capture what's useful, don't force a rigid shape onto a free-text answer. `type` is a light label: `flight`, `hotel`, `car`, `activity`, `reservation`, or `proposal` for a whole-trip quote.
 
 ## constraints — optional, structured (object)
 

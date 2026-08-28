@@ -71,6 +71,13 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             self.assertEqual("192.168.0.210/24", topology.lxc.ipv4)
             self.assertEqual("trip-tokyo-2026", topology.lxc.name)
             self.assertEqual("tokyo-2026.ara-united.store", topology.proxy.hostname)
+            # NPM must forward to the container's IP, not its LXC name: nothing
+            # resolves trip-* hostnames on this LAN (confirmed 2026-08-28 —
+            # even the live trip-kinerary does not resolve from the RPi4 that
+            # runs NPM), and every working NPM proxy host is IP-based. The
+            # hostname form came from the hand-written topology.yaml files,
+            # which their own headers admit were never actually applied.
+            self.assertEqual("192.168.0.210", topology.proxy.forward_host)
             # NOT the trip's own LXC address — the real tunnel forwards every
             # trip's ingress rule to NPM's local listener on the RPi4 itself.
             self.assertEqual("http://127.0.0.1:8080", topology.cloudflare.service)
@@ -108,6 +115,19 @@ class LxcProvisionAdapterTests(unittest.TestCase):
 
             topology, _ = second_provisioner.apply_calls[0]
             self.assertEqual("192.168.0.210/24", topology.lxc.ipv4)
+
+    def test_first_provision_arms_the_data_reset_for_the_real_provisioner(self) -> None:
+        # _build_provisioner (the real factory, not the fake here) reads
+        # self._reset_data to construct ProxmoxLxcAdapter(reset_data=...); the
+        # actual wipe is covered in tests/provisioning/test_adapters.py.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = _adapter(deploy_root, provisioner=FakeProvisioner(vmid="205"))
+
+            adapter.create_container("tokyo-2026", first_provision=True)
+            self.assertTrue(adapter._reset_data)
+
+            adapter.create_container("tokyo-2026")
+            self.assertFalse(adapter._reset_data)
 
     def test_a_second_trip_gets_the_next_free_pool_ip(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:

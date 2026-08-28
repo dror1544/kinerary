@@ -129,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     gateway=os.environ.get("PROXMOX_GATEWAY", "192.168.0.1"),
                     nameserver=os.environ.get("PROXMOX_NAMESERVER", "192.168.0.41"),
+                    # Shared onboarding password for a new site's participants.
+                    # Unset keeps server.js's safe default (independent random
+                    # per-user passwords) — but note that with Telegram SSO
+                    # ruled out and Google unconfigured, unset currently means
+                    # the provisioned site has no login path at all. A real
+                    # member/organizer signup flow is the actual fix; this is a
+                    # stopgap so a provisioned trip is reachable.
+                    seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                 )
@@ -154,9 +162,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 companion_adapter = NullCompanionProfileAdapter()
                 mcp_bridge_adapter = NullMcpBridgeAdapter()
+            from .enrichment import enrich_config
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,
                 companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
+                # Live destination enrichment (currency/emergency/coords/hero).
+                # Always on in a real run: it self-guards and degrades to "no
+                # enrichment", never a failure.
+                enrich=enrich_config,
             )
             import signal, time as _time
             stopping = False

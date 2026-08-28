@@ -18,7 +18,7 @@ import secrets
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 import psycopg
 from psycopg.rows import dict_row
@@ -30,7 +30,16 @@ from .companion_profile import (
 )
 from .compute import ComputeAdapter, NullComputeAdapter
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter
-from .transformer import derive_trip_slug, transform_intake
+from .transformer import (
+    derive_bookings,
+    derive_trip_slug,
+    intake_destination,
+    transform_intake,
+)
+
+# (config, destination) -> config. See ProvisionerWorker.__init__ for why this
+# defaults to a passthrough rather than the live enrich_config.
+EnrichFn = Callable[[dict[str, Any], str], dict[str, Any]]
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +52,14 @@ SLUG_COLLISION_LIMIT = 100
 class DeployAdapter(Protocol):
     """Deploys a trip config and returns the private URL."""
 
-    def deploy(self, slug: str, config: dict[str, Any]) -> str: ...
+    def deploy(
+        self,
+        slug: str,
+        config: dict[str, Any],
+        *,
+        first_provision: bool = False,
+        sidecars: Mapping[str, Any] | None = None,
+    ) -> str: ...
 
 
 class ShellDeployAdapter:
@@ -66,18 +82,36 @@ class ShellDeployAdapter:
         self._timeout = timeout
         self._compute = compute or NullComputeAdapter()
 
-    def deploy(self, slug: str, config: dict[str, Any]) -> str:
+    def deploy(
+        self,
+        slug: str,
+        config: dict[str, Any],
+        *,
+        first_provision: bool = False,
+        sidecars: Mapping[str, Any] | None = None,
+    ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
         # NullComputeAdapter by default, which raises the same error this
-        # used to raise unconditionally before Phase G existed.
-        vmid = self._vmid_map.get(slug) or self._compute.create_container(slug)
+        # used to raise unconditionally before Phase G existed. first_provision
+        # only reaches the compute path (a vmid_map trip is a long-lived hand
+        # box whose data is never reset here).
+        vmid = self._vmid_map.get(slug) or self._compute.create_container(
+            slug, first_provision=first_provision
+        )
 
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
         os.makedirs(trip_dir, exist_ok=True)
         config_path = os.path.join(trip_dir, "trip.config.json")
         with open(config_path, "w", encoding="utf-8") as fh:
             json.dump(config, fh, ensure_ascii=False, indent=2)
+
+        # bookings.json / trivia_questions.json sit beside trip.config.json;
+        # deploy.sh tars the whole trip dir onto the container, so writing them
+        # here is all that's needed — they are not deploy.sh arguments.
+        for name, payload in (sidecars or {}).items():
+            with open(os.path.join(trip_dir, name), "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
@@ -92,10 +126,18 @@ class ShellDeployAdapter:
             env=env,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                f"deploy.sh exited {result.returncode}: "
-                f"{result.stderr[:500] or result.stdout[:500]}"
+            # BOTH streams, not `stderr or stdout`: deploy.sh reports progress
+            # and its failure diagnostics (the health check's journalctl dump,
+            # npm's build errors) on stdout, while stderr carries only ssh's
+            # "Permanently added ... known hosts" warnings. Preferring stderr
+            # therefore reported pure noise on every real failure. Tails are
+            # kept because the failing command's own message comes last.
+            detail = " | ".join(
+                f"{name}: {text.strip()[-600:]}"
+                for name, text in (("stdout", result.stdout), ("stderr", result.stderr))
+                if text and text.strip()
             )
+            raise RuntimeError(f"deploy.sh exited {result.returncode}: {detail or '(no output)'}")
 
         return self._private_url(trip_dir)
 
@@ -138,12 +180,17 @@ class ProvisionerWorker:
         worker_id: str | None = None,
         companion: CompanionProfileAdapter | None = None,
         mcp_bridge: McpBridgeAdapter | None = None,
+        enrich: EnrichFn | None = None,
     ) -> None:
         self._db_url = db_url
         self._deploy = deploy
         self._worker_id = worker_id or f"{self.DEFAULT_WORKER_ID_PREFIX}_{secrets.token_hex(8)}"
         self._companion = companion or NullCompanionProfileAdapter()
         self._mcp_bridge = mcp_bridge or NullMcpBridgeAdapter()
+        # Default is a no-op passthrough: destination enrichment makes live
+        # HTTP calls, so it stays off unless __main__ wires enrich_config in,
+        # matching how compute/mcp_bridge default to their Null adapters.
+        self._enrich = enrich or (lambda config, destination: config)
 
     # ── public API ──────────────────────────────────────────────────────────────
 
@@ -175,13 +222,44 @@ class ProvisionerWorker:
                 # Transform to trip.config.json.
                 config = transform_intake(answers)
 
+                # Deterministic destination enrichment (Sprint 4.5): currency /
+                # emergency numbers for the country, lat-lng per phase, a hero
+                # photo per phase — each from a keyless public API. The default
+                # is a passthrough; __main__ injects the live enrich_config.
+                # It self-guards, but a provision job must never fail on an
+                # enrichment miss, so wrap it again here.
+                try:
+                    config = self._enrich(config, intake_destination(answers))
+                except Exception:  # pragma: no cover - enrich_config self-guards
+                    logger.warning("provisioner.enrichment_failed", exc_info=True)
+
+                # Sidecar files that live beside trip.config.json in the trip
+                # dir. trivia_questions.json is always written empty: control-
+                # plane trips ship without trivia (documented descope in
+                # docs/onboarding-mvp-sprint-plan.md, Sprint 4.5), and an empty
+                # file stops the trip server erroring on every boot.
+                # bookings.json carries the phase hotels and the travel_anchors
+                # the interview captured, which the config itself drops.
+                sidecars: dict[str, Any] = {"trivia_questions.json": []}
+                bookings = derive_bookings(config, answers)
+                if bookings:
+                    sidecars["bookings.json"] = bookings
+
                 # The slug assigned at signup approval is a placeholder — the
                 # destination and dates were not known yet. Now that the intake
                 # is confirmed, promote it to the one the family will see.
                 slug = self._promote_draft_slug(conn, trip_id, slug, answers)
 
-                # Deploy.
-                private_url = self._deploy.deploy(slug, config)
+                # Deploy. first_provision (from plan.desired, computed by the
+                # planner) tells the compute adapter whether this trip has ever
+                # been provisioned successfully — if not, any leftover per-trip
+                # NFS data is debris from a failed earlier attempt and is
+                # cleared so the freshly seeded users/config take.
+                private_url = self._deploy.deploy(
+                    slug, config,
+                    first_provision=bool(plan_desired.get("first_provision", False)),
+                    sidecars=sidecars,
+                )
 
                 # Commit success.
                 self._complete(

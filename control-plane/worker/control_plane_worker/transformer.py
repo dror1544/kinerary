@@ -65,6 +65,7 @@ still missing.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -298,6 +299,13 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     return brand, title
 
 
+def intake_destination(data: Mapping[str, Any]) -> str:
+    """The organizer's raw destination answer, e.g. "Japan" or "Tokyo, Kyoto &
+    Osaka". Empty string if unanswered. The enrichment pass needs this and the
+    transformed config doesn't keep it verbatim."""
+    return _text_value(data.get("destination", {})).strip()
+
+
 def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
     """Derive a human-readable trip slug from the confirmed intake.
 
@@ -343,7 +351,12 @@ def _derive_participants_and_families(travelers: list[Any]) -> tuple[list[dict[s
         if not name:
             continue
         name_en = str(raw.get("name_en") or name).strip()
-        family_key = _slugify(str(raw.get("family") or "traveler"))
+        # family_en mirrors name_en. Without it a Hebrew-only household name
+        # slugified to nothing (so the family id fell back to the literal
+        # "traveler") and its English label was the Hebrew string.
+        family_raw = str(raw.get("family") or "traveler")
+        family_en = str(raw.get("family_en") or family_raw).strip()
+        family_key = _slugify(family_en)
 
         username = _slugify(name_en or name)
         if username in used_usernames:
@@ -356,7 +369,7 @@ def _derive_participants_and_families(travelers: list[Any]) -> tuple[list[dict[s
             families_by_key[family_key] = {
                 "id": family_key,
                 "letter": letter,
-                "name": {"he": str(raw.get("family") or family_key), "en": str(raw.get("family") or family_key)},
+                "name": {"he": family_raw, "en": family_en},
                 "members": [],
                 "phases": "all",
                 "_color": color,
@@ -816,3 +829,152 @@ def transform_intake(
         }
 
     return config
+
+
+_ANCHOR_MONTHS: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+_ANCHOR_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b"      # 20 Sep 2026
+    r"|\b(\d{4})-(\d{2})-(\d{2})\b"                       # 2026-09-25
+)
+
+# Interview anchor `type` values are free-ish; map the ones seen in real
+# intakes onto the site's bookings table vocabulary, which is a hard
+# CHECK(type IN ('flight','hotel','car','attraction','other')) — anything
+# outside it is silently dropped by the seed's INSERT OR IGNORE, so an
+# unrecognised type must fall through to "other", never pass straight through.
+_BOOKING_TYPES = frozenset({"flight", "hotel", "car", "attraction", "other"})
+_ANCHOR_TYPE_MAP: dict[str, str] = {
+    "flight": "flight",
+    "hotel": "hotel",
+    "accommodation": "hotel",
+    "car": "car",
+    "rental": "car",
+    "activity": "attraction",
+    "attraction": "attraction",
+    "tour": "attraction",
+    "reservation": "attraction",
+    "ticket": "attraction",
+    "excursion": "attraction",
+    "proposal": "other",
+    "booking": "other",
+}
+
+
+def _extract_anchor_date(text: str) -> date | None:
+    """First date mentioned in an anchor's free-text detail, or None.
+
+    Recognises "20 Sep 2026" and "2026-09-25"; anything else (a bare "next
+    spring", a date with no year) stays undated rather than guessed.
+    """
+    match = _ANCHOR_DATE_RE.search(text or "")
+    if not match:
+        return None
+    if match.group(1):
+        month = _ANCHOR_MONTHS.get(match.group(2).lower())
+        if not month:
+            return None
+        try:
+            return date(int(match.group(3)), month, int(match.group(1)))
+        except ValueError:
+            return None
+    try:
+        return date(int(match.group(4)), int(match.group(5)), int(match.group(6)))
+    except ValueError:
+        return None
+
+
+def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
+    """The id of the phase whose date range contains `when`.
+
+    Phases share boundary dates (one ends the day the next begins), so the
+    range is treated half-open at the end, then inclusive as a fallback for a
+    date landing on the very last day of the trip.
+    """
+    for closed_end in (False, True):
+        for phase in phases:
+            dates = phase.get("dates") or {}
+            start = _parse_iso_date(dates.get("start"))
+            end = _parse_iso_date(dates.get("end"))
+            if not start or not end:
+                continue
+            if start <= when < end or (closed_end and start <= when <= end):
+                return str(phase.get("id")) or None
+    return None
+
+
+def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build bookings.json rows from an already-transformed config plus the raw
+    intake answers.
+
+    Two sources, both otherwise lost to the site:
+      * one `hotel` row per phase that has an accommodation — carrying whatever
+        confirmation the intake had, or `null` so the row still shows as
+        "not confirmed" rather than being omitted;
+      * one row per `travel_anchors[]` entry (dated activity tickets, a tour
+        proposal), typed via _ANCHOR_TYPE_MAP, with any date parsed out of the
+        free text and mapped back to the phase it falls in.
+
+    Every row carries a deterministic `seed_key` so re-provisioning the same
+    intake is idempotent against the site's `INSERT OR IGNORE ... seed_key`.
+
+    `bookings.phase` is `TEXT NOT NULL` on the site, so an anchor that maps to
+    no phase (undated, or a whole-trip proposal) is parked on the first phase
+    rather than dropped — it still shows on the Bookings tab, which is the
+    point.
+    """
+    phases = list(config.get("phases") or [])
+    fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
+    bookings: list[dict[str, Any]] = []
+
+    for phase in phases:
+        accommodation = phase.get("accommodation")
+        if not isinstance(accommodation, dict) or not accommodation.get("name"):
+            continue
+        dates = phase.get("dates") or {}
+        bookings.append({
+            "phase": str(phase.get("id")) or None,
+            "type": "hotel",
+            "name": str(accommodation.get("name_en") or accommodation["name"]),
+            "date_from": dates.get("start"),
+            "date_to": dates.get("end"),
+            "passengers": None,
+            "confirmation": accommodation.get("confirmation"),
+            "notes": None,
+            "cost": 0,
+            "seed_key": f"hotel_{phase.get('id')}",
+        })
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
+        anchor_type = str(raw.get("type") or "").strip().lower()
+        if not detail and not anchor_type:
+            continue
+        # A "proposal" is a whole-trip quote, not a dated item — any date inside
+        # it is a range endpoint, so don't pin it to a single day or phase.
+        when = None if anchor_type == "proposal" else _extract_anchor_date(detail)
+        name = _shorten_phase_name(detail, max_length=60) if detail else ""
+        phase_id = _phase_id_for_date(phases, when) if when else None
+        bookings.append({
+            "phase": phase_id or fallback_phase,
+            "type": _ANCHOR_TYPE_MAP.get(anchor_type, "other"),
+            "name": name or anchor_type.title() or "Booking",
+            "date_from": when.isoformat() if when else None,
+            "date_to": None,
+            "passengers": None,
+            "confirmation": raw.get("confirmation"),
+            "notes": detail or None,
+            "cost": 0,
+            "seed_key": "anchor_" + hashlib.sha1(
+                (detail or anchor_type).encode("utf-8")
+            ).hexdigest()[:10],
+        })
+
+    return bookings

@@ -5,7 +5,11 @@ import re
 import unittest
 from datetime import date
 
-from control_plane_worker.transformer import derive_trip_slug, transform_intake
+from control_plane_worker.transformer import (
+    derive_bookings,
+    derive_trip_slug,
+    transform_intake,
+)
 
 
 def _choice(option_id: str) -> dict:
@@ -644,3 +648,156 @@ class SchemaV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonLatinNameTests(unittest.TestCase):
+    """Hebrew-only traveler names produced usernames traveler/traveler1..4 and a
+    family whose `en` was Hebrew, because _slugify strips every non-[a-z0-9]
+    character and name_en/family fall back to the original. Confirmed on the
+    first pipeline-built site (japan-2026, 2026-08-28). The transformer must at
+    least honour explicitly supplied English names.
+    """
+
+    def _config(self, travelers: list[dict]) -> dict:
+        return transform_intake({**JAPAN_INTAKE, "travelers": _structured(travelers)})
+
+    def test_supplied_english_names_become_the_usernames(self) -> None:
+        config = self._config([
+            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "אלה", "name_en": "Ella", "age": 53, "family": "סולומון", "family_en": "Solomon"},
+        ])
+
+        self.assertEqual(["nir", "ella"], [p["username"] for p in config["participants"]])
+
+    def test_family_keeps_hebrew_display_but_uses_english_where_given(self) -> None:
+        config = self._config([
+            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+        ])
+
+        family = config["families"][0]
+        self.assertEqual("סולומון", family["name"]["he"])
+        self.assertEqual("Solomon", family["name"]["en"])
+
+
+class DeriveBookingsTests(unittest.TestCase):
+    """travel_anchors[] used to be collapsed into a single stat number and then
+    thrown away — the interview's most concrete output (dated activity tickets,
+    a tour proposal) never reached the site. derive_bookings turns them, plus
+    each phase's accommodation, into bookings.json rows so the site's Bookings
+    tab has real content. Confirmed missing on japan-2026 (2026-08-28).
+    """
+
+    PHASED_INTAKE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {
+                "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                "accommodation": {"name": "OMO3 Asakusa"},
+            },
+            {
+                "name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27",
+                "accommodation": {"name": "Cross Hotel Kyoto", "confirmation": "CH-88"},
+            },
+        ]),
+    }
+
+    def _bookings(self, intake: dict) -> list[dict]:
+        config = transform_intake(intake)
+        return derive_bookings(config, intake)
+
+    def test_each_phase_accommodation_becomes_a_hotel_booking(self) -> None:
+        bookings = self._bookings(self.PHASED_INTAKE)
+        hotels = [b for b in bookings if b["type"] == "hotel"]
+        self.assertEqual(2, len(hotels))
+        tokyo = next(b for b in hotels if b["phase"] == "tokyo")
+        self.assertEqual("OMO3 Asakusa", tokyo["name"])
+        self.assertEqual("2026-09-19", tokyo["date_from"])
+        self.assertEqual("2026-09-23", tokyo["date_to"])
+        # No confirmation given → surfaced as unconfirmed, never dropped.
+        self.assertIsNone(tokyo["confirmation"])
+        kyoto = next(b for b in hotels if b["phase"] == "kyoto")
+        self.assertEqual("CH-88", kyoto["confirmation"])
+
+    def test_travel_anchor_becomes_a_dated_booking_mapped_to_its_phase(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "detail": "Tokyo Skytree E-ticket — 20 Sep 2026 10:00"},
+            ]),
+        }
+        bookings = self._bookings(intake)
+        # "activity" is not a valid site booking type — it must land as "attraction".
+        anchor = next(b for b in bookings if b["type"] == "attraction")
+        self.assertEqual("Tokyo Skytree E-ticket", anchor["name"])
+        self.assertEqual("2026-09-20", anchor["date_from"])
+        self.assertEqual("tokyo", anchor["phase"])
+        self.assertEqual("Tokyo Skytree E-ticket — 20 Sep 2026 10:00", anchor["notes"])
+        self.assertIsNone(anchor["confirmation"])
+
+    def test_iso_dates_in_anchor_text_are_recognised(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "reservation", "detail": "Sumo hall 2026-09-25 17:00"},
+            ]),
+        }
+        anchor = self._bookings(intake)[-1]
+        self.assertEqual("2026-09-25", anchor["date_from"])
+        self.assertEqual("kyoto", anchor["phase"])
+
+    def test_every_anchor_type_maps_into_the_sites_allowed_set(self) -> None:
+        allowed = {"flight", "hotel", "car", "attraction", "other"}
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": t, "detail": f"{t} thing"}
+                for t in ("flight", "hotel", "car", "activity", "tour", "reservation",
+                          "ticket", "excursion", "proposal", "booking", "wibble", "")
+            ]),
+        }
+        anchors = [b for b in self._bookings(intake) if b["seed_key"].startswith("anchor_")]
+        self.assertTrue(anchors)
+        self.assertTrue(all(b["type"] in allowed for b in anchors))
+
+    def test_proposal_is_undated_and_parked_on_the_first_phase(self) -> None:
+        # The detail carries a date *range*, so it gets no date. But
+        # bookings.phase is NOT NULL on the site, so it can't be dropped —
+        # it parks on the first phase and still shows on the Bookings tab.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "proposal",
+                 "detail": "Japan Tours quote #100665 for 5 adults, 19 Sep–03 Oct 2026"},
+            ]),
+        }
+        proposal = next(b for b in self._bookings(intake) if b["seed_key"].startswith("anchor_"))
+        self.assertEqual("other", proposal["type"])
+        self.assertIsNone(proposal["date_from"])
+        self.assertEqual("tokyo", proposal["phase"])
+        self.assertIn("Japan Tours quote", proposal["notes"])
+
+    def test_no_anchor_row_ever_has_a_null_phase(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "proposal", "detail": "whole-trip quote, no dates"},
+                {"type": "activity", "detail": "undated museum pass"},
+                {"type": "flight", "detail": "DL123 on 20 Sep 2026"},
+            ]),
+        }
+        self.assertTrue(all(b["phase"] for b in self._bookings(intake)))
+
+    def test_every_row_carries_a_stable_seed_key(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 18:00"},
+            ]),
+        }
+        first = self._bookings(intake)
+        second = self._bookings(intake)
+        self.assertEqual([b["seed_key"] for b in first], [b["seed_key"] for b in second])
+        self.assertEqual(len(first), len({b["seed_key"] for b in first}))
+
+    def test_no_phases_and_no_anchors_yields_no_bookings(self) -> None:
+        self.assertEqual([], self._bookings(JAPAN_INTAKE))

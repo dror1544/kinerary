@@ -49,7 +49,7 @@ class ComputeAdapter(Protocol):
     """Creates (or reuses an already-created) compute instance for a trip.
     Returns its vmid as a string."""
 
-    def create_container(self, slug: str) -> str: ...
+    def create_container(self, slug: str, *, first_provision: bool = False) -> str: ...
 
 
 class NullComputeAdapter:
@@ -58,7 +58,7 @@ class NullComputeAdapter:
     creation hasn't been turned on. Matches the pre-Phase-G behavior: a
     clear error rather than a silent no-op."""
 
-    def create_container(self, slug: str) -> str:
+    def create_container(self, slug: str, *, first_provision: bool = False) -> str:
         raise ValueError(
             f"no vmid configured for slug {slug!r}, and automatic container "
             "creation (--enable-compute) is not turned on"
@@ -110,6 +110,7 @@ class LxcProvisionAdapter:
         memory_mb: int = 1024,
         disk_gb: int = 8,
         forward_port: int = 8080,
+        seed_password: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
     ) -> None:
         self._deploy_root = deploy_root
@@ -141,6 +142,11 @@ class LxcProvisionAdapter:
         self._memory_mb = memory_mb
         self._disk_gb = disk_gb
         self._forward_port = forward_port
+        self._seed_password = seed_password
+        # Set per-call by create_container (the worker is single-threaded — one
+        # job at a time via run_once), read by _build_provisioner when it
+        # constructs the ProxmoxLxcAdapter.
+        self._reset_data = False
         # Overridable so tests can inject a Provisioner built from fake
         # transports (matching tests/provisioning/test_adapters.py's own
         # FakeTransport) instead of the real HttpJsonTransport this
@@ -150,13 +156,18 @@ class LxcProvisionAdapter:
         # tests, not directly.
         self._provisioner_factory = provisioner_factory or self._build_provisioner
 
-    def create_container(self, slug: str) -> str:
+    def create_container(self, slug: str, *, first_provision: bool = False) -> str:
         topology_path = self._topology_path(slug)
         topology = self._load_topology(topology_path)
         if topology is None:
             topology = self._build_topology(slug)
             self._write_topology(topology_path, topology, slug)
 
+        # Consumed by _build_provisioner below. On a first provision the
+        # trip's NFS data dir must start clean — a container teardown leaves
+        # it intact, so a failed earlier attempt can leave a stale SQLite
+        # users table that server.js won't re-seed over.
+        self._reset_data = first_provision
         provisioner = self._provisioner_factory()
         provisioner.apply(topology, execute=True)
 
@@ -200,7 +211,13 @@ class LxcProvisionAdapter:
                 nfs_host_dir=f"{self._nfs_host_base}/{slug}",
                 nfs_mount_path=f"{self._nfs_mount_base}/{slug}",
             ),
-            proxy=ProxySpec(hostname=hostname, forward_host=name, forward_port=self._forward_port),
+            # forward_host is the container's IP, deliberately not its LXC name.
+            # No trip-* hostname resolves on this LAN — the containers hold
+            # static addresses outside DHCP, so nothing registers them in DNS,
+            # and NPM (on the RPi4) answers 502 for an unresolvable upstream.
+            # Every working proxy host is IP-based; the name form was inherited
+            # from topology.yaml files that were never actually applied.
+            proxy=ProxySpec(hostname=hostname, forward_host=ipv4, forward_port=self._forward_port),
             cloudflare=CloudflareSpec(
                 tunnel_id=self._tunnel_id, hostname=hostname,
                 # NOT the trip's own LXC address — every trip's ingress rule
@@ -297,7 +314,9 @@ class LxcProvisionAdapter:
             host=self._rpi_host, user=self._rpi_ssh_user, identity_file=self._rpi_ssh_key,
         )
         return Provisioner(
-            ProxmoxLxcAdapter(proxmox_ssh),
+            ProxmoxLxcAdapter(
+                proxmox_ssh, seed_password=self._seed_password, reset_data=self._reset_data,
+            ),
             NpmProxyHostAdapter(npm_transport),
             CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_zone_id, rpi_ssh),
         )
