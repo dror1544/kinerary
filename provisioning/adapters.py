@@ -52,8 +52,12 @@ class SubprocessSshTransport:
             capture_output=True, text=True, timeout=self.command_timeout,
         )
         if result.returncode != 0:
+            # Prefer stderr (ssh's own errors, and most remote tools'), but fall
+            # back to stdout — apt, git and deploy.sh all report failures there,
+            # and an empty-stderr failure otherwise reports just "exit N:".
+            detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(
-                f"ssh command failed (exit {result.returncode}): {_truncate_middle(result.stderr)}"
+                f"ssh command failed (exit {result.returncode}): {_truncate_middle(detail)}"
             )
         return result.stdout
 

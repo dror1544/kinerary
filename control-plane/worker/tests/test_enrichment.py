@@ -200,6 +200,21 @@ class HeroPhotoTests(unittest.TestCase):
         out = enrich_config(cfg, "Japan", http=http, pause=0)
         self.assertEqual("https://example.com/mine.jpg", out["phases"][0]["hero"]["photo"])
 
+    def test_hebrew_only_phase_title_queries_hebrew_wikipedia(self) -> None:
+        # A phase with no English title must not be sent to en.wikipedia.org
+        # (guaranteed 404 -> no hero). It should hit he.wikipedia.org instead.
+        cfg = _config()
+        cfg["phases"] = [{"id": "tokyo", "title": {"he": "טוקיו"}, "tabLabel": "טוקיו"}]
+        http = FakeHttp({
+            "he.wikipedia.org/api/rest_v1/page/summary/": {
+                "title": "טוקיו", "originalimage": {"source": "https://upload.wikimedia.org/he-tokyo.jpg"},
+            },
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://upload.wikimedia.org/he-tokyo.jpg", out["phases"][0]["hero"]["photo"])
+        self.assertTrue(any("he.wikipedia.org" in u for u in http.calls))
+        self.assertFalse(any("en.wikipedia.org" in u for u in http.calls))
+
 
 class ResilienceTests(unittest.TestCase):
     def test_a_raising_http_client_never_propagates(self) -> None:

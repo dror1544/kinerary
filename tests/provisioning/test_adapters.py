@@ -237,6 +237,20 @@ class AdapterTests(unittest.TestCase):
     def test_short_stderr_is_passed_through_whole(self) -> None:
         self.assertEqual("boom", _truncate_middle("  boom\n"))
 
+    def test_ssh_failure_falls_back_to_stdout_when_stderr_is_empty(self) -> None:
+        # A remote command that fails while writing its diagnostics to stdout
+        # (many do — apt, git, deploy.sh) left the RuntimeError with nothing
+        # after the colon. Prefer stderr, fall back to stdout.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=2, stdout="fatal: repository not found\n", stderr="")
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("git pull")
+        self.assertIn("repository not found", str(caught.exception))
+        self.assertIn("exit 2", str(caught.exception))
+
     def test_reset_data_wipes_server_data_and_media_before_anything_else(self) -> None:
         # The NFS dir outlives a container, so a failed earlier provision can
         # leave a stale SQLite users table that server.js seeds only once and

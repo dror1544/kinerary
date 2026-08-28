@@ -223,7 +223,7 @@ def enrich_config(
     for phase in out.get("phases") or []:
         if not isinstance(phase, dict):
             continue
-        label = _phase_query_label(phase)
+        label, lang = _phase_query(phase)
         if not label:
             continue
         query = f"{label}, {destination}".strip(", ")
@@ -237,7 +237,9 @@ def enrich_config(
             logger.warning("enrichment.geocode_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
             if "hero" not in phase:
-                image = _wikipedia_image(http, label)
+                # A Hebrew-only phase title against en.wikipedia is a guaranteed
+                # 404; query the wiki that matches the label's language.
+                image = _wikipedia_image(http, label, lang=lang)
                 if image:
                     phase["hero"] = {"photo": image, "title": str(phase.get("tabLabel") or label).upper()}
         except Exception:
@@ -259,11 +261,20 @@ def _enrich_country(out: dict[str, Any], destination: str, http: Http) -> None:
     out["travel_info"] = {"countries": {name: entry}}
 
 
-def _phase_query_label(phase: dict[str, Any]) -> str:
+def _phase_query(phase: dict[str, Any]) -> tuple[str, str]:
+    """The best label to search a phase by, and the Wikipedia language edition
+    that label belongs to. Prefer the English title (→ en.wikipedia); fall back
+    to the Hebrew one (→ he.wikipedia) rather than sending Hebrew to en."""
     title = phase.get("title")
     if isinstance(title, dict):
-        return str(title.get("en") or title.get("he") or "").strip()
-    return str(title or phase.get("tabLabel") or "").strip()
+        en = str(title.get("en") or "").strip()
+        if en:
+            return en, "en"
+        he = str(title.get("he") or "").strip()
+        if he:
+            return he, "he"
+    plain = str(title or phase.get("tabLabel") or "").strip()
+    return plain, "en"
 
 
 def _map_stop(phase: dict[str, Any], coords: tuple[float, float]) -> dict[str, Any]:
