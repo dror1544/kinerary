@@ -28,3 +28,38 @@ Afterward:
 5. Start and verify the dedicated gateway and one real enrollment flow before sending invitations.
 
 Never use `--clone` or profile export/import for this template: they can carry personalization and runtime state.
+
+## Doubling as the shared trip-companion host
+
+`config.overlay.yaml.tpl` ships `gateway.multiplex_profiles: false` by
+default, and getting this wrong doesn't fail loudly — it silently starts a
+second connection for a bot token something else already holds. Read this
+whole section before changing it, not just the config comment.
+
+**An allowlist alone does not make this safe.** In the installed Hermes
+source (`hermes_cli/profiles.py`'s `profiles_to_serve`), turning on
+`multiplex_profiles` unconditionally adds this Hermes install's `default`
+profile to the served set *before* `multiplex_profile_allowlist` is even
+consulted — the allowlist can add or remove named profiles, but it cannot
+exclude `default`. If `default` on this install has its own live bot token
+(it usually does — `default` is normally someone's personal assistant
+profile, not an empty placeholder), turning this on will make this gateway
+try to start that bot's adapter a second time, colliding with whatever
+already-running gateway currently holds it.
+
+Before setting `multiplex_profiles: true`, confirm one of:
+- `default` on this specific Hermes install has no enabled platforms (check
+  its `config.yaml` **and** its `.env` — a bare `TELEGRAM_BOT_TOKEN` there
+  auto-enables Telegram even with no `platforms:` block saying so), or
+- this profile has been promoted to actually **be** `default` (so the
+  unconditional inclusion is itself, which Hermes's own
+  `_start_secondary_profile_adapters` already skips), or
+- per-trip companion profiles get their own dedicated gateway instead of
+  being hosted here at all (see `profile-templates/familytrip-companion/`'s
+  "Register with trip-intake" section for the tradeoff).
+
+Only once that's confirmed: turn it on, set `gateway.multiplex_profile_allowlist`
+to an explicit list of companion profile names (never leave it unset — unset
+means "every profile this install has," not just these), add one
+`gateway.profile_routes` entry per allowlisted profile, and restart this
+gateway.
