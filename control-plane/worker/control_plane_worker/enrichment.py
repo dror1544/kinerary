@@ -3,11 +3,12 @@
 Sits between transform_intake() and deploy: fills in the parts of a
 trip.config.json that need an external lookup rather than a judgement call —
 currency and emergency numbers for the destination country, map coordinates
-for each phase, a hero photo per phase, and the top-level ``map`` object
-(centre + zoom + stops) the site's map tab needs to open framed on the trip
-instead of on a world view. It is the "port, don't design" half of Sprint
-4.5; the AI phase-narrative/anchor-extraction half is separate and still
-unscheduled.
+for each phase, a hero photo per phase, per-phase map-app deep links plus the
+weather-widget key (the site fetches the forecast itself, client-side), and
+the top-level ``map`` object (centre + zoom + stops) the site's map tab needs
+to open framed on the trip instead of on a world view. It is the "port, don't
+design" half of Sprint 4.5; the AI phase-narrative/anchor-extraction half is
+separate and still unscheduled.
 
 Two hard rules, both from the plan's own test list:
 
@@ -238,6 +239,10 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.geocode_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
+            _add_phase_nav(phase)
+        except Exception:
+            logger.warning("enrichment.nav_failed", extra={"phase": phase.get("id")}, exc_info=True)
+        try:
             if "hero" not in phase:
                 # A Hebrew-only phase title against en.wikipedia is a guaranteed
                 # 404; query the wiki that matches the label's language.
@@ -297,6 +302,39 @@ def _map_stop(phase: dict[str, Any], coords: tuple[float, float]) -> dict[str, A
         stop["hotel"] = str(acc.get("name_en") or acc["name"])
         stop["conf"] = str(acc.get("confirmation") or "–")
     return stop
+
+
+def _add_phase_nav(phase: dict[str, Any]) -> None:
+    """From the coordinates enrich already resolved, deep-link the phase to a
+    map app and wire its weather widget. ``weatherKey`` is what lets the site's
+    own client-side Open-Meteo call fire (site/app.js fetches the forecast live
+    at render time — nothing is fetched here, so it is never stale). ``maps`` /
+    ``waze`` are pure coordinate templating. All three are ``setdefault`` — a
+    hand-authored value always wins."""
+    stop = phase.get("mapStop")
+    if not isinstance(stop, dict):
+        return
+    try:
+        lat, lng = float(stop["lat"]), float(stop["lng"])
+    except (KeyError, TypeError, ValueError):
+        return
+    key = str(phase.get("id") or "").strip()
+    if not key:
+        return
+    stop.setdefault("weatherKey", key)
+    acc = phase.get("accommodation")
+    if isinstance(acc, dict):
+        acc.setdefault("weatherKey", key)
+        acc.setdefault("maps", _maps_url(lat, lng))
+        acc.setdefault("waze", _waze_url(lat, lng))
+
+
+def _maps_url(lat: float, lng: float) -> str:
+    return f"https://www.google.com/maps/search/?api=1&query={lat}%2C{lng}"
+
+
+def _waze_url(lat: float, lng: float) -> str:
+    return f"https://waze.com/ul?ll={lat}%2C{lng}&navigate=yes"
 
 
 def _build_map(out: dict[str, Any]) -> None:

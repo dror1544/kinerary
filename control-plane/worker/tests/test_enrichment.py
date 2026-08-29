@@ -216,6 +216,46 @@ class HeroPhotoTests(unittest.TestCase):
         self.assertFalse(any("en.wikipedia.org" in u for u in http.calls))
 
 
+class PhaseNavTests(unittest.TestCase):
+    def _cfg_with_acc(self):
+        cfg = _config()
+        cfg["phases"][0]["accommodation"] = {"name": "OMO3 Asakusa", "name_en": "OMO3 Asakusa"}
+        return cfg
+
+    def test_a_geocoded_phase_gets_a_weather_key_on_its_map_stop(self) -> None:
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(_config(), "Japan", http=http, pause=0)
+        self.assertEqual("tokyo", out["phases"][0]["mapStop"]["weatherKey"])
+
+    def test_accommodation_gets_maps_waze_and_weather_key(self) -> None:
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(self._cfg_with_acc(), "Japan", http=http, pause=0)
+        acc = out["phases"][0]["accommodation"]
+        self.assertEqual("tokyo", acc["weatherKey"])
+        self.assertIn("google.com/maps", acc["maps"])
+        self.assertIn("35.6764", acc["maps"])
+        self.assertIn("waze.com/ul", acc["waze"])
+        self.assertIn("navigate=yes", acc["waze"])
+
+    def test_nav_is_skipped_when_a_phase_never_geocoded(self) -> None:
+        http = FakeHttp({"q=Kyoto": NOMINATIM_KYOTO})  # Tokyo misses
+        out = enrich_config(self._cfg_with_acc(), "Japan", http=http, pause=0)
+        self.assertNotIn("maps", out["phases"][0].get("accommodation", {}))
+        self.assertIn("maps", out["phases"][1]["accommodation"]) if out["phases"][1].get("accommodation") else None
+
+    def test_a_hand_authored_maps_link_is_kept(self) -> None:
+        cfg = self._cfg_with_acc()
+        cfg["phases"][0]["accommodation"]["maps"] = "https://maps.example/mine"
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://maps.example/mine", out["phases"][0]["accommodation"]["maps"])
+
+    def test_weather_key_rides_through_to_the_top_level_map_stops(self) -> None:
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(_config(), "Japan", http=http, pause=0)
+        self.assertEqual("tokyo", out["map"]["stops"][0]["weatherKey"])
+
+
 class MapObjectTests(unittest.TestCase):
     def _geocoded(self):
         http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})

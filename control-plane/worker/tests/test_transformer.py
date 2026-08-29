@@ -349,7 +349,7 @@ class TransformerTests(unittest.TestCase):
         self.assertLessEqual(len(road_trip["title"]["en"]), 30)
         self.assertNotIn("Washington", road_trip["title"]["en"])
 
-    def test_verbose_name_produces_a_note_with_the_full_original_text(self) -> None:
+    def test_verbose_name_keeps_the_trimmed_context_in_the_note_blurb(self) -> None:
         intake = {
             **JAPAN_INTAKE,
             "phases": _structured([
@@ -359,15 +359,24 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         phase = config["phases"][0]
         self.assertEqual(phase["title"]["en"], "Orlando")
-        self.assertEqual(phase["note"]["en"], "Orlando — Disney and Universal (all travelers)")
+        self.assertIn("2 nights in Orlando", phase["note"]["en"])
+        self.assertIn("Disney and Universal (all travelers)", phase["note"]["en"])
 
-    def test_plain_name_produces_no_note(self) -> None:
+    def test_a_plain_dated_phase_gets_a_stay_blurb_not_a_name_dump(self) -> None:
         intake = {
             **JAPAN_INTAKE,
             "phases": _structured([{"name": "Tokyo", "start": "2026-09-06", "end": "2026-09-10"}]),
         }
-        config = transform_intake(intake)
-        self.assertNotIn("note", config["phases"][0])
+        phase = transform_intake(intake)["phases"][0]
+        self.assertEqual(phase["note"]["en"], "4 nights in Tokyo, 6 Sep–10 Sep")
+        self.assertIn("4 לילות", phase["note"]["he"])
+
+    def test_a_phase_with_no_dates_and_a_plain_name_has_no_note(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo"}]),
+        }
+        self.assertNotIn("note", transform_intake(intake)["phases"][0])
 
     def test_adjacent_same_named_phases_are_merged(self) -> None:
         intake = {

@@ -612,12 +612,10 @@ def _derive_agent(
     return agent or None
 
 
-def _phase_note_text(short: str, originals: list[str]) -> str:
-    """Joins whichever original phase name(s) carried more than just the
-    short label into one note. Context trimmed from the title (an event, a
-    sub-group, a route detail) isn't discarded — it belongs in the site's
-    phase detail view, not a nav tab, so it's kept here instead.
-    """
+def _phase_extra_context(short: str, originals: list[str]) -> str:
+    """Whatever the original phase name(s) carried beyond the short label — an
+    event, a sub-group, a route detail. Not discarded: it belongs in the phase
+    detail view, appended to the blurb below."""
     seen: set[str] = set()
     unique: list[str] = []
     for original in originals:
@@ -627,6 +625,48 @@ def _phase_note_text(short: str, originals: list[str]) -> str:
         seen.add(text)
         unique.append(text)
     return "; ".join(unique)
+
+
+def _fmt_phase_day(value: date, he: bool) -> str:
+    if he:
+        return f"{value.day}.{value.month}"
+    return value.strftime("%-d %b")
+
+
+def _phase_note_text(
+    short: str,
+    originals: list[str],
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    hotel: str = "",
+    day_count: int = 0,
+    lang: str = "en",
+) -> str:
+    """A short readable phase-detail blurb instead of a raw name dump: leads
+    with the stay (nights + dates), names the hotel, says how many days are
+    planned, and appends any real context trimmed from the phase name."""
+    he = lang == "he"
+    parts: list[str] = []
+    if start and end:
+        nights = (end - start).days
+        if nights >= 1:
+            span = f"{_fmt_phase_day(start, he)}–{_fmt_phase_day(end, he)}"
+            parts.append(
+                f"{nights} לילות ב{short}, {span}" if he
+                else f"{nights} night{'s' if nights != 1 else ''} in {short}, {span}"
+            )
+    if hotel:
+        parts.append(f"לינה ב{hotel}" if he else f"Staying at {hotel}")
+    if day_count:
+        parts.append(
+            f"{day_count} ימים מתוכננים" if he
+            else f"{day_count} day{'s' if day_count != 1 else ''} planned"
+        )
+    extra = _phase_extra_context(short, originals)
+    if extra:
+        parts.append(extra)
+    return ". ".join(p for p in parts if p)
 
 
 _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
@@ -774,14 +814,25 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             if accommodation.get("confirmation"):
                 phase["accommodation"]["confirmation"] = str(accommodation["confirmation"])
 
-        note_he = _phase_note_text(entry["short_he"], entry["notes_he"])
-        note_en = _phase_note_text(entry["short_en"], entry["notes_en"])
-        if note_he or note_en:
-            phase["note"] = {"he": note_he or note_en, "en": note_en or note_he}
-
         days = _normalise_days(entry["days"], entry["start"], entry["end"])
         if days:
             phase["days"] = days
+
+        acc_for_note = phase.get("accommodation") or {}
+        hotel_he = str(acc_for_note.get("name") or "")
+        hotel_en = str(acc_for_note.get("name_en") or acc_for_note.get("name") or "")
+        note_he = _phase_note_text(
+            entry["short_he"], entry["notes_he"],
+            start=entry["start"], end=entry["end"],
+            hotel=hotel_he, day_count=len(days), lang="he",
+        )
+        note_en = _phase_note_text(
+            entry["short_en"], entry["notes_en"],
+            start=entry["start"], end=entry["end"],
+            hotel=hotel_en, day_count=len(days), lang="en",
+        )
+        if note_he or note_en:
+            phase["note"] = {"he": note_he or note_en, "en": note_en or note_he}
 
         result.append(phase)
     return result
