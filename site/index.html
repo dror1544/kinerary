@@ -1,551 +1,97 @@
-<!DOCTYPE html>
-<html lang="he" dir="rtl" id="root">
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Family Trip</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;700;800;900&family=Anton&family=Assistant:wght@400;700;800&family=Rubik:wght@400;700;900&family=Frank+Ruhl+Libre:wght@500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css" crossorigin=""/>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
-<link rel="icon" type="image/svg+xml" href="/brand/kinerary-icon.svg">
-<link rel="apple-touch-icon" href="/brand/kinerary-icon.svg">
-<link rel="manifest" href="manifest.json">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Family Trip">
-<link rel="stylesheet" href="styles.css?v=41">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <script src="runtime-base.js"></script>
+  <title>Family Trip</title>
+  <style>
+    :root {
+      color: #10263a;
+      background: #faf8f5;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      display: grid;
+      min-height: 100vh;
+      margin: 0;
+      place-items: center;
+    }
+    main {
+      width: min(92vw, 420px);
+      text-align: center;
+    }
+    .mark {
+      display: inline-grid;
+      width: 58px;
+      height: 58px;
+      margin-bottom: 18px;
+      place-items: center;
+      border-radius: 18px;
+      color: #fff;
+      background: #0e8f86;
+      font-weight: 800;
+      box-shadow: 0 16px 40px rgba(16, 38, 58, .16);
+    }
+    p {
+      margin: 0;
+      color: #405363;
+      line-height: 1.6;
+    }
+    a {
+      color: #0e8f86;
+      font-weight: 700;
+    }
+  </style>
 </head>
 <body>
-
-<!-- ============================================
-     LOGIN OVERLAY
-     ============================================ -->
-<div id="login-overlay" class="login-overlay">
-  <div class="login-box">
-    <img class="login-logo" id="login-logo" src="/brand/kinerary-icon.svg" width="96" height="96" alt="Family Trip">
-    <h2 data-i18n="login_title"></h2>
-    <p class="login-picker-hint" id="login-picker-hint">👇 בחר/י את עצמך — Choose yourself</p>
-    <div class="login-picker" id="login-picker"></div>
-    <input id="user-input" type="text" placeholder="Username" autocomplete="username"/>
-    <div class="pwd-wrap">
-      <input id="pwd-input" type="password" placeholder="Password" autocomplete="current-password"/>
-      <button type="button" class="pwd-eye" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password';this.textContent=this.previousElementSibling.type==='password'?'👁':'🙈'" aria-label="הצג סיסמה">👁</button>
+  <main>
+    <div class="mark">K</div>
+    <p id="status">Opening your trip...</p>
+    <p><a id="fallback" href="classic.html" hidden>Open Classic</a></p>
+  </main>
+  <div class="hero-countdown" id="hero-countdown" hidden>
+    <div class="cd-caption" id="cd-caption"></div>
+    <div class="cd-units" id="cd-units">
+      <div class="cu"><strong id="cd-d">-</strong><small data-i18n="cd_days">days</small></div>
+      <div class="cu-sep">/</div>
+      <div class="cu"><strong id="cd-h">-</strong><small data-i18n="cd_hours">hours</small></div>
+      <div class="cu-sep">/</div>
+      <div class="cu"><strong id="cd-m">-</strong><small data-i18n="cd_min">minutes</small></div>
+      <div class="cu-sep">/</div>
+      <div class="cu"><strong id="cd-s">-</strong><small data-i18n="cd_sec">seconds</small></div>
     </div>
-    <button id="pwd-btn" data-i18n="login_btn">כניסה →</button>
-    <p id="pwd-err" class="login-error"></p>
-    <div id="google-signin-wrap" class="google-signin-wrap" style="display:none">
-      <div class="login-divider" data-i18n="login_or">או</div>
-      <div id="google-signin-btn"></div>
+    <div class="cd-live" id="cd-live" hidden>
+      <div class="cd-live-text">
+        <strong class="cd-live-phase" id="cd-live-phase"></strong>
+        <small class="cd-live-day" id="cd-live-day"></small>
+      </div>
+      <span class="cd-live-arrow" id="cd-live-arrow" aria-hidden="true"></span>
     </div>
-    <div id="telegram-signin-wrap" class="telegram-signin-wrap" style="display:none">
-      <div class="login-divider" data-i18n="login_or">או</div>
-      <div id="telegram-signin-btn"></div>
-    </div>
-    <a class="lf-login-link" onclick="showLostFoundForm()" data-i18n="lf_login_link">🔍 מצאת משהו של הקבוצה? Lost &amp; Found</a>
+    <div class="cd-finished" id="cd-finished" hidden></div>
   </div>
-</div>
+  <script>
+    const runtimePath = window.runtimePath || ((p) => p);
+    const samePrefix = (target) => runtimePath(target).replace(/\/index\.html$/, "/");
+    const fallback = document.getElementById("fallback");
+    const status = document.getElementById("status");
 
-<!-- ============================================
-     PARTICIPANT ENROLLMENT OVERLAY
-     Reached only via a one-time ?enroll=<token> link from
-     POST /api/agent/participants — never part of the normal login flow.
-     ============================================ -->
-<div id="enroll-overlay" class="lf-overlay" style="display:none">
-  <div class="lf-box">
-    <div class="lf-icon">🔑</div>
-    <h2 data-i18n="enroll_title">ברוך/ה הבא/ה</h2>
-    <p data-i18n="enroll_desc">בחר/י סיסמה כדי להצטרף לאתר הטיול.</p>
-    <div class="pwd-wrap">
-      <input id="enroll-pwd-input" type="password" data-i18n-ph="enroll_pwd_ph" placeholder="סיסמה חדשה" autocomplete="new-password"/>
-      <button type="button" class="pwd-eye" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password';this.textContent=this.previousElementSibling.type==='password'?'👁':'🙈'" aria-label="הצג סיסמה">👁</button>
-    </div>
-    <div class="pwd-wrap">
-      <input id="enroll-pwd-confirm-input" type="password" data-i18n-ph="enroll_pwd_confirm_ph" placeholder="אימות סיסמה" autocomplete="new-password"/>
-      <button type="button" class="pwd-eye" onclick="this.previousElementSibling.type=this.previousElementSibling.type==='password'?'text':'password';this.textContent=this.previousElementSibling.type==='password'?'👁':'🙈'" aria-label="הצג סיסמה">👁</button>
-    </div>
-    <button class="lf-submit" onclick="submitEnrollment()" data-i18n="enroll_submit">קבע/י סיסמה →</button>
-    <p id="enroll-err" class="lf-err"></p>
-  </div>
-</div>
+    async function chooseExperience() {
+      try {
+        const response = await fetch(runtimePath("/api/ui-bootstrap"), { cache: "no-store" });
+        if (!response.ok) throw new Error("bootstrap failed");
+        const data = await response.json();
+        const route = data.design_variant === "modern" ? data.routes?.modern || "/modern/" : data.routes?.classic || "/classic.html";
+        window.location.replace(samePrefix(route));
+      } catch (error) {
+        status.textContent = "Classic is ready if the modern shell cannot load.";
+        fallback.hidden = false;
+        fallback.href = samePrefix("/classic.html");
+      }
+    }
 
-<!-- ============================================
-     LOST & FOUND GUEST FORM OVERLAY
-     ============================================ -->
-<div id="lf-overlay" class="lf-overlay" style="display:none">
-  <div class="lf-box">
-    <button class="lf-close" onclick="hideLostFoundForm()">✕</button>
-    <div class="lf-icon">🔍</div>
-    <h2 data-i18n="lf_title">Lost &amp; Found</h2>
-    <p data-i18n="lf_desc">מצאת חפץ השייך לקבוצת הטיול שלנו? מלא את הפרטים ונחזור אליך בהקדם.</p>
-    <input id="lf-name"     type="text" data-i18n-ph="lf_name_ph"     placeholder="השם שלך *" />
-    <input id="lf-phone"    type="tel"  data-i18n-ph="lf_phone_ph"    placeholder="מספר טלפון" />
-    <input id="lf-location" type="text" data-i18n-ph="lf_location_ph" placeholder="איפה מצאת?" />
-    <textarea id="lf-item"  rows="3"    data-i18n-ph="lf_item_ph"     placeholder="תאר את הפריט שמצאת *"></textarea>
-    <button class="lf-submit" onclick="submitLostFound()" data-i18n="lf_submit">שלח דיווח →</button>
-    <p id="lf-err" class="lf-err"></p>
-  </div>
-</div>
-
-<!-- ============================================
-     BOOKING FORM OVERLAY
-     ============================================ -->
-<div id="bk-overlay" class="lf-overlay" style="display:none">
-  <div class="lf-box" style="max-height:90vh;overflow-y:auto">
-    <button class="lf-close" onclick="hideBookingForm()">✕</button>
-    <div class="lf-icon">📋</div>
-    <h2 id="bk-form-title" data-i18n="bk_form_title">הוסף הזמנה</h2>
-    <!-- AI Extract Section -->
-    <div id="bk-extract-section" style="background:linear-gradient(135deg,rgba(124,58,237,.1),rgba(168,85,247,.07));border:1px solid rgba(124,58,237,.25);border-radius:10px;padding:12px 14px;margin-bottom:14px">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:13px;font-weight:600;color:var(--ink)">
-        <span>✨</span><span data-i18n="bk_extract_heading">חלץ פרטים עם AI</span>
-      </div>
-      <input id="bk-extract-url" type="url" data-i18n-ph="bk_extract_url_ph" placeholder="הדבק קישור להזמנה (URL)" style="width:100%;margin-bottom:8px;padding:9px 10px;border-radius:7px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink);font-size:13px"/>
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:var(--ink-2)">
-          <span data-i18n="bk_extract_or_file">או PDF:</span>
-          <input id="bk-extract-file" type="file" accept="application/pdf" style="font-size:12px;max-width:160px"/>
-        </label>
-        <button onclick="extractBookingWithAI()" id="bk-extract-btn" style="margin-right:auto;padding:6px 16px;border-radius:7px;border:none;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-size:13px;font-weight:600;cursor:pointer" data-i18n="bk_extract_btn">חלץ ✨</button>
-      </div>
-      <p id="bk-extract-status" style="margin-top:8px;font-size:12px;color:var(--ink-2);min-height:16px"></p>
-    </div>
-    <div style="border-top:1px solid var(--border);margin-bottom:12px;opacity:.4"></div>
-    <input id="bk-id" type="hidden" value=""/>
-    <select id="bk-phase" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)">
-    </select>
-    <select id="bk-type" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)">
-      <option value="flight"     data-i18n="bk_type_flight">טיסה</option>
-      <option value="hotel"      data-i18n="bk_type_hotel">מלון</option>
-      <option value="car"        data-i18n="bk_type_car">רכב</option>
-      <option value="attraction" data-i18n="bk_type_attraction">אטרקציה</option>
-      <option value="other"      data-i18n="bk_type_other">אחר</option>
-    </select>
-    <input id="bk-name"       type="text"   data-i18n-ph="bk_ph_name"       placeholder="שם / תיאור *"/>
-    <input id="bk-date-from"  type="date"   placeholder="תאריך מ-" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)"/>
-    <input id="bk-date-to"    type="date"   placeholder="תאריך עד" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)"/>
-    <input id="bk-passengers" type="text"   data-i18n-ph="bk_ph_passengers" placeholder="נוסעים / אורחים"/>
-    <input id="bk-conf"       type="text"   data-i18n-ph="bk_ph_conf"       placeholder="מספר אישור"/>
-    <input id="bk-pin"        type="text"   data-i18n-ph="bk_ph_pin"        placeholder="PIN"/>
-    <input id="bk-cost"       type="number" data-i18n-ph="bk_ph_cost"       placeholder="עלות ($)" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)"/>
-    <textarea id="bk-notes" rows="2" data-i18n-ph="bk_ph_notes" placeholder="הערות" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink);resize:vertical"></textarea>
-    <input id="bk-google-wallet" type="url" data-i18n-ph="bk_ph_google_wallet" placeholder="Google Wallet URL" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)"/>
-    <input id="bk-location-url" type="url" data-i18n-ph="bk_ph_location_url" placeholder="Location URL (Google Maps / Waze)" style="width:100%;margin-bottom:10px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--card-bg);color:var(--ink)"/>
-    <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;color:var(--ink-2);font-size:14px">
-      <span data-i18n="bk_upload_pdf">צרף אישור PDF</span>
-      <input id="bk-file" type="file" accept="application/pdf" style="font-size:13px"/>
-    </label>
-    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;color:var(--ink-2);font-size:14px">
-      <span data-i18n="bk_upload_pkpass">🍎 Apple Wallet (.pkpass)</span>
-      <input id="bk-pkpass-file" type="file" accept=".pkpass" style="font-size:13px"/>
-    </label>
-    <button class="lf-submit" onclick="submitBooking()" data-i18n="bk_add_btn">הוסף הזמנה</button>
-    <p id="bk-err" class="lf-err"></p>
-  </div>
-</div>
-
-<!-- ============================================
-     SHELL
-     ============================================ -->
-<div class="shell" data-palette="blue" data-font="heebo">
-
-  <!-- HERO (dynamic per tab) -->
-  <section class="hero">
-    <div class="hero-img" id="hero-img"></div>
-    <div class="topbar">
-      <div class="topactions">
-        <button class="burger" id="burger-btn" aria-label="menu"><span></span><span></span><span></span></button>
-        <div class="topbar-logo-wrap" onclick="switchTab('home')" style="cursor:pointer">
-          <img src="/brand/kinerary-icon.svg" class="topbar-logo" id="topbar-logo" width="44" height="44" alt="Family Trip">
-          <img src="ara_united_transparent_vertical_spin.gif" class="topbar-logo-gif" id="topbar-logo-gif" width="44" height="44" alt="">
-        </div>
-      </div>
-      <div class="topbar-center">
-        <div class="brand" id="topbar-brand">TRIP <span class="reg">®</span></div>
-        <nav class="topnav">
-          <a data-tab="home" class="active">HOME</a>
-          <a data-tab="mapview">MAP</a>
-        </nav>
-      </div>
-      <button class="lang-toggle" id="lang-toggle" aria-label="Switch language">
-        <span class="lang-opt active" data-l="he">עב</span>
-        <span class="lang-sep">/</span>
-        <span class="lang-opt" data-l="en">EN</span>
-      </button>
-    </div>
-
-    <div class="hero-content">
-      <h1 class="hero-headline" id="hero-headline">TRIP<span class="dot">.</span></h1>
-      <div class="hero-bottom">
-        <div class="hero-left">
-          <div class="label" id="hero-label"></div>
-          <h3 id="hero-subtitle"></h3>
-          <p id="hero-blurb"></p>
-        </div>
-
-        <div class="hero-countdown" id="hero-countdown">
-          <div class="cd-caption" id="cd-caption"></div>
-          <div class="cd-units" id="cd-units">
-            <div class="cu"><strong id="cd-d">–</strong><small data-i18n="cd_days">ימים</small></div>
-            <div class="cu-sep">/</div>
-            <div class="cu"><strong id="cd-h">–</strong><small data-i18n="cd_hours">שעות</small></div>
-            <div class="cu-sep">/</div>
-            <div class="cu"><strong id="cd-m">–</strong><small data-i18n="cd_min">דקות</small></div>
-            <div class="cu-sep">/</div>
-            <div class="cu"><strong id="cd-s">–</strong><small data-i18n="cd_sec">שניות</small></div>
-          </div>
-          <!-- Mid-trip the counter is replaced by this: current phase + trip
-               day, and the whole card becomes a link into that phase. -->
-          <div class="cd-live" id="cd-live" hidden>
-            <div class="cd-live-text">
-              <strong class="cd-live-phase" id="cd-live-phase"></strong>
-              <small class="cd-live-day" id="cd-live-day"></small>
-            </div>
-            <span class="cd-live-arrow" id="cd-live-arrow" aria-hidden="true"></span>
-          </div>
-          <div class="cd-finished" id="cd-finished" hidden></div>
-        </div>
-
-        <div class="hero-right">
-          <div class="hero-meta" id="hero-meta">–</div>
-          <button class="cta-pill" id="hero-cta">בחר שלב <span class="arrow">←</span></button>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       HOME
-       ============================================ -->
-  <section class="section active" id="home">
-
-    <div class="statstrip" id="stat-strip"></div>
-
-    <div class="sec-body">
-      <div class="sec-inner">
-
-        <div id="home-alerts"></div>
-
-        <h3 class="section-h3"><span class="num ltr">01</span><span data-i18n="h3_phases">חלוקת השלבים</span></h3>
-        <div class="phases" id="home-phases"></div>
-
-        <h3 class="section-h3"><span class="num ltr">02</span><span data-i18n="h3_overview">סקירה מלאה</span></h3>
-        <div id="home-overview"></div>
-
-        <h3 class="section-h3"><span class="num ltr">03</span><span data-i18n="h3_who">מי בטיול</span></h3>
-        <div class="families" id="families-section"></div>
-
-        <h3 class="section-h3"><span class="num ltr">04</span><span data-i18n="h3_tasks">משימות אישיות</span></h3>
-        <div class="tbl-wrap" id="tasks-table-wrap"></div>
-
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       MAP VIEW
-       ============================================ -->
-  <section class="section" id="mapview">
-    <div class="sec-body">
-      <div class="sec-inner">
-        <h2 class="section-h2" data-i18n="map_h2">מפת המסלול</h2>
-        <p data-i18n="map_sub">לחץ על כל יעד לצפות בפרטי הלינה, תאריכים ואטרקציות עיקריות.</p>
-        <div id="leaflet-map"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Per-phase content (hotel card, day-by-day schedule, RSVP, packing, ratings,
-       photos) is entirely config-driven — buildPhaseNav() in app.js creates a
-       <section id="<phaseId>"> for every phase in trip.config.json at runtime.
-       No static NY/Dallas/Colorado/West Coast markup here on purpose: a static
-       section with a phase-matching id would silently take precedence over a
-       real trip's own phase of the same id (see buildPhaseNav()'s existence
-       check) — exactly the bug this generalization fixes. -->
-  <!-- ============================================
-       BOOKINGS
-       ============================================ -->
-  <section class="section" id="bookings">
-    <div class="sec-body">
-      <div class="sec-inner">
-        <h2 class="section-h2" data-i18n="bk_h2">כל ההזמנות · מאושר ובטיפול</h2>
-        <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
-          <button id="bk-add-main" onclick="showBookingForm()" style="display:none;padding:8px 18px;border-radius:8px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:14px" data-i18n="bk_add_btn">+ הוסף הזמנה</button>
-        </div>
-        <div id="bookings-content"><p style="color:var(--ink-2);padding:24px 0;text-align:center">...</p></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       BUDGET
-       ============================================ -->
-  <section class="section" id="budget">
-    <div class="sec-body">
-      <div class="sec-inner">
-        <h2 class="section-h2" id="budget-h2">תקציב מסע</h2>
-        <div class="alert alert-i" id="budget-note"></div>
-        <div id="budget-missing-alert" class="alert alert-w" style="display:none"></div>
-        <div id="budget-content">
-          <div class="budget-loading">טוען נתוני תקציב…</div>
-        </div>
-        <div id="budget-grand-total" class="budget-grand-total" style="display:none"></div>
-
-        <!-- Add cost form (auth only) -->
-        <div id="budget-add-wrap" style="display:none;margin-top:24px">
-          <h3 class="section-h3"><span class="num ltr">+</span><span data-i18n="budget_add_title">הוסף הוצאה</span></h3>
-          <div class="budget-add-form">
-            <select id="ba-phase">
-            </select>
-            <select id="ba-category">
-              <option value="flight" data-i18n="budget_cat_flight">טיסה</option>
-              <option value="hotel" data-i18n="budget_cat_hotel">מלון</option>
-              <option value="car" data-i18n="budget_cat_car">רכב</option>
-              <option value="attraction" data-i18n="budget_cat_attr">אטרקציה</option>
-              <option value="food" data-i18n="budget_cat_food">אוכל</option>
-              <option value="insurance" data-i18n="budget_cat_ins">ביטוח</option>
-              <option value="other" data-i18n="budget_cat_other">אחר</option>
-            </select>
-            <input id="ba-desc" type="text" placeholder="תיאור" data-i18n-ph="budget_ph_desc" />
-            <input id="ba-amount" type="number" min="0" step="1" placeholder="$0" />
-            <label class="budget-estimate-label">
-              <input id="ba-est" type="checkbox" /> <span data-i18n="budget_estimate">הערכה בלבד</span>
-            </label>
-            <button class="budget-add-btn" onclick="addBudgetItem()" data-i18n="budget_add_btn">הוסף</button>
-          </div>
-          <div id="budget-add-err" class="lf-err"></div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       PHOTOS
-       ============================================ -->
-  <section class="section" id="photos">
-    <div class="sec-body">
-      <div class="sec-inner">
-
-        <h2 class="section-h2" data-i18n="photos_h2">גלריית הטיול</h2>
-
-        <div class="immich-status-bar">
-          <span class="immich-dot" id="immich-dot"></span>
-          <span id="immich-status-text">בודק חיבור לגלריה...</span>
-        </div>
-
-        <h3 class="section-h3"><span class="num ltr">01</span><span data-i18n="photos_h3">העלאה לפי שלב טיול</span></h3>
-        <div class="grid2" id="photo-uploads"></div>
-        <div id="upload-log" style="margin-top:14px;font-size:13.5px;color:var(--ink-2)"></div>
-        <div id="photos-gallery" class="photos-gallery"></div>
-
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       INFO
-       ============================================ -->
-  <section class="section" id="info">
-    <div class="sec-body">
-      <div class="sec-inner">
-
-        <h2 class="section-h2" data-i18n="info_h2">מידע שימושי · בריאות, חירום, אריזה</h2>
-
-        <div id="info-block-emrg">
-          <h3 class="section-h3"><span class="num ltr">01</span><span data-i18n="info_h3_emrg">📞 חירום ומידע למדינה</span></h3>
-          <p class="info-emrg-note" data-i18n="info_emrg_note">מספרי חירום, מטבע וקידומת חיוג — נשלף אוטומטית לכל מדינה ביעד (ראו scripts/country-info.js). בדקו שוב לפני הנסיעה.</p>
-          <div class="grid2" id="info-countries"></div>
-        </div>
-
-        <div id="info-block-health">
-          <h3 class="section-h3"><span class="num ltr">02</span><span data-i18n="info_h3_health">🩺 בריאות</span></h3>
-          <ul id="info-health"></ul>
-        </div>
-
-        <div id="info-block-hosp">
-          <h3 class="section-h3"><span class="num ltr">03</span><span data-i18n="info_h3_hosp">🏥 בתי חולים קרובים</span></h3>
-          <ul id="info-hospitals"></ul>
-        </div>
-
-        <div id="info-block-money">
-          <h3 class="section-h3"><span class="num ltr">04</span><span data-i18n="info_h3_money">💳 כסף וכרטיסים</span></h3>
-          <ul id="info-money"></ul>
-        </div>
-
-        <div id="info-block-comm">
-          <h3 class="section-h3"><span class="num ltr">05</span><span data-i18n="info_h3_comm">📱 תקשורת</span></h3>
-          <ul id="info-communication"></ul>
-        </div>
-
-        <h3 class="section-h3"><span class="num ltr">06</span><span data-i18n="info_h3_pack">🎒 אריזה כללית</span></h3>
-        <div class="pack-grid" id="pack-general"></div>
-
-        <div id="info-block-age">
-          <h3 class="section-h3"><span class="num ltr">07</span><span data-i18n="info_h3_age">⚠️ הגבלות גיל</span></h3>
-          <ul id="info-age-notes"></ul>
-        </div>
-
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================
-       LOST & FOUND (authenticated users)
-       ============================================ -->
-  <section class="section" id="lostfound">
-    <div class="sec-body">
-      <div class="sec-inner">
-        <h2 class="section-h2" data-i18n="lf_section_h2">🔍 Lost &amp; Found</h2>
-        <p style="color:var(--ink-2);margin-bottom:20px" data-i18n="lf_section_desc">חפצים שדווחו כנמצאו על ידי אנשים שפגשו את הקבוצה.</p>
-        <div id="lf-list" class="lf-list"><div class="lf-loading">טוען...</div></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- FOOTER -->
-  <footer>
-    <p id="site-footer" data-i18n-html="footer">Made with ❤️ for the trip</p>
-  </footer>
-
-</div>
-
-<!-- ============================================
-     TWEAKS PANEL
-     ============================================ -->
-<aside class="tweaks">
-  <div class="t-head">
-    <div class="t-title">TWEAKS</div>
-    <button class="t-close" aria-label="close">✕</button>
-  </div>
-  <div class="t-group">
-    <div class="t-label">פלטה</div>
-    <div class="t-swatches">
-      <div class="t-swatch" data-tweak-key="palette" data-tweak-value="blue" style="--c1:#cfe1f2;--c2:#0a0f1c" title="Sky Blue"></div>
-      <div class="t-swatch" data-tweak-key="palette" data-tweak-value="desert" style="--c1:#f4ead5;--c2:#c1432a" title="Desert"></div>
-      <div class="t-swatch" data-tweak-key="palette" data-tweak-value="pine" style="--c1:#e8e4dc;--c2:#0a3d2c" title="Pine"></div>
-      <div class="t-swatch" data-tweak-key="palette" data-tweak-value="midnight" style="--c1:#161616;--c2:#e8b647" title="Midnight"></div>
-    </div>
-  </div>
-  <div class="t-group">
-    <div class="t-label">פונט</div>
-    <div class="t-buttons">
-      <button class="t-btn" data-tweak-key="font" data-tweak-value="heebo">Heebo</button>
-      <button class="t-btn" data-tweak-key="font" data-tweak-value="assistant">Assistant</button>
-      <button class="t-btn" data-tweak-key="font" data-tweak-value="rubik">Rubik</button>
-      <button class="t-btn" data-tweak-key="font" data-tweak-value="frank">Frank Ruhl</button>
-    </div>
-  </div>
-  <div class="t-group">
-    <div class="t-label">פוטו של ניו יורק</div>
-    <div class="t-buttons">
-      <button class="t-btn" data-tweak-key="nyPhoto" data-tweak-value="0">Skyline</button>
-      <button class="t-btn" data-tweak-key="nyPhoto" data-tweak-value="1">Brooklyn Br.</button>
-      <button class="t-btn" data-tweak-key="nyPhoto" data-tweak-value="2">Central Park</button>
-    </div>
-  </div>
-</aside>
-
-<!-- ============================================
-     SIDE MENU
-     ============================================ -->
-<div class="side-overlay" id="side-overlay"></div>
-<aside class="side-menu" id="side-menu">
-  <div class="sm-head">
-    <img src="/brand/kinerary-icon.svg" class="sm-logo" id="sm-logo" alt="Family Trip">
-    <button class="sm-close" id="sm-close">✕</button>
-  </div>
-  <div class="sm-user" id="sm-user" style="display:none">
-    <div class="sm-user-avatar" id="sm-user-avatar"></div>
-    <div class="sm-user-info">
-      <div class="sm-user-name" id="sm-user-name"></div>
-      <div class="sm-user-family" id="sm-user-family"></div>
-    </div>
-  </div>
-  <nav class="sm-nav">
-    <div class="sm-section">
-      <div class="sm-section-label" data-i18n="sm_nav">ניווט</div>
-      <a class="sm-link" data-tab="home" data-i18n="sm_home">🏠 Home</a>
-      <a class="sm-link" data-tab="mapview" data-i18n="sm_map">🗺️ Map</a>
-      <div id="sm-phase-links"></div>
-    </div>
-    <div class="sm-divider"></div>
-    <div class="sm-section">
-      <div class="sm-section-label" data-i18n="sm_logistics">לוגיסטיקה</div>
-      <a class="sm-link" data-tab="bookings" data-i18n="sm_bookings">📋 Bookings</a>
-      <a class="sm-link" data-tab="budget" data-i18n="sm_budget">💰 Budget</a>
-      <a class="sm-link" data-tab="photos" data-i18n="sm_photos">📷 Photos</a>
-      <a class="sm-link" data-tab="info" data-i18n="sm_info">ℹ️ Info</a>
-      <a class="sm-link" data-tab="lostfound" id="sm-lf-link"><span data-i18n="sm_lostfound">🔍 Lost &amp; Found</span> <span class="lf-badge" id="lf-badge" style="display:none"></span></a>
-    </div>
-    <div class="sm-divider"></div>
-    <div class="sm-section" id="sm-trivia-section" style="display:none">
-      <a class="sm-link" id="sm-trivia-link" href="/trivia.html" style="font-weight:700;background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(168,85,247,.15));border-radius:8px;padding:8px 12px;">🏆 Trip Quiz</a>
-    </div>
-    <div class="sm-divider"></div>
-    <div class="sm-section">
-      <button class="sm-link sm-logout" id="sm-logout-btn">🚪 Logout</button>
-    </div>
-  </nav>
-</aside>
-
-<div class="bk-modal-overlay" id="bk-modal-overlay"></div>
-<div class="bk-modal" id="bk-modal" role="dialog">
-  <div class="bk-modal-head">
-    <span class="bk-modal-title" id="bk-modal-title"></span>
-    <button class="bk-modal-close" id="bk-modal-close">✕</button>
-  </div>
-  <div class="bk-modal-body" id="bk-modal-body"></div>
-</div>
-
-<div class="avatar-lightbox" id="avatar-lightbox">
-  <div class="avatar-lb-box">
-    <button class="avatar-lb-close" id="avatar-lb-close" aria-label="Close">✕</button>
-    <div class="avatar-lb-wrap">
-      <div class="avatar-lb-track" id="avatar-lb-track"></div>
-    </div>
-    <div class="avatar-lb-nav" id="avatar-lb-nav">
-      <button class="avatar-lb-arr" id="avatar-lb-prev">‹</button>
-      <div class="avatar-lb-dots" id="avatar-lb-dots"></div>
-      <button class="avatar-lb-arr" id="avatar-lb-next">›</button>
-    </div>
-    <button class="avatar-lb-use" id="avatar-lb-use"></button>
-    <input type="file" id="avatar-lb-file" accept="image/*" style="display:none">
-    <button class="avatar-lb-upload" id="avatar-lb-upload"></button>
-    <button class="avatar-lb-upload" id="avatar-lb-reset-default" style="display:none" data-i18n="avatar_reset_default"></button>
-    <button class="avatar-lb-upload" id="avatar-lb-pw-toggle" data-i18n="avatar_change_password"></button>
-    <div class="avatar-lb-crop-panel" id="avatar-lb-crop-panel">
-      <div class="avatar-lb-crop-wrap">
-        <img id="avatar-lb-crop-img" src="" alt="">
-      </div>
-      <div class="avatar-lb-crop-status" id="avatar-lb-crop-status"></div>
-      <div class="avatar-lb-crop-actions">
-        <button class="avatar-lb-crop-cancel" id="avatar-lb-crop-cancel"></button>
-        <button class="avatar-lb-crop-confirm" id="avatar-lb-crop-confirm"></button>
-      </div>
-    </div>
-    <div class="avatar-lb-pw-panel" id="avatar-lb-pw-panel">
-      <input type="password" class="avatar-lb-pw-input" id="avatar-lb-pw-new"
-             data-i18n-ph="avatar_new_password_ph" autocomplete="new-password">
-      <input type="password" class="avatar-lb-pw-input" id="avatar-lb-pw-confirm-input"
-             data-i18n-ph="avatar_confirm_password_ph" autocomplete="new-password">
-      <div class="avatar-lb-crop-status" id="avatar-lb-pw-status"></div>
-      <div class="avatar-lb-crop-actions">
-        <button class="avatar-lb-crop-cancel" id="avatar-lb-pw-cancel" data-i18n="avatar_crop_cancel"></button>
-        <button class="avatar-lb-crop-confirm" id="avatar-lb-pw-save" data-i18n="avatar_pw_save"></button>
-      </div>
-    </div>
-    <div class="avatar-lb-google-wrap" id="avatar-lb-google-wrap" style="display:none">
-      <div class="avatar-lb-crop-status" id="avatar-lb-google-status"></div>
-      <div id="avatar-lb-google-btn"></div>
-      <button class="avatar-lb-upload" id="avatar-lb-google-disconnect" style="display:none" data-i18n="avatar_google_disconnect"></button>
-    </div>
-  </div>
-</div>
-
-<script src="translations.js?v=27"></script>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js" crossorigin=""></script>
-<script src="app.js?v=58"></script>
+    chooseExperience();
+  </script>
 </body>
 </html>

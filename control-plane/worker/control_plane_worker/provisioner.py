@@ -12,6 +12,7 @@ kinerary-deploy/deploy.sh via subprocess.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import secrets
@@ -408,6 +409,28 @@ class ProvisionerWorker:
                     WHERE  id = %s
                     """,
                     (trip_id,),
+                )
+
+                # Publish only an opaque route reference. The private provider
+                # address remains in the job result and can be resolved solely
+                # through the control plane's authenticated internal adapter.
+                route_ref = "route_" + hashlib.sha256(trip_id.encode("utf-8")).hexdigest()[:32]
+                cur.execute(
+                    """
+                    INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state)
+                    VALUES (%s, %s, 'ready')
+                    ON CONFLICT (trip_id) DO UPDATE
+                    SET state = 'ready', updated_at = now()
+                    """,
+                    (trip_id, route_ref),
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO control_plane.funnel_events(id, event_name, trip_id)
+                    VALUES (%s, 'provisioning_completed', %s)
+                    """,
+                    ("event_" + secrets.token_hex(16), trip_id),
                 )
 
                 # Enqueue organizer notification. recipient is the owner's real,

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Modern Trip SPA Forward Plan</title>
+  <style>
+    :root {
+      --ink: #10263a;
+      --soft: #405363;
+      --muted: #71818d;
+      --teal: #0e8f86;
+      --teal-light: #5fd3c4;
+      --coral: #f26b3a;
+      --paper: #faf8f5;
+      --line: rgba(16, 38, 58, .14);
+      --card: #fff;
+      --shadow: 0 18px 44px rgba(16, 38, 58, .1);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: linear-gradient(180deg, rgba(95,211,196,.18), transparent 320px), var(--paper);
+      font-family: "DM Sans", "Assistant", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    main { width: min(1160px, calc(100% - 32px)); margin: 0 auto; padding: 44px 0 72px; }
+    header { display: grid; gap: 16px; max-width: 920px; margin-bottom: 30px; }
+    .eyebrow { color: var(--teal); font-size: 13px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(38px, 6vw, 72px); line-height: .98; letter-spacing: -.04em; }
+    h2 { margin: 0 0 12px; font-size: clamp(24px, 3vw, 36px); line-height: 1.08; letter-spacing: -.025em; }
+    h3 { margin: 0 0 8px; font-size: 19px; }
+    p { margin: 0; color: var(--soft); }
+    small { color: var(--muted); font-weight: 700; }
+
+    section, .card {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: rgba(255,255,255,.86);
+      box-shadow: var(--shadow);
+    }
+
+    section { padding: clamp(18px, 3vw, 30px); margin-top: 18px; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { padding: 18px; box-shadow: none; background: var(--card); }
+    .tag { display: inline-flex; width: max-content; border-radius: 999px; padding: 4px 10px; color: var(--teal); background: rgba(95,211,196,.18); font-size: 12px; font-weight: 900; text-transform: uppercase; }
+    .tag.warn { color: #9a3412; background: rgba(242,107,58,.14); }
+    .tag.todo { color: var(--muted); background: rgba(16,38,58,.07); }
+    .tag.done { color: #116149; background: rgba(14,143,134,.14); }
+
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .flow .node { position: relative; min-height: 112px; border: 1px solid var(--line); border-radius: 16px; padding: 14px; background: #fff; }
+    .flow .node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -16px;
+      top: 40%;
+      color: var(--coral);
+      font-weight: 900;
+      z-index: 1;
+    }
+
+    .schema {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .box {
+      min-height: 96px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: #fff;
+    }
+    .arrow { color: var(--coral); font-size: 26px; font-weight: 900; }
+    .matrix { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 16px; }
+    .matrix th, .matrix td { border-bottom: 1px solid var(--line); padding: 12px; text-align: left; vertical-align: top; }
+    .matrix th { color: var(--teal); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; background: rgba(95,211,196,.12); }
+    .matrix tr:last-child td { border-bottom: 0; }
+
+    ul { margin: 10px 0 0; padding-left: 20px; color: var(--soft); }
+    li + li { margin-top: 6px; }
+    .priority { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: start; padding: 14px 0; border-bottom: 1px solid var(--line); }
+    .priority:last-child { border-bottom: 0; }
+
+    @media (max-width: 820px) {
+      .grid.two, .grid.three, .flow, .schema { grid-template-columns: 1fr; }
+      .flow .node:not(:last-child)::after, .arrow { display: none; }
+      .priority { grid-template-columns: 1fr; }
+      main { width: min(100% - 24px, 1160px); padding-top: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">Kinerary · Modern Trip SPA</div>
+      <h1>Forward plan from prototype to Classic parity</h1>
+      <p>
+        Current state after the first implementation pass: Modern has the new living-journey backbone, but Classic
+        remains the complete production experience. The next work is mostly parity reconstruction, not another design reset.
+      </p>
+    </header>
+
+    <section>
+      <h2>Current stage</h2>
+      <div class="grid three">
+        <div class="card">
+          <span class="tag done">Done</span>
+          <h3>Foundation</h3>
+          <p>Worktree, landing merge, shared Kinerary brand assets, Classic/Modern routing, participant SPA shell, mobile nav, and phase-aware hero are in place.</p>
+        </div>
+        <div class="card">
+          <span class="tag done">Core done</span>
+          <h3>SQL living itinerary</h3>
+          <p>Original/active itinerary revisions, immutable stored versions, compatibility adapters, provenance, and active itinerary API are implemented.</p>
+        </div>
+        <div class="card">
+          <span class="tag warn">Beta slice</span>
+          <h3>Daily Journey</h3>
+          <p>Today, Journey, Moments, More, weather/flight adapters, confirmations summary, bot handoff, and issue capture exist, but the full Classic feature set is not rebuilt yet.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Simple system schema</h2>
+      <div class="schema" aria-label="Architecture diagram">
+        <div class="box">
+          <h3>Trip data</h3>
+          <p>Config, bookings, participants, photos, tasks, budget, trivia, plan revisions.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box">
+          <h3>Runtime APIs</h3>
+          <p>Existing Classic APIs plus new living-journey APIs and compatibility adapters.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="box">
+          <h3>Two experiences</h3>
+          <p>Classic remains rollback. Modern becomes default only after parity acceptance.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Modern surface schema</h2>
+      <div class="schema" aria-label="Modern navigation diagram">
+        <div class="box">
+          <h3>Today</h3>
+          <p>Trip clock, now/next, weather, flights, confirmations, companion, alerts.</p>
+        </div>
+        <div class="arrow">↔</div>
+        <div class="box">
+          <h3>Journey</h3>
+          <p>Phase rail, day spine, timeline cards, tickets, confirmations, maps, enrichment.</p>
+        </div>
+        <div class="arrow">↔</div>
+        <div class="box">
+          <h3>Moments + More</h3>
+          <p>Memory capture, photos, workflows, organizer controls, Classic fallback until parity.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Parity backlog: what Modern must rebuild from Classic</h2>
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th>Area</th>
+            <th>Classic has today</th>
+            <th>Modern status</th>
+            <th>Go-forward requirement</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Identity</td>
+            <td>Password login, enrollment, avatar upload/crop, password change, Google/Telegram login paths.</td>
+            <td>Login only.</td>
+            <td>Rebuild account/profile drawer with avatar, password, Telegram/Google status, organizer-safe controls.</td>
+          </tr>
+          <tr>
+            <td>Home + map</td>
+            <td>Overview cards, phase list, map view, families, alerts, trip clock.</td>
+            <td>Trip clock and phase Journey exist; map view missing.</td>
+            <td>Fold overview into Today/Journey and add a proper map/destination layer.</td>
+          </tr>
+          <tr>
+            <td>Daily plan</td>
+            <td>Phase tabs, active plan edits, day swaps, import/export/enrichment, original comparison for organizer.</td>
+            <td>Participant timeline exists; organizer plan editor mostly not in Modern.</td>
+            <td>Add organizer-only editor, revision diff, conflict handling, and original-plan comparison UI.</td>
+          </tr>
+          <tr>
+            <td>Bookings</td>
+            <td>CRUD, AI extract from PDF/URL, confirmations, wallet links/files, phase grouping.</td>
+            <td>Daily cards expose stored links; booking management missing.</td>
+            <td>Modern booking center plus fast access from relevant itinerary cards.</td>
+          </tr>
+          <tr>
+            <td>Budget</td>
+            <td>Separate budget module with conversion, missing-cost alerts, add/edit/delete.</td>
+            <td>Only links back to Classic; costs intentionally absent from itinerary.</td>
+            <td>Rebuild Budget as its own More/Organizer module, still never inside daily plan cards.</td>
+          </tr>
+          <tr>
+            <td>Tasks + packing + info</td>
+            <td>Tasks done state, emergency/country info, health, hospitals, money, communication, packing, age notes.</td>
+            <td>Readiness summary only.</td>
+            <td>Create a Readiness hub and phase/day contextual info cards.</td>
+          </tr>
+          <tr>
+            <td>Photos + reactions</td>
+            <td>Uploads, phase albums, Immich hooks, gallery, reactions, comments.</td>
+            <td>Moments notes only; no full photo parity.</td>
+            <td>Unify Moments with photo references while preserving uploads, reactions, comments, and moderation.</td>
+          </tr>
+          <tr>
+            <td>Social feedback</td>
+            <td>RSVPs, venue comments, ratings, photo comments.</td>
+            <td>Missing.</td>
+            <td>Add member interactions where they belong: activity card, moment, photo, and post-trip recap.</td>
+          </tr>
+          <tr>
+            <td>Lost &amp; Found</td>
+            <td>Public report form plus authenticated triage/status.</td>
+            <td>Classic link only.</td>
+            <td>Rebuild as a lightweight report/triage flow, likely under More.</td>
+          </tr>
+          <tr>
+            <td>Trivia/game layer</td>
+            <td>Trivia state, SSE events, scores, organizer controls, questions.</td>
+            <td>Classic link only.</td>
+            <td>Rebuild current trivia first, then extend toward achievements/avatar game ideas later.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Recommended go-forward milestones</h2>
+      <div class="flow" aria-label="Milestone flow">
+        <div class="node">
+          <span class="tag done">Now</span>
+          <h3>Stabilize beta shell</h3>
+          <p>Keep Today/Journey direction, fix the Classic switch, review routing/design details with the organizer, and verify mobile/RTL.</p>
+        </div>
+        <div class="node">
+          <span class="tag warn">Next</span>
+          <h3>Operational parity</h3>
+          <p>Bookings, confirmations, tickets, wallet, Google Maps/Waze, flights, weather, and attraction links.</p>
+        </div>
+        <div class="node">
+          <span class="tag warn">Then</span>
+          <h3>Organizer plan editing</h3>
+          <p>Modern plan editor can wait until the member experience is stable, but Classic fallback must work reliably meanwhile.</p>
+        </div>
+        <div class="node">
+          <span class="tag warn">Then</span>
+          <h3>Budget + readiness</h3>
+          <p>Budget remains separate from the daily plan, then tasks, packing, and readiness become Modern screens.</p>
+        </div>
+        <div class="node">
+          <span class="tag todo">Gate</span>
+          <h3>Ratings + Moments</h3>
+          <p>Attraction rating, photo-led memory capture, group-chat import ideas, then lower-priority Classic features.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Decisions from organizer review</h2>
+      <div class="grid two">
+        <div class="card">
+          <span class="tag done">Routing</span>
+          <h3>Current routing is acceptable for now</h3>
+          <p>Keep the four-tab mobile structure, but interview on design issues per part. Desktop/tablet can become richer without changing the core mobile route model.</p>
+        </div>
+        <div class="card">
+          <span class="tag done">Bot name</span>
+          <h3>Display only, settings later</h3>
+          <p>The bot name comes from the trip-creation interview. Modern should display that name and open Telegram. Organizer bot-setting improvements require Hermes agent updates and are future scope.</p>
+        </div>
+        <div class="card">
+          <span class="tag warn">Classic fallback</span>
+          <h3>Fallback is required, but currently suspect</h3>
+          <p>Organizer plan editing may stay Classic-only during member stabilization, but the Modern-to-Classic switch must be fixed before Classic can carry that responsibility.</p>
+        </div>
+        <div class="card">
+          <span class="tag warn">Moments</span>
+          <h3>Make memory capture more active</h3>
+          <p>Moments should become the home for photos and memory capture, but not as a blank writing box. It should suggest memories from photos, ratings, group chat signals, and the active trip day.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Immediate build order</h2>
+      <div class="priority">
+        <span class="tag warn">1</span>
+        <div>
+          <h3>Review and stabilize structure/design</h3>
+          <p>Interview on Today, Journey, Moments, More, desktop/tablet routes, and mobile behavior. Fix the Classic switch before relying on Classic fallback.</p>
+        </div>
+      </div>
+      <div class="priority">
+        <span class="tag warn">2</span>
+        <div>
+          <h3>Bookings/tickets/maps first</h3>
+          <p>Bookings center, confirmation/ticket upload, wallet files, Google Maps/Waze, and contextual attraction enrichment.</p>
+        </div>
+      </div>
+      <div class="priority">
+        <span class="tag warn">3</span>
+        <div>
+          <h3>Organizer plan editing</h3>
+          <p>Rebuild plan edit/diff/revision UX after the member route structure is stable. Until then, keep Classic as the editor fallback.</p>
+        </div>
+      </div>
+      <div class="priority">
+        <span class="tag warn">4</span>
+        <div>
+          <h3>Budget, readiness, rating, photos</h3>
+          <p>Then rebuild Budget, tasks/packing, attraction rating, and photo-led Moments. Trivia, richer gamification, and less-used Classic features can follow later.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Design interview prompts for the next pass</h2>
+      <ul>
+        <li>Today: should the top of the screen feel more like a countdown/story card, an operations dashboard, or a playful “what now?” assistant?</li>
+        <li>Journey: should phases feel like destinations, chapters, hotels, transport legs, or a mix depending on trip structure?</li>
+        <li>Bookings/tickets: should members usually access them from the day card, a dedicated Bookings screen, or both?</li>
+        <li>Moments: during the active trip, what should the app ask people to do: rate a place, react to photos, answer a tiny prompt, upload one photo, or all of these depending on the day?</li>
+        <li>More: which Classic fallback links should stay visible to members, and which should be organizer-only?</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Acceptance gate</h2>
+      <p>
+        Modern can become selectable for production trips only when every Classic workflow either has Modern parity or a consciously accepted Classic fallback.
+        Modern should become the default only after one real test trip validates mobile, RTL/LTR, offline read behavior, operational links, privacy, and organizer rollback.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

@@ -211,7 +211,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "text",
     prompt: "Which of the travelers are you? (this sets up your private organizer channel with the trip assistant)",
     maxLength: 80,
-    required: false,
+    required: true,
   },
   {
     id: "bot_name",
@@ -502,7 +502,25 @@ export type SubmitAnswerResult =
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "ORGANIZER_IDENTITY_UNMATCHED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+
+function answerText(answer: IntakeAnswer | undefined): string {
+  return answer?.kind === "text" ? answer.text.trim() : "";
+}
+
+function organizerIdentityMatchesTraveler(answers: AnswerStore): boolean {
+  const organizer = answerText(answers.organizer_identity).toLocaleLowerCase();
+  const travelers = answers.travelers;
+  if (!organizer || travelers?.kind !== "structured" || !Array.isArray(travelers.data)) return false;
+  return travelers.data.some((traveler) => {
+    if (!traveler || typeof traveler !== "object") return false;
+    const value = traveler as Record<string, unknown>;
+    return ["name", "name_en", "username"].some((key) => {
+      const candidate = value[key];
+      return typeof candidate === "string" && candidate.trim().toLocaleLowerCase() === organizer;
+    });
+  });
+}
 
 // A private Telegram chat id is always a positive integer in string form —
 // reject anything else rather than storing whatever an LLM tool-call
@@ -540,8 +558,8 @@ export async function startSession(
 
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
-    const tripRow = await client.query<{ lifecycle_state: string }>(
-      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    const tripRow = await client.query<{ lifecycle_state: string; draft_inputs: Record<string, unknown> }>(
+      "SELECT lifecycle_state, draft_inputs FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
@@ -563,6 +581,25 @@ export async function startSession(
       );
     }
 
+    // Carry starter values from the web form into the normalized answer store.
+    // The interview recap still asks the organizer to confirm or correct them;
+    // it simply avoids repeating questions they have already answered.
+    const initialAnswers: AnswerStore = {};
+    const draft = trip.draft_inputs ?? {};
+    const starterValues: Array<[string, string | null, string | undefined]> = [
+      ["trip_type", draft.trip_type === "group" ? "group_of_families" : typeof draft.trip_type === "string" ? draft.trip_type : null, draft.trip_type === "other" ? "Other" : undefined],
+      ["destination", typeof draft.destination === "string" ? draft.destination : null, undefined],
+      ["departure_date", typeof draft.departure_date === "string" ? draft.departure_date : null, undefined],
+      ["return_date", typeof draft.return_date === "string" ? draft.return_date : null, undefined],
+    ];
+    for (const [questionId, optionId, otherText] of starterValues) {
+      if (!optionId) continue;
+      const value = questionId === "trip_type" && optionId === "other"
+        ? validateAnswer(questionId, "other", otherText)
+        : validateAnswer(questionId, optionId, undefined);
+      if (value.ok) initialAnswers[questionId] = value.answer;
+    }
+
     // Create session with a fresh token.
     const rawSessionToken = randomBytes(32).toString("base64url");
     const digest = sessionTokenDigest(rawSessionToken);
@@ -571,22 +608,16 @@ export async function startSession(
     await client.query(
       `INSERT INTO control_plane.intake_sessions
          (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest],
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest,
+        deriveSessionState(initialAnswers, INTAKE_QUESTIONS), JSON.stringify(initialAnswers)],
     );
 
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
 
-    const view: SessionView = {
-      sessionId,
-      tripId: enrollment.tripId,
-      state: "interviewing",
-      nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
-      optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
-      recap: null,
-    };
+    const view = buildSessionView(sessionId, enrollment.tripId, deriveSessionState(initialAnswers, INTAKE_QUESTIONS), initialAnswers);
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
@@ -772,6 +803,10 @@ export async function confirmIntake(
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_ALL_REQUIRED_ANSWERED" };
     }
+    if (!organizerIdentityMatchesTraveler(session.answers)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "ORGANIZER_IDENTITY_UNMATCHED" };
+    }
 
     // Answers are organizer-controlled free-form content (free text, "other"
     // follow-ups, and structured travelers/phases/travel_anchors/constraints
@@ -815,6 +850,12 @@ export async function confirmIntake(
     await client.query(
       "UPDATE control_plane.intake_sessions SET state = 'confirmed', updated_at = now() WHERE id = $1",
       [session.id],
+    );
+
+    await client.query(
+      `INSERT INTO control_plane.funnel_events(id, event_name, trip_id)
+       VALUES ($1, 'interview_confirmed', $2)`,
+      [generateId("event"), session.trip_id],
     );
 
     await client.query("COMMIT");

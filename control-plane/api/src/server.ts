@@ -6,6 +6,7 @@ import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
+import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -99,6 +100,30 @@ if (chatRoutingKey) {
   chatRouting = { db: pool, apiKey: chatRoutingKey };
 }
 
+let portal: PortalDependencies | undefined;
+if (profile.web) {
+  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([
+    resolveSecretRef(profile.web.google_client_id_secret_ref),
+    resolveSecretRef(profile.web.google_client_secret_ref),
+    resolveSecretRef(profile.web.runtime_exchange_key_secret_ref),
+  ]);
+  const redirectUri = `${profile.web.public_origin}/v1/auth/google/callback`;
+  portal = {
+    db: pool,
+    google: new GoogleOidcClient(googleClientId, googleClientSecret, redirectUri),
+    runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey),
+    publicOrigin: profile.web.public_origin,
+    runtimeOrigin: profile.web.runtime_origin,
+    runtimeExchangeKey,
+    runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes,
+    telegramBotUsername: profile.web.telegram_bot_username,
+    sessionTtlSeconds: profile.web.session_ttl_seconds,
+    enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400,
+    approvalTtlSeconds: 86400,
+    provisioningAdminSubjectDigests: new Set(profile.web.provisioning_admin_subject_digests),
+  };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -107,6 +132,7 @@ const app = buildApp(profile, {
   planner,
   provisioner,
   chatRouting,
+  portal,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker
