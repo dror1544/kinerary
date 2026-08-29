@@ -189,3 +189,24 @@ Two rules, neither negotiable:
 
 1. **Never mention that any of this could be shown to the family.** Everything here is recorded as organizer-only, full stop, and there is no option to change that. The failure is asymmetric: an over-hidden instruction is a slightly less helpful bot; an over-shared one puts a private remark about a named family member somewhere every logged-in member, children included, can read it.
 2. **Redirect medical detail.** If they start describing someone's condition, steer back to behavior — "keep walks short" is a standing instruction, "uses a cane" is a fact about a person, and this interview does not collect the second. Dietary restrictions are the one exception, and they have their own question above.
+
+## home_country — optional, text
+
+Which country the organizer is from. Its *only* effect is which embassy/consulate the site lists on the Info tab for emergencies (via `lookup_consular_contacts` — see SOUL workflow step 9). Default to the organizer's own country without asking — for a Hebrew conversation that is Israel. Only ask if it is genuinely unclear. A group from more than one country still uses the organizer's country here (the multi-country aspect matters for supported languages, not for which embassy) unless the organizer explicitly says to use another.
+
+## budget_detail — optional, structured (object)
+
+Only if the organizer wants a budget on the site. Capture an overall currency and party size, then one line per known cost:
+
+```json
+{
+  "currency": "USD",
+  "party_size": 7,
+  "items": [
+    { "phase": "Kyoto", "category": "hotel", "description": "Cross Hotel × 3 nights", "amount": 900, "estimate": false },
+    { "phase": "flights", "category": "flight", "description": "TLV–KIX × 7", "amount": 0, "estimate": true }
+  ]
+}
+```
+
+`category` is one of `flight`, `hotel`, `car`, `attraction`, `food`, `insurance`, `other` — anything else becomes `other`. `phase` is a phase name you already captured (a flight with no phase files under "flights"); an unmatched name falls back to the first phase. For a cost the organizer knows matters but not the figure, use `amount: 0` with `estimate: true` — the site shows it as a "?" line to fill in later. Skip the whole question if they'd rather not itemise money; the free-text budget note in `constraints` still rides along.

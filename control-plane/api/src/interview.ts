@@ -266,6 +266,23 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     dataShape: "array",
     required: false,
   },
+  // Additive-optional, like phases[].days — no INTAKE_SCHEMA_VERSION bump. A v2
+  // intake answered before these existed simply has no entry, and the
+  // transformer treats an absent answer as "not provided".
+  {
+    id: "home_country",
+    type: "text",
+    prompt: "Which country are you (the organizer) from? This only sets which embassy the site lists for emergencies — optional; we default to your own country.",
+    maxLength: 80,
+    required: false,
+  },
+  {
+    id: "budget_detail",
+    type: "structured",
+    prompt: "A rough budget, if you want it on the site: an overall currency and party size, plus one line per known cost — { currency, party_size?, items: [{ phase?, category, description, amount, estimate? }] }. category is one of flight/hotel/car/attraction/food/insurance/other. Use amount 0 with estimate true for a cost you know matters but not the figure. (optional)",
+    dataShape: "object",
+    required: false,
+  },
 ] as const;
 
 // ── Answer store ─────────────────────────────────────────────────────────────
@@ -743,8 +760,9 @@ export async function confirmIntake(
       user_id: string;
       state: SessionState;
       answers: AnswerStore;
+      source_document: unknown;
     }>(
-      `SELECT id, trip_id, user_id, state, answers
+      `SELECT id, trip_id, user_id, state, answers, source_document
        FROM control_plane.intake_sessions
        WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
        FOR UPDATE`,
@@ -800,9 +818,13 @@ export async function confirmIntake(
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
     await client.query(
-      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
-       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb)`,
-      [versionId, session.trip_id, nextVersion, artifactRef, intakeDigest, INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers)],
+      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document)
+       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb)`,
+      [
+        versionId, session.trip_id, nextVersion, artifactRef, intakeDigest,
+        INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers),
+        session.source_document ? JSON.stringify(session.source_document) : null,
+      ],
     );
 
     // Transition trip to 'intake_confirmed'.
@@ -871,6 +893,36 @@ export async function getSessionStatus(
   }
 
   return { ok: true, state: session.state };
+}
+
+// ── source document: the raw plan an organizer shared, kept for re-extraction ─
+
+const SOURCE_DOCUMENT_MAX_CHARS = 200_000;
+
+/** Stage the plan document text on the session. It is copied onto the
+ * immutable intake_versions row at confirm. Best-effort — a failure here never
+ * blocks the interview (the interviewer already extracted from it live). */
+export async function saveSourceDocument(
+  db: pg.Pool,
+  rawSessionToken: string,
+  text: string,
+  filename?: string,
+): Promise<{ ok: true; chars: number } | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }> {
+  const body = String(text ?? "");
+  if (!body.trim()) return { ok: false, reason: "INVALID_REQUEST" };
+  const doc = {
+    filename: String(filename ?? "").replace(/[<>]/g, "").slice(0, 200) || null,
+    text: body.slice(0, SOURCE_DOCUMENT_MAX_CHARS),
+    savedAt: new Date().toISOString(),
+  };
+  const res = await db.query(
+    `UPDATE control_plane.intake_sessions
+     SET source_document = $2::jsonb, updated_at = now()
+     WHERE session_token_digest = $1 AND state <> 'confirmed'`,
+    [sessionTokenDigest(rawSessionToken), JSON.stringify(doc)],
+  );
+  if (res.rowCount === 0) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, chars: doc.text.length };
 }
 
 // ── country_reference: cross-trip consular contacts ──────────────────────────

@@ -827,6 +827,77 @@ class NonLatinNameTests(unittest.TestCase):
         self.assertEqual("Solomon", family["name"]["en"])
 
 
+class HomeCountryTests(unittest.TestCase):
+    def test_answer_is_written_to_meta_home_country(self) -> None:
+        intake = {**JAPAN_INTAKE, "home_country": _text("United States")}
+        self.assertEqual("United States", transform_intake(intake)["meta"]["home_country"])
+
+    def test_absent_answer_leaves_no_meta_key(self) -> None:
+        self.assertNotIn("home_country", transform_intake(dict(JAPAN_INTAKE))["meta"])
+
+
+class DeriveBudgetTests(unittest.TestCase):
+    BASE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+        ]),
+    }
+
+    def _budget(self, detail: dict) -> dict:
+        intake = {**self.BASE, "budget_detail": _structured(detail)}
+        return transform_intake(intake).get("budget")
+
+    def test_no_answer_means_no_budget_block(self) -> None:
+        self.assertIsNone(transform_intake(dict(self.BASE)).get("budget"))
+
+    def test_items_become_seed_items_matched_to_phases(self) -> None:
+        budget = self._budget({
+            "currency": "USD", "party_size": 4,
+            "items": [
+                {"phase": "Kyoto", "category": "hotel", "description": "Cross Hotel × 3", "amount": 900},
+                {"category": "flight", "description": "TLV-NRT × 4", "amount": 0, "estimate": True},
+            ],
+        })
+        self.assertEqual(4, budget["party_size"])
+        self.assertEqual("USD", budget["currency"])
+        self.assertEqual(["intl_flights", "kyoto"], budget["phases"])
+        kyoto = next(s for s in budget["seed_items"] if s["phase"] == "kyoto")
+        self.assertEqual(900, kyoto["amount"])
+        self.assertFalse(kyoto["is_estimate"])
+        flight = next(s for s in budget["seed_items"] if s["phase"] == "intl_flights")
+        self.assertTrue(flight["is_estimate"])
+
+    def test_unknown_category_falls_back_to_other_and_seed_keys_are_unique(self) -> None:
+        budget = self._budget({"items": [
+            {"phase": "Tokyo", "category": "spa", "description": "onsen", "amount": 50},
+            {"phase": "Tokyo", "category": "spa", "description": "onsen", "amount": 50},
+        ]})
+        cats = {s["category"] for s in budget["seed_items"]}
+        self.assertEqual({"other"}, cats)
+        keys = [s["seed_key"] for s in budget["seed_items"]]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_party_size_defaults_to_the_traveler_count(self) -> None:
+        intake = {
+            **self.BASE,
+            "travelers": _structured([
+                {"name": "A", "family": "X"}, {"name": "B", "family": "X"}, {"name": "C", "family": "X"},
+            ]),
+            "budget_detail": _structured({"items": [
+                {"category": "food", "description": "meals", "amount": 400},
+            ]}),
+        }
+        self.assertEqual(3, transform_intake(intake)["budget"]["party_size"])
+
+    def test_markup_in_a_description_is_stripped(self) -> None:
+        budget = self._budget({"items": [
+            {"category": "attraction", "description": "<b>Disney</b> tickets", "amount": 300},
+        ]})
+        self.assertNotIn("<", budget["seed_items"][0]["description"])
+
+
 class DeriveBookingsTests(unittest.TestCase):
     """travel_anchors[] used to be collapsed into a single stat number and then
     thrown away — the interview's most concrete output (dated activity tickets,

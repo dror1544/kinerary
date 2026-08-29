@@ -838,6 +838,97 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
+_BUDGET_CATEGORIES = {"flight", "hotel", "car", "attraction", "food", "insurance", "other"}
+
+
+def _derive_budget(
+    data: Mapping[str, Any], phases: list[dict[str, Any]], default_party_size: int,
+) -> dict[str, Any] | None:
+    """Project the optional budget_detail answer into config.budget — the shape
+    server.js seeds budget_items from (seed_items[]) plus the phase_labels /
+    phases / party_size the site's Budget tab needs. Returns None when the
+    organizer didn't give a budget."""
+    raw = _structured_dict(data, "budget_detail")
+    items = raw.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+
+    # Match a free-text phase reference to a real phase id, its title, or the
+    # two synthetic buckets the reference config also uses.
+    by_key: dict[str, str] = {}
+    labels: dict[str, dict[str, str]] = {}
+    for phase in phases:
+        pid = phase["id"]
+        title = phase.get("title") or {}
+        labels[pid] = {"he": str(title.get("he") or pid), "en": str(title.get("en") or pid)}
+        for key in (pid, str(title.get("en") or ""), str(title.get("he") or "")):
+            if key.strip():
+                by_key[key.strip().lower()] = pid
+    labels["intl_flights"] = {"he": "✈️ טיסות", "en": "✈️ Flights"}
+    labels["other"] = {"he": "שונות", "en": "Other"}
+
+    seed_items: list[dict[str, Any]] = []
+    used: list[str] = []
+    seen_keys: set[str] = set()
+    for entry in items:
+        if not isinstance(entry, Mapping):
+            continue
+        category = str(entry.get("category") or "").strip().lower()
+        if category not in _BUDGET_CATEGORIES:
+            category = "other"
+        description = _plain(entry.get("description"))[:200]
+        if not description:
+            continue
+        try:
+            amount = max(0.0, float(entry.get("amount") or 0))
+        except (TypeError, ValueError):
+            amount = 0.0
+        is_estimate = bool(entry.get("estimate")) or amount == 0
+
+        ref = str(entry.get("phase") or "").strip().lower()
+        phase_id = by_key.get(ref)
+        if not phase_id:
+            phase_id = "intl_flights" if category == "flight" else (
+                phases[0]["id"] if phases else "other"
+            )
+        if phase_id not in used:
+            used.append(phase_id)
+
+        seed_key = f"intake-{phase_id}-{category}-{_slugify(description)[:24] or 'x'}"
+        if seed_key in seen_keys:
+            seed_key = f"{seed_key}-{len(seed_items)}"
+        seen_keys.add(seed_key)
+        seed_items.append({
+            "phase": phase_id,
+            "category": category,
+            "description": description,
+            "amount": amount,
+            "is_estimate": is_estimate,
+            "seed_key": seed_key,
+        })
+
+    if not seed_items:
+        return None
+
+    # Order: flights first, real phases in trip order, "other" last.
+    order = [p for p in (["intl_flights"] + [ph["id"] for ph in phases] + ["other"]) if p in used]
+    try:
+        party_size = int(raw.get("party_size"))
+    except (TypeError, ValueError):
+        party_size = default_party_size or 0
+
+    budget: dict[str, Any] = {
+        "party_size": party_size or 1,
+        "phases": order,
+        "phase_labels": {pid: labels[pid] for pid in order},
+        "seed_items": seed_items,
+    }
+    currency = _plain(raw.get("currency"))[:8]
+    if currency:
+        budget["currency"] = currency
+    return budget
+
+
 def transform_intake(
     data: Mapping[str, Any],
     today: date | None = None,
@@ -924,6 +1015,7 @@ def transform_intake(
             # any USD-destination trip, home == destination).
             "homeCurrency": "ILS",
         },
+
         "theme": {
             "palette": "blue",
             "font": "inter",
@@ -954,6 +1046,17 @@ def transform_intake(
                 },
             },
         }
+
+    # meta.home_country drives enrich_config's consular lookup (whose embassy).
+    # Israel is the default there; only written when the organizer answered the
+    # optional question.
+    home_country = _text_value(data.get("home_country", {})).strip()
+    if home_country:
+        config["meta"]["home_country"] = home_country[:80]
+
+    budget = _derive_budget(data, phases, len(participants))
+    if budget:
+        config["budget"] = budget
 
     return config
 

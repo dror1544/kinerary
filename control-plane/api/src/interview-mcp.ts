@@ -151,9 +151,21 @@ function buildMcpServer() {
       })).describe("The phases you captured — name plus start/end where known"),
       travelers: z.array(z.string()).optional().describe("Traveller first names, for context"),
       documentText: z.string().describe("Plain-text content of the uploaded plan document"),
+      documentName: z.string().optional().describe("The document's filename, if known"),
     },
-    async ({ destination, phases, travelers, documentText }) =>
-      ok(await extractItinerary({ destination, phases, travelers, documentText })),
+    async ({ sessionId, sessionToken, destination, phases, travelers, documentText, documentName }) => {
+      const result = await extractItinerary({ destination, phases, travelers, documentText });
+      // Keep the raw document for a later re-extraction. Best-effort — the
+      // extraction above already used it, so a persistence failure is silent.
+      if (documentText && documentText.trim()) {
+        try {
+          await forward(`/v1/interview/${encodeURIComponent(sessionId)}/source-document`, "POST", sessionToken, {
+            text: documentText, filename: documentName,
+          });
+        } catch { /* not fatal */ }
+      }
+      return ok(result);
+    },
   );
 
   // Also host-side, also not a forward: find the organizer's home-country
