@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" fill="none" role="img" aria-label="Kinerary">
+<g stroke="#EAF2F2" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+<path d="M33,100 V28"/>
+<path d="M33,66 L64,48"/>
+</g>
+<path d="M33,66 L88,99" stroke="#5FD3C4" stroke-width="12" stroke-linecap="round" stroke-dasharray="0.5 15"/>
+<circle cx="33" cy="100" r="6.0" fill="#5FD3C4"/>
+<path d="M69,50 C57.125,33.125 56.5,33.75 56.5,24.375000000000004 A12.5,12.5 0 1 1 81.5,24.375000000000004 C81.5,33.75 80.875,33.125 69,50 Z" fill="#F26B3A"/><circle cx="69" cy="24.375000000000004" r="4.8" fill="#FFFFFF"/>
+</svg>

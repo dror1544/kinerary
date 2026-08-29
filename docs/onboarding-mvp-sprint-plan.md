@@ -770,6 +770,13 @@ Build:
 - Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
   release/resource versions, redacted failures, health, audit trail and
   bounded analytics. Add suspend/retry controls with server-side authorization.
+  The **organizer-facing** half of this — a public landing page, account
+  signup/sign-in, and an authenticated console where an organizer lists their
+  own trips and each one's lifecycle state — is the landing SPA, now in-tree at
+  `web/` (see §5, and `docs/landing-page-plan.md` +
+  `docs/web-control-plane-integration-plan.md`). The super-admin dashboard here
+  stays operator-only; the two share the control-plane read models but not the
+  UI or the auth surface.
 - Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
@@ -964,6 +971,19 @@ Provisioning hardening**, which runs after the first successful end-to-end run
 proves the vertical path. The Sprint 4 acceptance test deliberately uses the
 existing `kinerary-deploy` infrastructure and a seeded development release
 record until then.
+
+**Landing SPA (`web/`).** The organizer-facing web console lives in `web/` — a
+Vite/React SPA with a public landing page, account signup/sign-in, and a
+trips-list view. It is merged in from `feat/landing-spa` (kept aligned with
+that branch) so it evolves on this line rather than diverging. The SPA ships
+here **ahead of its control-plane wiring**: the auth and organizer read-model
+endpoints it calls (`web/src/api.ts`) are not yet mounted on this branch's
+control-plane API — that integration is the Sprint 6 organizer-dashboard work
+above, tracked in `docs/web-control-plane-integration-plan.md`. Until then the
+SPA builds and tests in isolation (its own CI job) but is not wired to a live
+control plane. Landing-spa's parallel early control-plane implementation
+(`portal.ts`, `runtime-gateway/`, a second `0021` migration) is deliberately
+**not** merged — this branch's Sprints 1–4.5 control-plane is authoritative.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 
