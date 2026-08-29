@@ -3,6 +3,7 @@ import { test, describe } from "node:test";
 import {
   normaliseExtractedItinerary,
   buildExtractPrompt,
+  buildVenueLinkPrompt,
   type PhaseRef,
 } from "../src/itinerary-extract.js";
 
@@ -223,6 +224,15 @@ describe("buildExtractPrompt", () => {
     assert.match(prompt, /"phases": \[ \{ "name"/);
     assert.match(prompt, /land at Narita/);
     assert.match(prompt, /BOTH "he" \(Hebrew\) and "en"/);
+  });
+
+  test("buildVenueLinkPrompt lists the places and asks for first-party URLs by search", () => {
+    const prompt = buildVenueLinkPrompt(["Tokyo Skytree", "TeamLab Planets"], "Japan");
+    assert.match(prompt, /web search/i);
+    assert.match(prompt, /- Tokyo Skytree/);
+    assert.match(prompt, /- TeamLab Planets/);
+    assert.match(prompt, /never guess a domain/i);
+    assert.match(prompt, /"<name>": "https:/);
   });
 
   test("truncates a very long document", () => {

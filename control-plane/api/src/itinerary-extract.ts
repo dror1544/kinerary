@@ -21,6 +21,11 @@ import { execFile } from "node:child_process";
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || "";
 const EXTRACT_TIMEOUT_MS = Number(process.env.ITINERARY_EXTRACT_TIMEOUT_MS || "60000");
+// A profile that can web-search, for filling a venue's official/ticket URL
+// when the source document didn't print one. Falls back to the consular
+// profile (also "a profile that can search"). Unset -> the step is skipped.
+const HERMES_SEARCH_PROFILE = process.env.HERMES_SEARCH_PROFILE || process.env.HERMES_CONSULAR_PROFILE || "";
+const VENUE_LINK_TIMEOUT_MS = Number(process.env.VENUE_LINK_TIMEOUT_MS || "90000");
 
 export type PhaseRef = { name: string; start?: string; end?: string };
 type Bi = { he: string; en: string };
@@ -240,6 +245,58 @@ function runExtract(prompt: string): Promise<string> {
   });
 }
 
+/** Build a prompt asking for an official/ticket URL per venue by web search. */
+export function buildVenueLinkPrompt(names: string[], destination: string): string {
+  return [
+    `For a trip to ${destination || "the destination"}, find the official website (or the`,
+    `dedicated ticket page where advance booking is normal) for each place below.`,
+    `Use web search. Return ONLY a JSON object mapping the exact name to its URL.`,
+    `Omit a place you cannot find a real, first-party URL for — never guess a domain.`,
+    ``,
+    `Places:`,
+    ...names.map((n) => `- ${n}`),
+    ``,
+    `Return exactly: { "<name>": "https://..." }  — no commentary.`,
+  ].join("\n");
+}
+
+function runVenueLinkSearch(prompt: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      HERMES_BIN,
+      ["-p", HERMES_SEARCH_PROFILE, "chat", "-q", prompt, "-Q", "--safe-mode"],
+      { timeout: VENUE_LINK_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => (err ? reject(err) : resolve(String(stdout))),
+    );
+  });
+}
+
+/** Fill `venue.url` for venues that don't have one, by web search. Mutates
+ * `phases` in place. Best-effort: any failure just leaves those venues without
+ * a URL (the site still shows their Maps/Waze links). */
+async function resolveVenueLinks(phases: ExtractedPhase[], destination: string): Promise<void> {
+  if (!HERMES_SEARCH_PROFILE) return;
+  const missing = phases.flatMap((p) => p.venues.filter((v) => !v.url));
+  if (!missing.length) return;
+  const names = [...new Set(missing.map((v) => v.name.en))].slice(0, 20);
+  let parsed: unknown;
+  try {
+    parsed = firstJsonObject(await runVenueLinkSearch(buildVenueLinkPrompt(names, destination)));
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const map = parsed as Record<string, unknown>;
+  const byLowerName = new Map(Object.entries(map).map(([k, v]) => [k.trim().toLowerCase(), v]));
+  for (const p of phases) {
+    for (const v of p.venues) {
+      if (v.url) continue;
+      const hit = plain(byLowerName.get(v.name.en.trim().toLowerCase()));
+      if (/^https?:\/\/\S+$/i.test(hit)) v.url = hit;
+    }
+  }
+}
+
 export async function extractItinerary(args: ExtractItineraryArgs): Promise<ExtractItineraryResult> {
   if (!HERMES_EXTRACT_PROFILE) return { ok: false, reason: "EXTRACT_NOT_CONFIGURED" };
   if (!args.documentText || !args.documentText.trim()) {
@@ -254,5 +311,10 @@ export async function extractItinerary(args: ExtractItineraryArgs): Promise<Extr
   const parsed = firstJsonObject(stdout);
   if (!parsed) return { ok: false, reason: "EXTRACTION_FAILED", detail: "no JSON object in model output" };
   const { phases, warnings } = normaliseExtractedItinerary(parsed, args.phases);
+  // A venue's official/ticket link comes from the document when it prints one;
+  // otherwise web-search for it here so the site can show a 🎫 button.
+  try {
+    await resolveVenueLinks(phases, args.destination);
+  } catch { /* best-effort */ }
   return { ok: true, phases, warnings };
 }

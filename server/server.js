@@ -1699,6 +1699,16 @@ app.delete('/api/budget/:id', authRequired, (req, res) => {
 
 const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
 
+// With no enrichment worker, a row left 'pending' shows a permanent
+// "Finding links…" spinner. On a control-plane-provisioned trip the links
+// were filled at setup, so retire any stale pending rows on boot.
+if (!HERMES_URL) {
+  try {
+    db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    db.prepare("UPDATE phase_plan_days SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+  } catch { /* tables may not exist yet on a fresh db */ }
+}
+
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
@@ -2014,8 +2024,8 @@ function queuePhaseReview(phaseId) {
 function ensurePlanDay(phaseId, date) {
   if (!date) return;
   db.prepare(
-    "INSERT OR IGNORE INTO phase_plan_days (phase_id,date,enrichment_status) VALUES (?,?,'pending')"
-  ).run(phaseId, date);
+    "INSERT OR IGNORE INTO phase_plan_days (phase_id,date,enrichment_status) VALUES (?,?,?)"
+  ).run(phaseId, date, HERMES_URL ? 'pending' : 'none');
 }
 
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
@@ -2043,8 +2053,12 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
     sort_order != null ? Number(sort_order) : 0,
     req.user.username,
     // Queued rather than enriched inline: the request returns immediately and
-    // the worker fills the links in, retrying if Hermes isn't reachable.
-    'pending'
+    // the worker fills the links in, retrying if Hermes isn't reachable. With
+    // no worker configured (HERMES_URL unset — the usual case for a
+    // control-plane-provisioned site, where link enrichment already ran at
+    // setup) there is nothing to move it off 'pending', so it would show a
+    // permanent "Finding links…" spinner — record 'none' instead.
+    HERMES_URL ? 'pending' : 'none'
   );
   const created = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
   ensurePlanDay(req.params.phase_id, date || null);
@@ -2156,7 +2170,7 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
   // A day that now has a headline has nothing left for the worker to write; one
   // whose headline was just cleared goes back in the queue instead of staying
   // blank forever.
-  const status = (labelHe || labelEn) ? 'done' : 'pending';
+  const status = (labelHe || labelEn) ? 'done' : (HERMES_URL ? 'pending' : 'none');
   // A direct organizer rewrite supersedes any pending review correction, the
   // same way the item PATCH above does — otherwise the struck-through
   // "corrected" indicator would keep pointing at wording the organizer has
@@ -2228,7 +2242,7 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
       write.run(phaseId, date, src?.label_he ?? null, src?.label_en ?? null,
                 src?.label_he_prev ?? null, src?.label_en_prev ?? null,
                 src?.correction_note ?? null, src?.corrected_at ?? null,
-                (src?.label_he || src?.label_en) ? 'done' : 'pending');
+                (src?.label_he || src?.label_en) ? 'done' : (HERMES_URL ? 'pending' : 'none'));
     };
     put(date_a, fromB);
     put(date_b, fromA);
@@ -2795,10 +2809,13 @@ function stripTags(html) {
 app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, res) => {
   const created = [];
   const skipped = [];
+  // No enrichment worker (HERMES_URL unset) → 'none', not a permanent
+  // "Finding links…"; link enrichment for a provisioned trip ran at setup.
+  const enrichSeed = HERMES_URL ? 'pending' : 'none';
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
     '(phase_id,date,time,time_sort,text_he,text_en,location_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
-    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,'pending',?)"
+    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?)"
   );
   // Re-running promote repairs rows imported before extra_links existed, rather
   // than leaving an already-promoted trip permanently missing those links.
@@ -2828,7 +2845,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
         const he = stripTags(day.label?.he ?? day.label ?? '');
         const en = stripTags(day.label?.en ?? '');
         upsertDay.run(phase.id, day.date, he || null, en || null,
-                      (he || en) ? 'done' : 'pending');
+                      (he || en) ? 'done' : enrichSeed);
       }
       (day.items || []).forEach((item, ii) => {
         const ref = `${phase.id}|${day.date || `d${di}`}|${ii}`;
@@ -2857,7 +2874,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
           firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
           linksJson,
           findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
-          di * 1000 + ii, req.user.username, ref
+          di * 1000 + ii, req.user.username, enrichSeed, ref
         );
         if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phase.id, config_ref: ref });
         else skipped.push({ config_ref: ref, reason: 'already promoted' });

@@ -305,11 +305,11 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.geocode_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
-            _add_phase_nav(phase)
+            _add_phase_nav(phase, destination)
         except Exception:
             logger.warning("enrichment.nav_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
-            _enrich_venues(phase, http, label, destination, pause)
+            _enrich_venues(phase, label, destination)
         except Exception:
             logger.warning("enrichment.venues_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
@@ -427,29 +427,36 @@ def _map_stop(phase: dict[str, Any], coords: tuple[float, float]) -> dict[str, A
     return stop
 
 
-def _add_phase_nav(phase: dict[str, Any]) -> None:
-    """From the coordinates enrich already resolved, deep-link the phase to a
-    map app and wire its weather widget. ``weatherKey`` is what lets the site's
-    own client-side Open-Meteo call fire (site/app.js fetches the forecast live
-    at render time — nothing is fetched here, so it is never stale). ``maps`` /
-    ``waze`` are pure coordinate templating. All three are ``setdefault`` — a
-    hand-authored value always wins."""
+def _add_phase_nav(phase: dict[str, Any], destination: str = "") -> None:
+    """Deep-link the phase to a map app and wire its weather widget.
+    ``weatherKey`` is what lets the site's own client-side Open-Meteo call fire
+    (site/app.js fetches the forecast live at render time — nothing is fetched
+    here, so it is never stale). ``maps`` / ``waze`` search by the hotel *name*
+    (Google/Waze resolve a name far better than OSM does, and coordinate
+    templating on a shaky geocode drops the pin in the wrong district), falling
+    back to the phase coordinates only when there is no name. All ``setdefault``
+    — a hand-authored value always wins."""
     stop = phase.get("mapStop")
-    if not isinstance(stop, dict):
-        return
-    try:
-        lat, lng = float(stop["lat"]), float(stop["lng"])
-    except (KeyError, TypeError, ValueError):
-        return
     key = str(phase.get("id") or "").strip()
-    if not key:
-        return
-    stop.setdefault("weatherKey", key)
+    if isinstance(stop, dict) and key:
+        stop.setdefault("weatherKey", key)
     acc = phase.get("accommodation")
-    if isinstance(acc, dict):
+    if not isinstance(acc, dict):
+        return
+    if key:
         acc.setdefault("weatherKey", key)
-        acc.setdefault("maps", _maps_url(lat, lng))
-        acc.setdefault("waze", _waze_url(lat, lng))
+    hotel = _accommodation_name(phase)
+    if hotel:
+        query = ", ".join(p for p in (hotel, acc.get("address") or _phase_query(phase)[0], destination) if p)
+        acc.setdefault("maps", _maps_search_url(query))
+        acc.setdefault("waze", _waze_search_url(query))
+    elif isinstance(stop, dict):
+        try:
+            lat, lng = float(stop["lat"]), float(stop["lng"])
+            acc.setdefault("maps", _maps_url(lat, lng))
+            acc.setdefault("waze", _waze_url(lat, lng))
+        except (KeyError, TypeError, ValueError):
+            pass
 
 
 def _maps_url(lat: float, lng: float) -> str:
@@ -460,13 +467,19 @@ def _waze_url(lat: float, lng: float) -> str:
     return f"https://waze.com/ul?ll={lat}%2C{lng}&navigate=yes"
 
 
-def _enrich_venues(
-    phase: dict[str, Any], http: Http, label: str, destination: str, pause: float,
-) -> None:
-    """Geocode each must-see venue the intake named and add Maps/Waze deep
-    links. The venue's `url` (an official/ticket link from the source document)
-    is left as-is. `maps`/`waze` are `setdefault` — hand-authored wins. A venue
-    that will not geocode simply keeps whatever links it already had."""
+def _maps_search_url(query: str) -> str:
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(query.strip())
+
+
+def _waze_search_url(query: str) -> str:
+    return "https://waze.com/ul?q=" + urllib.parse.quote(query.strip()) + "&navigate=yes"
+
+
+def _enrich_venues(phase: dict[str, Any], label: str, destination: str) -> None:
+    """Give each must-see venue a Google Maps + Waze link that searches by the
+    venue *name* (reliable — no geocode needed). The venue's `url` (an official
+    or ticket link, from the source document or a web lookup at interview time)
+    is left as-is. Both `maps`/`waze` are `setdefault`."""
     venues = phase.get("venues")
     if not isinstance(venues, list):
         return
@@ -479,13 +492,9 @@ def _enrich_venues(
         name = str(name or "").strip()
         if not name:
             continue
-        area = str(venue.get("area") or "").strip()
-        query = ", ".join(p for p in (name, area, label, destination) if p)
-        coords = _geocode(http, query)
-        _sleep(pause)
-        if coords:
-            venue.setdefault("maps", _maps_url(coords[0], coords[1]))
-            venue.setdefault("waze", _waze_url(coords[0], coords[1]))
+        query = ", ".join(p for p in (name, str(venue.get("area") or "").strip(), label, destination) if p)
+        venue.setdefault("maps", _maps_search_url(query))
+        venue.setdefault("waze", _waze_search_url(query))
 
 
 def _build_map(out: dict[str, Any]) -> None:

@@ -248,21 +248,24 @@ class PhaseNavTests(unittest.TestCase):
         out = enrich_config(_config(), "Japan", http=http, pause=0)
         self.assertEqual("tokyo", out["phases"][0]["mapStop"]["weatherKey"])
 
-    def test_accommodation_gets_maps_waze_and_weather_key(self) -> None:
+    def test_accommodation_maps_waze_search_by_hotel_name_not_coords(self) -> None:
         http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
         out = enrich_config(self._cfg_with_acc(), "Japan", http=http, pause=0)
         acc = out["phases"][0]["accommodation"]
         self.assertEqual("tokyo", acc["weatherKey"])
         self.assertIn("google.com/maps", acc["maps"])
-        self.assertIn("35.6764", acc["maps"])
-        self.assertIn("waze.com/ul", acc["waze"])
+        self.assertIn("OMO3%20Asakusa", acc["maps"])  # searched by name
+        self.assertNotIn("35.6764", acc["maps"])       # not coordinate templating
+        self.assertIn("waze.com/ul?q=OMO3", acc["waze"])
         self.assertIn("navigate=yes", acc["waze"])
 
-    def test_nav_is_skipped_when_a_phase_never_geocoded(self) -> None:
-        http = FakeHttp({"q=Kyoto": NOMINATIM_KYOTO})  # Tokyo misses
+    def test_a_hotel_still_gets_name_links_when_its_pin_falls_back_to_the_city(self) -> None:
+        # Nominatim misses the hotel -> pin at city centre, but the Maps/Waze
+        # links still search the real hotel name (Google resolves it fine).
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
         out = enrich_config(self._cfg_with_acc(), "Japan", http=http, pause=0)
-        self.assertNotIn("maps", out["phases"][0].get("accommodation", {}))
-        self.assertIn("maps", out["phases"][1]["accommodation"]) if out["phases"][1].get("accommodation") else None
+        acc = out["phases"][0]["accommodation"]
+        self.assertIn("OMO3%20Asakusa", acc["maps"])
 
     def test_a_hand_authored_maps_link_is_kept(self) -> None:
         cfg = self._cfg_with_acc()
@@ -278,29 +281,25 @@ class PhaseNavTests(unittest.TestCase):
 
 
 class VenueEnrichmentTests(unittest.TestCase):
-    def test_each_venue_gets_maps_and_waze_from_geocoding(self) -> None:
+    def test_each_venue_gets_name_based_maps_and_waze_links(self) -> None:
         cfg = _config()
         cfg["phases"][0]["venues"] = [
             {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"},
              "url": "https://www.tokyo-skytree.jp/en/"},
         ]
-        http = FakeHttp({
-            "q=Tokyo+Skytree": [{"lat": "35.7101", "lon": "139.8107", "display_name": "Tokyo Skytree"}],
-            "q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO,
-        })
-        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO}), pause=0)
         v = out["phases"][0]["venues"][0]
-        self.assertIn("35.7101", v["maps"])
-        self.assertIn("waze.com/ul", v["waze"])
+        self.assertIn("Tokyo%20Skytree", v["maps"])
+        self.assertIn("waze.com/ul?q=Tokyo%20Skytree", v["waze"])
         self.assertEqual("https://www.tokyo-skytree.jp/en/", v["url"])  # untouched
 
-    def test_a_venue_that_does_not_geocode_keeps_its_url_and_gets_no_maps(self) -> None:
+    def test_a_hand_authored_venue_maps_link_is_kept(self) -> None:
         cfg = _config()
-        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Nowhere"}, "url": "https://x"}]
-        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO}), pause=0)
-        v = out["phases"][0]["venues"][0]
-        self.assertNotIn("maps", v)
-        self.assertEqual("https://x", v["url"])
+        cfg["phases"][0]["venues"] = [
+            {"id": "x", "name": {"en": "Somewhere"}, "maps": "https://maps.example/mine"},
+        ]
+        out = enrich_config(cfg, "Japan", http=FakeHttp({}), pause=0)
+        self.assertEqual("https://maps.example/mine", out["phases"][0]["venues"][0]["maps"])
 
 
 class MapObjectTests(unittest.TestCase):
