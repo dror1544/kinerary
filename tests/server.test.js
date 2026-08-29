@@ -610,6 +610,13 @@ describe('GET /api/config/roster', () => {
 });
 
 describe('Trip-specific read isolation', () => {
+  test('classic shell is available as a safe rollback route', async () => {
+    const res = await api('/classic.html');
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') || '', /html/);
+    assert.match(await res.text(), /id="login-overlay"/);
+  });
+
   test('anonymous requests cannot observe runtime data or download files', async () => {
     const paths = [
       '/api/ratings', '/api/photos', '/api/photos/file/private.jpg',

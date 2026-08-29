@@ -23,6 +23,23 @@ const app = express();
 app.use(express.json({ limit: '30mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+const SITE_DIR = path.join(__dirname, '..', 'site');
+const CLASSIC_STATIC_FILES = new Map([
+  ['/classic.html', 'classic.html'],
+  ['/app.js', 'app.js'],
+  ['/styles.css', 'styles.css'],
+  ['/translations.js', 'translations.js'],
+  ['/manifest.json', 'manifest.json'],
+  ['/apple-wallet-badge.svg', 'apple-wallet-badge.svg'],
+  ['/google-wallet-badge.svg', 'google-wallet-badge.svg'],
+  ['/brand/favicon.svg', 'brand/favicon.svg'],
+  ['/brand/logo.svg', 'brand/logo.svg'],
+  ['/brand/logo-reversed.svg', 'brand/logo-reversed.svg'],
+  ['/brand/mark.svg', 'brand/mark.svg'],
+]);
+for (const [route, relativeFile] of CLASSIC_STATIC_FILES) {
+  app.get(route, (_req, res) => res.sendFile(path.join(SITE_DIR, relativeFile)));
+}
 
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';

@@ -140,12 +140,12 @@
         <div class="arrow">→</div>
         <div class="box">
           <h3>Runtime APIs</h3>
-          <p>Existing Classic APIs plus new living-journey APIs and compatibility adapters.</p>
+          <p>Existing Classic APIs plus new living-journey APIs, compatibility adapters, and a narrow Classic shell route for organizer rollback.</p>
         </div>
         <div class="arrow">→</div>
         <div class="box">
           <h3>Two experiences</h3>
-          <p>Classic remains rollback. Modern becomes default only after parity acceptance.</p>
+          <p>Classic remains organizer rollback. Modern becomes default only after parity acceptance.</p>
         </div>
       </div>
     </section>
@@ -165,7 +165,7 @@
         <div class="arrow">↔</div>
         <div class="box">
           <h3>Moments + More</h3>
-          <p>Memory capture, photos, workflows, organizer controls, Classic fallback until parity.</p>
+          <p>Memory capture, photos, workflows, organizer controls, and organizer-only Classic fallback until parity.</p>
         </div>
       </div>
     </section>
@@ -283,7 +283,7 @@
         <div class="card">
           <span class="tag done">Routing</span>
           <h3>Current routing is acceptable for now</h3>
-          <p>Keep the four-tab mobile structure, but interview on design issues per part. Desktop/tablet can become richer without changing the core mobile route model.</p>
+          <p>Keep the four-tab mobile structure, add a top hamburger menu for direct links/settings, and expose richer desktop/tablet shortcuts without changing the core mobile route model.</p>
         </div>
         <div class="card">
           <span class="tag done">Bot name</span>
@@ -293,7 +293,7 @@
         <div class="card">
           <span class="tag warn">Classic fallback</span>
           <h3>Fallback is required, but currently suspect</h3>
-          <p>Organizer plan editing may stay Classic-only during member stabilization, but the Modern-to-Classic switch must be fixed before Classic can carry that responsibility.</p>
+          <p>Organizer plan editing may stay Classic-only during member stabilization. Classic is not a member fallback; it is organizer-only rollback/editing access.</p>
         </div>
         <div class="card">
           <span class="tag warn">Moments</span>
@@ -309,7 +309,7 @@
         <span class="tag warn">1</span>
         <div>
           <h3>Review and stabilize structure/design</h3>
-          <p>Interview on Today, Journey, Moments, More, desktop/tablet routes, and mobile behavior. Fix the Classic switch before relying on Classic fallback.</p>
+          <p>Interview on Today, Journey, Moments, More, desktop/tablet routes, and mobile behavior. Keep language/logout in the menu, default language from the device, and Classic organizer-only.</p>
         </div>
       </div>
       <div class="priority">
@@ -323,7 +323,7 @@
         <span class="tag warn">3</span>
         <div>
           <h3>Organizer plan editing</h3>
-          <p>Rebuild plan edit/diff/revision UX after the member route structure is stable. Until then, keep Classic as the editor fallback.</p>
+          <p>Rebuild plan edit/diff/revision UX after the member route structure is stable. Until then, keep Classic as the organizer editor fallback.</p>
         </div>
       </div>
       <div class="priority">
@@ -340,16 +340,16 @@
       <ul>
         <li>Today: should the top of the screen feel more like a countdown/story card, an operations dashboard, or a playful “what now?” assistant?</li>
         <li>Journey: should phases feel like destinations, chapters, hotels, transport legs, or a mix depending on trip structure?</li>
-        <li>Bookings/tickets: should members usually access them from the day card, a dedicated Bookings screen, or both?</li>
+        <li>Bookings/tickets: implement both day-card access and a dedicated Bookings screen; next interview should focus on the exact card layout and extraction flow.</li>
         <li>Moments: during the active trip, what should the app ask people to do: rate a place, react to photos, answer a tiny prompt, upload one photo, or all of these depending on the day?</li>
-        <li>More: which Classic fallback links should stay visible to members, and which should be organizer-only?</li>
+        <li>More: Classic is organizer-only; decide which not-yet-modern modules should be visible as “coming next” for members.</li>
       </ul>
     </section>
 
     <section>
       <h2>Acceptance gate</h2>
       <p>
-        Modern can become selectable for production trips only when every Classic workflow either has Modern parity or a consciously accepted Classic fallback.
+        Modern can become selectable for production trips only when every Classic workflow either has Modern parity or a consciously accepted organizer-only Classic fallback.
         Modern should become the default only after one real test trip validates mobile, RTL/LTR, offline read behavior, operational links, privacy, and organizer rollback.
       </p>
     </section>

@@ -40,3 +40,37 @@ Date: 2026-08-29
 ## Commit recommendation
 
 Commit is reasonable after the Classic fallback fix because the feature is staged, tested, and still protected by Classic rollback. The next phase should start with stabilizing structure/design and the Classic switch, then rebuild bookings/tickets/maps.
+
+## Stabilization follow-up — 2026-08-29
+
+### Scope reviewed
+
+- Classic shell availability at `/classic.html`.
+- Mobile Modern chrome: bottom tabs remain the primary navigation, with a top hamburger for direct module access and session controls.
+- Desktop/tablet Modern chrome: top-level shortcuts expose Bookings, Map, Budget, and Photos.
+- Organizer-only Classic fallback visibility from the Modern UI.
+- Default language selection from stored preference first, then device/browser language.
+
+### Findings fixed
+
+1. `/classic.html` returned `Cannot GET /classic.html` because the server did not expose the Classic shell as a static route.
+   - Fix: added a narrow allowlist of Classic shell/assets instead of serving all of `site/`.
+
+2. Mobile session controls competed for space with the trip header, and RTL caused logout/language overlap.
+   - Fix: moved language switching and logout into the hamburger menu.
+
+3. Classic fallback was too visible for ordinary participants.
+   - Fix: the Modern UI now shows Classic fallback only to organizers.
+
+4. Bookings, maps, budget, and photos were too buried for desktop/tablet use.
+   - Fix: added direct desktop/tablet shortcuts while keeping mobile bottom tabs.
+
+### Validation
+
+- `node --test --test-timeout=60000 --test-reporter=spec server.test.js`: 133 passed, 0 failed.
+- `trip-web` unit tests: 3 passed, 0 failed.
+- `trip-web` production build: passed.
+
+### Next review focus
+
+The next phase should build the Bookings/Tickets/Map layer as first-class Modern screens, while keeping related tickets, confirmations, Google Maps/Waze links, and extractable booking details one tap away from Today and Journey cards.

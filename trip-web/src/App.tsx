@@ -30,6 +30,7 @@ import {
   Sparkles,
   TicketCheck,
   Upload,
+  X,
 } from "lucide-react";
 import brandLogo from "./assets/brand/logo.svg";
 import brandLogoReversed from "./assets/brand/logo-reversed.svg";
@@ -95,6 +96,20 @@ function tabLabel(tab: Tab, lang: Lang) {
     more: { en: "More", he: "עוד" },
   };
   return labels[tab][lang];
+}
+
+const moduleShortcuts = [
+  "Bookings",
+  "Map",
+  "Budget",
+  "Photos",
+];
+
+export function preferredLang(): Lang {
+  const stored = localStorage.getItem("tripLang");
+  if (stored === "he" || stored === "en") return stored;
+  const languages = navigator.languages?.length ? navigator.languages : [navigator.language];
+  return languages.some((language) => language?.toLowerCase().startsWith("he") || language?.toLowerCase().startsWith("iw")) ? "he" : "en";
 }
 
 function botDisplayName(config?: TripConfig, hermesName?: string, lang: Lang = "en") {
@@ -174,7 +189,6 @@ function LoginScreen() {
           {error ? <p className="form-error">{error}</p> : null}
           <button className="primary-action" type="submit">Sign in</button>
         </form>
-        <a href={classicHref()}>Open Classic instead</a>
       </section>
     </main>
   );
@@ -187,7 +201,7 @@ function Hero({
   activeTab,
   heroPhaseId,
   setActiveTab,
-  setLang,
+  openMenu,
 }: {
   config?: TripConfig;
   settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
@@ -195,7 +209,7 @@ function Hero({
   activeTab: Tab;
   heroPhaseId?: string;
   setActiveTab: (tab: Tab) => void;
-  setLang: (lang: Lang) => void;
+  openMenu: () => void;
 }) {
   const activePhase = config?.phases?.find((phase) => phase.id === heroPhaseId);
   const activePhaseName = activePhase ? text(activePhase.title, lang) : "";
@@ -214,7 +228,7 @@ function Hero({
           <strong>{config?.meta?.title || "Family Trip"}</strong>
         </a>
         <div className="desktop-tabs">
-          {(Object.keys(tabIcons) as Tab[]).map((tab) => (
+          {(["today", "journey", "moments"] as Tab[]).map((tab) => (
             <a
               key={tab}
               href={`#${tab}`}
@@ -225,8 +239,13 @@ function Hero({
             </a>
           ))}
         </div>
-        <button className="icon-text" type="button" onClick={() => setLang(lang === "he" ? "en" : "he")}>
-          {lang === "he" ? "EN" : "HE"}
+        <div className="desktop-shortcuts" aria-label="Coming Modern modules">
+          {moduleShortcuts.map((shortcut) => (
+            <a key={shortcut} href="#more" onClick={() => setActiveTab("more")}>{shortcut}</a>
+          ))}
+        </div>
+        <button className="menu-button" type="button" onClick={openMenu} aria-label="Open menu">
+          <Menu size={20} />
         </button>
       </nav>
       <div className="hero-copy">
@@ -658,7 +677,7 @@ function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: 
     }
   }
 
-  const workflows = ["Classic rollback", "Identity and avatars", "Maps and country info", "Bookings, PDFs and wallet", "Tasks and packing", "RSVP, ratings and comments", "Photos and reactions", "Budget", "Lost and found", "Trivia and leaderboard"];
+  const workflows = ["Bookings, PDFs and wallet", "Maps and country info", "Budget", "Photos and reactions", "Tasks and packing", "RSVP, ratings and comments", "Lost and found", "Trivia and leaderboard"];
   return (
     <section className="more-layout">
       <div className="section-heading">
@@ -677,8 +696,14 @@ function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: 
         </section>
       ) : null}
       <div className="workflow-grid">
+        {isOrganizer ? (
+          <a className="workflow-link organizer-only" href={classicHref()}>
+            <ChevronLeft size={16} />
+            <span>Open Classic organizer fallback</span>
+          </a>
+        ) : null}
         {workflows.map((workflow) => (
-          <a key={workflow} className="workflow-link" href={classicHref()}>
+          <a key={workflow} className="workflow-link" href="#more">
             <ChevronLeft size={16} />
             <span>{workflow}</span>
           </a>
@@ -688,10 +713,75 @@ function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: 
   );
 }
 
+function AppMenu({
+  open,
+  lang,
+  isOrganizer,
+  setOpen,
+  setLang,
+  openTab,
+}: {
+  open: boolean;
+  lang: Lang;
+  isOrganizer?: boolean;
+  setOpen: (open: boolean) => void;
+  setLang: (lang: Lang) => void;
+  openTab: (tab: Tab) => void;
+}) {
+  if (!open) return null;
+  return (
+    <div className="menu-overlay" role="presentation" onClick={() => setOpen(false)}>
+      <aside className="app-menu" role="dialog" aria-modal="true" aria-label="Trip menu" onClick={(event) => event.stopPropagation()}>
+        <div className="menu-head">
+          <img src={brandLogo} alt="Kinerary" />
+          <button type="button" onClick={() => setOpen(false)} aria-label="Close menu"><X size={20} /></button>
+        </div>
+        <div className="menu-section">
+          <small>{lang === "he" ? "ניווט" : "Navigation"}</small>
+          {(Object.keys(tabIcons) as Tab[]).map((tab) => (
+            <button key={tab} type="button" onClick={() => openTab(tab)}>{tabLabel(tab, lang)}</button>
+          ))}
+        </div>
+        <div className="menu-section">
+          <small>{lang === "he" ? "בקרוב במודרן" : "Modern modules"}</small>
+          {moduleShortcuts.map((shortcut) => (
+            <button key={shortcut} type="button" onClick={() => openTab("more")}>{shortcut}</button>
+          ))}
+        </div>
+        <div className="menu-section">
+          <small>{lang === "he" ? "הגדרות" : "Settings"}</small>
+          <button
+            type="button"
+            onClick={() => {
+              const next = lang === "he" ? "en" : "he";
+              localStorage.setItem("tripLang", next);
+              setLang(next);
+            }}
+          >
+            {lang === "he" ? "Switch to English" : "עברית"}
+          </button>
+          {isOrganizer ? <a href={classicHref()}>Open Classic organizer fallback</a> : null}
+          <button
+            type="button"
+            className="danger-menu"
+            onClick={() => {
+              tokenStore.clear();
+              window.location.reload();
+            }}
+          >
+            <LogOut size={17} /> Sign out
+          </button>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>((Object.keys(tabIcons).includes(window.location.hash.replace("#", "")) ? window.location.hash.replace("#", "") : "today") as Tab);
-  const [lang, setLang] = useState<Lang>(document.documentElement.dir === "rtl" ? "he" : "en");
+  const [lang, setLang] = useState<Lang>(() => preferredLang());
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
   const authed = Boolean(tokenStore.get());
   const config = useQuery({ queryKey: ["config"], queryFn: getConfig, enabled: authed });
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, enabled: authed });
@@ -717,6 +807,11 @@ export default function App() {
   if (!authed) return <LoginScreen />;
 
   const tabs = Object.keys(tabIcons) as Tab[];
+  const openTab = (tab: Tab) => {
+    setActiveTab(tab);
+    window.location.hash = tab;
+    setMenuOpen(false);
+  };
   const companionName = botDisplayName(config.data, hermes.data?.identity.name, lang);
   const heroPhaseId = activeTab === "journey"
     ? journeyHeroPhaseId
@@ -732,8 +827,9 @@ export default function App() {
 
   return (
     <div className="modern-trip-app">
-      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} heroPhaseId={heroPhaseId} setActiveTab={setActiveTab} setLang={setLang} />
+      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} heroPhaseId={heroPhaseId} setActiveTab={setActiveTab} openMenu={() => setMenuOpen(true)} />
       <main className="app-content">{content}</main>
+      <AppMenu open={menuOpen} lang={lang} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} />
       <nav className="bottom-nav" aria-label="Primary">
         {tabs.map((tab) => {
           const Icon = tabIcons[tab];
@@ -742,7 +838,7 @@ export default function App() {
               key={tab}
               href={`#${tab}`}
               className={activeTab === tab ? "active" : ""}
-              onClick={() => setActiveTab(tab)}
+              onClick={() => openTab(tab)}
             >
               <Icon size={20} />
               <span>{tabLabel(tab, lang)}</span>
@@ -750,17 +846,6 @@ export default function App() {
           );
         })}
       </nav>
-      <button
-        className="logout-button"
-        type="button"
-        title="Sign out"
-        onClick={() => {
-          tokenStore.clear();
-          window.location.reload();
-        }}
-      >
-        <LogOut size={18} />
-      </button>
       {(config.isError || itinerary.isError) ? (
         <div className="toast"><RefreshCw size={16} /> Offline or stale data may be shown from the app cache.</div>
       ) : null}
