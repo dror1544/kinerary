@@ -212,6 +212,22 @@ def _accommodation_name(phase: dict[str, Any]) -> str:
     return str(name or "").strip()
 
 
+def _hotel_queries(hotel: str, city_query: str):
+    """Nominatim query variants for a hotel, most specific first. Long marketing
+    names ("OMO3 Asakusa by Hoshino Resorts Tokyo") often miss where a trimmed
+    one ("OMO3 Asakusa") hits."""
+    hotel = hotel.strip()
+    if not hotel:
+        return
+    seen: set[str] = set()
+    trimmed = re.split(r"\s+(?:by|-|–|—|,)\s+", hotel, maxsplit=1)[0].strip()
+    short = " ".join(hotel.split()[:3]).strip()
+    for name in (hotel, trimmed, short):
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            yield f"{name}, {city_query}"
+
+
 # ── hero photo ───────────────────────────────────────────────────────────────
 
 def _wikipedia_image(http: Http, title: str, lang: str = "en") -> str | None:
@@ -272,10 +288,12 @@ def enrich_config(
                 hotel = _accommodation_name(phase)
                 place = None
                 matched_hotel = False
-                if hotel:
-                    place = _geocode_place(http, f"{hotel}, {city_query}")
-                    matched_hotel = place is not None
+                for hq in _hotel_queries(hotel, city_query):
+                    place = _geocode_place(http, hq)
                     _sleep(pause)
+                    if place:
+                        matched_hotel = True
+                        break
                 if not place:
                     place = _geocode_place(http, city_query)
                     _sleep(pause)

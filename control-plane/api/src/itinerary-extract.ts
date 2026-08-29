@@ -198,7 +198,7 @@ export function buildExtractPrompt(args: ExtractItineraryArgs): string {
     `- "label": a 2-6 word day headline. "text": one activity per line, <=120 chars. Both plain text, no markup.`,
     `- Provide BOTH "he" (Hebrew) and "en" (English) for every label and text. You translate; never ask.`,
     `- Omit a day the document does not describe. A phase with nothing described -> "days": [].`,
-    `- "venues": the notable or bookable places named for that phase (attractions, museums, tours, parks). For each, give the name in "he" and "en", and "url" ONLY if the document itself prints an official or ticket link for it (never guess a URL). Up to ~10 per phase; [] if none.`,
+    `- "venues": real places you could point to on a map that this phase visits (attractions, museums, temples, parks, named tour boats/trains with a station). NOT a rail pass, day-pass, ticket bundle or transport product — those go in a day's items, not here. For each venue give the name in "he" and "en", and "url" ONLY if the document itself prints an official or ticket link for it (never guess a URL). Up to ~10 per phase; [] if none.`,
     ``,
     `Return exactly:`,
     `{ "phases": [ { "name": "<phase name>", "days": [ { "date": "YYYY-MM-DD", "label": { "he": "...", "en": "..." }, "items": [ { "time": "HH:MM" | null, "text": { "he": "...", "en": "..." } } ] } ], "venues": [ { "name": { "he": "...", "en": "..." }, "url": "https://..." } ] } ] }`,

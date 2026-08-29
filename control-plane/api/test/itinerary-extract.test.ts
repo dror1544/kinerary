@@ -232,7 +232,7 @@ describe("buildExtractPrompt", () => {
       documentText: "x".repeat(50000),
     });
     // 20 000-char document cap + a small fixed preamble.
-    assert.ok(prompt.length < 21500, `prompt was ${prompt.length}`);
+    assert.ok(prompt.length < 22000, `prompt was ${prompt.length}`);
     assert.ok(!prompt.includes("x".repeat(20001)));
   });
 });
