@@ -425,6 +425,145 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         self.assertEqual(config["phases"][0]["id"], "dallas")
 
+    def test_phase_days_are_projected_when_the_intake_carries_them(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {
+                            "date": "2026-09-20",
+                            "label": {"he": "יום 1", "en": "Arrival & Asakusa"},
+                            "items": [
+                                {"time": "10:00", "text": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+                                {"time": None, "text": {"he": "אסקוסה", "en": "Evening in Asakusa"}},
+                            ],
+                        },
+                    ],
+                },
+            ]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertEqual(1, len(phase["days"]))
+        day = phase["days"][0]
+        self.assertEqual("2026-09-20", day["date"])
+        self.assertEqual({"he": "יום 1", "en": "Arrival & Asakusa"}, day["label"])
+        self.assertEqual("10:00", day["items"][0]["time"])
+        self.assertIsNone(day["items"][1]["time"])
+        self.assertEqual({"he": "אסקוסה", "en": "Evening in Asakusa"}, day["items"][1]["text"])
+
+    def test_a_phase_with_no_days_has_no_days_key(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"}]),
+        }
+        self.assertNotIn("days", transform_intake(intake)["phases"][0])
+
+    def test_days_outside_the_phase_range_are_dropped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [{"text": {"en": "in range"}}]},
+                        {"date": "2026-10-05", "items": [{"text": {"en": "out of range"}}]},
+                        {"date": "not-a-date", "items": [{"text": {"en": "unparseable"}}]},
+                    ],
+                },
+            ]),
+        }
+        days = transform_intake(intake)["phases"][0]["days"]
+        self.assertEqual(["2026-09-20"], [d["date"] for d in days])
+
+    def test_item_language_is_mirrored_and_empty_items_dropped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [
+                            {"text": {"en": "English only"}},
+                            {"text": {"he": "עברית בלבד"}},
+                            {"text": {"he": "", "en": ""}},
+                            {"text": {}},
+                        ]},
+                    ],
+                },
+            ]),
+        }
+        items = transform_intake(intake)["phases"][0]["days"][0]["items"]
+        self.assertEqual(2, len(items))
+        self.assertEqual({"he": "English only", "en": "English only"}, items[0]["text"])
+        self.assertEqual({"he": "עברית בלבד", "en": "עברית בלבד"}, items[1]["text"])
+
+    def test_a_day_with_no_valid_items_is_dropped_and_all_bad_means_no_days_key(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [{"text": {}}]},
+                        {"date": "2026-09-21", "items": []},
+                    ],
+                },
+            ]),
+        }
+        self.assertNotIn("days", transform_intake(intake)["phases"][0])
+
+    def test_a_bad_time_is_coerced_to_null(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [{"date": "2026-09-20", "items": [
+                        {"time": "morning", "text": {"en": "loose time"}},
+                        {"time": "9am", "text": {"en": "also loose"}},
+                    ]}],
+                },
+            ]),
+        }
+        items = transform_intake(intake)["phases"][0]["days"][0]["items"]
+        self.assertTrue(all(i["time"] is None for i in items))
+
+    def test_html_in_day_label_and_item_text_is_stripped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [{
+                        "date": "2026-09-20",
+                        "label": {"en": "<b>Day 1</b>", "he": "יום 1"},
+                        "items": [{"text": {"en": "<img src=x onerror=alert(1)> museum"}}],
+                    }],
+                },
+            ]),
+        }
+        day = transform_intake(intake)["phases"][0]["days"][0]
+        self.assertNotIn("<", day["label"]["en"])
+        self.assertNotIn(">", day["label"]["en"])
+        self.assertNotIn("<", day["items"][0]["text"]["en"])
+        self.assertNotIn(">", day["items"][0]["text"]["en"])
+
+    def test_merged_adjacent_phases_concatenate_and_sort_their_days(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {"name": "Tokyo (boys)", "start": "2026-09-19", "end": "2026-09-21",
+                 "days": [{"date": "2026-09-20", "items": [{"text": {"en": "day A"}}]}]},
+                {"name": "Tokyo (all)", "start": "2026-09-21", "end": "2026-09-23",
+                 "days": [{"date": "2026-09-22", "items": [{"text": {"en": "day B"}}]}]},
+            ]),
+        }
+        phases = transform_intake(intake)["phases"]
+        self.assertEqual(1, len(phases))
+        self.assertEqual(["2026-09-20", "2026-09-22"], [d["date"] for d in phases[0]["days"]])
+
     def test_travel_anchors_appear_in_stats_when_present(self) -> None:
         intake = {
             **JAPAN_INTAKE,

@@ -33,6 +33,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
+import { extractItinerary } from "./itinerary-extract.js";
 
 const API_BASE = (process.env.CONTROL_PLANE_API_BASE_URL || "http://127.0.0.1:4310").replace(/\/$/, "");
 const MCP_PORT = Number(process.env.INTERVIEW_MCP_PORT || "4311");
@@ -123,6 +124,35 @@ function buildMcpServer() {
     },
     async ({ sessionId, sessionToken, questionId, optionId, otherText, data }) =>
       ok(await forward(`/v1/interview/${encodeURIComponent(sessionId)}/answer`, "POST", sessionToken, { questionId, optionId, otherText, data })),
+  );
+
+  // Unlike the tools above, this one does not forward to a control-plane
+  // endpoint: it runs a one-shot model call (the shared `kinerary-extract`
+  // profile) on this host, where the Hermes CLI is available. All invariants
+  // the trip site depends on are enforced in itinerary-extract.ts.
+  mcp.tool(
+    "extract_itinerary",
+    "Turn an uploaded trip-plan document into a per-phase day-by-day itinerary. Call this once, AFTER " +
+      "the `phases` answer is captured, ONLY when the organizer shared a plan document. Pass its text " +
+      "content as documentText (you have already read it in the conversation), the phases you captured, " +
+      "and the destination. Returns { ok, phases: [{ name, days: [...] }], warnings }: review the days " +
+      "with the organizer, then fold each phase's days[] into your phases answer and call " +
+      "submit_answer(\"phases\", ...). On { ok: false } just continue the interview without days[] — it is " +
+      "never required.",
+    {
+      sessionId: z.string(),
+      sessionToken: z.string(),
+      destination: z.string().describe("The trip destination, for prompt context"),
+      phases: z.array(z.object({
+        name: z.string(),
+        start: z.string().optional().describe("YYYY-MM-DD if known"),
+        end: z.string().optional().describe("YYYY-MM-DD if known"),
+      })).describe("The phases you captured — name plus start/end where known"),
+      travelers: z.array(z.string()).optional().describe("Traveller first names, for context"),
+      documentText: z.string().describe("Plain-text content of the uploaded plan document"),
+    },
+    async ({ destination, phases, travelers, documentText }) =>
+      ok(await extractItinerary({ destination, phases, travelers, documentText })),
   );
 
   mcp.tool(

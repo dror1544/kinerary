@@ -629,11 +629,81 @@ def _phase_note_text(short: str, originals: list[str]) -> str:
     return "; ".join(unique)
 
 
+_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _plain(value: Any) -> str:
+    """Angle brackets stripped. The site renders config `days` text through
+    `_biSpan`, which emits it as raw HTML (deliberate for hand-authored config),
+    so anything that reaches `phases[].days[]` from an LLM must not carry markup.
+    The `extract_itinerary` MCP tool sanitises first; this is the backstop for a
+    `days` payload that arrives some other way (e.g. `intake/correct`).
+    """
+    return re.sub(r"[<>]", "", str(value or "")).strip()
+
+
+def _bilingual_text(obj: Any) -> dict[str, str] | None:
+    """Normalise a {he,en} pair: strip markup, mirror the present side onto the
+    missing one, and return None when both sides are empty."""
+    if not isinstance(obj, Mapping):
+        return None
+    he, en = _plain(obj.get("he")), _plain(obj.get("en"))
+    if not he and not en:
+        return None
+    return {"he": he or en, "en": en or he}
+
+
+def _normalise_days(
+    raw_days: Any, start: date | None, end: date | None,
+) -> list[dict[str, Any]]:
+    """Turn a phases[].days intake payload into the site's config shape:
+    [{date, label?:{he,en}, items:[{time:"HH:MM"|None, text:{he,en}}]}].
+
+    Drops a day whose date is unparseable or (when the phase has a range)
+    outside it, and a day left with no valid items. An item keeps its `time`
+    only if it is exactly HH:MM, and is dropped if its text is empty in both
+    languages.
+    """
+    if not isinstance(raw_days, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in raw_days:
+        if not isinstance(raw, Mapping):
+            continue
+        when = _parse_iso_date(raw.get("date"))
+        if not when:
+            continue
+        if start and end and not (start <= when <= end):
+            continue
+        items: list[dict[str, Any]] = []
+        for raw_item in raw.get("items") or []:
+            if not isinstance(raw_item, Mapping):
+                continue
+            text = _bilingual_text(raw_item.get("text"))
+            if not text:
+                continue
+            raw_time = str(raw_item.get("time") or "").strip()
+            items.append({
+                "time": raw_time if _TIME_RE.match(raw_time) else None,
+                "text": text,
+            })
+        if not items:
+            continue
+        day: dict[str, Any] = {"date": when.isoformat(), "items": items}
+        label = _bilingual_text(raw.get("label"))
+        if label:
+            day["label"] = label
+        out.append(day)
+    out.sort(key=lambda d: d["date"])
+    return out
+
+
 def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
-    shape — logistics fields only (id/title/dates/accommodation/note). Hero
-    images, map coordinates and day-by-day itineraries need external lookups
-    this transformer deliberately doesn't perform (see module docstring).
+    shape — logistics fields, plus a day-by-day `days[]` when the intake
+    carries one (extracted from an uploaded plan document at interview time).
+    Hero images and map coordinates still need external lookups this
+    transformer deliberately doesn't perform (see module docstring).
 
     Consecutive stops that shorten to the same location (a group split like
     "Dallas (boys...)" immediately followed by "Dallas (all travelers)") are
@@ -658,6 +728,7 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             "start": _parse_iso_date(raw.get("start")),
             "end": _parse_iso_date(raw.get("end")),
             "accommodation": raw.get("accommodation"),
+            "days": raw.get("days") if isinstance(raw.get("days"), list) else [],
         })
 
     merged: list[dict[str, Any]] = []
@@ -671,6 +742,7 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             prev["accommodation"] = prev["accommodation"] or entry["accommodation"]
             prev["notes_he"].append(entry["full_he"])
             prev["notes_en"].append(entry["full_en"])
+            prev["days"] = prev["days"] + entry["days"]
         else:
             entry["notes_he"] = [entry["full_he"]]
             entry["notes_en"] = [entry["full_en"]]
@@ -706,6 +778,10 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
         note_en = _phase_note_text(entry["short_en"], entry["notes_en"])
         if note_he or note_en:
             phase["note"] = {"he": note_he or note_en, "en": note_en or note_he}
+
+        days = _normalise_days(entry["days"], entry["start"], entry["end"])
+        if days:
+            phase["days"] = days
 
         result.append(phase)
     return result

@@ -63,6 +63,21 @@ Submit as:
 ```
 For a single-destination trip this is still an array — just one entry.
 
+**Optional `days` per phase — a day-by-day plan.** Don't ask the organizer to type this. If they shared a plan document, run `extract_itinerary` after submitting `phases` (SOUL.md workflow step 8): it returns a `days` array per phase, which you review with them and then merge back into each matching phase before re-submitting `phases`. Shape (the site consumes it directly):
+```json
+"days": [
+  {
+    "date": "2026-09-07",
+    "label": { "he": "יום ראשון בטוקיו", "en": "First day in Tokyo" },
+    "items": [
+      { "time": "10:00", "text": { "he": "מגדל סקייטרי", "en": "Tokyo Skytree" } },
+      { "time": null,    "text": { "he": "ערב באסקוסה", "en": "Evening in Asakusa" } }
+    ]
+  }
+]
+```
+Every `date` must sit inside that phase's `start`/`end`. `time` is `"HH:MM"` or `null`. Both `he` and `en` on every string. A phase with nothing described just has no `days`. The transformer drops anything malformed, so a partial plan is safe.
+
 ## travel_anchors — optional, structured (array)
 
 Anything already booked and worth recording — flights, a rental car, a specific hotel outside the phases above. Skip this whole question if nothing's booked yet; don't ask "are you sure?" — "nothing yet" is a completely normal answer this early. If they have a confirmation email or ticket for any of this, reading it beats asking them to type out flight numbers and confirmation codes from memory.
