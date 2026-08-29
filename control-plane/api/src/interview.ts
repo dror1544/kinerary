@@ -872,3 +872,107 @@ export async function getSessionStatus(
 
   return { ok: true, state: session.state };
 }
+
+// ── country_reference: cross-trip consular contacts ──────────────────────────
+
+export type ConsularContact = { name: { he: string; en: string }; phone: string };
+
+const CONSULAR_MAX_AGE_DAYS = 180;
+
+function normaliseCountry(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
+}
+
+/** The site renders contact.name through `_biSpan` (raw HTML) and phone into a
+ * `tel:` href — same XSS posture as the itinerary `days` text, so strip markup
+ * here rather than trust the search model's output. */
+function cleanConsularContacts(raw: unknown): ConsularContact[] {
+  if (!Array.isArray(raw)) return [];
+  const plain = (v: unknown) => String(v ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
+  const out: ConsularContact[] = [];
+  for (const entry of raw.slice(0, 8)) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const nameObj = (e.name && typeof e.name === "object" ? e.name : {}) as Record<string, unknown>;
+    const nameStr = typeof e.name === "string" ? e.name : "";
+    const he = plain(nameObj.he ?? nameStr);
+    const en = plain(nameObj.en ?? nameStr);
+    const phone = plain(e.phone).replace(/[^\d+()\-\s]/g, "").trim().slice(0, 40);
+    if ((!he && !en) || !phone) continue;
+    out.push({ name: { he: he || en, en: en || he }, phone });
+  }
+  return out;
+}
+
+async function sessionActive(db: pg.Pool, rawSessionToken: string): Promise<boolean> {
+  const row = await db.query(
+    "SELECT 1 FROM control_plane.intake_sessions WHERE session_token_digest = $1 AND state <> 'confirmed'",
+    [sessionTokenDigest(rawSessionToken)],
+  );
+  return row.rows.length > 0;
+}
+
+/** Read a cached consular row. `found` is true only when a row exists and is
+ * fresher than CONSULAR_MAX_AGE_DAYS — the interviewer's tool then skips the
+ * web search entirely. */
+export async function consularContactsFor(
+  db: pg.Pool,
+  rawSessionToken: string,
+  destinationCountry: string,
+  homeCountry: string,
+): Promise<
+  | { ok: true; found: boolean; contacts: ConsularContact[]; fetchedAt?: string }
+  | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }
+> {
+  const dest = normaliseCountry(destinationCountry);
+  const home = normaliseCountry(homeCountry);
+  if (!dest || !home) return { ok: false, reason: "INVALID_REQUEST" };
+  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
+
+  const row = await db.query<{ contacts: unknown; fetched_at: string; stale: boolean }>(
+    `SELECT contacts, fetched_at,
+            (fetched_at < now() - ($3 || ' days')::interval) AS stale
+     FROM control_plane.country_reference
+     WHERE destination_country = $1 AND home_country = $2`,
+    [dest, home, String(CONSULAR_MAX_AGE_DAYS)],
+  );
+  const [hit] = row.rows;
+  if (!hit) return { ok: true, found: false, contacts: [] };
+  return {
+    ok: true,
+    found: !hit.stale,
+    contacts: cleanConsularContacts(hit.contacts),
+    fetchedAt: hit.fetched_at,
+  };
+}
+
+/** Upsert a consular row the interviewer's web search produced, for every later
+ * trip to the same (destination, home) pair to reuse. */
+export async function saveConsularContacts(
+  db: pg.Pool,
+  rawSessionToken: string,
+  destinationCountry: string,
+  homeCountry: string,
+  contacts: unknown,
+  source?: string,
+): Promise<
+  | { ok: true; contacts: ConsularContact[] }
+  | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" | "NO_USABLE_CONTACTS" }
+> {
+  const dest = normaliseCountry(destinationCountry);
+  const home = normaliseCountry(homeCountry);
+  if (!dest || !home) return { ok: false, reason: "INVALID_REQUEST" };
+  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
+
+  const clean = cleanConsularContacts(contacts);
+  if (clean.length === 0) return { ok: false, reason: "NO_USABLE_CONTACTS" };
+
+  await db.query(
+    `INSERT INTO control_plane.country_reference (destination_country, home_country, contacts, source, fetched_at)
+     VALUES ($1, $2, $3::jsonb, $4, now())
+     ON CONFLICT (destination_country, home_country)
+     DO UPDATE SET contacts = EXCLUDED.contacts, source = EXCLUDED.source, fetched_at = now()`,
+    [dest, home, JSON.stringify(clean), (source ?? "").slice(0, 200) || null],
+  );
+  return { ok: true, contacts: clean };
+}

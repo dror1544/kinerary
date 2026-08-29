@@ -163,13 +163,41 @@ def main(argv: list[str] | None = None) -> int:
                 companion_adapter = NullCompanionProfileAdapter()
                 mcp_bridge_adapter = NullMcpBridgeAdapter()
             from .enrichment import enrich_config
+            import re as _re
+
+            def _consular_lookup(destination: str, home_country: str):
+                """Read-only view of control_plane.country_reference, populated
+                by interview-mcp's lookup_consular_contacts. A miss (or any DB
+                error) returns None and enrich_config just skips the contacts."""
+                dest = _re.sub(r"\s+", " ", destination).strip().lower()
+                home = _re.sub(r"\s+", " ", home_country).strip().lower()
+                try:
+                    import psycopg
+                    with psycopg.connect(db_url) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT contacts FROM control_plane.country_reference "
+                                "WHERE destination_country = %s AND home_country = %s",
+                                (dest, home),
+                            )
+                            row = cur.fetchone()
+                    if row and isinstance(row[0], list):
+                        return row[0]
+                except Exception:
+                    return None
+                return None
+
+            def _enrich(config, destination):
+                return enrich_config(config, destination, consular_lookup=_consular_lookup)
+
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,
                 companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
-                # Live destination enrichment (currency/emergency/coords/hero).
+                # Live destination enrichment (currency/emergency/coords/hero,
+                # plus consular contacts from the cross-trip reference store).
                 # Always on in a real run: it self-guards and degrades to "no
                 # enrichment", never a failure.
-                enrich=enrich_config,
+                enrich=_enrich,
             )
             import signal, time as _time
             stopping = False

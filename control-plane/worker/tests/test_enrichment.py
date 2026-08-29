@@ -306,6 +306,55 @@ class MapObjectTests(unittest.TestCase):
         self.assertEqual({"center": [1.0, 2.0], "zoom": 9, "stops": []}, out["map"])
 
 
+class ConsularContactsTests(unittest.TestCase):
+    JP_IL = [
+        {"name": {"he": "שגרירות ישראל בטוקיו", "en": "Embassy of Israel in Tokyo"}, "phone": "+81-3-3264-0911"},
+        {"name": {"en": "Consulate — emergency line"}, "phone": "+81 90 0000 0000"},
+    ]
+
+    def test_contacts_land_under_travel_info_emergency_contacts(self) -> None:
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0,
+                            consular_lookup=lambda dest, home: self.JP_IL)
+        self.assertEqual(2, len(out["travel_info"]["emergency_contacts"]))
+        self.assertEqual("Embassy of Israel in Tokyo", out["travel_info"]["emergency_contacts"][0]["name"]["en"])
+
+    def test_the_missing_name_side_is_mirrored(self) -> None:
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0,
+                            consular_lookup=lambda dest, home: self.JP_IL)
+        second = out["travel_info"]["emergency_contacts"][1]["name"]
+        self.assertEqual(second["he"], second["en"])
+
+    def test_home_country_comes_from_meta_and_defaults_to_israel(self) -> None:
+        seen = {}
+        def lookup(dest, home):
+            seen["dest"], seen["home"] = dest, home
+            return self.JP_IL
+        enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0, consular_lookup=lookup)
+        self.assertEqual(("Japan", "Israel"), (seen["dest"], seen["home"]))
+        cfg = _config(meta={"title": "x", "home_country": "United States"})
+        enrich_config(cfg, "Japan", http=FakeHttp({}), pause=0, consular_lookup=lookup)
+        self.assertEqual("United States", seen["home"])
+
+    def test_markup_in_a_contact_is_stripped(self) -> None:
+        poisoned = [{"name": {"en": "<img src=x onerror=alert(1)> Embassy"}, "phone": "+1<script>"}]
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0,
+                            consular_lookup=lambda d, h: poisoned)
+        c = out["travel_info"]["emergency_contacts"][0]
+        self.assertNotIn("<", c["name"]["en"] + c["phone"])
+
+    def test_no_lookup_and_empty_result_leave_emergency_contacts_unset(self) -> None:
+        out1 = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0)
+        out2 = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0, consular_lookup=lambda d, h: [])
+        self.assertNotIn("emergency_contacts", out1.get("travel_info", {}))
+        self.assertNotIn("emergency_contacts", out2.get("travel_info", {}))
+
+    def test_a_raising_lookup_never_propagates(self) -> None:
+        def boom(dest, home):
+            raise RuntimeError("search on fire")
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0, consular_lookup=boom)
+        self.assertNotIn("emergency_contacts", out.get("travel_info", {}))
+
+
 class ResilienceTests(unittest.TestCase):
     def test_a_raising_http_client_never_propagates(self) -> None:
         http = FakeHttp({}, boom=True)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -205,12 +206,17 @@ def _wikipedia_image(http: Http, title: str, lang: str = "en") -> str | None:
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
+# (destination, home_country) -> [{"name": {"he","en"}, "phone"}] or None.
+ConsularLookup = Callable[[str, str], Any]
+
+
 def enrich_config(
     config: dict[str, Any],
     destination: str,
     *,
     http: Http | None = None,
     pause: float = 1.0,
+    consular_lookup: ConsularLookup | None = None,
 ) -> dict[str, Any]:
     """Return a copy of *config* with destination data, phase coordinates and
     phase hero photos filled in where a lookup succeeds. Never raises; a copy
@@ -222,6 +228,11 @@ def enrich_config(
         _enrich_country(out, destination, http)
     except Exception:
         logger.warning("enrichment.country_failed", exc_info=True)
+
+    try:
+        _enrich_consular(out, destination, consular_lookup)
+    except Exception:
+        logger.warning("enrichment.consular_failed", exc_info=True)
 
     for phase in out.get("phases") or []:
         if not isinstance(phase, dict):
@@ -271,6 +282,59 @@ def _enrich_country(out: dict[str, Any], destination: str, http: Http) -> None:
     # currency stub (which may sit under a slightly different name) so the Info
     # tab shows one country card, not two.
     out["travel_info"] = {"countries": {name: entry}}
+
+
+def _home_country(out: dict[str, Any]) -> str:
+    """Whose embassy to look up. The intake's optional home_country answer,
+    surfaced by the transformer at meta.home_country; Israel is the default
+    (Hebrew-speaking organizers, one shared bot) until the landing-page account
+    carries it per organizer."""
+    meta = out.get("meta")
+    if isinstance(meta, dict):
+        value = str(meta.get("home_country") or "").strip()
+        if value:
+            return value
+    return "Israel"
+
+
+def _enrich_consular(
+    out: dict[str, Any], destination: str, consular_lookup: "ConsularLookup | None",
+) -> None:
+    """Populate travel_info.emergency_contacts from the cross-trip
+    country_reference store (via the injected reader). The generic country
+    emergency numbers come from _enrich_country; this adds the named
+    home-country embassy/consulate a traveler in trouble actually calls."""
+    if consular_lookup is None or not destination or not destination.strip():
+        return
+    contacts = consular_lookup(destination.strip(), _home_country(out))
+    if not isinstance(contacts, list) or not contacts:
+        return
+    cleaned: list[dict[str, Any]] = []
+    for entry in contacts[:8]:
+        if not isinstance(entry, dict):
+            continue
+        raw_name = entry.get("name")
+        name = _bilingual_name(raw_name)
+        phone = re.sub(r"[<>]", "", str(entry.get("phone") or "")).strip()
+        if not name or not phone:
+            continue
+        cleaned.append({"name": name, "phone": phone})
+    if not cleaned:
+        return
+    travel_info = out.setdefault("travel_info", {})
+    if isinstance(travel_info, dict):
+        travel_info["emergency_contacts"] = cleaned
+
+
+def _bilingual_name(value: Any) -> dict[str, str] | None:
+    if isinstance(value, dict):
+        he = re.sub(r"[<>]", "", str(value.get("he") or "")).strip()
+        en = re.sub(r"[<>]", "", str(value.get("en") or "")).strip()
+    else:
+        he = en = re.sub(r"[<>]", "", str(value or "")).strip()
+    if not he and not en:
+        return None
+    return {"he": he or en, "en": en or he}
 
 
 def _phase_query(phase: dict[str, Any]) -> tuple[str, str]:

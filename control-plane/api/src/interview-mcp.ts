@@ -34,6 +34,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import { extractItinerary } from "./itinerary-extract.js";
+import { lookupConsularContacts } from "./consular-lookup.js";
 
 const API_BASE = (process.env.CONTROL_PLANE_API_BASE_URL || "http://127.0.0.1:4310").replace(/\/$/, "");
 const MCP_PORT = Number(process.env.INTERVIEW_MCP_PORT || "4311");
@@ -153,6 +154,53 @@ function buildMcpServer() {
     },
     async ({ destination, phases, travelers, documentText }) =>
       ok(await extractItinerary({ destination, phases, travelers, documentText })),
+  );
+
+  // Also host-side, also not a forward: find the organizer's home-country
+  // embassy/consulate in the destination (there is no keyless API). Checks the
+  // cross-trip country_reference store first via the /consular endpoint and
+  // only runs the web search on a miss, then writes the result back so the
+  // next trip to the same pair reuses it.
+  mcp.tool(
+    "lookup_consular_contacts",
+    "Find the organizer's home-country embassy/consulate in the trip destination (name + phone) for the " +
+      "site's Info tab. Call this once, after the destination is known. Pass the destination country and the " +
+      "organizer's home country (default the organizer's own country; ask only if unclear). Returns " +
+      "{ ok, contacts: [{ name: {he,en}, phone }], cached }. On { ok: false } just continue — the site still " +
+      "shows the generic emergency numbers; consular contacts are optional.",
+    {
+      sessionId: z.string(),
+      sessionToken: z.string(),
+      destination: z.string().describe("The destination country, e.g. \"Japan\""),
+      homeCountry: z.string().describe("The organizer's home country, e.g. \"Israel\""),
+    },
+    async ({ sessionId, sessionToken, destination, homeCountry }) => {
+      const base = `/v1/interview/${encodeURIComponent(sessionId)}/consular`;
+      try {
+        const cached = (await forward(base, "POST", sessionToken, { destination, homeCountry })) as {
+          found?: boolean; contacts?: unknown[];
+        };
+        if (cached?.found && Array.isArray(cached.contacts) && cached.contacts.length) {
+          return ok({ ok: true, contacts: cached.contacts, cached: true });
+        }
+      } catch {
+        // fall through to a live lookup — a read failure shouldn't block one
+      }
+
+      const result = await lookupConsularContacts({ destination, homeCountry });
+      if (!result.ok) return ok(result);
+
+      try {
+        const saved = (await forward(base, "POST", sessionToken, {
+          destination, homeCountry, contacts: result.contacts, source: "interview-web-search",
+        })) as { contacts?: unknown[] };
+        return ok({ ok: true, contacts: saved?.contacts ?? result.contacts, cached: false, warnings: result.warnings });
+      } catch (e) {
+        // The lookup worked; persistence didn't. Still hand the interviewer the
+        // contacts — they just won't be reused by the next trip.
+        return ok({ ok: true, contacts: result.contacts, cached: false, persisted: false, warnings: result.warnings });
+      }
+    },
   );
 
   mcp.tool(

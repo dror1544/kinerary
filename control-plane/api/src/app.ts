@@ -5,7 +5,10 @@ import type { ArchitectureProfile } from "./config.js";
 import { resolveTelegramCallbackRef, answerTelegramCallbackQuery } from "./adapters/telegram.js";
 import { issueEnrollment, verifyEnrollmentToken, type EnrollmentConfig } from "./enrollment.js";
 import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } from "./identity.js";
-import { startSession, getSession, submitAnswer, confirmIntake, getSessionStatus } from "./interview.js";
+import {
+  startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
+  consularContactsFor, saveConsularContacts,
+} from "./interview.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
@@ -89,6 +92,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
       "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/intake/correct",
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
+      "/v1/interview/:sessionId/consular",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
     ],
@@ -512,6 +516,51 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       digest: result.digest,
       versionNumber: result.versionNumber,
     });
+  });
+
+  // POST /v1/interview/:sessionId/consular — read or populate the cross-trip
+  // consular-contacts store (control_plane.country_reference).
+  // Header: Authorization: Bearer <session-token>
+  // Body: { destination, homeCountry, contacts?, source? }
+  //   - contacts omitted → read: { found, contacts, fetchedAt? }. `found` is
+  //     true only when a cached row exists and is fresh; the interviewer's tool
+  //     then skips the web search.
+  //   - contacts present → upsert the row the web search produced and echo the
+  //     cleaned list back.
+  app.post("/v1/interview/:sessionId/consular", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const destination = body.destination;
+    const homeCountry = body.homeCountry;
+    if (typeof destination !== "string" || typeof homeCountry !== "string") {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const db = dependencies.interview.db;
+    if (body.contacts === undefined) {
+      const read = await consularContactsFor(db, rawToken, destination, homeCountry);
+      if (!read.ok) {
+        return reply.code(read.reason === "NOT_FOUND" ? 404 : 400).send({ error: read.reason });
+      }
+      return reply.code(200).send({ found: read.found, contacts: read.contacts, fetchedAt: read.fetchedAt });
+    }
+
+    const saved = await saveConsularContacts(
+      db, rawToken, destination, homeCountry, body.contacts,
+      typeof body.source === "string" ? body.source : undefined,
+    );
+    if (!saved.ok) {
+      const status = saved.reason === "NOT_FOUND" ? 404 : 400;
+      return reply.code(status).send({ error: saved.reason });
+    }
+    return reply.code(200).send({ contacts: saved.contacts });
   });
 
   // GET /v1/interview/:sessionId/status — lifecycle status for the organizer status UI.
