@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -37,9 +37,13 @@ import brandLogoReversed from "./assets/brand/logo-reversed.svg";
 import brandMark from "./assets/brand/mark.svg";
 import {
   ActiveItinerary,
+  Booking,
+  approveBookingDraft,
   ItineraryItem,
   TripConfig,
   createMoment,
+  extractBookingDraft,
+  getBookings,
   getConfig,
   getConfirmations,
   getFlightStatus,
@@ -57,7 +61,9 @@ import {
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
+type Module = "bookings" | "map" | "budget" | "photos";
 type Lang = "he" | "en";
+type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
 
 const tabIcons = {
   today: Home,
@@ -98,12 +104,25 @@ function tabLabel(tab: Tab, lang: Lang) {
   return labels[tab][lang];
 }
 
-const moduleShortcuts = [
-  "Bookings",
-  "Map",
-  "Budget",
-  "Photos",
+const moduleShortcuts: Array<{ id: Module; en: string; he: string }> = [
+  { id: "bookings", en: "Bookings", he: "הזמנות" },
+  { id: "map", en: "Map", he: "מפה" },
+  { id: "budget", en: "Budget", he: "תקציב" },
+  { id: "photos", en: "Photos", he: "תמונות" },
 ];
+
+function moduleLabel(module: Module, lang: Lang) {
+  const shortcut = moduleShortcuts.find((item) => item.id === module);
+  return shortcut ? shortcut[lang] : module;
+}
+
+function isTab(value: string): value is Tab {
+  return Object.keys(tabIcons).includes(value);
+}
+
+function isModule(value: string): value is Module {
+  return moduleShortcuts.some((shortcut) => shortcut.id === value);
+}
 
 export function preferredLang(): Lang {
   const stored = localStorage.getItem("tripLang");
@@ -199,31 +218,44 @@ function Hero({
   settings,
   lang,
   activeTab,
+  activeModule,
   heroPhaseId,
-  setActiveTab,
+  openTab,
+  openModule,
   openMenu,
 }: {
   config?: TripConfig;
   settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
   lang: Lang;
   activeTab: Tab;
+  activeModule: Module | null;
   heroPhaseId?: string;
-  setActiveTab: (tab: Tab) => void;
+  openTab: (tab: Tab) => void;
+  openModule: (module: Module) => void;
   openMenu: () => void;
 }) {
   const activePhase = config?.phases?.find((phase) => phase.id === heroPhaseId);
   const activePhaseName = activePhase ? text(activePhase.title, lang) : "";
   const fallback = activePhase?.hero?.photo || settings?.hero.url || config?.meta?.homePhoto || config?.phases?.[0]?.hero?.photo || config?.meta?.mapPhoto || "";
+  const visiblePhoto = useRef(fallback);
+  const [departingPhoto, setDepartingPhoto] = useState<string | null>(null);
+  useEffect(() => {
+    if (!fallback || visiblePhoto.current === fallback) {
+      visiblePhoto.current = fallback;
+      return;
+    }
+    setDepartingPhoto(visiblePhoto.current || null);
+    visiblePhoto.current = fallback;
+    const timer = window.setTimeout(() => setDepartingPhoto(null), 900);
+    return () => window.clearTimeout(timer);
+  }, [fallback]);
+  const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
   return (
-    <header
-      className="trip-hero"
-      style={{
-        backgroundImage: fallback ? `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${fallback}")` : undefined,
-        backgroundPosition: `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`,
-      }}
-    >
+    <header className={departingPhoto ? "trip-hero phase-shift" : "trip-hero"}>
+      {departingPhoto ? <div className="hero-image-layer hero-image-departing" aria-hidden="true" style={{ backgroundImage: `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${departingPhoto}")`, backgroundPosition }} /> : null}
+      <div key={fallback || "solid"} className="hero-image-layer hero-image-arriving" aria-hidden="true" style={{ backgroundImage: fallback ? `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${fallback}")` : undefined, backgroundPosition }} />
       <nav className="topline" aria-label="Trip">
-        <a className="brand-lockup" href="#today" onClick={() => setActiveTab("today")} aria-label="Kinerary home">
+        <a className="brand-lockup" href="#today" onClick={() => openTab("today")} aria-label="Kinerary home">
           <img src={brandLogoReversed} alt="Kinerary" />
           <strong>{config?.meta?.title || "Family Trip"}</strong>
         </a>
@@ -232,23 +264,30 @@ function Hero({
             <a
               key={tab}
               href={`#${tab}`}
-              className={activeTab === tab ? "active" : ""}
-              onClick={() => setActiveTab(tab)}
+              className={!activeModule && activeTab === tab ? "active" : ""}
+              onClick={() => openTab(tab)}
             >
               {tabLabel(tab, lang)}
             </a>
           ))}
         </div>
-        <div className="desktop-shortcuts" aria-label="Coming Modern modules">
+        <div className="desktop-shortcuts" aria-label="Modern modules">
           {moduleShortcuts.map((shortcut) => (
-            <a key={shortcut} href="#more" onClick={() => setActiveTab("more")}>{shortcut}</a>
+            <a
+              key={shortcut.id}
+              href={`#${shortcut.id}`}
+              className={activeModule === shortcut.id ? "active" : ""}
+              onClick={() => openModule(shortcut.id)}
+            >
+              {shortcut[lang]}
+            </a>
           ))}
         </div>
         <button className="menu-button" type="button" onClick={openMenu} aria-label="Open menu">
           <Menu size={20} />
         </button>
       </nav>
-      <div className="hero-copy">
+      <div key={`${fallback}-${lang}`} className="hero-copy hero-copy-arriving">
         <span className="eyebrow"><Sparkles size={16} /> {activePhaseName || "Living journey"}</span>
         <h1>{activePhaseName || config?.meta?.destination || config?.meta?.title || "Today knows where the trip is."}</h1>
         <p>{lang === "he" ? "המסלול, הרגעים והעוזר זזים יחד עם השעון של הטיול." : "The itinerary, moments, and companion follow the trip clock as the day changes."}</p>
@@ -652,7 +691,215 @@ function MomentsView({ todayDate }: { todayDate?: string }) {
   );
 }
 
-function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: boolean }) {
+function phaseTitle(config: TripConfig | undefined, phaseId: string | null | undefined, lang: Lang) {
+  if (!phaseId) return lang === "he" ? "ללא שלב" : "Unassigned";
+  const phase = config?.phases?.find((entry) => entry.id === phaseId);
+  return phase ? text(phase.title, lang) || phaseId : phaseId;
+}
+
+function bookingDateLine(booking: Booking, lang: Lang) {
+  if (booking.date_from && booking.date_to && booking.date_from !== booking.date_to) {
+    return `${dateLabel(booking.date_from, lang)} → ${dateLabel(booking.date_to, lang)}`;
+  }
+  if (booking.date_from) return dateLabel(booking.date_from, lang);
+  if (booking.date_to) return dateLabel(booking.date_to, lang);
+  return lang === "he" ? "תאריך חסר" : "Date missing";
+}
+
+function bookingState(booking: Booking) {
+  if (booking.review_status === "draft") return "draft";
+  if (booking.confirmation || booking.conf_file || booking.google_wallet_url || booking.apple_wallet_url || booking.pkpass_file) return "verified";
+  return "needs-review";
+}
+
+function BookingActions({ booking }: { booking: Booking }) {
+  const confirmationUrl = safeFileUrl("/api/bookings/confirmation", booking.conf_file);
+  const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", booking.pkpass_file);
+  return (
+    <div className="action-strip">
+      {confirmationUrl ? <a href={confirmationUrl} target="_blank" rel="noreferrer"><ShieldCheck size={15} /> Confirmation</a> : null}
+      {booking.location_url ? <a href={booking.location_url} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
+      {booking.google_wallet_url ? <a href={booking.google_wallet_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
+      {booking.apple_wallet_url || appleWalletUrl ? <a href={booking.apple_wallet_url || appleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a> : null}
+    </div>
+  );
+}
+
+function BookingExtractPanel({ isOrganizer }: { isOrganizer?: boolean }) {
+  const [url, setUrl] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [result, setResult] = useState<Booking | null>(null);
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: () => {
+      const body = new FormData();
+      if (file) body.set("file", file);
+      if (url.trim()) body.set("url", url.trim());
+      return extractBookingDraft(body);
+    },
+    onSuccess: (value) => {
+      setResult(value.booking);
+      queryClient.invalidateQueries({ queryKey: ["bookings"] });
+    },
+  });
+
+  if (!isOrganizer) return null;
+  return (
+    <form
+      className="extract-panel"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!file && !url.trim()) return;
+        mutation.mutate();
+      }}
+    >
+      <span className="panel-label"><Upload size={16} /> Extract</span>
+      <h3>Pull booking details from a PDF or URL</h3>
+      <p>Creates an organizer-only draft. Check it, then approve it for trip members.</p>
+      <label>
+        Confirmation PDF
+        <input type="file" accept="application/pdf" onChange={(event) => setFile(event.target.files?.[0] || null)} />
+      </label>
+      <label>
+        Or booking URL
+        <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://..." />
+      </label>
+      <button className="primary-action" type="submit" disabled={mutation.isPending || (!file && !url.trim())}>
+        {mutation.isPending ? "Extracting..." : "Create draft for review"}
+      </button>
+      {mutation.isError ? <p className="form-error">{mutation.error instanceof Error ? mutation.error.message : "Extraction failed"}</p> : null}
+      {result ? <p className="extract-result">Draft created: <strong>{result.name}</strong>. It is visible only to organizers until approved.</p> : null}
+    </form>
+  );
+}
+
+function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const [filter, setFilter] = useState<BookingFilter>("phase");
+  const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
+  const allRows = bookings.data || [];
+  const activePhaseId = today.data?.current?.phase_id || today.data?.next?.phase_id || null;
+  const rows = useMemo(() => allRows.filter((booking) => {
+    if (filter === "phase") return true;
+    if (filter === "current") return Boolean(activePhaseId) && booking.phase === activePhaseId;
+    if (filter === "today") {
+      const day = today.data?.today;
+      return Boolean(day && booking.date_from && booking.date_from <= day && (!booking.date_to || booking.date_to >= day));
+    }
+    return booking.type === filter;
+  }), [activePhaseId, allRows, filter, today.data?.today]);
+  const grouped = useMemo(() => {
+    const order = new globalThis.Map((config?.phases || []).map((phase, index) => [phase.id, index]));
+    return Array.from(rows.reduce((map, booking) => {
+      const key = booking.phase || "unassigned";
+      map.set(key, [...(map.get(key) || []), booking]);
+      return map;
+    }, new globalThis.Map<string, Booking[]>()).entries()).sort(([a], [b]) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
+  }, [config?.phases, rows]);
+  const needsReview = rows.filter((booking) => bookingState(booking) !== "verified").length;
+  const approveMutation = useMutation({
+    mutationFn: approveBookingDraft,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["bookings"] }),
+  });
+
+  return (
+    <section className="module-layout">
+      <div className="module-header">
+        <span className="panel-label"><TicketCheck size={16} /> {moduleLabel("bookings", lang)}</span>
+        <h2>{lang === "he" ? "הזמנות וכרטיסים במקום אחד" : "Bookings and tickets, one tap away"}</h2>
+        <p>{lang === "he" ? "אישורים, ארנקים וקישורי מפה נשארים מחוץ לתקציב ומופיעים גם בכרטיסי המסלול הרלוונטיים." : "Confirmations, wallets, and map links stay separate from budget and also appear on matching journey cards."}</p>
+        <div className="module-stats">
+          <span>{rows.length} total</span>
+          <span>{needsReview} need review</span>
+        </div>
+      </div>
+      <BookingExtractPanel isOrganizer={isOrganizer} />
+      <div className="filter-row" aria-label="Booking filters">
+        {([
+          ["phase", lang === "he" ? "לפי שלב" : "By phase"],
+          ["today", lang === "he" ? "היום" : "Today"],
+          ["current", lang === "he" ? "השלב הנוכחי" : "Current phase"],
+          ["flight", lang === "he" ? "טיסות" : "Flights"],
+          ["hotel", lang === "he" ? "לינה" : "Stays"],
+          ["attraction", lang === "he" ? "אטרקציות" : "Attractions"],
+        ] as Array<[BookingFilter, string]>).map(([id, label]) => <button type="button" key={id} className={filter === id ? "filter-chip active" : "filter-chip"} onClick={() => setFilter(id)}>{label}</button>)}
+      </div>
+      {bookings.isError ? <p className="empty-state">Could not load bookings right now.</p> : null}
+      <div className="booking-groups">
+        {grouped.map(([phaseId, phaseBookings]) => (
+          <section className="booking-group" key={phaseId}>
+            <h3>{phaseTitle(config, phaseId, lang)}</h3>
+            <div className="module-grid">
+              {phaseBookings.map((booking) => (
+                <article className="booking-card" key={booking.id}>
+                  <div className="booking-card-head">
+                    <span className="booking-type">{booking.type}</span>
+                    <span className={`status-pill ${bookingState(booking)}`}>{bookingState(booking) === "verified" ? "Verified" : bookingState(booking) === "draft" ? "Draft" : "Needs review"}</span>
+                  </div>
+                  <h4>{booking.name}</h4>
+                  <p>{bookingDateLine(booking, lang)}</p>
+                  {booking.passengers ? <small>{booking.passengers}</small> : null}
+                  <BookingActions booking={booking} />
+                  {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
+                </article>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+      {!rows.length && !bookings.isLoading ? <p className="empty-state">No bookings have been added yet.</p> : null}
+    </section>
+  );
+}
+
+function MapView({ config, lang }: { config?: TripConfig; itinerary?: ActiveItinerary; lang: Lang }) {
+  const phaseStops = (config?.phases || []).filter((phase) => typeof phase.mapStop?.lat === "number" && typeof phase.mapStop?.lng === "number");
+
+  return (
+    <section className="module-layout">
+      <div className="module-header">
+        <span className="panel-label"><Map size={16} /> {moduleLabel("map", lang)}</span>
+        <h2>{lang === "he" ? "תחנות הלינה של שלבי הטיול" : "Journey phase accommodation stops"}</h2>
+        <p>{lang === "he" ? "בשלב הראשון המפה נשארת ממוקדת: תחנת הלינה הראשונה של כל שלב, עם ניווט מהיר. נקודות יומיות יתווספו בשלב הבא." : "The first map view stays intentionally focused: the first accommodation stop for each phase, with one-tap navigation. Daily locations come in the next stage."}</p>
+      </div>
+      <div className="module-grid">
+        {phaseStops.map((phase) => {
+          const ll = `${phase.mapStop?.lat},${phase.mapStop?.lng}`;
+          const accommodationName = text(phase.accommodation?.name, lang) || phase.accommodation?.name_en || text(phase.mapStop?.name, lang) || text(phase.title, lang) || phase.id;
+          const destination = phase.accommodation?.location_url || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(phase.accommodation?.address || ll)}`;
+          const wazeDestination = `https://waze.com/ul?ll=${encodeURIComponent(ll)}&navigate=yes`;
+          return (
+            <article className="map-anchor" key={phase.id}>
+              <span className="booking-type">{lang === "he" ? "שלב" : "Phase"}</span>
+              <h3>{text(phase.title, lang) || phase.id}</h3>
+              <p>{accommodationName}{phase.accommodation?.address ? ` · ${phase.accommodation.address}` : ""}</p>
+              <div className="action-strip">
+                <a href={destination} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a>
+                <a href={wazeDestination} target="_blank" rel="noreferrer"><Navigation size={15} /> Waze</a>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      {!phaseStops.length ? <p className="empty-state">No phase accommodation stops have been added yet.</p> : null}
+    </section>
+  );
+}
+
+function ModulePlaceholder({ module, lang }: { module: Module; lang: Lang }) {
+  return (
+    <section className="module-layout">
+      <div className="module-header">
+        <span className="panel-label"><Sparkles size={16} /> {moduleLabel(module, lang)}</span>
+        <h2>{moduleLabel(module, lang)} is next in the Modern rebuild.</h2>
+        <p>It stays visible in navigation so we can keep the structure stable while rebuilding parity slice by slice.</p>
+      </div>
+    </section>
+  );
+}
+
+function MoreView({ config, isOrganizer, openModule }: { config?: TripConfig; isOrganizer?: boolean; openModule: (module: Module) => void }) {
   const [busy, setBusy] = useState(false);
   const queryClient = useQueryClient();
 
@@ -677,7 +924,16 @@ function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: 
     }
   }
 
-  const workflows = ["Bookings, PDFs and wallet", "Maps and country info", "Budget", "Photos and reactions", "Tasks and packing", "RSVP, ratings and comments", "Lost and found", "Trivia and leaderboard"];
+  const workflows: Array<{ label: string; module?: Module }> = [
+    { label: "Bookings, PDFs and wallet", module: "bookings" },
+    { label: "Maps and country info", module: "map" },
+    { label: "Budget", module: "budget" },
+    { label: "Photos and reactions", module: "photos" },
+    { label: "Tasks and packing" },
+    { label: "RSVP, ratings and comments" },
+    { label: "Lost and found" },
+    { label: "Trivia and leaderboard" },
+  ];
   return (
     <section className="more-layout">
       <div className="section-heading">
@@ -703,9 +959,18 @@ function MoreView({ config, isOrganizer }: { config?: TripConfig; isOrganizer?: 
           </a>
         ) : null}
         {workflows.map((workflow) => (
-          <a key={workflow} className="workflow-link" href="#more">
+          <a
+            key={workflow.label}
+            className="workflow-link"
+            href={workflow.module ? `#${workflow.module}` : "#more"}
+            onClick={(event) => {
+              if (!workflow.module) return;
+              event.preventDefault();
+              openModule(workflow.module);
+            }}
+          >
             <ChevronLeft size={16} />
-            <span>{workflow}</span>
+            <span>{workflow.label}</span>
           </a>
         ))}
       </div>
@@ -720,6 +985,7 @@ function AppMenu({
   setOpen,
   setLang,
   openTab,
+  openModule,
 }: {
   open: boolean;
   lang: Lang;
@@ -727,6 +993,7 @@ function AppMenu({
   setOpen: (open: boolean) => void;
   setLang: (lang: Lang) => void;
   openTab: (tab: Tab) => void;
+  openModule: (module: Module) => void;
 }) {
   if (!open) return null;
   return (
@@ -743,9 +1010,9 @@ function AppMenu({
           ))}
         </div>
         <div className="menu-section">
-          <small>{lang === "he" ? "בקרוב במודרן" : "Modern modules"}</small>
+          <small>{lang === "he" ? "כלי הטיול" : "Trip tools"}</small>
           {moduleShortcuts.map((shortcut) => (
-            <button key={shortcut} type="button" onClick={() => openTab("more")}>{shortcut}</button>
+            <button key={shortcut.id} type="button" onClick={() => openModule(shortcut.id)}>{shortcut[lang]}</button>
           ))}
         </div>
         <div className="menu-section">
@@ -778,7 +1045,9 @@ function AppMenu({
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>((Object.keys(tabIcons).includes(window.location.hash.replace("#", "")) ? window.location.hash.replace("#", "") : "today") as Tab);
+  const initialHash = window.location.hash.replace("#", "");
+  const [activeTab, setActiveTab] = useState<Tab>(isTab(initialHash) ? initialHash : "today");
+  const [activeModule, setActiveModule] = useState<Module | null>(isModule(initialHash) ? initialHash : null);
   const [lang, setLang] = useState<Lang>(() => preferredLang());
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -798,7 +1067,11 @@ export default function App() {
   useEffect(() => {
     const syncHash = () => {
       const next = window.location.hash.replace("#", "");
-      if (Object.keys(tabIcons).includes(next)) setActiveTab(next as Tab);
+      if (isTab(next)) {
+        setActiveTab(next);
+        setActiveModule(null);
+      }
+      if (isModule(next)) setActiveModule(next);
     };
     window.addEventListener("hashchange", syncHash);
     return () => window.removeEventListener("hashchange", syncHash);
@@ -809,27 +1082,40 @@ export default function App() {
   const tabs = Object.keys(tabIcons) as Tab[];
   const openTab = (tab: Tab) => {
     setActiveTab(tab);
+    setActiveModule(null);
     window.location.hash = tab;
     setMenuOpen(false);
   };
+  const openModule = (module: Module) => {
+    setActiveModule(module);
+    window.location.hash = module;
+    setMenuOpen(false);
+  };
   const companionName = botDisplayName(config.data, hermes.data?.identity.name, lang);
-  const heroPhaseId = activeTab === "journey"
+  const heroPhaseId = !activeModule && activeTab === "journey"
     ? journeyHeroPhaseId
-    : activeTab === "today"
+    : !activeModule && activeTab === "today"
       ? todayPhaseId(config.data, itinerary.data, today.data)
       : "";
-  const content = {
+  const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
     journey: <JourneyView itinerary={itinerary.data} config={config.data} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} />,
     moments: <MomentsView todayDate={today.data?.today} />,
-    more: <MoreView config={config.data} isOrganizer={me.data?.is_organizer} />,
+    more: <MoreView config={config.data} isOrganizer={me.data?.is_organizer} openModule={openModule} />,
   }[activeTab];
+  const moduleContent = activeModule ? {
+    bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
+    map: <MapView config={config.data} lang={lang} />,
+    budget: <ModulePlaceholder module="budget" lang={lang} />,
+    photos: <ModulePlaceholder module="photos" lang={lang} />,
+  }[activeModule] : null;
+  const content = moduleContent || tabContent;
 
   return (
     <div className="modern-trip-app">
-      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} heroPhaseId={heroPhaseId} setActiveTab={setActiveTab} openMenu={() => setMenuOpen(true)} />
+      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} />
       <main className="app-content">{content}</main>
-      <AppMenu open={menuOpen} lang={lang} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} />
+      <AppMenu open={menuOpen} lang={lang} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} />
       <nav className="bottom-nav" aria-label="Primary">
         {tabs.map((tab) => {
           const Icon = tabIcons[tab];
@@ -837,7 +1123,7 @@ export default function App() {
             <a
               key={tab}
               href={`#${tab}`}
-              className={activeTab === tab ? "active" : ""}
+              className={!activeModule && activeTab === tab ? "active" : ""}
               onClick={() => openTab(tab)}
             >
               <Icon size={20} />

@@ -43,7 +43,13 @@ export const configSchema = z.object({
     start: z.string().optional(),
     end: z.string().optional(),
     hero: z.object({ photo: z.string().optional() }).optional(),
-    mapStop: z.object({ lat: z.number().optional(), lng: z.number().optional() }).optional(),
+    mapStop: z.object({ lat: z.number().optional(), lng: z.number().optional(), name: bilingualSchema }).optional(),
+    accommodation: z.object({
+      name: bilingualSchema,
+      name_en: z.string().optional(),
+      address: z.string().optional(),
+      location_url: z.string().optional(),
+    }).optional(),
   })).optional(),
   agent: z.object({
     name: z.string().optional(),
@@ -121,6 +127,26 @@ export type TodayContext = {
   flights: Array<{ id: number; name: string; date_from?: string | null; confirmation?: string | null }>;
 };
 
+const bookingSchema = z.object({
+  id: z.number(),
+  phase: z.string().nullable().optional(),
+  type: z.string(),
+  name: z.string(),
+  date_from: z.string().nullable().optional(),
+  date_to: z.string().nullable().optional(),
+  passengers: z.string().nullable().optional(),
+  confirmation: z.string().nullable().optional(),
+  conf_file: z.string().nullable().optional(),
+  location_url: z.string().nullable().optional(),
+  google_wallet_url: z.string().nullable().optional(),
+  apple_wallet_url: z.string().nullable().optional(),
+  pkpass_file: z.string().nullable().optional(),
+  notes: z.string().nullable().optional(),
+  review_status: z.enum(["approved", "draft"]).optional(),
+});
+
+export type Booking = z.infer<typeof bookingSchema>;
+
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
     method: "POST",
@@ -139,6 +165,10 @@ export const getItinerary = () => api<unknown>("/api/itinerary/active").then((va
   days: z.array(z.any()),
   items: z.array(itemSchema),
 }).parse(value) as ActiveItinerary);
+export const getBookings = () => api<unknown>("/api/bookings").then((value) => z.array(bookingSchema).parse(value));
+export const extractBookingDetails = (body: FormData) => api<unknown>("/api/bookings/extract", { method: "POST", body });
+export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });
+export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
 export const getMoments = () => api<Array<{ id: string; caption: string; body?: string | null; date?: string | null; visibility: string; author: string }>>("/api/moments");
 export const createMoment = (input: { caption: string; body?: string; date?: string; visibility?: "draft" | "published" }) => api("/api/moments", { method: "POST", body: JSON.stringify(input) });
 export const getHermes = () => api<{ identity: { name: string }; available: boolean; ask_in_telegram: boolean; telegram_username: string | null; verification_freshness: { open_issues: number; checked_at: string } }>("/api/hermes/status");

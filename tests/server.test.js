@@ -617,6 +617,13 @@ describe('Trip-specific read isolation', () => {
     assert.match(await res.text(), /id="login-overlay"/);
   });
 
+  test('classic rollback shell can load its required local assets', async () => {
+    for (const path of ['/runtime-base.js', '/app.js', '/styles.css', '/translations.js', '/brand/kinerary-icon.svg']) {
+      const res = await api(path);
+      assert.equal(res.status, 200, `${path} must remain available to Classic`);
+    }
+  });
+
   test('anonymous requests cannot observe runtime data or download files', async () => {
     const paths = [
       '/api/ratings', '/api/photos', '/api/photos/file/private.jpg',

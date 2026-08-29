@@ -34,7 +34,7 @@ before(async () => {
     req.on('end', () => {
       lastMockRequest = { headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString() || '{}') };
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ name: 'Mock Hotel', type: 'hotel' }));
+      res.end(JSON.stringify({ phase: 'ny', name: 'Mock Hotel', type: 'hotel', confirmation: 'MOCK-42' }));
     });
   });
   await new Promise(resolve => mockHermes.listen(MOCK_PORT, resolve));
@@ -108,5 +108,40 @@ describe('POST /api/bookings/extract', () => {
     assert.match(contentType, /application\/json/);
     const data = await res.json(); // throws if this is HTML, proving the fix
     assert.ok(data.error);
+  });
+});
+
+describe('POST /api/bookings/extract-draft', () => {
+  test('creates a private organizer draft, then makes it visible only after approval', async () => {
+    const created = await api('/api/bookings/extract-draft', {
+      method: 'POST', token, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(created.status, 201);
+    const { booking } = await created.json();
+    assert.equal(booking.review_status, 'draft');
+    assert.equal(booking.confirmation, 'MOCK-42');
+
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const memberRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(memberRows.some(row => row.id === booking.id), false, 'member must not see unapproved drafts');
+
+    const approved = await api(`/api/bookings/${booking.id}/approve`, { method: 'POST', token });
+    assert.equal(approved.status, 200);
+    const visibleRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(visibleRows.some(row => row.id === booking.id), true, 'approved draft should be visible to members');
+  });
+
+  test('rejects a member attempting to create a draft', async () => {
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const res = await api('/api/bookings/extract-draft', {
+      method: 'POST', token: bobToken, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(res.status, 403);
   });
 });

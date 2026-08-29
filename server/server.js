@@ -26,13 +26,16 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200
 const SITE_DIR = path.join(__dirname, '..', 'site');
 const CLASSIC_STATIC_FILES = new Map([
   ['/classic.html', 'classic.html'],
+  ['/trivia.html', 'trivia.html'],
   ['/app.js', 'app.js'],
   ['/styles.css', 'styles.css'],
   ['/translations.js', 'translations.js'],
+  ['/runtime-base.js', 'runtime-base.js'],
   ['/manifest.json', 'manifest.json'],
   ['/apple-wallet-badge.svg', 'apple-wallet-badge.svg'],
   ['/google-wallet-badge.svg', 'google-wallet-badge.svg'],
   ['/brand/favicon.svg', 'brand/favicon.svg'],
+  ['/brand/kinerary-icon.svg', 'brand/kinerary-icon.svg'],
   ['/brand/logo.svg', 'brand/logo.svg'],
   ['/brand/logo-reversed.svg', 'brand/logo-reversed.svg'],
   ['/brand/mark.svg', 'brand/mark.svg'],
@@ -354,6 +357,14 @@ db.exec(`
     created_at  TEXT DEFAULT (datetime('now'))
   );
 `);
+// Extraction creates a private organizer draft first. Existing installations
+// need additive migrations because CREATE TABLE IF NOT EXISTS does not change
+// their bookings table.
+for (const [col, decl] of [
+  ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
+]) {
+  try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
+}
 
 // ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
 // Snapshots trip.config.json into trip_config_versions whenever its content
@@ -1833,36 +1844,40 @@ const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
 
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
-  if (!HERMES_URL) return res.status(503).json({ error: 'HERMES_URL not configured' });
+async function extractBookingDetails(req) {
+  if (!HERMES_URL) throw Object.assign(new Error('HERMES_URL not configured'), { status: 503 });
   const url = req.body?.url;
   // The site's own "Extract Details with AI" upload (site/app.js) sends
   // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
   // populated for an actual multipart caller (e.g. a direct API client).
   const pdfBase64 = req.file ? req.file.buffer.toString('base64') : req.body?.pdf_base64;
   const pdfName = req.file ? req.file.originalname : req.body?.pdf_name;
-  if (!pdfBase64 && !url) return res.status(400).json({ error: 'Provide a file or url' });
+  if (!pdfBase64 && !url) throw Object.assign(new Error('Provide a file or url'), { status: 400 });
 
+  const body = url
+    ? JSON.stringify({ url })
+    : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
+
+  const r = await fetch(`${HERMES_URL}/extract`, {
+    method: 'POST',
+    headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
+    body,
+    // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
+    // call (mcp/mcp.js) — this used to be shorter (30s), so this call
+    // could time out and error here while trip-mcp's own call was still
+    // legitimately running, producing a confusing failure under load.
+    timeout: 50000,
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
+  return r.json();
+}
+
+app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
   try {
-    const body = url
-      ? JSON.stringify({ url })
-      : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
-
-    const r = await fetch(`${HERMES_URL}/extract`, {
-      method: 'POST',
-      headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
-      body,
-      // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
-      // call (mcp/mcp.js) — this used to be shorter (30s), so this call
-      // could time out and error here while trip-mcp's own call was still
-      // legitimately running, producing a confusing failure under load.
-      timeout: 50000,
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
-    res.json(await r.json());
+    res.json(await extractBookingDetails(req));
   } catch (e) {
     console.error('[extract proxy]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -1880,11 +1895,43 @@ app.get('/api/bookings', authRequired, (req, res) => {
   let sql = 'SELECT * FROM bookings';
   const params = [];
   const wheres = [];
+  // Drafts are a private organizer workflow. Members only ever receive
+  // approved bookings, even if they guess the status query parameter.
+  const canReviewDrafts = req.user?.isAgent || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
+  if (!canReviewDrafts) wheres.push("review_status = 'approved'");
   if (phase) { wheres.push('phase = ?'); params.push(phase); }
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
   res.json(db.prepare(sql).all(...params));
+});
+
+app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
+  try {
+    const extracted = await extractBookingDetails(req);
+    const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
+    const type = typeof extracted.type === 'string' ? extracted.type : 'other';
+    const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
+    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
+    if (!VALID_PLAN_PHASES.has(phase) || !validTypes.has(type) || !name) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
+    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    const result = db.prepare(
+      "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
+    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json({ ok: true, booking, extracted });
+  } catch (e) {
+    console.error('[extract draft]', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
+  const result = db.prepare("UPDATE bookings SET review_status = 'approved' WHERE id = ? AND review_status = 'draft'").run(req.params.id);
+  if (!result.changes) return res.status(404).json({ error: 'draft booking not found' });
+  res.json({ ok: true });
 });
 
 app.post('/api/bookings', authRequired, (req, res) => {
