@@ -12,7 +12,7 @@ Reusable policy:
 - use observed Telegram group identity and current membership, never guessed IDs;
 - publish only organizer-supplied trivia questions.
 
-Deliberately excluded: auth/config secrets, `.env`, tokens, provider chat IDs, channel/session state, Telegram or WhatsApp stores, raw interview answers, logs, cron jobs, memories, organizer/participant names, bot names, trip URLs, booking confirmations, passwords, and runtime endpoints.
+Deliberately excluded: auth/config secrets, `.env`, tokens, provider chat IDs, channel/session state, Telegram or WhatsApp stores, raw interview answers, logs, cron jobs, memories, organizer/participant names, bot names, trip URLs, booking confirmations, passwords, and runtime endpoints. The rendered overlay does include the approved, account-independent model identifiers and cheap-first fallback order for this Kinerary project; the target profile must have matching active credentials.
 
 ## Portable input contract
 

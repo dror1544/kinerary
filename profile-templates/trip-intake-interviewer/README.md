@@ -1,6 +1,6 @@
 # Portable Hermes intake interviewer template
 
-A neutral template for deploying a private intake interviewer on any Hermes Agent installation. It contains no organizer, operator, product, bot, model/provider, endpoint credential, chat ID, token, session, memory, log, or runtime state.
+A neutral template for deploying a private intake interviewer on any Hermes Agent installation. It contains no organizer, operator, product, bot, endpoint credential, chat ID, token, session, memory, log, or runtime state. The overlay includes the Kinerary cost-optimized model routing policy; credentials are still configured separately in the target Hermes profile.
 
 It expects a narrowly scoped service implementing `start_interview`, `get_session_status`, `submit_answer`, and `confirm_intake`; see `INTERVIEW-SERVICE-CONTRACT.md`.
 
@@ -18,7 +18,7 @@ python3 render_interviewer.py --input setup.json --output /tmp/intake-interviewe
   --install-profile intakebot --workspace "$HOME/.hermes-workspaces/intakebot"
 ```
 
-The installer creates a fresh profile and workspace and applies only non-secret safety settings. It never writes tokens, credentials, user IDs, model/provider settings, or starts a gateway.
+The installer creates a fresh profile and workspace and bundles non-secret settings, including the project model-routing overlay. It never writes credentials, user IDs, or starts a gateway. The overlay must be deliberately merged into the generated profile config as described below.
 
 Afterward:
 1. Configure a model with `hermes -p <profile> model` if needed.
