@@ -187,8 +187,36 @@ def main(argv: list[str] | None = None) -> int:
                     return None
                 return None
 
+            def _venue_lookup(destination: str, names: list):
+                """Read-only view of control_plane.venue_links (resolved rows
+                only), populated by interview-mcp / the API's retry drain. Fills
+                a venue's ticket/official URL when the interview-time search was
+                rate-limited. A miss or any DB error returns None."""
+                dest = _re.sub(r"\s+", " ", destination).strip().lower()
+                wanted = [_re.sub(r"\s+", " ", str(n)).strip().lower() for n in names if str(n).strip()]
+                if not dest or not wanted:
+                    return None
+                try:
+                    import psycopg
+                    with psycopg.connect(db_url) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT venue_name, url FROM control_plane.venue_links "
+                                "WHERE destination = %s AND url IS NOT NULL "
+                                "AND venue_name = ANY(%s)",
+                                (dest, wanted),
+                            )
+                            rows = cur.fetchall()
+                    return {name: url for name, url in rows}
+                except Exception:
+                    return None
+
             def _enrich(config, destination):
-                return enrich_config(config, destination, consular_lookup=_consular_lookup)
+                return enrich_config(
+                    config, destination,
+                    consular_lookup=_consular_lookup,
+                    venue_lookup=_venue_lookup,
+                )
 
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,

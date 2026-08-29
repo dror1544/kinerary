@@ -483,9 +483,9 @@ live-plan enrichment worker) stays out of 4.5.
 | Trivia | `built` (descope) | Empty `trivia_questions.json` (`[]`) sidecar so the trip server stops logging a missing-file error every boot. No content generated; real trivia can come from `create-trip` or a later debrief pass. |
 | **Itinerary from an uploaded plan document** | `built` | Extracted at intake into an optional `phases[].days[]` field (`extract_itinerary` MCP tool → `kinerary-extract`), sanitised to plain text, projected through `transformer._normalise_days`. Repeated phase names resolved per-day by date range. Spec below (§4.5-i). Verified on japan-2026. |
 | **Map tab: phase pins + click-to-summary** | `built` | Root cause was the missing top-level `map`: `initMap` fell back to `setView([30,10], 3)` so the pins sat off-screen. `enrichment._build_map` now emits `center` (centroid), `zoom` (from bounding-box span), `stops[]` from the phase `mapStop`s; `site/app.js` hardened (emoji default on the `map.stops` branch, `buildMapPopup` skips absent fields instead of printing `undefined`). |
-| Accommodation location (Maps/Waze/address) | `built` | `_add_phase_nav` sets `accommodation.maps` / `accommodation.waze` as **name searches** (`.../maps/search/?...&query=<hotel name>, <city>` and `waze.com/ul?q=…`) — Google/Waze resolve a hotel name far better than OSM, and coordinate templating on a shaky geocode drops the pin in the wrong district (the OMO3 Asakusa bug). `enrich_config` still geocodes the hotel name for the map *pin* (`phase.mapStop`) + `accommodation.address` (Nominatim `display_name`), city-centre only when it misses — but the links no longer depend on that succeeding. Matches the hand-built trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`: `accommodation.{maps,waze,address}`). |
-| Per-venue location + **ticket/official links** | `built` | `extract_itinerary` returns `venues[]` per phase — the real map-pointable places the source document names (not rail passes / ticket bundles). A venue's `url` comes from the document when it prints one; otherwise `extract_itinerary`'s `resolveVenueLinks` step **web-searches** for the first-party/ticket site (`HERMES_SEARCH_PROFILE`, falls back to the consular profile; skipped if neither is set, never guesses a domain). `transformer._normalise_venues` projects `phases[].venues[]` = `[{id, name:{he,en}, url?, area?}]`; `enrichment._enrich_venues` adds name-search `maps`/`waze`. The site renders a card per venue (rating + 🗺️/🔵/🎫 buttons) — `loadRatings` now renders `VENUES[phase.id]` for config-driven phases (previously only the removed static HTML). Mirrors the hand-built `venues[]` (`{id, name, name_he, url, area}`) in `kinerary-deploy/trips/japan-2025`. |
-| Consular / embassy contacts (`travel_info.emergency_contacts`) | `built` | Migration 0023 `country_reference` keyed `(destination_country, home_country)`. `interview-mcp` `lookup_consular_contacts` checks the store, then runs a host-side web search (`HERMES_CONSULAR_PROFILE`) on a miss and writes back. `enrich_config` takes an injected `consular_lookup`; `__main__` wires a read-only query. `home_country` from `meta.home_country`, Israel default. japan/israel row seeded from the real listing. |
+| Accommodation location (Maps/Waze/address) | `built` | `_add_phase_nav` sets `accommodation.maps` / `accommodation.waze` as **name searches** — query is exactly `<hotel name>, <city>, <country>` (`.../maps/search/?...&query=…` and `waze.com/ul?q=…`). Google/Waze resolve a hotel name far better than OSM, and coordinate templating on a shaky geocode drops the pin in the wrong district (the OMO3 Asakusa bug). `enrich_config` still geocodes the hotel name for the map *pin* (`phase.mapStop`) + `accommodation.address` (Nominatim `display_name`), city-centre only when it misses — but the links no longer depend on that succeeding, **and the `display_name` is kept for the address text field only, never spliced into the search query** (a full `CROSS HOTEL KYOTO, 龍馬通, 大黒町, 中京区, …, 日本` query is weaker than `Cross Hotel Kyoto, Kyoto, Japan`). Matches the hand-built trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`: `accommodation.{maps,waze,address}`). |
+| Per-venue location + **ticket/official links** | `built` | `extract_itinerary` returns `venues[]` per phase — the real map-pointable places the source document names (not rail passes / ticket bundles). A venue's `url` comes from the document when it prints one; otherwise `extract_itinerary`'s `resolveVenueLinks` step **web-searches** for the first-party/ticket site (`HERMES_SEARCH_PROFILE`, falls back to the consular profile; skipped if neither is set, never guesses a domain). `transformer._normalise_venues` projects `phases[].venues[]` = `[{id, name:{he,en}, url?, area?}]`; `enrichment._enrich_venues` adds name-search `maps`/`waze`. The site renders a card per venue (rating + 🗺️/🔵/🎫 buttons) — `loadRatings` now renders `VENUES[phase.id]` for config-driven phases (previously only the removed static HTML). Mirrors the hand-built `venues[]` (`{id, name, name_he, url, area}`) in `kinerary-deploy/trips/japan-2025`. **Rate-limit → deferred retry:** `isRateLimited()` classifies a provider throttle (`429` / "usage limit" / "overloaded" …) distinctly from a clean miss. On a throttle, `extract_itinerary` returns the unresolved names in `venueLinksDeferred`; the interview-mcp tool parks them in `control_plane.venue_links` (migration 0025, `url IS NULL`, keyed `(destination, venue_name)`) via `POST /v1/interview/:id/venue-links`. `server.ts` runs `resolvePendingVenueLinks` on a 5-min interval (same single-process guard as the outbox loop) — one web search per destination, `attempts` capped at 6, a rate-limited pass costs no attempt. `enrich_config`'s per-venue pass reads resolved rows at provision time (`__main__._venue_lookup`, read-only), so a link the drain fills after CONFIRM still reaches the site on the next provision, and a later trip naming the same place reuses it. Residual: a trip provisioned before the drain's first tick ships without the ticket URL until it is re-provisioned (same posture as `country_reference`). Consular lookup carries the matching `RATE_LIMITED` reason. |
+| Consular / embassy contacts (`travel_info.emergency_contacts`) | `built` | Migration 0023 `country_reference` keyed `(destination_country, home_country)`. `interview-mcp` `lookup_consular_contacts` checks the store, then runs a host-side web search on a miss (`HERMES_CONSULAR_PROFILE`, **falls back to `HERMES_SEARCH_PROFILE`** — one search profile serves both the venue-link and consular paths) and writes back. `enrich_config` takes an injected `consular_lookup`; `__main__` wires a read-only query. `home_country` from `meta.home_country`, Israel default. Verified live for Japan/Israel via `kinerary-extract` — Embassy of Israel in Tokyo `+81-3-3264-0911` + honorary consulates (Kobe, Nagoya). |
 | 7-day weather per phase | `built` | Open-Meteo is keyless and the site already fetches it client-side. `enrichment._add_phase_nav` sets `phase.mapStop.weatherKey` (and `accommodation.weatherKey`) to the phase id, which is all `site/app.js` needs to fire its own forecast call at render time — never baked into the config, never stale. |
 | Anchor extraction from phase prose | `follow-on` | Promote a dated event buried in a phase `name`/`note` into a `travel_anchors[]` entry. Now largely covered: a document's dated events land in `phases[].days[]` via `extract_itinerary`, and text trimmed from a phase name is kept in the `phase.note` blurb. The residual — date-parsing an organizer's typed phase name — is low value and regression-prone; deferred. |
 | Phase narrative blurb | `built` | `transformer._phase_note_text` writes a readable blurb ("4 nights in Tokyo, 6 Sep–10 Sep. Staying at …. 3 days planned") with any trimmed name context as a trailing clause, replacing the raw concat. |
@@ -512,11 +512,18 @@ live-plan enrichment worker) stays out of 4.5.
   Implementation mirrors `mcp/mcp.js`'s `/extract` (lines ~589–760): `pdf-parse`
   → text capped ~20 000 chars; prompt built fresh from the passed `phases` (ids
   + date ranges) + destination + session roster; `execFile(HERMES_BIN, ['-p',
-  HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode',
+  HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--ignore-rules',
   '--reasoning', 'none'])`, ~60 s timeout, `execFile` not `exec` (document text
-  is one argv entry, never shell-interpolated). Reuses the existing shared
-  `kinerary-extract` profile (no tools, no memory — already used by Add-Booking).
-  Any failure ⇒ `{ ok: false }`, never a throw.
+  is one argv entry, never shell-interpolated). Reuses the shared
+  `kinerary-extract` profile. **`--ignore-rules`, not `--safe-mode`:** we still
+  want a clean single-turn run (no AGENTS.md / memory / preloaded skills), but
+  `--safe-mode` *also* discards the profile's model config — and that is where
+  the `kinerary-extract` fallback chain lives (`gpt-5.6-luna-900k` →
+  `claude-sonnet-4-6` → `gpt-oss:120b` → `gpt-5.6-sol`), which is the whole
+  point of a dedicated profile: a quota-limited primary escalates instead of
+  failing the call. The venue-link and consular searches additionally pass
+  `-t web` (they must actually search, not answer a URL / embassy phone from
+  model memory). Any failure ⇒ `{ ok: false }`, never a throw.
 - **Deterministic post-processing in the tool** (model extracts structure, code
   enforces invariants): drop phase blocks whose `name` ∉ the passed ids; drop
   days whose `date` is unparseable or outside the phase range (→ `warnings`);
@@ -525,8 +532,12 @@ live-plan enrichment worker) stays out of 4.5.
   and re-expanding entity from every `label`/`text`.** `renderDays` sends config
   `days` text through `_biSpan`, which emits raw HTML (deliberate for
   hand-authored config — `server.js:2879` says so), so unsanitised model output
-  there is an XSS sink. `--safe-mode` + the no-tools profile handle injection
-  *into an agent*; this handles injection *into the page*.
+  there is an XSS sink. `--ignore-rules` + the single-turn call handle injection
+  *into an agent*; this handles injection *into the page*. A venue `url` also
+  passes `acceptableVenueUrl()` — http(s) + real host, and **not** a personal
+  booking docket / reservation link (`travelbooster`, `paxFileNum`, `bookingId`,
+  a collapsed line-wrap `...` mid-URL); a real leak — a booking-system docket
+  URL with a `paxFileNum` becoming a public 🎫 button — was caught this way.
 - **Interviewer workflow** (`.agents/skills/trip-intake-interviewer/SOUL.md`
   step 3, `…/references/QUESTIONS.md` phases section): after `phases` is
   captured, if a document was uploaded, call `extract_itinerary`; summarise the
@@ -603,6 +614,23 @@ edit or a destroy-and-recreate today):
   `PROXMOX_*`/`RPI_*` explicitly because `compose.local.yml` passes each as
   `${VAR:-}` and an empty string beats the code's own default — keep the
   caveat.)
+
+Build — **carry the enriched links onto the itinerary lines and the anchor
+list** (reviewing the first real provisioned site, 2026-08-29): provision-time
+enrichment attaches `maps` / `waze` / `url` to `phases[].venues[]`, so the
+per-venue ranking cards get 🗺️/🔵/🎫 buttons — but the same links never reach
+(a) the day-by-day itinerary lines (`phases[].days[].items[]` — the extract
+schema has no per-item URL field, and `site/app.js` `renderDays` prints the
+config-days branch as bare `time — text`), or (b) the anchor / bookings home
+list (`bookings.json` hotel rows get no `maps`/`waze`). The hand-built
+reference trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`,
+legacy USA2026 on CT200) carry these everywhere. Scope: match a day item /
+hotel booking to the phase venue it names and copy the links across
+(`enrichment.py`), and render item links in the config-days branch
+(`site/app.js`). Related plan-layer columns already exist
+(`phase_plan_items.{location_url,waze_url,website_url,ticket_url}`) but nothing
+populates them from config venues — `promote-config-days` only lifts links out
+of inline `<a>` markup, which extraction output does not produce.
 
 Build — **release-artifact hardening** (moved here from Sprint 4's "Deferred
 past this gate" note and §5):

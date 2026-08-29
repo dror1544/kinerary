@@ -27,6 +27,12 @@ const EXTRACT_TIMEOUT_MS = Number(process.env.ITINERARY_EXTRACT_TIMEOUT_MS || "6
 const HERMES_SEARCH_PROFILE = process.env.HERMES_SEARCH_PROFILE || process.env.HERMES_CONSULAR_PROFILE || "";
 const VENUE_LINK_TIMEOUT_MS = Number(process.env.VENUE_LINK_TIMEOUT_MS || "90000");
 
+/** Whether a web-search profile is configured for venue-link resolution. The
+ * API's background drain only schedules itself when this is true. */
+export function venueLinkSearchConfigured(): boolean {
+  return Boolean(HERMES_SEARCH_PROFILE);
+}
+
 export type PhaseRef = { name: string; start?: string; end?: string };
 type Bi = { he: string; en: string };
 export type ItineraryItem = { time: string | null; text: Bi };
@@ -48,14 +54,43 @@ export type ExtractItineraryArgs = {
 };
 
 export type ExtractItineraryResult =
-  | { ok: true; phases: ExtractedPhase[]; warnings: string[] }
+  | { ok: true; phases: ExtractedPhase[]; warnings: string[]; venueLinksDeferred: string[] }
   | { ok: false; reason: "EXTRACT_NOT_CONFIGURED" | "EXTRACTION_FAILED"; detail?: string };
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const HHMM = /^\d{2}:\d{2}$/;
 
+/**
+ * A provider "you've hit your quota / too many requests" response, as it
+ * surfaces through the Hermes CLI (stderr, stdout, or a non-zero exit). A
+ * rate-limited lookup is worth retrying later; a clean "no URL found" is not —
+ * the two must not be conflated, or a transient limit becomes a permanent gap.
+ */
+export function isRateLimited(text: string): boolean {
+  return /\b429\b|rate[\s-]?limit|usage limit|too many requests|quota (?:exceeded|reached)|overloaded|capacity/i.test(
+    String(text ?? ""),
+  );
+}
+
 function plain(value: unknown): string {
   return String(value ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
+}
+
+// Booking-confirmation / reservation-docket links an uploaded itinerary PDF
+// often prints for each item — personal, expiring, sometimes carrying a booking
+// reference. They pass a bare "is it a URL" test but must never become a
+// public 🎫 button. Also rejects a link with a collapsed line-wrap in it
+// (`...` mid-URL) — plain() glues the wrapped remainder on with no space.
+const BOOKING_DOCKET_URL =
+  /docket|paxfile|bookingref|booking[-_]?id|reservation.*(?:id|ref)|confirmation.*(?:id|ref)|itinerary.*(?:id|ref)|travelbooster|[?&](?:pax|pnr|resid)=/i;
+
+/** A URL fit to show as a venue's official / ticket link: well-formed, http(s),
+ * and not a personal booking docket. */
+export function acceptableVenueUrl(value: unknown): string {
+  const url = plain(value);
+  if (!/^https?:\/\/[^\s.]+\.[^\s]+$/i.test(url)) return "";
+  if (url.includes("...") || BOOKING_DOCKET_URL.test(url)) return "";
+  return url;
 }
 
 function bilingual(value: unknown): Bi | null {
@@ -127,8 +162,8 @@ export function normaliseExtractedItinerary(
         if (!name) continue;
         if (bucket.some((x) => x.name.en.toLowerCase() === name.en.toLowerCase())) continue;
         const venue: ExtractedVenue = { name };
-        const url = plain(v.url);
-        if (/^https?:\/\/\S+$/i.test(url)) venue.url = url;
+        const url = acceptableVenueUrl(v.url);
+        if (url) venue.url = url;
         const area = plain(v.area);
         if (area) venue.area = area;
         bucket.push(venue);
@@ -203,7 +238,7 @@ export function buildExtractPrompt(args: ExtractItineraryArgs): string {
     `- "label": a 2-6 word day headline. "text": one activity per line, <=120 chars. Both plain text, no markup.`,
     `- Provide BOTH "he" (Hebrew) and "en" (English) for every label and text. You translate; never ask.`,
     `- Omit a day the document does not describe. A phase with nothing described -> "days": [].`,
-    `- "venues": real places you could point to on a map that this phase visits (attractions, museums, temples, parks, named tour boats/trains with a station). NOT a rail pass, day-pass, ticket bundle or transport product — those go in a day's items, not here. For each venue give the name in "he" and "en", and "url" ONLY if the document itself prints an official or ticket link for it (never guess a URL). Up to ~10 per phase; [] if none.`,
+    `- "venues": real places you could point to on a map that this phase visits (attractions, museums, temples, parks, named tour boats/trains with a station). NOT a rail pass, day-pass, ticket bundle or transport product — those go in a day's items, not here. For each venue give the name in "he" and "en", and "url" ONLY if the document prints the place's OWN official site or public ticket page (never guess a URL). Do NOT use a personal booking-confirmation link, a reservation docket, or any URL with a booking reference / customer id in it — omit "url" instead. Up to ~10 per phase; [] if none.`,
     ``,
     `Return exactly:`,
     `{ "phases": [ { "name": "<phase name>", "days": [ { "date": "YYYY-MM-DD", "label": { "he": "...", "en": "..." }, "items": [ { "time": "HH:MM" | null, "text": { "he": "...", "en": "..." } } ] } ], "venues": [ { "name": { "he": "...", "en": "..." }, "url": "https://..." } ] } ] }`,
@@ -231,7 +266,11 @@ function runExtract(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
-      ["-p", HERMES_EXTRACT_PROFILE, "chat", "-q", prompt, "-Q", "--safe-mode", "--reasoning", "none"],
+      // --ignore-rules, not --safe-mode: we still want a clean single-turn run
+      // (no AGENTS.md / memory / preloaded skills), but --safe-mode also
+      // discards the profile's model config, which is where the
+      // kinerary-extract fallback chain (quota escalation) lives.
+      ["-p", HERMES_EXTRACT_PROFILE, "chat", "-q", prompt, "-Q", "--ignore-rules", "--reasoning", "none"],
       { timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout));
@@ -239,7 +278,8 @@ function runExtract(prompt: string): Promise<string> {
           return reject(new Error(`hermes CLI not found (HERMES_BIN=${HERMES_BIN})`));
         }
         const why = err.killed || err.signal ? `timed out (${EXTRACT_TIMEOUT_MS}ms)` : `exit ${(err as NodeJS.ErrnoException).code}`;
-        reject(new Error(`hermes ${why}${stderr ? ` — ${String(stderr).trim().slice(-200)}` : ""}`));
+        const tail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-250);
+        reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ""}`));
       },
     );
   });
@@ -264,37 +304,73 @@ function runVenueLinkSearch(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
-      ["-p", HERMES_SEARCH_PROFILE, "chat", "-q", prompt, "-Q", "--safe-mode"],
+      // -t web so the model actually searches instead of answering from memory
+      // ("never guess a domain" only holds if it can look); --ignore-rules for
+      // a clean run without dropping the profile's fallback chain.
+      ["-p", HERMES_SEARCH_PROFILE, "chat", "-q", prompt, "-Q", "--ignore-rules", "-t", "web"],
       { timeout: VENUE_LINK_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout) => (err ? reject(err) : resolve(String(stdout))),
+      (err, stdout, stderr) => {
+        if (!err) return resolve(String(stdout));
+        // Keep stdout too — a rate-limit notice often comes back as model text,
+        // not on stderr — so isRateLimited() upstream can see it.
+        const detail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-300);
+        reject(new Error(`hermes venue-link search failed${detail ? ` — ${detail}` : ""}`));
+      },
     );
   });
 }
 
-/** Fill `venue.url` for venues that don't have one, by web search. Mutates
- * `phases` in place. Best-effort: any failure just leaves those venues without
- * a URL (the site still shows their Maps/Waze links). */
-async function resolveVenueLinks(phases: ExtractedPhase[], destination: string): Promise<void> {
-  if (!HERMES_SEARCH_PROFILE) return;
-  const missing = phases.flatMap((p) => p.venues.filter((v) => !v.url));
-  if (!missing.length) return;
-  const names = [...new Set(missing.map((v) => v.name.en))].slice(0, 20);
-  let parsed: unknown;
+export type VenueUrlSearch =
+  | { ok: true; urls: Map<string, string> }
+  | { ok: false; rateLimited: boolean };
+
+/**
+ * Web-search a batch of venue names for a first-party / ticket URL. Shared by
+ * extract_itinerary's inline pass and the API's deferred-retry drain
+ * (venue-links.ts). Never throws. Returns `ok: false` with `rateLimited` set
+ * when the provider knocked the call back — the caller parks those names for a
+ * later retry rather than treating them as "no link exists".
+ */
+export async function searchVenueUrls(names: string[], destination: string): Promise<VenueUrlSearch> {
+  if (!HERMES_SEARCH_PROFILE) return { ok: false, rateLimited: false };
+  const unique = [...new Set(names.map((n) => String(n ?? "").trim()).filter(Boolean))].slice(0, 20);
+  if (!unique.length) return { ok: true, urls: new Map() };
+  let raw: string;
   try {
-    parsed = firstJsonObject(await runVenueLinkSearch(buildVenueLinkPrompt(names, destination)));
-  } catch {
-    return;
+    raw = await runVenueLinkSearch(buildVenueLinkPrompt(unique, destination));
+  } catch (e) {
+    return { ok: false, rateLimited: isRateLimited(String((e as Error)?.message ?? e)) };
   }
-  if (!parsed || typeof parsed !== "object") return;
-  const map = parsed as Record<string, unknown>;
-  const byLowerName = new Map(Object.entries(map).map(([k, v]) => [k.trim().toLowerCase(), v]));
+  const parsed = firstJsonObject(raw);
+  if (!parsed || typeof parsed !== "object") return { ok: true, urls: new Map() };
+  const urls = new Map<string, string>();
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    const url = acceptableVenueUrl(v);
+    if (url) urls.set(k.trim().toLowerCase(), url);
+  }
+  return { ok: true, urls };
+}
+
+/** Fill `venue.url` for venues that don't have one, by web search. Mutates
+ * `phases` in place. Returns the venue names left unresolved *because the
+ * search was rate-limited* — the caller parks those for the background drain to
+ * retry. A clean "no URL found" is not deferred (the site still shows the
+ * venue's Maps/Waze links). */
+async function resolveVenueLinks(phases: ExtractedPhase[], destination: string): Promise<{ deferred: string[] }> {
+  const missingNames = [
+    ...new Set(phases.flatMap((p) => p.venues.filter((v) => !v.url).map((v) => v.name.en))),
+  ];
+  if (!missingNames.length) return { deferred: [] };
+  const result = await searchVenueUrls(missingNames, destination);
+  if (!result.ok) return { deferred: result.rateLimited ? missingNames : [] };
   for (const p of phases) {
     for (const v of p.venues) {
       if (v.url) continue;
-      const hit = plain(byLowerName.get(v.name.en.trim().toLowerCase()));
-      if (/^https?:\/\/\S+$/i.test(hit)) v.url = hit;
+      const hit = result.urls.get(v.name.en.trim().toLowerCase());
+      if (hit) v.url = hit;
     }
   }
+  return { deferred: [] };
 }
 
 export async function extractItinerary(args: ExtractItineraryArgs): Promise<ExtractItineraryResult> {
@@ -312,9 +388,12 @@ export async function extractItinerary(args: ExtractItineraryArgs): Promise<Extr
   if (!parsed) return { ok: false, reason: "EXTRACTION_FAILED", detail: "no JSON object in model output" };
   const { phases, warnings } = normaliseExtractedItinerary(parsed, args.phases);
   // A venue's official/ticket link comes from the document when it prints one;
-  // otherwise web-search for it here so the site can show a 🎫 button.
+  // otherwise web-search for it here so the site can show a 🎫 button. If the
+  // search is rate-limited, the names come back in `deferred` for the caller to
+  // park in venue_links for the background retry.
+  let venueLinksDeferred: string[] = [];
   try {
-    await resolveVenueLinks(phases, args.destination);
+    ({ deferred: venueLinksDeferred } = await resolveVenueLinks(phases, args.destination));
   } catch { /* best-effort */ }
-  return { ok: true, phases, warnings };
+  return { ok: true, phases, warnings, venueLinksDeferred };
 }

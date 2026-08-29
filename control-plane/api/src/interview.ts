@@ -956,7 +956,7 @@ function cleanConsularContacts(raw: unknown): ConsularContact[] {
   return out;
 }
 
-async function sessionActive(db: pg.Pool, rawSessionToken: string): Promise<boolean> {
+export async function sessionActive(db: pg.Pool, rawSessionToken: string): Promise<boolean> {
   const row = await db.query(
     "SELECT 1 FROM control_plane.intake_sessions WHERE session_token_digest = $1 AND state <> 'confirmed'",
     [sessionTokenDigest(rawSessionToken)],

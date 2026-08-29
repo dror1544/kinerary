@@ -164,6 +164,16 @@ function buildMcpServer() {
           });
         } catch { /* not fatal */ }
       }
+      // A venue whose URL search was rate-limited is parked in venue_links for
+      // the API's background drain to retry; enrich_config picks it up at
+      // provision time. Best-effort.
+      if (result.ok && result.venueLinksDeferred.length) {
+        try {
+          await forward(`/v1/interview/${encodeURIComponent(sessionId)}/venue-links`, "POST", sessionToken, {
+            destination, deferred: result.venueLinksDeferred,
+          });
+        } catch { /* not fatal */ }
+      }
       return ok(result);
     },
   );

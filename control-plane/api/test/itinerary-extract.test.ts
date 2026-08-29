@@ -4,6 +4,8 @@ import {
   normaliseExtractedItinerary,
   buildExtractPrompt,
   buildVenueLinkPrompt,
+  isRateLimited,
+  acceptableVenueUrl,
   type PhaseRef,
 } from "../src/itinerary-extract.js";
 
@@ -244,5 +246,56 @@ describe("buildExtractPrompt", () => {
     // 20 000-char document cap + a small fixed preamble.
     assert.ok(prompt.length < 22000, `prompt was ${prompt.length}`);
     assert.ok(!prompt.includes("x".repeat(20001)));
+  });
+});
+
+describe("isRateLimited", () => {
+  test("matches the provider quota / throttle phrasings that surface via the CLI", () => {
+    for (const s of [
+      "hermes venue-link search failed — HTTP 429: Too Many Requests",
+      "The usage limit has been reached",
+      "Error: rate limit exceeded, retry after 30s",
+      "rate-limited by upstream",
+      "model overloaded, try again",
+      "quota exceeded for this key",
+      "at capacity right now",
+    ]) {
+      assert.equal(isRateLimited(s), true, s);
+    }
+  });
+
+  test("does not fire on an ordinary failure or a clean empty result", () => {
+    for (const s of [
+      "hermes exit 1 — no JSON object in model output",
+      "hermes CLI not found (HERMES_BIN=hermes)",
+      "timed out (90000ms)",
+      "",
+    ]) {
+      assert.equal(isRateLimited(s), false, s);
+    }
+  });
+});
+
+describe("acceptableVenueUrl", () => {
+  test("keeps a plain first-party site", () => {
+    assert.equal(acceptableVenueUrl("https://www.tokyo-skytree.jp/en/ticket/"), "https://www.tokyo-skytree.jp/en/ticket/");
+    assert.equal(acceptableVenueUrl("http://teamlabplanets.dmm.com/en"), "http://teamlabplanets.dmm.com/en");
+  });
+
+  test("rejects a personal booking docket / reservation link", () => {
+    for (const u of [
+      "https://b2c-japantours.travelbooster.com/UI_NET/Booking/Customer/Docket.aspx?paxFileNum=99",
+      "https://book.example.com/itinerary?bookingId=ABC123",
+      "https://portal.example.com/reservation?resId=55&ref=x",
+      "https://www.tokyo-skytree.jp/en/ticket/...1/4",
+    ]) {
+      assert.equal(acceptableVenueUrl(u), "", u);
+    }
+  });
+
+  test("rejects a non-URL or a hostless string", () => {
+    for (const u of ["not-a-url", "https://dup", "", "ftp://x.com", null, 42]) {
+      assert.equal(acceptableVenueUrl(u), "", String(u));
+    }
   });
 });

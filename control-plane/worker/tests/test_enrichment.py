@@ -208,6 +208,9 @@ class HeroPhotoTests(unittest.TestCase):
         hero = out["phases"][0]["hero"]
         self.assertEqual("https://upload.wikimedia.org/tokyo.jpg", hero["photo"])
         self.assertEqual("TOKYO", hero["title"])
+        # cta present so the site's hero button has text (an absent cta rendered
+        # the literal word "undefined").
+        self.assertEqual({"he": "צפה בפרטים", "en": "View details"}, hero["cta"])
 
     def test_no_wikipedia_image_means_no_hero(self) -> None:
         http = FakeHttp({"page/summary/Tokyo": {"title": "Tokyo"}})  # no image
@@ -259,6 +262,26 @@ class PhaseNavTests(unittest.TestCase):
         self.assertIn("waze.com/ul?q=OMO3", acc["waze"])
         self.assertIn("navigate=yes", acc["waze"])
 
+    def test_maps_query_is_hotel_plus_city_not_the_full_nominatim_address(self) -> None:
+        # When the hotel geocodes, accommodation.address becomes Nominatim's
+        # full display_name. That must NOT be spliced into the Maps/Waze search
+        # query — it dilutes the search (street / ward / postcode / 日本).
+        cfg = _config()
+        cfg["phases"][0]["accommodation"] = {"name": "Cross Hotel Kyoto"}
+        cfg["phases"][0]["title"] = {"he": "קיוטו", "en": "Kyoto"}
+        http = FakeHttp({
+            "q=Cross+Hotel+Kyoto": [{"lat": "35.0", "lon": "135.76",
+                "display_name": "CROSS HOTEL KYOTO, 龍馬通, 大黒町, 中京区, 京都市, 京都府, 604-8031, 日本"}],
+            "q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO,
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        acc = out["phases"][0]["accommodation"]
+        self.assertIn("604-8031", acc["address"])           # display_name still kept for the text field
+        self.assertNotIn("604-8031", acc["maps"])            # but not in the search query
+        self.assertNotIn("%E9%BE%8D", acc["maps"])           # no 龍 (ward name) either
+        self.assertIn("Cross%20Hotel%20Kyoto", acc["maps"])
+        self.assertIn("Kyoto%2C%20Japan", acc["maps"])       # hotel, city, country
+
     def test_a_hotel_still_gets_name_links_when_its_pin_falls_back_to_the_city(self) -> None:
         # Nominatim misses the hotel -> pin at city centre, but the Maps/Waze
         # links still search the real hotel name (Google resolves it fine).
@@ -300,6 +323,50 @@ class VenueEnrichmentTests(unittest.TestCase):
         ]
         out = enrich_config(cfg, "Japan", http=FakeHttp({}), pause=0)
         self.assertEqual("https://maps.example/mine", out["phases"][0]["venues"][0]["maps"])
+
+    def test_a_urlless_venue_is_backfilled_from_the_venue_lookup(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+        ]
+        seen = {}
+
+        def lookup(destination, names):
+            seen["call"] = (destination, list(names))
+            return {"tokyo skytree": "https://skytree.example/tickets"}
+
+        out = enrich_config(
+            cfg, "Japan",
+            http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO}),
+            pause=0, venue_lookup=lookup,
+        )
+        self.assertEqual("https://skytree.example/tickets", out["phases"][0]["venues"][0]["url"])
+        self.assertEqual(("Japan", ["Tokyo Skytree"]), seen["call"])
+
+    def test_venue_lookup_never_overrides_a_url_already_present(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"en": "Tokyo Skytree"}, "url": "https://from-the-doc.example"},
+        ]
+        out = enrich_config(
+            cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO}),
+            pause=0, venue_lookup=lambda d, n: {"tokyo skytree": "https://cron.example"},
+        )
+        self.assertEqual("https://from-the-doc.example", out["phases"][0]["venues"][0]["url"])
+
+    def test_a_venue_lookup_that_raises_is_swallowed(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere"}}]
+
+        def boom(destination, names):
+            raise RuntimeError("db down")
+
+        out = enrich_config(
+            cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO}),
+            pause=0, venue_lookup=boom,
+        )
+        self.assertNotIn("url", out["phases"][0]["venues"][0])
+        self.assertIn("maps", out["phases"][0]["venues"][0])
 
 
 class MapObjectTests(unittest.TestCase):

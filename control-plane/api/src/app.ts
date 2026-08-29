@@ -9,6 +9,7 @@ import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
 } from "./interview.js";
+import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
@@ -93,6 +94,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/intake/correct",
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/interview/:sessionId/consular", "/v1/interview/:sessionId/source-document",
+      "/v1/interview/:sessionId/venue-links",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
     ],
@@ -588,6 +590,32 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(result.reason === "NOT_FOUND" ? 404 : 400).send({ error: result.reason });
     }
     return reply.code(200).send({ chars: result.chars });
+  });
+
+  // POST /v1/interview/:sessionId/venue-links — park venue names whose
+  // interview-time ticket/official-URL search was rate-limited, for the API's
+  // background drain (resolvePendingVenueLinks) to retry. Best-effort; the
+  // venue still shows its Maps/Waze links without a ticket URL.
+  // Header: Authorization: Bearer <session-token>. Body: { destination, deferred: string[] }
+  app.post("/v1/interview/:sessionId/venue-links", async (request, reply) => {
+    if (!dependencies.interview) {
+      return reply.code(503).send({ error: "INTERVIEW_NOT_CONFIGURED" });
+    }
+    const authHeader = (request.headers as Record<string, unknown>)["authorization"];
+    const rawToken = typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7) : null;
+    if (!rawToken) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    if (typeof body.destination !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await saveDeferredVenueLinks(
+      dependencies.interview.db, rawToken, body.destination, body.deferred,
+    );
+    if (!result.ok) {
+      return reply.code(result.reason === "NOT_FOUND" ? 404 : 400).send({ error: result.reason });
+    }
+    return reply.code(200).send({ queued: result.queued });
   });
 
   // GET /v1/interview/:sessionId/status — lifecycle status for the organizer status UI.

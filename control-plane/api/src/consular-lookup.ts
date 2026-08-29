@@ -14,9 +14,13 @@
  * country_reference store first and only reaches here on a miss.
  */
 import { execFile } from "node:child_process";
+import { isRateLimited } from "./itinerary-extract.js";
 
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
-const HERMES_CONSULAR_PROFILE = process.env.HERMES_CONSULAR_PROFILE || "";
+// Consular lookup is a web search like venue-link resolution, so a single
+// HERMES_SEARCH_PROFILE can serve both; HERMES_CONSULAR_PROFILE stays as an
+// override for the rare case they want a different profile per task.
+const HERMES_CONSULAR_PROFILE = process.env.HERMES_CONSULAR_PROFILE || process.env.HERMES_SEARCH_PROFILE || "";
 const LOOKUP_TIMEOUT_MS = Number(process.env.CONSULAR_LOOKUP_TIMEOUT_MS || "90000");
 
 export type ConsularContact = { name: { he: string; en: string }; phone: string };
@@ -25,7 +29,7 @@ export type ConsularLookupArgs = { destination: string; homeCountry: string };
 
 export type ConsularLookupResult =
   | { ok: true; contacts: ConsularContact[]; warnings: string[] }
-  | { ok: false; reason: "LOOKUP_NOT_CONFIGURED" | "LOOKUP_FAILED"; detail?: string };
+  | { ok: false; reason: "LOOKUP_NOT_CONFIGURED" | "LOOKUP_FAILED" | "RATE_LIMITED"; detail?: string };
 
 function plain(value: unknown): string {
   return String(value ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
@@ -93,7 +97,9 @@ function runLookup(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
-      ["-p", HERMES_CONSULAR_PROFILE, "chat", "-q", prompt, "-Q", "--safe-mode"],
+      // -t web to actually search (not answer an embassy phone from memory);
+      // --ignore-rules keeps the run clean without dropping the fallback chain.
+      ["-p", HERMES_CONSULAR_PROFILE, "chat", "-q", prompt, "-Q", "--ignore-rules", "-t", "web"],
       { timeout: LOOKUP_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout));
@@ -101,7 +107,10 @@ function runLookup(prompt: string): Promise<string> {
           return reject(new Error(`hermes CLI not found (HERMES_BIN=${HERMES_BIN})`));
         }
         const why = err.killed || err.signal ? `timed out (${LOOKUP_TIMEOUT_MS}ms)` : `exit ${(err as NodeJS.ErrnoException).code}`;
-        reject(new Error(`hermes ${why}${stderr ? ` — ${String(stderr).trim().slice(-200)}` : ""}`));
+        // Include stdout — a provider rate-limit notice often lands there as
+        // model text, not on stderr.
+        const tail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-250);
+        reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ""}`));
       },
     );
   });
@@ -116,7 +125,10 @@ export async function lookupConsularContacts(args: ConsularLookupArgs): Promise<
   try {
     stdout = await runLookup(buildConsularPrompt(args));
   } catch (e) {
-    return { ok: false, reason: "LOOKUP_FAILED", detail: String((e as Error)?.message ?? e).slice(0, 200) };
+    const detail = String((e as Error)?.message ?? e).slice(0, 200);
+    // A rate limit is transient — the interviewer's tool reports it so a later
+    // attempt (same or next trip) can still populate country_reference.
+    return { ok: false, reason: isRateLimited(detail) ? "RATE_LIMITED" : "LOOKUP_FAILED", detail };
   }
   const parsed = firstJsonObject(stdout);
   if (!parsed) return { ok: false, reason: "LOOKUP_FAILED", detail: "no JSON object in model output" };

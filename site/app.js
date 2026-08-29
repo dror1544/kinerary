@@ -1249,14 +1249,23 @@ function setHero(tabId) {
   if (img) img.style.backgroundImage = `url("${h.photo}")`;
   if (headline) headline.innerHTML = `${h.title}<span class="dot">.</span>`;
   const i18n = h._i18n; // bilingual source from config (preferred over T)
-  if (label) label.textContent = (i18n?.label?.[currentLang]) || tr[`hero_${k}_label`] || h.label;
-  if (sub)   sub.textContent   = (i18n?.sub?.[currentLang])   || tr[`hero_${k}_sub`]   || h.sub;
-  if (blurb) blurb.textContent = (i18n?.blurb?.[currentLang]) || tr[`hero_${k}_blurb`] || h.blurb;
-  if (meta) meta.textContent = h.meta;
+  // A per-phase hero built by provision-time enrichment carries only photo +
+  // title — no label/sub/blurb/cta. `textContent = undefined` prints the literal
+  // word "undefined", so every optional field falls back to '' and the CTA
+  // button hides itself when there is nothing for it to say.
+  if (label) label.textContent = (i18n?.label?.[currentLang]) || tr[`hero_${k}_label`] || h.label || '';
+  if (sub)   sub.textContent   = (i18n?.sub?.[currentLang])   || tr[`hero_${k}_sub`]   || h.sub   || '';
+  if (blurb) blurb.textContent = (i18n?.blurb?.[currentLang]) || tr[`hero_${k}_blurb`] || h.blurb || '';
+  if (meta) meta.textContent = h.meta || '';
   if (cta) {
-    const arrow = currentLang === 'he' ? '←' : '→';
-    const ctaText = (i18n?.cta?.[currentLang]) || tr[`hero_${k}_cta`] || h.cta;
-    cta.innerHTML = `${ctaText} <span class="arrow">${arrow}</span>`;
+    const ctaText = (i18n?.cta?.[currentLang]) || tr[`hero_${k}_cta`] || h.cta || '';
+    if (ctaText) {
+      const arrow = currentLang === 'he' ? '←' : '→';
+      cta.innerHTML = `${ctaText} <span class="arrow">${arrow}</span>`;
+      cta.hidden = false;
+    } else {
+      cta.hidden = true;
+    }
   }
   if (countdown) countdown.style.display = h.countdown ? '' : 'none';
   const heroRight = document.querySelector('.hero-right');
@@ -3810,9 +3819,12 @@ function _buildPlanItemRow(item, phaseId, tr) {
   // uses: green once a real booking backs it, red while money still has to
   // change hands. Nothing at all when the place needs no ticket, so the
   // schedule doesn't fill up with reassurances.
-  const ticket = item.booking
-    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)}${
-        item.booking.confirmation ? ` · ${esc(item.booking.confirmation)}` : ''}</span>`
+  // Green pill only when a booking with a real confirmation number backs the
+  // line — that is what "✅ confirmed" means here. A booking row echoed from the
+  // intake (hotel name, confirmation: null) is not a confirmed reservation, so
+  // it gets no pill rather than a mysterious bare green check.
+  const ticket = item.booking && item.booking.confirmation
+    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)} · ${esc(item.booking.confirmation)}</span>`
     : item.needs_tickets
       ? `<span class="tag r plan-tag">⚠️ ${esc(item.advance_booking ? tr.plan_tickets_advance : tr.plan_tickets_needed)}</span>`
       : '';

@@ -2718,6 +2718,16 @@ if (HERMES_URL) {
 // organizer-triggered rather than an automatic sweep, so deploying this doesn't
 // fire a batch of model calls at every item that already exists.
 app.post('/api/phase-plan/enrich-pending', organizerOrAgentRequired, (req, res) => {
+  // No enrichment worker (HERMES_URL unset — the usual case for a
+  // control-plane-provisioned trip): don't move anything to 'pending', or every
+  // line would render a permanent "Finding links…". The links this button would
+  // fetch were already baked into the config at trip setup. Also sweep any
+  // rows a pre-fix press left stuck.
+  if (!HERMES_URL) {
+    db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    db.prepare("UPDATE phase_plan_days SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    return res.json({ queued: 0, in_flight: 0, hermes_configured: false });
+  }
   // Requeue what was never attempted ('none'/NULL), what gave up ('failed'),
   // and what is stuck — 'pending' with its attempts exhausted, which the worker
   // skips forever. A 'pending' item that still has attempts left is already

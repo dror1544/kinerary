@@ -246,6 +246,10 @@ def _wikipedia_image(http: Http, title: str, lang: str = "en") -> str | None:
 
 # (destination, home_country) -> [{"name": {"he","en"}, "phone"}] or None.
 ConsularLookup = Callable[[str, str], Any]
+# (destination, [venue name, ...]) -> {venue name (lower-cased): url} or None.
+# Fills a venue's official/ticket URL from the cross-trip venue_links store when
+# the interview-time search was rate-limited and a later drain resolved it.
+VenueLookup = Callable[[str, list], Any]
 
 
 def enrich_config(
@@ -255,6 +259,7 @@ def enrich_config(
     http: Http | None = None,
     pause: float = 1.0,
     consular_lookup: ConsularLookup | None = None,
+    venue_lookup: VenueLookup | None = None,
 ) -> dict[str, Any]:
     """Return a copy of *config* with destination data, phase coordinates and
     phase hero photos filled in where a lookup succeeds. Never raises; a copy
@@ -309,7 +314,7 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.nav_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
-            _enrich_venues(phase, label, destination)
+            _enrich_venues(phase, label, destination, venue_lookup)
         except Exception:
             logger.warning("enrichment.venues_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
@@ -318,7 +323,15 @@ def enrich_config(
                 # 404; query the wiki that matches the label's language.
                 image = _wikipedia_image(http, label, lang=lang)
                 if image:
-                    phase["hero"] = {"photo": image, "title": str(phase.get("tabLabel") or label).upper()}
+                    # `cta` so the site renders its "View details" button rather
+                    # than a bare one (an absent cta printed the literal word
+                    # "undefined"). label/sub/blurb are marketing copy — left
+                    # for a hand edit or a later content pass.
+                    phase["hero"] = {
+                        "photo": image,
+                        "title": str(phase.get("tabLabel") or label).upper(),
+                        "cta": {"he": "צפה בפרטים", "en": "View details"},
+                    }
         except Exception:
             logger.warning("enrichment.hero_failed", extra={"phase": phase.get("id")}, exc_info=True)
 
@@ -447,7 +460,10 @@ def _add_phase_nav(phase: dict[str, Any], destination: str = "") -> None:
         acc.setdefault("weatherKey", key)
     hotel = _accommodation_name(phase)
     if hotel:
-        query = ", ".join(p for p in (hotel, acc.get("address") or _phase_query(phase)[0], destination) if p)
+        # hotel name + city + country is the strongest Google/Waze query. NOT
+        # acc["address"] — that is Nominatim's full display_name (street, ward,
+        # postcode, 日本, …), which dilutes the search rather than sharpening it.
+        query = ", ".join(p for p in (hotel, _phase_query(phase)[0], destination) if p)
         acc.setdefault("maps", _maps_search_url(query))
         acc.setdefault("waze", _waze_search_url(query))
     elif isinstance(stop, dict):
@@ -475,22 +491,54 @@ def _waze_search_url(query: str) -> str:
     return "https://waze.com/ul?q=" + urllib.parse.quote(query.strip()) + "&navigate=yes"
 
 
-def _enrich_venues(phase: dict[str, Any], label: str, destination: str) -> None:
+def _enrich_venues(
+    phase: dict[str, Any], label: str, destination: str,
+    venue_lookup: "VenueLookup | None" = None,
+) -> None:
     """Give each must-see venue a Google Maps + Waze link that searches by the
-    venue *name* (reliable — no geocode needed). The venue's `url` (an official
-    or ticket link, from the source document or a web lookup at interview time)
-    is left as-is. Both `maps`/`waze` are `setdefault`."""
+    venue *name* (reliable — no geocode needed). A venue's `url` (an official or
+    ticket link) comes from the source document or the interview-time web
+    search; where that was rate-limited, back-fill it here from the cross-trip
+    venue_links store via the injected reader. `maps`/`waze`/`url` are all
+    `setdefault` — a value already present wins."""
     venues = phase.get("venues")
     if not isinstance(venues, list):
         return
+
+    def _venue_name(v: dict[str, Any]) -> str:
+        n = v.get("name")
+        if isinstance(n, dict):
+            n = n.get("en") or n.get("he")
+        return str(n or "").strip()
+
+    resolved: dict[str, str] = {}
+    if venue_lookup is not None and destination and destination.strip():
+        wanted = [
+            _venue_name(v) for v in venues
+            if isinstance(v, dict) and not v.get("url") and _venue_name(v)
+        ]
+        if wanted:
+            try:
+                hit = venue_lookup(destination.strip(), wanted)
+            except Exception:
+                hit = None
+            if isinstance(hit, dict):
+                for k, val in hit.items():
+                    url = str(val or "").strip()
+                    if url.startswith("http"):
+                        resolved[str(k).strip().lower()] = url
+
     for venue in venues:
-        if not isinstance(venue, dict) or "maps" in venue:
+        if not isinstance(venue, dict):
             continue
-        name = venue.get("name")
-        if isinstance(name, dict):
-            name = name.get("en") or name.get("he")
-        name = str(name or "").strip()
+        name = _venue_name(venue)
         if not name:
+            continue
+        if not venue.get("url"):
+            found = resolved.get(name.lower())
+            if found:
+                venue["url"] = found
+        if "maps" in venue:
             continue
         query = ", ".join(p for p in (name, str(venue.get("area") or "").strip(), label, destination) if p)
         venue.setdefault("maps", _maps_search_url(query))
