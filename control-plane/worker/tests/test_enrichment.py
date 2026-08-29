@@ -179,6 +179,27 @@ class GeocodeTests(unittest.TestCase):
         self.assertNotIn("mapStop", out["phases"][0])
         self.assertIn("mapStop", out["phases"][1])
 
+    def test_the_hotel_is_geocoded_in_preference_to_the_city(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["accommodation"] = {"name": "OMO3 Asakusa", "name_en": "OMO3 Asakusa"}
+        http = FakeHttp({
+            "q=OMO3+Asakusa": [{"lat": "35.7106", "lon": "139.7986", "display_name": "OMO3 Asakusa, Taito, Tokyo, Japan"}],
+            "q=Tokyo": NOMINATIM_TOKYO,
+            "q=Kyoto": NOMINATIM_KYOTO,
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        stop = out["phases"][0]["mapStop"]
+        self.assertAlmostEqual(35.7106, stop["lat"])  # the hotel, not 35.6764 (Tokyo)
+        self.assertEqual("OMO3 Asakusa, Taito, Tokyo, Japan", out["phases"][0]["accommodation"]["address"])
+
+    def test_falls_back_to_the_city_when_the_hotel_does_not_resolve(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["accommodation"] = {"name": "Nonexistent Inn"}
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertAlmostEqual(35.6764, out["phases"][0]["mapStop"]["lat"])  # Tokyo centre
+        self.assertNotIn("address", out["phases"][0]["accommodation"])
+
 
 class HeroPhotoTests(unittest.TestCase):
     def test_phase_hero_photo_from_wikipedia_summary(self) -> None:
@@ -254,6 +275,32 @@ class PhaseNavTests(unittest.TestCase):
         http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
         out = enrich_config(_config(), "Japan", http=http, pause=0)
         self.assertEqual("tokyo", out["map"]["stops"][0]["weatherKey"])
+
+
+class VenueEnrichmentTests(unittest.TestCase):
+    def test_each_venue_gets_maps_and_waze_from_geocoding(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"},
+             "url": "https://www.tokyo-skytree.jp/en/"},
+        ]
+        http = FakeHttp({
+            "q=Tokyo+Skytree": [{"lat": "35.7101", "lon": "139.8107", "display_name": "Tokyo Skytree"}],
+            "q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO,
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        v = out["phases"][0]["venues"][0]
+        self.assertIn("35.7101", v["maps"])
+        self.assertIn("waze.com/ul", v["waze"])
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", v["url"])  # untouched
+
+    def test_a_venue_that_does_not_geocode_keeps_its_url_and_gets_no_maps(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Nowhere"}, "url": "https://x"}]
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO}), pause=0)
+        v = out["phases"][0]["venues"][0]
+        self.assertNotIn("maps", v)
+        self.assertEqual("https://x", v["url"])
 
 
 class MapObjectTests(unittest.TestCase):

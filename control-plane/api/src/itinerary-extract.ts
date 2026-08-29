@@ -26,10 +26,14 @@ export type PhaseRef = { name: string; start?: string; end?: string };
 type Bi = { he: string; en: string };
 export type ItineraryItem = { time: string | null; text: Bi };
 export type ItineraryDay = { date: string; label?: Bi; items: ItineraryItem[] };
+/** A notable place the itinerary names, with any official/ticket URL the
+ * source document carried for it. enrich_config geocodes it to add maps/waze;
+ * the site renders it as a venue card on the phase page. */
+export type ExtractedVenue = { name: Bi; url?: string; area?: string };
 /** `phaseIndex` is the 0-based position in the `phases` array passed to the
- * extractor — the interviewer folds `days` back in at that index, which
- * disambiguates a name that repeats (e.g. two "Tokyo" stops). */
-export type ExtractedPhase = { name: string; phaseIndex: number; days: ItineraryDay[] };
+ * extractor — the interviewer folds `days`/`venues` back in at that index,
+ * which disambiguates a name that repeats (e.g. two "Tokyo" stops). */
+export type ExtractedPhase = { name: string; phaseIndex: number; days: ItineraryDay[]; venues: ExtractedVenue[] };
 
 export type ExtractItineraryArgs = {
   destination: string;
@@ -92,8 +96,9 @@ export function normaliseExtractedItinerary(
     else if (Array.isArray(o.itinerary)) blocks = o.itinerary;
   }
 
-  // Accumulate days per phase index (a single model "Tokyo" block can feed two).
+  // Accumulate days/venues per phase index (a single model "Tokyo" block can feed two).
   const daysByIndex = new Map<number, ItineraryDay[]>();
+  const venuesByIndex = new Map<number, ExtractedVenue[]>();
 
   for (const block of blocks) {
     if (!block || typeof block !== "object") continue;
@@ -103,6 +108,26 @@ export function normaliseExtractedItinerary(
     if (!candidates || !candidates.length) {
       if (key) warnings.push(`dropped unknown phase "${plain(b.name)}"`);
       continue;
+    }
+
+    // Venues aren't date-bound; route them to the first occurrence of the name.
+    if (Array.isArray(b.venues) && b.venues.length) {
+      const venueIndex = candidates[0]!.index;
+      const bucket = venuesByIndex.get(venueIndex) ?? venuesByIndex.set(venueIndex, []).get(venueIndex)!;
+      for (const rawVenue of b.venues) {
+        if (bucket.length >= 12) break;
+        if (!rawVenue || typeof rawVenue !== "object") continue;
+        const v = rawVenue as Record<string, unknown>;
+        const name = bilingual(v.name);
+        if (!name) continue;
+        if (bucket.some((x) => x.name.en.toLowerCase() === name.en.toLowerCase())) continue;
+        const venue: ExtractedVenue = { name };
+        const url = plain(v.url);
+        if (/^https?:\/\/\S+$/i.test(url)) venue.url = url;
+        const area = plain(v.area);
+        if (area) venue.area = area;
+        bucket.push(venue);
+      }
     }
 
     for (const rawDay of Array.isArray(b.days) ? b.days : []) {
@@ -140,11 +165,15 @@ export function normaliseExtractedItinerary(
   }
 
   const out: ExtractedPhase[] = [];
-  for (const [index, days] of [...daysByIndex.entries()].sort((a, b) => a[0] - b[0])) {
+  const indices = [...new Set([...daysByIndex.keys(), ...venuesByIndex.keys()])].sort((a, b) => a - b);
+  for (const index of indices) {
     const ref = phases[index];
     if (!ref) continue;
+    const days = daysByIndex.get(index) ?? [];
+    const venues = venuesByIndex.get(index) ?? [];
+    if (!days.length && !venues.length) continue;
     days.sort((a, b2) => (a.date < b2.date ? -1 : a.date > b2.date ? 1 : 0));
-    out.push({ name: ref.name, phaseIndex: index, days });
+    out.push({ name: ref.name, phaseIndex: index, days, venues });
   }
   return { phases: out, warnings };
 }
@@ -169,9 +198,10 @@ export function buildExtractPrompt(args: ExtractItineraryArgs): string {
     `- "label": a 2-6 word day headline. "text": one activity per line, <=120 chars. Both plain text, no markup.`,
     `- Provide BOTH "he" (Hebrew) and "en" (English) for every label and text. You translate; never ask.`,
     `- Omit a day the document does not describe. A phase with nothing described -> "days": [].`,
+    `- "venues": the notable or bookable places named for that phase (attractions, museums, tours, parks). For each, give the name in "he" and "en", and "url" ONLY if the document itself prints an official or ticket link for it (never guess a URL). Up to ~10 per phase; [] if none.`,
     ``,
     `Return exactly:`,
-    `{ "phases": [ { "name": "<phase name>", "days": [ { "date": "YYYY-MM-DD", "label": { "he": "...", "en": "..." }, "items": [ { "time": "HH:MM" | null, "text": { "he": "...", "en": "..." } } ] } ] } ] }`,
+    `{ "phases": [ { "name": "<phase name>", "days": [ { "date": "YYYY-MM-DD", "label": { "he": "...", "en": "..." }, "items": [ { "time": "HH:MM" | null, "text": { "he": "...", "en": "..." } } ] } ], "venues": [ { "name": { "he": "...", "en": "..." }, "url": "https://..." } ] } ] }`,
     `No commentary.`,
     ``,
     `Document:`,

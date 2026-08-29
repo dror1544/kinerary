@@ -738,6 +738,40 @@ def _normalise_days(
     return out
 
 
+_HTTP_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
+    """Turn a phases[].venues intake payload into the site's config shape:
+    [{id, name:{he,en}, url?, area?}]. Deduped by english name, capped, `url`
+    kept only if it is a real http(s) link."""
+    if not isinstance(raw_venues, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for raw in raw_venues:
+        if not isinstance(raw, Mapping) or len(out) >= 12:
+            continue
+        name = _bilingual_text(raw.get("name"))
+        if not name or name["en"].lower() in seen_names:
+            continue
+        seen_names.add(name["en"].lower())
+        vid = _slug_words(name["en"])[:40] or f"venue{len(out)}"
+        if vid in seen_ids:
+            vid = f"{vid}-{len(out)}"
+        seen_ids.add(vid)
+        venue: dict[str, Any] = {"id": vid, "name": name}
+        url = _plain(raw.get("url"))
+        if _HTTP_URL_RE.match(url):
+            venue["url"] = url
+        area = _plain(raw.get("area"))
+        if area:
+            venue["area"] = area
+        out.append(venue)
+    return out
+
+
 def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
     shape — logistics fields, plus a day-by-day `days[]` when the intake
@@ -769,6 +803,7 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             "end": _parse_iso_date(raw.get("end")),
             "accommodation": raw.get("accommodation"),
             "days": raw.get("days") if isinstance(raw.get("days"), list) else [],
+            "venues": raw.get("venues") if isinstance(raw.get("venues"), list) else [],
         })
 
     merged: list[dict[str, Any]] = []
@@ -783,6 +818,7 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             prev["notes_he"].append(entry["full_he"])
             prev["notes_en"].append(entry["full_en"])
             prev["days"] = prev["days"] + entry["days"]
+            prev["venues"] = prev["venues"] + entry["venues"]
         else:
             entry["notes_he"] = [entry["full_he"]]
             entry["notes_en"] = [entry["full_en"]]
@@ -817,6 +853,10 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
         days = _normalise_days(entry["days"], entry["start"], entry["end"])
         if days:
             phase["days"] = days
+
+        venues = _normalise_venues(entry["venues"])
+        if venues:
+            phase["venues"] = venues
 
         acc_for_note = phase.get("accommodation") or {}
         hotel_he = str(acc_for_note.get("name") or "")

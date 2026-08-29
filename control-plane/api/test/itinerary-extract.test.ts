@@ -167,6 +167,42 @@ describe("normaliseExtractedItinerary", () => {
     assert.equal(normaliseExtractedItinerary(raw, undated).phases[0].days.length, 1);
   });
 
+  test("venues are collected with a valid url and deduped by name", () => {
+    const raw = {
+      phases: [
+        {
+          name: "Tokyo",
+          days: [{ date: "2026-09-20", items: [{ text: { en: "Skytree" } }] }],
+          venues: [
+            { name: { en: "Tokyo Skytree", he: "סקייטרי" }, url: "https://www.tokyo-skytree.jp/en/" },
+            { name: { en: "tokyo skytree" }, url: "https://dup" },
+            { name: { en: "TeamLab" }, url: "not-a-url" },
+            { name: {} },
+          ],
+        },
+      ],
+    };
+    const { phases } = normaliseExtractedItinerary(raw, PHASES);
+    assert.equal(phases[0].venues.length, 2);
+    assert.equal(phases[0].venues[0].url, "https://www.tokyo-skytree.jp/en/");
+    assert.equal(phases[0].venues[1].url, undefined); // "not-a-url" dropped
+  });
+
+  test("a phase with only venues (no days) is still returned", () => {
+    const raw = { phases: [{ name: "Kyoto", venues: [{ name: { en: "Fushimi Inari" } }] }] };
+    const { phases } = normaliseExtractedItinerary(raw, PHASES);
+    assert.equal(phases.length, 1);
+    assert.equal(phases[0].phaseIndex, 1);
+    assert.equal(phases[0].days.length, 0);
+    assert.equal(phases[0].venues[0].name.he, "Fushimi Inari");
+  });
+
+  test("a repeated-name phase routes its venues to the first occurrence", () => {
+    const raw = { phases: [{ name: "Tokyo", venues: [{ name: { en: "Shibuya Crossing" } }] }] };
+    const { phases } = normaliseExtractedItinerary(raw, JAPAN_PHASES);
+    assert.deepEqual(phases.map((p) => p.phaseIndex), [0]);
+  });
+
   test("garbage input yields an empty result, not a throw", () => {
     assert.deepEqual(normaliseExtractedItinerary(null, PHASES), { phases: [], warnings: [] });
     assert.deepEqual(normaliseExtractedItinerary("nope", PHASES), { phases: [], warnings: [] });

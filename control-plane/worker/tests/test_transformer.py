@@ -827,6 +827,35 @@ class NonLatinNameTests(unittest.TestCase):
         self.assertEqual("Solomon", family["name"]["en"])
 
 
+class PhaseVenuesTests(unittest.TestCase):
+    def _phase(self, venues):
+        intake = {**JAPAN_INTAKE, "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23", "venues": venues},
+        ])}
+        return transform_intake(intake)["phases"][0]
+
+    def test_venues_project_with_slug_ids_and_kept_urls(self) -> None:
+        p = self._phase([
+            {"name": {"he": "סקייטרי", "en": "Tokyo Skytree"}, "url": "https://www.tokyo-skytree.jp/en/"},
+            {"name": {"en": "TeamLab Planets"}, "url": "javascript:alert(1)"},
+        ])
+        self.assertEqual([v["id"] for v in p["venues"]], ["tokyo-skytree", "teamlab-planets"])
+        self.assertEqual(p["venues"][0]["url"], "https://www.tokyo-skytree.jp/en/")
+        self.assertNotIn("url", p["venues"][1])  # non-http dropped
+
+    def test_venues_dedupe_by_name_and_empty_names_drop(self) -> None:
+        p = self._phase([
+            {"name": {"en": "Senso-ji"}},
+            {"name": {"en": "senso-ji"}},
+            {"name": {}},
+        ])
+        self.assertEqual(len(p["venues"]), 1)
+
+    def test_a_phase_with_no_venues_has_no_venues_key(self) -> None:
+        p = self._phase([])
+        self.assertNotIn("venues", p)
+
+
 class HomeCountryTests(unittest.TestCase):
     def test_answer_is_written_to_meta_home_country(self) -> None:
         intake = {**JAPAN_INTAKE, "home_country": _text("United States")}

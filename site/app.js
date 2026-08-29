@@ -1509,6 +1509,11 @@ async function loadRatings() {
     const key = ['ny', 'dallas', 'colorado', 'wc'][i];
     renderRatings(id, VENUES[key]);
   });
+  // Config-driven phases: render each phase's venues[] into its own section.
+  // (buildGlobalsFromConfig fills VENUES[phase.id] from phases[].venues.)
+  for (const p of (window.TRIP_CONFIG?.phases || [])) {
+    if (VENUES[p.id]?.length) renderRatings(`ratings-${p.id}`, VENUES[p.id]);
+  }
 }
 
 function buildRatingChips(venueId) {
@@ -1529,15 +1534,21 @@ function renderRatings(containerId, venues) {
     const myRating = currentUser ? (allRatings[v.id]?.[currentUser.username] || 0) : 0;
     const stars = [5, 4, 3, 2, 1].map(n => `<input type="radio" id="${v.id}-s${n}" name="${v.id}" value="${n}" ${myRating == n ? 'checked' : ''}><label for="${v.id}-s${n}">★</label>`).join('');
     const chips = buildRatingChips(v.id);
-    const vname = typeof v.name === 'object' ? (v.name[currentLang] || v.name.he) : v.name;
+    const tr = T[currentLang] || T['he'];
+    const vname = typeof v.name === 'object' ? (v.name[currentLang] || v.name.he || v.name.en) : v.name;
+    const navLinks = [
+      v.maps ? `<a class="btn poi-btn" href="${esc(v.maps)}" target="_blank" rel="noopener">🗺️ ${esc(tr.venue_maps || 'Maps')}</a>` : '',
+      v.waze ? `<a class="btn poi-btn" href="${esc(v.waze)}" target="_blank" rel="noopener">🔵 Waze</a>` : '',
+      /^https?:\/\//i.test(v.url || '') ? `<a class="btn poi-btn" href="${esc(v.url)}" target="_blank" rel="noopener">🎫 ${esc(tr.venue_site || 'Site / tickets')}</a>` : '',
+    ].filter(Boolean).join('');
     return `<div class="rating-card" id="rc-${v.id}">
-      <h4>${vname}</h4>
+      <h4>${esc(vname)}</h4>
+      ${navLinks ? `<div class="poi-links">${navLinks}</div>` : ''}
       <div class="stars">${stars}</div>
-      <textarea class="rating-note" id="note-${v.id}" placeholder="${(T[currentLang]||T['he']).rating_note_ph}"></textarea>
+      <textarea class="rating-note" id="note-${v.id}" placeholder="${esc(tr.rating_note_ph)}"></textarea>
       <br>
-      <button class="save-btn" onclick="saveRating('${v.id}')">${(T[currentLang]||T['he']).rating_save}</button>
-      <span class="saved-msg" id="saved-${v.id}">${(T[currentLang]||T['he']).rating_saved}</span>
-      <a class="trip-link" href="${v.url}" target="_blank">${(T[currentLang]||T['he']).rating_ta_link}</a>
+      <button class="save-btn" onclick="saveRating('${v.id}')">${esc(tr.rating_save)}</button>
+      <span class="saved-msg" id="saved-${v.id}">${esc(tr.rating_saved)}</span>
       <div class="rating-others" id="ro-${v.id}">${chips}</div>
       <button class="vc-toggle" id="vc-toggle-${v.id}" onclick="toggleVenueComments('${v.id}')">💬 ${(T[currentLang]||T['he']).ph_comments}</button>
       <div class="vc-thread" id="vc-thread-${v.id}"></div>
@@ -3034,7 +3045,7 @@ function buildPhaseNav(cfg) {
     sec.innerHTML = `<div class="sec-body"><div class="sec-inner">` +
       `<h2 class="section-h2"><span class="lang-he">${p.title?.he || p.tabLabel}</span>` +
       `<span class="lang-en">${p.title?.en || p.tabLabel}</span></h2>` +
-      (p.note ? `<p class="phase-note">${esc(p.note)}</p>` : '') +
+      (p.note ? `<p class="phase-note"><span class="lang-he">${esc(p.note.he ?? p.note)}</span><span class="lang-en">${esc(p.note.en ?? p.note.he ?? p.note)}</span></p>` : '') +
       `<div id="hotel-${p.id}"></div>` +
       `<div id="sched-${p.id}"></div>` +
       `<div id="rsvp-${p.id}"></div>` +

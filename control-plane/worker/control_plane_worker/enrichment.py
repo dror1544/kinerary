@@ -178,6 +178,14 @@ def _country_entry(http: Http, destination: str) -> tuple[str, dict] | None:
 # ── geocoding ────────────────────────────────────────────────────────────────
 
 def _geocode(http: Http, query: str) -> tuple[float, float] | None:
+    place = _geocode_place(http, query)
+    if not place:
+        return None
+    return place["lat"], place["lng"]
+
+
+def _geocode_place(http: Http, query: str) -> dict[str, Any] | None:
+    """Like _geocode but also returns Nominatim's `display_name` as `address`."""
     url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
         {"q": query, "format": "jsonv2", "limit": "1"}
     )
@@ -185,9 +193,23 @@ def _geocode(http: Http, query: str) -> tuple[float, float] | None:
     if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
         return None
     try:
-        return float(rows[0]["lat"]), float(rows[0]["lon"])
+        out: dict[str, Any] = {"lat": float(rows[0]["lat"]), "lng": float(rows[0]["lon"])}
     except (KeyError, TypeError, ValueError):
         return None
+    display = str(rows[0].get("display_name") or "").strip()
+    if display:
+        out["address"] = display
+    return out
+
+
+def _accommodation_name(phase: dict[str, Any]) -> str:
+    acc = phase.get("accommodation")
+    if not isinstance(acc, dict):
+        return ""
+    name = acc.get("name_en") or acc.get("name")
+    if isinstance(name, dict):
+        name = name.get("en") or name.get("he")
+    return str(name or "").strip()
 
 
 # ── hero photo ───────────────────────────────────────────────────────────────
@@ -240,19 +262,38 @@ def enrich_config(
         label, lang = _phase_query(phase)
         if not label:
             continue
-        query = f"{label}, {destination}".strip(", ")
+        city_query = f"{label}, {destination}".strip(", ")
         try:
             if "mapStop" not in phase:
-                coords = _geocode(http, query)
-                if coords:
-                    phase["mapStop"] = _map_stop(phase, coords)
-                _sleep(pause)
+                # Anchor the pin (and so the Maps/Waze links) on the hotel when
+                # there is one — "where are we staying" is the question a phase
+                # pin answers. Fall back to the city centre only if the hotel
+                # doesn't resolve. Matches the hand-built trips.
+                hotel = _accommodation_name(phase)
+                place = None
+                matched_hotel = False
+                if hotel:
+                    place = _geocode_place(http, f"{hotel}, {city_query}")
+                    matched_hotel = place is not None
+                    _sleep(pause)
+                if not place:
+                    place = _geocode_place(http, city_query)
+                    _sleep(pause)
+                if place:
+                    phase["mapStop"] = _map_stop(phase, (place["lat"], place["lng"]))
+                    acc = phase.get("accommodation")
+                    if matched_hotel and place.get("address") and isinstance(acc, dict):
+                        acc.setdefault("address", place["address"])
         except Exception:
             logger.warning("enrichment.geocode_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
             _add_phase_nav(phase)
         except Exception:
             logger.warning("enrichment.nav_failed", extra={"phase": phase.get("id")}, exc_info=True)
+        try:
+            _enrich_venues(phase, http, label, destination, pause)
+        except Exception:
+            logger.warning("enrichment.venues_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
             if "hero" not in phase:
                 # A Hebrew-only phase title against en.wikipedia is a guaranteed
@@ -399,6 +440,34 @@ def _maps_url(lat: float, lng: float) -> str:
 
 def _waze_url(lat: float, lng: float) -> str:
     return f"https://waze.com/ul?ll={lat}%2C{lng}&navigate=yes"
+
+
+def _enrich_venues(
+    phase: dict[str, Any], http: Http, label: str, destination: str, pause: float,
+) -> None:
+    """Geocode each must-see venue the intake named and add Maps/Waze deep
+    links. The venue's `url` (an official/ticket link from the source document)
+    is left as-is. `maps`/`waze` are `setdefault` — hand-authored wins. A venue
+    that will not geocode simply keeps whatever links it already had."""
+    venues = phase.get("venues")
+    if not isinstance(venues, list):
+        return
+    for venue in venues:
+        if not isinstance(venue, dict) or "maps" in venue:
+            continue
+        name = venue.get("name")
+        if isinstance(name, dict):
+            name = name.get("en") or name.get("he")
+        name = str(name or "").strip()
+        if not name:
+            continue
+        area = str(venue.get("area") or "").strip()
+        query = ", ".join(p for p in (name, area, label, destination) if p)
+        coords = _geocode(http, query)
+        _sleep(pause)
+        if coords:
+            venue.setdefault("maps", _maps_url(coords[0], coords[1]))
+            venue.setdefault("waze", _waze_url(coords[0], coords[1]))
 
 
 def _build_map(out: dict[str, Any]) -> None:
