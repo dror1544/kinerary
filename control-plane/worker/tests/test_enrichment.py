@@ -216,6 +216,56 @@ class HeroPhotoTests(unittest.TestCase):
         self.assertFalse(any("en.wikipedia.org" in u for u in http.calls))
 
 
+class MapObjectTests(unittest.TestCase):
+    def _geocoded(self):
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        return enrich_config(_config(), "Japan", http=http, pause=0)
+
+    def test_top_level_map_is_built_from_the_phase_mapstops(self) -> None:
+        out = self._geocoded()
+        self.assertIn("map", out)
+        self.assertEqual(2, len(out["map"]["stops"]))
+        self.assertEqual({"he": "Tokyo", "en": "Tokyo"}, out["map"]["stops"][0]["name"])
+
+    def test_map_centre_is_the_centroid_of_the_stops(self) -> None:
+        out = self._geocoded()
+        self.assertAlmostEqual((35.6764 + 35.0116) / 2, out["map"]["center"][0], places=3)
+        self.assertAlmostEqual((139.65 + 135.7681) / 2, out["map"]["center"][1], places=3)
+
+    def test_zoom_frames_the_span(self) -> None:
+        # Tokyo↔Kyoto is ~3.9° of longitude → zoom 6, same as the reference config.
+        self.assertEqual(6, self._geocoded()["map"]["zoom"])
+
+    def test_every_stop_carries_a_fallback_emoji(self) -> None:
+        for stop in self._geocoded()["map"]["stops"]:
+            self.assertEqual("📍", stop["emoji"])
+
+    def test_a_single_stop_still_gets_a_map_with_a_close_zoom(self) -> None:
+        cfg = _config()
+        cfg["phases"] = [cfg["phases"][0]]
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual(1, len(out["map"]["stops"]))
+        self.assertEqual(10, out["map"]["zoom"])
+
+    def test_phases_that_do_not_geocode_are_left_out_of_the_stop_list(self) -> None:
+        http = FakeHttp({"q=Kyoto": NOMINATIM_KYOTO})  # Tokyo misses
+        out = enrich_config(_config(), "Japan", http=http, pause=0)
+        self.assertEqual(1, len(out["map"]["stops"]))
+        self.assertEqual("Kyoto", out["map"]["stops"][0]["name"]["en"])
+
+    def test_no_geocoded_phases_means_no_map(self) -> None:
+        out = enrich_config(_config(), "Japan", http=FakeHttp({}), pause=0)
+        self.assertNotIn("map", out)
+
+    def test_a_hand_authored_map_is_not_overwritten(self) -> None:
+        cfg = _config()
+        cfg["map"] = {"center": [1.0, 2.0], "zoom": 9, "stops": []}
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual({"center": [1.0, 2.0], "zoom": 9, "stops": []}, out["map"])
+
+
 class ResilienceTests(unittest.TestCase):
     def test_a_raising_http_client_never_propagates(self) -> None:
         http = FakeHttp({}, boom=True)

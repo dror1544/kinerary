@@ -3,9 +3,11 @@
 Sits between transform_intake() and deploy: fills in the parts of a
 trip.config.json that need an external lookup rather than a judgement call —
 currency and emergency numbers for the destination country, map coordinates
-for each phase, and a hero photo per phase. It is the "port, don't design"
-half of Sprint 4.5; the AI phase-narrative/anchor-extraction half is separate
-and still unscheduled.
+for each phase, a hero photo per phase, and the top-level ``map`` object
+(centre + zoom + stops) the site's map tab needs to open framed on the trip
+instead of on a world view. It is the "port, don't design" half of Sprint
+4.5; the AI phase-narrative/anchor-extraction half is separate and still
+unscheduled.
 
 Two hard rules, both from the plan's own test list:
 
@@ -245,6 +247,11 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.hero_failed", extra={"phase": phase.get("id")}, exc_info=True)
 
+    try:
+        _build_map(out)
+    except Exception:
+        logger.warning("enrichment.map_failed", exc_info=True)
+
     return out
 
 
@@ -290,6 +297,45 @@ def _map_stop(phase: dict[str, Any], coords: tuple[float, float]) -> dict[str, A
         stop["hotel"] = str(acc.get("name_en") or acc["name"])
         stop["conf"] = str(acc.get("confirmation") or "–")
     return stop
+
+
+def _build_map(out: dict[str, Any]) -> None:
+    """Assemble the top-level ``map`` object from the per-phase ``mapStop``s:
+    a centre, a zoom that frames every stop, and the stop list itself. Without
+    it the map tab opens on ``[30, 10]`` zoom 3 — a world view with the phase
+    pins off-screen. A hand-authored ``map`` is left untouched."""
+    if isinstance(out.get("map"), dict):
+        return
+    stops: list[dict[str, Any]] = []
+    for phase in out.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        raw = phase.get("mapStop")
+        if not isinstance(raw, dict):
+            continue
+        try:
+            lat, lng = float(raw["lat"]), float(raw["lng"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        stop = dict(raw)
+        stop["lat"], stop["lng"] = lat, lng
+        stop.setdefault("emoji", "📍")
+        stops.append(stop)
+    if not stops:
+        return
+    lats = [s["lat"] for s in stops]
+    lngs = [s["lng"] for s in stops]
+    center = [round(sum(lats) / len(lats), 4), round(sum(lngs) / len(lngs), 4)]
+    span = max(max(lats) - min(lats), max(lngs) - min(lngs))
+    out["map"] = {"center": center, "zoom": _zoom_for_span(span), "stops": stops}
+
+
+def _zoom_for_span(span: float) -> int:
+    """A Leaflet zoom level that keeps a bounding box *span* degrees wide in view."""
+    for limit, zoom in ((0.5, 10), (1.5, 9), (3.0, 7), (6.0, 6), (12.0, 5), (30.0, 4)):
+        if span <= limit:
+            return zoom
+    return 3
 
 
 def _sleep(seconds: float) -> None:

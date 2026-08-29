@@ -1214,13 +1214,15 @@ function buildMapPopup(s, lang) {
   const dir  = isHe ? 'rtl' : 'ltr';
   const confLabel   = isHe ? 'אישור' : 'Confirmation';
   const privateStay = isHe ? 'לינה פרטית' : 'Private stay';
-  const hasConf = s.conf !== '–';
-  return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">
-    <strong style="font-size:1.05em">${s.emoji} ${name}</strong><br>
-    📅 ${s.dates}<br>
-    🏨 ${s.hotel}<br>
-    ${hasConf ? `✅ ${confLabel}: <code>${s.conf}</code>` : `🏠 ${privateStay}`}
-  </div>`;
+  const hasConf = s.conf && s.conf !== '–';
+  // Enriched stops can arrive without every field; skip a line rather than
+  // print "undefined", and only claim "private stay" when there's no hotel at all.
+  const lines = [`<strong style="font-size:1.05em">${s.emoji || '📍'} ${name}</strong>`];
+  if (s.dates) lines.push(`📅 ${s.dates}`);
+  if (s.hotel) lines.push(`🏨 ${s.hotel}`);
+  if (hasConf) lines.push(`✅ ${confLabel}: <code>${s.conf}</code>`);
+  else if (!s.hotel) lines.push(`🏠 ${privateStay}`);
+  return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">${lines.join('<br>')}</div>`;
 }
 
 function updateMapPopups(lang) {
@@ -3069,7 +3071,7 @@ function buildGlobalsFromConfig(cfg) {
   if (cfg.map?.stops?.length) {
     MAP_STOPS.length = 0;
     cfg.map.stops.forEach(s => MAP_STOPS.push({
-      lat: s.lat, lng: s.lng, emoji: s.emoji,
+      lat: s.lat, lng: s.lng, emoji: s.emoji || '📍',
       name_he: s.name?.he || s.name, name_en: s.name?.en || s.name,
       dates: s.dates, hotel: s.hotel, conf: s.conf, color: '#0a0f1c',
     }));
