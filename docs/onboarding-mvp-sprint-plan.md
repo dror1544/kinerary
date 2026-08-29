@@ -690,6 +690,12 @@ Build:
   has no reliable, server-verified way to learn its own chat id, so
   `interview.ts`'s `telegramChatIdHint` (migration 0022) is necessarily an
   LLM-relayed, unverified value in the meantime, not a substitute for this.
+- **Consider: a web signup for organizers (landing SPA).** This sprint owns
+  organizer identity and interview-mode entry, which makes it the cheapest
+  place to add a non-Telegram account signup that hands off to the existing
+  intake flow — the standing "provisioned sites / console have no login"
+  gap. Scope and the intake-hand-off decision are in §5's Landing SPA note
+  (point 3); pull it in here only if it lands without stretching the sprint.
 - **Interview UX and correctness** — the batch of interview-side issues from the
   first live signup run (`docs/signup-test-execution-capture (Manual).md`'s
   status ledger: General #1–4, Step 2 #1–3, Step 3 #1–13). Folded here because
@@ -770,13 +776,13 @@ Build:
 - Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
   release/resource versions, redacted failures, health, audit trail and
   bounded analytics. Add suspend/retry controls with server-side authorization.
-  The **organizer-facing** half of this — a public landing page, account
-  signup/sign-in, and an authenticated console where an organizer lists their
-  own trips and each one's lifecycle state — is the landing SPA, now in-tree at
-  `web/` (see §5, and `docs/landing-page-plan.md` +
-  `docs/web-control-plane-integration-plan.md`). The super-admin dashboard here
-  stays operator-only; the two share the control-plane read models but not the
-  UI or the auth surface.
+  This dashboard stays **operator-only**. The **organizer-facing** view — the
+  landing SPA now in-tree at `web/` — reads the same aggregator but through a
+  separate, organizer-scoped projection and its own auth surface. Whether that
+  projection is built here (cheap once the aggregator exists) or deferred to
+  the post-MVP web track is an open decision — see §5's Landing SPA note
+  (points 1–2), `docs/landing-page-plan.md`,
+  `docs/web-control-plane-integration-plan.md`.
 - Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
@@ -976,14 +982,43 @@ record until then.
 Vite/React SPA with a public landing page, account signup/sign-in, and a
 trips-list view. It is merged in from `feat/landing-spa` (kept aligned with
 that branch) so it evolves on this line rather than diverging. The SPA ships
-here **ahead of its control-plane wiring**: the auth and organizer read-model
-endpoints it calls (`web/src/api.ts`) are not yet mounted on this branch's
-control-plane API — that integration is the Sprint 6 organizer-dashboard work
-above, tracked in `docs/web-control-plane-integration-plan.md`. Until then the
-SPA builds and tests in isolation (its own CI job) but is not wired to a live
-control plane. Landing-spa's parallel early control-plane implementation
-(`portal.ts`, `runtime-gateway/`, a second `0021` migration) is deliberately
-**not** merged — this branch's Sprints 1–4.5 control-plane is authoritative.
+here **ahead of its control-plane wiring**: the endpoints it calls
+(`web/src/api.ts`) are not yet mounted on this branch's control-plane API.
+Until then the SPA builds and tests in isolation (its own CI job) but is not
+wired to a live control plane. Landing-spa's parallel early control-plane
+implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
+deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
+authoritative.
+
+Three connection points between the SPA and the control plane are **open
+future decisions**. They are recorded here so they are not lost; each is
+revisited in a dedicated post-MVP web track *unless* the note below says a
+coming sprint is the right place to start it:
+
+1. **The SPA as a UI layer over the control plane.** The console needs an
+   organizer-scoped read API — trip list, per-trip lifecycle state, job /
+   blocked-action status, redacted failures — that it renders. This is the
+   same read model Sprint 6's super-admin dashboard builds; the decision is
+   whether to expose an organizer-scoped projection of it *in Sprint 6*
+   (cheap once the aggregator exists) or defer the whole organizer view.
+   Auth model is part of this decision: reuse the organizer identity the
+   control plane already issues, or a separate web session.
+2. **Trip management actions from the SPA.** View state, trigger a
+   re-provision or an intake correction, request activation. The *backends*
+   for these largely have sprint homes already — the re-provision endpoint is
+   **Sprint 4.7**, suspend/retry controls are **Sprint 6** — so the open
+   piece is only the SPA surface and its authorization, which can follow
+   whenever #1 lands.
+3. **Provisioning a new trip from the SPA, and signup.** `NewTripPage.tsx`
+   implies an account-creation → new-trip flow that does **not** go through
+   Telegram. Telegram SSO is permanently ruled out (see the shared-bot
+   decision), so a real web signup for organizers is already a standing gap;
+   the landing page is its natural home. This one **should be considered for
+   Sprint 5**, which already owns organizer identity, the shared router, and
+   interview-mode entry — a web signup that then hands off to the existing
+   intake flow is a smaller addition there than as its own track. What starts
+   the intake (the SPA vs. the Telegram router) and where the organizer's
+   verified chat id is captured are the sub-decisions.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 
