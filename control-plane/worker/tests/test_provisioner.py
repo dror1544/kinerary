@@ -365,6 +365,36 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("succeeded", row["state"])
 
+    def test_lease_heartbeat_renews_while_a_slow_job_runs(self) -> None:
+        # A deploy that blocks long enough for several heartbeat intervals.
+        import time as _time
+
+        class SlowDeploy(FakeDeployAdapter):
+            def deploy(self, *args: Any, **kwargs: Any) -> str:
+                _time.sleep(0.5)
+                return super().deploy(*args, **kwargs)
+
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=SlowDeploy(), worker_id="hb-test",
+        )
+        worker.LEASE_SECONDS = 4
+        worker.HEARTBEAT_INTERVAL_SECONDS = 0.15
+
+        t0 = self.conn.execute("SELECT now() AS n").fetchone()["n"]
+        worker.run_once()
+
+        row = self.conn.execute(
+            "SELECT state, last_heartbeat_at FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "succeeded")
+        # _claim stamps last_heartbeat_at at ~t0; a beat during the 0.5s deploy
+        # pushes it at least one interval past that.
+        self.assertGreater(
+            (row["last_heartbeat_at"] - t0).total_seconds(),
+            worker.HEARTBEAT_INTERVAL_SECONDS,
+        )
+
     def test_empty_queue_returns_false(self) -> None:
         # Consume the job first.
         self.worker.run_once()

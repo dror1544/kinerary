@@ -141,6 +141,11 @@ services:
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}
+      # Preferred over a static NPM_API_TOKEN (which is a ~1-day JWT): with
+      # both set the worker mints a fresh token per job (compute._mint_npm_token).
+      # __main__.py's --enable-compute guard requires one or the other.
+      NPM_IDENTITY: ${NPM_IDENTITY:-}
+      NPM_SECRET: ${NPM_SECRET:-}
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
     # Bind mounts for real provisioning: your kinerary-deploy checkout

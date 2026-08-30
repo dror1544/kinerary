@@ -582,34 +582,47 @@ patching the output afterward.
 recovery steps" into "recovers itself", and finish the release-artifact work
 Sprint 4 explicitly deferred.
 
-Build — **operational gaps found in the Phase H run** (each needs a hand DB
-edit or a destroy-and-recreate today):
+**Status (2026-08-30):** the four operational-gap items below are **built**
+(migration 0026, `retryProvision` + `POST /v1/trips/:id/plan/retry`, the lease
+heartbeat, the in-place bootstrap converge, and worker-minted NPM tokens), with
+unit coverage in `planner.test.ts`, `intake-correction.test.ts`,
+`test_provisioner.py`, `tests/provisioning/test_engine.py`,
+`test_adapters.py`, and `test_compute.py`. The link-carry-forward item and the
+release-artifact hardening block are **not yet built**.
 
-- **Provisioning-retry endpoint.** A terminal/failed job leaves the trip
-  wedged; re-planning the same intake hits `plans_trip_id_digest_key` (identical
-  intake + release ⇒ identical digest) → `PLAN_ALREADY_PENDING`. Every retry
-  during Sprint 4.5's live work needed a manual cleanup — delete the dead plan,
-  its `plan_approvals` row and its job, then reset `trips.lifecycle_state`. This
-  wants a first-class endpoint that supersedes the old plan/job and generates a
-  fresh one, and (for a live trip) does so with `first_provision = false` so
-  the container's seeded users survive.
-- **`ready_private` is not in `CORRECTABLE_STATES`.** Re-provisioning a live
-  trip currently needs a manual `UPDATE control_plane.trips SET
-  lifecycle_state='intake_confirmed'` before `intake/correct` or `generatePlan`
-  will run. Either add the state to the set, or route re-provision through the
-  retry endpoint above with no lifecycle hop.
-- **Job lease (600 s) is shorter than the bootstrap ceiling (900 s), with no
-  heartbeat.** Harmless while a real bootstrap takes ~140 s, but a hung one
-  outlives its lease and can be double-claimed. Add a heartbeat, or make the
-  lease cover the ceiling.
-- **`_bootstrap_app_environment` only runs inside `create()`.** `apply()` is
-  inspect-then-create, so a container that exists but is half-built is never
-  repaired — the only recovery is destroy and recreate. Make the bootstrap
-  idempotent and callable against an existing container.
-- **Worker should mint its own NPM token.** `NPM_API_TOKEN` in
-  `provisioning.env` is a ~1-day JWT; a provision run after it expires 401s at
-  the NPM step (hit twice during 4.5 work). The worker holds
-  `NPM_IDENTITY`/`NPM_SECRET` — it should exchange them for a JWT at job time.
+Build — **operational gaps found in the Phase H run** (each needed a hand DB
+edit or a destroy-and-recreate before this sprint):
+
+- **Provisioning-retry endpoint. — BUILT.** `POST /v1/trips/:id/plan/retry`
+  (`retryProvision` in `planner.ts`, owner-auth): supersedes any active plan,
+  cancels its non-terminal jobs, reverts the trip to `intake_confirmed`, then
+  `generatePlan`. Refuses while a provision job holds a live lease; cancels a
+  stale one. `first_provision` is recomputed from job history, so a live-trip
+  re-provision comes out `false` and the seeded users survive. **Migration
+  0026** narrows the old table-level `UNIQUE (trip_id, digest)` on
+  `control_plane.plans` to a partial index over the active statuses, so a
+  retired plan's digest can be reused by a fresh plan (that constraint was
+  what turned every retry into a hand cleanup).
+- **`ready_private` in `CORRECTABLE_STATES`. — BUILT.** Added, so an organizer
+  can also fix an answer on a live trip; `correctIntake` supersedes the
+  executed plan and reverts to `intake_confirmed`, and the next plan is
+  `first_provision = false`.
+- **Job lease heartbeat. — BUILT.** `_LeaseHeartbeat` (a daemon thread in
+  `provisioner.py`) renews `lease_expires_at` every
+  `HEARTBEAT_INTERVAL_SECONDS` (60s) for the life of a claimed job; the base
+  `LEASE_SECONDS` was raised 600 → 900 to cover the single-remote-command
+  ceiling even if the thread stalls. A 0-row renew means the lease is no
+  longer ours and the thread stops.
+- **In-place bootstrap converge. — BUILT.** `ProxmoxLxcAdapter.needs_bootstrap()`
+  probes for the bootstrap markers (`.env`, the systemd unit, the nginx site);
+  `bootstrap()` runs the already-idempotent `_bootstrap_app_environment`
+  against an existing container (starting it first if stopped). `Provisioner`
+  emits a `bootstrap` change for a container that exists but is half-built —
+  the case `inspect()`/`plan()` could not see.
+- **Worker-minted NPM token. — BUILT.** `compute._mint_npm_token()` exchanges
+  `NPM_IDENTITY` / `NPM_SECRET` for a fresh JWT per provision run (`POST
+  /api/tokens`); a static `NPM_API_TOKEN` still works as a fallback but goes
+  stale. `__main__` fails loudly at startup if neither is configured.
   (Related, already mitigated: `provisioning.env` must set every
   `PROXMOX_*`/`RPI_*` explicitly because `compose.local.yml` passes each as
   `${VAR:-}` and an empty string beats the code's own default — keep the

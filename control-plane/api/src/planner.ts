@@ -124,6 +124,154 @@ export async function generatePlan(
   return { ok: true, planId, planDigest, releaseId: release.id, jobId };
 }
 
+export type RetryProvisionResult =
+  | {
+      ok: true;
+      planId: string;
+      planDigest: string;
+      releaseId: string;
+      jobId: string;
+      supersededPlanId: string | null;
+    }
+  | {
+      ok: false;
+      reason:
+        | "TRIP_NOT_FOUND"
+        | "NOT_RETRYABLE_STATE"
+        | "PROVISION_IN_PROGRESS"
+        | "TRIP_NOT_CONFIRMED"
+        | "NO_INTAKE_VERSION"
+        | "NO_COMPATIBLE_RELEASE"
+        | "PLAN_ALREADY_PENDING";
+    };
+
+// States a re-provision can start from. Everything up to and including a live
+// private trip; not the activation states or a sealed/completed trip, which
+// need their own ceremony. `intake_confirmed` is the degenerate case — nothing
+// to supersede, generatePlan alone would do — but it is accepted so the
+// endpoint is idempotent to call.
+const RETRYABLE_STATES = new Set([
+  "intake_confirmed",
+  "planned",
+  "provisioning_approved",
+  "provisioning",
+  "ready_private",
+]);
+
+/**
+ * Re-runs provisioning for a trip whose previous attempt is finished (failed,
+ * or succeeded and now being replaced) without a hand DB edit. Supersedes any
+ * still-active plan and cancels its non-terminal jobs, reverts the trip to
+ * `intake_confirmed`, then calls generatePlan against the latest confirmed
+ * intake. `first_provision` is recomputed there from job history, so a
+ * re-provision of a live trip (a prior succeeded job) correctly comes out
+ * `false` and the container's seeded users survive.
+ *
+ * Refuses while a provision job holds a live lease — a stale/expired lease is
+ * cancelled, an in-flight one is not yanked.
+ */
+export async function retryProvision(
+  db: pg.Pool,
+  tripId: string,
+  correlationId: string,
+): Promise<RetryProvisionResult> {
+  const client = await db.connect();
+  let supersededPlanId: string | null = null;
+  try {
+    await client.query("BEGIN");
+
+    const tripRow = await client.query<{ lifecycle_state: string }>(
+      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+      [tripId],
+    );
+    const trip = tripRow.rows[0];
+    if (!trip) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "TRIP_NOT_FOUND" };
+    }
+    if (!RETRYABLE_STATES.has(trip.lifecycle_state)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "NOT_RETRYABLE_STATE" };
+    }
+
+    // Lock every non-terminal provision job for this trip, THEN decide. The
+    // worker claims with `... FOR UPDATE OF j SKIP LOCKED`, so once we hold
+    // these row locks a claim racing us skips the row instead of leasing it
+    // in the window between our check and our cancel — without the lock, a
+    // job claimed in that window would be cancelled here while its worker
+    // kept provisioning, and generatePlan would then queue a second one.
+    // `live` is computed against the DB clock in the same statement so a job
+    // that is genuinely in flight is never cancelled from under its worker.
+    const provisionJobs = await client.query<{ id: string; live: boolean }>(
+      `SELECT id,
+              (state IN ('leased', 'running')
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at > now()) AS live
+       FROM control_plane.jobs
+       WHERE trip_id = $1 AND job_type = 'provision'
+         AND state NOT IN ('succeeded', 'failed', 'cancelled')
+       FOR UPDATE`,
+      [tripId],
+    );
+    if (provisionJobs.rows.some((j) => j.live)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PROVISION_IN_PROGRESS" };
+    }
+
+    // Supersede any active plan — same shape as correctIntake, without writing
+    // a new intake version.
+    const supersededRows = await client.query<{ id: string }>(
+      `UPDATE control_plane.plans
+       SET status = 'superseded', updated_at = now()
+       WHERE trip_id = $1 AND status IN ('pending_approval', 'approved')
+       RETURNING id`,
+      [tripId],
+    );
+    if (supersededRows.rowCount && supersededRows.rowCount > 0) {
+      supersededPlanId = supersededRows.rows[0]!.id;
+    }
+
+    // Cancel the (now lock-held) non-terminal jobs by id — trip-scoped rather
+    // than plan-scoped, so an orphan job whose plan already moved on is cleared
+    // too. Nothing here is `live` (checked above).
+    const jobIds = provisionJobs.rows.map((j) => j.id);
+    if (jobIds.length > 0) {
+      await client.query(
+        `UPDATE control_plane.jobs
+         SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+         WHERE id = ANY($1)`,
+        [jobIds],
+      );
+    }
+
+    await client.query(
+      "UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1",
+      [tripId],
+    );
+
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  // Fresh connection / transaction. If this fails (e.g. NO_COMPATIBLE_RELEASE)
+  // the trip is left at intake_confirmed with no plan — a valid resting state
+  // and strictly more recoverable than where it started.
+  const gen = await generatePlan(db, tripId, correlationId);
+  if (!gen.ok) return { ok: false, reason: gen.reason };
+  return {
+    ok: true,
+    planId: gen.planId,
+    planDigest: gen.planDigest,
+    releaseId: gen.releaseId,
+    jobId: gen.jobId,
+    supersededPlanId,
+  };
+}
+
 export interface PlanView {
   id: string;
   tripId: string;

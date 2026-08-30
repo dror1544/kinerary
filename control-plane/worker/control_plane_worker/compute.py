@@ -111,6 +111,8 @@ class LxcProvisionAdapter:
         disk_gb: int = 8,
         forward_port: int = 8080,
         seed_password: str = "",
+        npm_identity: str = "",
+        npm_secret: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
     ) -> None:
         self._deploy_root = deploy_root
@@ -125,6 +127,8 @@ class LxcProvisionAdapter:
         self._tunnel_id = tunnel_id
         self._npm_url = npm_url
         self._npm_api_token = npm_api_token
+        self._npm_identity = npm_identity
+        self._npm_secret = npm_secret
         self._cloudflare_zone_id = cloudflare_zone_id
         self._cloudflare_api_token = cloudflare_api_token
         self._proxmox_host = proxmox_host
@@ -169,6 +173,15 @@ class LxcProvisionAdapter:
         # users table that server.js won't re-seed over.
         self._reset_data = first_provision
         provisioner = self._provisioner_factory()
+
+        # ProxmoxLxcAdapter.create() runs that wipe, but only when it runs —
+        # i.e. when the LXC is absent. A first attempt that created the
+        # container and then failed downstream (bootstrap, NPM, deploy) leaves
+        # the LXC in place, so this apply() plans no create() and the stale
+        # data dir would survive a "first" provision. Wipe it here in that case.
+        if first_provision and provisioner.proxmox.inspect(topology.lxc) is not None:
+            provisioner.proxmox.reset_trip_data(topology.lxc)
+
         provisioner.apply(topology, execute=True)
 
         record = provisioner.proxmox.inspect(topology.lxc)
@@ -302,8 +315,26 @@ class LxcProvisionAdapter:
         )
         path.write_text(header + yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
+    def _mint_npm_token(self) -> str:
+        """A fresh NPM JWT for this provision run. NPM tokens expire in ~1 day,
+        so a long-lived NPM_API_TOKEN baked into provisioning.env 401s the NPM
+        step on any run after it lapsed (hit twice during Sprint 4.5). When
+        NPM_IDENTITY / NPM_SECRET are configured, exchange them at job time;
+        otherwise fall back to the static NPM_API_TOKEN.
+        """
+        if self._npm_identity and self._npm_secret:
+            result = HttpJsonTransport(self._npm_url, {}).request(
+                "POST", "/api/tokens",
+                payload={"identity": self._npm_identity, "secret": self._npm_secret},
+            )
+            token = result.get("token") if isinstance(result, dict) else None
+            if not token:
+                raise RuntimeError("NPM /api/tokens returned no token")
+            return token
+        return self._npm_api_token
+
     def _build_provisioner(self) -> Provisioner:
-        npm_transport = HttpJsonTransport(self._npm_url, {"Authorization": f"Bearer {self._npm_api_token}"})
+        npm_transport = HttpJsonTransport(self._npm_url, {"Authorization": f"Bearer {self._mint_npm_token()}"})
         cloudflare_transport = HttpJsonTransport("https://api.cloudflare.com", {
             "Authorization": f"Bearer {self._cloudflare_api_token}",
         })

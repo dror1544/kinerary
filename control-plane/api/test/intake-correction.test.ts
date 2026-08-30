@@ -308,4 +308,19 @@ describe("correctIntake", () => {
       await teardownFixture(fix);
     }
   });
+
+  test("can correct from ready_private — a live trip, reverting to intake_confirmed", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool, "ready_private");
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", CORRECTED_ANSWERS);
+      assert.equal(result.ok, true);
+      const row = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1",
+        [fix.tripId],
+      );
+      assert.equal(row.rows[0]?.lifecycle_state, "intake_confirmed");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
 });
