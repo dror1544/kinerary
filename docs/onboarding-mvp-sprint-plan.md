@@ -587,8 +587,9 @@ Sprint 4 explicitly deferred.
 heartbeat, the in-place bootstrap converge, and worker-minted NPM tokens), with
 unit coverage in `planner.test.ts`, `intake-correction.test.ts`,
 `test_provisioner.py`, `tests/provisioning/test_engine.py`,
-`test_adapters.py`, and `test_compute.py`. The link-carry-forward item and the
-release-artifact hardening block are **not yet built**.
+`test_adapters.py`, and `test_compute.py`. The **link-carry-forward item is
+now built too** (see below). Only the release-artifact hardening block is
+**not yet built**.
 
 Build — **operational gaps found in the Phase H run** (each needed a hand DB
 edit or a destroy-and-recreate before this sprint):
@@ -629,21 +630,47 @@ edit or a destroy-and-recreate before this sprint):
   caveat.)
 
 Build — **carry the enriched links onto the itinerary lines and the anchor
-list** (reviewing the first real provisioned site, 2026-08-29): provision-time
-enrichment attaches `maps` / `waze` / `url` to `phases[].venues[]`, so the
-per-venue ranking cards get 🗺️/🔵/🎫 buttons — but the same links never reach
-(a) the day-by-day itinerary lines (`phases[].days[].items[]` — the extract
-schema has no per-item URL field, and `site/app.js` `renderDays` prints the
-config-days branch as bare `time — text`), or (b) the anchor / bookings home
-list (`bookings.json` hotel rows get no `maps`/`waze`). The hand-built
-reference trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`,
-legacy USA2026 on CT200) carry these everywhere. Scope: match a day item /
-hotel booking to the phase venue it names and copy the links across
-(`enrichment.py`), and render item links in the config-days branch
-(`site/app.js`). Related plan-layer columns already exist
-(`phase_plan_items.{location_url,waze_url,website_url,ticket_url}`) but nothing
-populates them from config venues — `promote-config-days` only lifts links out
-of inline `<a>` markup, which extraction output does not produce.
+list. — BUILT (2026-08-30).** (Reviewing the first real provisioned site,
+2026-08-29): provision-time enrichment attaches `maps` / `waze` / `url` to
+`phases[].venues[]`, so the per-venue ranking cards get 🗺️/🔵/🎫 buttons — but
+the same links never reached (a) the day-by-day itinerary lines
+(`phases[].days[].items[]` — the extract schema has no per-item URL field, and
+`site/app.js` `renderDays` printed the config-days branch as bare
+`time — text`), or (b) the anchor / bookings home list (`bookings.json` hotel
+rows got no `maps`/`waze`). The hand-built reference trips
+(`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`, legacy USA2026 on
+CT200) carry these everywhere.
+
+  - `enrichment._carry_venue_links_to_days` runs after `_enrich_venues` in the
+    per-phase loop: for each `days[].items[]` whose text names a phase venue
+    (case-insensitive substring on either language side, plus the venue name
+    with a trailing city/country word dropped so "TeamLab Planets" matches the
+    venue "TeamLab Planets Tokyo"), it copies that venue's `maps`/`waze`/`url`
+    onto the item as siblings of `time`/`text` — `setdefault`, so a
+    hand-authored value wins. Self-guarded like every other enrichment step.
+  - `transformer.derive_bookings` (runs on the already-enriched config): a
+    hotel row takes `location_url` from `accommodation.mapsUrl`/`.maps`
+    (falling back to a venue match on the hotel name); an anchor row takes it
+    from a venue its name/notes names. `_config_venue_link` — longest
+    venue-name match wins.
+  - `site/app.js` `renderDays` config-days branch renders `item.maps`/`waze`/
+    `url` as the same 🗺️/🔵/🎫 buttons the venue card shows (`safeUrl` gate,
+    `.day-item-link` styling); `server.js` bookings seed now reads
+    `b.location_url`; `promote-config-days` lifts the item siblings into
+    `phase_plan_items.{location_url,waze_url,ticket_url}` (and backfills them on
+    a re-run), closing the gap that it only ever parsed inline `<a>` markup,
+    which extraction output does not produce.
+  - Two carry-over gaps closed after review (both are next-boot repairs on an
+    already-persistent trip DB, only ever filling a column still NULL): the
+    bookings seed backfills `location_url` onto an existing `seed_key` row that
+    `INSERT OR IGNORE` skips; the promote backfill is no longer gated on
+    `extra_links IS NULL`, so a row promoted from an inline-linked config item
+    still picks up a Waze / ticket sibling a later enrichment added.
+  - Coverage: `test_enrichment.DayLinkCarryTests`,
+    `test_transformer.DeriveBookingsLinkTests`, `tests/config-day-links.test.js`
+    (render branch + promote path + a two-boot persistence check for the seed
+    and promote backfills, incl. a `javascript:` URL that must never become an
+    href and an organizer-set link that must never be stomped).
 
 Build — **release-artifact hardening** (moved here from Sprint 4's "Deferred
 past this gate" note and §5):

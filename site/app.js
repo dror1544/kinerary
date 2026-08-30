@@ -4125,9 +4125,18 @@ function renderDays(phase) {
     const supersededByPlan = dbItems.length > 0;
     if (!supersededByPlan || isOrganizer) {
       const daysHtml = phase.days.map(day => {
-        const items = (day.items || []).map(item =>
-          `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}</li>`
-        ).join('');
+        const items = (day.items || []).map(item => {
+          // Provision-time enrichment matches a day line to the phase venue it
+          // names and copies the venue's links onto the item — the extract
+          // schema has no per-item URL field, so they arrive as siblings of
+          // text/time, not inline <a>. Same 🗺️/🔵/🎫 the venue card shows.
+          const nav = [['🗺️', item.maps], ['🔵', item.waze], ['🎫', item.url]]
+            .map(([icon, u]) => {
+              const safe = safeUrl(u);
+              return safe ? `<a class="poi-btn day-item-link" href="${esc(safe)}" target="_blank" rel="noopener">${icon}</a>` : '';
+            }).join('');
+          return `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
+        }).join('');
         return `<div class="day-block">
           <div class="day-label">${_biSpan(day.label)}</div>
           <ul>${items}</ul>

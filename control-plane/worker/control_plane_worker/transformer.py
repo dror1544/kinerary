@@ -1159,6 +1159,43 @@ def _extract_anchor_date(text: str) -> date | None:
         return None
 
 
+def _first_http(*candidates: Any) -> str | None:
+    """First argument that is a real http(s) URL, or None."""
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if _HTTP_URL_RE.match(text):
+            return text
+    return None
+
+
+def _config_venue_link(text: Any, phases: list[Any]) -> str | None:
+    """A maps / official URL for a booking row whose name or notes names one of
+    the config venues. ``derive_bookings`` runs after enrichment has linked
+    ``phases[].venues[]``, so this just reads those links back out — the longest
+    venue-name match wins so a specific place beats a city-name collision."""
+    hay = str(text or "").lower()
+    if len(hay) < 4:
+        return None
+    best_len = 0
+    best_url: str | None = None
+    for phase in phases:
+        if not isinstance(phase, Mapping):
+            continue
+        for venue in phase.get("venues") or []:
+            if not isinstance(venue, Mapping):
+                continue
+            link = _first_http(venue.get("url"), venue.get("maps"))
+            if not link:
+                continue
+            name = venue.get("name")
+            sides = [name.get("en"), name.get("he")] if isinstance(name, Mapping) else [name]
+            for side in sides:
+                needle = str(side or "").strip().lower()
+                if len(needle) >= 4 and needle in hay and len(needle) > best_len:
+                    best_len, best_url = len(needle), link
+    return best_url
+
+
 def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
     """The id of the phase whose date range contains `when`.
 
@@ -1207,16 +1244,24 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
         if not isinstance(accommodation, dict) or not accommodation.get("name"):
             continue
         dates = phase.get("dates") or {}
+        hotel_name = str(accommodation.get("name_en") or accommodation["name"])
         bookings.append({
             "phase": str(phase.get("id")) or None,
             "type": "hotel",
-            "name": str(accommodation.get("name_en") or accommodation["name"]),
+            "name": hotel_name,
             "date_from": dates.get("start"),
             "date_to": dates.get("end"),
             "passengers": None,
             "confirmation": accommodation.get("confirmation"),
             "notes": None,
             "cost": 0,
+            # The map link enrichment already anchored on this hotel (name
+            # search, so it survives a shaky geocode) — carry it so the
+            # Bookings tab's 📍 badge points somewhere.
+            "location_url": (
+                _first_http(accommodation.get("mapsUrl"), accommodation.get("maps"))
+                or _config_venue_link(hotel_name, phases)
+            ),
             "seed_key": f"hotel_{phase.get('id')}",
         })
 
@@ -1242,6 +1287,9 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             "confirmation": raw.get("confirmation"),
             "notes": detail or None,
             "cost": 0,
+            # If the anchor names a venue the itinerary already links, reuse
+            # that link rather than leaving the row with a bare 📍.
+            "location_url": _config_venue_link(f"{name} {detail}", phases),
             "seed_key": "anchor_" + hashlib.sha1(
                 (detail or anchor_type).encode("utf-8")
             ).hexdigest()[:10],
