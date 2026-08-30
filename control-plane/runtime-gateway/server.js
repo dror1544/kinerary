@@ -186,7 +186,7 @@ export function createRuntimeGateway() {
       // A rejected/expired launch grant is an authentication failure. It is
       // not evidence that the runtime is unavailable.
       const controlPlaneError = error && typeof error === "object" ? error : {};
-      if (controlPlaneError.message === "CONTROL_PLANE_REJECTED" && controlPlaneError.statusCode >= 400 && controlPlaneError.statusCode < 500) {
+      if (controlPlaneError.message === "CONTROL_PLANE_REJECTED" && controlPlaneError.statusCode === 401) {
         return json(res, 401, { error: "LAUNCH_INVALID" });
       }
       return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
