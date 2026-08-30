@@ -36,6 +36,10 @@ export const configSchema = z.object({
     destination: z.string().optional(),
     homePhoto: z.string().optional(),
     mapPhoto: z.string().optional(),
+    // Optional trip-owned mark shown in the hero. Keep it outside git/runtime
+    // storage when it is an uploaded image; a public HTTPS URL also works.
+    logo: z.string().optional(),
+    logoAlt: z.string().optional(),
   }).optional(),
   phases: z.array(z.object({
     id: z.string(),

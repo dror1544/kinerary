@@ -33,7 +33,6 @@ import {
   X,
 } from "lucide-react";
 import brandLogo from "./assets/brand/logo.svg";
-import brandLogoReversed from "./assets/brand/logo-reversed.svg";
 import brandMark from "./assets/brand/mark.svg";
 import {
   ActiveItinerary,
@@ -84,14 +83,34 @@ function dateLabel(date: string, lang: Lang) {
   return value.toLocaleDateString(lang === "he" ? "he-IL" : "en-US", { weekday: "short", month: "short", day: "numeric" });
 }
 
-function phaseLabel(phase: string) {
-  return {
-    pre_trip: "Getting ready",
-    flight_day: "Flight day",
-    active_day: "On the road",
-    transfer_day: "Transfer day",
-    post_trip: "Memory mode",
-  }[phase] || "Today";
+function daySelectorSubtitle(day: { label_he?: string | null; label_en?: string | null; phase_id: string }, lang: Lang) {
+  const raw = (lang === "he" ? day.label_he || day.label_en : day.label_en || day.label_he) || day.phase_id;
+  // The date is already the button title. Prefer the descriptive part after a
+  // date-divider, then remove any remaining date token for compact day chips.
+  const afterDivider = raw.split(/[—–]/).map((part) => part.trim()).filter(Boolean).at(-1) || raw;
+  const compact = afterDivider
+    .replace(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b\.?/gi, "")
+    .replace(/\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?\b/g, "")
+    .replace(/^\s*[-–—·,:]+|\s*[-–—·,:]+$/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return compact.length > 46 ? `${compact.slice(0, 45).trimEnd()}…` : compact || day.phase_id;
+}
+
+function copy(lang: Lang, en: string, he: string) {
+  return lang === "he" ? he : en;
+}
+
+function phaseLabel(phase: string, lang: Lang) {
+  const labels: Record<string, [string, string]> = {
+    pre_trip: ["Getting ready", "מתארגנים לקראת הטיול"],
+    flight_day: ["Flight day", "יום טיסה"],
+    active_day: ["On the road", "בדרך"],
+    transfer_day: ["Transfer day", "יום מעבר"],
+    post_trip: ["Memory mode", "זמן לזיכרונות"],
+  };
+  const label = labels[phase] || ["Today", "היום"];
+  return lang === "he" ? label[1] : label[0];
 }
 
 function tabLabel(tab: Tab, lang: Lang) {
@@ -150,6 +169,17 @@ function itemTitle(item: ItineraryItem, lang: Lang) {
 function safeFileUrl(path: string, file?: string | null) {
   if (!file) return "";
   return runtimeUrl(`${path}/${encodeURIComponent(file)}`);
+}
+
+function tripLogoUrl(value?: string) {
+  if (!value) return null;
+  if (value.startsWith("/")) return runtimeUrl(value);
+  try {
+    const url = new URL(value);
+    return ["https:", "http:"].includes(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function extraLinkLabel(link: NonNullable<ItineraryItem["extra_links"]>[number], lang: Lang) {
@@ -237,6 +267,8 @@ function Hero({
   const activePhase = config?.phases?.find((phase) => phase.id === heroPhaseId);
   const activePhaseName = activePhase ? text(activePhase.title, lang) : "";
   const fallback = activePhase?.hero?.photo || settings?.hero.url || config?.meta?.homePhoto || config?.phases?.[0]?.hero?.photo || config?.meta?.mapPhoto || "";
+  const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
+  const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
   const visiblePhoto = useRef(fallback);
   const [departingPhoto, setDepartingPhoto] = useState<string | null>(null);
   useEffect(() => {
@@ -256,7 +288,7 @@ function Hero({
       <div key={fallback || "solid"} className="hero-image-layer hero-image-arriving" aria-hidden="true" style={{ backgroundImage: fallback ? `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${fallback}")` : undefined, backgroundPosition }} />
       <nav className="topline" aria-label="Trip">
         <a className="brand-lockup" href="#today" onClick={() => openTab("today")} aria-label="Kinerary home">
-          <img src={brandLogoReversed} alt="Kinerary" />
+          <img className="hero-logo" src={heroLogo} alt={heroLogoAlt} />
           <strong>{config?.meta?.title || "Family Trip"}</strong>
         </a>
         <div className="desktop-tabs">
@@ -288,8 +320,7 @@ function Hero({
         </button>
       </nav>
       <div key={`${fallback}-${lang}`} className="hero-copy hero-copy-arriving">
-        <span className="eyebrow"><Sparkles size={16} /> {activePhaseName || "Living journey"}</span>
-        <h1>{activePhaseName || config?.meta?.destination || config?.meta?.title || "Today knows where the trip is."}</h1>
+        <h1>{activePhaseName || config?.meta?.destination || config?.meta?.title || copy(lang, "Today knows where the trip is.", "היום יודע איפה הטיול נמצא.")}</h1>
         <p>{lang === "he" ? "המסלול, הרגעים והעוזר זזים יחד עם השעון של הטיול." : "The itinerary, moments, and companion follow the trip clock as the day changes."}</p>
       </div>
     </header>
@@ -322,31 +353,31 @@ function TimelineItem({
   return (
     <article className={`timeline-item ${compact ? "compact" : ""}`}>
       <div className="time-rail">
-        <span>{item.time || "Anytime"}</span>
+        <span>{item.time || copy(lang, "Anytime", "בכל שעה")}</span>
         <i />
       </div>
       <div className="item-body">
         <div className="item-kicker">
           <Icon size={16} />
           <span>{item.item_type.replace("_", " ")}</span>
-          {item.provenance?.status === "updated_from_original" ? <b>Updated from original</b> : null}
-          {item.provenance?.status === "added" ? <b>Added</b> : null}
+          {item.provenance?.status === "updated_from_original" ? <b>{copy(lang, "Updated from original", "עודכן מהתוכנית המקורית")}</b> : null}
+          {item.provenance?.status === "added" ? <b>{copy(lang, "Added", "נוסף")}</b> : null}
         </div>
         <h3>{title}</h3>
         <div className="item-meta">
-          {item.booking?.confirmation ? <span><CheckCircle2 size={14} /> Confirmation stored</span> : null}
-          {item.location_url ? <a href={item.location_url} target="_blank" rel="noreferrer"><MapPin size={14} /> Map</a> : null}
+          {item.booking?.confirmation ? <span><CheckCircle2 size={14} /> {copy(lang, "Confirmation stored", "אישור שמור")}</span> : null}
+          {item.location_url ? <a href={item.location_url} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
           {item.waze_url ? <a href={item.waze_url} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
-          {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> Needs review</span> : null}
+          {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
         <div className="item-actions" aria-label={`Actions for ${title}`}>
-          {confirmationUrl ? <a className="item-action" href={confirmationUrl} target="_blank" rel="noreferrer"><ShieldCheck size={15} /> Confirmation</a> : null}
-          {item.ticket_url ? <a className="item-action" href={item.ticket_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Tickets</a> : null}
-          {item.website_url ? <a className="item-action" href={item.website_url} target="_blank" rel="noreferrer"><Globe2 size={15} /> Site</a> : null}
+          {confirmationUrl ? <a className="item-action" href={confirmationUrl} target="_blank" rel="noreferrer"><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</a> : null}
+          {item.ticket_url ? <a className="item-action" href={item.ticket_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
+          {item.website_url ? <a className="item-action" href={item.website_url} target="_blank" rel="noreferrer"><Globe2 size={15} /> {copy(lang, "Site", "אתר")}</a> : null}
           {item.booking?.google_wallet_url ? <a className="item-action" href={item.booking.google_wallet_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
           {item.booking?.apple_wallet_url || appleWalletUrl ? <a className="item-action" href={item.booking?.apple_wallet_url || appleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a> : null}
           {extraLinks.map((link) => <a key={`${link.label}-${link.url}`} className="item-action" href={link.url} target="_blank" rel="noreferrer"><ExternalLink size={15} /> {link.label}</a>)}
-          {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> Ask</a> : null}
+          {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {copy(lang, "Ask", "שאלו")}</a> : null}
         </div>
       </div>
     </article>
@@ -435,8 +466,8 @@ function TripClockPanel({
   const phaseDayIndex = today?.today ? phaseDays.findIndex((day) => day.date === today.today) + 1 : 0;
   const totalIndex = today?.today ? (itinerary?.days.findIndex((day) => day.date === today.today) ?? -1) + 1 : 0;
   const totalDays = itinerary?.days.length || 0;
-  const label = today ? phaseLabel(today.phase) : "Trip clock";
-  const destination = phase ? text(phase.title, lang) || phase.id : config?.meta?.destination || config?.meta?.title || "the journey";
+  const label = today ? phaseLabel(today.phase, lang) : copy(lang, "Trip clock", "שעון הטיול");
+  const destination = phase ? text(phase.title, lang) || phase.id : config?.meta?.destination || config?.meta?.title || copy(lang, "the journey", "הטיול");
 
   return (
     <section className="clock-panel">
@@ -448,15 +479,15 @@ function TripClockPanel({
         <span className="panel-label"><Route size={16} /> {label}</span>
         <h3>
           {today?.phase === "pre_trip" && today.countdown_days != null
-            ? `${Math.max(today.countdown_days, 0)} days until the adventure starts`
+            ? copy(lang, `${Math.max(today.countdown_days, 0)} days until the adventure starts`, `נותרו ${Math.max(today.countdown_days, 0)} ימים עד תחילת ההרפתקה`)
             : phaseDayIndex > 0
-              ? `Day ${phaseDayIndex} in ${destination}`
-              : `Now tracking ${destination}`}
+              ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
+              : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`)}
         </h3>
         <p>
           {totalDays && totalIndex > 0
-            ? `Trip day ${totalIndex} of ${totalDays}. The page keeps following destination-local time.`
-            : "Countdown, current phase, and next event all move with the trip clock."}
+            ? copy(lang, `Trip day ${totalIndex} of ${totalDays}. The page keeps following destination-local time.`, `יום ${totalIndex} מתוך ${totalDays} בטיול. העמוד מתעדכן לפי השעה המקומית ביעד.`)
+            : copy(lang, "Countdown, current phase, and next event all move with the trip clock.", "הספירה לאחור, השלב הנוכחי והאירוע הבא מתעדכנים עם שעון הטיול.")}
         </p>
       </div>
     </section>
@@ -491,12 +522,12 @@ function TodayView({
   return (
     <section className="view-grid today-grid">
       <div className="focus-panel">
-        <span className="panel-label">{today.data ? phaseLabel(today.data.phase) : "Today"}</span>
-        <h2>{next ? next.text_en || next.text_he : "Your trip clock is warming up."}</h2>
+        <span className="panel-label">{today.data ? phaseLabel(today.data.phase, lang) : copy(lang, "Today", "היום")}</span>
+        <h2>{next ? itemTitle(next, lang) : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
         <p>
           {today.data?.phase === "pre_trip" && today.data.countdown_days != null
-            ? `${Math.max(today.data.countdown_days, 0)} days until departure.`
-            : "Now and next stay current without a page reload."}
+            ? copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)
+            : copy(lang, "Now and next stay current without a page reload.", "האירוע הנוכחי והבא מתעדכנים בלי לרענן את העמוד.")}
         </p>
         {next ? <TimelineItem item={next} compact lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} /> : null}
         <TripClockPanel config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
@@ -637,7 +668,7 @@ function JourneyView({
             {(activePhase?.days || []).map((entry) => (
               <button key={`${entry.phase_id}-${entry.date}`} className={entry.date === activeDate ? "active" : ""} onClick={() => setSelected(entry.date)}>
                 <span>{dateLabel(entry.date, lang)}</span>
-                <small>{entry.label_en || entry.label_he || entry.phase_id}</small>
+                <small>{daySelectorSubtitle(entry, lang)}</small>
               </button>
             ))}
           </div>

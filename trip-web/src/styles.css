@@ -65,6 +65,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 }
 .brand-lockup { display: inline-flex; align-items: center; gap: 14px; min-width: 0; font-weight: 800; }
 .brand-lockup img { display: block; width: 148px; max-width: 38vw; height: auto; }
+.brand-lockup .hero-logo { width: 44px; height: 44px; max-width: none; border-radius: 12px; padding: 5px; object-fit: contain; background: rgba(255,255,255,.92); }
 .brand-lockup strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: white; text-shadow: 0 2px 16px rgba(16,38,58,.26); }
 .desktop-tabs, .desktop-shortcuts { display: flex; gap: 8px; padding: 5px; border: 1px solid rgba(255,255,255,.28); border-radius: var(--kit-radius); background: rgba(255,255,255,.12); }
 .desktop-tabs a, .desktop-shortcuts a, .menu-button {
@@ -80,7 +81,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .desktop-tabs a, .desktop-shortcuts a { display: inline-flex; align-items: center; color: rgba(255,255,255,.82); }
 .desktop-tabs a.active, .desktop-shortcuts a.active { color: var(--kit-ink); background: white; }
 .desktop-shortcuts a { color: white; background: rgba(255,255,255,.12); }
-.menu-button { display: inline-grid; place-items: center; border: 1px solid rgba(255,255,255,.32); background: rgba(16,38,58,.2); }
+.menu-button { display: inline-grid; order: -1; place-items: center; border: 1px solid rgba(255,255,255,.32); background: rgba(16,38,58,.2); }
+/* Flex's start edge follows writing direction: this makes the menu left in
+   English and right in Hebrew without language-specific positioning. */
 .hero-copy { position: relative; z-index: 1; display: grid; align-content: end; max-width: 760px; min-height: clamp(260px, 42vh, 490px); }
 .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px; color: var(--kit-teal-light); font-size: 13px; font-weight: 800; text-transform: uppercase; }
 .hero-copy h1 { margin: 0; font: 800 clamp(42px, 8vw, 86px)/1.02 var(--kit-font-display); letter-spacing: 0; }
@@ -453,7 +456,7 @@ textarea { min-height: 132px; resize: vertical; }
   inset: 0;
   z-index: 40;
   display: grid;
-  justify-items: end;
+  justify-items: start;
   background: rgba(16, 38, 58, .32);
   backdrop-filter: blur(5px);
 }
@@ -467,7 +470,7 @@ textarea { min-height: 132px; resize: vertical; }
   background: var(--kit-paper);
   box-shadow: -18px 0 44px rgba(16, 38, 58, .18);
 }
-[dir="rtl"] .menu-overlay { justify-items: start; }
+[dir="rtl"] .menu-overlay { justify-items: end; }
 [dir="rtl"] .app-menu { box-shadow: 18px 0 44px rgba(16, 38, 58, .18); }
 .menu-head {
   display: flex;
@@ -582,6 +585,7 @@ textarea { min-height: 132px; resize: vertical; }
 @media (max-width: 520px) {
   .trip-hero { min-height: 430px; padding-inline: 16px; }
   .brand-lockup img { width: 126px; }
+  .brand-lockup .hero-logo { width: 42px; height: 42px; }
   .brand-lockup strong { max-width: 142px; }
   .hero-copy { min-height: 310px; }
   .app-content { width: min(100% - 28px, 1180px); margin-top: 22px; }

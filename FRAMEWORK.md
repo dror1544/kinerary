@@ -95,6 +95,8 @@ Everything trip-specific lives in **`trip/trip.config.json`**. The framework cod
   "meta": {
     "title": "Trip Name",
     "brand": "RIVERA",
+    "logo": "https://cdn.example.com/rivera-trip-mark.png",
+    "logoAlt": "Rivera family trip",
     "defaultLang": "he",
     "departure": "2027-03-10T06:00:00+03:00",
     "returnDate": "2027-03-24",
