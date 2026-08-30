@@ -38,9 +38,9 @@ def render(d, out: Path):
         "```bash\n"
         f"hermes profile create {d['profile']['name']} --no-skills "
         f"--description {json.dumps(d['profile']['description'])}\n"
-        f"# Then merge config.overlay.yaml keys into the profile config:\n"
-        f"hermes -p {d['profile']['name']} config set model.default gpt-5.6-luna-900k\n"
-        f"hermes -p {d['profile']['name']} config set model.provider openai-codex\n"
+        f"# Then merge config.overlay.yaml keys into the profile config, e.g.:\n"
+        f"hermes -p {d['profile']['name']} config set model.default minimax/minimax-m3:free\n"
+        f"hermes -p {d['profile']['name']} config set model.provider openrouter\n"
         f"# Verify fallback working:\n"
         f"hermes -p {d['profile']['name']} -z 'reply OK only'\n"
         "```\n"
@@ -56,18 +56,27 @@ def install(bundle: Path, name: str):
         check=True
     )
     shutil.copy2(bundle / 'config.overlay.yaml', home / 'config.overlay.yaml')
+    # These MUST track templates/config.overlay.yaml: the copy above is only
+    # a reference file, the live profile config is whatever these `config set`
+    # calls write. Keep the two in step whenever the overlay's routing changes.
     for key, val in [
-        ('model.default',       'gpt-5.6-luna-900k'),
-        ('model.provider',      'openai-codex'),
-        ('delegation.model',    'claude-opus-4-6'),
+        ('model.default',       'minimax/minimax-m3:free'),
+        ('model.provider',      'openrouter'),
+        ('delegation.model',    'claude-sonnet-4-6'),
         ('delegation.provider', 'anthropic'),
         ('display.show_cost',   'true'),
     ]:
         subprocess.run(['hermes', '-p', name, 'config', 'set', key, val], check=True)
     subprocess.run(['hermes', '-p', name, 'config', 'set', 'fallback_providers',
-        '[{"provider":"anthropic","model":"claude-sonnet-4-6"},'
-        '{"provider":"ollama-cloud","model":"gpt-oss:120b"},'
-        '{"provider":"openai-codex","model":"gpt-5.6-sol"}]'], check=True)
+        json.dumps([
+            {"provider": "openai-codex", "model": "gpt-5.6-luna-900k"},
+            {"provider": "anthropic",    "model": "claude-sonnet-4-6"},
+            {"provider": "openrouter",   "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"},
+            {"provider": "openrouter",   "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
+            {"provider": "openrouter",   "model": "dots-studio/dots-3-note-preview:free"},
+            {"provider": "ollama-cloud", "model": "gpt-oss:120b"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        ])], check=True)
 
 def main():
     p = argparse.ArgumentParser()
