@@ -233,18 +233,17 @@ describe("validateAnswer (unit)", () => {
     }
   });
 
-  test("assistant details stay optional except the runtime organizer identity", () => {
+  test("every question added in schema v2 is optional", () => {
     // A required question here would block confirmation for an organizer who
     // simply doesn't want an assistant yet.
     for (const id of [
-      "trip_pace", "dietary", "dietary_scope",
+      "trip_pace", "dietary", "dietary_scope", "organizer_identity",
       "bot_name", "bot_gender", "bot_tone", "bot_proactive", "bot_limits",
     ]) {
       const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
       assert.ok(q, `${id} must exist`);
       assert.equal(q.required, false, `${id} must be optional`);
     }
-    assert.equal(INTAKE_QUESTIONS.find((q) => q.id === "organizer_identity")?.required, true);
   });
 });
 
@@ -383,7 +382,6 @@ async function answerAllRequiredQuestions(pool: pg.Pool, sessionToken: string): 
   await submitAnswer(pool, sessionToken, "travelers", null, undefined, undefined, [
     { name: "Test Traveler", age: 30, family: "Test" },
   ]);
-  await submitAnswer(pool, sessionToken, "organizer_identity", null, "Test Traveler");
   await submitAnswer(pool, sessionToken, "phases", null, undefined, undefined, [
     { name: "Test City", start: "2026-09-06", end: "2026-09-20" },
   ]);

@@ -35,4 +35,5 @@ telegram_manager/__pycache__/
 control-plane/api/dist/
 control-plane/worker/**/__pycache__/
 control-plane/deployment/.local-secrets/
+profile-templates/**/__pycache__/
 .hermes-pr3-architecture-review.md

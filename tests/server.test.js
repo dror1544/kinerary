@@ -9,7 +9,12 @@ import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/se
 let token;
 
 before(async () => {
-  await startTestServer();
+  // A non-empty HERMES_URL puts the plan layer in its normal "an enrichment
+  // worker exists" mode, so a newly added item/day seeds
+  // enrichment_status='pending'. The no-worker path (seed 'none', boot
+  // reconcile) is covered by itinerary-plan-layer.test.js, which starts its
+  // server without one.
+  await startTestServer({ HERMES_URL: 'http://127.0.0.1:59999/hermes-stub' });
   token = await loginAsAlice();
 });
 
@@ -579,16 +584,18 @@ describe('GET /api/health', () => {
 });
 
 // ── GET /api/config/roster ──────────────────────────────────────────────────────
-// The embedded runtime receives a gateway-backed session before bootstrap, so
-// even the minimal roster is trip-specific data and must remain authenticated.
+// Deliberately public — the pre-auth login picker needs a "who's on this
+// trip" list before any session exists, but it must carry only the four
+// fields the picker actually renders, never anything from the full,
+// authenticated /api/config (itinerary, budget, needs, PII).
 describe('GET /api/config/roster', () => {
-  test('requires a token', async () => {
+  test('is reachable without a token', async () => {
     const res = await api('/api/config/roster');
-    assert.equal(res.status, 401);
+    assert.equal(res.status, 200);
   });
 
   test('includes every participant with only username/name/name_en/color', async () => {
-    const res = await api('/api/config/roster', { token });
+    const res = await api('/api/config/roster');
     const { participants } = await res.json();
     const usernames = participants.map(p => p.username);
     assert.ok(usernames.includes('alice'));
@@ -600,42 +607,11 @@ describe('GET /api/config/roster', () => {
   });
 
   test('never exposes age, family, needs, pin, or telegram_id', async () => {
-    const res = await api('/api/config/roster', { token });
+    const res = await api('/api/config/roster');
     const { participants } = await res.json();
     const serialized = JSON.stringify(participants);
     for (const forbidden of ['age', 'family', 'needs', 'pin', 'telegram_id']) {
       assert.ok(!serialized.includes(forbidden), `roster leaked a "${forbidden}" field`);
-    }
-  });
-});
-
-describe('Trip-specific read isolation', () => {
-  test('classic shell is available as a safe rollback route', async () => {
-    const res = await api('/classic.html');
-    assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type') || '', /html/);
-    assert.match(await res.text(), /id="login-overlay"/);
-  });
-
-  test('classic rollback shell can load its required local assets', async () => {
-    for (const path of ['/runtime-base.js', '/app.js', '/styles.css', '/translations.js', '/brand/kinerary-icon.svg']) {
-      const res = await api(path);
-      assert.equal(res.status, 200, `${path} must remain available to Classic`);
-    }
-  });
-
-  test('anonymous requests cannot observe runtime data or download files', async () => {
-    const paths = [
-      '/api/ratings', '/api/photos', '/api/photos/file/private.jpg',
-      '/api/comments/venue/venue-1', '/api/rsvps/activity-1', '/api/reactions',
-      '/api/comments/photo', '/api/tasks/done', '/api/bookings',
-      '/api/bookings/confirmation/private.pdf', '/api/bookings/wallet-apple/private.pkpass',
-      '/api/trivia/public-events',
-    ];
-    for (const path of paths) {
-      const res = await api(path);
-      assert.equal(res.status, 401, `${path} exposed a non-401 response`);
-      assert.deepEqual(await res.json(), { error: 'unauthorized' }, `${path} exposed a route-specific response body`);
     }
   });
 });
@@ -1304,71 +1280,6 @@ describe('GET /api/auth/me — is_organizer', () => {
     const res = await api('/api/auth/me', { token: bt });
     const me = await res.json();
     assert.equal(me.is_organizer, false);
-  });
-});
-
-// ── private control-plane/runtime exchange ───────────────────────────────────
-describe('Control-plane runtime exchange', () => {
-  test('is unavailable without the private exchange key', async () => {
-    const res = await api('/api/internal/control-plane/session', {
-      method: 'POST', body: { userId: 'user_private', role: 'owner', runtimeUsername: null },
-    });
-    assert.equal(res.status, 401);
-    assert.deepEqual(await res.json(), { error: 'unauthorized' });
-  });
-
-  test('maps an owner to the configured organizer and returns a normal runtime session', async () => {
-    const exchanged = await api('/api/internal/control-plane/session', {
-      method: 'POST', apiKey: 'test-control-plane-exchange-key',
-      body: { userId: 'user_private', role: 'owner', runtimeUsername: null },
-    });
-    assert.equal(exchanged.status, 200);
-    assert.equal(exchanged.headers.get('cache-control'), 'no-store');
-    const { token: runtimeToken } = await exchanged.json();
-    const config = await api('/api/config', { token: runtimeToken });
-    assert.equal(config.status, 200);
-  });
-
-  test('rejects an owner exchange when no organizer can be mapped', async () => {
-    const exchanged = await api('/api/internal/control-plane/session', {
-      method: 'POST', apiKey: 'test-control-plane-exchange-key',
-      body: { userId: 'user_private', role: 'owner', runtimeUsername: 'missing-user' },
-    });
-    assert.equal(exchanged.status, 404);
-    assert.deepEqual(await exchanged.json(), { error: 'runtime_participant_not_found' });
-  });
-
-  test('reports whether an invite runtime participant exists', async () => {
-    const known = await api('/api/internal/control-plane/participants/bob', {
-      method: 'GET', apiKey: 'test-control-plane-exchange-key',
-    });
-    assert.equal(known.status, 200);
-    const missing = await api('/api/internal/control-plane/participants/missing-user', {
-      method: 'GET', apiKey: 'test-control-plane-exchange-key',
-    });
-    assert.equal(missing.status, 404);
-  });
-
-  test('password participant enrollment is invite-bound and idempotent', async () => {
-    const payload = {
-      inviteId: 'invite_runtimeexchange1', runtimeUsername: 'bob', method: 'password', password: 'new-bob-password',
-    };
-    const first = await api('/api/internal/control-plane/participants', {
-      method: 'POST', apiKey: 'test-control-plane-exchange-key', body: payload,
-    });
-    assert.equal(first.status, 200);
-    const retry = await api('/api/internal/control-plane/participants', {
-      method: 'POST', apiKey: 'test-control-plane-exchange-key', body: payload,
-    });
-    assert.equal(retry.status, 200);
-    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: 'new-bob-password' } });
-    assert.equal(login.status, 200);
-
-    const conflict = await api('/api/internal/control-plane/participants', {
-      method: 'POST', apiKey: 'test-control-plane-exchange-key',
-      body: { ...payload, runtimeUsername: 'eve' },
-    });
-    assert.equal(conflict.status, 409);
   });
 });
 

@@ -5,7 +5,11 @@ import re
 import unittest
 from datetime import date
 
-from control_plane_worker.transformer import derive_trip_slug, transform_intake
+from control_plane_worker.transformer import (
+    derive_bookings,
+    derive_trip_slug,
+    transform_intake,
+)
 
 
 def _choice(option_id: str) -> dict:
@@ -345,7 +349,7 @@ class TransformerTests(unittest.TestCase):
         self.assertLessEqual(len(road_trip["title"]["en"]), 30)
         self.assertNotIn("Washington", road_trip["title"]["en"])
 
-    def test_verbose_name_produces_a_note_with_the_full_original_text(self) -> None:
+    def test_verbose_name_keeps_the_trimmed_context_in_the_note_blurb(self) -> None:
         intake = {
             **JAPAN_INTAKE,
             "phases": _structured([
@@ -355,15 +359,24 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         phase = config["phases"][0]
         self.assertEqual(phase["title"]["en"], "Orlando")
-        self.assertEqual(phase["note"]["en"], "Orlando — Disney and Universal (all travelers)")
+        self.assertIn("2 nights in Orlando", phase["note"]["en"])
+        self.assertIn("Disney and Universal (all travelers)", phase["note"]["en"])
 
-    def test_plain_name_produces_no_note(self) -> None:
+    def test_a_plain_dated_phase_gets_a_stay_blurb_not_a_name_dump(self) -> None:
         intake = {
             **JAPAN_INTAKE,
             "phases": _structured([{"name": "Tokyo", "start": "2026-09-06", "end": "2026-09-10"}]),
         }
-        config = transform_intake(intake)
-        self.assertNotIn("note", config["phases"][0])
+        phase = transform_intake(intake)["phases"][0]
+        self.assertEqual(phase["note"]["en"], "4 nights in Tokyo, 6 Sep–10 Sep")
+        self.assertIn("4 לילות", phase["note"]["he"])
+
+    def test_a_phase_with_no_dates_and_a_plain_name_has_no_note(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo"}]),
+        }
+        self.assertNotIn("note", transform_intake(intake)["phases"][0])
 
     def test_adjacent_same_named_phases_are_merged(self) -> None:
         intake = {
@@ -420,6 +433,145 @@ class TransformerTests(unittest.TestCase):
         }
         config = transform_intake(intake)
         self.assertEqual(config["phases"][0]["id"], "dallas")
+
+    def test_phase_days_are_projected_when_the_intake_carries_them(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {
+                            "date": "2026-09-20",
+                            "label": {"he": "יום 1", "en": "Arrival & Asakusa"},
+                            "items": [
+                                {"time": "10:00", "text": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+                                {"time": None, "text": {"he": "אסקוסה", "en": "Evening in Asakusa"}},
+                            ],
+                        },
+                    ],
+                },
+            ]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertEqual(1, len(phase["days"]))
+        day = phase["days"][0]
+        self.assertEqual("2026-09-20", day["date"])
+        self.assertEqual({"he": "יום 1", "en": "Arrival & Asakusa"}, day["label"])
+        self.assertEqual("10:00", day["items"][0]["time"])
+        self.assertIsNone(day["items"][1]["time"])
+        self.assertEqual({"he": "אסקוסה", "en": "Evening in Asakusa"}, day["items"][1]["text"])
+
+    def test_a_phase_with_no_days_has_no_days_key(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"}]),
+        }
+        self.assertNotIn("days", transform_intake(intake)["phases"][0])
+
+    def test_days_outside_the_phase_range_are_dropped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [{"text": {"en": "in range"}}]},
+                        {"date": "2026-10-05", "items": [{"text": {"en": "out of range"}}]},
+                        {"date": "not-a-date", "items": [{"text": {"en": "unparseable"}}]},
+                    ],
+                },
+            ]),
+        }
+        days = transform_intake(intake)["phases"][0]["days"]
+        self.assertEqual(["2026-09-20"], [d["date"] for d in days])
+
+    def test_item_language_is_mirrored_and_empty_items_dropped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [
+                            {"text": {"en": "English only"}},
+                            {"text": {"he": "עברית בלבד"}},
+                            {"text": {"he": "", "en": ""}},
+                            {"text": {}},
+                        ]},
+                    ],
+                },
+            ]),
+        }
+        items = transform_intake(intake)["phases"][0]["days"][0]["items"]
+        self.assertEqual(2, len(items))
+        self.assertEqual({"he": "English only", "en": "English only"}, items[0]["text"])
+        self.assertEqual({"he": "עברית בלבד", "en": "עברית בלבד"}, items[1]["text"])
+
+    def test_a_day_with_no_valid_items_is_dropped_and_all_bad_means_no_days_key(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [
+                        {"date": "2026-09-20", "items": [{"text": {}}]},
+                        {"date": "2026-09-21", "items": []},
+                    ],
+                },
+            ]),
+        }
+        self.assertNotIn("days", transform_intake(intake)["phases"][0])
+
+    def test_a_bad_time_is_coerced_to_null(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [{"date": "2026-09-20", "items": [
+                        {"time": "morning", "text": {"en": "loose time"}},
+                        {"time": "9am", "text": {"en": "also loose"}},
+                    ]}],
+                },
+            ]),
+        }
+        items = transform_intake(intake)["phases"][0]["days"][0]["items"]
+        self.assertTrue(all(i["time"] is None for i in items))
+
+    def test_html_in_day_label_and_item_text_is_stripped(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {
+                    "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                    "days": [{
+                        "date": "2026-09-20",
+                        "label": {"en": "<b>Day 1</b>", "he": "יום 1"},
+                        "items": [{"text": {"en": "<img src=x onerror=alert(1)> museum"}}],
+                    }],
+                },
+            ]),
+        }
+        day = transform_intake(intake)["phases"][0]["days"][0]
+        self.assertNotIn("<", day["label"]["en"])
+        self.assertNotIn(">", day["label"]["en"])
+        self.assertNotIn("<", day["items"][0]["text"]["en"])
+        self.assertNotIn(">", day["items"][0]["text"]["en"])
+
+    def test_merged_adjacent_phases_concatenate_and_sort_their_days(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([
+                {"name": "Tokyo (boys)", "start": "2026-09-19", "end": "2026-09-21",
+                 "days": [{"date": "2026-09-20", "items": [{"text": {"en": "day A"}}]}]},
+                {"name": "Tokyo (all)", "start": "2026-09-21", "end": "2026-09-23",
+                 "days": [{"date": "2026-09-22", "items": [{"text": {"en": "day B"}}]}]},
+            ]),
+        }
+        phases = transform_intake(intake)["phases"]
+        self.assertEqual(1, len(phases))
+        self.assertEqual(["2026-09-20", "2026-09-22"], [d["date"] for d in phases[0]["days"]])
 
     def test_travel_anchors_appear_in_stats_when_present(self) -> None:
         intake = {
@@ -644,3 +796,256 @@ class SchemaV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonLatinNameTests(unittest.TestCase):
+    """Hebrew-only traveler names produced usernames traveler/traveler1..4 and a
+    family whose `en` was Hebrew, because _slugify strips every non-[a-z0-9]
+    character and name_en/family fall back to the original. Confirmed on the
+    first pipeline-built site (japan-2026, 2026-08-28). The transformer must at
+    least honour explicitly supplied English names.
+    """
+
+    def _config(self, travelers: list[dict]) -> dict:
+        return transform_intake({**JAPAN_INTAKE, "travelers": _structured(travelers)})
+
+    def test_supplied_english_names_become_the_usernames(self) -> None:
+        config = self._config([
+            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "אלה", "name_en": "Ella", "age": 53, "family": "סולומון", "family_en": "Solomon"},
+        ])
+
+        self.assertEqual(["nir", "ella"], [p["username"] for p in config["participants"]])
+
+    def test_family_keeps_hebrew_display_but_uses_english_where_given(self) -> None:
+        config = self._config([
+            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+        ])
+
+        family = config["families"][0]
+        self.assertEqual("סולומון", family["name"]["he"])
+        self.assertEqual("Solomon", family["name"]["en"])
+
+
+class PhaseVenuesTests(unittest.TestCase):
+    def _phase(self, venues):
+        intake = {**JAPAN_INTAKE, "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23", "venues": venues},
+        ])}
+        return transform_intake(intake)["phases"][0]
+
+    def test_venues_project_with_slug_ids_and_kept_urls(self) -> None:
+        p = self._phase([
+            {"name": {"he": "סקייטרי", "en": "Tokyo Skytree"}, "url": "https://www.tokyo-skytree.jp/en/"},
+            {"name": {"en": "TeamLab Planets"}, "url": "javascript:alert(1)"},
+        ])
+        self.assertEqual([v["id"] for v in p["venues"]], ["tokyo-skytree", "teamlab-planets"])
+        self.assertEqual(p["venues"][0]["url"], "https://www.tokyo-skytree.jp/en/")
+        self.assertNotIn("url", p["venues"][1])  # non-http dropped
+
+    def test_venues_dedupe_by_name_and_empty_names_drop(self) -> None:
+        p = self._phase([
+            {"name": {"en": "Senso-ji"}},
+            {"name": {"en": "senso-ji"}},
+            {"name": {}},
+        ])
+        self.assertEqual(len(p["venues"]), 1)
+
+    def test_a_phase_with_no_venues_has_no_venues_key(self) -> None:
+        p = self._phase([])
+        self.assertNotIn("venues", p)
+
+
+class HomeCountryTests(unittest.TestCase):
+    def test_answer_is_written_to_meta_home_country(self) -> None:
+        intake = {**JAPAN_INTAKE, "home_country": _text("United States")}
+        self.assertEqual("United States", transform_intake(intake)["meta"]["home_country"])
+
+    def test_absent_answer_leaves_no_meta_key(self) -> None:
+        self.assertNotIn("home_country", transform_intake(dict(JAPAN_INTAKE))["meta"])
+
+
+class DeriveBudgetTests(unittest.TestCase):
+    BASE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+        ]),
+    }
+
+    def _budget(self, detail: dict) -> dict:
+        intake = {**self.BASE, "budget_detail": _structured(detail)}
+        return transform_intake(intake).get("budget")
+
+    def test_no_answer_means_no_budget_block(self) -> None:
+        self.assertIsNone(transform_intake(dict(self.BASE)).get("budget"))
+
+    def test_items_become_seed_items_matched_to_phases(self) -> None:
+        budget = self._budget({
+            "currency": "USD", "party_size": 4,
+            "items": [
+                {"phase": "Kyoto", "category": "hotel", "description": "Cross Hotel × 3", "amount": 900},
+                {"category": "flight", "description": "TLV-NRT × 4", "amount": 0, "estimate": True},
+            ],
+        })
+        self.assertEqual(4, budget["party_size"])
+        self.assertEqual("USD", budget["currency"])
+        self.assertEqual(["intl_flights", "kyoto"], budget["phases"])
+        kyoto = next(s for s in budget["seed_items"] if s["phase"] == "kyoto")
+        self.assertEqual(900, kyoto["amount"])
+        self.assertFalse(kyoto["is_estimate"])
+        flight = next(s for s in budget["seed_items"] if s["phase"] == "intl_flights")
+        self.assertTrue(flight["is_estimate"])
+
+    def test_unknown_category_falls_back_to_other_and_seed_keys_are_unique(self) -> None:
+        budget = self._budget({"items": [
+            {"phase": "Tokyo", "category": "spa", "description": "onsen", "amount": 50},
+            {"phase": "Tokyo", "category": "spa", "description": "onsen", "amount": 50},
+        ]})
+        cats = {s["category"] for s in budget["seed_items"]}
+        self.assertEqual({"other"}, cats)
+        keys = [s["seed_key"] for s in budget["seed_items"]]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_party_size_defaults_to_the_traveler_count(self) -> None:
+        intake = {
+            **self.BASE,
+            "travelers": _structured([
+                {"name": "A", "family": "X"}, {"name": "B", "family": "X"}, {"name": "C", "family": "X"},
+            ]),
+            "budget_detail": _structured({"items": [
+                {"category": "food", "description": "meals", "amount": 400},
+            ]}),
+        }
+        self.assertEqual(3, transform_intake(intake)["budget"]["party_size"])
+
+    def test_markup_in_a_description_is_stripped(self) -> None:
+        budget = self._budget({"items": [
+            {"category": "attraction", "description": "<b>Disney</b> tickets", "amount": 300},
+        ]})
+        self.assertNotIn("<", budget["seed_items"][0]["description"])
+
+
+class DeriveBookingsTests(unittest.TestCase):
+    """travel_anchors[] used to be collapsed into a single stat number and then
+    thrown away — the interview's most concrete output (dated activity tickets,
+    a tour proposal) never reached the site. derive_bookings turns them, plus
+    each phase's accommodation, into bookings.json rows so the site's Bookings
+    tab has real content. Confirmed missing on japan-2026 (2026-08-28).
+    """
+
+    PHASED_INTAKE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {
+                "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                "accommodation": {"name": "OMO3 Asakusa"},
+            },
+            {
+                "name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27",
+                "accommodation": {"name": "Cross Hotel Kyoto", "confirmation": "CH-88"},
+            },
+        ]),
+    }
+
+    def _bookings(self, intake: dict) -> list[dict]:
+        config = transform_intake(intake)
+        return derive_bookings(config, intake)
+
+    def test_each_phase_accommodation_becomes_a_hotel_booking(self) -> None:
+        bookings = self._bookings(self.PHASED_INTAKE)
+        hotels = [b for b in bookings if b["type"] == "hotel"]
+        self.assertEqual(2, len(hotels))
+        tokyo = next(b for b in hotels if b["phase"] == "tokyo")
+        self.assertEqual("OMO3 Asakusa", tokyo["name"])
+        self.assertEqual("2026-09-19", tokyo["date_from"])
+        self.assertEqual("2026-09-23", tokyo["date_to"])
+        # No confirmation given → surfaced as unconfirmed, never dropped.
+        self.assertIsNone(tokyo["confirmation"])
+        kyoto = next(b for b in hotels if b["phase"] == "kyoto")
+        self.assertEqual("CH-88", kyoto["confirmation"])
+
+    def test_travel_anchor_becomes_a_dated_booking_mapped_to_its_phase(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "detail": "Tokyo Skytree E-ticket — 20 Sep 2026 10:00"},
+            ]),
+        }
+        bookings = self._bookings(intake)
+        # "activity" is not a valid site booking type — it must land as "attraction".
+        anchor = next(b for b in bookings if b["type"] == "attraction")
+        self.assertEqual("Tokyo Skytree E-ticket", anchor["name"])
+        self.assertEqual("2026-09-20", anchor["date_from"])
+        self.assertEqual("tokyo", anchor["phase"])
+        self.assertEqual("Tokyo Skytree E-ticket — 20 Sep 2026 10:00", anchor["notes"])
+        self.assertIsNone(anchor["confirmation"])
+
+    def test_iso_dates_in_anchor_text_are_recognised(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "reservation", "detail": "Sumo hall 2026-09-25 17:00"},
+            ]),
+        }
+        anchor = self._bookings(intake)[-1]
+        self.assertEqual("2026-09-25", anchor["date_from"])
+        self.assertEqual("kyoto", anchor["phase"])
+
+    def test_every_anchor_type_maps_into_the_sites_allowed_set(self) -> None:
+        allowed = {"flight", "hotel", "car", "attraction", "other"}
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": t, "detail": f"{t} thing"}
+                for t in ("flight", "hotel", "car", "activity", "tour", "reservation",
+                          "ticket", "excursion", "proposal", "booking", "wibble", "")
+            ]),
+        }
+        anchors = [b for b in self._bookings(intake) if b["seed_key"].startswith("anchor_")]
+        self.assertTrue(anchors)
+        self.assertTrue(all(b["type"] in allowed for b in anchors))
+
+    def test_proposal_is_undated_and_parked_on_the_first_phase(self) -> None:
+        # The detail carries a date *range*, so it gets no date. But
+        # bookings.phase is NOT NULL on the site, so it can't be dropped —
+        # it parks on the first phase and still shows on the Bookings tab.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "proposal",
+                 "detail": "Japan Tours quote #100665 for 5 adults, 19 Sep–03 Oct 2026"},
+            ]),
+        }
+        proposal = next(b for b in self._bookings(intake) if b["seed_key"].startswith("anchor_"))
+        self.assertEqual("other", proposal["type"])
+        self.assertIsNone(proposal["date_from"])
+        self.assertEqual("tokyo", proposal["phase"])
+        self.assertIn("Japan Tours quote", proposal["notes"])
+
+    def test_no_anchor_row_ever_has_a_null_phase(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "proposal", "detail": "whole-trip quote, no dates"},
+                {"type": "activity", "detail": "undated museum pass"},
+                {"type": "flight", "detail": "DL123 on 20 Sep 2026"},
+            ]),
+        }
+        self.assertTrue(all(b["phase"] for b in self._bookings(intake)))
+
+    def test_every_row_carries_a_stable_seed_key(self) -> None:
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 18:00"},
+            ]),
+        }
+        first = self._bookings(intake)
+        second = self._bookings(intake)
+        self.assertEqual([b["seed_key"] for b in first], [b["seed_key"] for b in second])
+        self.assertEqual(len(first), len({b["seed_key"] for b in first}))
+
+    def test_no_phases_and_no_anchors_yields_no_bookings(self) -> None:
+        self.assertEqual([], self._bookings(JAPAN_INTAKE))

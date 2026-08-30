@@ -483,11 +483,32 @@ describe('B. Swapping two days of the active plan', () => {
     assert.equal(updated.label_he, 'שם ראשון', 'an omitted language should be left alone');
   });
 
-  test('clearing a headline re-queues the day for an AI-written one', async () => {
+  // With no HERMES_URL (this server has none) there is no worker to write an
+  // AI headline, so a cleared headline drops to 'none' rather than sitting on a
+  // 'pending' that would render a forever "Finding links…" — the same reason
+  // the swap above reports 'unavailable' instead of 'queued'.
+  test('clearing a headline drops it to none when no reviewer is configured', async () => {
     await setLabel(DAY_14, { label_he: 'משהו', label_en: 'Something' });
     const cleared = await setLabel(DAY_14, { label_he: '', label_en: '' });
     assert.equal(cleared.label_he, null);
-    assert.equal(cleared.enrichment_status, 'pending');
+    assert.equal(cleared.enrichment_status, 'none');
+  });
+
+  test('pressing "Enrich all" with no worker does not leave lines stuck on pending', async () => {
+    await seedHonolulu();
+    // Force a stuck state the way a pre-fix press would have.
+    for (const it of await planItems()) {
+      await api(`/api/phases/${PHASE}/plan/${it.id}`, {
+        method: 'PATCH', apiKey: AGENT_KEY, body: { enrichment_status: 'pending' },
+      });
+    }
+    const res = await api('/api/phase-plan/enrich-pending', { method: 'POST', apiKey: AGENT_KEY });
+    const body = await res.json();
+    assert.equal(body.hermes_configured, false);
+    assert.equal(body.queued, 0);
+    // Nothing may still be 'pending' — the site renders that as a forever spinner.
+    const stuck = (await planItems()).filter(i => i.enrichment_status === 'pending');
+    assert.equal(stuck.length, 0, `still pending: ${stuck.map(i => i.text_en).join(', ')}`);
   });
 });
 

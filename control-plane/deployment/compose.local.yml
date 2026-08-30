@@ -61,6 +61,13 @@ services:
         target: /run/config/architecture.json
     ports:
       - "${CONTROL_PLANE_BIND_IP:-127.0.0.1}:4310:4310"
+    # Dev only: run the host's freshly-compiled dist over the image's baked
+    # copy, so `npm run build` (or `npx tsc`) is enough to pick up a source
+    # change — no `docker compose build api` every edit. The image still builds
+    # dist for a real deploy; this just overlays it. Keep dist/ current on the
+    # host (the api package has a tsc watch if you want one).
+    volumes:
+      - ../../control-plane/api/dist:/app/dist:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4310/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 5s
@@ -125,6 +132,12 @@ services:
       RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
       PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
       PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      # Shared onboarding password baked into a new site's .env. Empty (the
+      # default) keeps server.js's independent random per-user passwords —
+      # which today means the site has no usable login at all, since Telegram
+      # SSO is ruled out and Google is unconfigured. Stopgap until a real
+      # member/organizer signup flow exists.
+      PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}
@@ -141,6 +154,12 @@ services:
     volumes:
       - ${WORKER_DEPLOY_ROOT_HOST:-/Users/elul/kinerary-deploy}:/deploy-root
       - ${WORKER_REPO_ROOT_HOST:-/Users/elul/kinerary}:/repo:ro
+      # Dev only: run the host's live package over the image's baked copy, so an
+      # enrichment.py / transformer.py edit takes effect on the next job with no
+      # `docker compose build worker`. (The image still COPYs it for a real
+      # deploy; this just overlays it. `/repo` above is a different concern —
+      # deploy.sh's site/server/shared inputs.)
+      - ${WORKER_REPO_ROOT_HOST:-/Users/elul/kinerary}/control-plane/worker/control_plane_worker:/app/control_plane_worker:ro
       # Only the two specific keys this needs, not the whole ~/.ssh
       # directory (which also holds unrelated personal/other-project keys).
       - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro

@@ -120,8 +120,8 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.ok(rows.length >= 2, 'expected at least the boot snapshot plus the participant-add snapshot');
   });
 
-  test('the new participant appears in the authenticated roster with no restart', async () => {
-    const res = await api('/api/config/roster', { token: aliceToken });
+  test('the new participant appears in the public roster with no restart', async () => {
+    const res = await api('/api/config/roster');
     const { participants } = await res.json();
     assert.ok(participants.some(p => p.username === 'dana'), 'roster should reflect the in-memory config update immediately');
   });
@@ -274,7 +274,7 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     const created = await api('/api/agent/participants', { method: 'POST', apiKey: AGENT_KEY, body: { username: 'remove-me', name: 'Remove Me', telegram_id: '888000111' } });
     assert.equal(created.status, 200);
 
-    let roster = await (await api('/api/config/roster', { token: aliceToken })).json();
+    let roster = await (await api('/api/config/roster')).json();
     assert.ok(roster.participants.some(p => p.username === 'remove-me'));
 
     const removed = await api('/api/agent/participants/remove-me', { method: 'DELETE', token: aliceToken });
@@ -283,7 +283,7 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.equal(body.username, 'remove-me');
     assert.ok(body.note.includes('session token'), 'response should surface the session-revocation caveat');
 
-    roster = await (await api('/api/config/roster', { token: aliceToken })).json();
+    roster = await (await api('/api/config/roster')).json();
     assert.ok(!roster.participants.some(p => p.username === 'remove-me'), 'removed participant must not still be in the roster');
 
     const cfg = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'));

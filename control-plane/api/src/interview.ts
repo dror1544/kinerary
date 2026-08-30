@@ -211,7 +211,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "text",
     prompt: "Which of the travelers are you? (this sets up your private organizer channel with the trip assistant)",
     maxLength: 80,
-    required: true,
+    required: false,
   },
   {
     id: "bot_name",
@@ -264,6 +264,23 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Anything it should keep in mind about these people, or stay away from? One entry per thing, each as {he, en}.",
     dataShape: "array",
+    required: false,
+  },
+  // Additive-optional, like phases[].days — no INTAKE_SCHEMA_VERSION bump. A v2
+  // intake answered before these existed simply has no entry, and the
+  // transformer treats an absent answer as "not provided".
+  {
+    id: "home_country",
+    type: "text",
+    prompt: "Which country are you (the organizer) from? This only sets which embassy the site lists for emergencies — optional; we default to your own country.",
+    maxLength: 80,
+    required: false,
+  },
+  {
+    id: "budget_detail",
+    type: "structured",
+    prompt: "A rough budget, if you want it on the site: an overall currency and party size, plus one line per known cost — { currency, party_size?, items: [{ phase?, category, description, amount, estimate? }] }. category is one of flight/hotel/car/attraction/food/insurance/other. Use amount 0 with estimate true for a cost you know matters but not the figure. (optional)",
+    dataShape: "object",
     required: false,
   },
 ] as const;
@@ -502,25 +519,7 @@ export type SubmitAnswerResult =
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "ORGANIZER_IDENTITY_UNMATCHED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
-
-function answerText(answer: IntakeAnswer | undefined): string {
-  return answer?.kind === "text" ? answer.text.trim() : "";
-}
-
-function organizerIdentityMatchesTraveler(answers: AnswerStore): boolean {
-  const organizer = answerText(answers.organizer_identity).toLocaleLowerCase();
-  const travelers = answers.travelers;
-  if (!organizer || travelers?.kind !== "structured" || !Array.isArray(travelers.data)) return false;
-  return travelers.data.some((traveler) => {
-    if (!traveler || typeof traveler !== "object") return false;
-    const value = traveler as Record<string, unknown>;
-    return ["name", "name_en", "username"].some((key) => {
-      const candidate = value[key];
-      return typeof candidate === "string" && candidate.trim().toLocaleLowerCase() === organizer;
-    });
-  });
-}
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
 
 // A private Telegram chat id is always a positive integer in string form —
 // reject anything else rather than storing whatever an LLM tool-call
@@ -558,8 +557,8 @@ export async function startSession(
 
     // Verify the trip is still in 'draft' (enrollment could be issued and
     // the trip could have moved if something went wrong on a prior attempt).
-    const tripRow = await client.query<{ lifecycle_state: string; draft_inputs: Record<string, unknown> }>(
-      "SELECT lifecycle_state, draft_inputs FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+    const tripRow = await client.query<{ lifecycle_state: string }>(
+      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
       [enrollment.tripId],
     );
     const [trip] = tripRow.rows;
@@ -581,25 +580,6 @@ export async function startSession(
       );
     }
 
-    // Carry starter values from the web form into the normalized answer store.
-    // The interview recap still asks the organizer to confirm or correct them;
-    // it simply avoids repeating questions they have already answered.
-    const initialAnswers: AnswerStore = {};
-    const draft = trip.draft_inputs ?? {};
-    const starterValues: Array<[string, string | null, string | undefined]> = [
-      ["trip_type", draft.trip_type === "group" ? "group_of_families" : typeof draft.trip_type === "string" ? draft.trip_type : null, draft.trip_type === "other" ? "Other" : undefined],
-      ["destination", typeof draft.destination === "string" ? draft.destination : null, undefined],
-      ["departure_date", typeof draft.departure_date === "string" ? draft.departure_date : null, undefined],
-      ["return_date", typeof draft.return_date === "string" ? draft.return_date : null, undefined],
-    ];
-    for (const [questionId, optionId, otherText] of starterValues) {
-      if (!optionId) continue;
-      const value = questionId === "trip_type" && optionId === "other"
-        ? validateAnswer(questionId, "other", otherText)
-        : validateAnswer(questionId, optionId, undefined);
-      if (value.ok) initialAnswers[questionId] = value.answer;
-    }
-
     // Create session with a fresh token.
     const rawSessionToken = randomBytes(32).toString("base64url");
     const digest = sessionTokenDigest(rawSessionToken);
@@ -608,16 +588,22 @@ export async function startSession(
     await client.query(
       `INSERT INTO control_plane.intake_sessions
          (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest,
-        deriveSessionState(initialAnswers, INTAKE_QUESTIONS), JSON.stringify(initialAnswers)],
+       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest],
     );
 
     await client.query("COMMIT");
 
     log(structuredLog("info", "interview.session_started", { session_id: sessionId, trip_id: enrollment.tripId }));
 
-    const view = buildSessionView(sessionId, enrollment.tripId, deriveSessionState(initialAnswers, INTAKE_QUESTIONS), initialAnswers);
+    const view: SessionView = {
+      sessionId,
+      tripId: enrollment.tripId,
+      state: "interviewing",
+      nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
+      optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
+      recap: null,
+    };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
@@ -774,8 +760,9 @@ export async function confirmIntake(
       user_id: string;
       state: SessionState;
       answers: AnswerStore;
+      source_document: unknown;
     }>(
-      `SELECT id, trip_id, user_id, state, answers
+      `SELECT id, trip_id, user_id, state, answers, source_document
        FROM control_plane.intake_sessions
        WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
        FOR UPDATE`,
@@ -802,10 +789,6 @@ export async function confirmIntake(
     if (!allAnswered) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_ALL_REQUIRED_ANSWERED" };
-    }
-    if (!organizerIdentityMatchesTraveler(session.answers)) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "ORGANIZER_IDENTITY_UNMATCHED" };
     }
 
     // Answers are organizer-controlled free-form content (free text, "other"
@@ -835,9 +818,13 @@ export async function confirmIntake(
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
     await client.query(
-      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
-       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb)`,
-      [versionId, session.trip_id, nextVersion, artifactRef, intakeDigest, INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers)],
+      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document)
+       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb)`,
+      [
+        versionId, session.trip_id, nextVersion, artifactRef, intakeDigest,
+        INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers),
+        session.source_document ? JSON.stringify(session.source_document) : null,
+      ],
     );
 
     // Transition trip to 'intake_confirmed'.
@@ -850,12 +837,6 @@ export async function confirmIntake(
     await client.query(
       "UPDATE control_plane.intake_sessions SET state = 'confirmed', updated_at = now() WHERE id = $1",
       [session.id],
-    );
-
-    await client.query(
-      `INSERT INTO control_plane.funnel_events(id, event_name, trip_id)
-       VALUES ($1, 'interview_confirmed', $2)`,
-      [generateId("event"), session.trip_id],
     );
 
     await client.query("COMMIT");
@@ -912,4 +893,138 @@ export async function getSessionStatus(
   }
 
   return { ok: true, state: session.state };
+}
+
+// ── source document: the raw plan an organizer shared, kept for re-extraction ─
+
+const SOURCE_DOCUMENT_MAX_CHARS = 200_000;
+
+/** Stage the plan document text on the session. It is copied onto the
+ * immutable intake_versions row at confirm. Best-effort — a failure here never
+ * blocks the interview (the interviewer already extracted from it live). */
+export async function saveSourceDocument(
+  db: pg.Pool,
+  rawSessionToken: string,
+  text: string,
+  filename?: string,
+): Promise<{ ok: true; chars: number } | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }> {
+  const body = String(text ?? "");
+  if (!body.trim()) return { ok: false, reason: "INVALID_REQUEST" };
+  const doc = {
+    filename: String(filename ?? "").replace(/[<>]/g, "").slice(0, 200) || null,
+    text: body.slice(0, SOURCE_DOCUMENT_MAX_CHARS),
+    savedAt: new Date().toISOString(),
+  };
+  const res = await db.query(
+    `UPDATE control_plane.intake_sessions
+     SET source_document = $2::jsonb, updated_at = now()
+     WHERE session_token_digest = $1 AND state <> 'confirmed'`,
+    [sessionTokenDigest(rawSessionToken), JSON.stringify(doc)],
+  );
+  if (res.rowCount === 0) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, chars: doc.text.length };
+}
+
+// ── country_reference: cross-trip consular contacts ──────────────────────────
+
+export type ConsularContact = { name: { he: string; en: string }; phone: string };
+
+const CONSULAR_MAX_AGE_DAYS = 180;
+
+function normaliseCountry(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
+}
+
+/** The site renders contact.name through `_biSpan` (raw HTML) and phone into a
+ * `tel:` href — same XSS posture as the itinerary `days` text, so strip markup
+ * here rather than trust the search model's output. */
+function cleanConsularContacts(raw: unknown): ConsularContact[] {
+  if (!Array.isArray(raw)) return [];
+  const plain = (v: unknown) => String(v ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
+  const out: ConsularContact[] = [];
+  for (const entry of raw.slice(0, 8)) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const nameObj = (e.name && typeof e.name === "object" ? e.name : {}) as Record<string, unknown>;
+    const nameStr = typeof e.name === "string" ? e.name : "";
+    const he = plain(nameObj.he ?? nameStr);
+    const en = plain(nameObj.en ?? nameStr);
+    const phone = plain(e.phone).replace(/[^\d+()\-\s]/g, "").trim().slice(0, 40);
+    if ((!he && !en) || !phone) continue;
+    out.push({ name: { he: he || en, en: en || he }, phone });
+  }
+  return out;
+}
+
+export async function sessionActive(db: pg.Pool, rawSessionToken: string): Promise<boolean> {
+  const row = await db.query(
+    "SELECT 1 FROM control_plane.intake_sessions WHERE session_token_digest = $1 AND state <> 'confirmed'",
+    [sessionTokenDigest(rawSessionToken)],
+  );
+  return row.rows.length > 0;
+}
+
+/** Read a cached consular row. `found` is true only when a row exists and is
+ * fresher than CONSULAR_MAX_AGE_DAYS — the interviewer's tool then skips the
+ * web search entirely. */
+export async function consularContactsFor(
+  db: pg.Pool,
+  rawSessionToken: string,
+  destinationCountry: string,
+  homeCountry: string,
+): Promise<
+  | { ok: true; found: boolean; contacts: ConsularContact[]; fetchedAt?: string }
+  | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }
+> {
+  const dest = normaliseCountry(destinationCountry);
+  const home = normaliseCountry(homeCountry);
+  if (!dest || !home) return { ok: false, reason: "INVALID_REQUEST" };
+  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
+
+  const row = await db.query<{ contacts: unknown; fetched_at: string; stale: boolean }>(
+    `SELECT contacts, fetched_at,
+            (fetched_at < now() - ($3 || ' days')::interval) AS stale
+     FROM control_plane.country_reference
+     WHERE destination_country = $1 AND home_country = $2`,
+    [dest, home, String(CONSULAR_MAX_AGE_DAYS)],
+  );
+  const [hit] = row.rows;
+  if (!hit) return { ok: true, found: false, contacts: [] };
+  return {
+    ok: true,
+    found: !hit.stale,
+    contacts: cleanConsularContacts(hit.contacts),
+    fetchedAt: hit.fetched_at,
+  };
+}
+
+/** Upsert a consular row the interviewer's web search produced, for every later
+ * trip to the same (destination, home) pair to reuse. */
+export async function saveConsularContacts(
+  db: pg.Pool,
+  rawSessionToken: string,
+  destinationCountry: string,
+  homeCountry: string,
+  contacts: unknown,
+  source?: string,
+): Promise<
+  | { ok: true; contacts: ConsularContact[] }
+  | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" | "NO_USABLE_CONTACTS" }
+> {
+  const dest = normaliseCountry(destinationCountry);
+  const home = normaliseCountry(homeCountry);
+  if (!dest || !home) return { ok: false, reason: "INVALID_REQUEST" };
+  if (!(await sessionActive(db, rawSessionToken))) return { ok: false, reason: "NOT_FOUND" };
+
+  const clean = cleanConsularContacts(contacts);
+  if (clean.length === 0) return { ok: false, reason: "NO_USABLE_CONTACTS" };
+
+  await db.query(
+    `INSERT INTO control_plane.country_reference (destination_country, home_country, contacts, source, fetched_at)
+     VALUES ($1, $2, $3::jsonb, $4, now())
+     ON CONFLICT (destination_country, home_country)
+     DO UPDATE SET contacts = EXCLUDED.contacts, source = EXCLUDED.source, fetched_at = now()`,
+    [dest, home, JSON.stringify(clean), (source ?? "").slice(0, 200) || null],
+  );
+  return { ok: true, contacts: clean };
 }

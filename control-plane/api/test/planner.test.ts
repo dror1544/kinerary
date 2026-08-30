@@ -160,6 +160,40 @@ describe("generatePlan", () => {
     }
   });
 
+  test("desired.first_provision is true until a provision job has succeeded", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      const firstDesired = (await fix.pool.query<{ desired: { first_provision?: boolean } }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [first.planId],
+      )).rows[0]!.desired;
+      assert.equal(firstDesired.first_provision, true);
+
+      // Simulate a completed provision. A second plan then carries
+      // first_provision:false, which also gives it a different digest — so no
+      // supersede/delete gymnastics are needed to dodge plans_trip_id_digest_key.
+      await fix.pool.query(
+        `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state)
+         VALUES ($1, $2, $3, 'provision', $4, $5, 'succeeded')`,
+        [`job_${randomHex(16)}`, fix.tripId, first.planId, `done-${first.planId}`, `corr_${randomHex(16)}`],
+      );
+      await fix.pool.query("UPDATE control_plane.plans SET status = 'superseded' WHERE id = $1", [first.planId]);
+      await fix.pool.query("UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed' WHERE id = $1", [fix.tripId]);
+
+      const second = await generatePlan(fix.pool, fix.tripId, `corr_${randomHex(8)}`);
+      assert.equal(second.ok, true);
+      if (!second.ok) throw new Error("unreachable");
+      const secondDesired = (await fix.pool.query<{ desired: { first_provision?: boolean } }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [second.planId],
+      )).rows[0]!.desired;
+      assert.equal(secondDesired.first_provision, false);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("rejects when trip is not intake_confirmed", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {

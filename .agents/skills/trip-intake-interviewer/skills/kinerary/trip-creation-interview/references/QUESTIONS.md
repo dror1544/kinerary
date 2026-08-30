@@ -47,6 +47,8 @@ Where the trip goes and when, one entry per stop. Ask for: place name, date rang
 
 **Keep `name` to a short location or theme only** — a city, region, or a light label like "Road Trip". The site displays `name` directly as a nav tab and section header, so it must stay light: "Dallas", not "Dallas (boys; Mavericks game September 6)". If the conversation surfaces extra context for a stop — who's on that leg, an event, a scheduling note — that's genuinely useful to know and fine to ask about and reflect back in your confirmation summary, but it does not belong in the structured `name` field; there's no field for it yet, so just leave it out of the submitted data rather than appending it to the name.
 
+If a shared document lists a hotel per stop, fill `accommodation` for that phase from it (name, and confirmation number if the document has one) rather than leaving it blank — each becomes a hotel row on the Bookings tab, shown as unconfirmed when no number is present.
+
 Submit as:
 ```json
 [
@@ -61,17 +63,35 @@ Submit as:
 ```
 For a single-destination trip this is still an array — just one entry.
 
+**Optional `days` per phase — a day-by-day plan.** Don't ask the organizer to type this. If they shared a plan document, run `extract_itinerary` after submitting `phases` (SOUL.md workflow step 8): it returns a `days` array per phase, which you review with them and then merge back into each matching phase before re-submitting `phases`. Shape (the site consumes it directly):
+```json
+"days": [
+  {
+    "date": "2026-09-07",
+    "label": { "he": "יום ראשון בטוקיו", "en": "First day in Tokyo" },
+    "items": [
+      { "time": "10:00", "text": { "he": "מגדל סקייטרי", "en": "Tokyo Skytree" } },
+      { "time": null,    "text": { "he": "ערב באסקוסה", "en": "Evening in Asakusa" } }
+    ]
+  }
+]
+```
+Every `date` must sit inside that phase's `start`/`end`. `time` is `"HH:MM"` or `null`. Both `he` and `en` on every string. A phase with nothing described just has no `days`. The transformer drops anything malformed, so a partial plan is safe.
+
 ## travel_anchors — optional, structured (array)
 
 Anything already booked and worth recording — flights, a rental car, a specific hotel outside the phases above. Skip this whole question if nothing's booked yet; don't ask "are you sure?" — "nothing yet" is a completely normal answer this early. If they have a confirmation email or ticket for any of this, reading it beats asking them to type out flight numbers and confirmation codes from memory.
 
+**When the organizer shared a document (workflow step 3), mine it, don't skim it.** A tour proposal or itinerary PDF usually lists every dated activity, transfer, and reservation — capture each one as its own entry with its date, not a single "there's a proposal" line. Each becomes a row on the trip site's Bookings tab, so one entry per real thing is the difference between a useful tab and an empty one. Put the date inside `detail` in a form that carries the year ("20 Sep 2026" or "2026-09-20") so it can be placed on the right phase.
+
 Submit as a loose array of whatever the organizer tells you, e.g.:
 ```json
 [
-  { "type": "flight", "detail": "Delta DL123, Sept 6", "confirmation": "XYZ789" }
+  { "type": "flight", "detail": "Delta DL123, 6 Sep 2026", "confirmation": "XYZ789" },
+  { "type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 10:00" }
 ]
 ```
-There's no strict schema here beyond "array of objects" — capture what's useful, don't force a rigid shape onto a free-text answer.
+There's no strict schema here beyond "array of objects" — capture what's useful, don't force a rigid shape onto a free-text answer. `type` is a light label: `flight`, `hotel`, `car`, `activity`, `reservation`, or `proposal` for a whole-trip quote.
 
 ## constraints — optional, structured (object)
 
@@ -169,3 +189,24 @@ Two rules, neither negotiable:
 
 1. **Never mention that any of this could be shown to the family.** Everything here is recorded as organizer-only, full stop, and there is no option to change that. The failure is asymmetric: an over-hidden instruction is a slightly less helpful bot; an over-shared one puts a private remark about a named family member somewhere every logged-in member, children included, can read it.
 2. **Redirect medical detail.** If they start describing someone's condition, steer back to behavior — "keep walks short" is a standing instruction, "uses a cane" is a fact about a person, and this interview does not collect the second. Dietary restrictions are the one exception, and they have their own question above.
+
+## home_country — optional, text
+
+Which country the organizer is from. Its *only* effect is which embassy/consulate the site lists on the Info tab for emergencies (via `lookup_consular_contacts` — see SOUL workflow step 9). Default to the organizer's own country without asking — for a Hebrew conversation that is Israel. Only ask if it is genuinely unclear. A group from more than one country still uses the organizer's country here (the multi-country aspect matters for supported languages, not for which embassy) unless the organizer explicitly says to use another.
+
+## budget_detail — optional, structured (object)
+
+Only if the organizer wants a budget on the site. Capture an overall currency and party size, then one line per known cost:
+
+```json
+{
+  "currency": "USD",
+  "party_size": 7,
+  "items": [
+    { "phase": "Kyoto", "category": "hotel", "description": "Cross Hotel × 3 nights", "amount": 900, "estimate": false },
+    { "phase": "flights", "category": "flight", "description": "TLV–KIX × 7", "amount": 0, "estimate": true }
+  ]
+}
+```
+
+`category` is one of `flight`, `hotel`, `car`, `attraction`, `food`, `insurance`, `other` — anything else becomes `other`. `phase` is a phase name you already captured (a flight with no phase files under "flights"); an unmatched name falls back to the first phase. For a cost the organizer knows matters but not the figure, use `amount: 0` with `estimate: true` — the site shows it as a "?" line to fill in later. Skip the whole question if they'd rather not itemise money; the free-text budget note in `constraints` still rides along.

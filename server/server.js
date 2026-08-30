@@ -48,9 +48,6 @@ const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
-// Shared only with the fixed-origin runtime gateway. It is deliberately
-// independent from the Hermes service credential and has no browser path.
-const CONTROL_PLANE_EXCHANGE_KEY = process.env.CONTROL_PLANE_EXCHANGE_KEY || '';
 // Optional shared onboarding password for a fresh DB's seeded users. Leave
 // unset in production once Telegram/Google login is live — each participant
 // then gets an independent random password instead of one shared, guessable
@@ -348,13 +345,6 @@ db.exec(`
     content    TEXT NOT NULL,
     hash       TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS control_plane_enrollments (
-    invite_id   TEXT PRIMARY KEY,
-    username    TEXT NOT NULL REFERENCES users(username),
-    method      TEXT NOT NULL CHECK(method IN ('google','password')),
-    created_at  TEXT DEFAULT (datetime('now'))
   );
 `);
 // Extraction creates a private organizer draft first. Existing installations
@@ -699,70 +689,6 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-function controlPlaneExchangeRequired(req, res, next) {
-  if (!CONTROL_PLANE_EXCHANGE_KEY || req.headers['x-api-key'] !== CONTROL_PLANE_EXCHANGE_KEY) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  next();
-}
-
-// The runtime gateway exchanges a consumed control-plane grant for the
-// runtime's normal JWT. Browsers can neither call nor authenticate this route.
-app.post('/api/internal/control-plane/session', controlPlaneExchangeRequired, (req, res) => {
-  const role = typeof req.body?.role === 'string' ? req.body.role : '';
-  const requestedUsername = typeof req.body?.runtimeUsername === 'string' ? req.body.runtimeUsername : '';
-  const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
-  const username = requestedUsername || (['owner', 'organizer'].includes(role) ? organizers[0] : '');
-  if (!username || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) {
-    return res.status(404).json({ error: 'runtime_participant_not_found' });
-  }
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({ token: jwt.sign({ username }, JWT_SECRET, { expiresIn: '12h' }) });
-});
-
-app.get('/api/internal/control-plane/participants/:username', controlPlaneExchangeRequired, (req, res) => {
-  const runtimeUsername = typeof req.params?.username === 'string' ? req.params.username : '';
-  if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return res.status(400).json({ error: 'invalid_request' });
-  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(runtimeUsername)) {
-    return res.status(404).json({ error: 'runtime_participant_not_found' });
-  }
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({ ok: true, username: runtimeUsername });
-});
-
-// Idempotent by invite_id: a retry after an uncertain network response never
-// rotates credentials twice or enrolls a different runtime participant.
-app.post('/api/internal/control-plane/participants', controlPlaneExchangeRequired, async (req, res) => {
-  const { inviteId, runtimeUsername, method, password } = req.body || {};
-  if (typeof inviteId !== 'string' || !/^invite_[A-Za-z0-9]{8,64}$/.test(inviteId)
-      || typeof runtimeUsername !== 'string' || !/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)
-      || !['google', 'password'].includes(method)) {
-    return res.status(400).json({ error: 'invalid_request' });
-  }
-  const prior = db.prepare('SELECT username, method FROM control_plane_enrollments WHERE invite_id = ?').get(inviteId);
-  if (prior) {
-    if (prior.username !== runtimeUsername || prior.method !== method) return res.status(409).json({ error: 'invite_binding_conflict' });
-    return res.json({ ok: true, username: prior.username });
-  }
-  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(runtimeUsername)) {
-    return res.status(404).json({ error: 'runtime_participant_not_found' });
-  }
-  if (method === 'password' && (typeof password !== 'string' || password.length < 8 || password.length > 128)) {
-    return res.status(400).json({ error: 'password_invalid' });
-  }
-  const hash = await bcrypt.hash(method === 'password' ? password : crypto.randomBytes(32).toString('base64url'), 12);
-  try {
-    db.transaction(() => {
-      db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, runtimeUsername);
-      db.prepare('INSERT INTO control_plane_enrollments(invite_id, username, method) VALUES (?, ?, ?)').run(inviteId, runtimeUsername, method);
-    })();
-  } catch (error) {
-    if (String(error.message).includes('UNIQUE')) return res.status(409).json({ error: 'invite_binding_conflict' });
-    throw error;
-  }
-  res.json({ ok: true, username: runtimeUsername });
-});
-
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
 // Strip PIN codes, organizer-only needs, and organizer-only agent standing
 // instructions before serving to clients — every family member is authed,
@@ -867,7 +793,7 @@ app.get('/api/currency-rates', authRequired, async (_req, res) => {
 // here — rather than reusing sanitizeConfig() — keeps the public surface
 // obvious at a glance instead of depending on a general-purpose sanitizer
 // that could grow more fields later.
-app.get('/api/config/roster', authRequired, (_req, res) => {
+app.get('/api/config/roster', (_req, res) => {
   const roster = (TRIP_CONFIG.participants || []).map(p => ({
     username: p.username,
     name: p.name,
@@ -1200,7 +1126,7 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
-app.get('/api/trip/logo', authRequired, (_req, res) => {
+app.get('/api/trip/logo', (_req, res) => {
   const logoFile = TRIP_CONFIG.meta?.logo;
   if (!logoFile) return res.status(404).end();
   const logoPath = path.join(TRIP_DIR, logoFile);
@@ -1371,7 +1297,7 @@ app.post('/api/auth/avatar/upload', authRequired,
 );
 
 // ── RATINGS ───────────────────────────────────────────────────────────────────
-app.get('/api/ratings', authRequired, (_req, res) => {
+app.get('/api/ratings', (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
   const result = {};
   for (const r of rows) {
@@ -1454,7 +1380,7 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   }
 });
 
-app.get('/api/photos', authRequired, (req, res) => {
+app.get('/api/photos', (req, res) => {
   const { phase } = req.query;
   const rows = phase
     ? db.prepare('SELECT * FROM photos WHERE phase = ? ORDER BY uploaded_at DESC').all(phase)
@@ -1473,7 +1399,7 @@ app.get('/api/photos', authRequired, (req, res) => {
   res.json(photos);
 });
 
-app.get('/api/photos/file/:filename', authRequired, (req, res) => {
+app.get('/api/photos/file/:filename', (req, res) => {
   const filePath = path.join(UPLOADS_DIR, path.basename(req.params.filename));
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not_found' });
   res.sendFile(filePath);
@@ -1509,7 +1435,7 @@ app.delete('/api/photos/:id', authRequired, async (req, res) => {
 });
 
 // ── VENUE COMMENTS ────────────────────────────────────────────────────────────
-app.get('/api/comments/venue/:venueId', authRequired, (req, res) => {
+app.get('/api/comments/venue/:venueId', (req, res) => {
   const rows = db.prepare('SELECT * FROM venue_comments WHERE venue = ? ORDER BY created_at ASC').all(req.params.venueId);
   const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
   res.json(comments);
@@ -1534,7 +1460,7 @@ app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
 });
 
 // ── RSVPs ─────────────────────────────────────────────────────────────────────
-app.get('/api/rsvps/:activityId', authRequired, (req, res) => {
+app.get('/api/rsvps/:activityId', (req, res) => {
   const rows = db.prepare('SELECT * FROM rsvps WHERE activity = ?').all(req.params.activityId);
   const rsvps = rows.map(r => ({ ...r, user: getUser(r.username) || { username: r.username } }));
   res.json(rsvps);
@@ -1551,7 +1477,7 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 
 // ── PHOTO REACTIONS ───────────────────────────────────────────────────────────
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
-app.get('/api/reactions', authRequired, (req, res) => {
+app.get('/api/reactions', (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
   const grouped = {};
   for (const r of rows) {
@@ -1562,7 +1488,7 @@ app.get('/api/reactions', authRequired, (req, res) => {
   res.json(grouped);
 });
 
-app.get('/api/reactions/:photoId', authRequired, (req, res) => {
+app.get('/api/reactions/:photoId', (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
   // Group by emoji: { '❤️': [{ username, user }], ... }
   const grouped = {};
@@ -1588,7 +1514,7 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 
 // ── PHOTO COMMENTS ────────────────────────────────────────────────────────────
 // Bulk fetch — all photo comments (for gallery preload)
-app.get('/api/comments/photo', authRequired, (req, res) => {
+app.get('/api/comments/photo', (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
   const grouped = {};
   for (const c of rows) {
@@ -1598,7 +1524,7 @@ app.get('/api/comments/photo', authRequired, (req, res) => {
   res.json(grouped);
 });
 
-app.get('/api/comments/photo/:photoId', authRequired, (req, res) => {
+app.get('/api/comments/photo/:photoId', (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments WHERE photo_id = ? ORDER BY created_at ASC').all(req.params.photoId);
   const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
   res.json(comments);
@@ -1623,7 +1549,7 @@ app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
 });
 
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
-app.get('/api/tasks/done', authRequired, (req, res) => {
+app.get('/api/tasks/done', (req, res) => {
   const rows = db.prepare('SELECT * FROM task_done ORDER BY done_at ASC').all();
   res.json(rows.map(r => ({ ...r, user: getUser(r.done_by) })));
 });
@@ -1842,6 +1768,16 @@ app.delete('/api/budget/:id', authRequired, (req, res) => {
 
 const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
 
+// With no enrichment worker, a row left 'pending' shows a permanent
+// "Finding links…" spinner. On a control-plane-provisioned trip the links
+// were filled at setup, so retire any stale pending rows on boot.
+if (!HERMES_URL) {
+  try {
+    db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    db.prepare("UPDATE phase_plan_days SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+  } catch { /* tables may not exist yet on a fresh db */ }
+}
+
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 async function extractBookingDetails(req) {
@@ -1973,7 +1909,7 @@ app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file
 });
 
 // Serve confirmation PDFs — uploaded ones from CONF_DIR; static ones from site/confirmations/ via Nginx
-app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
+app.get('/api/bookings/confirmation/:fn', (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
@@ -1997,7 +1933,7 @@ app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('fi
   res.json({ ok: true, pkpass_file: req.file.filename });
 });
 
-app.get('/api/bookings/wallet-apple/:fn', authRequired, (req, res) => {
+app.get('/api/bookings/wallet-apple/:fn', (req, res) => {
   const fn = path.basename(req.params.fn);
   const filePath = path.join(CONF_DIR, fn);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not found' });
@@ -2193,8 +2129,8 @@ function queuePhaseReview(phaseId) {
 function ensurePlanDay(phaseId, date) {
   if (!date) return;
   db.prepare(
-    "INSERT OR IGNORE INTO phase_plan_days (phase_id,date,enrichment_status) VALUES (?,?,'pending')"
-  ).run(phaseId, date);
+    "INSERT OR IGNORE INTO phase_plan_days (phase_id,date,enrichment_status) VALUES (?,?,?)"
+  ).run(phaseId, date, HERMES_URL ? 'pending' : 'none');
 }
 
 app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
@@ -2222,8 +2158,12 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
     sort_order != null ? Number(sort_order) : 0,
     req.user.username,
     // Queued rather than enriched inline: the request returns immediately and
-    // the worker fills the links in, retrying if Hermes isn't reachable.
-    'pending'
+    // the worker fills the links in, retrying if Hermes isn't reachable. With
+    // no worker configured (HERMES_URL unset — the usual case for a
+    // control-plane-provisioned site, where link enrichment already ran at
+    // setup) there is nothing to move it off 'pending', so it would show a
+    // permanent "Finding links…" spinner — record 'none' instead.
+    HERMES_URL ? 'pending' : 'none'
   );
   const created = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
   ensurePlanDay(req.params.phase_id, date || null);
@@ -2338,7 +2278,7 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
   // A day that now has a headline has nothing left for the worker to write; one
   // whose headline was just cleared goes back in the queue instead of staying
   // blank forever.
-  const status = (labelHe || labelEn) ? 'done' : 'pending';
+  const status = (labelHe || labelEn) ? 'done' : (HERMES_URL ? 'pending' : 'none');
   // A direct organizer rewrite supersedes any pending review correction, the
   // same way the item PATCH above does — otherwise the struck-through
   // "corrected" indicator would keep pointing at wording the organizer has
@@ -2411,7 +2351,7 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
       write.run(phaseId, date, src?.label_he ?? null, src?.label_en ?? null,
                 src?.label_he_prev ?? null, src?.label_en_prev ?? null,
                 src?.correction_note ?? null, src?.corrected_at ?? null,
-                (src?.label_he || src?.label_en) ? 'done' : 'pending');
+                (src?.label_he || src?.label_en) ? 'done' : (HERMES_URL ? 'pending' : 'none'));
     };
     put(date_a, fromB);
     put(date_b, fromA);
@@ -2888,6 +2828,16 @@ if (HERMES_URL) {
 // organizer-triggered rather than an automatic sweep, so deploying this doesn't
 // fire a batch of model calls at every item that already exists.
 app.post('/api/phase-plan/enrich-pending', organizerOrAgentRequired, (req, res) => {
+  // No enrichment worker (HERMES_URL unset — the usual case for a
+  // control-plane-provisioned trip): don't move anything to 'pending', or every
+  // line would render a permanent "Finding links…". The links this button would
+  // fetch were already baked into the config at trip setup. Also sweep any
+  // rows a pre-fix press left stuck.
+  if (!HERMES_URL) {
+    db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    db.prepare("UPDATE phase_plan_days SET enrichment_status = 'none' WHERE enrichment_status = 'pending'").run();
+    return res.json({ queued: 0, in_flight: 0, hermes_configured: false });
+  }
   // Requeue what was never attempted ('none'/NULL), what gave up ('failed'),
   // and what is stuck — 'pending' with its attempts exhausted, which the worker
   // skips forever. A 'pending' item that still has attempts left is already
@@ -2979,10 +2929,13 @@ function stripTags(html) {
 app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, res) => {
   const created = [];
   const skipped = [];
+  // No enrichment worker (HERMES_URL unset) → 'none', not a permanent
+  // "Finding links…"; link enrichment for a provisioned trip ran at setup.
+  const enrichSeed = HERMES_URL ? 'pending' : 'none';
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
     '(phase_id,date,time,time_sort,text_he,text_en,location_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
-    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,'pending',?)"
+    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?)"
   );
   // Re-running promote repairs rows imported before extra_links existed, rather
   // than leaving an already-promoted trip permanently missing those links.
@@ -3012,7 +2965,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
         const he = stripTags(day.label?.he ?? day.label ?? '');
         const en = stripTags(day.label?.en ?? '');
         upsertDay.run(phase.id, day.date, he || null, en || null,
-                      (he || en) ? 'done' : 'pending');
+                      (he || en) ? 'done' : enrichSeed);
       }
       (day.items || []).forEach((item, ii) => {
         const ref = `${phase.id}|${day.date || `d${di}`}|${ii}`;
@@ -3041,7 +2994,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
           firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
           linksJson,
           findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
-          di * 1000 + ii, req.user.username, ref
+          di * 1000 + ii, req.user.username, enrichSeed, ref
         );
         if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phase.id, config_ref: ref });
         else skipped.push({ config_ref: ref, reason: 'already promoted' });
@@ -3423,7 +3376,7 @@ app.get('/api/trivia/events', authRequired, (req, res) => {
 });
 
 // GET /api/trivia/public-events — unauthenticated SSE for TV/projector screen display
-app.get('/api/trivia/public-events', authRequired, (req, res) => {
+app.get('/api/trivia/public-events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');

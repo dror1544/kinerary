@@ -3,6 +3,8 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { venueLinkSearchConfigured } from "./itinerary-extract.js";
+import { resolvePendingVenueLinks } from "./venue-links.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
@@ -102,26 +104,8 @@ if (chatRoutingKey) {
 
 let portal: PortalDependencies | undefined;
 if (profile.web) {
-  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([
-    resolveSecretRef(profile.web.google_client_id_secret_ref),
-    resolveSecretRef(profile.web.google_client_secret_ref),
-    resolveSecretRef(profile.web.runtime_exchange_key_secret_ref),
-  ]);
-  const redirectUri = `${profile.web.public_origin}/v1/auth/google/callback`;
-  portal = {
-    db: pool,
-    google: new GoogleOidcClient(googleClientId, googleClientSecret, redirectUri),
-    runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey),
-    publicOrigin: profile.web.public_origin,
-    runtimeOrigin: profile.web.runtime_origin,
-    runtimeExchangeKey,
-    runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes,
-    telegramBotUsername: profile.web.telegram_bot_username,
-    sessionTtlSeconds: profile.web.session_ttl_seconds,
-    enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400,
-    approvalTtlSeconds: 86400,
-    provisioningAdminSubjectDigests: new Set(profile.web.provisioning_admin_subject_digests),
-  };
+  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([resolveSecretRef(profile.web.google_client_id_secret_ref), resolveSecretRef(profile.web.google_client_secret_ref), resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)]);
+  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, provisioningAdminSubjectDigests: new Set(profile.web.provisioning_admin_subject_digests) };
 }
 
 const app = buildApp(profile, {
@@ -154,6 +138,26 @@ if (signup) {
       })
       .finally(() => { dispatching = false; });
   }, OUTBOX_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Retries venue ticket/official-URL lookups parked in venue_links because the
+// interview-time web search was rate-limited. Same single-process overlap guard
+// as the outbox loop. Only runs when a search profile is configured.
+if (venueLinkSearchConfigured()) {
+  let draining = false;
+  const VENUE_LINK_POLL_INTERVAL_MS = 5 * 60_000;
+  const timer = setInterval(() => {
+    if (draining) return;
+    draining = true;
+    resolvePendingVenueLinks(pool, undefined, (line) => process.stderr.write(`${line}\n`))
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "venue_links.drain_loop_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { draining = false; });
+  }, VENUE_LINK_POLL_INTERVAL_MS);
   timer.unref();
 }
 

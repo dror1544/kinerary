@@ -30,12 +30,22 @@ class FakeDeployAdapter:
         self._fail = fail
         self._error_code = error_code
 
-    def deploy(self, slug: str, config: dict[str, Any]) -> str:
+    def deploy(
+        self,
+        slug: str,
+        config: dict[str, Any],
+        *,
+        first_provision: bool = False,
+        sidecars: dict[str, Any] | None = None,
+    ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
             exc.safe_error_code = self._error_code  # type: ignore[attr-defined]
             raise exc
-        self.deployed.append({"slug": slug, "config": config})
+        self.deployed.append({
+            "slug": slug, "config": config, "first_provision": first_provision,
+            "sidecars": sidecars or {},
+        })
         return f"https://{slug}.test.example"
 
 
@@ -57,7 +67,10 @@ JAPAN_INTAKE = {
 }
 
 
-def setup_fixture(conn: psycopg.Connection, slug: str | None = None, intake: dict | None = None) -> dict:
+def setup_fixture(
+    conn: psycopg.Connection, slug: str | None = None, intake: dict | None = None,
+    first_provision: bool | None = None,
+) -> dict:
     """Create a trip with an approved provision job ready to claim.
 
     *slug* defaults to a non-draft `prov-test-*` value, so slug promotion stays
@@ -79,12 +92,15 @@ def setup_fixture(conn: psycopg.Connection, slug: str | None = None, intake: dic
 
     intake_data = json.dumps(intake if intake is not None else JAPAN_INTAKE)
     intake_digest = sha256(intake_data)
-    plan_desired = json.dumps({
+    desired: dict[str, Any] = {
         "release_id": release_id,
         "intake_version_id": intake_id,
         "intake_digest": intake_digest,
         "resource_intent": [{"logical_type": "trip_runtime", "isolation_tier": "shared_test"}],
-    })
+    }
+    if first_provision is not None:
+        desired["first_provision"] = first_provision
+    plan_desired = json.dumps(desired)
     plan_digest = sha256(plan_desired)
     token_digest = sha256(f"raw-token-{tag}")
 
@@ -271,6 +287,83 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # that don't move rather than a full string that would go stale.
         self.assertIn("Japan", config["meta"]["title"])
         self.assertIn("Family", config["meta"]["title"])
+
+    def test_first_provision_from_plan_desired_reaches_the_deploy_adapter(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.plans SET desired = jsonb_set(desired, '{first_provision}', 'true') WHERE id = %s",
+            (self.fix["plan_id"],),
+        )
+        self.conn.commit()
+        self.worker.run_once()
+        self.assertTrue(self.fake_deploy.deployed[0]["first_provision"])
+
+    def test_first_provision_defaults_false_when_desired_omits_it(self) -> None:
+        # The default fixture writes no first_provision key.
+        self.worker.run_once()
+        self.assertFalse(self.fake_deploy.deployed[0]["first_provision"])
+
+    def test_deploy_always_gets_an_empty_trivia_sidecar(self) -> None:
+        # Control-plane trips ship without trivia (documented descope in the
+        # sprint plan); writing an empty file stops the trip server logging a
+        # missing-file error on every boot.
+        self.worker.run_once()
+        sidecars = self.fake_deploy.deployed[0]["sidecars"]
+        self.assertEqual([], sidecars["trivia_questions.json"])
+
+    def test_bookings_sidecar_is_derived_from_phases_and_anchors(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "phases": {"kind": "structured", "schema_version": 2, "data": [
+                {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                 "accommodation": {"name": "OMO3 Asakusa"}},
+            ]},
+            "travel_anchors": {"kind": "structured", "schema_version": 2, "data": [
+                {"type": "activity", "detail": "Tokyo Skytree — 20 Sep 2026 10:00"},
+            ]},
+        })
+        self.worker.run_once()
+        bookings = self.fake_deploy.deployed[0]["sidecars"]["bookings.json"]
+        kinds = sorted(b["type"] for b in bookings)
+        self.assertEqual(["attraction", "hotel"], kinds)
+        self.assertTrue(all(b["seed_key"] for b in bookings))
+
+    def test_no_bookings_means_no_bookings_sidecar(self) -> None:
+        # Default fixture intake has no phases and no anchors.
+        self.worker.run_once()
+        self.assertNotIn("bookings.json", self.fake_deploy.deployed[0]["sidecars"])
+
+    def test_enrich_hook_receives_the_config_and_destination(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_enrich(config: dict, destination: str) -> dict:
+            seen["destination"] = destination
+            return {**config, "travel_info": {"countries": {"Japan": {"flag": "🇯🇵"}}}}
+
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-enrich",
+            enrich=fake_enrich,
+        )
+        worker.run_once()
+        self.assertEqual("Japan", seen["destination"])
+        self.assertEqual(
+            "🇯🇵",
+            self.fake_deploy.deployed[0]["config"]["travel_info"]["countries"]["Japan"]["flag"],
+        )
+
+    def test_a_raising_enrich_hook_does_not_fail_the_job(self) -> None:
+        def boom(config: dict, destination: str) -> dict:
+            raise RuntimeError("enrichment exploded")
+
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-enrich-boom",
+            enrich=boom,
+        )
+        worker.run_once()
+        row = self.conn.execute(
+            "SELECT state FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual("succeeded", row["state"])
 
     def test_empty_queue_returns_false(self) -> None:
         # Consume the job first.
@@ -797,3 +890,75 @@ class ProvisionerFailureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShellDeployAdapterErrorReportingTests(unittest.TestCase):
+    """deploy.sh writes its progress and its failure diagnostics to stdout, and
+    only SSH's own "Permanently added ... to the list of known hosts" warnings
+    to stderr. The original `stderr or stdout` fallback therefore reported
+    nothing but those warnings on every real failure — a health-check failure
+    on 2026-08-28 printed 6 identical warning lines and not one word about the
+    cause, which was `npm install` dying several stages earlier.
+    """
+
+    def _run_failing_deploy(self, stdout: str, stderr: str) -> str:
+        from unittest import mock
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        adapter = ShellDeployAdapter(
+            deploy_root="/deploy-root", vmid_map={"japan-2026": "101"}, repo_root="/repo",
+        )
+        completed = mock.Mock(returncode=1, stdout=stdout, stderr=stderr)
+        with mock.patch("control_plane_worker.provisioner.subprocess.run", return_value=completed), \
+             mock.patch("control_plane_worker.provisioner.os.makedirs"), \
+             mock.patch("builtins.open", mock.mock_open()), \
+             mock.patch("control_plane_worker.provisioner.json.dump"):
+            with self.assertRaises(RuntimeError) as caught:
+                adapter.deploy("japan-2026", {"trip": {}})
+        return str(caught.exception)
+
+    def test_stdout_is_reported_even_when_stderr_is_non_empty(self) -> None:
+        message = self._run_failing_deploy(
+            stdout="Installing server dependencies...\ngyp ERR! find Python\n",
+            stderr="Warning: Permanently added '192.168.0.40' (ED25519) to the list of known hosts.\n",
+        )
+
+        self.assertIn("gyp ERR!", message)
+
+    def test_stderr_is_still_reported(self) -> None:
+        message = self._run_failing_deploy(stdout="", stderr="ssh: connect to host: Connection refused\n")
+
+        self.assertIn("Connection refused", message)
+
+
+class ShellDeployAdapterSidecarTests(unittest.TestCase):
+    """The transformer's bookings.json / trivia_questions.json land next to
+    trip.config.json in the trip dir, which deploy.sh tars wholesale onto the
+    container — so they only need to be written to disk, not passed to
+    deploy.sh explicitly.
+    """
+
+    def test_sidecar_files_are_written_next_to_the_config(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as deploy_root:
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"japan-2026": "101"}, repo_root="/repo",
+            )
+            completed = mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch("control_plane_worker.provisioner.subprocess.run", return_value=completed), \
+                 mock.patch.object(ShellDeployAdapter, "_private_url", return_value="https://japan-2026.example"):
+                adapter.deploy(
+                    "japan-2026", {"meta": {"title": "Japan"}},
+                    sidecars={"bookings.json": [{"seed_key": "hotel_tokyo"}], "trivia_questions.json": []},
+                )
+
+            trip_dir = os.path.join(deploy_root, "trips", "japan-2026")
+            with open(os.path.join(trip_dir, "bookings.json"), encoding="utf-8") as fh:
+                self.assertEqual([{"seed_key": "hotel_tokyo"}], json.load(fh))
+            with open(os.path.join(trip_dir, "trivia_questions.json"), encoding="utf-8") as fh:
+                self.assertEqual([], json.load(fh))

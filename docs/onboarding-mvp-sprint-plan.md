@@ -10,8 +10,9 @@ interview, explicitly confirm the intake, approve a provisioning plan, and
 receive a working private trip URL — without editing JSON, accessing the
 repository, or running deployment commands. Each boundary is independently
 testable before it is connected to the next one. Sprint 4 is the sprint whose
-exit gate proves this end-to-end. Sprints 5–7 extend the live trip experience
-after the provisioning path is proven.
+exit gate proves this end-to-end. Sprint 4.5 makes the generated site actually
+useful (destination data, itinerary, map); Sprint 4.7 hardens the provisioning
+path once it has run for real. Sprints 5–7 extend the live trip experience.
 
 The demo uses the Japan fake-trip fixture and a non-production hostname and
 test Telegram identities/groups only. It must never use a real family's data
@@ -355,9 +356,23 @@ Build:
   `intake_sessions.answers` state indirectly. Its digest must verify before
   planning or transformation.
 - **Intake transformer** — reads the confirmed immutable intake version and
-  produces a valid `trip.config.json` and `trivia_questions.json` using the
-  existing Kinerary schema. Validate the output against the existing schema
-  before writing. Store only the logical config; no VMIDs, IPs, or paths.
+  produces a valid `trip.config.json` using the existing Kinerary schema.
+  Validate the output against the existing schema before writing. Store only
+  the logical config; no VMIDs, IPs, or paths.
+  - **`trivia_questions.json` is descoped** (decision 2026-08-28, reviewing the
+    first pipeline-built site): the interview collects nothing that feeds
+    trivia, and generating it deterministically from destination + phase names
+    would be thin filler, not the "who remembers this from the last trip"
+    content the feature is for. The provisioner now writes an empty
+    `trivia_questions.json` (`[]`) so `server.js` stops logging a
+    missing-file error on every boot; real trivia can come from a later
+    enrichment/debrief pass or the `create-trip` path, not this transformer.
+- **`bookings.json` from the intake** (added 2026-08-28) — `travel_anchors[]`
+  (dated activity tickets, a tour proposal) and each phase's accommodation were
+  captured by the interview but dropped by `transform_intake` (anchors became a
+  single Hero stat number). `derive_bookings()` now projects both into a
+  `bookings.json` sidecar, every row `confirmation: null` unless the intake
+  carried one, so the site's Bookings tab has real, if unconfirmed, content.
 - **Provisioner worker** — implements the job worker that claims an approved
   provisioning job, invokes the intake transformer, and deploys a private trip
   instance using the existing `kinerary-deploy` infrastructure. Records the
@@ -431,94 +446,213 @@ demonstrated and recorded.
 _Deferred past this gate (original Sprint 4 scope):_ immutable release-artifact
 renderer, sanitation scans, sealed manifests, release promotion pipeline
 (`candidate` → `available`), and dedicated compute/persistent-data/secret
-adapters. These belong in a hardening sprint after the first successful
-end-to-end run proves the vertical path.
+adapters. These now live in **Sprint 4.7 — Provisioning hardening**, alongside
+the operational recovery gaps the first end-to-end run surfaced.
 
-### Sprint 4.5 — Trip content enrichment (destination data + phase narrative)
+### Sprint 4.5 — Trip content enrichment (destination data, itinerary, map)
 
 **Goal:** close the gap found reviewing the first real control-plane-provisioned
-trip (2026-08-23): `transform_intake()` produces a valid but visually thin
-config — no destination info (currency/emergency numbers), and organizer prose
-that named a sub-group or a specific event inside a phase name (a live example:
-"Dallas (boys; Mavericks game September 6)") had nowhere structured to go. This
-was patched same-day with a hardcoded 15-country currency dict and a raw-text
-`phase.note` field — a stopgap, not the fix. This sprint is that fix, defined
-but **not yet built or scheduled**.
+trip (2026-08-23, confirmed again 2026-08-28/29): `transform_intake()` produces
+a schema-valid but visually thin config — no destination info, no per-phase
+day-by-day, an empty map tab. Turn a deployed shell into a site trip members
+find useful.
 
-This is not a new idea invented from scratch: `.agents/skills/create-trip/`
-(the older, human-driven scaffolding path) already does the deterministic half
-of this for real, every time it's used — see `INTERVIEW.md` §4 ("Country info
-— always do this, don't ask, just run it"), backed by `scripts/country-info.js`
-(live, keyless lookups against `countries.dev` + `emergencynumberapi.com`,
-already producing exactly `travel_info.countries[name]`'s real shape). The
-control-plane pipeline (Sprint 1-4, the Telegram-interview path) never got the
-equivalent. `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
-(a different, earlier initiative, never implemented) scoped the deterministic
-geocoding/weather/hero-photo half of this more thoroughly — reuse its task
-breakdown for that part rather than re-designing it, but note its "Confirmed
-product decisions" explicitly forbade inventing itinerary content; the
-anchor/narrative half below is new territory that plan didn't cover, and needs
-its own product sign-off on where the line is.
+This is not a new idea. `.agents/skills/create-trip/` (the older, human-driven
+scaffolding path) already does the deterministic half every time it runs — see
+`INTERVIEW.md` §4 and `scripts/country-info.js` (keyless lookups against
+`countries.dev` + `emergencynumberapi.com`, producing `travel_info.countries[*]`
+shape). `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
+(never implemented) scoped the geocoding/weather/hero-photo half. Neither
+reached the control-plane pipeline. The itinerary/anchor/narrative work is new
+territory both prior plans left open; the execution point is now decided —
+**at intake, via the shared `kinerary-extract` Hermes profile**, with a
+deterministic post-processing layer enforcing invariants (below).
 
-Two genuinely different kinds of work, and they don't belong in the same
-function:
+**Scope**, every item tagged: `built` (on the branch) · `follow-on` (defined,
+deferred past this sprint, no open product decision) · `separate build` (real,
+out of 4.5).
 
-- **Deterministic destination data** (no judgment required — port, don't
-  rebuild): for each distinct destination country in the confirmed intake, get
-  currency/emergency numbers/calling code the same way `country-info.js`
-  already does, and populate `travel_info.countries[*]`. This replaces
-  `transformer.py`'s `_KNOWN_COUNTRY_CURRENCY` stopgap. Pure Python
-  stdlib HTTP calls against the same two free APIs is enough; no new
-  dependency needed. Geocoding/weather/hero-photo verification from the
-  `.hermes` plan belong here too, once scoped.
-- **AI-driven phase content pass** — this is the part that genuinely needs
-  judgment, not a lookup, and needs a product decision on where it runs and
-  under what authority:
-  - **Anchor extraction**: read each phase's raw organizer text (name +
-    accommodation + any free-form notes) and identify concrete, dated,
-    already-decided events mentioned inside it — a booked flight, a sports
-    game, a reservation — and promote them into `travel_anchors[]` as
-    first-class entries instead of leaving them buried in a phase name. This
-    is restructuring what the organizer already said, not inventing new facts
-    — consistent with the `.hermes` plan's constraint, just applied to intake
-    prose instead of external search results.
-  - **Phase narrative**: turn what's left of the trimmed context (the part
-    that isn't a discrete anchor — "boys only", "all travelers", general
-    color) into a short, readable blurb for the site's phase detail view,
-    replacing the current same-day stopgap (`phase.note`, which just
-    concatenates the raw original text verbatim).
-  - **Open questions, not yet decided:** does this run as one more step inside
-    the existing interview conversation (the Hermes profile already reasons
-    over this exact text once, right before `CONFIRM`), as a separate
-    short-lived agent invocation the provisioner triggers after
-    `confirm_intake` and before `generatePlan`, or inside `ProvisionerWorker`
-    itself alongside `transform_intake()`? Whichever it is, its output needs
-    somewhere durable to land — a new field on `intake_versions`, a sibling
-    "enrichment" version, or a transformer input alongside the raw answers —
-    and that storage decision should be made deliberately, not backed into.
+As of 2026-08-30 every item below is `built` except one low-visual residual
+(`follow-on`): **prose anchor extraction**. The `separate build` (site
+live-plan enrichment worker) stays out of 4.5.
 
-Automated tests (once built):
+| Item | Tag | Notes |
+|---|---|---|
+| Deterministic destination data | `built` | `control_plane_worker/enrichment.py` `enrich_config`, wired as `ProvisionerWorker(enrich=…)` — live from `__main__`, no-op passthrough in tests. `countries.dev` → currency / calling code / capital / flag; a static `_EMERGENCY_BY_ISO` table + EU-112 bloc (`emergencynumberapi.com` is dead — domain reassigned, all `/api` 404); Nominatim → `phase.mapStop {lat,lng}`; Wikipedia REST summary → `phase.hero.photo` (en title → en.wikipedia, he-only → he.wikipedia). Every lookup self-guards: a miss leaves that slice of the config alone; an enrichment failure never fails the provision job. `_KNOWN_COUNTRY_CURRENCY` kept as the offline fallback. |
+| Bookings from the intake | `built` | `transformer.derive_bookings()` → `bookings.json` sidecar. `travel_anchors[]` + each phase's accommodation, `confirmation: null` unless the intake carried one. Anchor `type` maps into the site's `CHECK(type IN ('flight','hotel','car','attraction','other'))`; an anchor with no resolvable phase parks on phase 1 (`bookings.phase` is `NOT NULL`). |
+| Trivia | `built` (descope) | Empty `trivia_questions.json` (`[]`) sidecar so the trip server stops logging a missing-file error every boot. No content generated; real trivia can come from `create-trip` or a later debrief pass. |
+| **Itinerary from an uploaded plan document** | `built` | Extracted at intake into an optional `phases[].days[]` field (`extract_itinerary` MCP tool → `kinerary-extract`), sanitised to plain text, projected through `transformer._normalise_days`. Repeated phase names resolved per-day by date range. Spec below (§4.5-i). Verified on japan-2026. |
+| **Map tab: phase pins + click-to-summary** | `built` | Root cause was the missing top-level `map`: `initMap` fell back to `setView([30,10], 3)` so the pins sat off-screen. `enrichment._build_map` now emits `center` (centroid), `zoom` (from bounding-box span), `stops[]` from the phase `mapStop`s; `site/app.js` hardened (emoji default on the `map.stops` branch, `buildMapPopup` skips absent fields instead of printing `undefined`). |
+| Accommodation location (Maps/Waze/address) | `built` | `_add_phase_nav` sets `accommodation.maps` / `accommodation.waze` as **name searches** — query is exactly `<hotel name>, <city>, <country>` (`.../maps/search/?...&query=…` and `waze.com/ul?q=…`). Google/Waze resolve a hotel name far better than OSM, and coordinate templating on a shaky geocode drops the pin in the wrong district (the OMO3 Asakusa bug). `enrich_config` still geocodes the hotel name for the map *pin* (`phase.mapStop`) + `accommodation.address` (Nominatim `display_name`), city-centre only when it misses — but the links no longer depend on that succeeding, **and the `display_name` is kept for the address text field only, never spliced into the search query** (a full `CROSS HOTEL KYOTO, 龍馬通, 大黒町, 中京区, …, 日本` query is weaker than `Cross Hotel Kyoto, Kyoto, Japan`). Matches the hand-built trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`: `accommodation.{maps,waze,address}`). |
+| Per-venue location + **ticket/official links** | `built` | `extract_itinerary` returns `venues[]` per phase — the real map-pointable places the source document names (not rail passes / ticket bundles). A venue's `url` comes from the document when it prints one; otherwise `extract_itinerary`'s `resolveVenueLinks` step **web-searches** for the first-party/ticket site (`HERMES_SEARCH_PROFILE`, falls back to the consular profile; skipped if neither is set, never guesses a domain). `transformer._normalise_venues` projects `phases[].venues[]` = `[{id, name:{he,en}, url?, area?}]`; `enrichment._enrich_venues` adds name-search `maps`/`waze`. The site renders a card per venue (rating + 🗺️/🔵/🎫 buttons) — `loadRatings` now renders `VENUES[phase.id]` for config-driven phases (previously only the removed static HTML). Mirrors the hand-built `venues[]` (`{id, name, name_he, url, area}`) in `kinerary-deploy/trips/japan-2025`. **Rate-limit → deferred retry:** `isRateLimited()` classifies a provider throttle (`429` / "usage limit" / "overloaded" …) distinctly from a clean miss. On a throttle, `extract_itinerary` returns the unresolved names in `venueLinksDeferred`; the interview-mcp tool parks them in `control_plane.venue_links` (migration 0025, `url IS NULL`, keyed `(destination, venue_name)`) via `POST /v1/interview/:id/venue-links`. `server.ts` runs `resolvePendingVenueLinks` on a 5-min interval (same single-process guard as the outbox loop) — one web search per destination, `attempts` capped at 6, a rate-limited pass costs no attempt. `enrich_config`'s per-venue pass reads resolved rows at provision time (`__main__._venue_lookup`, read-only), so a link the drain fills after CONFIRM still reaches the site on the next provision, and a later trip naming the same place reuses it. Residual: a trip provisioned before the drain's first tick ships without the ticket URL until it is re-provisioned (same posture as `country_reference`). Consular lookup carries the matching `RATE_LIMITED` reason. |
+| Consular / embassy contacts (`travel_info.emergency_contacts`) | `built` | Migration 0023 `country_reference` keyed `(destination_country, home_country)`. `interview-mcp` `lookup_consular_contacts` checks the store, then runs a host-side web search on a miss (`HERMES_CONSULAR_PROFILE`, **falls back to `HERMES_SEARCH_PROFILE`** — one search profile serves both the venue-link and consular paths) and writes back. `enrich_config` takes an injected `consular_lookup`; `__main__` wires a read-only query. `home_country` from `meta.home_country`, Israel default. Verified live for Japan/Israel via `kinerary-extract` — Embassy of Israel in Tokyo `+81-3-3264-0911` + honorary consulates (Kobe, Nagoya). |
+| 7-day weather per phase | `built` | Open-Meteo is keyless and the site already fetches it client-side. `enrichment._add_phase_nav` sets `phase.mapStop.weatherKey` (and `accommodation.weatherKey`) to the phase id, which is all `site/app.js` needs to fire its own forecast call at render time — never baked into the config, never stale. |
+| Anchor extraction from phase prose | `follow-on` | Promote a dated event buried in a phase `name`/`note` into a `travel_anchors[]` entry. Now largely covered: a document's dated events land in `phases[].days[]` via `extract_itinerary`, and text trimmed from a phase name is kept in the `phase.note` blurb. The residual — date-parsing an organizer's typed phase name — is low value and regression-prone; deferred. |
+| Phase narrative blurb | `built` | `transformer._phase_note_text` writes a readable blurb ("4 nights in Tokyo, 6 Sep–10 Sep. Staying at …. 3 days planned") with any trimmed name context as a trailing clause, replacing the raw concat. |
+| Persist the raw uploaded document | `built` | Migration 0024 adds `intake_sessions.source_document` + `intake_versions.source_document` (jsonb `{filename,text,savedAt}`). `POST /v1/interview/:id/source-document` stages it; `extract_itinerary` forwards the document after extracting (best-effort); `confirmIntake` copies session → version. Sibling column — outside the `data` canonical-safety CHECK and the digest. |
+| Structured budget | `built` | Optional `budget_detail` structured question → `transformer._derive_budget` projects `config.budget` (`party_size` / `phases` / `phase_labels` / `seed_items`), the shape `server.js` seeds `budget_items` from. Categories validated to the site's set; `amount 0 + estimate` → a "fill-in" row; `seed_key` stable for idempotent re-seed. No `INTAKE_SCHEMA_VERSION` bump (additive-optional). |
+| Site live-plan enrichment worker | `separate build` | The trip site already has the DB hooks — `phase_plan_items` / `phase_plan_days` with `enrichment_status` (`none/pending/done/failed`), `review_status`, `config_ref` dedup, day-headline correction trail. A worker that calls a model post-deploy to detect ticketing needs, re-enrich, and feed the in-app review queue is its own sprint, not 4.5. |
+
+#### §4.5-i. Itinerary-from-document spec (`this step`)
+
+- **Schema.** `phases[]` intake items gain an optional `days` key. **No
+  `INTAKE_SCHEMA_VERSION` bump** — `validateAnswer` only shape-checks structured
+  answers (array vs object), so item keys pass through untouched; a `phases`
+  entry with no `days` transforms byte-identically to today, the same rule that
+  lets a v1 intake ride a v2 release. `days` shape mirrors the site's config
+  contract exactly, so `site/app.js` `renderDays` and the
+  `/api/phases/:id/plan/promote` `config_ref` path consume it unchanged:
+  `{ date: "YYYY-MM-DD" (inside the phase range), label: {he,en} (plain text),
+     items: [{ time: "HH:MM"|null, text: {he,en} (plain text) }] }`.
+- **New tool `extract_itinerary`** on `control-plane/api/src/interview-mcp.ts`,
+  next to `submit_answer`. `extract_itinerary({ sessionToken, phases,
+  pdf_base64 | document_url | document_text })` →
+  `{ ok: true, phases: [{name, days:[…]}], warnings:[…] }` or
+  `{ ok: false, reason: "EXTRACT_NOT_CONFIGURED" | "EXTRACTION_FAILED" }`.
+  Implementation mirrors `mcp/mcp.js`'s `/extract` (lines ~589–760): `pdf-parse`
+  → text capped ~20 000 chars; prompt built fresh from the passed `phases` (ids
+  + date ranges) + destination + session roster; `execFile(HERMES_BIN, ['-p',
+  HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--ignore-rules',
+  '--reasoning', 'none'])`, ~60 s timeout, `execFile` not `exec` (document text
+  is one argv entry, never shell-interpolated). Reuses the shared
+  `kinerary-extract` profile. **`--ignore-rules`, not `--safe-mode`:** we still
+  want a clean single-turn run (no AGENTS.md / memory / preloaded skills), but
+  `--safe-mode` *also* discards the profile's model config — and that is where
+  the `kinerary-extract` fallback chain lives (`gpt-5.6-luna-900k` →
+  `claude-sonnet-4-6` → `gpt-oss:120b` → `gpt-5.6-sol`), which is the whole
+  point of a dedicated profile: a quota-limited primary escalates instead of
+  failing the call. The venue-link and consular searches additionally pass
+  `-t web` (they must actually search, not answer a URL / embassy phone from
+  model memory). Any failure ⇒ `{ ok: false }`, never a throw.
+- **Deterministic post-processing in the tool** (model extracts structure, code
+  enforces invariants): drop phase blocks whose `name` ∉ the passed ids; drop
+  days whose `date` is unparseable or outside the phase range (→ `warnings`);
+  mirror the present side when one of `he`/`en` is missing, drop an item only if
+  both are empty; coerce a non-`HH:MM` `time` to `null`; **strip every `<…>`
+  and re-expanding entity from every `label`/`text`.** `renderDays` sends config
+  `days` text through `_biSpan`, which emits raw HTML (deliberate for
+  hand-authored config — `server.js:2879` says so), so unsanitised model output
+  there is an XSS sink. `--ignore-rules` + the single-turn call handle injection
+  *into an agent*; this handles injection *into the page*. A venue `url` also
+  passes `acceptableVenueUrl()` — http(s) + real host, and **not** a personal
+  booking docket / reservation link (`travelbooster`, `paxFileNum`, `bookingId`,
+  a collapsed line-wrap `...` mid-URL); a real leak — a booking-system docket
+  URL with a `paxFileNum` becoming a public 🎫 button — was caught this way.
+- **Interviewer workflow** (`.agents/skills/trip-intake-interviewer/SOUL.md`
+  step 3, `…/references/QUESTIONS.md` phases section): after `phases` is
+  captured, if a document was uploaded, call `extract_itinerary`; summarise the
+  result back conversationally; on confirmation, fold `days` into each phase
+  entry and re-`submit_answer("phases", …)` (a pre-CONFIRM correction is already
+  normal). `{ ok: false }` or no upload → proceed with no `days`. **Never
+  blocks CONFIRM.**
+- **Transformer** (`transformer.py` `_derive_phases`): read `raw.get("days")`,
+  keep only well-formed days, normalise to the site shape, attach `phase["days"]`
+  only when non-empty; adjacent same-named merged phases concatenate their
+  `days`. No `days` → output unchanged.
+- **Digest.** `days` is inside the `phases` answer → part of
+  `computeIntakeDigest` → part of the plan digest. Editing the itinerary
+  post-CONFIRM = a new intake version through the existing `intake/correct`
+  path → re-plan. No new mechanism.
+
+**Automated tests (`this step` + already built):**
 
 - a known destination gets a `travel_info.countries[*]` entry with real
-  currency/emergency data, sourced the same way as `country-info.js` (fake the
-  HTTP layer in tests, the way `country-info.js` itself is never tested against
-  the live APIs);
-- an unrecognized/unreachable destination degrades to no `travel_info` entry,
-  not a failed provisioning run — enrichment failure must never block
-  deployment;
-- a phase whose raw name mentions a dated, concrete event produces a
-  `travel_anchors[]` entry for it, not just a `phase.note`;
-- a phase with only a sub-group/context qualifier (no discrete anchor) produces
-  a narrative `phase.note`/blurb, not an empty one;
-- the anchor/narrative pass never fabricates a destination, date, or booking
-  status the organizer didn't provide.
+  currency/emergency data, HTTP layer faked (the way `country-info.js` itself is
+  never tested against the live APIs) — *exists*;
+- an unrecognized/unreachable destination degrades to no `travel_info` entry and
+  no crash — enrichment failure must never block deployment — *exists*;
+- an intake whose document describes a multi-day plan produces
+  `phases[].days[]` that is date-correct (every `date` inside its phase),
+  bilingual, and **plain text** (an HTML payload in the source is stripped);
+- an intake with no document, or a failed extraction, produces the same config
+  as today and does not block CONFIRM;
+- the top-level `map` object is emitted with a `center`/`zoom` and one `stop`
+  per geocoded phase.
 
-Exit gate: a confirmed intake with an unremarkable free-text phase name (real
-organizer language, not a clean "Tokyo"/"Kyoto" one-word example) produces a
-`trip.config.json` with populated `travel_info`, at least one correctly
-extracted `travel_anchors[]` entry, and phase titles that stay short while the
-trimmed context is genuinely readable elsewhere on the site — without a human
-manually patching the output afterward, the way this session did.
+Exit gate: a confirmed intake whose uploaded document describes a real
+multi-day plan produces a `trip.config.json` with populated `travel_info`,
+per-phase `days[]` the site renders on the phase pages, and a map tab that shows
+a pin per phase with a summary on click — with graceful degradation (no `days`,
+no `map` beyond what geocoded) when the inputs aren't there, and no human
+patching the output afterward.
+
+### Sprint 4.7 — Provisioning hardening
+
+**Goal:** turn the provisioning path from "works once you know the manual
+recovery steps" into "recovers itself", and finish the release-artifact work
+Sprint 4 explicitly deferred.
+
+Build — **operational gaps found in the Phase H run** (each needs a hand DB
+edit or a destroy-and-recreate today):
+
+- **Provisioning-retry endpoint.** A terminal/failed job leaves the trip
+  wedged; re-planning the same intake hits `plans_trip_id_digest_key` (identical
+  intake + release ⇒ identical digest) → `PLAN_ALREADY_PENDING`. Every retry
+  during Sprint 4.5's live work needed a manual cleanup — delete the dead plan,
+  its `plan_approvals` row and its job, then reset `trips.lifecycle_state`. This
+  wants a first-class endpoint that supersedes the old plan/job and generates a
+  fresh one, and (for a live trip) does so with `first_provision = false` so
+  the container's seeded users survive.
+- **`ready_private` is not in `CORRECTABLE_STATES`.** Re-provisioning a live
+  trip currently needs a manual `UPDATE control_plane.trips SET
+  lifecycle_state='intake_confirmed'` before `intake/correct` or `generatePlan`
+  will run. Either add the state to the set, or route re-provision through the
+  retry endpoint above with no lifecycle hop.
+- **Job lease (600 s) is shorter than the bootstrap ceiling (900 s), with no
+  heartbeat.** Harmless while a real bootstrap takes ~140 s, but a hung one
+  outlives its lease and can be double-claimed. Add a heartbeat, or make the
+  lease cover the ceiling.
+- **`_bootstrap_app_environment` only runs inside `create()`.** `apply()` is
+  inspect-then-create, so a container that exists but is half-built is never
+  repaired — the only recovery is destroy and recreate. Make the bootstrap
+  idempotent and callable against an existing container.
+- **Worker should mint its own NPM token.** `NPM_API_TOKEN` in
+  `provisioning.env` is a ~1-day JWT; a provision run after it expires 401s at
+  the NPM step (hit twice during 4.5 work). The worker holds
+  `NPM_IDENTITY`/`NPM_SECRET` — it should exchange them for a JWT at job time.
+  (Related, already mitigated: `provisioning.env` must set every
+  `PROXMOX_*`/`RPI_*` explicitly because `compose.local.yml` passes each as
+  `${VAR:-}` and an empty string beats the code's own default — keep the
+  caveat.)
+
+Build — **carry the enriched links onto the itinerary lines and the anchor
+list** (reviewing the first real provisioned site, 2026-08-29): provision-time
+enrichment attaches `maps` / `waze` / `url` to `phases[].venues[]`, so the
+per-venue ranking cards get 🗺️/🔵/🎫 buttons — but the same links never reach
+(a) the day-by-day itinerary lines (`phases[].days[].items[]` — the extract
+schema has no per-item URL field, and `site/app.js` `renderDays` prints the
+config-days branch as bare `time — text`), or (b) the anchor / bookings home
+list (`bookings.json` hotel rows get no `maps`/`waze`). The hand-built
+reference trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`,
+legacy USA2026 on CT200) carry these everywhere. Scope: match a day item /
+hotel booking to the phase venue it names and copy the links across
+(`enrichment.py`), and render item links in the config-days branch
+(`site/app.js`). Related plan-layer columns already exist
+(`phase_plan_items.{location_url,waze_url,website_url,ticket_url}`) but nothing
+populates them from config venues — `promote-config-days` only lifts links out
+of inline `<a>` markup, which extraction output does not produce.
+
+Build — **release-artifact hardening** (moved here from Sprint 4's "Deferred
+past this gate" note and §5):
+
+- immutable release-artifact renderer (build pipeline, sanitation scan, sealed
+  manifest); release promotion rules (`candidate` → `available`); dedicated
+  compute / persistent-data / secret adapter abstractions.
+
+Automated tests:
+
+- a terminally failed provision recovers to a fresh queued job through the
+  retry endpoint with no database edits, and a re-provision of a live trip
+  keeps its users (`first_provision = false`);
+- a stale lease / worker restart mid-bootstrap reconciles to exactly one
+  logical provision, never two;
+- bootstrap run twice against the same container is a no-op the second time;
+- a sealed release artifact renders, passes the sanitation scan, and promotes
+  `candidate` → `available`; a plan cannot select a `candidate` release.
+
+Exit gate: a failed provision is recovered through a documented endpoint with
+no manual DB changes; a worker restart mid-bootstrap does not double-provision;
+a sealed, scanned release artifact is promoted and selected by the planner.
 
 ### Sprint 5 — Organizer profile, Trip Context Gateway, and Telegram routing
 
@@ -556,11 +690,53 @@ Build:
   has no reliable, server-verified way to learn its own chat id, so
   `interview.ts`'s `telegramChatIdHint` (migration 0022) is necessarily an
   LLM-relayed, unverified value in the meantime, not a substitute for this.
+- **Consider: a web signup for organizers (landing SPA).** This sprint owns
+  organizer identity and interview-mode entry, which makes it the cheapest
+  place to add a non-Telegram account signup that hands off to the existing
+  intake flow — the standing "provisioned sites / console have no login"
+  gap. Scope and the intake-hand-off decision are in §5's Landing SPA note
+  (point 3); pull it in here only if it lands without stretching the sprint.
+- **Interview UX and correctness** — the batch of interview-side issues from the
+  first live signup run (`docs/signup-test-execution-capture (Manual).md`'s
+  status ledger: General #1–4, Step 2 #1–3, Step 3 #1–13). Folded here because
+  this sprint already rebuilds the interviewer as a router mode. In scope:
+  - localise `clarify` option labels to the organizer's language — they render
+    in Hebrew regardless today (General #3);
+  - drop the "(Recommended)" tag on constraint-type answers — dates, headcount,
+    organizer identity — where a recommendation is meaningless (Step 2 #3b,
+    Step 3 #2); buttons only, no numbered list echoed in the message text
+    (Step 3 #1);
+  - derive headcount from the traveler roster instead of the separate confusing
+    `group_size` question; derive duration from the dates where they're known
+    (Step 3 #3, #4);
+  - allow multiple planned-order answers, with a flight-details option on flight
+    days (Step 3 #8);
+  - let the interviewer read a pasted link / scrape a page without prompting the
+    organizer for approval (Step 3 #5, #6);
+  - say plainly that day-by-day itinerary help lives on the trip bot and this
+    interview is for structure (Step 3 #10);
+  - prompt for the English spelling of non-Latin traveller names — the
+    transformer already honours `name_en`/`family_en` when supplied (Step 3 #13);
+  - LLM-parse an answer that doesn't parse deterministically, carry extra detail
+    forward to later questions, and reconcile the spoken end-summary against the
+    stored intake after CONFIRM (General #4); also fix `derive_trip_slug`'s
+    `"trip"` fallback to use the first phase name before a generic word;
+  - close the post-CONFIRM dead end with a link to the site / bot (Step 3 #11 —
+    same root as the router work above);
+  - **two bugs to reproduce and fix**: the dietary step threw an error
+    (Step 3 #7); schedule/planned-order failed to submit (Step 3 #9).
+  Out of scope, homed elsewhere: per-user Telegram info-message logging
+  (General #1) → Sprint 6 analytics; driving the approval gates from the Hermes
+  profile via MCP (Step 3 #12) → exploration, unscheduled.
 
 Automated tests:
 
 - organizer-profile bundle versioning, structured memory consent and Trip
   Context Gateway scoping;
+- `clarify` option labels render in the organizer's language; headcount is
+  derived from the roster with no separate `group_size` prompt; the dietary
+  step and a planned-order submission both succeed (regressions for Step 3
+  #7 / #9);
 - two-trip router matrix: two groups may reach the same organizer profile, but
   use isolated sessions and different server-issued trip contexts; cross-trip
   reads/writes and private-memory leakage fail;
@@ -600,6 +776,13 @@ Build:
 - Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
   release/resource versions, redacted failures, health, audit trail and
   bounded analytics. Add suspend/retry controls with server-side authorization.
+  This dashboard stays **operator-only**. The **organizer-facing** view — the
+  landing SPA now in-tree at `web/` — reads the same aggregator but through a
+  separate, organizer-scoped projection and its own auth surface. Whether that
+  projection is built here (cheap once the aggregator exists) or deferred to
+  the post-MVP web track is an open decision — see §5's Landing SPA note
+  (points 1–2), `docs/landing-page-plan.md`,
+  `docs/web-control-plane-integration-plan.md`.
 - Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
@@ -786,13 +969,56 @@ their interfaces: release manifests, resource IDs, secret references,
 selection, service-connection capabilities, consent/provenance-labelled
 imports/feedback and lifecycle events are required in the first schema.
 
-Defer also the release-hardening work originally scoped for Sprint 4: the
-immutable release-artifact renderer (build pipeline, sanitation scan, sealed
-manifest), release promotion rules (`candidate` → `available`), and dedicated
-compute/persistent-data/secret adapter abstractions. The acceptance test in
-Sprint 4 uses the existing `kinerary-deploy` infrastructure and a seeded
-development release record. The hardening sprint belongs after the first
-successful end-to-end run proves the vertical path — not before it.
+The release-hardening work originally scoped for Sprint 4 — the immutable
+release-artifact renderer (build pipeline, sanitation scan, sealed manifest),
+release promotion rules (`candidate` → `available`), and dedicated
+compute/persistent-data/secret adapter abstractions — is now **Sprint 4.7 —
+Provisioning hardening**, which runs after the first successful end-to-end run
+proves the vertical path. The Sprint 4 acceptance test deliberately uses the
+existing `kinerary-deploy` infrastructure and a seeded development release
+record until then.
+
+**Landing SPA (`web/`).** The organizer-facing web console lives in `web/` — a
+Vite/React SPA with a public landing page, account signup/sign-in, and a
+trips-list view. It is merged in from `feat/landing-spa` (kept aligned with
+that branch) so it evolves on this line rather than diverging. The SPA ships
+here **ahead of its control-plane wiring**: the endpoints it calls
+(`web/src/api.ts`) are not yet mounted on this branch's control-plane API.
+Until then the SPA builds and tests in isolation (its own CI job) but is not
+wired to a live control plane. Landing-spa's parallel early control-plane
+implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
+deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
+authoritative.
+
+Three connection points between the SPA and the control plane are **open
+future decisions**. They are recorded here so they are not lost; each is
+revisited in a dedicated post-MVP web track *unless* the note below says a
+coming sprint is the right place to start it:
+
+1. **The SPA as a UI layer over the control plane.** The console needs an
+   organizer-scoped read API — trip list, per-trip lifecycle state, job /
+   blocked-action status, redacted failures — that it renders. This is the
+   same read model Sprint 6's super-admin dashboard builds; the decision is
+   whether to expose an organizer-scoped projection of it *in Sprint 6*
+   (cheap once the aggregator exists) or defer the whole organizer view.
+   Auth model is part of this decision: reuse the organizer identity the
+   control plane already issues, or a separate web session.
+2. **Trip management actions from the SPA.** View state, trigger a
+   re-provision or an intake correction, request activation. The *backends*
+   for these largely have sprint homes already — the re-provision endpoint is
+   **Sprint 4.7**, suspend/retry controls are **Sprint 6** — so the open
+   piece is only the SPA surface and its authorization, which can follow
+   whenever #1 lands.
+3. **Provisioning a new trip from the SPA, and signup.** `NewTripPage.tsx`
+   implies an account-creation → new-trip flow that does **not** go through
+   Telegram. Telegram SSO is permanently ruled out (see the shared-bot
+   decision), so a real web signup for organizers is already a standing gap;
+   the landing page is its natural home. This one **should be considered for
+   Sprint 5**, which already owns organizer identity, the shared router, and
+   interview-mode entry — a web signup that then hands off to the existing
+   intake flow is a smaller addition there than as its own track. What starts
+   the intake (the SPA vs. the Telegram router) and where the organizer's
+   verified chat id is captured are the sub-decisions.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 

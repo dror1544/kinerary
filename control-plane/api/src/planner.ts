@@ -65,10 +65,22 @@ export async function generatePlan(
   const release = releaseRow.rows[0];
   if (!release) return { ok: false, reason: "NO_COMPATIBLE_RELEASE" };
 
+  // Has this trip ever been provisioned successfully? A first provision starts
+  // from clean per-trip data (the NFS media/DB dir outlives a container, so a
+  // failed earlier attempt can leave a stale SQLite users table that blocks
+  // re-seeding); a re-provision replaces a container behind a live trip and
+  // must preserve it. The provisioner reads this from plan.desired.
+  const priorSuccess = await db.query(
+    "SELECT 1 FROM control_plane.jobs WHERE trip_id = $1 AND job_type = 'provision' AND state = 'succeeded' LIMIT 1",
+    [tripId],
+  );
+  const firstProvision = priorSuccess.rows.length === 0;
+
   const desired = {
     release_id: release.id,
     intake_version_id: intake.id,
     intake_digest: intake.digest,
+    first_provision: firstProvision,
     resource_intent: [
       { logical_type: "trip_runtime", isolation_tier: "shared_test" },
     ],

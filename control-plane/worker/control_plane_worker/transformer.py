@@ -65,6 +65,7 @@ still missing.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -298,6 +299,13 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     return brand, title
 
 
+def intake_destination(data: Mapping[str, Any]) -> str:
+    """The organizer's raw destination answer, e.g. "Japan" or "Tokyo, Kyoto &
+    Osaka". Empty string if unanswered. The enrichment pass needs this and the
+    transformed config doesn't keep it verbatim."""
+    return _text_value(data.get("destination", {})).strip()
+
+
 def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
     """Derive a human-readable trip slug from the confirmed intake.
 
@@ -343,7 +351,12 @@ def _derive_participants_and_families(travelers: list[Any]) -> tuple[list[dict[s
         if not name:
             continue
         name_en = str(raw.get("name_en") or name).strip()
-        family_key = _slugify(str(raw.get("family") or "traveler"))
+        # family_en mirrors name_en. Without it a Hebrew-only household name
+        # slugified to nothing (so the family id fell back to the literal
+        # "traveler") and its English label was the Hebrew string.
+        family_raw = str(raw.get("family") or "traveler")
+        family_en = str(raw.get("family_en") or family_raw).strip()
+        family_key = _slugify(family_en)
 
         username = _slugify(name_en or name)
         if username in used_usernames:
@@ -356,7 +369,7 @@ def _derive_participants_and_families(travelers: list[Any]) -> tuple[list[dict[s
             families_by_key[family_key] = {
                 "id": family_key,
                 "letter": letter,
-                "name": {"he": str(raw.get("family") or family_key), "en": str(raw.get("family") or family_key)},
+                "name": {"he": family_raw, "en": family_en},
                 "members": [],
                 "phases": "all",
                 "_color": color,
@@ -599,12 +612,10 @@ def _derive_agent(
     return agent or None
 
 
-def _phase_note_text(short: str, originals: list[str]) -> str:
-    """Joins whichever original phase name(s) carried more than just the
-    short label into one note. Context trimmed from the title (an event, a
-    sub-group, a route detail) isn't discarded — it belongs in the site's
-    phase detail view, not a nav tab, so it's kept here instead.
-    """
+def _phase_extra_context(short: str, originals: list[str]) -> str:
+    """Whatever the original phase name(s) carried beyond the short label — an
+    event, a sub-group, a route detail. Not discarded: it belongs in the phase
+    detail view, appended to the blurb below."""
     seen: set[str] = set()
     unique: list[str] = []
     for original in originals:
@@ -616,11 +627,157 @@ def _phase_note_text(short: str, originals: list[str]) -> str:
     return "; ".join(unique)
 
 
+def _fmt_phase_day(value: date, he: bool) -> str:
+    if he:
+        return f"{value.day}.{value.month}"
+    return value.strftime("%-d %b")
+
+
+def _phase_note_text(
+    short: str,
+    originals: list[str],
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    hotel: str = "",
+    day_count: int = 0,
+    lang: str = "en",
+) -> str:
+    """A short readable phase-detail blurb instead of a raw name dump: leads
+    with the stay (nights + dates), names the hotel, says how many days are
+    planned, and appends any real context trimmed from the phase name."""
+    he = lang == "he"
+    parts: list[str] = []
+    if start and end:
+        nights = (end - start).days
+        if nights >= 1:
+            span = f"{_fmt_phase_day(start, he)}–{_fmt_phase_day(end, he)}"
+            parts.append(
+                f"{nights} לילות ב{short}, {span}" if he
+                else f"{nights} night{'s' if nights != 1 else ''} in {short}, {span}"
+            )
+    if hotel:
+        parts.append(f"לינה ב{hotel}" if he else f"Staying at {hotel}")
+    if day_count:
+        parts.append(
+            f"{day_count} ימים מתוכננים" if he
+            else f"{day_count} day{'s' if day_count != 1 else ''} planned"
+        )
+    extra = _phase_extra_context(short, originals)
+    if extra:
+        parts.append(extra)
+    return ". ".join(p for p in parts if p)
+
+
+_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _plain(value: Any) -> str:
+    """Angle brackets stripped. The site renders config `days` text through
+    `_biSpan`, which emits it as raw HTML (deliberate for hand-authored config),
+    so anything that reaches `phases[].days[]` from an LLM must not carry markup.
+    The `extract_itinerary` MCP tool sanitises first; this is the backstop for a
+    `days` payload that arrives some other way (e.g. `intake/correct`).
+    """
+    return re.sub(r"[<>]", "", str(value or "")).strip()
+
+
+def _bilingual_text(obj: Any) -> dict[str, str] | None:
+    """Normalise a {he,en} pair: strip markup, mirror the present side onto the
+    missing one, and return None when both sides are empty."""
+    if not isinstance(obj, Mapping):
+        return None
+    he, en = _plain(obj.get("he")), _plain(obj.get("en"))
+    if not he and not en:
+        return None
+    return {"he": he or en, "en": en or he}
+
+
+def _normalise_days(
+    raw_days: Any, start: date | None, end: date | None,
+) -> list[dict[str, Any]]:
+    """Turn a phases[].days intake payload into the site's config shape:
+    [{date, label?:{he,en}, items:[{time:"HH:MM"|None, text:{he,en}}]}].
+
+    Drops a day whose date is unparseable or (when the phase has a range)
+    outside it, and a day left with no valid items. An item keeps its `time`
+    only if it is exactly HH:MM, and is dropped if its text is empty in both
+    languages.
+    """
+    if not isinstance(raw_days, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in raw_days:
+        if not isinstance(raw, Mapping):
+            continue
+        when = _parse_iso_date(raw.get("date"))
+        if not when:
+            continue
+        if start and end and not (start <= when <= end):
+            continue
+        items: list[dict[str, Any]] = []
+        for raw_item in raw.get("items") or []:
+            if not isinstance(raw_item, Mapping):
+                continue
+            text = _bilingual_text(raw_item.get("text"))
+            if not text:
+                continue
+            raw_time = str(raw_item.get("time") or "").strip()
+            items.append({
+                "time": raw_time if _TIME_RE.match(raw_time) else None,
+                "text": text,
+            })
+        if not items:
+            continue
+        day: dict[str, Any] = {"date": when.isoformat(), "items": items}
+        label = _bilingual_text(raw.get("label"))
+        if label:
+            day["label"] = label
+        out.append(day)
+    out.sort(key=lambda d: d["date"])
+    return out
+
+
+_HTTP_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
+    """Turn a phases[].venues intake payload into the site's config shape:
+    [{id, name:{he,en}, url?, area?}]. Deduped by english name, capped, `url`
+    kept only if it is a real http(s) link."""
+    if not isinstance(raw_venues, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for raw in raw_venues:
+        if not isinstance(raw, Mapping) or len(out) >= 12:
+            continue
+        name = _bilingual_text(raw.get("name"))
+        if not name or name["en"].lower() in seen_names:
+            continue
+        seen_names.add(name["en"].lower())
+        vid = _slug_words(name["en"])[:40] or f"venue{len(out)}"
+        if vid in seen_ids:
+            vid = f"{vid}-{len(out)}"
+        seen_ids.add(vid)
+        venue: dict[str, Any] = {"id": vid, "name": name}
+        url = _plain(raw.get("url"))
+        if _HTTP_URL_RE.match(url):
+            venue["url"] = url
+        area = _plain(raw.get("area"))
+        if area:
+            venue["area"] = area
+        out.append(venue)
+    return out
+
+
 def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
-    shape — logistics fields only (id/title/dates/accommodation/note). Hero
-    images, map coordinates and day-by-day itineraries need external lookups
-    this transformer deliberately doesn't perform (see module docstring).
+    shape — logistics fields, plus a day-by-day `days[]` when the intake
+    carries one (extracted from an uploaded plan document at interview time).
+    Hero images and map coordinates still need external lookups this
+    transformer deliberately doesn't perform (see module docstring).
 
     Consecutive stops that shorten to the same location (a group split like
     "Dallas (boys...)" immediately followed by "Dallas (all travelers)") are
@@ -645,6 +802,8 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             "start": _parse_iso_date(raw.get("start")),
             "end": _parse_iso_date(raw.get("end")),
             "accommodation": raw.get("accommodation"),
+            "days": raw.get("days") if isinstance(raw.get("days"), list) else [],
+            "venues": raw.get("venues") if isinstance(raw.get("venues"), list) else [],
         })
 
     merged: list[dict[str, Any]] = []
@@ -658,6 +817,8 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             prev["accommodation"] = prev["accommodation"] or entry["accommodation"]
             prev["notes_he"].append(entry["full_he"])
             prev["notes_en"].append(entry["full_en"])
+            prev["days"] = prev["days"] + entry["days"]
+            prev["venues"] = prev["venues"] + entry["venues"]
         else:
             entry["notes_he"] = [entry["full_he"]]
             entry["notes_en"] = [entry["full_en"]]
@@ -689,13 +850,123 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             if accommodation.get("confirmation"):
                 phase["accommodation"]["confirmation"] = str(accommodation["confirmation"])
 
-        note_he = _phase_note_text(entry["short_he"], entry["notes_he"])
-        note_en = _phase_note_text(entry["short_en"], entry["notes_en"])
+        days = _normalise_days(entry["days"], entry["start"], entry["end"])
+        if days:
+            phase["days"] = days
+
+        venues = _normalise_venues(entry["venues"])
+        if venues:
+            phase["venues"] = venues
+
+        acc_for_note = phase.get("accommodation") or {}
+        hotel_he = str(acc_for_note.get("name") or "")
+        hotel_en = str(acc_for_note.get("name_en") or acc_for_note.get("name") or "")
+        note_he = _phase_note_text(
+            entry["short_he"], entry["notes_he"],
+            start=entry["start"], end=entry["end"],
+            hotel=hotel_he, day_count=len(days), lang="he",
+        )
+        note_en = _phase_note_text(
+            entry["short_en"], entry["notes_en"],
+            start=entry["start"], end=entry["end"],
+            hotel=hotel_en, day_count=len(days), lang="en",
+        )
         if note_he or note_en:
             phase["note"] = {"he": note_he or note_en, "en": note_en or note_he}
 
         result.append(phase)
     return result
+
+
+_BUDGET_CATEGORIES = {"flight", "hotel", "car", "attraction", "food", "insurance", "other"}
+
+
+def _derive_budget(
+    data: Mapping[str, Any], phases: list[dict[str, Any]], default_party_size: int,
+) -> dict[str, Any] | None:
+    """Project the optional budget_detail answer into config.budget — the shape
+    server.js seeds budget_items from (seed_items[]) plus the phase_labels /
+    phases / party_size the site's Budget tab needs. Returns None when the
+    organizer didn't give a budget."""
+    raw = _structured_dict(data, "budget_detail")
+    items = raw.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+
+    # Match a free-text phase reference to a real phase id, its title, or the
+    # two synthetic buckets the reference config also uses.
+    by_key: dict[str, str] = {}
+    labels: dict[str, dict[str, str]] = {}
+    for phase in phases:
+        pid = phase["id"]
+        title = phase.get("title") or {}
+        labels[pid] = {"he": str(title.get("he") or pid), "en": str(title.get("en") or pid)}
+        for key in (pid, str(title.get("en") or ""), str(title.get("he") or "")):
+            if key.strip():
+                by_key[key.strip().lower()] = pid
+    labels["intl_flights"] = {"he": "✈️ טיסות", "en": "✈️ Flights"}
+    labels["other"] = {"he": "שונות", "en": "Other"}
+
+    seed_items: list[dict[str, Any]] = []
+    used: list[str] = []
+    seen_keys: set[str] = set()
+    for entry in items:
+        if not isinstance(entry, Mapping):
+            continue
+        category = str(entry.get("category") or "").strip().lower()
+        if category not in _BUDGET_CATEGORIES:
+            category = "other"
+        description = _plain(entry.get("description"))[:200]
+        if not description:
+            continue
+        try:
+            amount = max(0.0, float(entry.get("amount") or 0))
+        except (TypeError, ValueError):
+            amount = 0.0
+        is_estimate = bool(entry.get("estimate")) or amount == 0
+
+        ref = str(entry.get("phase") or "").strip().lower()
+        phase_id = by_key.get(ref)
+        if not phase_id:
+            phase_id = "intl_flights" if category == "flight" else (
+                phases[0]["id"] if phases else "other"
+            )
+        if phase_id not in used:
+            used.append(phase_id)
+
+        seed_key = f"intake-{phase_id}-{category}-{_slugify(description)[:24] or 'x'}"
+        if seed_key in seen_keys:
+            seed_key = f"{seed_key}-{len(seed_items)}"
+        seen_keys.add(seed_key)
+        seed_items.append({
+            "phase": phase_id,
+            "category": category,
+            "description": description,
+            "amount": amount,
+            "is_estimate": is_estimate,
+            "seed_key": seed_key,
+        })
+
+    if not seed_items:
+        return None
+
+    # Order: flights first, real phases in trip order, "other" last.
+    order = [p for p in (["intl_flights"] + [ph["id"] for ph in phases] + ["other"]) if p in used]
+    try:
+        party_size = int(raw.get("party_size"))
+    except (TypeError, ValueError):
+        party_size = default_party_size or 0
+
+    budget: dict[str, Any] = {
+        "party_size": party_size or 1,
+        "phases": order,
+        "phase_labels": {pid: labels[pid] for pid in order},
+        "seed_items": seed_items,
+    }
+    currency = _plain(raw.get("currency"))[:8]
+    if currency:
+        budget["currency"] = currency
+    return budget
 
 
 def transform_intake(
@@ -784,6 +1055,7 @@ def transform_intake(
             # any USD-destination trip, home == destination).
             "homeCurrency": "ILS",
         },
+
         "theme": {
             "palette": "blue",
             "font": "inter",
@@ -815,4 +1087,164 @@ def transform_intake(
             },
         }
 
+    # meta.home_country drives enrich_config's consular lookup (whose embassy).
+    # Israel is the default there; only written when the organizer answered the
+    # optional question.
+    home_country = _text_value(data.get("home_country", {})).strip()
+    if home_country:
+        config["meta"]["home_country"] = home_country[:80]
+
+    budget = _derive_budget(data, phases, len(participants))
+    if budget:
+        config["budget"] = budget
+
     return config
+
+
+_ANCHOR_MONTHS: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+_ANCHOR_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b"      # 20 Sep 2026
+    r"|\b(\d{4})-(\d{2})-(\d{2})\b"                       # 2026-09-25
+)
+
+# Interview anchor `type` values are free-ish; map the ones seen in real
+# intakes onto the site's bookings table vocabulary, which is a hard
+# CHECK(type IN ('flight','hotel','car','attraction','other')) — anything
+# outside it is silently dropped by the seed's INSERT OR IGNORE, so an
+# unrecognised type must fall through to "other", never pass straight through.
+_BOOKING_TYPES = frozenset({"flight", "hotel", "car", "attraction", "other"})
+_ANCHOR_TYPE_MAP: dict[str, str] = {
+    "flight": "flight",
+    "hotel": "hotel",
+    "accommodation": "hotel",
+    "car": "car",
+    "rental": "car",
+    "activity": "attraction",
+    "attraction": "attraction",
+    "tour": "attraction",
+    "reservation": "attraction",
+    "ticket": "attraction",
+    "excursion": "attraction",
+    "proposal": "other",
+    "booking": "other",
+}
+
+
+def _extract_anchor_date(text: str) -> date | None:
+    """First date mentioned in an anchor's free-text detail, or None.
+
+    Recognises "20 Sep 2026" and "2026-09-25"; anything else (a bare "next
+    spring", a date with no year) stays undated rather than guessed.
+    """
+    match = _ANCHOR_DATE_RE.search(text or "")
+    if not match:
+        return None
+    if match.group(1):
+        month = _ANCHOR_MONTHS.get(match.group(2).lower())
+        if not month:
+            return None
+        try:
+            return date(int(match.group(3)), month, int(match.group(1)))
+        except ValueError:
+            return None
+    try:
+        return date(int(match.group(4)), int(match.group(5)), int(match.group(6)))
+    except ValueError:
+        return None
+
+
+def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
+    """The id of the phase whose date range contains `when`.
+
+    Phases share boundary dates (one ends the day the next begins), so the
+    range is treated half-open at the end, then inclusive as a fallback for a
+    date landing on the very last day of the trip.
+    """
+    for closed_end in (False, True):
+        for phase in phases:
+            dates = phase.get("dates") or {}
+            start = _parse_iso_date(dates.get("start"))
+            end = _parse_iso_date(dates.get("end"))
+            if not start or not end:
+                continue
+            if start <= when < end or (closed_end and start <= when <= end):
+                return str(phase.get("id")) or None
+    return None
+
+
+def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build bookings.json rows from an already-transformed config plus the raw
+    intake answers.
+
+    Two sources, both otherwise lost to the site:
+      * one `hotel` row per phase that has an accommodation — carrying whatever
+        confirmation the intake had, or `null` so the row still shows as
+        "not confirmed" rather than being omitted;
+      * one row per `travel_anchors[]` entry (dated activity tickets, a tour
+        proposal), typed via _ANCHOR_TYPE_MAP, with any date parsed out of the
+        free text and mapped back to the phase it falls in.
+
+    Every row carries a deterministic `seed_key` so re-provisioning the same
+    intake is idempotent against the site's `INSERT OR IGNORE ... seed_key`.
+
+    `bookings.phase` is `TEXT NOT NULL` on the site, so an anchor that maps to
+    no phase (undated, or a whole-trip proposal) is parked on the first phase
+    rather than dropped — it still shows on the Bookings tab, which is the
+    point.
+    """
+    phases = list(config.get("phases") or [])
+    fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
+    bookings: list[dict[str, Any]] = []
+
+    for phase in phases:
+        accommodation = phase.get("accommodation")
+        if not isinstance(accommodation, dict) or not accommodation.get("name"):
+            continue
+        dates = phase.get("dates") or {}
+        bookings.append({
+            "phase": str(phase.get("id")) or None,
+            "type": "hotel",
+            "name": str(accommodation.get("name_en") or accommodation["name"]),
+            "date_from": dates.get("start"),
+            "date_to": dates.get("end"),
+            "passengers": None,
+            "confirmation": accommodation.get("confirmation"),
+            "notes": None,
+            "cost": 0,
+            "seed_key": f"hotel_{phase.get('id')}",
+        })
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
+        anchor_type = str(raw.get("type") or "").strip().lower()
+        if not detail and not anchor_type:
+            continue
+        # A "proposal" is a whole-trip quote, not a dated item — any date inside
+        # it is a range endpoint, so don't pin it to a single day or phase.
+        when = None if anchor_type == "proposal" else _extract_anchor_date(detail)
+        name = _shorten_phase_name(detail, max_length=60) if detail else ""
+        phase_id = _phase_id_for_date(phases, when) if when else None
+        bookings.append({
+            "phase": phase_id or fallback_phase,
+            "type": _ANCHOR_TYPE_MAP.get(anchor_type, "other"),
+            "name": name or anchor_type.title() or "Booking",
+            "date_from": when.isoformat() if when else None,
+            "date_to": None,
+            "passengers": None,
+            "confirmation": raw.get("confirmation"),
+            "notes": detail or None,
+            "cost": 0,
+            "seed_key": "anchor_" + hashlib.sha1(
+                (detail or anchor_type).encode("utf-8")
+            ).hexdigest()[:10],
+        })
+
+    return bookings

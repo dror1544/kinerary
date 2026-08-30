@@ -3,7 +3,13 @@ from __future__ import annotations
 import re
 import unittest
 
-from provisioning.adapters import CloudflareTunnelDnsAdapter, NpmProxyHostAdapter, ProxmoxLxcAdapter
+from provisioning.adapters import (
+    CloudflareTunnelDnsAdapter,
+    NpmProxyHostAdapter,
+    ProxmoxLxcAdapter,
+    SubprocessSshTransport,
+    _truncate_middle,
+)
 from provisioning.models import CloudflareSpec, LxcSpec, ProxySpec
 
 
@@ -93,6 +99,8 @@ class FakeProxmoxSsh:
             return self.nextid + "\n"
         if command.startswith("mkdir -p "):
             return ""
+        if command.startswith("rm -rf "):
+            return ""
         if command.startswith("pct create ") and " && pct start " in command:
             return ""
         if command.startswith("pct stop "):
@@ -138,6 +146,14 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("ip=192.168.0.60/24", create_and_start)
         self.assertIn("--nameserver 192.168.0.41", create_and_start)
         self.assertIn("--mp0 /mnt/pve/truenas-nfs/tokyo-2026,mp=/nfs/tokyo-2026", create_and_start)
+        # PRIVILEGED, and not by preference: `pct create` defaults to
+        # unprivileged, where container root maps to host uid 100000, so the
+        # root-owned mp0 NFS directory mounts as nobody:nogroup and the
+        # bootstrap's own `mkdir -p <mount>/media/avatars` gets EACCES. Every
+        # real trip container (CT200/201/202) is privileged for this reason.
+        # Found 2026-08-28 when the first adapter-created container (CT101)
+        # died exactly there, mid-bootstrap.
+        self.assertIn("--unprivileged 0", create_and_start)
         self.assertIn("&& pct start 203", create_and_start)
 
         # deploy.sh assumes nginx/Node/the systemd unit/.env already exist —
@@ -150,6 +166,120 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("ln -sfn /nfs/tokyo-2026/media/avatars /opt/kinerary/site/avatars", bootstrap)
         self.assertIn("listen 8080", bootstrap)
         self.assertIn("systemctl enable nginx kinerary-server", bootstrap)
+        # The debian-12 template generates only C.utf8, so every apt/perl call
+        # emits multi-line "Setting locale failed" warnings. Harmless in
+        # themselves, but they filled the truncated stderr this transport
+        # reports on failure and hid the real error (the EACCES above) behind
+        # pure noise. Pin a locale that exists.
+        self.assertIn("LANG=C.UTF-8", bootstrap)
+        # server/package.json depends on better-sqlite3, a native module. When
+        # no prebuilt binary matches, npm falls back to node-gyp, which needs a
+        # compiler — so `deploy.sh`'s own `npm install --production` dies on a
+        # container that has none. Every hand-built trip container (CT201) has
+        # these; CT101, the first adapter-built one, did not. Found 2026-08-28.
+        self.assertIn("build-essential", bootstrap)
+        # No seed password configured -> the site keeps its safe default of
+        # per-user random passwords.
+        self.assertNotIn("SEED_PASSWORD", bootstrap)
+        # A HERMES_API_KEY is always written so the site can accept agent/MCP
+        # calls at all — without it the Sprint 5 companion wiring would have to
+        # redeploy every container just to add one. Generated locally on the
+        # container (never sent over the wire), like JWT_SECRET.
+        self.assertIn("HERMES_API_KEY=${HERMES_API_KEY}", bootstrap)
+        self.assertRegex(bootstrap, r"HERMES_API_KEY=\$\(head -c 32 /dev/urandom")
+
+    def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
+        # Without it a provisioned site has NO way in at all: Telegram SSO is
+        # ruled out by the shared-bot routing, Google is unconfigured, and
+        # server.js seeds unrecoverable random passwords when SEED_PASSWORD is
+        # unset — and only ever seeds while the users table is empty, so it
+        # cannot be fixed after the fact. Confirmed live on CT101 2026-08-28.
+        ssh = FakeProxmoxSsh(nextid="203")
+        adapter = ProxmoxLxcAdapter(ssh, seed_password="s3cret pw$x")
+
+        adapter.create(LXC_SPEC)
+
+        bootstrap = ssh.commands[3]
+        # Shell-quoted, and appended rather than interpolated into the heredoc:
+        # that heredoc is unquoted so ${...} expands, which would corrupt any
+        # password containing a dollar sign.
+        self.assertIn("'s3cret pw$x'", bootstrap)
+        self.assertIn("SEED_PASSWORD=%s", bootstrap)
+
+    def test_connect_timeout_and_command_timeout_are_independent(self) -> None:
+        # Regression: one `timeout` served as BOTH the ssh ConnectTimeout and
+        # the whole subprocess deadline (timeout + 15 = 35s). The bootstrap
+        # installs build-essential plus a Node toolchain, which takes minutes,
+        # so every real container creation was killed mid-apt on 2026-08-28.
+        # A connection that stalls 20s is dead; a command that runs 5 minutes
+        # is just apt. They cannot share a number.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
+            transport.run("apt-get install -y build-essential")
+
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertIn("ConnectTimeout=20", argv)
+        self.assertGreaterEqual(kwargs["timeout"], 600)
+
+    def test_truncated_stderr_keeps_the_tail_where_the_real_error_lives(self) -> None:
+        # Regression: head-only truncation reported 500 chars of apt/perl
+        # locale warnings and dropped the EACCES that actually failed the run.
+        noise = "perl: warning: Setting locale failed.\n" * 40
+        message = _truncate_middle(noise + "mkdir: cannot create directory '/nfs/x': Permission denied")
+
+        self.assertIn("Permission denied", message)
+        self.assertIn("chars omitted", message)
+        self.assertLess(len(message), len(noise))
+
+    def test_short_stderr_is_passed_through_whole(self) -> None:
+        self.assertEqual("boom", _truncate_middle("  boom\n"))
+
+    def test_ssh_failure_falls_back_to_stdout_when_stderr_is_empty(self) -> None:
+        # A remote command that fails while writing its diagnostics to stdout
+        # (many do — apt, git, deploy.sh) left the RuntimeError with nothing
+        # after the colon. Prefer stderr, fall back to stdout.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=2, stdout="fatal: repository not found\n", stderr="")
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("git pull")
+        self.assertIn("repository not found", str(caught.exception))
+        self.assertIn("exit 2", str(caught.exception))
+
+    def test_reset_data_wipes_server_data_and_media_before_anything_else(self) -> None:
+        # The NFS dir outlives a container, so a failed earlier provision can
+        # leave a stale SQLite users table that server.js seeds only once and
+        # never migrates. A first provision must start clean. Found 2026-08-28.
+        ssh = FakeProxmoxSsh(nextid="203")
+        adapter = ProxmoxLxcAdapter(ssh, reset_data=True)
+
+        adapter.create(LXC_SPEC)
+
+        self.assertEqual(
+            "rm -rf /mnt/pve/truenas-nfs/tokyo-2026/server-data /mnt/pve/truenas-nfs/tokyo-2026/media",
+            ssh.commands[0],
+        )
+        self.assertEqual(f"mkdir -p {LXC_SPEC.nfs_host_dir}", ssh.commands[1])
+
+    def test_reset_data_defaults_off(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+
+        self.assertFalse(any(c.startswith("rm -rf") for c in ssh.commands))
+
+    def test_reset_data_refuses_a_dir_with_no_slug_segment(self) -> None:
+        # An empty or "/" nfs_host_dir would make the rm -rf target the shared
+        # NFS root (or worse, "/"). Refuse before running anything.
+        adapter = ProxmoxLxcAdapter(FakeProxmoxSsh(), reset_data=True)
+        for bad in ("", "/", "//"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    adapter._reset_trip_data(bad)
 
     def test_proxmox_delete_stops_and_destroys_when_found(self) -> None:
         ssh = FakeProxmoxSsh()

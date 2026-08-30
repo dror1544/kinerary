@@ -129,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     gateway=os.environ.get("PROXMOX_GATEWAY", "192.168.0.1"),
                     nameserver=os.environ.get("PROXMOX_NAMESERVER", "192.168.0.41"),
+                    # Shared onboarding password for a new site's participants.
+                    # Unset keeps server.js's safe default (independent random
+                    # per-user passwords) — but note that with Telegram SSO
+                    # ruled out and Google unconfigured, unset currently means
+                    # the provisioned site has no login path at all. A real
+                    # member/organizer signup flow is the actual fix; this is a
+                    # stopgap so a provisioned trip is reachable.
+                    seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                 )
@@ -154,9 +162,70 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 companion_adapter = NullCompanionProfileAdapter()
                 mcp_bridge_adapter = NullMcpBridgeAdapter()
+            from .enrichment import enrich_config
+            import re as _re
+
+            def _consular_lookup(destination: str, home_country: str):
+                """Read-only view of control_plane.country_reference, populated
+                by interview-mcp's lookup_consular_contacts. A miss (or any DB
+                error) returns None and enrich_config just skips the contacts."""
+                dest = _re.sub(r"\s+", " ", destination).strip().lower()
+                home = _re.sub(r"\s+", " ", home_country).strip().lower()
+                try:
+                    import psycopg
+                    with psycopg.connect(db_url) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT contacts FROM control_plane.country_reference "
+                                "WHERE destination_country = %s AND home_country = %s",
+                                (dest, home),
+                            )
+                            row = cur.fetchone()
+                    if row and isinstance(row[0], list):
+                        return row[0]
+                except Exception:
+                    return None
+                return None
+
+            def _venue_lookup(destination: str, names: list):
+                """Read-only view of control_plane.venue_links (resolved rows
+                only), populated by interview-mcp / the API's retry drain. Fills
+                a venue's ticket/official URL when the interview-time search was
+                rate-limited. A miss or any DB error returns None."""
+                dest = _re.sub(r"\s+", " ", destination).strip().lower()
+                wanted = [_re.sub(r"\s+", " ", str(n)).strip().lower() for n in names if str(n).strip()]
+                if not dest or not wanted:
+                    return None
+                try:
+                    import psycopg
+                    with psycopg.connect(db_url) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT venue_name, url FROM control_plane.venue_links "
+                                "WHERE destination = %s AND url IS NOT NULL "
+                                "AND venue_name = ANY(%s)",
+                                (dest, wanted),
+                            )
+                            rows = cur.fetchall()
+                    return {name: url for name, url in rows}
+                except Exception:
+                    return None
+
+            def _enrich(config, destination):
+                return enrich_config(
+                    config, destination,
+                    consular_lookup=_consular_lookup,
+                    venue_lookup=_venue_lookup,
+                )
+
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,
                 companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
+                # Live destination enrichment (currency/emergency/coords/hero,
+                # plus consular contacts from the cross-trip reference store).
+                # Always on in a real run: it self-guards and degrades to "no
+                # enrichment", never a failure.
+                enrich=_enrich,
             )
             import signal, time as _time
             stopping = False

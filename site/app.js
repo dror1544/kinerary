@@ -1214,13 +1214,15 @@ function buildMapPopup(s, lang) {
   const dir  = isHe ? 'rtl' : 'ltr';
   const confLabel   = isHe ? 'אישור' : 'Confirmation';
   const privateStay = isHe ? 'לינה פרטית' : 'Private stay';
-  const hasConf = s.conf !== '–';
-  return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">
-    <strong style="font-size:1.05em">${s.emoji} ${name}</strong><br>
-    📅 ${s.dates}<br>
-    🏨 ${s.hotel}<br>
-    ${hasConf ? `✅ ${confLabel}: <code>${s.conf}</code>` : `🏠 ${privateStay}`}
-  </div>`;
+  const hasConf = s.conf && s.conf !== '–';
+  // Enriched stops can arrive without every field; skip a line rather than
+  // print "undefined", and only claim "private stay" when there's no hotel at all.
+  const lines = [`<strong style="font-size:1.05em">${s.emoji || '📍'} ${name}</strong>`];
+  if (s.dates) lines.push(`📅 ${s.dates}`);
+  if (s.hotel) lines.push(`🏨 ${s.hotel}`);
+  if (hasConf) lines.push(`✅ ${confLabel}: <code>${s.conf}</code>`);
+  else if (!s.hotel) lines.push(`🏠 ${privateStay}`);
+  return `<div dir="${dir}" style="min-width:180px;font-family:'Heebo',sans-serif">${lines.join('<br>')}</div>`;
 }
 
 function updateMapPopups(lang) {
@@ -1247,14 +1249,23 @@ function setHero(tabId) {
   if (img) img.style.backgroundImage = `url("${h.photo}")`;
   if (headline) headline.innerHTML = `${h.title}<span class="dot">.</span>`;
   const i18n = h._i18n; // bilingual source from config (preferred over T)
-  if (label) label.textContent = (i18n?.label?.[currentLang]) || tr[`hero_${k}_label`] || h.label;
-  if (sub)   sub.textContent   = (i18n?.sub?.[currentLang])   || tr[`hero_${k}_sub`]   || h.sub;
-  if (blurb) blurb.textContent = (i18n?.blurb?.[currentLang]) || tr[`hero_${k}_blurb`] || h.blurb;
-  if (meta) meta.textContent = h.meta;
+  // A per-phase hero built by provision-time enrichment carries only photo +
+  // title — no label/sub/blurb/cta. `textContent = undefined` prints the literal
+  // word "undefined", so every optional field falls back to '' and the CTA
+  // button hides itself when there is nothing for it to say.
+  if (label) label.textContent = (i18n?.label?.[currentLang]) || tr[`hero_${k}_label`] || h.label || '';
+  if (sub)   sub.textContent   = (i18n?.sub?.[currentLang])   || tr[`hero_${k}_sub`]   || h.sub   || '';
+  if (blurb) blurb.textContent = (i18n?.blurb?.[currentLang]) || tr[`hero_${k}_blurb`] || h.blurb || '';
+  if (meta) meta.textContent = h.meta || '';
   if (cta) {
-    const arrow = currentLang === 'he' ? '←' : '→';
-    const ctaText = (i18n?.cta?.[currentLang]) || tr[`hero_${k}_cta`] || h.cta;
-    cta.innerHTML = `${ctaText} <span class="arrow">${arrow}</span>`;
+    const ctaText = (i18n?.cta?.[currentLang]) || tr[`hero_${k}_cta`] || h.cta || '';
+    if (ctaText) {
+      const arrow = currentLang === 'he' ? '←' : '→';
+      cta.innerHTML = `${ctaText} <span class="arrow">${arrow}</span>`;
+      cta.hidden = false;
+    } else {
+      cta.hidden = true;
+    }
   }
   if (countdown) countdown.style.display = h.countdown ? '' : 'none';
   const heroRight = document.querySelector('.hero-right');
@@ -1507,6 +1518,11 @@ async function loadRatings() {
     const key = ['ny', 'dallas', 'colorado', 'wc'][i];
     renderRatings(id, VENUES[key]);
   });
+  // Config-driven phases: render each phase's venues[] into its own section.
+  // (buildGlobalsFromConfig fills VENUES[phase.id] from phases[].venues.)
+  for (const p of (window.TRIP_CONFIG?.phases || [])) {
+    if (VENUES[p.id]?.length) renderRatings(`ratings-${p.id}`, VENUES[p.id]);
+  }
 }
 
 function buildRatingChips(venueId) {
@@ -1527,15 +1543,21 @@ function renderRatings(containerId, venues) {
     const myRating = currentUser ? (allRatings[v.id]?.[currentUser.username] || 0) : 0;
     const stars = [5, 4, 3, 2, 1].map(n => `<input type="radio" id="${v.id}-s${n}" name="${v.id}" value="${n}" ${myRating == n ? 'checked' : ''}><label for="${v.id}-s${n}">★</label>`).join('');
     const chips = buildRatingChips(v.id);
-    const vname = typeof v.name === 'object' ? (v.name[currentLang] || v.name.he) : v.name;
+    const tr = T[currentLang] || T['he'];
+    const vname = typeof v.name === 'object' ? (v.name[currentLang] || v.name.he || v.name.en) : v.name;
+    const navLinks = [
+      v.maps ? `<a class="btn poi-btn" href="${esc(v.maps)}" target="_blank" rel="noopener">🗺️ ${esc(tr.venue_maps || 'Maps')}</a>` : '',
+      v.waze ? `<a class="btn poi-btn" href="${esc(v.waze)}" target="_blank" rel="noopener">🔵 Waze</a>` : '',
+      /^https?:\/\//i.test(v.url || '') ? `<a class="btn poi-btn" href="${esc(v.url)}" target="_blank" rel="noopener">🎫 ${esc(tr.venue_site || 'Site / tickets')}</a>` : '',
+    ].filter(Boolean).join('');
     return `<div class="rating-card" id="rc-${v.id}">
-      <h4>${vname}</h4>
+      <h4>${esc(vname)}</h4>
+      ${navLinks ? `<div class="poi-links">${navLinks}</div>` : ''}
       <div class="stars">${stars}</div>
-      <textarea class="rating-note" id="note-${v.id}" placeholder="${(T[currentLang]||T['he']).rating_note_ph}"></textarea>
+      <textarea class="rating-note" id="note-${v.id}" placeholder="${esc(tr.rating_note_ph)}"></textarea>
       <br>
-      <button class="save-btn" onclick="saveRating('${v.id}')">${(T[currentLang]||T['he']).rating_save}</button>
-      <span class="saved-msg" id="saved-${v.id}">${(T[currentLang]||T['he']).rating_saved}</span>
-      <a class="trip-link" href="${v.url}" target="_blank">${(T[currentLang]||T['he']).rating_ta_link}</a>
+      <button class="save-btn" onclick="saveRating('${v.id}')">${esc(tr.rating_save)}</button>
+      <span class="saved-msg" id="saved-${v.id}">${esc(tr.rating_saved)}</span>
       <div class="rating-others" id="ro-${v.id}">${chips}</div>
       <button class="vc-toggle" id="vc-toggle-${v.id}" onclick="toggleVenueComments('${v.id}')">💬 ${(T[currentLang]||T['he']).ph_comments}</button>
       <div class="vc-thread" id="vc-thread-${v.id}"></div>
@@ -3032,7 +3054,7 @@ function buildPhaseNav(cfg) {
     sec.innerHTML = `<div class="sec-body"><div class="sec-inner">` +
       `<h2 class="section-h2"><span class="lang-he">${p.title?.he || p.tabLabel}</span>` +
       `<span class="lang-en">${p.title?.en || p.tabLabel}</span></h2>` +
-      (p.note ? `<p class="phase-note">${esc(p.note)}</p>` : '') +
+      (p.note ? `<p class="phase-note"><span class="lang-he">${esc(p.note.he ?? p.note)}</span><span class="lang-en">${esc(p.note.en ?? p.note.he ?? p.note)}</span></p>` : '') +
       `<div id="hotel-${p.id}"></div>` +
       `<div id="sched-${p.id}"></div>` +
       `<div id="rsvp-${p.id}"></div>` +
@@ -3069,7 +3091,7 @@ function buildGlobalsFromConfig(cfg) {
   if (cfg.map?.stops?.length) {
     MAP_STOPS.length = 0;
     cfg.map.stops.forEach(s => MAP_STOPS.push({
-      lat: s.lat, lng: s.lng, emoji: s.emoji,
+      lat: s.lat, lng: s.lng, emoji: s.emoji || '📍',
       name_he: s.name?.he || s.name, name_en: s.name?.en || s.name,
       dates: s.dates, hotel: s.hotel, conf: s.conf, color: '#0a0f1c',
     }));
@@ -3797,9 +3819,12 @@ function _buildPlanItemRow(item, phaseId, tr) {
   // uses: green once a real booking backs it, red while money still has to
   // change hands. Nothing at all when the place needs no ticket, so the
   // schedule doesn't fill up with reassurances.
-  const ticket = item.booking
-    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)}${
-        item.booking.confirmation ? ` · ${esc(item.booking.confirmation)}` : ''}</span>`
+  // Green pill only when a booking with a real confirmation number backs the
+  // line — that is what "✅ confirmed" means here. A booking row echoed from the
+  // intake (hotel name, confirmation: null) is not a confirmed reservation, so
+  // it gets no pill rather than a mysterious bare green check.
+  const ticket = item.booking && item.booking.confirmation
+    ? `<span class="tag g plan-tag" title="${esc(tr.plan_conf_badge)}">✅ ${esc(item.booking.name)} · ${esc(item.booking.confirmation)}</span>`
     : item.needs_tickets
       ? `<span class="tag r plan-tag">⚠️ ${esc(item.advance_booking ? tr.plan_tickets_advance : tr.plan_tickets_needed)}</span>`
       : '';

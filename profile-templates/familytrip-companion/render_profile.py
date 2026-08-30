@@ -40,7 +40,7 @@ def render(d,out):
  group={'schema_version':1,'trip':{k:t[k] for k in ('id','title','default_language','timezone')},'assistant':a,'preferences':d['interview'].get('group_safe',{})}
  private={'schema_version':1,'handoff_id':d['handoff_id'],'trip_ref':d['trip_ref'],'organizer':o,'organizer_private':d['interview'].get('organizer_private',{}),'participant_needs':d['interview'].get('participant_needs',[]),'source':d['source']}
  (out/'references/group-context.json').write_text(json.dumps(group,indent=2,ensure_ascii=False)+'\n'); (out/'references/interview-context.private.json').write_text(json.dumps(private,indent=2,ensure_ascii=False)+'\n')
- (out/'INSTALL.md').write_text('# Install '+d['profile']['name']+'\n\nCreate a fresh profile, copy this overlay, deliberately merge config.overlay.yaml, configure secrets securely, verify live reads/privacy/write read-back, then start the gateway.\n')
+ (out/'INSTALL.md').write_text('# Install '+d['profile']['name']+'\n\nCreate a fresh profile, copy this overlay, deliberately merge config.overlay.yaml, configure secrets securely, verify live reads/privacy/write read-back, then start the gateway.\n\nBefore starting the gateway: read profile-templates/familytrip-companion/README.md "Register with trip-intake" and profile-templates/trip-intake-interviewer/README.md "Doubling as the shared trip-companion host" to check whether trip-intake multiplexing is safe to use yet on this Hermes install. If not, give "'+d['profile']['name']+'" its own dedicated gateway and bot token instead of waiting on trip-intake to route to it.\n')
 def install(bundle,name):
  home=Path.home()/'.hermes/profiles'/name
  if home.exists(): bad(f'refusing to overwrite existing profile: {home}')
