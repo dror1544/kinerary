@@ -46,7 +46,12 @@ function parseCookies(header: unknown): Record<string, string> {
   return Object.fromEntries(header.split(";").flatMap((part) => {
     const index = part.indexOf("=");
     if (index < 1) return [];
-    return [[part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())]];
+    try {
+      return [[part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())]];
+    } catch {
+      // A malformed cookie is untrusted input, not an application error.
+      return [];
+    }
   }));
 }
 
@@ -431,27 +436,6 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/me", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    if (Date.now() - user.sessionCreatedAt.getTime() > 15 * 60 * 1000) {
-      const sessionToken = base64url(32);
-      const csrf = base64url(24);
-      const client = await deps.db.connect();
-      try {
-        await client.query("BEGIN");
-        const revoked = await client.query("UPDATE control_plane.web_sessions SET revoked_at = now() WHERE token_digest = $1 AND revoked_at IS NULL", [user.sessionDigest]);
-        if (revoked.rowCount) await client.query(
-          `INSERT INTO control_plane.web_sessions(id, user_id, token_digest, csrf_digest, expires_at)
-           VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'))`,
-          [opaque("wsess"), user.id, sha256(sessionToken), sha256(csrf), deps.sessionTtlSeconds]);
-        await client.query("COMMIT");
-        if (revoked.rowCount) {
-          const secure = deps.publicOrigin.startsWith("https://");
-          reply.header("set-cookie", [cookie("kit_session", sessionToken, { maxAge: deps.sessionTtlSeconds, secure }), cookie("kit_csrf", csrf, { maxAge: deps.sessionTtlSeconds, httpOnly: false, secure })]);
-        }
-      } catch (error) {
-        await client.query("ROLLBACK");
-        throw error;
-      } finally { client.release(); }
-    }
     return { id: user.id, displayName: user.displayName, isProvisioningAdmin: user.isProvisioningAdmin };
   });
 
@@ -629,11 +613,16 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!participantExists) return reply.code(409).send({ error: "RUNTIME_PARTICIPANT_NOT_FOUND" });
     const token = base64url(32);
     const inviteId = opaque("invite");
-    await deps.db.query(
-      `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days')`,
-      [inviteId, tripId, user.id, displayName, runtimeUsername, sha256(token)],
-    );
+    try {
+      await deps.db.query(
+        `INSERT INTO control_plane.site_invites(id, trip_id, created_by, intended_display_name, runtime_username, token_digest, state, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'unused', now() + interval '7 days')`,
+        [inviteId, tripId, user.id, displayName, runtimeUsername, sha256(token)],
+      );
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "INVITE_ALREADY_EXISTS" });
+      throw error;
+    }
     return reply.code(201).send({ id: inviteId, status: "unused", joinUrl: `${deps.publicOrigin}/join#token=${token}` });
   });
 
@@ -668,11 +657,16 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const token = body.token;
     const method = body.method;
     if (typeof token !== "string" || (method !== "google" && method !== "password")) return reply.code(400).send({ error: "INVALID_REQUEST" });
-    const signedIn = await portalUser(request, deps);
+    let signedIn = await portalUser(request, deps);
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
     const runtimeCredential: { googleSubjectDigest?: string; password?: string } = {};
     if (method === "google") {
+      // Google redemption acts through an existing browser session, so it is
+      // a state-changing request and must prove the session's CSRF secret.
+      const csrfUser = await requireMutation(request, reply, deps);
+      if (!csrfUser) return;
+      signedIn = csrfUser;
       if (!signedIn?.googleSubjectDigest) return reply.code(401).send({ error: "GOOGLE_SIGN_IN_REQUIRED" });
       runtimeCredential.googleSubjectDigest = signedIn.googleSubjectDigest;
     } else {

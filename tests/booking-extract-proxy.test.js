@@ -128,6 +128,19 @@ describe('POST /api/bookings/extract-draft', () => {
     const memberRows = await (await api('/api/bookings', { token: bobToken })).json();
     assert.equal(memberRows.some(row => row.id === booking.id), false, 'member must not see unapproved drafts');
 
+    // A draft linked by an organizer must remain redacted in every Modern
+    // participant projection, not only in the Classic bookings list.
+    const itineraryWrite = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: 'ny', date: '2027-03-11', text_he: 'טיוטת מלון פרטית', booking_id: booking.id },
+    });
+    assert.equal(itineraryWrite.status, 201);
+    const itineraryCreated = await itineraryWrite.json();
+    const active = await (await api('/api/itinerary/active', { token: bobToken })).json();
+    assert.equal(active.items.find(item => item.item_uid === itineraryCreated.item_uid)?.booking, null);
+    const confirmations = await (await api('/api/confirmations/summary', { token: bobToken })).json();
+    assert.equal(confirmations.items.some(item => item.id === booking.id), false, 'draft confirmation leaked through Modern summary');
+
     const approved = await api(`/api/bookings/${booking.id}/approve`, { method: 'POST', token });
     assert.equal(approved.status, 200);
     const visibleRows = await (await api('/api/bookings', { token: bobToken })).json();
@@ -143,5 +156,17 @@ describe('POST /api/bookings/extract-draft', () => {
       method: 'POST', token: bobToken, body: { url: 'https://example.com/confirmation' },
     });
     assert.equal(res.status, 403);
+  });
+
+  test('an ignored quality issue remains ignored after the engine recomputes', async () => {
+    const reported = await api('/api/issues/report', {
+      method: 'POST', token, body: { title: 'Keep ignored', detail: 'organizer decision' },
+    });
+    assert.equal(reported.status, 201);
+    const { id } = await reported.json();
+    const ignored = await api(`/api/issues/${id}`, { method: 'PATCH', token, body: { status: 'ignored' } });
+    assert.equal(ignored.status, 200);
+    const issues = await (await api('/api/issues', { token })).json();
+    assert.equal(issues.find(issue => issue.id === id)?.status, 'ignored');
   });
 });

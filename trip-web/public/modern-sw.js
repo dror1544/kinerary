@@ -1,15 +1,5 @@
-const CACHE = "kinerary-modern-v1";
+const CACHE = "kinerary-modern-v2";
 const SHELL = ["./", "./index.html"];
-const READ_ONLY_API = [
-  "/api/config",
-  "/api/ui-settings",
-  "/api/itinerary/active",
-  "/api/today",
-  "/api/confirmations/summary",
-  "/api/operations/flights",
-  "/api/hermes/status",
-  "/api/moments",
-];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -27,8 +17,11 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
   const url = new URL(request.url);
-  const isReadOnlyApi = READ_ONLY_API.some((path) => url.pathname.endsWith(path));
-  if (request.mode === "navigate" || isReadOnlyApi || url.pathname.includes("/modern/")) {
+  // API responses are authenticated, personal, and explicitly no-store. Do
+  // not put them in the shared service-worker cache; offline mode is shell
+  // only until per-user encrypted storage is designed.
+  if (url.pathname.includes("/api/")) return;
+  if (request.mode === "navigate" || url.pathname.includes("/modern/")) {
     event.respondWith(
       fetch(request)
         .then((response) => {

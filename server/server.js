@@ -43,6 +43,11 @@ const CLASSIC_STATIC_FILES = new Map([
 for (const [route, relativeFile] of CLASSIC_STATIC_FILES) {
   app.get(route, (_req, res) => res.sendFile(path.join(SITE_DIR, relativeFile)));
 }
+// The root is the variant loader and Modern is a bundled SPA.  These routes
+// are deliberately registered before API handlers but only match their exact
+// static prefixes, so gateway-prefixed API traffic keeps reaching its routes.
+app.get('/', (_req, res) => res.sendFile(path.join(SITE_DIR, 'index.html')));
+app.use('/modern', express.static(path.join(SITE_DIR, 'modern'), { index: 'index.html' }));
 
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
@@ -427,6 +432,9 @@ for (const [col, decl] of [
   // Identifies the config day item this row was promoted from, so promoting
   // twice can't duplicate the schedule.
   ['config_ref',        'TEXT'],
+  // A compatibility-only identity for the Modern itinerary projection. It is
+  // intentionally distinct from config_ref, whose contract is config import.
+  ['itinerary_item_uid','TEXT'],
   // Ticketing state. needs_tickets/advance_booking come from enrichment;
   // booking_id (above) is set by deterministic matching against real bookings,
   // never by the model — "is this paid for" is a fact, not a judgment call.
@@ -455,6 +463,7 @@ for (const [col, decl] of [
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_config_ref ON phase_plan_items(config_ref) WHERE config_ref IS NOT NULL'); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_item_uid ON phase_plan_items(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL'); } catch {}
 // A day's headline ("Thu 13/8 — Diamond Head + Waikiki") says what the day IS;
 // grouping items by date alone loses it. Kept per (phase, date) rather than on
 // each item so it can't drift between rows of the same day.
@@ -478,9 +487,12 @@ for (const [col, decl] of [
   ['corrected_at',     'TEXT'],
   ['review_status',    "TEXT DEFAULT 'none'"],
   ['review_attempts',  'INTEGER DEFAULT 0'],
+  // Lets compatibility reconciliation delete only rows it previously wrote.
+  ['itinerary_day_key','TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_days ADD COLUMN ${col} ${decl}`); } catch {}
 }
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_day_key ON phase_plan_days(itinerary_day_key) WHERE itinerary_day_key IS NOT NULL'); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_enrich ON phase_plan_items(enrichment_status)`); } catch {}
 // GET filters by phase_id on every page load and joinBooking() looks up
 // booking_id per row; neither had an index.

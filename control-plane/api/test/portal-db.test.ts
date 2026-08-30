@@ -128,6 +128,28 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     passwordInviteeId = inviteRow.rows[0]?.redeemed_by;
     assert.ok(passwordInviteeId);
 
+    const duplicateInvite = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`,
+      headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf },
+      payload: { displayName: "Same Guest", runtimeUsername: "password-guest" },
+    });
+    assert.equal(duplicateInvite.statusCode, 409);
+    assert.deepEqual(duplicateInvite.json(), { error: "INVITE_ALREADY_EXISTS" });
+
+    const googleInvite = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`,
+      headers: { cookie: owner.cookie, "x-csrf-token": owner.csrf },
+      payload: { displayName: "Google Guest", runtimeUsername: "google-guest" },
+    });
+    assert.equal(googleInvite.statusCode, 201);
+    const googleToken = new URL(googleInvite.json().joinUrl).hash.slice("#token=".length);
+    const googleWithoutCsrf = await app.inject({
+      method: "POST", url: "/v1/site-invites/redeem", headers: { cookie: owner.cookie },
+      payload: { token: googleToken, method: "google" },
+    });
+    assert.equal(googleWithoutCsrf.statusCode, 403);
+    assert.deepEqual(googleWithoutCsrf.json(), { error: "CSRF_INVALID" });
+
     const setCookie = redeemed.headers["set-cookie"];
     const cookieLines = Array.isArray(setCookie) ? setCookie : [setCookie ?? ""];
     const limitedCookie = cookieLines.map((line) => line.split(";", 1)[0]).join("; ");

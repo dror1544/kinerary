@@ -323,7 +323,7 @@ function rowsFromLegacyPlan(db) {
   const items = db.prepare(
     'SELECT * FROM phase_plan_items ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
   ).all().map((row, index) => ({
-    item_uid: row.config_ref ? `cfg_${digest(row.config_ref).slice(0, 16)}` : `legacy_${row.id}`,
+    item_uid: row.itinerary_item_uid || (row.config_ref ? `cfg_${digest(row.config_ref).slice(0, 16)}` : `legacy_${row.id}`),
     phase_id: row.phase_id,
     date: row.date || null,
     time: row.time || null,
@@ -464,7 +464,10 @@ function markProvenance(db, payload) {
 }
 
 function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
-  const bookingsById = new Map(db.prepare('SELECT id, type, name, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings').all().map((booking) => [booking.id, booking]));
+  // A booking imported for organizer review is not participant-visible yet.
+  // Every participant-facing itinerary projection must enforce that boundary;
+  // filtering only /api/bookings leaked draft details through attached cards.
+  const bookingsById = new Map(db.prepare("SELECT id, type, name, date_from, date_to, confirmation, conf_file, location_url, google_wallet_url, apple_wallet_url, pkpass_file FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved'").all().map((booking) => [booking.id, booking]));
   const payload = {
     revision: rows.version.revision_id,
     kind: rows.version.kind,
@@ -488,7 +491,7 @@ function upsertIssue(db, issue) {
   const existing = db.prepare('SELECT id FROM trip_quality_issues WHERE fingerprint = ?').get(fingerprint);
   if (existing) {
     db.prepare(
-      "UPDATE trip_quality_issues SET status = CASE WHEN status = 'resolved' THEN status ELSE 'open' END, detail = ?, updated_at = datetime('now') WHERE id = ?"
+      "UPDATE trip_quality_issues SET status = CASE WHEN status IN ('resolved', 'ignored') THEN status ELSE 'open' END, detail = ?, updated_at = datetime('now') WHERE id = ?"
     ).run(issue.detail || null, existing.id);
     return existing.id;
   }
@@ -588,25 +591,48 @@ function updateLegacyFromActive(db) {
   const rows = activeRows(db);
   if (!rows) return;
   db.transaction(() => {
-    db.prepare('DELETE FROM phase_plan_items').run();
-    db.prepare('DELETE FROM phase_plan_days').run();
+    // Existing compatibility rows are the source of the initial active
+    // revision. Adopt only rows identified by that active revision, then all
+    // later deletes are scoped to explicit Modern ownership keys.
+    const adoptByConfigRef = db.prepare('UPDATE phase_plan_items SET itinerary_item_uid = ? WHERE itinerary_item_uid IS NULL AND config_ref = ?');
+    const adoptByLegacyId = db.prepare('UPDATE phase_plan_items SET itinerary_item_uid = ? WHERE itinerary_item_uid IS NULL AND id = ?');
+    for (const item of rows.items) {
+      if (typeof item.source_ref === 'string' && /^[^|]+\|\d{4}-\d{2}-\d{2}\|\d+$/.test(item.source_ref)) adoptByConfigRef.run(item.item_uid, item.source_ref);
+      const legacyId = /^legacy_(\d+)$/.exec(item.item_uid || '')?.[1];
+      if (legacyId) adoptByLegacyId.run(item.item_uid, Number(legacyId));
+    }
     const dayInsert = db.prepare(
-      "INSERT OR REPLACE INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status) VALUES (?,?,?,?, 'done')"
+      `INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status,itinerary_day_key) VALUES (?,?,?,?, 'done', ?)
+       ON CONFLICT(phase_id,date) DO UPDATE SET label_he = excluded.label_he, label_en = excluded.label_en, itinerary_day_key = excluded.itinerary_day_key`
     );
     for (const day of rows.days) {
-      dayInsert.run(day.phase_id, day.date, day.label_he, day.label_en);
+      dayInsert.run(day.phase_id, day.date, day.label_he, day.label_en, `${day.phase_id}\u001f${day.date}`);
     }
     const itemInsert = db.prepare(
-      'INSERT INTO phase_plan_items (phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,status,sort_order,created_by,enrichment_status,config_ref,extra_links) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      `INSERT INTO phase_plan_items (phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,website_url,ticket_url,booking_id,status,sort_order,created_by,enrichment_status,config_ref,itinerary_item_uid,extra_links)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL DO UPDATE SET
+         phase_id=excluded.phase_id, date=excluded.date, time=excluded.time, time_sort=excluded.time_sort,
+         text_he=excluded.text_he, text_en=excluded.text_en, location_url=excluded.location_url,
+         waze_url=excluded.waze_url, website_url=excluded.website_url, ticket_url=excluded.ticket_url,
+         booking_id=excluded.booking_id, status=excluded.status, sort_order=excluded.sort_order,
+         extra_links=excluded.extra_links`
     );
     for (const item of rows.items) {
+      const configRef = typeof item.source_ref === 'string' && /^[^|]+\|\d{4}-\d{2}-\d{2}\|\d+$/.test(item.source_ref) ? item.source_ref : null;
       itemInsert.run(
         item.phase_id, item.date, item.time, item.time_sort, item.text_he, item.text_en,
         item.location_url, item.waze_url, item.website_url, item.ticket_url, item.booking_id,
         item.confirmation_state === 'verified' ? 'confirmed' : 'needs_review',
-        item.sort_order || 0, item.created_by || 'modern', 'none', item.source_ref, writeJson(item.extra_links)
+        item.sort_order || 0, item.created_by || 'modern', 'none', configRef, item.item_uid, writeJson(item.extra_links)
       );
     }
+    const dayKeys = rows.days.map((day) => `${day.phase_id}\u001f${day.date}`);
+    if (dayKeys.length) db.prepare(`DELETE FROM phase_plan_days WHERE itinerary_day_key IS NOT NULL AND itinerary_day_key NOT IN (${dayKeys.map(() => '?').join(',')})`).run(...dayKeys);
+    else db.prepare('DELETE FROM phase_plan_days WHERE itinerary_day_key IS NOT NULL').run();
+    const itemUids = rows.items.map((item) => item.item_uid);
+    if (itemUids.length) db.prepare(`DELETE FROM phase_plan_items WHERE itinerary_item_uid IS NOT NULL AND itinerary_item_uid NOT IN (${itemUids.map(() => '?').join(',')})`).run(...itemUids);
+    else db.prepare('DELETE FROM phase_plan_items WHERE itinerary_item_uid IS NOT NULL').run();
   })();
 }
 
@@ -616,11 +642,16 @@ function syncFromLegacy(db, raw, author = 'legacy-api') {
   const rows = rowsFromLegacyPlan(db);
   if (!rows.items.length && !rows.days.length) return state.active_version_id;
   const current = getVersionRows(db, state.active_version_id);
-  const nextDigest = digest(JSON.stringify(rows));
-  const currentDigest = digest(JSON.stringify({
-    days: current.days.map((day) => ({ ...day, lodging_context: writeJson(day.lodging_context), pickup_context: writeJson(day.pickup_context) })),
-    items: current.items.map((item) => ({ ...item, extra_links: writeJson(item.extra_links) })),
-  }));
+  const comparable = (value) => ({
+    days: value.days.map(({ phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order }) => ({
+      phase_id, date, label_he, label_en, lodging_context: writeJson(lodging_context), pickup_context: writeJson(pickup_context), sort_order,
+    })),
+    items: value.items.map(({ item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links }) => ({
+      item_uid, phase_id, date, time, time_sort, item_type, text_he, text_en, location_url, waze_url, website_url, ticket_url, booking_id, confirmation_state, duration_minutes, sort_order, source_ref, created_by, extra_links: writeJson(extra_links),
+    })),
+  });
+  const nextDigest = digest(JSON.stringify(comparable(rows)));
+  const currentDigest = digest(JSON.stringify(comparable(current)));
   if (nextDigest === currentDigest) return state.active_version_id;
   const cfg = configVersion(db, raw);
   let nextId;
@@ -808,7 +839,7 @@ function buildTodayContext(db, config) {
   else phase = 'active_day';
   const todayItems = datedItems.filter((item) => item.date === today);
   const nextItem = todayItems.find((item) => item.time_sort == null || item.time_sort >= clock.minutes) || datedItems.find((item) => item.date >= today) || null;
-  const flightToday = db.prepare("SELECT id, type, name, date_from, date_to, confirmation, conf_file, notes FROM bookings WHERE type = 'flight' AND (date_from = ? OR date_to = ?) ORDER BY date_from ASC").all(today, today);
+  const flightToday = db.prepare("SELECT id, type, name, date_from, date_to, confirmation, conf_file, notes FROM bookings WHERE type = 'flight' AND COALESCE(review_status, 'approved') = 'approved' AND (date_from = ? OR date_to = ?) ORDER BY date_from ASC").all(today, today);
   if (flightToday.length) phase = 'flight_day';
   return {
     today,
@@ -825,7 +856,7 @@ function buildTodayContext(db, config) {
 }
 
 function confirmationSummary(db) {
-  const bookings = db.prepare('SELECT id, type, name, confirmation, conf_file, date_from, date_to FROM bookings ORDER BY date_from ASC, id ASC').all();
+  const bookings = db.prepare("SELECT id, type, name, confirmation, conf_file, date_from, date_to FROM bookings WHERE COALESCE(review_status, 'approved') = 'approved' ORDER BY date_from ASC, id ASC").all();
   return bookings.map((booking) => {
     const hasConfirmation = Boolean(booking.confirmation || booking.conf_file);
     return {
@@ -948,7 +979,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
         waze_url: null,
         website_url: null,
         ticket_url: null,
-        booking_id: Number.isInteger(Number(body.booking_id)) ? Number(body.booking_id) : null,
+        booking_id: body.booking_id == null || (typeof body.booking_id === 'string' && body.booking_id.trim() === '') ? null : Number.isInteger(Number(body.booking_id)) ? Number(body.booking_id) : null,
         confirmation_state: normalizeConfirmation(body.confirmation_state),
         duration_minutes: Number.isFinite(Number(body.duration_minutes)) ? Number(body.duration_minutes) : null,
         sort_order: rows.items.length + 1,
@@ -964,6 +995,12 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.patch('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
     const uid = req.params.item_uid;
     const body = req.body || {};
+    for (const field of ['phase_id', 'date', 'text_he']) {
+      if (body[field] !== undefined && (typeof body[field] !== 'string' || !body[field].trim())) {
+        return res.status(400).json({ error: `${field} must not be empty` });
+      }
+    }
+    if (body.date !== undefined && !ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
     let touched = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer edited itinerary item', (rows) => {
       rows.items = rows.items.map((item) => {
@@ -971,7 +1008,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
         touched = true;
         const next = { ...item };
         for (const field of ['phase_id', 'date', 'text_he', 'text_en', 'location_url']) {
-          if (body[field] !== undefined) next[field] = body[field] || null;
+          if (body[field] !== undefined) next[field] = typeof body[field] === 'string' ? body[field].trim() || null : null;
         }
         if (body.time !== undefined) {
           next.time = normalizeTime(body.time);
@@ -1032,7 +1069,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   });
 
   app.get('/api/operations/flights', authRequired, async (_req, res) => {
-    const flights = db.prepare("SELECT * FROM bookings WHERE type = 'flight' ORDER BY date_from ASC, id ASC").all();
+    const flights = db.prepare("SELECT * FROM bookings WHERE type = 'flight' AND COALESCE(review_status, 'approved') = 'approved' ORDER BY date_from ASC, id ASC").all();
     const statuses = [];
     for (const booking of flights) statuses.push(await flightStatus(db, fetchImpl, booking));
     res.json({ provider: 'flightaware', statuses });

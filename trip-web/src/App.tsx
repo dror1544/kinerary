@@ -509,11 +509,11 @@ function TodayView({
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
-  const firstStop = config?.phases?.find((phase) => phase.mapStop?.lat && phase.mapStop?.lng)?.mapStop;
+  const firstStop = config?.phases?.find((phase) => Number.isFinite(phase.mapStop?.lat) && Number.isFinite(phase.mapStop?.lng))?.mapStop;
   const weather = useQuery({
     queryKey: ["weather", firstStop?.lat, firstStop?.lng, today.data?.today],
     queryFn: () => getWeather(firstStop!.lat!, firstStop!.lng!, today.data!.today),
-    enabled: Boolean(firstStop?.lat && firstStop?.lng && today.data?.today),
+    enabled: Boolean(Number.isFinite(firstStop?.lat) && Number.isFinite(firstStop?.lng) && today.data?.today),
   });
   const missing = confirmations.data?.items.filter((item) => item.state !== "verified").slice(0, 3) || [];
   const next = today.data?.next || itinerary?.items[0] || null;

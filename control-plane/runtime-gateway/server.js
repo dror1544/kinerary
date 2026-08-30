@@ -65,7 +65,10 @@ function cookieValue(req, name) {
 
 async function controlPlane(path, init = {}) {
   const response = await fetch(`${CONTROL_PLANE_ORIGIN}${path}`, { ...init, headers: { ...init.headers, "x-api-key": EXCHANGE_KEY } });
-  if (!response.ok) throw new Error("CONTROL_PLANE_REJECTED");
+  if (!response.ok) {
+    const error = Object.assign(new Error("CONTROL_PLANE_REJECTED"), { statusCode: response.status });
+    throw error;
+  }
   return response.json();
 }
 
@@ -179,7 +182,13 @@ export function createRuntimeGateway() {
         return res.end(html);
       }
       return await proxy(req, res, tripId, suffix, session);
-    } catch {
+    } catch (error) {
+      // A rejected/expired launch grant is an authentication failure. It is
+      // not evidence that the runtime is unavailable.
+      const controlPlaneError = error && typeof error === "object" ? error : {};
+      if (controlPlaneError.message === "CONTROL_PLANE_REJECTED" && controlPlaneError.statusCode >= 400 && controlPlaneError.statusCode < 500) {
+        return json(res, 401, { error: "LAUNCH_INVALID" });
+      }
       return json(res, 503, { error: "RUNTIME_UNAVAILABLE" });
     }
   });
