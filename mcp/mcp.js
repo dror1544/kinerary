@@ -129,6 +129,11 @@ async function apiPostFile(path, filePath, fieldName, contentType, fields = {}) 
 async function apiPostPdf(path, filePath) {
   return apiPostFile(path, filePath, 'file', 'application/pdf');
 }
+async function apiGetBuffer(path) {
+  const r = await fetchTrip(path, { headers: { 'x-api-key': TRIP_API_KEY } });
+  if (!r.ok) throw new Error(`GET ${path} → ${r.status}${await errorSuffix(r)}`);
+  return r.buffer();
+}
 
 const IMAGE_MIME_BY_EXT = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
@@ -350,6 +355,35 @@ mcp.tool('upload_booking_confirmation',
   id:       z.number().describe('Booking ID from get_bookings'),
   filePath: z.string().describe('Absolute filesystem path to a PDF file on this machine'),
 }, async ({ id, filePath }) => ok(await apiPostPdf(`/api/bookings/${id}/confirmation`, filePath)));
+
+// Uploads permit up to 50MB — base64-encoding an entire file that size into
+// one tool result would run to ~67MB of JSON text through the SSE channel
+// and straight into the model's context, on exactly the confirmations this
+// tool matters most for. Past this ceiling (~5.3MB base64), extract text
+// instead — reusing the same bounded pdfParse extraction /extract already
+// uses — rather than risk blowing an MCP client or model limit.
+const MAX_INLINE_PDF_BYTES = 4 * 1024 * 1024;
+
+mcp.tool('get_booking_confirmation',
+  'Fetch a booking\'s uploaded or bundled PDF confirmation through the trip site\'s authenticated document API — as base64 (small enough to relay into a chat, e.g. Telegram sendDocument) when it fits comfortably in a tool result, or as extracted text when it does not. ' +
+  'The site now requires a logged-in session to view this file directly, so this tool is the way an agent retrieves it. ' +
+  'Returns conf_file: null (no pdf_base64/pdf_text) if nothing has been uploaded for this booking yet.', {
+  id: z.number().describe('Booking ID from get_bookings'),
+}, async ({ id }) => {
+  const bookings = await apiGet('/api/bookings');
+  const booking = bookings.find(b => b.id === id);
+  if (!booking) throw new Error(`Booking ${id} not found`);
+  if (!booking.conf_file) return ok({ id, name: booking.name, conf_file: null });
+  const buf = await apiGetBuffer(`/api/bookings/confirmation/${encodeURIComponent(booking.conf_file)}`);
+  if (buf.length <= MAX_INLINE_PDF_BYTES) {
+    return ok({ id, name: booking.name, conf_file: booking.conf_file, pdf_base64: buf.toString('base64') });
+  }
+  const text = await extractPdfText(buf);
+  return ok({
+    id, name: booking.name, conf_file: booking.conf_file, pdf_base64: null, pdf_text: text,
+    note: `File is ${(buf.length / 1024 / 1024).toFixed(1)}MB — too large to relay as base64, returning extracted text instead.`,
+  });
+});
 
 // ── Trivia / Kahoot tools ─────────────────────────────────────────────────────
 

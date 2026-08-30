@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { mkdtempSync, rmSync, cpSync } from 'fs';
+import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,6 +28,10 @@ export async function startTestServer(extraEnv = {}) {
   // other test files already copy for exactly this reason.
   tripDir = join(dataDir, 'trip');
   cpSync(FIXTURES_DIR, tripDir, { recursive: true });
+  const siteDir = join(dataDir, 'site');
+  mkdirSync(join(siteDir, 'confirmations'), { recursive: true });
+  writeFileSync(join(siteDir, 'confirmations', 'static-test.pdf'), '%PDF-1.4 static confirmation');
+  writeFileSync(join(siteDir, 'private-guide.docx'), 'private test document');
   const port = extraEnv.PORT || DEFAULT_TEST_PORT;
   BASE_URL = `http://localhost:${port}`;
 
@@ -38,6 +42,7 @@ export async function startTestServer(extraEnv = {}) {
         ...process.env,
         TRIP_DIR:     tripDir,
         DATA_DIR:     dataDir,
+        SITE_DIR:     siteDir,
         AVATARS_DIR:  join(dataDir, 'avatars'),
         PORT:       String(port),
         JWT_SECRET: 'test-secret-000',

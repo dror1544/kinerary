@@ -4,9 +4,13 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
 
 let token;
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 before(async () => {
   await startTestServer();
@@ -14,6 +18,21 @@ before(async () => {
 });
 
 after(() => stopTestServer());
+
+describe('Nginx document routing', () => {
+  const nginx = readFileSync(join(HERE, '..', 'nginx.conf'), 'utf8');
+
+  test('/confirmations paths are proxied to the authenticated server, never aliased from disk', () => {
+    const block = nginx.match(/location \^~ \/confirmations\/ \{([\s\S]*?)\n  \}/)?.[1] || '';
+    assert.match(block, /proxy_pass http:\/\/trip-server:3000/);
+    assert.doesNotMatch(block, /\balias\b|\btry_files\b/);
+  });
+
+  test('other document URLs are also proxied for authentication', () => {
+    const block = nginx.match(/location ~\* \\.\(md\|txt\|rtf\|pdf\|doc\|docx\|xls\|xlsx\|ppt\|pptx\|odt\|ods\|odp\|pkpass\)\$ \{([\s\S]*?)\n  \}/)?.[1] || '';
+    assert.match(block, /proxy_pass http:\/\/trip-server:3000/);
+  });
+});
 
 // ── /api/config ───────────────────────────────────────────────────────────────
 describe('GET /api/config', () => {
@@ -364,6 +383,88 @@ describe('GET /api/bookings — auth', () => {
 
   test('returns 200 with a valid token', async () => {
     const res = await api('/api/bookings', { token });
+    assert.equal(res.status, 200);
+  });
+});
+
+// ── GET /api/bookings/confirmation/:fn — auth ─────────────────────────────────
+describe('GET /api/bookings/confirmation/:fn — auth', () => {
+  let confFile;
+
+  before(async () => {
+    const all = await (await api('/api/bookings', { token })).json();
+    const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
+    const form = new FormData();
+    form.append('file', new Blob([Buffer.from('%PDF-1.4 test')], { type: 'application/pdf' }), 'test.pdf');
+    const uploadRes = await api(`/api/bookings/${seed.id}/confirmation`, { method: 'POST', token, body: form });
+    assert.equal(uploadRes.status, 200);
+    ({ conf_file: confFile } = await uploadRes.json());
+  });
+
+  test('returns 401 without any auth', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`);
+    assert.equal(res.status, 401);
+  });
+
+  test('returns 200 with a valid Bearer token', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`, { token });
+    assert.equal(res.status, 200);
+  });
+
+  test('returns 200 with a ?_t= query token (shared authRequired path, used by SSE — not by the booking-file links, which fetch with a header instead)', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}?_t=${token}`);
+    assert.equal(res.status, 200);
+  });
+
+  test('returns 200 with the agent API key (what the MCP server uses)', async () => {
+    const res = await api(`/api/bookings/confirmation/${confFile}`, { apiKey: 'test-hermes-key' });
+    assert.equal(res.status, 200);
+  });
+
+  test('also protects and serves static/seed confirmations through the same endpoint', async () => {
+    assert.equal((await api('/api/bookings/confirmation/static-test.pdf')).status, 401);
+    const res = await api('/api/bookings/confirmation/static-test.pdf', { token });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-disposition'), /^inline;/);
+    assert.equal(res.headers.get('cache-control'), 'private, no-store');
+  });
+});
+
+describe('legacy and generic document URLs — auth', () => {
+  for (const path of ['/confirmations/view/static-test.pdf', '/confirmations/static-test.pdf', '/private-guide.docx']) {
+    test(`${path} returns 401 without auth`, async () => {
+      assert.equal((await api(path)).status, 401);
+    });
+
+    test(`${path} returns 200 with a valid Bearer token`, async () => {
+      const res = await api(path, { token });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('cache-control'), 'private, no-store');
+    });
+  }
+});
+
+// ── GET /api/bookings/wallet-apple/:fn — auth ─────────────────────────────────
+describe('GET /api/bookings/wallet-apple/:fn — auth', () => {
+  let pkpassFile;
+
+  before(async () => {
+    const all = await (await api('/api/bookings', { token })).json();
+    const seed = all.find(b => b.seed_key === 'test-seed-hotel-nyc');
+    const form = new FormData();
+    form.append('file', new Blob([Buffer.from([0])], { type: 'application/vnd.apple.pkpass' }), 'test.pkpass');
+    const uploadRes = await api(`/api/bookings/${seed.id}/wallet-apple`, { method: 'POST', token, body: form });
+    assert.equal(uploadRes.status, 200);
+    ({ pkpass_file: pkpassFile } = await uploadRes.json());
+  });
+
+  test('returns 401 without any auth', async () => {
+    const res = await api(`/api/bookings/wallet-apple/${pkpassFile}`);
+    assert.equal(res.status, 401);
+  });
+
+  test('returns 200 with a valid Bearer token', async () => {
+    const res = await api(`/api/bookings/wallet-apple/${pkpassFile}`, { token });
     assert.equal(res.status, 200);
   });
 });

@@ -34,11 +34,12 @@ const ANCHOR_TYPES = ['flight', 'hotel', 'attraction'];
 const PHASE_LABELS = {};
 function bkConfUrls(confFile) {
   if (!confFile) return null;
-  return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}` };
+  const url = `/api/bookings/confirmation/${encodeURIComponent(confFile)}`;
+  return { view: url, download: url };
 }
 function bookingRefBadges(b) {
   const urls = bkConfUrls(b.conf_file);
-  const pdfLink = urls ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}">👁</a></span>` : '';
+  const pdfLink = urls ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" data-authed-document="${urls.view}">👁</a></span>` : '';
   const confBadge = b.confirmation ? `<span class="conf">${b.confirmation}</span>` : '';
   const locationBadge = b.location_url ? `<a class="loc" href="${b.location_url}" title="Location">📍</a>` : '';
   return `${confBadge}${pdfLink}${locationBadge}`;
