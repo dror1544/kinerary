@@ -187,6 +187,7 @@ function extraLinkLabel(link: NonNullable<ItineraryItem["extra_links"]>[number],
 }
 
 export function classicHrefForLocation(path: string, hostname: string, port: string) {
+  if (!import.meta.env.DEV) return path;
   const devPreview = ["4185", "4186"].includes(port) && ["127.0.0.1", "localhost"].includes(hostname);
   return devPreview ? `http://127.0.0.1:3000${path}` : path;
 }
