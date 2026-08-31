@@ -2546,12 +2546,83 @@ const PHASE_LABELS = {};
 
 function bkConfUrls(confFile) {
   if (!confFile) return null;
-  if (confFile.startsWith('booking-')) {
-    const url = `/api/bookings/confirmation/${confFile}`;
-    return { view: url, download: url };
-  }
-  return { view: `/confirmations/view/${confFile}`, download: `/confirmations/${confFile}` };
+  // Uploaded and static/seed confirmations share one authenticated endpoint.
+  // A plain <a href> cannot carry an Authorization header, and putting the
+  // session JWT in the query string would leak it into logs and history.
+  const url = `/api/bookings/confirmation/${encodeURIComponent(confFile)}`;
+  return { view: url, download: url };
 }
+
+// Fetches an authRequired file with the session's Authorization header and
+// opens it as a blob: URL — never puts the JWT in a URL. Opens the tab with
+// the blob URL already in hand, rather than opening a blank tab first and
+// filling it in after the async fetch — that earlier approach made Chrome
+// hand the PDF off to a second, genuinely separate tab while leaving the
+// pre-opened one blank and focused. Standalone (home-screen PWA) mode gets
+// no new tab at all, since a blob: URL set on a window opened from a
+// standalone context has a history of silently failing to render there.
+//
+// Deliberately does NOT branch on window.open()'s return value to detect a
+// blocked popup — with the noopener flag, window.open() returns null
+// unconditionally, on success or failure alike (that's the point of
+// noopener: no reference back to the new window), so that was never a
+// valid signal. Checks navigator.userActivation instead, *before* calling
+// window.open(): confirmation PDFs can be up to 50MB, and a fetch that
+// slow can outlast the browser's few-second "transient activation" window
+// that window.open() needs — once that expires the popup is silently
+// blocked with no way to detect it after the fact. Same-tab navigation
+// isn't gated by activation at all, so it's the fallback whenever we can't
+// positively confirm activation is still active (including when the API
+// itself isn't supported).
+async function openAuthedBlob(url) {
+  const token = localStorage.getItem('trip-token');
+  try {
+    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) throw new Error(String(res.status));
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const canPopup = !isStandaloneAppMode() && (navigator.userActivation?.isActive ?? false);
+    if (canPopup) window.open(blobUrl, '_blank', 'noopener');
+    else window.location.href = blobUrl;
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  } catch (e) {
+    console.error('Failed to open file', e);
+  }
+}
+
+async function downloadAuthedBlob(url, filename) {
+  const token = localStorage.getItem('trip-token');
+  try {
+    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!res.ok) throw new Error(String(res.status));
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  } catch (e) {
+    console.error('Failed to download file', e);
+  }
+}
+
+// Document links are generated in several dynamic renderers. Data attributes
+// keep filenames and URLs out of inline JavaScript, then this one delegated
+// handler applies the authenticated blob flow to all of them.
+document.addEventListener('click', e => {
+  const link = e.target.closest('[data-authed-document]');
+  if (!link) return;
+  e.preventDefault();
+  const url = link.dataset.authedDocument;
+  if (link.dataset.documentAction === 'download') {
+    downloadAuthedBlob(url, link.dataset.documentFilename || 'document');
+  } else {
+    openAuthedBlob(url);
+  }
+});
 
 // Local to this section rather than reusing esc()/safeUrl() from the
 // RENDER_FUNS region below: those are already relied on by ~30 call sites in
@@ -2579,11 +2650,13 @@ function bkSafeUrl(u) {
 function bookingRefBadges(b) {
   const urls = bkConfUrls(b.conf_file);
   const pdfLink = urls
-    ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="${urls.view}" target="_blank" title="View">👁</a><a class="conf-pdf" href="${urls.download}" download title="Download">⬇</a></span>`
+    ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" data-authed-document="${bkEsc(urls.view)}" data-document-action="view" title="View">👁</a><a class="conf-pdf" href="#" data-authed-document="${bkEsc(urls.download)}" data-document-action="download" data-document-filename="${bkEsc(b.conf_file)}" title="Download">⬇</a></span>`
     : '';
   const confBadge = b.confirmation ? `<span class="conf">${bkEsc(b.confirmation)}</span>` : '';
+  // Also served by Express behind authRequired, same as the PDF above —
+  // opened via openAuthedBlob rather than a plain href for the same reason.
   const appleWalletBadge = b.pkpass_file
-    ? `<a href="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
+    ? `<a href="#" data-authed-document="/api/bookings/wallet-apple/${encodeURIComponent(b.pkpass_file)}" data-document-action="view" style="display:inline-flex;align-items:center;text-decoration:none;margin-right:4px;vertical-align:middle"><img src="/apple-wallet-badge.svg" alt="Add to Apple Wallet" style="height:52px;display:block"></a>`
     : '';
   // bkSafeUrl() only validates the scheme — the rest of an attacker-chosen
   // URL (e.g. a literal " character) still needs HTML-escaping before it's
@@ -3558,7 +3631,8 @@ function renderPhaseHotelCard(phase) {
     metaHtml += `<span class="tag${cls ? ' '+cls : ''}">${_biSpan(n.text)}</span>`;
   });
 
-  const pdfHtml = pdfFile ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="/confirmations/view/${pdfFile}" title="View">👁</a><a class="conf-pdf" href="/confirmations/${pdfFile}" download title="Download">⬇</a></span>` : '';
+  const pdfUrls = bkConfUrls(pdfFile);
+  const pdfHtml = pdfUrls ? `<span class="conf-pdf-pair"><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.view)}" data-document-action="view" title="View">👁</a><a class="conf-pdf" href="#" data-authed-document="${bkEsc(pdfUrls.download)}" data-document-action="download" data-document-filename="${bkEsc(pdfFile)}" title="Download">⬇</a></span>` : '';
   const navHtml = (mapsUrl || wazeUrl || weatherKey) ? `<div class="loc-nav-row" style="margin-top:10px">${mapsUrl ? `<a class="btn" href="${mapsUrl}" target="_blank">🗺️ Google Maps</a>` : ''}${wazeUrl ? `<a class="btn" href="${wazeUrl}" target="_blank">🔵 Waze</a>` : ''}${weatherKey ? `<button class="btn" type="button" onclick="loadWx('${weatherKey}')">🌤️ תחזית</button>` : ''}</div>${weatherKey ? `<div id="wx-${weatherKey}" class="wx-panel" style="display:none"></div>` : ''}` : '';
   const descHtml = acc.description ? `<p>${_biSpan(acc.description)}</p>` : '';
   const icon = acc.type === 'private' ? '🏠' : '🏨';
@@ -4345,48 +4419,10 @@ const BOOKING_DATA = {};
 
 const BK_TYPE_ICON = { flight: '✈️', hotel: '🏨', car: '🚗', event: '⚽', house: '🏠' };
 
-function confirmationViewUrl(file) {
-  return `/confirmations/view/${encodeURIComponent(file)}`;
-}
-
 function isStandaloneAppMode() {
   return window.navigator.standalone === true ||
     (typeof window.matchMedia === 'function' &&
       window.matchMedia('(display-mode: standalone)').matches);
-}
-
-function confirmationViewAttrs() {
-  return isStandaloneAppMode() ? '' : ' target="_blank" rel="noopener"';
-}
-
-function initConfirmationViewLinks() {
-  // In iOS standalone (home-screen PWA), WebKit opens a blank window
-  // synchronously on target="_blank" before JS preventDefault() can fire.
-  // Fix: never leave target="_blank" on confirmation view links in standalone.
-  const isStandalone = isStandaloneAppMode();
-
-  document.querySelectorAll('a[href*="/confirmations/view/"]').forEach(a => {
-    if (isStandalone) {
-      a.target = '_self';
-      a.removeAttribute('rel');
-    } else {
-      a.target = '_blank';
-      a.rel = 'noopener';
-    }
-  });
-
-  if (!isStandalone) return;
-
-  // In standalone mode, View = Download: navigate to /confirmations/ URL
-  // (same path the Download button uses — iOS handles it correctly there).
-  document.addEventListener('click', e => {
-    const link = e.target.closest('a[href*="/confirmations/view/"]');
-    if (!link) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const file = decodeURIComponent(link.href.split('/confirmations/view/').pop());
-    window.location.href = `/confirmations/${file}`;
-  }, true);
 }
 
 function openBookingModal(bkId) {
@@ -4420,8 +4456,8 @@ function openBookingModal(bkId) {
       <div class="bkm-pdfs">${item.pdfs.map(p => `
         <span class="bkm-pdf-pair">
           <span class="bkm-pdf-name">📄 ${p.label}</span>
-          <a class="bkm-pdf-btn" href="${confirmationViewUrl(p.file)}"${confirmationViewAttrs()}>👁 View</a>
-          <a class="bkm-pdf-btn bkm-pdf-dl" href="/confirmations/${p.file}" download="${p.file}">⬇ Download</a>
+          <a class="bkm-pdf-btn" href="#" data-authed-document="${bkEsc(bkConfUrls(p.file).view)}" data-document-action="view">👁 View</a>
+          <a class="bkm-pdf-btn bkm-pdf-dl" href="#" data-authed-document="${bkEsc(bkConfUrls(p.file).download)}" data-document-action="download" data-document-filename="${bkEsc(p.file)}">⬇ Download</a>
         </span>`).join('')}
       </div>` : '';
     return `<div class="bkm-item bkm-type-${item.type}">
@@ -4449,7 +4485,6 @@ function closeBookingModal() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  initConfirmationViewLinks();
   document.getElementById('bk-modal-close')?.addEventListener('click', closeBookingModal);
   document.getElementById('bk-modal-overlay')?.addEventListener('click', closeBookingModal);
   document.querySelectorAll('tr[data-bk]').forEach(tr => {

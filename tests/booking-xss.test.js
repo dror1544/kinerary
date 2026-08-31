@@ -30,9 +30,19 @@ function extractSource() {
   return src.slice(start, end);
 }
 
-function makeContext() {
+function makeContext(extra = {}) {
   const win = new Window({ url: 'http://localhost/' });
-  const ctx = vm.createContext({ window: win, document: win.document, console });
+  const ctx = vm.createContext({
+    window: win,
+    document: win.document,
+    localStorage: win.localStorage,
+    navigator: win.navigator,
+    URL: { createObjectURL: () => 'blob:test-document', revokeObjectURL: () => {} },
+    setTimeout: () => {},
+    isStandaloneAppMode: () => true,
+    console,
+    ...extra,
+  });
   vm.runInContext(extractSource(), ctx, { filename: 'app.js (booking-row region)' });
   return ctx;
 }
@@ -68,6 +78,36 @@ describe('bookingRefBadges() — escaping and URL sanitization', () => {
     const ctx = makeContext();
     const html = ctx.bookingRefBadges({ pkpass_file: '"><script>alert(1)</script>' });
     assert.ok(!html.includes('<script>'), 'must not produce a live <script> tag');
+  });
+
+  test('static confirmation files use the authenticated API path, never a public /confirmations link', () => {
+    const ctx = makeContext();
+    const html = ctx.bookingRefBadges({ conf_file: 'seed-confirmation.pdf' });
+    assert.ok(html.includes('/api/bookings/confirmation/seed-confirmation.pdf'));
+    assert.ok(!html.includes('href="/confirmations/'));
+    assert.ok(html.includes('data-authed-document='));
+  });
+
+  test('a quote in a confirmation filename cannot create inline JavaScript', () => {
+    const ctx = makeContext();
+    const html = ctx.bookingRefBadges({ conf_file: `booking-1-');alert(1);//.pdf` });
+    assert.ok(!html.includes('onclick='));
+    assert.ok(!html.includes(`');alert(1)`));
+  });
+
+  test('the document opener fetches with the logged-in bearer token, never a tokenized URL', async () => {
+    let request;
+    const ctx = makeContext({
+      fetch: async (url, options) => {
+        request = { url, options };
+        return { ok: true, blob: async () => ({ type: 'application/pdf' }) };
+      },
+    });
+    ctx.localStorage.setItem('trip-token', 'test-session-token');
+    await ctx.openAuthedBlob('/api/bookings/confirmation/seed-confirmation.pdf');
+    assert.equal(request.url, '/api/bookings/confirmation/seed-confirmation.pdf');
+    assert.equal(request.options.headers.Authorization, 'Bearer test-session-token');
+    assert.ok(!request.url.includes('test-session-token'));
   });
 
   test('a location_url with an embedded quote cannot break out of the href attribute', () => {
