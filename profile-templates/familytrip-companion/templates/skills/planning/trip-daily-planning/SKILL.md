@@ -20,13 +20,15 @@ Merged from: `trip-itinerary-briefing` + `group-travel-daily-recommendations`.
 
 ## When to Use
 
-- "מה יש לנו בטיול?" / "תסכם לי את הטיול"
-- "מה אנחנו עושים היום / מחר?"
-- "תכין הודעה לקבוצה"
-- "מה מומלץ לעשות ביום..."
-- "מה מזג האוויר?"
-- "תדריך בוקר"
-- pre-trip overview or mid-trip operational questions
+- "מה יש לנו בטיול?" / "What's on our trip?" / trip overview in any language
+- "מה אנחנו עושים היום / מחר?" / "What are we doing today/tomorrow?"
+- "תכין הודעה לקבוצה" / "Send a group summary"
+- "מה מומלץ לעשות ביום..." / "What should we do on day..."
+- "מה מזג האוויר?" / "What's the weather?"
+- "תדריך בוקר" / "Morning briefing"
+- pre-trip overview or mid-trip operational questions, in any language
+
+**Language note:** Respond in the language the user is writing in. Hebrew examples throughout this skill are illustrative — apply the same logic and structure in English, French, or any other language the organizer uses.
 
 ---
 
@@ -45,9 +47,10 @@ Never blur the two. If a fact is missing from verified sources, say so plainly.
 
 1. Call `get_config` via trip-mcp for the live config.
 2. Extract: trip dates, party size, destinations in order, hotel per phase, movement days, flights, cars, pending tasks.
-3. Compute the **current local date/time at the active destination** (not Israel, not UTC).
+3. Compute the **current local date/time at the active destination** (not the organizer's timezone, not UTC).
 4. Identify the **active phase** based on that local date.
-5. Proceed with phase-aware answers only.
+5. **If planning is for today:** note the current local time and treat it as the starting point — do not plan from 00:00 or from morning if it is already afternoon or evening. Only suggest activities and logistics that are still reachable and open from now.
+6. Proceed with phase-aware, time-aware answers only.
 
 ---
 
@@ -304,6 +307,25 @@ Recommend recovery first. Avoid long drives or rigid morning plans.
 
 ---
 
+## Site update offer — after every daily plan
+
+After generating a day plan (pattern C or D), always offer to update the trip site's daily schedule with the plan:
+
+1. **Summarize what would be written** — one line per day item in plain language, as it would appear on the site.
+2. **Ask for confirmation before writing:**
+   > "רוצה שאעדכן את המסלול הזה באתר? הנה מה שיירשם: [summary]"
+   > / "Want me to update today's plan on the site? Here's what will be written: [summary]"
+3. **Write only after explicit approval** — "כן" / "yes" / "תעדכן" counts as approval. Do not write speculatively.
+4. After writing, **read back the updated day entry** from the site and confirm it matches the approved plan.
+5. If the site still shows the old plan after writing, say so explicitly and do not claim success.
+
+**When NOT to offer a site update:**
+- Ultra-short or overview requests (patterns A, B, E)
+- When the organizer explicitly said "just a suggestion" or "don't update"
+- When the plan covers a day that has already passed
+
+---
+
 ## Output Patterns
 
 ### A. "מה יש לנו בטיול?" — Trip overview
@@ -324,9 +346,11 @@ Format:
 Hebrew tone: warm, simple, scannable. Emojis sparingly but visibly.
 
 ### C. "מה היום / מחר?" — Daily operational brief
+**Time awareness:** if planning for today, start from the current local time — skip activities that are no longer reachable or already closed.
+
 For each day:
 ```
-📅 [date] — [phase/city]
+📅 [date] — [phase/city]  [🕐 current local time if today]
 מאומת: [flights / car return / check-in if any]
 🅿️ חניה: [parking warning + lot links — if urban attraction]
 ⚠️ קליטה: [dead-zone warning + Maps link — if remote route]
@@ -335,6 +359,7 @@ For each day:
 שיקול: [one-line — time, distance, group fit]
 🌤️ תחזית: [temp range + rain risk — if applicable]
 ```
+→ After delivering: offer to update the site (see "Site update offer" section).
 
 ### D. תדריך בוקר — Morning briefing
 ```
@@ -348,6 +373,7 @@ For each day:
 ⚠️ קליטה: [dead-zone note + Maps link — if relevant today]
 💡 טיפ: [one practical note]
 ```
+→ After delivering: offer to update the site with today's plan (see "Site update offer" section).
 
 ### E. Ultra-short version
 If user asks for shorter: duration + destination sequence + hotel names + key transition dates only.
@@ -377,7 +403,9 @@ If user asks for shorter: duration + destination sequence + hotel names + key tr
 - Do not build a Maps link with invented place names; use known confirmed stop names only.
 - Do not suggest en-route stops that require backtracking or >10 min detour — ask first instead.
 - Do not invent stop names; use maps skill or web_search results only.
-- Do not add parking notes for rural, wilderness, or free-lot destinations.
+- Do not plan from the start of the day if it is already afternoon or evening — start from the current local time.
+- Do not suggest activities that are already closed or unreachable given the current local time.
+- Do not write to the trip site without explicit organizer approval — always summarize first and wait for "yes".
 - Do not invent parking prices — only mention price if found in a web source.
 - Always offer both Google Maps and Waze nav links (unless user specified one).
 
@@ -392,6 +420,8 @@ If user asks for shorter: duration + destination sequence + hotel names + key tr
 - [ ] Attraction hours verified via web for specific recommendations?
 - [ ] Weather included where required by trip type or briefing setting?
 - [ ] Active phase/date computed from live config, not memory?
+- [ ] If planning for today: does the plan start from the current local time, not from morning?
+- [ ] Site update offered after daily plan (C or D)? Summary shown before writing? Approval received?
 - [ ] Parking checked for urban attractions? Warning + lot links included if problematic?
 - [ ] En-route stops (gas/coffee/restrooms): on-route or minor detour only? Detour time noted if 5–10 min?
 - [ ] Dead-zone check done for remote/scenic routes? Warning shown + Maps link built if confirmed?
