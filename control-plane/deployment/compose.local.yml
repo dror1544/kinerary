@@ -53,6 +53,14 @@ services:
       # not part of the provider-neutral architecture profile. Empty default
       # leaves the route unmounted (503) rather than failing startup.
       CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
+      # Local dev deploys from the hand-seeded `release_localdev0001`, which has
+      # no sealed manifest — so generatePlan would otherwise reject it and there
+      # would be no selectable release at all. This opts that box into the
+      # unsealed-release fallback (worker deploys the ambient REPO_ROOT checkout
+      # with a `provisioner.release_unverified` warning). A real deployment
+      # leaves this unset, so only a manifest-backed, digest-verified release is
+      # ever selectable.
+      CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
     secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]

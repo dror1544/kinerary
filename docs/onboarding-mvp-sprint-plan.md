@@ -588,8 +588,12 @@ heartbeat, the in-place bootstrap converge, and worker-minted NPM tokens), with
 unit coverage in `planner.test.ts`, `intake-correction.test.ts`,
 `test_provisioner.py`, `tests/provisioning/test_engine.py`,
 `test_adapters.py`, and `test_compute.py`. The **link-carry-forward item is
-now built too** (see below). Only the release-artifact hardening block is
-**not yet built**.
+now built too** (see below). The **release pipeline + promotion** half of the
+release-artifact hardening block is **now built** (see below); the dedicated
+compute / persistent-data / secret adapter abstractions are the one piece of
+this sprint still **not built** — deferred as a follow-on, since the exit gate
+("a sealed, scanned release artifact is promoted and selected by the planner")
+does not hinge on them.
 
 Build — **operational gaps found in the Phase H run** (each needed a hand DB
 edit or a destroy-and-recreate before this sprint):
@@ -675,9 +679,78 @@ CT200) carry these everywhere.
 Build — **release-artifact hardening** (moved here from Sprint 4's "Deferred
 past this gate" note and §5):
 
-- immutable release-artifact renderer (build pipeline, sanitation scan, sealed
-  manifest); release promotion rules (`candidate` → `available`); dedicated
-  compute / persistent-data / secret adapter abstractions.
+- **Release pipeline + promotion. — BUILT (2026-08-30).** A "release" is now the
+  trip-runtime source (`site/` + `server/` + `shared/`) frozen at a git
+  revision, rendered into a **sealed manifest**:
+  - `release-artifact.ts` (`buildReleaseManifest`) — `git ls-tree` gives the
+    exact tracked file list at the revision plus each file's blob sha (git's own
+    content hash), so `artifactDigest = sha256(sorted "<path> <blobsha>" lines)`
+    is revision-accurate and reproducible. `verifyManifest` re-derives it — an
+    added/removed/altered file breaks the seal.
+  - **Sanitation scan** (`scanPayload`) — every text file in the payload is
+    line-scanned for private IPv4 (the exact pattern `canonical.ts` rejects),
+    host paths, `PVEAPIToken=`, connection strings with inline userinfo, JWT /
+    AWS / GitHub / Slack / OpenAI key shapes, and PEM private-key blocks.
+    Deliberately **not** `Bearer \S+` — `Bearer ${token}` is legitimate client
+    code. Findings store `{path,line,rule}`, never the matched text, so the
+    manifest stays a canonical record.
+  - **Promotion state machine** (`release-registry.ts`): `registerCandidateRelease`
+    (idempotent on the digest) → `promoteRelease` walks `candidate → verified →
+    available`, refusing the skip; `→ verified` requires `verifyManifest` to pass
+    *and* the scan to be clean; every hop writes an append-only audit row.
+    Migration **0027** adds `releases.manifest` (canonical-guarded),
+    `sanitation_passed`, `promoted_to_available_at`/`promoted_by`, and a
+    `releases_scanned_before_verified` CHECK (a manifest-bearing row can't reach
+    verified/available without a passed scan; hand seeds like the 0016 dev
+    release are grandfathered).
+  - **Operator CLI** `npm run release -- build|promote|list|show` (`release-cli.ts`,
+    LAN-only, not an HTTP route — same posture as `mcp/provision.js`). `build`
+    exits non-zero when the scan fails but still records the candidate so the
+    failure is visible.
+  - **The worker deploys the promoted revision, not the ambient checkout**
+    (review P1). `generatePlan` puts `release_source_revision` /
+    `release_artifact_digest` / `release_verified` into `plan.desired`;
+    `provisioner.py` — for a manifest-backed release — calls
+    `release_source.materialize_release_source` (Python twin of
+    `computeArtifactDigest`) to `git archive` `site/ server/ shared/` at that
+    revision into a throwaway dir, re-verify the tree digest, and point
+    `deploy.sh` at it via `REPO_ROOT`; a mismatch or unreachable revision fails
+    the job (`RELEASE_ARTIFACT_DIGEST_MISMATCH` / `RELEASE_REVISION_UNAVAILABLE`)
+    rather than shipping unscanned code. The manifest-less 0016 dev release has
+    no real digest, so it falls back to `REPO_ROOT` with a
+    `provisioner.release_unverified` warning.
+  - **Scan covers extensionless runtime files** (review P1): the payload
+    classifier is now binary-*exclusion* + a NUL-byte content sniff, not a
+    text-extension allowlist — a leak in `server/Dockerfile` is caught, where
+    the allowlist silently skipped it.
+  - `generatePlan` already selected only `status = 'available'`; `planner.test.ts`
+    now proves a `candidate` **and** a `verified`-but-not-`available` release are
+    both unselectable, that promoting one to `available` makes the planner pick
+    exactly it, and that `desired` pins the release's revision/digest. Coverage:
+    `release-artifact.test.ts` (16, pure), `release-registry.test.ts` (9, DB),
+    `release-cli.test.ts` (2, end-to-end through the CLI), `test_release_source.py`
+    (9, throwaway git repo), `test_provisioner.py` `ReleaseMaterializationTests`
+    (3, verified / dev-seed / digest-mismatch paths).
+- **Dedicated compute / persistent-data / secret adapter abstractions. — NOT
+  BUILT.** Deferred follow-on: the provisioner still calls the existing
+  `kinerary-deploy` infrastructure directly. Refactoring that behind
+  `ComputeAdapter` / `DataAdapter` / `SecretAdapter` interfaces is a larger,
+  riskier change on the live provisioning path and the exit gate does not
+  require it.
+  - **Release source-supply is dev-only wiring, folded in here.** The
+    verified-release path (`release_source.materialize_release_source`) needs a
+    local git repo to run `git ls-tree` / `git archive` against the promoted
+    `source_revision`; today `compose.local.yml` supplies that by bind-mounting
+    the operator's live checkout at `/repo` (same affordance as the mounted
+    `kinerary-deploy` tree and SSH keys). `git` is now in `worker/Dockerfile`
+    because it is a genuine runtime dependency of that verification, not a
+    worktree workaround — but the *acquisition* mechanism is not production
+    shape. Target: the worker fetches the pinned `source_revision` from the git
+    remote with a read-only deploy key (no bind mount, independent digest
+    verification preserved), landing alongside the `SecretAdapter` work since it
+    needs a credential. `deployment/compose.example.yml` still runs the worker
+    as the `run` observer, so nothing production-facing regresses in the
+    meantime.
 
 Automated tests:
 
@@ -1009,14 +1082,15 @@ their interfaces: release manifests, resource IDs, secret references,
 selection, service-connection capabilities, consent/provenance-labelled
 imports/feedback and lifecycle events are required in the first schema.
 
-The release-hardening work originally scoped for Sprint 4 — the immutable
-release-artifact renderer (build pipeline, sanitation scan, sealed manifest),
-release promotion rules (`candidate` → `available`), and dedicated
-compute/persistent-data/secret adapter abstractions — is now **Sprint 4.7 —
-Provisioning hardening**, which runs after the first successful end-to-end run
-proves the vertical path. The Sprint 4 acceptance test deliberately uses the
-existing `kinerary-deploy` infrastructure and a seeded development release
-record until then.
+The release-hardening work originally scoped for Sprint 4 moved to **Sprint 4.7
+— Provisioning hardening**. As of 2026-08-30 the immutable release-artifact
+renderer (build pipeline, sanitation scan, sealed manifest) and the release
+promotion rules (`candidate` → `verified` → `available`) are **built** (see
+Sprint 4.7). The dedicated compute/persistent-data/secret adapter abstractions
+are the remaining deferred piece — the provisioner still calls the existing
+`kinerary-deploy` infrastructure directly, and the Sprint 4 acceptance test
+used the seeded development release record (`release_localdev0001`, migration
+0016) until the pipeline landed.
 
 **Landing SPA (`web/`).** The organizer-facing web console lives in `web/` — a
 Vite/React SPA with a public landing page, account signup/sign-in, and a

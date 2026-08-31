@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ from .companion_profile import (
 )
 from .compute import ComputeAdapter, NullComputeAdapter
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter
+from .release_source import ReleaseSourceError, materialize_release_source
 from .transformer import (
     derive_bookings,
     derive_trip_slug,
@@ -41,6 +43,11 @@ from .transformer import (
 # (config, destination) -> config. See ProvisionerWorker.__init__ for why this
 # defaults to a passthrough rather than the live enrich_config.
 EnrichFn = Callable[[dict[str, Any], str], dict[str, Any]]
+
+# (source_revision, artifact_digest | None) -> a directory holding site/ server/
+# shared/ checked out at that revision. Injectable so tests do not need a git
+# repo; None means "use the real release_source.materialize_release_source".
+MaterializeFn = Callable[[str, str | None], str]
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +67,7 @@ class DeployAdapter(Protocol):
         *,
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
+        source_dir: str | None = None,
     ) -> str: ...
 
 
@@ -90,6 +98,7 @@ class ShellDeployAdapter:
         *,
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
+        source_dir: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -116,8 +125,11 @@ class ShellDeployAdapter:
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
-        if self._repo_root:
-            env["REPO_ROOT"] = self._repo_root
+        # A materialized release checkout (site/ server/ shared/ at the promoted
+        # revision) wins over the ambient repo — deploy.sh tars ${REPO_ROOT}/{server,site,shared}.
+        repo_root = source_dir or self._repo_root
+        if repo_root:
+            env["REPO_ROOT"] = repo_root
 
         result = subprocess.run(
             [deploy_sh, slug, vmid, "--sync-config", "--restart", "--trip-dir", trip_dir],
@@ -276,6 +288,8 @@ class ProvisionerWorker:
         companion: CompanionProfileAdapter | None = None,
         mcp_bridge: McpBridgeAdapter | None = None,
         enrich: EnrichFn | None = None,
+        repo_root: str | None = None,
+        materialize: MaterializeFn | None = None,
     ) -> None:
         self._db_url = db_url
         self._deploy = deploy
@@ -286,6 +300,12 @@ class ProvisionerWorker:
         # HTTP calls, so it stays off unless __main__ wires enrich_config in,
         # matching how compute/mcp_bridge default to their Null adapters.
         self._enrich = enrich or (lambda config, destination: config)
+        # Where to check out a promoted release's source_revision from. Same
+        # value ShellDeployAdapter uses as its fallback REPO_ROOT.
+        self._repo_root = repo_root or os.environ.get("PROVISIONER_REPO_ROOT") or os.environ.get("REPO_ROOT", "")
+        self._materialize = materialize or (
+            lambda revision, digest: materialize_release_source(self._repo_root, revision, digest)
+        )
 
     # ── public API ──────────────────────────────────────────────────────────────
 
@@ -364,16 +384,27 @@ class ProvisionerWorker:
             # is confirmed, promote it to the one the family will see.
             slug = self._promote_draft_slug(conn, trip_id, slug, answers)
 
-            # Deploy. first_provision (from plan.desired, computed by the
-            # planner) tells the compute adapter whether this trip has ever
-            # been provisioned successfully — if not, any leftover per-trip
-            # NFS data is debris from a failed earlier attempt and is
-            # cleared so the freshly seeded users/config take.
-            private_url = self._deploy.deploy(
-                slug, config,
-                first_provision=bool(plan_desired.get("first_provision", False)),
-                sidecars=sidecars,
-            )
+            # Deploy the exact source the promoted release was scanned at, not
+            # whatever is in the worker's repo checkout. A manifest-backed
+            # release (release_verified) is materialized and digest-verified; the
+            # hand-seeded dev release has no manifest and no real digest, so it
+            # falls back to REPO_ROOT with a warning.
+            source_dir = self._materialize_release_if_verified(plan_desired, job_id)
+            try:
+                # first_provision (from plan.desired, computed by the planner)
+                # tells the compute adapter whether this trip has ever been
+                # provisioned successfully — if not, any leftover per-trip NFS
+                # data is debris from a failed earlier attempt and is cleared so
+                # the freshly seeded users/config take.
+                private_url = self._deploy.deploy(
+                    slug, config,
+                    first_provision=bool(plan_desired.get("first_provision", False)),
+                    sidecars=sidecars,
+                    source_dir=source_dir,
+                )
+            finally:
+                if source_dir:
+                    shutil.rmtree(source_dir, ignore_errors=True)
 
             # Commit success.
             self._complete(
@@ -394,6 +425,33 @@ class ProvisionerWorker:
                 exc_info=True,
             )
             self._fail(conn, job_id, plan_id, error_code)
+
+    def _materialize_release_if_verified(
+        self, plan_desired: Mapping[str, Any], job_id: str,
+    ) -> str | None:
+        """A checkout dir for a manifest-backed release's source_revision, or
+        None to deploy from REPO_ROOT. A materialize failure (unreachable
+        revision, digest mismatch) is fatal — it carries a safe_error_code so
+        the job records why rather than deploying unverified code."""
+        revision = plan_desired.get("release_source_revision")
+        if not revision:
+            return None
+        if not plan_desired.get("release_verified"):
+            # The dev-seed release (migration 0016): no manifest, artifact_digest
+            # is a placeholder. Deploy REPO_ROOT as before, but say so.
+            logger.warning(
+                "provisioner.release_unverified",
+                extra={"job_id": job_id, "release_source_revision": revision},
+            )
+            return None
+        digest = plan_desired.get("release_artifact_digest")
+        try:
+            return self._materialize(revision, digest)
+        except ReleaseSourceError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            exc.safe_error_code = "RELEASE_MATERIALIZE_FAILED"  # type: ignore[attr-defined]
+            raise
 
     # ── DB operations (mirror job-queue.ts) ────────────────────────────────────
 

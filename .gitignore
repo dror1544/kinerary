@@ -33,6 +33,7 @@ provisioning/__pycache__/
 tests/provisioning/__pycache__/
 telegram_manager/__pycache__/
 control-plane/api/dist/
+control-plane/api/releases/
 control-plane/worker/**/__pycache__/
 control-plane/deployment/.local-secrets/
 profile-templates/**/__pycache__/

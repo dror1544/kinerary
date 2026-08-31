@@ -238,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Always on in a real run: it self-guards and degrades to "no
                 # enrichment", never a failure.
                 enrich=_enrich,
+                # Same checkout the deploy adapter tars from; the worker uses it
+                # to materialize the promoted release's source_revision.
+                repo_root=args.repo_root,
             )
             import signal, time as _time
             stopping = False

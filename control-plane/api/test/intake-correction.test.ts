@@ -11,6 +11,11 @@ const DB_URL = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
 const SKIP = !DB_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
+// This suite's fixture release carries no sealed manifest; generatePlan() only
+// selects such a release when the unsealed-fallback opt-in is set (planner.ts /
+// migration 0027). Production leaves it unset.
+process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE = "1";
+
 async function runMigrations(pool: pg.Pool) {
   const client = await pool.connect();
   try { await applyMigrations(client, migrationsDir); }
@@ -74,8 +79,10 @@ async function setupFixture(pool: pg.Pool, initialState: string = "intake_confir
     [generateTestId("memb"), tripId, ownerId],
   );
   await pool.query(
-    `INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status)
-     VALUES ($1, $2, $3, 1, 1, 1, 'available')`,
+    // Direct insert: carry the promotion bookkeeping migration 0027 requires of
+    // any 'available' row (releases_available_requires_promotion).
+    `INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by)
+     VALUES ($1, $2, $3, 1, 1, 1, 'available', now(), 'test:fixture')`,
     [releaseId, sourceRevision, artifactDigest],
   );
   await pool.query(

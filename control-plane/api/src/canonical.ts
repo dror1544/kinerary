@@ -70,6 +70,16 @@ export function assertCanonicalRecordSafe(value: unknown, path = "$"): void {
   }
 }
 
+/**
+ * The private-address definition this guard rejects, exposed so the release
+ * sanitation scan (release-artifact.ts) tests shipped source against the exact
+ * same pattern the canonical-record guard uses. The credential/host-path value
+ * pattern is deliberately not re-exported: it matches `Bearer \S+`, which is a
+ * legitimate literal in client fetch() code, so the scan carries its own
+ * higher-signal credential set instead.
+ */
+export const privateIpv4Pattern: RegExp = privateIpv4;
+
 /** Boolean form, mirroring the SQL function's return value for parity tests. */
 export function isCanonicalRecordSafe(value: unknown): boolean {
   try {

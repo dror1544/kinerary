@@ -140,3 +140,35 @@ docker compose -f control-plane/deployment/compose.local.yml down
 
 Deleting the named volume is a separate destructive operation and is never
 performed by the setup or test scripts.
+
+## Release catalog (operator CLI)
+
+A release is the trip-runtime source (`site/` + `server/` + `shared/`) frozen at
+a git revision, rendered into a sealed manifest — the exact file list with git's
+per-file content hash, a sanitation scan report, and the schema-compatibility
+range. `generatePlan` only ever selects a release whose status is `available`.
+
+LAN-only, like `mcp/provision.js` — building and promoting a release is a
+deliberate local command, not an HTTP route. Run from `control-plane/api/`:
+
+```bash
+npm run release -- build                       # freeze HEAD -> a 'candidate' row + releases/<id>.json
+npm run release -- promote <id> --to verified  # re-verifies the seal + requires a clean scan
+npm run release -- promote <id> --to available # enters the planner-selectable pool
+npm run release -- list                        # every release and its status
+npm run release -- show <id>
+```
+
+`build` is idempotent on the artifact digest and exits non-zero when the scan
+finds anything, while still recording the candidate so the failure is visible.
+A `candidate` cannot skip straight to `available`. DB URL comes from
+`CONTROL_PLANE_DATABASE_URL` / `..._FILE` / `CONTROL_PLANE_TEST_DATABASE_URL`
+or `--database-url`.
+
+At provision time the worker checks out `site/ server/ shared/` at the selected
+release's `source_revision` into a throwaway dir, re-verifies the tree against
+its `artifact_digest`, and deploys from there — so a release scanned and
+promoted for one commit can never ship a later, unscanned one. The hand-seeded
+`release_localdev0001` (no manifest) is the exception: it deploys the ambient
+checkout with a `provisioner.release_unverified` warning until a real
+`npm run release -- build` replaces it.
