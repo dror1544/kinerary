@@ -13,11 +13,15 @@ proxmox:
     disk_gb: 16
     bridge: ${PROXMOX_BRIDGE}
     ipv4: dhcp
+    gateway: ${PROXMOX_GATEWAY}
+    nameserver: ${PROXMOX_NAMESERVER}
+    nfs_host_dir: ${NFS_HOST_DIR}
+    nfs_mount_path: ${NFS_MOUNT_PATH}
 npm:
   hostname: ${PUBLIC_HOSTNAME}
   forward_host: ${LXC_NAME}
   forward_port: 8080
 cloudflare:
-  tunnel_name: ${CLOUDFLARE_TUNNEL_NAME}
+  tunnel_id: ${CLOUDFLARE_TUNNEL_ID}
   hostname: ${PUBLIC_HOSTNAME}
   service: ${CLOUDFLARE_TUNNEL_SERVICE}

@@ -46,6 +46,28 @@ rm -rf .claude/skills/create-trip
 ln -s ../../.agents/skills/create-trip .claude/skills/create-trip
 ```
 
+### Hermes skills: capture before you deploy
+
+`~/.hermes` is not version controlled, so a skill edited only in a profile has
+no history. But the profile is where the agent actually works, so it is where
+insight shows up first — a scoring note that proved wrong, a metric worth
+adding, a takeaway other agents should reuse. Traffic goes both ways:
+
+```bash
+scripts/install-hermes-skill.sh <skill> <profile> --capture  # profile -> repo, then commit
+scripts/install-hermes-skill.sh <skill> <profile>            # repo -> profile
+scripts/install-hermes-skill.sh <skill> <profile> --check    # report drift, exit 1
+```
+
+Deploy **refuses** when the profile has diverged, so capture-then-deploy is
+enforced rather than remembered; `--force` discards local changes and is only
+for when you have confirmed there is nothing there worth keeping. Every deploy
+refreshes a notice in the profile stating this.
+
+Anything durable belongs in `.agents/skills/`, not only in a profile. If you
+find content in a profile that is not in the repo, capture it — that is how
+`trip-assistant-experience-evaluation` nearly lost its scoring notes.
+
 ## Two MCP servers — different trust levels
 
 | | `mcp/mcp.js` | `mcp/provision.js` |

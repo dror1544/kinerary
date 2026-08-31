@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "environment": "test",
+  "public_api": {
+    "bind_host": "127.0.0.1",
+    "port": 4310
+  },
+  "worker": {
+    "queue": "postgres",
+    "health_bind_host": "127.0.0.1",
+    "health_port": 4311
+  },
+  "database": {
+    "connection_secret_ref": "env://CONTROL_PLANE_DATABASE_URL"
+  },
+  "adapters": {
+    "compute": "fake",
+    "ingress": "fake",
+    "agent_runtime": "fake",
+    "messaging": "fake",
+    "secrets": "fake"
+  },
+  "test_resources": {
+    "enabled": true,
+    "label_key": "kinerary.test_run_id",
+    "allowed_name_prefix": "kinerary-test-local"
+  },
+  "signup": {
+    "telegram_bot_token_secret_ref": "env://CONTROL_PLANE_TELEGRAM_CREDS",
+    "super_admin_subject_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "action_secret_ref": "env://CONTROL_PLANE_APPROVAL_SIGNING_KEY",
+    "action_ttl_seconds": 3600,
+    "signup_rate_limit_cooldown_seconds": 3600,
+    "webhook_secret_ref": "env://CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET"
+  }
+}

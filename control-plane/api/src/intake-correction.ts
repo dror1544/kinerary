@@ -1,0 +1,176 @@
+import { randomBytes } from "node:crypto";
+import type pg from "pg";
+import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
+import {
+  INTAKE_QUESTIONS,
+  INTAKE_SCHEMA_VERSION,
+  computeIntakeDigest,
+  validateAnswer,
+  type AnswerStore,
+} from "./interview.js";
+
+function generateId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString("hex")}`;
+}
+
+export type CorrectIntakeResult =
+  | { ok: true; versionId: string; version: number; digest: string }
+  | { ok: false; reason: "UNSAFE_ANSWER_CONTENT"; unsafePath: string }
+  | {
+      ok: false;
+      reason:
+        | "TRIP_NOT_FOUND"
+        | "NOT_AUTHORIZED"
+        | "NO_INTAKE_TO_CORRECT"
+        | "INVALID_STATE"
+        | "INVALID_ANSWERS";
+    };
+
+const CORRECTABLE_STATES = new Set([
+  "intake_confirmed",
+  "planned",
+  "provisioning_approved",
+  // A live private trip: the organizer can still fix an answer and re-provision.
+  // correctIntake supersedes the executed plan and reverts to intake_confirmed;
+  // the next plan comes out first_provision=false, so seeded users survive.
+  "ready_private",
+]);
+
+function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore | null {
+  const known = new Set(INTAKE_QUESTIONS.map((q) => q.id));
+  if (Object.keys(input).some((id) => !known.has(id))) return null;
+
+  const normalized: AnswerStore = {};
+  for (const question of INTAKE_QUESTIONS) {
+    const raw = input[question.id];
+    if (raw === undefined) {
+      if (question.required) return null;
+      continue;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const answer = raw as Record<string, unknown>;
+
+    let checked;
+    if (question.type === "choice" && answer.kind === "choice") {
+      if (typeof answer.option_id !== "string") return null;
+      checked = validateAnswer(question.id, answer.option_id, null);
+    } else if (question.type === "choice" && answer.kind === "choice_other") {
+      if (typeof answer.other_text !== "string") return null;
+      checked = validateAnswer(question.id, "other", answer.other_text);
+    } else if (question.type === "text" && answer.kind === "text") {
+      if (typeof answer.text !== "string") return null;
+      checked = validateAnswer(question.id, answer.text, null);
+    } else if (question.type === "structured" && answer.kind === "structured") {
+      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS, answer.data);
+    } else if (question.type === "multi_choice" && answer.kind === "multi_choice") {
+      if (!Array.isArray(answer.option_ids) || answer.option_ids.some((id) => typeof id !== "string")) return null;
+      checked = validateAnswer(question.id, null, null, INTAKE_QUESTIONS, undefined, answer.option_ids as string[]);
+    } else {
+      return null;
+    }
+    if (!checked.ok) return null;
+    normalized[question.id] = checked.answer;
+  }
+  return normalized;
+}
+
+/**
+ * Creates a new confirmed intake version from updated, schema-validated
+ * answers, supersedes any active plan, cancels associated jobs, and reverts
+ * the trip to 'intake_confirmed'. The previous confirmed version is immutable.
+ */
+export async function correctIntake(
+  db: pg.Pool,
+  tripId: string,
+  actorRef: string,
+  newAnswers: Record<string, unknown>,
+): Promise<CorrectIntakeResult> {
+  const normalized = normalizeCorrectionAnswers(newAnswers);
+  if (!normalized) return { ok: false, reason: "INVALID_ANSWERS" };
+
+  // Corrections write the same immutable intake_versions.data record as the
+  // initial confirmation path. Reject unsafe content before opening a
+  // transaction so callers receive a stable validation error instead of an
+  // opaque PostgreSQL CHECK-constraint failure. Migration 0015 remains the
+  // final backstop for every writer.
+  try {
+    assertCanonicalRecordSafe(normalized);
+  } catch (error) {
+    if (error instanceof UnsafeCanonicalRecordError) {
+      return { ok: false, reason: "UNSAFE_ANSWER_CONTENT", unsafePath: error.path };
+    }
+    throw error;
+  }
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    const tripRow = await client.query<{ lifecycle_state: string }>(
+      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1 FOR UPDATE",
+      [tripId],
+    );
+    const trip = tripRow.rows[0];
+    if (!trip) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "TRIP_NOT_FOUND" };
+    }
+    if (!CORRECTABLE_STATES.has(trip.lifecycle_state)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "INVALID_STATE" };
+    }
+
+    const existingRow = await client.query<{ max_version: number | null }>(
+      "SELECT MAX(version) AS max_version FROM control_plane.intake_versions WHERE trip_id = $1",
+      [tripId],
+    );
+    const previousVersion = existingRow.rows[0]?.max_version;
+    if (previousVersion == null) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "NO_INTAKE_TO_CORRECT" };
+    }
+
+    const digest = computeIntakeDigest(tripId, normalized);
+    const versionId = generateId("intk");
+    const nextVersion = previousVersion + 1;
+    const artifactRef = `intake:correction:${tripId}:v${nextVersion}:${actorRef}`;
+
+    await client.query(
+      `INSERT INTO control_plane.intake_versions
+         (id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
+       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb)`,
+      [versionId, tripId, nextVersion, artifactRef, digest, INTAKE_SCHEMA_VERSION, JSON.stringify(normalized)],
+    );
+
+    const planRow = await client.query<{ id: string }>(
+      `UPDATE control_plane.plans
+       SET status = 'superseded', updated_at = now()
+       WHERE trip_id = $1 AND status IN ('pending_approval', 'approved')
+       RETURNING id`,
+      [tripId],
+    );
+    if (planRow.rowCount && planRow.rowCount > 0) {
+      const planIds = planRow.rows.map((row) => row.id);
+      await client.query(
+        `UPDATE control_plane.jobs
+         SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
+         WHERE plan_id = ANY($1)
+           AND state NOT IN ('succeeded', 'failed', 'cancelled')`,
+        [planIds],
+      );
+    }
+
+    await client.query(
+      "UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1",
+      [tripId],
+    );
+
+    await client.query("COMMIT");
+    return { ok: true, versionId, version: nextVersion, digest };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}

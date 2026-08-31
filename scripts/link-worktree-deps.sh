@@ -33,7 +33,7 @@ MAIN_ROOT="${COMMON_DIR%/.git}"
 info "worktree: $WT_ROOT"
 info "main:     $MAIN_ROOT"
 
-for pkg in server tests mcp; do
+for pkg in server tests mcp control-plane/api; do
   main_pkg="$MAIN_ROOT/$pkg"
   wt_pkg="$WT_ROOT/$pkg"
 

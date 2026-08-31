@@ -13,7 +13,12 @@ let token;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 before(async () => {
-  await startTestServer();
+  // A non-empty HERMES_URL puts the plan layer in its normal "an enrichment
+  // worker exists" mode, so a newly added item/day seeds
+  // enrichment_status='pending'. The no-worker path (seed 'none', boot
+  // reconcile) is covered by itinerary-plan-layer.test.js, which starts its
+  // server without one.
+  await startTestServer({ HERMES_URL: 'http://127.0.0.1:59999/hermes-stub' });
   token = await loginAsAlice();
 });
 

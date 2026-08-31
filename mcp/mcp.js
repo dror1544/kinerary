@@ -729,17 +729,19 @@ async function extractPdfText(buf) {
 }
 
 // One-shot, non-interactive call: -q for the single query, -Q for
-// script-friendly output (no banner/spinner), --safe-mode to also strip
-// AGENTS.md/memory/plugin injection on top of the profile's own
-// already-disabled toolsets, --reasoning none so stdout is bare JSON instead
-// of a reasoning-trace panel. No shell involved (execFile, not exec) — the
-// extracted document text reaches this as a single argv entry, never
-// interpolated into a command string.
+// script-friendly output (no banner/spinner), --ignore-rules to strip
+// AGENTS.md/SOUL.md/memory/preloaded-skill injection, --reasoning none so
+// stdout is bare JSON instead of a reasoning-trace panel. NOT --safe-mode:
+// that also discards the profile's model config, and kinerary-extract's whole
+// value is its fallback chain (a quota-limited primary escalates instead of
+// 429ing the call). No shell involved (execFile, not exec) — the extracted
+// document text reaches this as a single argv entry, never interpolated into
+// a command string.
 function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       HERMES_BIN,
-      ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--safe-mode', '--reasoning', 'none'],
+      ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--ignore-rules', '--reasoning', 'none'],
       { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
@@ -751,7 +753,7 @@ function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
         const why = err.killed || err.signal
           ? `timed out after ${timeoutMs}ms (signal ${err.signal || 'none'})`
           : `exit ${err.code}`;
-        const tail = String(stderr || '').trim().slice(-300);
+        const tail = `${String(stderr || '').trim()} ${String(stdout || '').trim()}`.trim().slice(-300);
         reject(new Error(`hermes ${why}${tail ? ` — ${tail}` : ''}`));
       }
     );

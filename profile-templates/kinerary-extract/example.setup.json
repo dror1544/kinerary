@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "record_type": "kinerary_extract_profile_input",
+  "profile": {
+    "name": "kinerary-extract",
+    "description": "Single-turn document/URL data extraction for kinerary Add Booking AI-extract feature"
+  }
+}

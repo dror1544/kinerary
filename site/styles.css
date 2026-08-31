@@ -651,6 +651,13 @@ h2.section-h2 {
   margin-bottom: 26px;
   max-width: 920px;
 }
+.phase-note {
+  color: var(--ink-2);
+  font-size: 14px;
+  line-height: 1.5;
+  max-width: 720px;
+  margin: -14px 0 22px;
+}
 h3.section-h3 {
   font-family: var(--font-display);
   font-size: clamp(19px, 1.9vw, 25px);
@@ -768,6 +775,8 @@ a.inline:hover { border-color: var(--ink); }
 .day-block ul { list-style: none; padding: 0; margin: 0; }
 .day-block li { font-size: 14px; color: var(--ink-2); padding: 5px 0; border-bottom: 1px solid var(--line); }
 .day-block li:last-child { border-bottom: none; }
+.day-item-links { display: inline-flex; gap: 4px; vertical-align: middle; white-space: nowrap; }
+a.poi-btn.day-item-link { font-size: 11px; padding: 2px 7px; line-height: 1.4; }
 
 /* Confirmation badge (bookings table) */
 .conf-badge {

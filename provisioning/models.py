@@ -22,6 +22,14 @@ class LxcSpec:
     disk_gb: int
     bridge: str
     ipv4: str
+    gateway: str
+    nameserver: str
+    # Trip media (avatars/photos) storage: nfs_host_dir already lives on the
+    # NFS mount Proxmox itself has (confirmed live: /mnt/pve/truenas-nfs/...,
+    # a subdirectory there is all a new trip needs — no separate TrueNAS-side
+    # provisioning). nfs_mount_path is where the container sees it (mp0).
+    nfs_host_dir: str
+    nfs_mount_path: str
 
 
 @dataclass(frozen=True)
@@ -33,7 +41,12 @@ class ProxySpec:
 
 @dataclass(frozen=True)
 class CloudflareSpec:
-    tunnel_name: str
+    # A static value, not looked up via Cloudflare's account-scoped tunnel
+    # API — the tunnel is pre-existing, shared, and locally-managed (reads
+    # /etc/cloudflared/config.yml on the RPi4); this adapter never creates
+    # or deletes the tunnel object itself, only DNS records and ingress
+    # rules for it, so there's nothing to resolve at runtime.
+    tunnel_id: str
     hostname: str
     service: str
 
@@ -109,6 +122,10 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
             disk_gb=_positive_int(lxc, "disk_gb", "proxmox.lxc"),
             bridge=_nonempty_string(lxc, "bridge", "proxmox.lxc"),
             ipv4=_nonempty_string(lxc, "ipv4", "proxmox.lxc"),
+            gateway=_nonempty_string(lxc, "gateway", "proxmox.lxc"),
+            nameserver=_nonempty_string(lxc, "nameserver", "proxmox.lxc"),
+            nfs_host_dir=_nonempty_string(lxc, "nfs_host_dir", "proxmox.lxc"),
+            nfs_mount_path=_nonempty_string(lxc, "nfs_mount_path", "proxmox.lxc"),
         ),
         proxy=ProxySpec(
             hostname=_nonempty_string(proxy, "hostname", "npm"),
@@ -116,7 +133,7 @@ def load_topology(raw: Mapping[str, Any]) -> Topology:
             forward_port=_positive_int(proxy, "forward_port", "npm"),
         ),
         cloudflare=CloudflareSpec(
-            tunnel_name=_nonempty_string(cloudflare, "tunnel_name", "cloudflare"),
+            tunnel_id=_nonempty_string(cloudflare, "tunnel_id", "cloudflare"),
             hostname=_nonempty_string(cloudflare, "hostname", "cloudflare"),
             service=_nonempty_string(cloudflare, "service", "cloudflare"),
         ),

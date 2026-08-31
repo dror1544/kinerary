@@ -1,0 +1,215 @@
+name: kinerary-control-plane-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kinerary_control_plane
+      POSTGRES_USER: kinerary_control_plane
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - control_plane_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kinerary_control_plane -d kinerary_control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [private]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: control-plane/api/Dockerfile
+    command: ["node", "dist/migrate.js"]
+    environment:
+      # Resolves database.connection_secret_ref from the same profile the API
+      # uses, so both cannot end up pointed at different databases.
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      CONTROL_PLANE_MIGRATIONS_DIR: /app/migrations
+    secrets: [control_plane_database_url]
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [private]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: control-plane/api/Dockerfile
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      # Shared secret Hermes's gateway presents to resolve chat_id -> trip
+      # profile routing. Same tier/pattern as interview-mcp.ts's
+      # INTERVIEW_MCP_KEY — a bare env var, not a profile secret_ref, because
+      # it's a process-to-process key for an already-trusted local caller,
+      # not part of the provider-neutral architecture profile. Empty default
+      # leaves the route unmounted (503) rather than failing startup.
+      CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
+      # Local dev deploys from the hand-seeded `release_localdev0001`, which has
+      # no sealed manifest — so generatePlan would otherwise reject it and there
+      # would be no selectable release at all. This opts that box into the
+      # unsealed-release fallback (worker deploys the ambient REPO_ROOT checkout
+      # with a `provisioner.release_unverified` warning). A real deployment
+      # leaves this unset, so only a manifest-backed, digest-verified release is
+      # ever selectable.
+      CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
+    # The secret is still mounted: the profile's file:// database reference
+    # resolves to this path.
+    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    ports:
+      - "${CONTROL_PLANE_BIND_IP:-127.0.0.1}:4310:4310"
+    # Dev only: run the host's freshly-compiled dist over the image's baked
+    # copy, so `npm run build` (or `npx tsc`) is enough to pick up a source
+    # change — no `docker compose build api` every edit. The image still builds
+    # dist for a real deploy; this just overlays it. Keep dist/ current on the
+    # host (the api package has a tsc watch if you want one).
+    volumes:
+      - ../../control-plane/api/dist:/app/dist:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4310/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [ingress, private]
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: control-plane/worker/Dockerfile
+    # Overrides the Dockerfile's USER nobody for this local dev stack only.
+    # Two real reasons: (1) kinerary-deploy/deploy.sh hardcodes its SSH key
+    # path as $HOME/.ssh/id_ed25519_proxmox_hermes with no env override, so
+    # $HOME has to resolve to something with a real .ssh dir under it: root's
+    # always does. (2) the mounted SSH key files keep the host's real
+    # permissions (0600, owned by this Mac's user) — nobody (uid 65534)
+    # can't read them, root can. This container already performs real,
+    # privileged infra actions (Proxmox/NPM/Cloudflare) when PROVISIONER_
+    # COMPUTE_ENABLED is on; nobody's isolation wasn't buying much extra
+    # safety over that regardless.
+    user: root
+    # "run" only observes the queue — it never calls the deploy/companion/
+    # mcp_bridge adapters, so an approved job sat here forever. "provision"
+    # is the subcommand that actually drains it (see __main__.py).
+    command: ["python", "-m", "control_plane_worker", "provision", "--poll-seconds", "10"]
+    environment:
+      HOME: /root
+      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+      # Both required by "provision", both left empty by default on purpose
+      # (same reasoning as before this file gained real mounts below): an
+      # unconfigured worker must fail loudly every poll cycle, not reach
+      # real infra by accident just because docker compose up was run for
+      # something else. Pass PROVISIONER_DEPLOY_ROOT=/deploy-root REPO_ROOT=/repo
+      # (matching the bind mounts below) at `up` time to actually turn this on.
+      PROVISIONER_DEPLOY_ROOT: ${PROVISIONER_DEPLOY_ROOT:-}
+      PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-}
+      # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
+      # deploy.sh's own default is a host macOS path that doesn't exist
+      # inside this container, so this must be set (to /repo) whenever
+      # deploy-root is.
+      REPO_ROOT: ${REPO_ROOT:-}
+      # Phase G real compute provisioning — off unless PROVISIONER_COMPUTE_ENABLED
+      # is explicitly passed at `docker compose up` time (see --enable-compute's
+      # help text in __main__.py for the full list this then requires).
+      PROVISIONER_COMPUTE_ENABLED: ${PROVISIONER_COMPUTE_ENABLED:-}
+      PROXMOX_NODE: ${PROXMOX_NODE:-}
+      PROXMOX_STORAGE: ${PROXMOX_STORAGE:-}
+      PROXMOX_BRIDGE: ${PROXMOX_BRIDGE:-}
+      PROXMOX_LXC_TEMPLATE: ${PROXMOX_LXC_TEMPLATE:-}
+      PROXMOX_GATEWAY: ${PROXMOX_GATEWAY:-}
+      PROXMOX_NAMESERVER: ${PROXMOX_NAMESERVER:-}
+      PROXMOX_HOST: ${PROXMOX_HOST:-}
+      PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-}
+      PROXMOX_SSH_KEY: /root/.ssh/id_ed25519_proxmox_hermes
+      RPI_HOST: ${RPI_HOST:-}
+      RPI_SSH_USER: ${RPI_SSH_USER:-}
+      RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
+      PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
+      PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      # Shared onboarding password baked into a new site's .env. Empty (the
+      # default) keeps server.js's independent random per-user passwords —
+      # which today means the site has no usable login at all, since Telegram
+      # SSO is ruled out and Google is unconfigured. Stopgap until a real
+      # member/organizer signup flow exists.
+      PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
+      NPM_URL: ${NPM_URL:-}
+      NPM_API_TOKEN: ${NPM_API_TOKEN:-}
+      # Preferred over a static NPM_API_TOKEN (which is a ~1-day JWT): with
+      # both set the worker mints a fresh token per job (compute._mint_npm_token).
+      # __main__.py's --enable-compute guard requires one or the other.
+      NPM_IDENTITY: ${NPM_IDENTITY:-}
+      NPM_SECRET: ${NPM_SECRET:-}
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+    # Bind mounts for real provisioning: your kinerary-deploy checkout
+    # (read-write — deploy.sh and the compute adapter both write into it),
+    # this repo (read-only — deploy.sh only ever reads server/site/shared
+    # from it), and your SSH keys (read-only). All three are no-ops for the
+    # queue-observing "run" command; only "provision" (this service's
+    # command) ever touches them, and only once PROVISIONER_COMPUTE_ENABLED/
+    # PROVISIONER_DEPLOY_ROOT above are actually set. Paths match this
+    # developer machine's real checkouts — adjust if yours differ.
+    volumes:
+      - ${WORKER_DEPLOY_ROOT_HOST:-/Users/elul/kinerary-deploy}:/deploy-root
+      - ${WORKER_REPO_ROOT_HOST:-/Users/elul/kinerary}:/repo:ro
+      # Dev only: run the host's live package over the image's baked copy, so an
+      # enrichment.py / transformer.py edit takes effect on the next job with no
+      # `docker compose build worker`. (The image still COPYs it for a real
+      # deploy; this just overlays it. `/repo` above is a different concern —
+      # deploy.sh's site/server/shared inputs.)
+      - ${WORKER_REPO_ROOT_HOST:-/Users/elul/kinerary}/control-plane/worker/control_plane_worker:/app/control_plane_worker:ro
+      # Only the two specific keys this needs, not the whole ~/.ssh
+      # directory (which also holds unrelated personal/other-project keys).
+      - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
+      - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_rpi4_hermes:/root/.ssh/id_ed25519_rpi4_hermes:ro
+    secrets: [control_plane_database_url]
+    healthcheck:
+      test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [private]
+
+secrets:
+  postgres_password:
+    file: ./.local-secrets/postgres_password
+  control_plane_database_url:
+    file: ./.local-secrets/control_plane_database_url
+  telegram_creds:
+    file: ./.local-secrets/telegram_creds
+  approval_signing_key:
+    file: ./.local-secrets/approval_signing_key
+  telegram_webhook_secret:
+    file: ./.local-secrets/telegram_webhook_secret
+  telegram_super_admin_chat_id:
+    file: ./.local-secrets/telegram_super_admin_chat_id
+
+configs:
+  architecture_profile:
+    file: ../config/architecture.local.example.json
+
+volumes:
+  control_plane_postgres_data:
+
+networks:
+  ingress: {}
+  private: {}

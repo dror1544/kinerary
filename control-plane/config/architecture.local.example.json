@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "environment": "development",
+  "public_api": {
+    "bind_host": "0.0.0.0",
+    "port": 4310
+  },
+  "worker": {
+    "queue": "postgres",
+    "health_bind_host": "127.0.0.1",
+    "health_port": 4311
+  },
+  "database": {
+    "connection_secret_ref": "file:///run/secrets/control_plane_database_url"
+  },
+  "adapters": {
+    "compute": "fake",
+    "ingress": "fake",
+    "agent_runtime": "fake",
+    "messaging": "telegram",
+    "secrets": "file"
+  },
+  "test_resources": {
+    "enabled": false
+  },
+  "signup": {
+    "telegram_bot_token_secret_ref": "file:///run/secrets/telegram_creds",
+    "super_admin_subject_digest": "sha256:c9a2902fe9b1d10e1c0fbf586f6b6bc72c1b8d50b9ab974245d35ec499c1f318",
+    "super_admin_chat_id_secret_ref": "file:///run/secrets/telegram_super_admin_chat_id",
+    "action_secret_ref": "file:///run/secrets/approval_signing_key",
+    "action_ttl_seconds": 3600,
+    "signup_rate_limit_cooldown_seconds": 3600,
+    "webhook_secret_ref": "file:///run/secrets/telegram_webhook_secret"
+  }
+}

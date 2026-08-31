@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .adapters import CloudflareTunnelDnsAdapter, NpmProxyHostAdapter, ProxmoxLxcAdapter
+from .adapters import CloudflareTunnelDnsAdapter, NpmProxyHostAdapter, ProxmoxLxcAdapter, SubprocessSshTransport
 from .engine import Provisioner
 from .models import ProvisioningError, Topology, load_topology
 from .runtime import HttpJsonTransport
@@ -32,19 +32,30 @@ def _required_env(name: str) -> str:
 
 
 def build_provisioner(topology: Topology) -> Provisioner:
-    proxmox = HttpJsonTransport(_required_env("PROXMOX_URL"), {
-        "Authorization": "PVEAPIToken=" + _required_env("PROXMOX_TOKEN_ID") + "=" + _required_env("PROXMOX_TOKEN_SECRET"),
-    })
     npm = HttpJsonTransport(_required_env("NPM_URL"), {
         "Authorization": "Bearer " + _required_env("NPM_API_TOKEN"),
     })
     cloudflare = HttpJsonTransport("https://api.cloudflare.com", {
         "Authorization": "Bearer " + _required_env("CLOUDFLARE_API_TOKEN"),
     })
+    # Proxmox itself and the RPi4 that runs cloudflared — confirmed live
+    # (2026-08-25) at these defaults; override via env if either box ever
+    # changes. No Proxmox API token: pct create/list/destroy over the same
+    # SSH key kinerary-deploy's scripts already use for pct exec/pct config.
+    proxmox_ssh = SubprocessSshTransport(
+        host=os.environ.get("PROXMOX_HOST", "192.168.0.40"),
+        user=os.environ.get("PROXMOX_SSH_USER", "root"),
+        identity_file=os.path.expanduser(os.environ.get("PROXMOX_SSH_KEY", "~/.ssh/id_ed25519_proxmox_hermes")),
+    )
+    rpi_ssh = SubprocessSshTransport(
+        host=os.environ.get("RPI_HOST", "192.168.0.41"),
+        user=os.environ.get("RPI_SSH_USER", "dror"),
+        identity_file=os.path.expanduser(os.environ.get("RPI_SSH_KEY", "~/.ssh/id_ed25519_rpi4_hermes")),
+    )
     return Provisioner(
-        ProxmoxLxcAdapter(proxmox, topology.lxc.node),
+        ProxmoxLxcAdapter(proxmox_ssh),
         NpmProxyHostAdapter(npm),
-        CloudflareTunnelDnsAdapter(cloudflare, _required_env("CLOUDFLARE_ACCOUNT_ID"), _required_env("CLOUDFLARE_ZONE_ID")),
+        CloudflareTunnelDnsAdapter(cloudflare, _required_env("CLOUDFLARE_ZONE_ID"), rpi_ssh),
     )
 
 
