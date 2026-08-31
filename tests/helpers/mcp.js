@@ -23,6 +23,7 @@ export async function startTestMcp(extraEnv = {}) {
   const port = extraEnv.MCP_PORT || DEFAULT_TEST_PORT;
   BASE_URL = `http://localhost:${port}`;
   return new Promise((resolve, reject) => {
+    let startupTimer;
     mcpProcess = spawn('node', [MCP_JS], {
       cwd: MCP_DIR,
       env: {
@@ -42,18 +43,25 @@ export async function startTestMcp(extraEnv = {}) {
     mcpProcess.stdout.on('data', chunk => {
       if (!ready && chunk.toString().includes('listening on')) {
         ready = true;
+        clearTimeout(startupTimer);
         resolve();
       }
     });
     mcpProcess.stderr.on('data', chunk => {
       if (!ready) process.stderr.write(chunk);
     });
-    mcpProcess.on('error', reject);
+    mcpProcess.on('error', err => {
+      clearTimeout(startupTimer);
+      reject(err);
+    });
     mcpProcess.on('exit', code => {
-      if (!ready) reject(new Error(`trip-mcp exited with code ${code} before becoming ready`));
+      if (!ready) {
+        clearTimeout(startupTimer);
+        reject(new Error(`trip-mcp exited with code ${code} before becoming ready`));
+      }
     });
 
-    setTimeout(() => {
+    startupTimer = setTimeout(() => {
       if (!ready) reject(new Error('Test trip-mcp did not start within 10s'));
     }, 10_000);
   });
@@ -73,7 +81,7 @@ export function stopTestMcp() {
  * which is the tools/list payload on the wire, and this stays readable across
  * SDK versions.
  */
-export async function mcpListTools({ apiKey = MCP_API_KEY, timeoutMs = 10_000 } = {}) {
+async function mcpRequest(method, params, { apiKey = MCP_API_KEY, timeoutMs = 10_000 } = {}) {
   const ctrl = new AbortController();
   const stream = await fetch(`${BASE_URL}/sse`, {
     headers: { 'X-API-Key': apiKey, Accept: 'text/event-stream' },
@@ -143,13 +151,22 @@ export async function mcpListTools({ apiKey = MCP_API_KEY, timeoutMs = 10_000 } 
     });
     await waitFor(() => messages.find(m => m.id === 1), 'the initialize result');
     await send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-    await send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-    const listed = await waitFor(() => messages.find(m => m.id === 2), 'the tools/list result');
-    if (listed.error) throw new Error(`tools/list error: ${JSON.stringify(listed.error)}`);
-    return Object.fromEntries((listed.result?.tools || []).map(t => [t.name, t]));
+    await send({ jsonrpc: '2.0', id: 2, method, params });
+    const response = await waitFor(() => messages.find(m => m.id === 2), `the ${method} result`);
+    if (response.error) throw new Error(`${method} error: ${JSON.stringify(response.error)}`);
+    return response.result;
   } finally {
     ctrl.abort();
   }
+}
+
+export async function mcpListTools(options = {}) {
+  const result = await mcpRequest('tools/list', {}, options);
+  return Object.fromEntries((result?.tools || []).map(t => [t.name, t]));
+}
+
+export async function mcpCallTool(name, args = {}, options = {}) {
+  return mcpRequest('tools/call', { name, arguments: args }, options);
 }
 
 export async function mcpApi(path, { method = 'GET', body, apiKey } = {}) {

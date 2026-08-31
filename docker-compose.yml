@@ -27,8 +27,10 @@ services:
     environment:
       TZ: Asia/Jerusalem
       TRIP_DIR: /trip
+      SITE_DIR: /app/site
     volumes:
       - ./server/data:/app/data
+      - ./site:/app/site:ro
       - ./site/avatars:/app/avatars
       - ${TRIP_DIR_HOST:-./trip}:/trip:ro
     networks:
