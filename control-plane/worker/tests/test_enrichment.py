@@ -369,6 +369,69 @@ class VenueEnrichmentTests(unittest.TestCase):
         self.assertIn("maps", out["phases"][0]["venues"][0])
 
 
+class DayLinkCarryTests(unittest.TestCase):
+    """Sprint 4.7: a venue's maps/waze/url is copied onto any day item whose
+    text names it, so the itinerary line shows the same 🗺️/🔵/🎫 as the venue
+    card. The extract schema has no per-item link field — this is the only path."""
+
+    def _cfg(self, items):
+        cfg = _config()
+        cfg["phases"] = [{
+            "id": "tokyo", "title": {"he": "טוקיו", "en": "Tokyo"}, "tabLabel": "TOKYO",
+            "dates": {"start": "2026-09-19", "end": "2026-09-23"},
+            "venues": [
+                {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"},
+                 "url": "https://www.tokyo-skytree.jp/en/"},
+                {"id": "teamlab", "name": {"he": "טימלאב", "en": "TeamLab Planets Tokyo"},
+                 "url": "https://planets.teamlab.art/tokyo/"},
+            ],
+            "days": [{"date": "2026-09-20", "items": items}],
+        }]
+        return cfg
+
+    def _enriched_items(self, items):
+        http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO})
+        out = enrich_config(self._cfg(items), "Japan", http=http, pause=0)
+        return out["phases"][0]["days"][0]["items"]
+
+    def test_a_day_line_naming_a_venue_gets_that_venues_links(self) -> None:
+        item = self._enriched_items(
+            [{"time": "10:00", "text": {"he": "כניסה ל-Tokyo Skytree", "en": "Entry to Tokyo Skytree"}}]
+        )[0]
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", item["url"])
+        self.assertIn("Tokyo%20Skytree", item["maps"])          # name-search link from _enrich_venues
+        self.assertIn("waze.com/ul?q=Tokyo%20Skytree", item["waze"])
+
+    def test_a_trailing_city_word_on_the_venue_name_is_dropped_for_matching(self) -> None:
+        # venue is "TeamLab Planets Tokyo"; the line only says "TeamLab Planets".
+        item = self._enriched_items(
+            [{"time": "18:00", "text": {"he": "טימלאב", "en": "Entry to TeamLab Planets in Toyosu"}}]
+        )[0]
+        self.assertEqual("https://planets.teamlab.art/tokyo/", item["url"])
+
+    def test_an_item_that_names_no_venue_is_left_untouched(self) -> None:
+        item = self._enriched_items(
+            [{"time": "09:00", "text": {"he": "בוקר חופשי", "en": "Free morning"}}]
+        )[0]
+        self.assertNotIn("maps", item)
+        self.assertNotIn("url", item)
+
+    def test_a_link_already_on_the_item_is_not_overwritten(self) -> None:
+        item = self._enriched_items([{
+            "time": "10:00", "text": {"he": "Tokyo Skytree", "en": "Tokyo Skytree"},
+            "url": "https://hand-authored.example/",
+        }])[0]
+        self.assertEqual("https://hand-authored.example/", item["url"])
+
+    def test_no_days_or_no_venues_is_a_safe_no_op(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["days"] = [{"date": "2026-09-20", "items": [
+            {"time": "10:00", "text": {"he": "x", "en": "Tokyo Skytree"}}]}]
+        # no venues key at all
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO}), pause=0)
+        self.assertNotIn("url", out["phases"][0]["days"][0]["items"][0])
+
+
 class MapObjectTests(unittest.TestCase):
     def _geocoded(self):
         http = FakeHttp({"q=Tokyo": NOMINATIM_TOKYO, "q=Kyoto": NOMINATIM_KYOTO})

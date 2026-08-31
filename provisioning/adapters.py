@@ -123,6 +123,54 @@ class ProxmoxLxcAdapter:
                 return {"vmid": parts[0], "status": parts[1], "name": parts[-1]}
         return None
 
+    # Files _bootstrap_app_environment writes only once it runs to completion.
+    # The bootstrap script is `set -euo pipefail`, so a mid-way failure (e.g.
+    # the apt EACCES seen 2026-08-28) leaves the container existing but without
+    # these — a state inspect()/plan() cannot see, since inspect() only checks
+    # the container exists.
+    _BOOTSTRAP_MARKERS = (
+        "/opt/kinerary/.env",
+        "/etc/systemd/system/kinerary-server.service",
+        "/etc/nginx/sites-enabled/kinerary",
+    )
+
+    def needs_bootstrap(self, spec: LxcSpec) -> bool:
+        """True when the container exists but its app environment is missing or
+        incomplete — the case the create/no-op logic in the engine cannot
+        reach. False when the container is absent (create() handles that) or
+        fully bootstrapped."""
+        record = self.inspect(spec)
+        if record is None:
+            return False
+        vmid = record["vmid"]
+        test_expr = " -a ".join(f"-e {marker}" for marker in self._BOOTSTRAP_MARKERS)
+        try:
+            self.ssh.run(f"pct exec {shlex.quote(vmid)} -- sh -c {shlex.quote(f'test {test_expr}')}")
+        except RuntimeError:
+            return True
+        return False
+
+    def bootstrap(self, spec: LxcSpec) -> None:
+        """Run the (idempotent) app-environment bootstrap against a container
+        that already exists — the in-place converge path for a half-built one.
+        Starts the container first if it is stopped."""
+        record = self.inspect(spec)
+        if record is None:
+            raise RuntimeError(
+                f"cannot bootstrap {spec.name!r}: no such container on the node"
+            )
+        vmid = record["vmid"]
+        if record.get("status") != "running":
+            self.ssh.run(f"pct start {shlex.quote(vmid)}")
+        self._bootstrap_app_environment(vmid, spec)
+
+    def reset_trip_data(self, spec: LxcSpec) -> None:
+        """Public entry point for the first-provision data wipe, for the case
+        create() will not run because the container already exists (a failed
+        earlier attempt left it and its NFS dir behind). Same guard-railed
+        rm -rf as create()'s own reset; the caller decides when it applies."""
+        self._reset_trip_data(spec.nfs_host_dir)
+
     def create(self, spec: LxcSpec) -> None:
         if self._reset_data:
             self._reset_trip_data(spec.nfs_host_dir)

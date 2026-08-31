@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
                            help="create a fresh LXC (+ NPM proxy host + Cloudflare tunnel DNS) for any slug missing "
                                 "from --vmid-map — pct over SSH into Proxmox, real NPM/Cloudflare API calls — "
                                 "requires PROXMOX_NODE/PROXMOX_LXC_TEMPLATE/PROXMOX_STORAGE/PROXMOX_BRIDGE, "
-                                "NPM_URL/NPM_API_TOKEN, "
+                                "NPM_URL and (NPM_API_TOKEN or NPM_IDENTITY+NPM_SECRET), "
                                 "CLOUDFLARE_ZONE_ID/CLOUDFLARE_API_TOKEN, and "
                                 "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_ID "
                                 "(PROVISIONER_COMPUTE_ENABLED=1)")
@@ -100,6 +100,13 @@ def main(argv: list[str] | None = None) -> int:
                 ip_pool = json.loads(_required_env("PROVISIONER_LXC_IP_POOL"))
                 if not isinstance(ip_pool, list) or not ip_pool:
                     raise ValueError("PROVISIONER_LXC_IP_POOL must be a non-empty JSON array of IPv4 addresses")
+                if not os.environ.get("NPM_API_TOKEN") and not (
+                    os.environ.get("NPM_IDENTITY") and os.environ.get("NPM_SECRET")
+                ):
+                    raise ValueError(
+                        "NPM auth: set NPM_API_TOKEN, or NPM_IDENTITY + NPM_SECRET "
+                        "(preferred — the worker then mints a fresh token per job)"
+                    )
                 compute_adapter = LxcProvisionAdapter(
                     deploy_root=args.deploy_root,
                     node=_required_env("PROXMOX_NODE"),
@@ -110,7 +117,12 @@ def main(argv: list[str] | None = None) -> int:
                     hostname_domain=_required_env("PROVISIONER_LXC_HOSTNAME_DOMAIN"),
                     tunnel_id=_required_env("PROVISIONER_LXC_TUNNEL_ID"),
                     npm_url=_required_env("NPM_URL"),
-                    npm_api_token=_required_env("NPM_API_TOKEN"),
+                    # NPM tokens expire in ~1 day. Prefer identity/secret so the
+                    # worker mints a fresh token per job (compute._mint_npm_token);
+                    # a static NPM_API_TOKEN still works but goes stale.
+                    npm_api_token=os.environ.get("NPM_API_TOKEN", ""),
+                    npm_identity=os.environ.get("NPM_IDENTITY", ""),
+                    npm_secret=os.environ.get("NPM_SECRET", ""),
                     cloudflare_zone_id=_required_env("CLOUDFLARE_ZONE_ID"),
                     cloudflare_api_token=_required_env("CLOUDFLARE_API_TOKEN"),
                     # Proxmox itself and the RPi4 that runs cloudflared —
@@ -226,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Always on in a real run: it self-guards and degrades to "no
                 # enrichment", never a failure.
                 enrich=_enrich,
+                # Same checkout the deploy adapter tars from; the worker uses it
+                # to materialize the promoted release's source_revision.
+                repo_root=args.repo_root,
             )
             import signal, time as _time
             stopping = False

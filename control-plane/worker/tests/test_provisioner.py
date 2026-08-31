@@ -17,6 +17,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from control_plane_worker.provisioner import DeployAdapter, ProvisionerWorker
+from control_plane_worker.release_source import ReleaseSourceError
 
 DB_URL = os.environ.get("CONTROL_PLANE_TEST_DATABASE_URL")
 SKIP = not DB_URL
@@ -37,6 +38,7 @@ class FakeDeployAdapter:
         *,
         first_provision: bool = False,
         sidecars: dict[str, Any] | None = None,
+        source_dir: str | None = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -44,7 +46,7 @@ class FakeDeployAdapter:
             raise exc
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
-            "sidecars": sidecars or {},
+            "sidecars": sidecars or {}, "source_dir": source_dir,
         })
         return f"https://{slug}.test.example"
 
@@ -69,7 +71,7 @@ JAPAN_INTAKE = {
 
 def setup_fixture(
     conn: psycopg.Connection, slug: str | None = None, intake: dict | None = None,
-    first_provision: bool | None = None,
+    first_provision: bool | None = None, desired_extra: dict | None = None,
 ) -> dict:
     """Create a trip with an approved provision job ready to claim.
 
@@ -100,6 +102,8 @@ def setup_fixture(
     }
     if first_provision is not None:
         desired["first_provision"] = first_provision
+    if desired_extra:
+        desired.update(desired_extra)
     plan_desired = json.dumps(desired)
     plan_digest = sha256(plan_desired)
     token_digest = sha256(f"raw-token-{tag}")
@@ -119,8 +123,13 @@ def setup_fixture(
                 (f"memb_{rnd()}", trip_id, user_id),
             )
             cur.execute(
-                """INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status)
-                   VALUES (%s, %s, %s, 1, 1, 1, 'available')""",
+                # Direct insert (not via promoteRelease), so it must carry the
+                # promotion bookkeeping migration 0027's
+                # releases_available_requires_promotion demands of any
+                # 'available' row — same as migration 0016's seed and the
+                # planner.test.ts fixture.
+                """INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by)
+                   VALUES (%s, %s, %s, 1, 1, 1, 'available', now(), 'test:fixture')""",
                 (release_id, rnd(20), sha256(f"artifact-{tag}")),
             )
             # artifact_ref is a back-reference to the session, but for the
@@ -365,6 +374,36 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("succeeded", row["state"])
 
+    def test_lease_heartbeat_renews_while_a_slow_job_runs(self) -> None:
+        # A deploy that blocks long enough for several heartbeat intervals.
+        import time as _time
+
+        class SlowDeploy(FakeDeployAdapter):
+            def deploy(self, *args: Any, **kwargs: Any) -> str:
+                _time.sleep(0.5)
+                return super().deploy(*args, **kwargs)
+
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=SlowDeploy(), worker_id="hb-test",
+        )
+        worker.LEASE_SECONDS = 4
+        worker.HEARTBEAT_INTERVAL_SECONDS = 0.15
+
+        t0 = self.conn.execute("SELECT now() AS n").fetchone()["n"]
+        worker.run_once()
+
+        row = self.conn.execute(
+            "SELECT state, last_heartbeat_at FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "succeeded")
+        # _claim stamps last_heartbeat_at at ~t0; a beat during the 0.5s deploy
+        # pushes it at least one interval past that.
+        self.assertGreater(
+            (row["last_heartbeat_at"] - t0).total_seconds(),
+            worker.HEARTBEAT_INTERVAL_SECONDS,
+        )
+
     def test_empty_queue_returns_false(self) -> None:
         # Consume the job first.
         self.worker.run_once()
@@ -387,6 +426,94 @@ class ProvisionerHappyPathTests(unittest.TestCase):
             (self.fix["job_id"],),
         ).fetchone()
         self.assertEqual(row["state"], "queued")
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ReleaseMaterializationTests(unittest.TestCase):
+    """The provisioner must deploy the promoted release's source_revision, not
+    whatever is in the worker's checkout (Sprint 4.7 review P1)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fake_deploy = FakeDeployAdapter()
+        self.materialize_calls: list[tuple[str, str | None]] = []
+        self.made_dirs: list[str] = []
+
+    def tearDown(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+
+    def _fake_materialize(self, revision: str, digest: str | None) -> str:
+        import tempfile
+        self.materialize_calls.append((revision, digest))
+        path = tempfile.mkdtemp(prefix="fake-release-")
+        self.made_dirs.append(path)
+        return path
+
+    def _worker(self, **kw: Any) -> ProvisionerWorker:
+        kw.setdefault("materialize", self._fake_materialize)
+        return ProvisionerWorker(
+            db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-release-mat", **kw,
+        )
+
+    def test_verified_release_is_materialized_and_deployed_from_that_checkout(self) -> None:
+        rev = "a" * 40
+        self.fix = setup_fixture(self.conn, desired_extra={
+            "release_verified": True,
+            "release_source_revision": rev,
+            "release_artifact_digest": sha256("tree"),
+        })
+        self._worker().run_once()
+
+        self.assertEqual(self.materialize_calls, [(rev, sha256("tree"))])
+        deployed = self.fake_deploy.deployed[0]
+        self.assertEqual(deployed["source_dir"], self.made_dirs[0])
+        # The checkout is a throwaway — cleaned up after the deploy returns.
+        self.assertFalse(os.path.exists(self.made_dirs[0]))
+
+    def test_unverified_dev_seed_release_deploys_repo_root_with_a_warning(self) -> None:
+        self.fix = setup_fixture(self.conn, desired_extra={
+            "release_source_revision": "b" * 40,  # present, but no release_verified
+        })
+        with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as logs:
+            self._worker().run_once()
+        self.assertEqual(self.materialize_calls, [])
+        self.assertIsNone(self.fake_deploy.deployed[0]["source_dir"])
+        self.assertTrue(any("release_unverified" in line for line in logs.output))
+
+    def test_a_materialize_failure_fails_the_job_and_never_deploys(self) -> None:
+        self.fix = setup_fixture(self.conn, desired_extra={
+            "release_verified": True,
+            "release_source_revision": "c" * 40,
+            "release_artifact_digest": sha256("expected"),
+        })
+
+        def boom(revision: str, digest: str | None) -> str:
+            raise ReleaseSourceError("digest mismatch", "RELEASE_ARTIFACT_DIGEST_MISMATCH")
+
+        # Exhaust retries so the failure is terminal, not re-queued.
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET attempt = max_attempts - 1 WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+
+        self._worker(materialize=boom).run_once()
+
+        self.assertEqual(len(self.fake_deploy.deployed), 0)
+        row = self.conn.execute(
+            "SELECT state, safe_error_code FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["safe_error_code"], "RELEASE_ARTIFACT_DIGEST_MISMATCH")
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")

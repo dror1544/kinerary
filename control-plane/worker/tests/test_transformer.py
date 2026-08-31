@@ -1049,3 +1049,62 @@ class DeriveBookingsTests(unittest.TestCase):
 
     def test_no_phases_and_no_anchors_yields_no_bookings(self) -> None:
         self.assertEqual([], self._bookings(JAPAN_INTAKE))
+
+    def test_hotel_row_has_a_null_location_url_when_the_config_was_not_enriched(self) -> None:
+        hotel = next(b for b in self._bookings(self.PHASED_INTAKE) if b["type"] == "hotel")
+        self.assertIn("location_url", hotel)
+        self.assertIsNone(hotel["location_url"])
+
+
+class DeriveBookingsLinkTests(unittest.TestCase):
+    """Sprint 4.7: derive_bookings() runs on the already-enriched config, so a
+    hotel row can carry the map link enrichment anchored on that hotel, and an
+    anchor row can reuse a link the itinerary venues already resolved."""
+
+    def _enriched_config(self) -> dict:
+        return {
+            "phases": [{
+                "id": "tokyo",
+                "dates": {"start": "2026-09-19", "end": "2026-09-23"},
+                "accommodation": {
+                    "name": "OMO3 Asakusa", "name_en": "OMO3 Asakusa",
+                    "maps": "https://www.google.com/maps/search/?api=1&query=OMO3%20Asakusa",
+                },
+                "venues": [
+                    {"id": "skytree", "name": {"en": "Tokyo Skytree"},
+                     "url": "https://www.tokyo-skytree.jp/en/"},
+                ],
+            }],
+        }
+
+    def test_hotel_row_takes_its_location_url_from_the_enriched_accommodation(self) -> None:
+        rows = derive_bookings(self._enriched_config(), JAPAN_INTAKE)
+        hotel = next(b for b in rows if b["type"] == "hotel")
+        self.assertIn("OMO3%20Asakusa", hotel["location_url"])
+
+    def test_anchor_row_reuses_a_link_from_a_venue_it_names(self) -> None:
+        data = {
+            **JAPAN_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 10:00"},
+            ]),
+        }
+        rows = derive_bookings(self._enriched_config(), data)
+        anchor = next(b for b in rows if b["seed_key"].startswith("anchor_"))
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", anchor["location_url"])
+
+    def test_an_anchor_that_names_no_venue_gets_no_link(self) -> None:
+        data = {
+            **JAPAN_INTAKE,
+            "travel_anchors": _structured([{"type": "other", "detail": "misc reservation"}]),
+        }
+        rows = derive_bookings(self._enriched_config(), data)
+        anchor = next(b for b in rows if b["seed_key"].startswith("anchor_"))
+        self.assertIsNone(anchor["location_url"])
+
+    def test_a_non_http_accommodation_maps_value_is_ignored(self) -> None:
+        cfg = self._enriched_config()
+        cfg["phases"][0]["accommodation"]["maps"] = "javascript:alert(1)"
+        cfg["phases"][0]["venues"] = []
+        hotel = next(b for b in derive_bookings(cfg, JAPAN_INTAKE) if b["type"] == "hotel")
+        self.assertIsNone(hotel["location_url"])

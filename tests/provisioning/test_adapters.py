@@ -86,9 +86,17 @@ PCT_LIST_OUTPUT = (
 
 
 class FakeProxmoxSsh:
-    def __init__(self, pct_list_output: str = PCT_LIST_OUTPUT, nextid: str = "203") -> None:
+    def __init__(
+        self,
+        pct_list_output: str = PCT_LIST_OUTPUT,
+        nextid: str = "203",
+        bootstrapped: bool = True,
+    ) -> None:
         self.pct_list_output = pct_list_output
         self.nextid = nextid
+        # Controls whether the `test -e <marker>` probe from needs_bootstrap
+        # succeeds (all markers present) or fails (half-built container).
+        self.bootstrapped = bootstrapped
         self.commands: list[str] = []
 
     def run(self, command: str) -> str:
@@ -103,8 +111,14 @@ class FakeProxmoxSsh:
             return ""
         if command.startswith("pct create ") and " && pct start " in command:
             return ""
+        if command.startswith("pct start "):
+            return ""
         if command.startswith("pct stop "):
             return ""
+        if "-- sh -c" in command and "test -e " in command:
+            if self.bootstrapped:
+                return ""
+            raise RuntimeError("ssh command failed (exit 1): test")
         if command.startswith("#!/bin/bash") and "BOOTSTRAP_INNER" in command:
             return ""
         raise AssertionError(f"FakeProxmoxSsh got an unexpected command: {command!r}")
@@ -281,6 +295,19 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     adapter._reset_trip_data(bad)
 
+    def test_public_reset_trip_data_wipes_from_a_spec_without_touching_reset_data(self) -> None:
+        # The compute wrapper calls this directly when the container already
+        # exists (create() won't run), regardless of the reset_data flag.
+        ssh = FakeProxmoxSsh()
+        adapter = ProxmoxLxcAdapter(ssh, reset_data=False)
+
+        adapter.reset_trip_data(LXC_SPEC)
+
+        self.assertEqual(
+            ["rm -rf /mnt/pve/truenas-nfs/tokyo-2026/server-data /mnt/pve/truenas-nfs/tokyo-2026/media"],
+            ssh.commands,
+        )
+
     def test_proxmox_delete_stops_and_destroys_when_found(self) -> None:
         ssh = FakeProxmoxSsh()
         adapter = ProxmoxLxcAdapter(ssh)
@@ -299,6 +326,39 @@ class AdapterTests(unittest.TestCase):
         adapter.delete(LXC_SPEC)
 
         self.assertFalse(any("pct stop" in c or "pct destroy" in c for c in ssh.commands))
+
+    def test_needs_bootstrap_is_false_for_an_absent_container(self) -> None:
+        adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())
+        self.assertFalse(adapter.needs_bootstrap(LXC_SPEC))  # LXC_SPEC's name is not in pct list
+
+    def test_needs_bootstrap_is_false_when_all_markers_are_present(self) -> None:
+        ssh = FakeProxmoxSsh(bootstrapped=True)
+        adapter = ProxmoxLxcAdapter(ssh)
+        spec = LxcSpec("trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m")
+        self.assertFalse(adapter.needs_bootstrap(spec))
+
+    def test_needs_bootstrap_is_true_when_a_marker_is_missing(self) -> None:
+        ssh = FakeProxmoxSsh(bootstrapped=False)
+        adapter = ProxmoxLxcAdapter(ssh)
+        spec = LxcSpec("trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "h", "m")
+        self.assertTrue(adapter.needs_bootstrap(spec))
+
+    def test_bootstrap_runs_the_app_environment_script_against_the_existing_vmid(self) -> None:
+        ssh = FakeProxmoxSsh(bootstrapped=False)
+        adapter = ProxmoxLxcAdapter(ssh)
+        spec = LxcSpec("trip-kinerary", "pve", "t", "s", 2, 1024, 8, "vmbr0", "ip", "gw", "ns", "/nfs/kinerary", "/nfs/kinerary")
+
+        adapter.bootstrap(spec)
+
+        # container in PCT_LIST_OUTPUT is 'running', so no pct start; the
+        # bootstrap script (targets vmid 201) is what runs.
+        self.assertFalse(any(c.startswith("pct start ") for c in ssh.commands))
+        self.assertTrue(any(c.startswith("#!/bin/bash") and "pct exec 201 --" in c for c in ssh.commands))
+
+    def test_bootstrap_raises_when_the_container_does_not_exist(self) -> None:
+        adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())
+        with self.assertRaises(RuntimeError):
+            adapter.bootstrap(LXC_SPEC)
 
     def test_npm_existing_hostname_is_idempotent(self) -> None:
         transport = FakeTransport([[{"id": 9, "domain_names": ["site.example.invalid"]}]])

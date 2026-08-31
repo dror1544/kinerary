@@ -318,6 +318,10 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.venues_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
+            _carry_venue_links_to_days(phase, label, destination)
+        except Exception:
+            logger.warning("enrichment.day_links_failed", extra={"phase": phase.get("id")}, exc_info=True)
+        try:
             if "hero" not in phase:
                 # A Hebrew-only phase title against en.wikipedia is a guaranteed
                 # 404; query the wiki that matches the label's language.
@@ -543,6 +547,90 @@ def _enrich_venues(
         query = ", ".join(p for p in (name, str(venue.get("area") or "").strip(), label, destination) if p)
         venue.setdefault("maps", _maps_search_url(query))
         venue.setdefault("waze", _waze_search_url(query))
+
+
+def _venue_name_variants(name: Any, label: str, destination: str) -> list[str]:
+    """Lower-cased match candidates for a venue name: each language side as-is,
+    plus that side with a trailing city / country word dropped (a source
+    document writes "TeamLab Planets" for a venue stored as "TeamLab Planets
+    Tokyo"). Anything under 4 characters is skipped — too short to match on
+    without stumbling into a coincidental substring."""
+    if isinstance(name, dict):
+        sides = [name.get("en"), name.get("he")]
+    elif isinstance(name, str):
+        sides = [name]
+    else:
+        return []
+    trailing = {w for w in (label.strip().lower(), destination.strip().lower()) if w}
+    out: list[str] = []
+    seen: set[str] = set()
+    for side in sides:
+        text = str(side or "").strip()
+        variants = [text]
+        words = text.split()
+        if len(words) >= 2 and words[-1].lower() in trailing:
+            variants.append(" ".join(words[:-1]))
+        for variant in variants:
+            key = variant.lower()
+            if len(key) >= 4 and key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
+def _carry_venue_links_to_days(phase: dict[str, Any], label: str, destination: str) -> None:
+    """Copy a venue's ``maps`` / ``waze`` / ``url`` onto any day item whose text
+    names that venue. The extract schema has no per-item link field and the
+    site renders a config day as a bare ``time — text`` line, so without this
+    the 🗺️/🔵/🎫 the venue card already carries never reach the itinerary line
+    that actually mentions the place. Each link is only added when the item
+    doesn't already carry one — a hand-authored value wins."""
+    days = phase.get("days")
+    venues = phase.get("venues")
+    if not isinstance(days, list) or not isinstance(venues, list):
+        return
+
+    # (needle, {link key: url}); matched longest-needle-first so a specific
+    # venue ("Tokyo Station") wins over a bare "Tokyo" when both are on the phase.
+    needles: list[tuple[str, dict[str, str]]] = []
+    for venue in venues:
+        if not isinstance(venue, dict):
+            continue
+        links = {
+            key: venue[key]
+            for key in ("maps", "waze", "url")
+            if isinstance(venue.get(key), str) and venue[key].strip()
+        }
+        if not links:
+            continue
+        for cand in _venue_name_variants(venue.get("name"), label, destination):
+            needles.append((cand, links))
+    if not needles:
+        return
+    needles.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        for item in day.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if any(
+                isinstance(item.get(key), str) and item[key].strip()
+                for key in ("maps", "waze", "url")
+            ):
+                continue
+            text = item.get("text")
+            if not isinstance(text, dict):
+                continue
+            hay = f"{str(text.get('en') or '').lower()} {str(text.get('he') or '').lower()}"
+            if not hay.strip():
+                continue
+            for needle, links in needles:
+                if needle in hay:
+                    for key, value in links.items():
+                        item.setdefault(key, value)
+                    break
 
 
 def _build_map(out: dict[str, Any]) -> None:

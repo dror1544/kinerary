@@ -13,7 +13,7 @@ import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
-import { generatePlan, getPlan, listAvailableReleases } from "./planner.js";
+import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
 import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import {
@@ -93,7 +93,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     endpoints: [
       "/healthz", "/readyz",
       "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
-      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/intake/correct",
+      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/plan/retry", "/v1/trips/:id/intake/correct",
       "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
       "/v1/interview/:sessionId/consular", "/v1/interview/:sessionId/source-document",
       "/v1/interview/:sessionId/venue-links",
@@ -717,6 +717,57 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       planDigest: result.planDigest,
       releaseId: result.releaseId,
       jobId: result.jobId,
+    });
+  });
+
+  // POST /v1/trips/:id/plan/retry — re-run provisioning for a trip whose
+  // previous attempt is finished (terminally failed, or succeeded and being
+  // replaced) without a manual database edit. Supersedes any active plan,
+  // cancels its non-terminal jobs, reverts to intake_confirmed, and generates
+  // a fresh plan + job from the latest confirmed intake.
+  // Header: X-Telegram-Login (trip owner only)
+  app.post("/v1/trips/:id/plan/retry", async (request, reply) => {
+    if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
+      return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
+    }
+    const { planner, signup, interview } = dependencies;
+
+    const params = request.params as Record<string, unknown>;
+    const tripId = params?.id;
+    if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const loginResult = await resolveWebAuth(request.headers as Record<string, unknown>, signup.db, verifyTelegramLogin, signup.botToken);
+    if (!loginResult.ok) return reply.code(401).send({ error: loginResult.error });
+
+    const identityRow = await interview.db.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = $1 AND provider_subject_digest = $2",
+      [loginResult.identity.provider, loginResult.identity.providerSubjectDigest],
+    );
+    const identity = identityRow.rows[0];
+    if (!identity) return reply.code(401).send({ error: "UNKNOWN_USER" });
+
+    const memberRow = await planner.db.query(
+      "SELECT id FROM control_plane.trip_memberships WHERE trip_id = $1 AND user_id = $2 AND role = 'owner' AND status = 'active'",
+      [tripId, identity.user_id],
+    );
+    if (!memberRow.rows[0]) return reply.code(403).send({ error: "NOT_OWNER" });
+
+    const correlationId = `corr_${randomBytes(12).toString("hex")}`;
+    const result = await retryProvision(planner.db, tripId, correlationId);
+
+    if (!result.ok) {
+      const status = result.reason === "TRIP_NOT_FOUND" ? 404
+        : result.reason === "NO_COMPATIBLE_RELEASE" ? 422
+        : 409;
+      return reply.code(status).send({ error: result.reason });
+    }
+
+    return reply.code(201).send({
+      planId: result.planId,
+      planDigest: result.planDigest,
+      releaseId: result.releaseId,
+      jobId: result.jobId,
+      supersededPlanId: result.supersededPlanId,
     });
   });
 

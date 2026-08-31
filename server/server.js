@@ -644,13 +644,21 @@ async function initData() {
   try {
     const bookingSeeds = JSON.parse(fs.readFileSync(path.join(TRIP_DIR, 'bookings.json'), 'utf8'));
     const bookingInsert = db.prepare(
-      'INSERT OR IGNORE INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,conf_file,seed_key,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,conf_file,location_url,seed_key,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    );
+    // A trip DB seeded before bookings.json carried location_url keeps NULL
+    // forever — INSERT OR IGNORE is a no-op once the seed_key row exists. Fill
+    // it in on a later boot, but only where it is still unset so a hand edit on
+    // the Bookings tab is never stomped.
+    const bookingBackfillLoc = db.prepare(
+      'UPDATE bookings SET location_url = ? WHERE seed_key = ? AND location_url IS NULL'
     );
     db.transaction(() => {
       for (const b of bookingSeeds) {
         bookingInsert.run(b.phase, b.type, b.name, b.date_from || null, b.date_to || null,
           b.passengers || null, b.confirmation || null, b.pin || null,
-          b.notes || null, b.cost || 0, b.conf_file || null, b.seed_key, 'seed');
+          b.notes || null, b.cost || 0, b.conf_file || null, b.location_url || null, b.seed_key, 'seed');
+        if (b.location_url) bookingBackfillLoc.run(b.location_url, b.seed_key);
       }
     })();
     console.log('Bookings seeded.');
@@ -2946,15 +2954,24 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
   const enrichSeed = HERMES_URL ? 'pending' : 'none';
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
-    '(phase_id,date,time,time_sort,text_he,text_en,location_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
-    "VALUES (?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?)"
+    '(phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,ticket_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,?,?)"
   );
-  // Re-running promote repairs rows imported before extra_links existed, rather
-  // than leaving an already-promoted trip permanently missing those links.
+  // Re-running promote repairs a row whose links weren't available (or the
+  // column didn't exist) the first time — filling only what is still NULL, so
+  // an organizer edit is never stomped. Not gated on extra_links: a row
+  // promoted from an inline-linked config item has non-null extra_links but
+  // may still be missing a Waze / ticket sibling a later enrichment added.
   const backfillLinks = db.prepare(
-    'UPDATE phase_plan_items SET extra_links = ?, location_url = COALESCE(location_url, ?) ' +
-    'WHERE config_ref = ? AND extra_links IS NULL'
+    'UPDATE phase_plan_items SET ' +
+    'extra_links = COALESCE(extra_links, ?), location_url = COALESCE(location_url, ?), ' +
+    'waze_url = COALESCE(waze_url, ?), ticket_url = COALESCE(ticket_url, ?) ' +
+    'WHERE config_ref = ?'
   );
+  // Provision-time enrichment attaches maps/waze/url straight onto a config day
+  // item (matched from phases[].venues[]) — siblings of text/time, never inline
+  // <a>, so allConfigLinks()/firstMapHref() below never see them.
+  const httpOrNull = (u) => (/^https?:\/\//i.test(u || '') ? u : null);
 
   const upsertDay = db.prepare(
     'INSERT INTO phase_plan_days (phase_id,date,label_he,label_en,enrichment_status) VALUES (?,?,?,?,?) ' +
@@ -2985,9 +3002,22 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
           .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i);
         const linksJson = links.length ? JSON.stringify(links) : null;
 
-        if (db.prepare('SELECT 1 FROM phase_plan_items WHERE config_ref = ?').get(ref)) {
-          const fixed = backfillLinks.run(linksJson, firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null, ref);
-          skipped.push({ config_ref: ref, reason: fixed.changes ? 'already promoted (links backfilled)' : 'already promoted' });
+        const mapsHref  = firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || httpOrNull(item.maps);
+        const wazeHref  = httpOrNull(item.waze);
+        const ticketHref = httpOrNull(item.url);
+
+        const existing = db.prepare(
+          'SELECT location_url, waze_url, ticket_url, extra_links FROM phase_plan_items WHERE config_ref = ?'
+        ).get(ref);
+        if (existing) {
+          // Only report a backfill when a NULL column actually had a value to take.
+          const filled =
+            (existing.extra_links  == null && linksJson  != null) ||
+            (existing.location_url == null && mapsHref    != null) ||
+            (existing.waze_url     == null && wazeHref    != null) ||
+            (existing.ticket_url   == null && ticketHref  != null);
+          if (filled) backfillLinks.run(linksJson, mapsHref, wazeHref, ticketHref, ref);
+          skipped.push({ config_ref: ref, reason: filled ? 'already promoted (links backfilled)' : 'already promoted' });
           return;
         }
         const rawTime = typeof item.time === 'string' ? item.time.trim() : '';
@@ -3003,7 +3033,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
         const info = insert.run(
           phase.id, day.date || null, time, planTimeSort(time),
           he || en, en || null,
-          firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
+          mapsHref, wazeHref, ticketHref,
           linksJson,
           findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
           di * 1000 + ii, req.user.username, enrichSeed, ref

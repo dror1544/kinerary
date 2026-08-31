@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -30,6 +32,7 @@ from .companion_profile import (
 )
 from .compute import ComputeAdapter, NullComputeAdapter
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter
+from .release_source import ReleaseSourceError, materialize_release_source
 from .transformer import (
     derive_bookings,
     derive_trip_slug,
@@ -40,6 +43,11 @@ from .transformer import (
 # (config, destination) -> config. See ProvisionerWorker.__init__ for why this
 # defaults to a passthrough rather than the live enrich_config.
 EnrichFn = Callable[[dict[str, Any], str], dict[str, Any]]
+
+# (source_revision, artifact_digest | None) -> a directory holding site/ server/
+# shared/ checked out at that revision. Injectable so tests do not need a git
+# repo; None means "use the real release_source.materialize_release_source".
+MaterializeFn = Callable[[str, str | None], str]
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +67,7 @@ class DeployAdapter(Protocol):
         *,
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
+        source_dir: str | None = None,
     ) -> str: ...
 
 
@@ -89,6 +98,7 @@ class ShellDeployAdapter:
         *,
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
+        source_dir: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -115,8 +125,11 @@ class ShellDeployAdapter:
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
-        if self._repo_root:
-            env["REPO_ROOT"] = self._repo_root
+        # A materialized release checkout (site/ server/ shared/ at the promoted
+        # revision) wins over the ambient repo — deploy.sh tars ${REPO_ROOT}/{server,site,shared}.
+        repo_root = source_dir or self._repo_root
+        if repo_root:
+            env["REPO_ROOT"] = repo_root
 
         result = subprocess.run(
             [deploy_sh, slug, vmid, "--sync-config", "--restart", "--trip-dir", trip_dir],
@@ -161,6 +174,93 @@ def _generate_notif_id() -> str:
     return f"notif_{secrets.token_hex(16)}"
 
 
+class _LeaseHeartbeat:
+    """Renews a claimed job's lease on a background thread while run_once()
+    works the job.
+
+    run_once() is single-threaded and blocks on multi-minute SSH subprocesses
+    during a real provision — the container bootstrap alone has a 900s ceiling
+    — so without this the lease can expire under a perfectly healthy run and
+    recoverStaleLeases re-queues the job, producing a second provision. The
+    thread renews every `interval_seconds`; if the renewing UPDATE ever matches
+    no row the lease is no longer ours (stolen, or the job already moved on)
+    and the thread stops. Transient DB errors are logged and retried until
+    stop().
+
+    Used as a context manager so start/stop is exception-safe.
+    """
+
+    def __init__(
+        self,
+        db_url: str,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: float,
+        interval_seconds: float,
+    ) -> None:
+        self._db_url = db_url
+        self._job_id = job_id
+        self._worker_id = worker_id
+        self._lease_seconds = lease_seconds
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.lease_lost = False
+
+    def __enter__(self) -> "_LeaseHeartbeat":
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"lease-heartbeat-{self._job_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def _loop(self) -> None:
+        # wait() at the top: the claim already set lease_expires_at and
+        # last_heartbeat_at, so the first renewal is only due one interval in.
+        # A fast job (every unit test) stops before this first wait returns and
+        # never opens a connection here.
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                with psycopg.connect(self._db_url) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE control_plane.jobs
+                            SET    lease_expires_at = now() + make_interval(secs => %s::float8),
+                                   last_heartbeat_at = now(),
+                                   updated_at = now()
+                            WHERE  id = %s AND lease_owner = %s AND state = 'leased'
+                            """,
+                            (self._lease_seconds, self._job_id, self._worker_id),
+                        )
+                        if cur.rowcount == 0:
+                            # The job is no longer 'leased' by us: either it
+                            # just completed (a beat racing _complete/_fail at
+                            # the tail — harmless) or the lease was stolen. The
+                            # thread's job is only to renew, so either way it
+                            # stops; _complete/_fail's own lease guards and
+                            # recoverStaleLeases are the real safety net.
+                            logger.info(
+                                "provisioner.heartbeat_stopping_lease_not_held",
+                                extra={"job_id": self._job_id},
+                            )
+                            self.lease_lost = True
+                            return
+            except Exception:  # transient DB blip — keep beating until stop()
+                logger.warning(
+                    "provisioner.heartbeat_failed",
+                    exc_info=True,
+                    extra={"job_id": self._job_id},
+                )
+
+
 class ProvisionerWorker:
     """Claims one approved provision job at a time, transforms intake to
     trip.config.json, deploys via the deploy adapter, and records the result.
@@ -170,7 +270,14 @@ class ProvisionerWorker:
     approval is consumed only at terminal events (success or exhausted failure).
     """
 
-    LEASE_SECONDS = 600  # 10 minutes; deployment timeout is 5 minutes and no heartbeat exists yet
+    # Covers the 900s single-remote-command ceiling (SubprocessSshTransport in
+    # provisioning/adapters.py) even if the heartbeat thread stalls. A running
+    # job's lease is renewed every HEARTBEAT_INTERVAL_SECONDS on a side thread
+    # (see _LeaseHeartbeat), so a genuinely long healthy provision never loses
+    # its lease; a dead worker's lease still expires within LEASE_SECONDS of its
+    # last beat and recoverStaleLeases reclaims it.
+    LEASE_SECONDS = 900
+    HEARTBEAT_INTERVAL_SECONDS = 60
     DEFAULT_WORKER_ID_PREFIX = "provisioner"
 
     def __init__(
@@ -181,6 +288,8 @@ class ProvisionerWorker:
         companion: CompanionProfileAdapter | None = None,
         mcp_bridge: McpBridgeAdapter | None = None,
         enrich: EnrichFn | None = None,
+        repo_root: str | None = None,
+        materialize: MaterializeFn | None = None,
     ) -> None:
         self._db_url = db_url
         self._deploy = deploy
@@ -191,6 +300,12 @@ class ProvisionerWorker:
         # HTTP calls, so it stays off unless __main__ wires enrich_config in,
         # matching how compute/mcp_bridge default to their Null adapters.
         self._enrich = enrich or (lambda config, destination: config)
+        # Where to check out a promoted release's source_revision from. Same
+        # value ShellDeployAdapter uses as its fallback REPO_ROOT.
+        self._repo_root = repo_root or os.environ.get("PROVISIONER_REPO_ROOT") or os.environ.get("REPO_ROOT", "")
+        self._materialize = materialize or (
+            lambda revision, digest: materialize_release_source(self._repo_root, revision, digest)
+        )
 
     # ── public API ──────────────────────────────────────────────────────────────
 
@@ -206,82 +321,137 @@ class ProvisionerWorker:
             plan_id = claim["plan_id"]
             attempt = claim["attempt"]
 
+            # Renew the lease on a side thread for the life of the job — the
+            # body below blocks on multi-minute SSH subprocesses and must not
+            # let a healthy run's lease lapse into a re-queue.
+            with _LeaseHeartbeat(
+                self._db_url, job_id, self._worker_id,
+                self.LEASE_SECONDS, self.HEARTBEAT_INTERVAL_SECONDS,
+            ):
+                self._work_claimed_job(conn, job_id, trip_id, plan_id, attempt)
+
+        return True
+
+    def _work_claimed_job(
+        self,
+        conn: psycopg.Connection,
+        job_id: str,
+        trip_id: str,
+        plan_id: str,
+        attempt: int,
+    ) -> None:
+        try:
+            # Load plan.desired to get intake_version_id.
+            plan_desired = self._load_plan_desired(conn, plan_id)
+            intake_version_id = plan_desired.get("intake_version_id")
+            if not intake_version_id:
+                raise ValueError("plan.desired missing intake_version_id")
+
+            # Load trip slug.
+            slug = self._load_trip_slug(conn, trip_id)
+
+            # Load intake answers from intake_versions.data.
+            answers = self._load_intake_data(conn, intake_version_id)
+
+            # Transform to trip.config.json.
+            config = transform_intake(answers)
+
+            # Deterministic destination enrichment (Sprint 4.5): currency /
+            # emergency numbers for the country, lat-lng per phase, a hero
+            # photo per phase — each from a keyless public API. The default
+            # is a passthrough; __main__ injects the live enrich_config.
+            # It self-guards, but a provision job must never fail on an
+            # enrichment miss, so wrap it again here.
             try:
-                # Load plan.desired to get intake_version_id.
-                plan_desired = self._load_plan_desired(conn, plan_id)
-                intake_version_id = plan_desired.get("intake_version_id")
-                if not intake_version_id:
-                    raise ValueError("plan.desired missing intake_version_id")
+                config = self._enrich(config, intake_destination(answers))
+            except Exception:  # pragma: no cover - enrich_config self-guards
+                logger.warning("provisioner.enrichment_failed", exc_info=True)
 
-                # Load trip slug.
-                slug = self._load_trip_slug(conn, trip_id)
+            # Sidecar files that live beside trip.config.json in the trip
+            # dir. trivia_questions.json is always written empty: control-
+            # plane trips ship without trivia (documented descope in
+            # docs/onboarding-mvp-sprint-plan.md, Sprint 4.5), and an empty
+            # file stops the trip server erroring on every boot.
+            # bookings.json carries the phase hotels and the travel_anchors
+            # the interview captured, which the config itself drops.
+            sidecars: dict[str, Any] = {"trivia_questions.json": []}
+            bookings = derive_bookings(config, answers)
+            if bookings:
+                sidecars["bookings.json"] = bookings
 
-                # Load intake answers from intake_versions.data.
-                answers = self._load_intake_data(conn, intake_version_id)
+            # The slug assigned at signup approval is a placeholder — the
+            # destination and dates were not known yet. Now that the intake
+            # is confirmed, promote it to the one the family will see.
+            slug = self._promote_draft_slug(conn, trip_id, slug, answers)
 
-                # Transform to trip.config.json.
-                config = transform_intake(answers)
-
-                # Deterministic destination enrichment (Sprint 4.5): currency /
-                # emergency numbers for the country, lat-lng per phase, a hero
-                # photo per phase — each from a keyless public API. The default
-                # is a passthrough; __main__ injects the live enrich_config.
-                # It self-guards, but a provision job must never fail on an
-                # enrichment miss, so wrap it again here.
-                try:
-                    config = self._enrich(config, intake_destination(answers))
-                except Exception:  # pragma: no cover - enrich_config self-guards
-                    logger.warning("provisioner.enrichment_failed", exc_info=True)
-
-                # Sidecar files that live beside trip.config.json in the trip
-                # dir. trivia_questions.json is always written empty: control-
-                # plane trips ship without trivia (documented descope in
-                # docs/onboarding-mvp-sprint-plan.md, Sprint 4.5), and an empty
-                # file stops the trip server erroring on every boot.
-                # bookings.json carries the phase hotels and the travel_anchors
-                # the interview captured, which the config itself drops.
-                sidecars: dict[str, Any] = {"trivia_questions.json": []}
-                bookings = derive_bookings(config, answers)
-                if bookings:
-                    sidecars["bookings.json"] = bookings
-
-                # The slug assigned at signup approval is a placeholder — the
-                # destination and dates were not known yet. Now that the intake
-                # is confirmed, promote it to the one the family will see.
-                slug = self._promote_draft_slug(conn, trip_id, slug, answers)
-
-                # Deploy. first_provision (from plan.desired, computed by the
-                # planner) tells the compute adapter whether this trip has ever
-                # been provisioned successfully — if not, any leftover per-trip
-                # NFS data is debris from a failed earlier attempt and is
-                # cleared so the freshly seeded users/config take.
+            # Deploy the exact source the promoted release was scanned at, not
+            # whatever is in the worker's repo checkout. A manifest-backed
+            # release (release_verified) is materialized and digest-verified; the
+            # hand-seeded dev release has no manifest and no real digest, so it
+            # falls back to REPO_ROOT with a warning.
+            source_dir = self._materialize_release_if_verified(plan_desired, job_id)
+            try:
+                # first_provision (from plan.desired, computed by the planner)
+                # tells the compute adapter whether this trip has ever been
+                # provisioned successfully — if not, any leftover per-trip NFS
+                # data is debris from a failed earlier attempt and is cleared so
+                # the freshly seeded users/config take.
                 private_url = self._deploy.deploy(
                     slug, config,
                     first_provision=bool(plan_desired.get("first_provision", False)),
                     sidecars=sidecars,
+                    source_dir=source_dir,
                 )
+            finally:
+                if source_dir:
+                    shutil.rmtree(source_dir, ignore_errors=True)
 
-                # Commit success.
-                self._complete(
-                    conn, job_id, plan_id, trip_id, private_url,
-                    slug=slug, config=config, intake_version_id=intake_version_id,
-                )
+            # Commit success.
+            self._complete(
+                conn, job_id, plan_id, trip_id, private_url,
+                slug=slug, config=config, intake_version_id=intake_version_id,
+            )
 
-                logger.info(
-                    "provisioner.job_succeeded",
-                    extra={"job_id": job_id, "trip_id": trip_id, "attempt": attempt},
-                )
+            logger.info(
+                "provisioner.job_succeeded",
+                extra={"job_id": job_id, "trip_id": trip_id, "attempt": attempt},
+            )
 
-            except Exception as exc:
-                error_code = getattr(exc, "safe_error_code", None) or "PROVISIONER_ERROR"
-                logger.warning(
-                    "provisioner.job_failed",
-                    extra={"job_id": job_id, "error_code": error_code, "attempt": attempt},
-                    exc_info=True,
-                )
-                self._fail(conn, job_id, plan_id, error_code)
+        except Exception as exc:
+            error_code = getattr(exc, "safe_error_code", None) or "PROVISIONER_ERROR"
+            logger.warning(
+                "provisioner.job_failed",
+                extra={"job_id": job_id, "error_code": error_code, "attempt": attempt},
+                exc_info=True,
+            )
+            self._fail(conn, job_id, plan_id, error_code)
 
-        return True
+    def _materialize_release_if_verified(
+        self, plan_desired: Mapping[str, Any], job_id: str,
+    ) -> str | None:
+        """A checkout dir for a manifest-backed release's source_revision, or
+        None to deploy from REPO_ROOT. A materialize failure (unreachable
+        revision, digest mismatch) is fatal — it carries a safe_error_code so
+        the job records why rather than deploying unverified code."""
+        revision = plan_desired.get("release_source_revision")
+        if not revision:
+            return None
+        if not plan_desired.get("release_verified"):
+            # The dev-seed release (migration 0016): no manifest, artifact_digest
+            # is a placeholder. Deploy REPO_ROOT as before, but say so.
+            logger.warning(
+                "provisioner.release_unverified",
+                extra={"job_id": job_id, "release_source_revision": revision},
+            )
+            return None
+        digest = plan_desired.get("release_artifact_digest")
+        try:
+            return self._materialize(revision, digest)
+        except ReleaseSourceError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            exc.safe_error_code = "RELEASE_MATERIALIZE_FAILED"  # type: ignore[attr-defined]
+            raise
 
     # ── DB operations (mirror job-queue.ts) ────────────────────────────────────
 

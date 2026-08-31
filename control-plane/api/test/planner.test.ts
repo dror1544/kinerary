@@ -3,13 +3,22 @@ import { test, describe, before, after } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
-import { generatePlan } from "../src/planner.js";
+import { generatePlan, retryProvision } from "../src/planner.js";
 import { issueApproval } from "../src/plan-approval.js";
 import { claimJob, heartbeat, recoverStaleLeases, recoverExpiredApprovals, completeJob, failJob } from "../src/job-queue.js";
+import { buildReleaseManifest, type PayloadSource } from "../src/release-artifact.js";
+import { promoteRelease, registerCandidateRelease } from "../src/release-registry.js";
 
 const DB_URL = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
 const SKIP = !DB_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+
+// generatePlan() only selects a manifest-less 'available' release when this is
+// set (see planner.ts / migration 0027 — the production default is OFF, so a
+// deprecated sealed release never silently falls back to unscanned code). The
+// fixtures here use a manifest-less release, so opt this file's process in;
+// the dedicated "production default" test below clears it around its own body.
+process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE = "1";
 
 async function runMigrations(pool: pg.Pool) {
   const client = await pool.connect();
@@ -60,8 +69,11 @@ async function setupFixture(pool: pg.Pool): Promise<PlannerFixture> {
     [generateTestId("memb"), tripId, ownerId],
   );
   await pool.query(
-    `INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status)
-     VALUES ($1, $2, $3, 1, 1, 1, 'available')`,
+    // Direct insert (not via promoteRelease), so it must carry the promotion
+    // bookkeeping migration 0027's releases_available_requires_promotion demands
+    // of any 'available' row — the same way migration 0016's seed does.
+    `INSERT INTO control_plane.releases(id, source_revision, artifact_digest, application_schema, data_schema_min, data_schema_max, status, promoted_to_available_at, promoted_by)
+     VALUES ($1, $2, $3, 1, 1, 1, 'available', now(), 'test:fixture')`,
     [releaseId, sourceRevision, artifactDigest],
   );
   await pool.query(
@@ -73,29 +85,34 @@ async function setupFixture(pool: pg.Pool): Promise<PlannerFixture> {
   return { pool, ownerId, tripId, releaseId, intakeVersionId, intakeDigest, correlationId };
 }
 
-// Deprecates every 'available' release other than the fixture's own —
-// including the permanent dev-seed release from migration 0016 — so a test
-// can construct a genuine "no compatible release" scenario. Returns the ids
-// to restore afterward.
-async function withOtherAvailableReleasesDeprecated(fix: PlannerFixture): Promise<string[]> {
-  const { rows } = await fix.pool.query<{ id: string }>(
-    "SELECT id FROM control_plane.releases WHERE status = 'available' AND id <> $1",
+// Hides every 'available' release other than the fixture's own — including the
+// permanent dev-seed release from migration 0016 — so a test can construct a
+// genuine "no compatible release" scenario. Pushes the schema range out of
+// reach rather than flipping status: migration 0027's transition trigger
+// forbids deprecated -> available, so a status round-trip can't be undone.
+// Returns the prior ranges to restore afterward.
+type HiddenRelease = { id: string; min: number; max: number };
+
+async function withOtherAvailableReleasesHidden(fix: PlannerFixture): Promise<HiddenRelease[]> {
+  const { rows } = await fix.pool.query<{ id: string; data_schema_min: number; data_schema_max: number }>(
+    "SELECT id, data_schema_min, data_schema_max FROM control_plane.releases WHERE status = 'available' AND id <> $1",
     [fix.releaseId],
   );
   if (rows.length === 0) return [];
   await fix.pool.query(
-    "UPDATE control_plane.releases SET status = 'deprecated' WHERE id = ANY($1)",
+    "UPDATE control_plane.releases SET data_schema_min = 999, data_schema_max = 999 WHERE id = ANY($1)",
     [rows.map((r) => r.id)],
   );
-  return rows.map((r) => r.id);
+  return rows.map((r) => ({ id: r.id, min: r.data_schema_min, max: r.data_schema_max }));
 }
 
-async function restoreAvailableReleases(fix: PlannerFixture, ids: string[]): Promise<void> {
-  if (ids.length === 0) return;
-  await fix.pool.query(
-    "UPDATE control_plane.releases SET status = 'available' WHERE id = ANY($1)",
-    [ids],
-  );
+async function restoreAvailableReleases(_fix: PlannerFixture, hidden: HiddenRelease[]): Promise<void> {
+  for (const h of hidden) {
+    await _fix.pool.query(
+      "UPDATE control_plane.releases SET data_schema_min = $2, data_schema_max = $3 WHERE id = $1",
+      [h.id, h.min, h.max],
+    );
+  }
 }
 
 async function teardownFixture(fix: PlannerFixture) {
@@ -155,6 +172,16 @@ describe("generatePlan", () => {
         [fix.tripId],
       );
       assert.equal(tripRow.rows[0]?.lifecycle_state, "planned");
+
+      // desired pins the exact source the worker must deploy. The fixture
+      // release carries no manifest, so release_verified is false.
+      const desired = (await fix.pool.query<{ desired: Record<string, unknown> }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [result.planId],
+      )).rows[0]!.desired;
+      assert.equal(desired.release_id, fix.releaseId);
+      assert.match(desired.release_source_revision as string, /^[a-f0-9]{40}$/);
+      assert.match(desired.release_artifact_digest as string, /^sha256:[a-f0-9]{64}$/);
+      assert.equal(desired.release_verified, false);
     } finally {
       await teardownFixture(fix);
     }
@@ -213,7 +240,7 @@ describe("generatePlan", () => {
     // The dev-seed migration (0016) inserts a permanently 'available' release
     // so generatePlan has something to select against outside tests. Neutralize
     // every other available release so this scenario is genuinely release-less.
-    const others = await withOtherAvailableReleasesDeprecated(fix);
+    const others = await withOtherAvailableReleasesHidden(fix);
     try {
       // Mark the release as deprecated so no available release exists.
       await fix.pool.query("UPDATE control_plane.releases SET status = 'deprecated' WHERE id = $1", [fix.releaseId]);
@@ -231,7 +258,7 @@ describe("generatePlan", () => {
     const fix = await setupFixture(pool);
     // Same interference as above: neutralize the dev-seed release so it
     // cannot mask the fixture release's now-incompatible schema range.
-    const others = await withOtherAvailableReleasesDeprecated(fix);
+    const others = await withOtherAvailableReleasesHidden(fix);
     try {
       // Reconfigure the release to support only schema version 2+.
       await fix.pool.query(
@@ -245,6 +272,100 @@ describe("generatePlan", () => {
       assert.equal(result.reason, "NO_COMPATIBLE_RELEASE");
     } finally {
       await restoreAvailableReleases(fix, others);
+      await teardownFixture(fix);
+    }
+  });
+
+  test("only an 'available' release is selectable — a candidate/verified one is not", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const others = await withOtherAvailableReleasesHidden(fix);
+    // Take the fixture's own release out of the pool too, so the only path to a
+    // plan is the pipeline-built release we promote below.
+    await fix.pool.query("UPDATE control_plane.releases SET status = 'deprecated' WHERE id = $1", [fix.releaseId]);
+
+    // Build + register a real candidate through the release pipeline.
+    const revision = randomHex(40);
+    const source: PayloadSource = {
+      async resolveRevision() { return revision; },
+      async listPayload() {
+        return [
+          { path: "server/server.js", blobSha: randomHex(40) },
+          { path: "shared/schema.js", blobSha: randomHex(40) },
+          { path: "site/app.js", blobSha: randomHex(40) },
+        ];
+      },
+      async readTextFile() { return "// clean\nconst v = process.env.X;\n"; },
+    };
+    const manifest = await buildReleaseManifest(source, {
+      applicationSchema: 1, dataSchemaMin: 1, dataSchemaMax: 2,
+      now: () => new Date("2026-08-30T00:00:00.000Z"),
+    });
+    const { releaseId } = await registerCandidateRelease(fix.pool, manifest);
+
+    try {
+      // candidate → no plan
+      let result = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok ? "" : result.reason, "NO_COMPATIBLE_RELEASE");
+
+      // verified but not available → still no plan
+      assert.equal((await promoteRelease(fix.pool, { releaseId, to: "verified", actorRef: "operator:test" })).ok, true);
+      result = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok ? "" : result.reason, "NO_COMPATIBLE_RELEASE");
+
+      // available → the planner selects exactly this release
+      assert.equal((await promoteRelease(fix.pool, { releaseId, to: "available", actorRef: "operator:test" })).ok, true);
+      result = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("unreachable");
+      assert.equal(result.releaseId, releaseId);
+
+      // A manifest-backed release → the worker will materialize + digest-verify it.
+      const desired = (await fix.pool.query<{ desired: Record<string, unknown> }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [result.planId],
+      )).rows[0]!.desired;
+      assert.equal(desired.release_verified, true);
+      assert.equal(desired.release_source_revision, revision);
+      assert.equal(desired.release_artifact_digest, manifest.artifactDigest);
+    } finally {
+      await restoreAvailableReleases(fix, others);
+      await teardownFixture(fix);
+      await fix.pool.query("DELETE FROM control_plane.releases WHERE id = $1", [releaseId]);
+    }
+  });
+
+  test("production default: a manifest-less 'available' release is NOT selectable", { skip: SKIP }, async () => {
+    // The dev-seed release (migration 0016 / 0027) is 'available' but carries a
+    // `legacy-hand-seed` manifest with no `files` — unmaterializable and
+    // unverifiable. With CONTROL_PLANE_ALLOW_UNSEALED_RELEASE unset (what a real
+    // deployment runs), generatePlan must not pick it and silently fall the
+    // worker back to the ambient checkout.
+    const fix = await setupFixture(pool);
+    // Take the fixture's own (also manifest-less) release out of the pool so the
+    // dev seed is the only 'available' row left.
+    await fix.pool.query("UPDATE control_plane.releases SET status = 'deprecated' WHERE id = $1", [fix.releaseId]);
+    const prior = process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE;
+    try {
+      delete process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE;
+      let result = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok ? "" : result.reason, "NO_COMPATIBLE_RELEASE");
+
+      // Flip the local-dev opt-in back on: the same seed is now selectable, and
+      // the plan is explicitly marked unverified so the worker deploys REPO_ROOT
+      // with a warning rather than trying to digest-check a placeholder.
+      process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE = "1";
+      result = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("unreachable");
+      const desired = (await fix.pool.query<{ desired: Record<string, unknown> }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [result.planId],
+      )).rows[0]!.desired;
+      assert.equal(desired.release_verified, false);
+    } finally {
+      if (prior === undefined) delete process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE;
+      else process.env.CONTROL_PLANE_ALLOW_UNSEALED_RELEASE = prior;
       await teardownFixture(fix);
     }
   });
@@ -290,6 +411,237 @@ describe("generatePlan", () => {
     } finally {
       await teardownFixture(fix);
     }
+  });
+});
+
+describe("retryProvision", () => {
+  let pool: pg.Pool;
+
+  before(async () => {
+    if (SKIP) return;
+    pool = new pg.Pool({ connectionString: DB_URL, max: 5 });
+    await runMigrations(pool);
+  });
+
+  after(async () => { if (!SKIP) await pool?.end(); });
+
+  // Leaves the trip in the exact shape _fail() / failJob() do at max_attempts:
+  // job 'failed' with a safe error code, plan 'superseded', approval consumed,
+  // trip still parked at 'provisioning_approved'.
+  async function simulateTerminalFailure(fix: PlannerFixture, planId: string, jobId: string) {
+    await fix.pool.query(
+      "UPDATE control_plane.jobs SET state = 'failed', safe_error_code = 'PROVISIONER_ERROR', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
+      [jobId],
+    );
+    await fix.pool.query("UPDATE control_plane.plan_approvals SET used_at = now() WHERE plan_id = $1", [planId]);
+    await fix.pool.query("UPDATE control_plane.plans SET status = 'superseded' WHERE id = $1", [planId]);
+  }
+
+  test("recovers a terminally failed provision to a fresh queued job — no DB edits, same digest", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      const approval = await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      assert.equal(approval.ok, true);
+      await simulateTerminalFailure(fix, first.planId, first.jobId);
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, true);
+      if (!retry.ok) throw new Error("unreachable");
+
+      // A brand-new plan, with the SAME digest as the dead one — proving the
+      // 0026 partial index lets a retired digest be reused.
+      assert.notEqual(retry.planId, first.planId);
+      assert.equal(retry.planDigest, first.planDigest);
+      assert.equal(retry.supersededPlanId, null); // the failed plan was already superseded
+
+      const newPlan = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [retry.planId],
+      );
+      assert.equal(newPlan.rows[0]?.status, "pending_approval");
+      const newJob = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [retry.jobId],
+      );
+      assert.equal(newJob.rows[0]?.state, "waiting_for_user_action");
+
+      // History preserved: the failed plan is still there, still superseded.
+      const oldPlan = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [first.planId],
+      );
+      assert.equal(oldPlan.rows[0]?.status, "superseded");
+
+      const trip = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId],
+      );
+      assert.equal(trip.rows[0]?.lifecycle_state, "planned");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("re-provision of a live trip: first_provision=false, executed plan untouched", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      // Simulate a completed provision: job succeeded, plan executed, trip live.
+      await fix.pool.query(
+        "UPDATE control_plane.jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
+        [first.jobId],
+      );
+      await fix.pool.query("UPDATE control_plane.plans SET status = 'executed' WHERE id = $1", [first.planId]);
+      await fix.pool.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1", [fix.tripId]);
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, true);
+      if (!retry.ok) throw new Error("unreachable");
+
+      const desired = (await fix.pool.query<{ desired: { first_provision?: boolean } }>(
+        "SELECT desired FROM control_plane.plans WHERE id = $1", [retry.planId],
+      )).rows[0]!.desired;
+      assert.equal(desired.first_provision, false);
+      // A live-trip re-provision has a different digest from the first
+      // (first_provision flipped), but that is incidental — the point is the
+      // executed plan is left as history, not disturbed.
+      const oldPlan = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [first.planId],
+      );
+      assert.equal(oldPlan.rows[0]?.status, "executed");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("supersedes a still-active plan and cancels its non-terminal job", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      const approval = await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      assert.equal(approval.ok, true);
+      // Job is now 'queued', plan 'approved', trip 'provisioning_approved'.
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, true);
+      if (!retry.ok) throw new Error("unreachable");
+      assert.equal(retry.supersededPlanId, first.planId);
+
+      const oldPlan = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE id = $1", [first.planId],
+      );
+      assert.equal(oldPlan.rows[0]?.status, "superseded");
+      const oldJob = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [first.jobId],
+      );
+      assert.equal(oldJob.rows[0]?.state, "cancelled");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("cancels a non-terminal provision job even after its plan was superseded elsewhere", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      // Something else superseded the plan but left the queued job behind — an
+      // orphan the old plan_id-scoped cancel would have missed. The retry is
+      // trip-scoped now, so it still clears it.
+      await fix.pool.query("UPDATE control_plane.plans SET status = 'superseded' WHERE id = $1", [first.planId]);
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, true);
+      if (!retry.ok) throw new Error("unreachable");
+      assert.equal(retry.supersededPlanId, null); // nothing active left to supersede
+
+      const oldJob = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [first.jobId],
+      );
+      assert.equal(oldJob.rows[0]?.state, "cancelled");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("refuses while a provision job holds a live lease", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      const claim = await claimJob(fix.pool, "worker_live", 600);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) throw new Error("unreachable");
+      assert.equal(claim.claim.tripId, fix.tripId);
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, false);
+      if (retry.ok) throw new Error("unreachable");
+      assert.equal(retry.reason, "PROVISION_IN_PROGRESS");
+
+      // Nothing touched.
+      const job = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [first.jobId],
+      );
+      assert.equal(job.rows[0]?.state, "leased");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("cancels a stale (expired) lease and re-plans", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await issueApproval(fix.pool, first.planId, "user:test", 3600);
+      const claim = await claimJob(fix.pool, "worker_stale", 600);
+      assert.equal(claim.ok, true);
+      // Force the lease into the past.
+      await fix.pool.query(
+        "UPDATE control_plane.jobs SET lease_expires_at = now() - interval '1 hour' WHERE id = $1",
+        [first.jobId],
+      );
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, true);
+      if (!retry.ok) throw new Error("unreachable");
+      assert.equal(retry.supersededPlanId, first.planId);
+      const oldJob = await fix.pool.query<{ state: string }>(
+        "SELECT state FROM control_plane.jobs WHERE id = $1", [first.jobId],
+      );
+      assert.equal(oldJob.rows[0]?.state, "cancelled");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("rejects a trip in a non-retryable lifecycle state", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      await fix.pool.query("UPDATE control_plane.trips SET lifecycle_state = 'active' WHERE id = $1", [fix.tripId]);
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, false);
+      if (retry.ok) throw new Error("unreachable");
+      assert.equal(retry.reason, "NOT_RETRYABLE_STATE");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("rejects an unknown trip", { skip: SKIP }, async () => {
+    const retry = await retryProvision(pool, `trip_${randomHex(16)}`, `corr_${randomHex(12)}`);
+    assert.equal(retry.ok, false);
+    if (retry.ok) throw new Error("unreachable");
+    assert.equal(retry.reason, "TRIP_NOT_FOUND");
   });
 });
 

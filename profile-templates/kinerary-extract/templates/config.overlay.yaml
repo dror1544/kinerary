@@ -1,17 +1,28 @@
 # Merge deliberately into the fresh profile config. Secrets are absent.
 # Model routing for this Kinerary installation — credentials configured separately.
 model:
-  default: gpt-5.6-luna-900k
-  provider: openai-codex
+  default: minimax/minimax-m3:free
+  provider: openrouter
 fallback_providers:
+  # Vision / multimodal — primary for image/PDF/web extraction
+  - provider: openai-codex
+    model: gpt-5.6-luna-900k
   - provider: anthropic
     model: claude-sonnet-4-6
+  - provider: openrouter
+    model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+  # Strong text — for parsing/structuring extracted content
+  - provider: openrouter
+    model: nvidia/nemotron-3-ultra-550b-a55b:free
+  - provider: openrouter
+    model: dots-studio/dots-3-note-preview:free
+  # Text-only last resort
   - provider: ollama-cloud
     model: gpt-oss:120b
   - provider: openai-codex
     model: gpt-5.6-sol
 delegation:
-  model: claude-opus-4-6
+  model: claude-sonnet-4-6
   provider: anthropic
 display:
   show_cost: true

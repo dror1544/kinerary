@@ -7,29 +7,41 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 from control_plane_worker.compute import LxcProvisionAdapter, NullComputeAdapter
 
 
 class FakeProxmox:
-    def __init__(self, vmid: str | None = "999") -> None:
+    def __init__(self, vmid: str | None = "999", *, exists_before_apply: bool = True) -> None:
         self.vmid = vmid
         self.inspected: list = []
+        self.reset_calls: list = []
+        # A container left behind by a failed earlier attempt is visible to
+        # inspect() from the start; a genuinely-new one only after apply().
+        self._exists_before_apply = exists_before_apply
+        self.applied = False
 
     def inspect(self, spec):
         self.inspected.append(spec)
         if self.vmid is None:
             return None
+        if not self.applied and not self._exists_before_apply:
+            return None
         return {"vmid": self.vmid, "name": spec.name}
+
+    def reset_trip_data(self, spec):
+        self.reset_calls.append(spec)
 
 
 class FakeProvisioner:
-    def __init__(self, vmid: str | None = "999") -> None:
-        self.proxmox = FakeProxmox(vmid)
+    def __init__(self, vmid: str | None = "999", *, exists_before_apply: bool = True) -> None:
+        self.proxmox = FakeProxmox(vmid, exists_before_apply=exists_before_apply)
         self.apply_calls: list = []
 
     def apply(self, topology, *, execute: bool) -> None:
         self.apply_calls.append((topology, execute))
+        self.proxmox.applied = True
 
 
 def _adapter(deploy_root: str, ip_pool=None, provisioner: FakeProvisioner | None = None) -> LxcProvisionAdapter:
@@ -129,6 +141,41 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             adapter.create_container("tokyo-2026")
             self.assertFalse(adapter._reset_data)
 
+    def test_first_provision_wipes_data_when_a_failed_attempt_left_the_container(self) -> None:
+        # inspect() sees a container from the start (debris of a failed earlier
+        # attempt): apply() plans no create(), so create_container runs the wipe.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205", exists_before_apply=True)
+            adapter = _adapter(deploy_root, provisioner=provisioner)
+
+            adapter.create_container("tokyo-2026", first_provision=True)
+
+            self.assertEqual(1, len(provisioner.proxmox.reset_calls))
+            self.assertEqual(
+                "/mnt/pve/truenas-nfs/tokyo-2026",
+                provisioner.proxmox.reset_calls[0].nfs_host_dir,
+            )
+
+    def test_first_provision_leaves_the_wipe_to_create_when_the_container_is_absent(self) -> None:
+        # inspect() is None until apply() runs: create() runs and does its own
+        # reset, so create_container must not double-wipe here.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205", exists_before_apply=False)
+            adapter = _adapter(deploy_root, provisioner=provisioner)
+
+            adapter.create_container("tokyo-2026", first_provision=True)
+
+            self.assertEqual([], provisioner.proxmox.reset_calls)
+
+    def test_a_re_provision_that_is_not_first_never_wipes_data(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205", exists_before_apply=True)
+            adapter = _adapter(deploy_root, provisioner=provisioner)
+
+            adapter.create_container("tokyo-2026", first_provision=False)
+
+            self.assertEqual([], provisioner.proxmox.reset_calls)
+
     def test_a_second_trip_gets_the_next_free_pool_ip(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:
             _adapter(deploy_root, provisioner=FakeProvisioner()).create_container("tokyo-2026")
@@ -155,6 +202,55 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             adapter = _adapter(deploy_root, provisioner=provisioner)
             with self.assertRaises(RuntimeError):
                 adapter.create_container("tokyo-2026")
+
+
+class NpmTokenMintingTests(unittest.TestCase):
+    def _adapter(self, **kw) -> LxcProvisionAdapter:
+        base = dict(
+            deploy_root="/tmp", node="pve", template="t", storage="s", bridge="vmbr0",
+            ip_pool=["192.168.0.210"], hostname_domain="ara-united.store",
+            tunnel_id="edd0b94a-ecce-48b1-b3a5-33d15d0f5f8c",
+            npm_url="https://npm.example", npm_api_token="static-token",
+            cloudflare_zone_id="zone", cloudflare_api_token="cf-token",
+        )
+        base.update(kw)
+        return LxcProvisionAdapter(**base)
+
+    def test_falls_back_to_the_static_token_without_identity_and_secret(self) -> None:
+        adapter = self._adapter()
+        self.assertEqual("static-token", adapter._mint_npm_token())
+
+    def test_exchanges_identity_and_secret_for_a_fresh_token(self) -> None:
+        calls: list = []
+
+        class FakeTransport:
+            def __init__(self, base_url, headers):
+                calls.append(("init", base_url, headers))
+
+            def request(self, method, path, *, payload=None, params=None):
+                calls.append(("request", method, path, payload))
+                return {"token": "minted-jwt", "expires": "2026-09-01T00:00:00Z"}
+
+        adapter = self._adapter(npm_identity="admin@npm", npm_secret="hunter2")
+        with unittest.mock.patch("control_plane_worker.compute.HttpJsonTransport", FakeTransport):
+            token = adapter._mint_npm_token()
+
+        self.assertEqual("minted-jwt", token)
+        self.assertEqual(
+            ("request", "POST", "/api/tokens", {"identity": "admin@npm", "secret": "hunter2"}),
+            calls[-1],
+        )
+
+    def test_raises_when_the_token_endpoint_returns_no_token(self) -> None:
+        class FakeTransport:
+            def __init__(self, *a, **k): ...
+            def request(self, *a, **k):
+                return {"expires": "soon"}
+
+        adapter = self._adapter(npm_identity="admin@npm", npm_secret="hunter2")
+        with unittest.mock.patch("control_plane_worker.compute.HttpJsonTransport", FakeTransport):
+            with self.assertRaises(RuntimeError):
+                adapter._mint_npm_token()
 
 
 if __name__ == "__main__":

@@ -582,62 +582,175 @@ patching the output afterward.
 recovery steps" into "recovers itself", and finish the release-artifact work
 Sprint 4 explicitly deferred.
 
-Build — **operational gaps found in the Phase H run** (each needs a hand DB
-edit or a destroy-and-recreate today):
+**Status (2026-08-30):** the four operational-gap items below are **built**
+(migration 0026, `retryProvision` + `POST /v1/trips/:id/plan/retry`, the lease
+heartbeat, the in-place bootstrap converge, and worker-minted NPM tokens), with
+unit coverage in `planner.test.ts`, `intake-correction.test.ts`,
+`test_provisioner.py`, `tests/provisioning/test_engine.py`,
+`test_adapters.py`, and `test_compute.py`. The **link-carry-forward item is
+now built too** (see below). The **release pipeline + promotion** half of the
+release-artifact hardening block is **now built** (see below); the dedicated
+compute / persistent-data / secret adapter abstractions are the one piece of
+this sprint still **not built** — deferred as a follow-on, since the exit gate
+("a sealed, scanned release artifact is promoted and selected by the planner")
+does not hinge on them.
 
-- **Provisioning-retry endpoint.** A terminal/failed job leaves the trip
-  wedged; re-planning the same intake hits `plans_trip_id_digest_key` (identical
-  intake + release ⇒ identical digest) → `PLAN_ALREADY_PENDING`. Every retry
-  during Sprint 4.5's live work needed a manual cleanup — delete the dead plan,
-  its `plan_approvals` row and its job, then reset `trips.lifecycle_state`. This
-  wants a first-class endpoint that supersedes the old plan/job and generates a
-  fresh one, and (for a live trip) does so with `first_provision = false` so
-  the container's seeded users survive.
-- **`ready_private` is not in `CORRECTABLE_STATES`.** Re-provisioning a live
-  trip currently needs a manual `UPDATE control_plane.trips SET
-  lifecycle_state='intake_confirmed'` before `intake/correct` or `generatePlan`
-  will run. Either add the state to the set, or route re-provision through the
-  retry endpoint above with no lifecycle hop.
-- **Job lease (600 s) is shorter than the bootstrap ceiling (900 s), with no
-  heartbeat.** Harmless while a real bootstrap takes ~140 s, but a hung one
-  outlives its lease and can be double-claimed. Add a heartbeat, or make the
-  lease cover the ceiling.
-- **`_bootstrap_app_environment` only runs inside `create()`.** `apply()` is
-  inspect-then-create, so a container that exists but is half-built is never
-  repaired — the only recovery is destroy and recreate. Make the bootstrap
-  idempotent and callable against an existing container.
-- **Worker should mint its own NPM token.** `NPM_API_TOKEN` in
-  `provisioning.env` is a ~1-day JWT; a provision run after it expires 401s at
-  the NPM step (hit twice during 4.5 work). The worker holds
-  `NPM_IDENTITY`/`NPM_SECRET` — it should exchange them for a JWT at job time.
+Build — **operational gaps found in the Phase H run** (each needed a hand DB
+edit or a destroy-and-recreate before this sprint):
+
+- **Provisioning-retry endpoint. — BUILT.** `POST /v1/trips/:id/plan/retry`
+  (`retryProvision` in `planner.ts`, owner-auth): supersedes any active plan,
+  cancels its non-terminal jobs, reverts the trip to `intake_confirmed`, then
+  `generatePlan`. Refuses while a provision job holds a live lease; cancels a
+  stale one. `first_provision` is recomputed from job history, so a live-trip
+  re-provision comes out `false` and the seeded users survive. **Migration
+  0026** narrows the old table-level `UNIQUE (trip_id, digest)` on
+  `control_plane.plans` to a partial index over the active statuses, so a
+  retired plan's digest can be reused by a fresh plan (that constraint was
+  what turned every retry into a hand cleanup).
+- **`ready_private` in `CORRECTABLE_STATES`. — BUILT.** Added, so an organizer
+  can also fix an answer on a live trip; `correctIntake` supersedes the
+  executed plan and reverts to `intake_confirmed`, and the next plan is
+  `first_provision = false`.
+- **Job lease heartbeat. — BUILT.** `_LeaseHeartbeat` (a daemon thread in
+  `provisioner.py`) renews `lease_expires_at` every
+  `HEARTBEAT_INTERVAL_SECONDS` (60s) for the life of a claimed job; the base
+  `LEASE_SECONDS` was raised 600 → 900 to cover the single-remote-command
+  ceiling even if the thread stalls. A 0-row renew means the lease is no
+  longer ours and the thread stops.
+- **In-place bootstrap converge. — BUILT.** `ProxmoxLxcAdapter.needs_bootstrap()`
+  probes for the bootstrap markers (`.env`, the systemd unit, the nginx site);
+  `bootstrap()` runs the already-idempotent `_bootstrap_app_environment`
+  against an existing container (starting it first if stopped). `Provisioner`
+  emits a `bootstrap` change for a container that exists but is half-built —
+  the case `inspect()`/`plan()` could not see.
+- **Worker-minted NPM token. — BUILT.** `compute._mint_npm_token()` exchanges
+  `NPM_IDENTITY` / `NPM_SECRET` for a fresh JWT per provision run (`POST
+  /api/tokens`); a static `NPM_API_TOKEN` still works as a fallback but goes
+  stale. `__main__` fails loudly at startup if neither is configured.
   (Related, already mitigated: `provisioning.env` must set every
   `PROXMOX_*`/`RPI_*` explicitly because `compose.local.yml` passes each as
   `${VAR:-}` and an empty string beats the code's own default — keep the
   caveat.)
 
 Build — **carry the enriched links onto the itinerary lines and the anchor
-list** (reviewing the first real provisioned site, 2026-08-29): provision-time
-enrichment attaches `maps` / `waze` / `url` to `phases[].venues[]`, so the
-per-venue ranking cards get 🗺️/🔵/🎫 buttons — but the same links never reach
-(a) the day-by-day itinerary lines (`phases[].days[].items[]` — the extract
-schema has no per-item URL field, and `site/app.js` `renderDays` prints the
-config-days branch as bare `time — text`), or (b) the anchor / bookings home
-list (`bookings.json` hotel rows get no `maps`/`waze`). The hand-built
-reference trips (`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`,
-legacy USA2026 on CT200) carry these everywhere. Scope: match a day item /
-hotel booking to the phase venue it names and copy the links across
-(`enrichment.py`), and render item links in the config-days branch
-(`site/app.js`). Related plan-layer columns already exist
-(`phase_plan_items.{location_url,waze_url,website_url,ticket_url}`) but nothing
-populates them from config venues — `promote-config-days` only lifts links out
-of inline `<a>` markup, which extraction output does not produce.
+list. — BUILT (2026-08-30).** (Reviewing the first real provisioned site,
+2026-08-29): provision-time enrichment attaches `maps` / `waze` / `url` to
+`phases[].venues[]`, so the per-venue ranking cards get 🗺️/🔵/🎫 buttons — but
+the same links never reached (a) the day-by-day itinerary lines
+(`phases[].days[].items[]` — the extract schema has no per-item URL field, and
+`site/app.js` `renderDays` printed the config-days branch as bare
+`time — text`), or (b) the anchor / bookings home list (`bookings.json` hotel
+rows got no `maps`/`waze`). The hand-built reference trips
+(`kinerary-deploy/trips/los-angeles-hawaii-vegas-2026`, legacy USA2026 on
+CT200) carry these everywhere.
+
+  - `enrichment._carry_venue_links_to_days` runs after `_enrich_venues` in the
+    per-phase loop: for each `days[].items[]` whose text names a phase venue
+    (case-insensitive substring on either language side, plus the venue name
+    with a trailing city/country word dropped so "TeamLab Planets" matches the
+    venue "TeamLab Planets Tokyo"), it copies that venue's `maps`/`waze`/`url`
+    onto the item as siblings of `time`/`text` — `setdefault`, so a
+    hand-authored value wins. Self-guarded like every other enrichment step.
+  - `transformer.derive_bookings` (runs on the already-enriched config): a
+    hotel row takes `location_url` from `accommodation.mapsUrl`/`.maps`
+    (falling back to a venue match on the hotel name); an anchor row takes it
+    from a venue its name/notes names. `_config_venue_link` — longest
+    venue-name match wins.
+  - `site/app.js` `renderDays` config-days branch renders `item.maps`/`waze`/
+    `url` as the same 🗺️/🔵/🎫 buttons the venue card shows (`safeUrl` gate,
+    `.day-item-link` styling); `server.js` bookings seed now reads
+    `b.location_url`; `promote-config-days` lifts the item siblings into
+    `phase_plan_items.{location_url,waze_url,ticket_url}` (and backfills them on
+    a re-run), closing the gap that it only ever parsed inline `<a>` markup,
+    which extraction output does not produce.
+  - Two carry-over gaps closed after review (both are next-boot repairs on an
+    already-persistent trip DB, only ever filling a column still NULL): the
+    bookings seed backfills `location_url` onto an existing `seed_key` row that
+    `INSERT OR IGNORE` skips; the promote backfill is no longer gated on
+    `extra_links IS NULL`, so a row promoted from an inline-linked config item
+    still picks up a Waze / ticket sibling a later enrichment added.
+  - Coverage: `test_enrichment.DayLinkCarryTests`,
+    `test_transformer.DeriveBookingsLinkTests`, `tests/config-day-links.test.js`
+    (render branch + promote path + a two-boot persistence check for the seed
+    and promote backfills, incl. a `javascript:` URL that must never become an
+    href and an organizer-set link that must never be stomped).
 
 Build — **release-artifact hardening** (moved here from Sprint 4's "Deferred
 past this gate" note and §5):
 
-- immutable release-artifact renderer (build pipeline, sanitation scan, sealed
-  manifest); release promotion rules (`candidate` → `available`); dedicated
-  compute / persistent-data / secret adapter abstractions.
+- **Release pipeline + promotion. — BUILT (2026-08-30).** A "release" is now the
+  trip-runtime source (`site/` + `server/` + `shared/`) frozen at a git
+  revision, rendered into a **sealed manifest**:
+  - `release-artifact.ts` (`buildReleaseManifest`) — `git ls-tree` gives the
+    exact tracked file list at the revision plus each file's blob sha (git's own
+    content hash), so `artifactDigest = sha256(sorted "<path> <blobsha>" lines)`
+    is revision-accurate and reproducible. `verifyManifest` re-derives it — an
+    added/removed/altered file breaks the seal.
+  - **Sanitation scan** (`scanPayload`) — every text file in the payload is
+    line-scanned for private IPv4 (the exact pattern `canonical.ts` rejects),
+    host paths, `PVEAPIToken=`, connection strings with inline userinfo, JWT /
+    AWS / GitHub / Slack / OpenAI key shapes, and PEM private-key blocks.
+    Deliberately **not** `Bearer \S+` — `Bearer ${token}` is legitimate client
+    code. Findings store `{path,line,rule}`, never the matched text, so the
+    manifest stays a canonical record.
+  - **Promotion state machine** (`release-registry.ts`): `registerCandidateRelease`
+    (idempotent on the digest) → `promoteRelease` walks `candidate → verified →
+    available`, refusing the skip; `→ verified` requires `verifyManifest` to pass
+    *and* the scan to be clean; every hop writes an append-only audit row.
+    Migration **0027** adds `releases.manifest` (canonical-guarded),
+    `sanitation_passed`, `promoted_to_available_at`/`promoted_by`, and a
+    `releases_scanned_before_verified` CHECK (a manifest-bearing row can't reach
+    verified/available without a passed scan; hand seeds like the 0016 dev
+    release are grandfathered).
+  - **Operator CLI** `npm run release -- build|promote|list|show` (`release-cli.ts`,
+    LAN-only, not an HTTP route — same posture as `mcp/provision.js`). `build`
+    exits non-zero when the scan fails but still records the candidate so the
+    failure is visible.
+  - **The worker deploys the promoted revision, not the ambient checkout**
+    (review P1). `generatePlan` puts `release_source_revision` /
+    `release_artifact_digest` / `release_verified` into `plan.desired`;
+    `provisioner.py` — for a manifest-backed release — calls
+    `release_source.materialize_release_source` (Python twin of
+    `computeArtifactDigest`) to `git archive` `site/ server/ shared/` at that
+    revision into a throwaway dir, re-verify the tree digest, and point
+    `deploy.sh` at it via `REPO_ROOT`; a mismatch or unreachable revision fails
+    the job (`RELEASE_ARTIFACT_DIGEST_MISMATCH` / `RELEASE_REVISION_UNAVAILABLE`)
+    rather than shipping unscanned code. The manifest-less 0016 dev release has
+    no real digest, so it falls back to `REPO_ROOT` with a
+    `provisioner.release_unverified` warning.
+  - **Scan covers extensionless runtime files** (review P1): the payload
+    classifier is now binary-*exclusion* + a NUL-byte content sniff, not a
+    text-extension allowlist — a leak in `server/Dockerfile` is caught, where
+    the allowlist silently skipped it.
+  - `generatePlan` already selected only `status = 'available'`; `planner.test.ts`
+    now proves a `candidate` **and** a `verified`-but-not-`available` release are
+    both unselectable, that promoting one to `available` makes the planner pick
+    exactly it, and that `desired` pins the release's revision/digest. Coverage:
+    `release-artifact.test.ts` (16, pure), `release-registry.test.ts` (9, DB),
+    `release-cli.test.ts` (2, end-to-end through the CLI), `test_release_source.py`
+    (9, throwaway git repo), `test_provisioner.py` `ReleaseMaterializationTests`
+    (3, verified / dev-seed / digest-mismatch paths).
+- **Dedicated compute / persistent-data / secret adapter abstractions. — NOT
+  BUILT.** Deferred follow-on: the provisioner still calls the existing
+  `kinerary-deploy` infrastructure directly. Refactoring that behind
+  `ComputeAdapter` / `DataAdapter` / `SecretAdapter` interfaces is a larger,
+  riskier change on the live provisioning path and the exit gate does not
+  require it.
+  - **Release source-supply is dev-only wiring, folded in here.** The
+    verified-release path (`release_source.materialize_release_source`) needs a
+    local git repo to run `git ls-tree` / `git archive` against the promoted
+    `source_revision`; today `compose.local.yml` supplies that by bind-mounting
+    the operator's live checkout at `/repo` (same affordance as the mounted
+    `kinerary-deploy` tree and SSH keys). `git` is now in `worker/Dockerfile`
+    because it is a genuine runtime dependency of that verification, not a
+    worktree workaround — but the *acquisition* mechanism is not production
+    shape. Target: the worker fetches the pinned `source_revision` from the git
+    remote with a read-only deploy key (no bind mount, independent digest
+    verification preserved), landing alongside the `SecretAdapter` work since it
+    needs a credential. `deployment/compose.example.yml` still runs the worker
+    as the `run` observer, so nothing production-facing regresses in the
+    meantime.
 
 Automated tests:
 
@@ -969,14 +1082,15 @@ their interfaces: release manifests, resource IDs, secret references,
 selection, service-connection capabilities, consent/provenance-labelled
 imports/feedback and lifecycle events are required in the first schema.
 
-The release-hardening work originally scoped for Sprint 4 — the immutable
-release-artifact renderer (build pipeline, sanitation scan, sealed manifest),
-release promotion rules (`candidate` → `available`), and dedicated
-compute/persistent-data/secret adapter abstractions — is now **Sprint 4.7 —
-Provisioning hardening**, which runs after the first successful end-to-end run
-proves the vertical path. The Sprint 4 acceptance test deliberately uses the
-existing `kinerary-deploy` infrastructure and a seeded development release
-record until then.
+The release-hardening work originally scoped for Sprint 4 moved to **Sprint 4.7
+— Provisioning hardening**. As of 2026-08-30 the immutable release-artifact
+renderer (build pipeline, sanitation scan, sealed manifest) and the release
+promotion rules (`candidate` → `verified` → `available`) are **built** (see
+Sprint 4.7). The dedicated compute/persistent-data/secret adapter abstractions
+are the remaining deferred piece — the provisioner still calls the existing
+`kinerary-deploy` infrastructure directly, and the Sprint 4 acceptance test
+used the seeded development release record (`release_localdev0001`, migration
+0016) until the pipeline landed.
 
 **Landing SPA (`web/`).** The organizer-facing web console lives in `web/` — a
 Vite/React SPA with a public landing page, account signup/sign-in, and a

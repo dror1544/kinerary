@@ -73,6 +73,10 @@ if (profile.signup) {
 
 // Planner is active whenever signup is configured. Approval TTL defaults to
 // 24 hours; add a planner block to the profile to tune it independently.
+// generatePlan() also reads CONTROL_PLANE_ALLOW_UNSEALED_RELEASE from the
+// environment: unset (the default, and what a real deployment uses) means only
+// a manifest-backed, digest-verified release is selectable; "1" lets the
+// hand-seeded dev release through for local work. See planner.ts.
 let planner: PlannerDependencies | undefined;
 if (profile.signup) {
   planner = {

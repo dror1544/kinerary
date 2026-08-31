@@ -30,6 +30,10 @@ const CORRECTABLE_STATES = new Set([
   "intake_confirmed",
   "planned",
   "provisioning_approved",
+  // A live private trip: the organizer can still fix an answer and re-provision.
+  // correctIntake supersedes the executed plan and reverts to intake_confirmed;
+  // the next plan comes out first_provision=false, so seeded users survive.
+  "ready_private",
 ]);
 
 function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore | null {
