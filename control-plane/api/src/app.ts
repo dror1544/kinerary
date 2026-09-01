@@ -961,8 +961,14 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (typeof chatId !== "string" || chatId.length === 0) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
+    // `closed_at IS NULL` is load-bearing, not tidiness. Migration 0029 keeps
+    // closed bindings as history, so an unfiltered read would route a group to
+    // a trip it was deliberately detached from — on a shared bot, that is
+    // another organizer's trip.
     const result = await db.query<{ trip_id: string; hermes_profile: string }>(
-      "SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+      `SELECT trip_id, hermes_profile
+       FROM control_plane.telegram_chat_bindings
+       WHERE chat_id = $1 AND closed_at IS NULL`,
       [chatId],
     );
     const [row] = result.rows;

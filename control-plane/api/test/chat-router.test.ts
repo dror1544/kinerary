@@ -231,7 +231,7 @@ describe("resolveChatRoute (DB)", () => {
   test("a bound chat with no live interview routes to the companion", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["555000222", fix.tripId, "trip-companion-abc"],
       );
       const route = await resolveChatRoute(fix.pool, "555000222");
@@ -246,7 +246,7 @@ describe("resolveChatRoute (DB)", () => {
     // never take a turn — every message would go to the companion.
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["555000333", fix.tripId, "trip-companion-first"],
       );
       const token = await issueToken(fix);
@@ -261,7 +261,7 @@ describe("resolveChatRoute (DB)", () => {
   test("confirming the interview hands the chat back to the companion", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["555000444", fix.tripId, "trip-companion-first"],
       );
       const token = await issueToken(fix);
@@ -437,6 +437,51 @@ describe("startFromDeepLink (DB)", () => {
       // And it really does still work, in the DM it was meant for.
       const inDm = await startFromDeepLink(fix.pool, "555001300", issued.token);
       assert.equal(inDm.kind, "started");
+    });
+  });
+});
+
+describe("resolveChatRoute — closed bindings", () => {
+  test("a closed binding stops routing entirely", { skip: SKIP }, async () => {
+    // Migration 0029 keeps closed bindings as history. An unfiltered read
+    // would keep routing the chat to the trip it was deliberately detached
+    // from — on a shared bot, that is another organizer's trip. This is the
+    // assertion that the `closed_at IS NULL` filter is actually present.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile, closed_at, closed_reason)
+         VALUES ($1, $2, $3, $4, now(), 'organizer_reassigned')`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003000", fix.tripId, "companion-old"],
+      );
+
+      const route = await resolveChatRoute(fix.pool, "700003000");
+      assert.equal(route.kind, "unbound", "history must not route");
+    });
+  });
+
+  test("the open binding wins while a closed one for the same chat exists", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile, closed_at, closed_reason)
+         VALUES ($1, $2, $3, $4, now(), 'organizer_reassigned')`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003001", fix.tripId, "companion-old"],
+      );
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile)
+         VALUES ($1, $2, $3, $4)`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003001", fix.tripId, "companion-new"],
+      );
+
+      const route = await resolveChatRoute(fix.pool, "700003001");
+      assert.equal(route.kind, "companion");
+      assert.equal(
+        route.kind === "companion" ? route.hermesProfile : "",
+        "companion-new",
+        "the binding in force, not the one it replaced",
+      );
     });
   });
 });

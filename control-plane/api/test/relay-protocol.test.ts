@@ -320,7 +320,7 @@ describe("normalizeUpdate (DB)", () => {
   test("stamps source.profile from the chat's binding", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["600000111", fix.tripId, "trip-companion-japan"],
       );
 
@@ -348,7 +348,7 @@ describe("normalizeUpdate (DB)", () => {
     // is the load-bearing property of the whole design.
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["600000333", fix.tripId, "trip-companion-real"],
       );
 
@@ -375,11 +375,11 @@ describe("normalizeUpdate (DB)", () => {
         [secondTripId, secondTripId.replace(/_/g, "-")],
       );
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["600000444", fix.tripId, "companion-trip-one"],
       );
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["600000555", secondTripId, "companion-trip-two"],
       );
 
@@ -408,7 +408,7 @@ describe("normalizeUpdate (DB)", () => {
     // On a shared bot in a group, echoing our own output back is a loop.
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["600000777", fix.tripId, "companion"],
       );
       const update = textUpdate("600000777", "echo");
@@ -431,7 +431,7 @@ describe("normalizeUpdate (DB)", () => {
   test("a group chat carries group semantics, not dm", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["-1009999", fix.tripId, "companion"],
       );
       const update = textUpdate("-1009999", "what's the plan?", "supergroup");

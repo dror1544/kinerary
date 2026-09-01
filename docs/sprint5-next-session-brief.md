@@ -35,8 +35,10 @@ Built this session:
 - **Interview answer capture**, chat-addressed. `submitAnswerForChat`,
   `confirmIntakeForChat` and `getSessionForChat` in `interview.ts`.
 
-Tests: **446 in the control-plane suite, 440 pass / 0 fail / 6 skipped**
-(from 423/417/6). Site suite untouched.
+Tests after the wiring work: **446 in the control-plane suite, 440 pass /
+0 fail / 6 skipped** (from 423/417/6). The provisioner fix below moved them
+again — see its own section for the current numbers. Site suite untouched at
+405/405.
 
 Re-verified after the changes:
 
@@ -124,19 +126,53 @@ the verification has to come from the router, not the agent.
 
 This is a design decision for Dror, not something to guess at.
 
-## Also still open, unchanged from the last brief
+## Done — the provisioner binding fix
 
-**Fix the provisioner's binding upsert.** `control_plane_worker/provisioner.py:749`
-does `ON CONFLICT (chat_id) DO UPDATE SET trip_id = …, hermes_profile = …`,
-silently retargeting an existing binding. The sprint plan forbids this —
-reassignment must "close rather than overwrite the old binding" and binding
-history must be preserved. No history table exists. Parallel trips is exactly
-when this bites. The same block swallows failures
-(`except Exception: logger.warning`), so a trip can provision "successfully"
-and be unroutable. Fix both together.
+Both halves are fixed, so Track 2's two-trip isolation matrix is now a real
+test rather than a test of a known-broken binding.
 
-Then Track 2's **two-trip isolation matrix** becomes a real test. Track 3 (the
-interview UX batch) is last — most parallelizable, least blocked.
+**Migration 0029** gives a binding a lifecycle. `chat_id` stops being the
+primary key (a surrogate `id` takes over, carrying 0005's opaque-id format);
+"the binding in force" becomes a PARTIAL UNIQUE INDEX over rows where
+`closed_at IS NULL`. Same shape 0028 uses for one live interview per chat. A
+`CHECK` keeps `closed_at` and `closed_reason` from ever disagreeing.
+
+**`bind_chat_to_trip`** in `provisioner.py` replaces the `ON CONFLICT DO UPDATE`
+with four explicit cases, under `FOR UPDATE`:
+
+| situation | what happens |
+|---|---|
+| no open binding | open one |
+| same trip, same profile | no-op (an unchanged re-provision) |
+| same trip, new profile | close the old row, open a new one — leaves a trail |
+| **a different trip** | **`BindingRefused`** — the existing binding is untouched |
+
+Refusing the last case is the point: a background provisioning job has no
+signed organizer action, so it has no standing to move a group that is actively
+using another trip.
+
+**The swallowed failure** is fixed separately. The binding write moved out of
+the broad `except Exception: logger.warning` that also covers the companion
+install, into its own handler at **error** level with an explicit `consequence`
+field. A trip whose companion installed but whose binding did not open is
+*unroutable*, which is a different severity from a best-effort profile install
+failing. The provision still succeeds — a deployed trip must not roll back over
+a side effect — but the absence of an open binding row is now durable,
+queryable evidence, and there is a test asserting exactly that.
+
+**READERS MUST FILTER.** Both production readers now carry `closed_at IS NULL`
+(`chat-router.ts`'s `resolveChatRoute` and `app.ts`'s chat-routing endpoint).
+A closed binding that still resolved would be worse than having no lifecycle:
+it would route a group to the trip it was deliberately detached from. Tests
+assert it.
+
+Tests: control plane **448, 442 pass / 0 fail / 6 skipped**; worker **257, all
+pass** (7 new binding-lifecycle cases plus an end-to-end refusal case).
+
+Note the brief previously gave the wrong path — it is
+`control-plane/worker/control_plane_worker/provisioner.py`.
+
+Track 3 (the interview UX batch) is last — most parallelizable, least blocked.
 
 ## Getting running
 
@@ -158,6 +194,20 @@ cd control-plane/api
 CONTROL_PLANE_TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:5434/cptest" npm test
 
 cd ../../tests && npm test        # site suite, no DB needed
+```
+
+The **worker** suite is Python and has two traps worth not rediscovering: it
+needs the repo root on `PYTHONPATH` (`control_plane_worker.compute` imports the
+top-level `provisioning` package), and it needs **Python 3.10+** — macOS's
+system 3.9 dies on `str | None` in a module-level type alias. The Dockerfile
+targets 3.12.
+
+```bash
+python3.11 -m venv /tmp/wvenv && /tmp/wvenv/bin/pip install -r control-plane/worker/requirements.txt
+cd control-plane/worker
+PYTHONPATH=$(git rev-parse --show-toplevel) \
+  CONTROL_PLANE_TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:5434/cptest" \
+  /tmp/wvenv/bin/python -m unittest discover -s tests
 ```
 
 Wire conformance (the only thing that validates the protocol — see Landmines):
@@ -260,6 +310,11 @@ the contract's buffered-delivery lane is still unimplemented.
 - **Allowlist automation.** Adding a companion profile is a manual config edit
   plus a gateway restart, per trip. Blocks comfortable parallel-trip testing.
   Automating it in the provisioner is unscoped — raise with Dror.
+- **Who closes a binding, and how.** 0029 makes closing expressible and the
+  provisioner refuses to do it implicitly, but nothing yet performs a reviewed
+  reassignment — the signed organizer action is still unbuilt. Today a chat is
+  freed only by an operator UPDATE. `closed_reason` is free text at 64 chars;
+  the values used so far are `profile_rebound` and `organizer_reassigned`.
 - **Capability model.** What is built stamps a *profile name*. The sprint text
   describes a richer router-issued organizer/trip/channel/role/lifecycle
   capability. Whether the profile stamp suffices for the exit gate is undecided.
@@ -279,6 +334,8 @@ the contract's buffered-delivery lane is still unimplemented.
 | `control-plane/api/src/relay/connector.ts` | WS server the gateway dials |
 | `control-plane/api/src/relay/server.ts` | serve vs conformance entrypoint |
 | `control-plane/db/migrations/0028_*.sql` | chat ↔ intake session binding |
+| `control-plane/db/migrations/0029_*.sql` | binding lifecycle — close, don't overwrite |
+| `control-plane/worker/.../provisioner.py` | `bind_chat_to_trip`, `BindingRefused` |
 | `control-plane/deployment/relay-conformance-check.py` | wire validation |
 | `.agents/skills/hermes-multiplex-relay/SKILL.md` | Hermes multiplex/relay operations |
 | `docs/sprint5-trip-bot-router-design.md` | design, A/B, live evidence |

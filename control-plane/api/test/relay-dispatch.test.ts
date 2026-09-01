@@ -81,7 +81,7 @@ function tap(chatId: string | null, data: string, fromId = 777): TelegramUpdate 
 
 async function bindCompanion(fix: Fixture, chatId: string, profile: string): Promise<void> {
   await fix.pool.query(
-    "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+    "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
     [chatId, fix.tripId, profile],
   );
 }

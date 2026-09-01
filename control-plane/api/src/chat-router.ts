@@ -106,8 +106,14 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   const [session] = live.rows;
   if (session) return { kind: "interview", sessionId: session.id, tripId: session.trip_id };
 
+  // Only an OPEN binding routes. Migration 0029 keeps closed ones as history,
+  // and a closed binding that still resolved would be worse than having no
+  // lifecycle at all — it would route a group to the trip it was deliberately
+  // detached from, which on a shared bot is someone else's trip.
   const bound = await db.query<{ trip_id: string; hermes_profile: string }>(
-    "SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+    `SELECT trip_id, hermes_profile
+     FROM control_plane.telegram_chat_bindings
+     WHERE chat_id = $1 AND closed_at IS NULL`,
     [chatId],
   );
   const [binding] = bound.rows;

@@ -366,7 +366,7 @@ describe("turns handed to the gateway", () => {
   test("a bound chat's message reaches the gateway stamped with its profile", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["700100030", fix.tripId, "companion-japan"],
       );
       await turn(fix, msg("700100030", "what time is our flight?"));
@@ -382,7 +382,7 @@ describe("turns handed to the gateway", () => {
     // answer that is never coming.
     await withFixture(async (fix) => {
       await fix.pool.query(
-        "INSERT INTO control_plane.telegram_chat_bindings(chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3)",
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
         ["700100031", fix.tripId, "companion-japan"],
       );
       await turn(fix, msg("700100031", "are we there yet?"));
