@@ -527,6 +527,16 @@ export type ConfirmIntakeResult =
 // value is a best-effort hint, never treated as verified identity).
 const TELEGRAM_CHAT_ID_HINT_PATTERN = /^\d{1,20}$/;
 
+// The router-verified binding (0028) accepts the same positive-integer shape,
+// and that restriction is load-bearing rather than incidental: a Telegram
+// GROUP chat id is negative (supergroups are -100…), so this pattern also
+// enforces that only a private 1:1 DM can start an interview. An interview
+// carries the organizer's own answers and its enrollment is scoped to one
+// owner; conducting it in a group would put that behind whoever else is in
+// the room. Group chats bind to a trip's COMPANION instead (0019), after the
+// signed organizer action Sprint 5 requires.
+const TELEGRAM_PRIVATE_CHAT_ID_PATTERN = /^\d{1,20}$/;
+
 /**
  * Exchanges a valid enrollment token for a session, atomically:
  *   1. Verifies and consumes the enrollment (FOR UPDATE lock)
@@ -534,6 +544,19 @@ const TELEGRAM_CHAT_ID_HINT_PATTERN = /^\d{1,20}$/;
  *   3. Creates the intake_sessions row with a fresh session token
  *   4. Records telegramChatIdHint (if present and well-formed) as the
  *      trip's best-effort notification delivery hint — see migration 0022.
+ *   5. Records verifiedTelegramChatId (if present and well-formed) on the
+ *      session itself, binding this chat to this interview — see 0028.
+ *
+ * The two chat-id parameters are NOT interchangeable, and the difference is
+ * the whole point of both migrations:
+ *
+ *   telegramChatIdHint      relayed by the interviewer LLM as a tool-call
+ *                           argument. Unverified. Delivery hint only; must
+ *                           never become an identity or routing fact.
+ *   verifiedTelegramChatId  read by the Trip Bot router off the Telegram
+ *                           update it received on its own authenticated
+ *                           connection. No message content or agent can
+ *                           influence it, so routing may rely on it.
  *
  * Returns the session ID and raw session token. The raw token is not stored —
  * only its SHA-256 digest is. Subsequent session API calls must present this
@@ -544,6 +567,7 @@ export async function startSession(
   rawEnrollmentToken: string,
   log: (line: string) => void = () => {},
   telegramChatIdHint?: string,
+  verifiedTelegramChatId?: string,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -585,11 +609,21 @@ export async function startSession(
     const digest = sessionTokenDigest(rawSessionToken);
     const sessionId = generateId("sess");
 
+    // Bound in the SAME transaction as the session it identifies: a chat
+    // bound to a session that then failed to commit would route later
+    // messages at nothing, and the router treats "no live session" as
+    // unbound (fail closed). Written NULL when the caller is not the
+    // router — the HTTP/MCP path has no verified chat id to offer.
+    const chatId =
+      verifiedTelegramChatId && TELEGRAM_PRIVATE_CHAT_ID_PATTERN.test(verifiedTelegramChatId)
+        ? verifiedTelegramChatId
+        : null;
+
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest],
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id)
+       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId],
     );
 
     await client.query("COMMIT");
