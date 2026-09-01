@@ -289,21 +289,51 @@ that bypasses the socket entirely, so no test on either side exercises the
 framing. Treat "our tests pass" as saying nothing about wire conformance —
 run the conformance check.
 
-## Not wired up yet
+## Wired up — 2026-09-01, second session
 
-The pieces exist but nothing runs them together yet:
+The three pieces above are built, and the spine now runs as one process.
 
-- **The poll loop.** `dispatch.ts` decides what happens to an update; no loop
-  feeds it updates or acts on its decisions. That loop must SUBSUME
-  `startTelegramApprovalPoller` rather than run beside it (see the constraint
-  below) — `dispatch.ts` already returns `approval_callback` for that path.
-- **Interview answer capture.** A tapped intake button routes to
-  `interview_callback` with the right session, but nothing calls
-  `submitAnswer` yet, and free-text answers mid-interview currently get a
-  nudge rather than being parsed.
-- **Server wiring.** No `server.ts` entry constructs a `RelayConnector`, and
-  the Hermes side needs `multiplex_profiles: true` plus the
-  `GATEWAY_RELAY_URL` env stamp before `source.profile` is honoured at all.
+- **The poll loop** (`relay/poller.ts`). One `getUpdates` loop on the trip bot,
+  subscribed to `message` and `callback_query` both — a single loop is not free
+  to filter, because whatever it declines is not delivered to anyone else
+  either, just dropped. `applyDecision` is exported apart from the loop so the
+  decision→effect table runs against a fake client.
+
+  It does NOT subsume `startTelegramApprovalPoller`: that loop polls the
+  *signup* bot, a different token, so the two cannot contend. The
+  `approval_callback` branch stays defensive-only and is logged, not handled.
+- **Interview answer capture**, addressed by the router-verified chat id rather
+  than a session token — `submitAnswerForChat`, `confirmIntakeForChat`,
+  `getSessionForChat`. `interview.ts` grew an internal `SessionLocator` and a
+  shared `lockSession`; the token entry points keep their signatures and their
+  SQL verbatim, and everything below the lookup is shared.
+- **Server wiring** (`relay/server.ts`), with SERVE and CONFORMANCE as two
+  explicit modes and both-at-once refused. The relay's secrets bind through the
+  existing `secret_ref` indirection (`relay.gateway_secret_refs`, a list, so
+  rotation can overlap).
+
+Tests: **446 in the control-plane suite, 440 pass / 0 fail / 6 skipped**; site
+suite **405 pass / 0 fail**. Conformance re-run after the changes:
+`HANDSHAKE OK`, `UNSUPPORTED_OP`, clean disconnect.
+
+### What still cannot happen: a complete interview
+
+The deterministic layer handles taps. It cannot handle the required questions
+that are not tappable — `destination`, the two date questions, `travelers` and
+`phases`. Capturing their raw text was considered and rejected: the date
+prompts deliberately name no format because the interviewer is supposed to
+resolve "September 6th" and confirm its reading back in words, so storing the
+raw string would put un-normalised dates into an immutable intake version.
+
+So an organizer taps the link, answers question 1 with a real button, and stops
+at question 2. `dispatch.ts` returns a dedicated `interview_text` decision for
+that turn and the organizer gets an honest refusal rather than a "got it!" for
+something nothing stored.
+
+`interview_text` is shaped to become the forward-to-the-gateway branch. What
+blocks that is a real design decision — how the interviewer agent binds to a
+session without either holding a token or asserting its own chat id, the exact
+thing migration 0022's header warns against. See the next-session brief.
 
 Tracks 2 (capability issuance, the two-trip isolation matrix) and 3 (the
 interview UX batch and the two unreproduced bugs) remain untouched.

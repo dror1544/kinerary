@@ -7,6 +7,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
+import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 
 const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
@@ -242,6 +243,147 @@ describe("dispatchUpdate — callback routing", () => {
         kind: "ignore",
         reason: "NO_CALLBACK_SENDER",
       });
+    });
+  });
+});
+
+describe("chat-addressed session writes", () => {
+  // The router holds a router-verified chat id and never a session token.
+  // These assert that the chat alone is a sufficient AND correctly scoped
+  // credential — the reason submitAnswerForChat exists rather than the router
+  // storing a token at rest to satisfy submitAnswer's signature.
+
+  test("an answer written by chat id lands in that chat's session", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(issued.ok);
+      const started = await startFromDeepLink(fix.pool, "700002000", issued.token);
+      assert.equal(started.kind, "started");
+
+      const result = await submitAnswerForChat(fix.pool, "700002000", "trip_type", "family");
+      assert.ok(result.ok);
+      assert.equal(result.ok && result.view.sessionId, started.kind === "started" ? started.sessionId : "");
+      assert.equal(result.ok && result.view.nextQuestion?.id, "destination");
+    });
+  });
+
+  test("a chat with no interview can write nothing", { skip: SKIP }, async () => {
+    // Fail closed. The chat id is a routing fact; where it resolves to no
+    // session it must grant nothing, not fall back to any default.
+    await withFixture(async (fix) => {
+      const result = await submitAnswerForChat(fix.pool, "700002001", "trip_type", "family");
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "NOT_FOUND");
+    });
+  });
+
+  test("one organizer's chat cannot write into another's session", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const first = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(first.ok);
+      await startFromDeepLink(fix.pool, "700002002", first.token);
+
+      // A second chat, no session of its own, submitting the same payload.
+      const result = await submitAnswerForChat(fix.pool, "700002003", "trip_type", "couple");
+      assert.equal(result.ok, false);
+
+      const victim = await getSessionForChat(fix.pool, "700002002");
+      assert.ok(victim.ok);
+      assert.equal(victim.ok && victim.view.nextQuestion?.id, "trip_type", "untouched");
+    });
+  });
+
+  test("a confirmed session refuses further answers but still confirms idempotently", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(issued.ok);
+      await startFromDeepLink(fix.pool, "700002004", issued.token);
+      await fix.pool.query(
+        `UPDATE control_plane.intake_sessions
+         SET answers = $1, state = 'awaiting_confirmation'
+         WHERE telegram_chat_id = $2`,
+        [
+          JSON.stringify({
+            trip_type: { kind: "choice", option_id: "family", schema_version: 2, other_text: null },
+            destination: { kind: "text", schema_version: 2, text: "Japan" },
+            group_size: { kind: "choice", option_id: "3_to_5", schema_version: 2, other_text: null },
+            trip_duration: { kind: "choice", option_id: "week", schema_version: 2, other_text: null },
+            departure_date: { kind: "text", schema_version: 2, text: "2026-09-06" },
+            return_date: { kind: "text", schema_version: 2, text: "2026-09-13" },
+            travelers: { kind: "structured", schema_version: 2, data: [{ name: "Dror" }] },
+            phases: { kind: "structured", schema_version: 2, data: [{ name: "Tokyo" }] },
+          }),
+          "700002004",
+        ],
+      );
+
+      const first = await confirmIntakeForChat(fix.pool, "700002004");
+      assert.ok(first.ok);
+
+      // Locating by chat must NOT exclude confirmed sessions, or this second
+      // call — an organizer double-tapping Confirm — would report NOT_FOUND
+      // for a confirmation that in fact succeeded.
+      const second = await confirmIntakeForChat(fix.pool, "700002004");
+      assert.ok(second.ok);
+      assert.equal(
+        second.ok && second.intakeVersionId,
+        first.ok ? first.intakeVersionId : "",
+        "the same version, not a second one",
+      );
+
+      const late = await submitAnswerForChat(fix.pool, "700002004", "trip_type", "couple");
+      assert.equal(late.ok === false && late.reason, "SESSION_CONFIRMED");
+    });
+  });
+
+  test("a second interview in the same chat is the one that gets written", { skip: SKIP }, async () => {
+    // An organizer who finished one trip must be able to start another from
+    // the same DM (Sprint 5's "re-enter interview mode for a new trip"). The
+    // chat then owns two sessions, so lockSession's ordering — live first — is
+    // what decides where the answer goes, and it is load-bearing rather than
+    // cosmetic.
+    await withFixture(async (fix) => {
+      const chatId = "700002005";
+
+      // The first trip, taken all the way to confirmed through the real path
+      // so the row has the shape the schema actually requires.
+      const firstIssued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(firstIssued.ok);
+      const firstStarted = await startFromDeepLink(fix.pool, chatId, firstIssued.token);
+      assert.equal(firstStarted.kind, "started");
+      const firstSessionId = firstStarted.kind === "started" ? firstStarted.sessionId : "";
+      await fix.pool.query(
+        `UPDATE control_plane.intake_sessions
+         SET state = 'confirmed', updated_at = now() - interval '1 day'
+         WHERE id = $1`,
+        [firstSessionId],
+      );
+
+      // A second trip — a new interview is for a new trip, not a rerun of the
+      // confirmed one.
+      const secondTripId = testId("trip");
+      await fix.pool.query(
+        "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+        [secondTripId, secondTripId.replace(/_/g, "-")],
+      );
+      await fix.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), secondTripId, fix.userId],
+      );
+
+      const secondIssued = await issueEnrollment(fix.pool, fix.userId, secondTripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(secondIssued.ok);
+      const secondStarted = await startFromDeepLink(fix.pool, chatId, secondIssued.token);
+      assert.equal(secondStarted.kind, "started", "a confirmed session does not block a new one");
+
+      const result = await submitAnswerForChat(fix.pool, chatId, "trip_type", "couple");
+      assert.ok(result.ok);
+      assert.equal(
+        result.ok && result.view.sessionId,
+        secondStarted.kind === "started" ? secondStarted.sessionId : "",
+        "the LIVE session, not the old confirmed one",
+      );
+      assert.equal(result.ok && result.view.tripId, secondTripId);
     });
   });
 });

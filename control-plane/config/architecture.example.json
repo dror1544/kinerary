@@ -32,5 +32,13 @@
     "action_ttl_seconds": 3600,
     "signup_rate_limit_cooldown_seconds": 3600,
     "webhook_secret_ref": "env://CONTROL_PLANE_TELEGRAM_WEBHOOK_SECRET"
+  },
+  "relay": {
+    "bind_host": "127.0.0.1",
+    "port": 4312,
+    "gateway_secret_refs": [
+      "env://CONTROL_PLANE_RELAY_GATEWAY_SECRET"
+    ],
+    "telegram_bot_token_secret_ref": "env://CONTROL_PLANE_TRIP_BOT_CREDS"
   }
 }

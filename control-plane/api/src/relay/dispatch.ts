@@ -50,6 +50,19 @@ export type DispatchDecision =
   | { kind: "reply"; reply: DirectReply }
   /** A tapped inline button that belongs to the interview flow. */
   | { kind: "interview_callback"; chatId: string; callbackQueryId: string; data: string; sessionId: string }
+  /**
+   * A WRITTEN message from a chat that is mid-interview.
+   *
+   * Its own branch rather than a canned nudge, because what should happen to
+   * it depends on the question actually pending: an unanswered choice question
+   * means the organizer typed instead of tapping, while a text or structured
+   * question means they answered exactly as asked and the deterministic layer
+   * has no way to record it (dates need normalising, travelers and phases need
+   * assembling — both LLM work). The caller looks up which, so this stays a
+   * branch table. When the interviewer agent is reachable through the gateway,
+   * this is the branch that forwards to it.
+   */
+  | { kind: "interview_text"; chatId: string; sessionId: string; text: string }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
@@ -66,6 +79,12 @@ export interface DispatchStrings {
   notPrivate: string;
   /** Shown when a link arrives while this chat is already interviewing. */
   alreadyInterviewing: string;
+  /** Shown when someone types while a CHOICE question is pending — the buttons are right there. */
+  tapAnOption: string;
+  /** Shown when someone answers a text/structured question in writing. See interview_text. */
+  writtenAnswerUnsupported: string;
+  /** Shown when a turn could not be handed to the gateway, so no answer is coming. */
+  gatewayUnavailable: string;
 }
 
 /**
@@ -82,6 +101,15 @@ export const DEFAULT_STRINGS: DispatchStrings = {
   badLink: "That link isn't valid any more. Ask for a fresh one and I'll pick up from there.",
   notPrivate: "Let's do this in a private chat — message me directly and open your link there.",
   alreadyInterviewing: "We're already planning a trip in this chat. Let's finish this one first.",
+  tapAnOption: "Tap one of the options above and we'll keep going.",
+  // Honest rather than reassuring, and deliberately so. The alternative — a
+  // "got it!" for something nothing recorded — would read as working while
+  // silently dropping the organizer's answer, and they would only find out at
+  // the recap. Saying it plainly costs a turn; pretending costs their trust.
+  writtenAnswerUnsupported:
+    "I can't take written answers just yet — that part of me is still being connected. Anything with buttons works now.",
+  gatewayUnavailable:
+    "I couldn't reach the trip assistant just now. Give it a moment and send that again.",
 };
 
 /**
@@ -146,15 +174,14 @@ export async function dispatchUpdate(
   if (outcome.kind === "event") return { kind: "to_gateway", event: outcome.event };
 
   switch (outcome.reason) {
-    case "INTERVIEW":
-      // A free-text answer mid-interview. Answer capture is the interview
-      // layer's job and is not wired through this path yet — the intake
-      // questions the router asks are button-answered. Falls through to a
-      // gentle nudge rather than silence.
-      return {
-        kind: "reply",
-        reply: { chatId, text: "Tap one of the options above and we'll keep going." },
-      };
+    case "INTERVIEW": {
+      // A written message mid-interview. Which session it belongs to comes
+      // from the chat, never from the text — same authority as every other
+      // branch here.
+      const route = await resolveChatRoute(db, chatId);
+      if (route.kind !== "interview") return { kind: "ignore", reason: "INTERVIEW_ENDED" };
+      return { kind: "interview_text", chatId, sessionId: route.sessionId, text };
+    }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
     default:

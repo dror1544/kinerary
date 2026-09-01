@@ -675,6 +675,37 @@ export async function getSession(
   return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
 }
 
+/**
+ * The current view of whichever interview a Telegram chat is conducting.
+ *
+ * Read-only counterpart to submitAnswerForChat, and addressed the same way —
+ * by the router-verified chat id, never a session token. The router needs this
+ * to know what is actually pending before it answers a written message: a
+ * choice question means "the buttons are right there", a text or structured
+ * one means the organizer did as asked and the deterministic layer cannot
+ * record it.
+ *
+ * Unlike the write paths this only considers a LIVE session. There is no
+ * idempotency to preserve on a read, and a confirmed session is not something
+ * the router should still be narrating.
+ */
+export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
+  const row = await db.query<{
+    id: string;
+    trip_id: string;
+    state: SessionState;
+    answers: AnswerStore;
+  }>(
+    `SELECT id, trip_id, state, answers
+     FROM control_plane.intake_sessions
+     WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId],
+  );
+  const [session] = row.rows;
+  if (!session) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
+}
+
 function buildSessionView(
   sessionId: string,
   tripId: string,
@@ -699,6 +730,83 @@ function buildSessionView(
   };
 }
 
+// ── Locating a session ────────────────────────────────────────────────────────
+
+/**
+ * How a caller proves it is entitled to act on a session.
+ *
+ * Two credentials, deliberately not interchangeable:
+ *
+ *   token  the session bearer token, issued at startSession and held by the
+ *          HTTP and MCP callers. Bound to one user and one trip at issuance.
+ *   chat   a Telegram chat id the Trip Bot router read off its OWN
+ *          authenticated connection to Telegram (migration 0028). No message
+ *          body, tool argument, or agent can influence it.
+ *
+ * The router holds the second and not the first, and that is on purpose: it
+ * never sees a session token, and storing one at rest just to satisfy a
+ * function signature would create a durable credential where the binding
+ * already IS the authorization fact. So the locator is what varies, and
+ * everything below it — the confirmed-session guards, validation, versioning —
+ * is shared rather than reimplemented per caller.
+ */
+type SessionLocator =
+  | { by: "token"; token: string; expectedSessionId?: string }
+  | { by: "chat"; chatId: string };
+
+interface LockedSession {
+  id: string;
+  trip_id: string;
+  user_id: string;
+  state: SessionState;
+  answers: AnswerStore;
+  source_document: unknown;
+}
+
+/**
+ * Selects and row-locks the one session a locator designates.
+ *
+ * The chat branch does NOT filter out confirmed sessions, and that is what
+ * makes a double-tap safe. Two concurrent taps both pass resolveChatRoute
+ * while the session is still live; the first confirms and commits, and the
+ * second then re-reads the row under the lock. Had the predicate excluded
+ * `confirmed`, that second read would find nothing and report NOT_FOUND for
+ * what was actually a successful confirmation. Instead it sees the confirmed
+ * row and takes the idempotent path.
+ *
+ * A chat accumulates confirmed sessions over time — one per trip the organizer
+ * has onboarded from that DM — so an ordering is needed for the answer to be
+ * deterministic: the live session wins, and among confirmed ones the most
+ * recently touched. Migration 0028's partial unique index guarantees at most
+ * one live session per chat, so the first sort key can never tie.
+ */
+async function lockSession(
+  client: pg.PoolClient,
+  locator: SessionLocator,
+): Promise<LockedSession | null> {
+  const columns = "id, trip_id, user_id, state, answers, source_document";
+  if (locator.by === "token") {
+    const row = await client.query<LockedSession>(
+      `SELECT ${columns}
+       FROM control_plane.intake_sessions
+       WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
+       FOR UPDATE`,
+      [sessionTokenDigest(locator.token), locator.expectedSessionId ?? null],
+    );
+    return row.rows[0] ?? null;
+  }
+  const row = await client.query<LockedSession>(
+    `SELECT ${columns}
+     FROM control_plane.intake_sessions
+     WHERE telegram_chat_id = $1
+     ORDER BY (state <> 'confirmed') DESC, updated_at DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [locator.chatId],
+  );
+  return row.rows[0] ?? null;
+}
+
 /**
  * Submits an answer to a question in an active session.
  *
@@ -721,25 +829,53 @@ export async function submitAnswer(
   structuredData?: unknown,
   optionIds?: readonly string[],
 ): Promise<SubmitAnswerResult> {
-  const digest = sessionTokenDigest(rawSessionToken);
+  return submitAnswerVia(
+    db,
+    { by: "token", token: rawSessionToken, expectedSessionId },
+    questionId, optionId, otherText, structuredData, optionIds,
+  );
+}
+
+/**
+ * Records an answer for whichever interview the given Telegram chat is
+ * conducting — the Trip Bot router's entry point.
+ *
+ * The chat id is the credential (see SessionLocator). The router obtained it
+ * from Telegram itself, so this needs no further identity check, and crucially
+ * no session token: a tapped button carries only WHICH OPTION was chosen, and
+ * which session that lands in is decided here, from the chat, in the same
+ * transaction that writes the answer.
+ */
+export async function submitAnswerForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+  optionId: string | "other" | null,
+  otherText?: string,
+  structuredData?: unknown,
+  optionIds?: readonly string[],
+): Promise<SubmitAnswerResult> {
+  return submitAnswerVia(
+    db,
+    { by: "chat", chatId },
+    questionId, optionId, otherText, structuredData, optionIds,
+  );
+}
+
+async function submitAnswerVia(
+  db: pg.Pool,
+  locator: SessionLocator,
+  questionId: string,
+  optionId: string | "other" | null,
+  otherText?: string,
+  structuredData?: unknown,
+  optionIds?: readonly string[],
+): Promise<SubmitAnswerResult> {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const row = await client.query<{
-      id: string;
-      trip_id: string;
-      user_id: string;
-      state: SessionState;
-      answers: AnswerStore;
-    }>(
-      `SELECT id, trip_id, user_id, state, answers
-       FROM control_plane.intake_sessions
-       WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
-       FOR UPDATE`,
-      [digest, expectedSessionId ?? null],
-    );
-    const [session] = row.rows;
+    const session = await lockSession(client, locator);
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
 
@@ -783,26 +919,38 @@ export async function confirmIntake(
   log: (line: string) => void = () => {},
   expectedSessionId?: string,
 ): Promise<ConfirmIntakeResult> {
-  const digest = sessionTokenDigest(rawSessionToken);
+  return confirmIntakeVia(db, { by: "token", token: rawSessionToken, expectedSessionId }, log);
+}
+
+/**
+ * Confirms whichever interview the given Telegram chat is conducting — the
+ * router's counterpart to submitAnswerForChat, and what makes the Confirm
+ * button a real confirmation rather than a prompt to go type the word.
+ *
+ * Sprint 2's rule is that a literal CONFIRM creates the immutable intake
+ * version. A labelled button satisfies "explicit and unambiguous" at least as
+ * well as typed capitals — there is no typo or near-miss to interpret — so
+ * this changes the mechanism, not the rule. Typed CONFIRM still works through
+ * confirmIntake above.
+ */
+export async function confirmIntakeForChat(
+  db: pg.Pool,
+  chatId: string,
+  log: (line: string) => void = () => {},
+): Promise<ConfirmIntakeResult> {
+  return confirmIntakeVia(db, { by: "chat", chatId }, log);
+}
+
+async function confirmIntakeVia(
+  db: pg.Pool,
+  locator: SessionLocator,
+  log: (line: string) => void = () => {},
+): Promise<ConfirmIntakeResult> {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
 
-    const row = await client.query<{
-      id: string;
-      trip_id: string;
-      user_id: string;
-      state: SessionState;
-      answers: AnswerStore;
-      source_document: unknown;
-    }>(
-      `SELECT id, trip_id, user_id, state, answers, source_document
-       FROM control_plane.intake_sessions
-       WHERE session_token_digest = $1 AND ($2::text IS NULL OR id = $2)
-       FOR UPDATE`,
-      [digest, expectedSessionId ?? null],
-    );
-    const [session] = row.rows;
+    const session = await lockSession(client, locator);
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
 
     // Idempotency: already confirmed — return the existing intake version.
