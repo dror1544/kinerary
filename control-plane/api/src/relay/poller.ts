@@ -32,6 +32,9 @@ import {
   submitAnswerForChat,
   type SessionView,
 } from "../interview.js";
+import { digestTelegramId } from "../identity.js";
+import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
+import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -61,6 +64,20 @@ export interface TripBotPollerDeps {
    * rather than "replying to us".
    */
   botIdentity?: BotIdentity;
+  /**
+   * Signup-approval handling, for the topology where the trip bot and the
+   * signup bot are THE SAME BOT.
+   *
+   * Telegram delivers each update to exactly one getUpdates caller and answers
+   * a second concurrent one with 409, so two loops on one token do not split
+   * the work — they steal from each other, at random. When the tokens
+   * coincide, this loop must therefore subsume telegram-poller.ts's rather
+   * than run beside it, and server.ts stands its own poller down.
+   *
+   * Absent when the two bots are genuinely different, in which case the
+   * approval branch is unreachable and stays defensive.
+   */
+  approvals?: { config: SignupConfig };
   log?: (line: string) => void;
 }
 
@@ -140,12 +157,37 @@ export async function applyDecision(
       return;
     }
 
-    case "approval_callback":
-      // Unreachable in the current topology (different bot token). Logged
-      // rather than handled so that if the topology ever merges, this shows up
-      // as a named gap instead of a silently dropped approval.
-      log(structuredLog("warn", "trip_bot.approval_callback_unhandled", {}));
+    case "approval_callback": {
+      // Reachable exactly when the trip bot and the signup bot are one bot.
+      if (!deps.approvals) {
+        // The tokens are different, so this update cannot be ours — some other
+        // callback shape arrived. Dropping it is right; handling it would mean
+        // acting on an approval this process was never given the config for.
+        log(structuredLog("warn", "trip_bot.approval_callback_unconfigured", {}));
+        return;
+      }
+      // Same ref-expansion + verification path POST /v1/signup/callback and
+      // telegram-poller.ts both use. The sender identity is derived from the
+      // update Telegram delivered to us, never from the callback payload —
+      // that distinction is the whole authorization story for this action.
+      const resolved = (await resolveTelegramCallbackRef(deps.db, decision.data)) ?? decision.data;
+      const senderDigest = digestTelegramId(decision.fromId);
+      const result = await processApprovalCallback(
+        deps.db, resolved, senderDigest, deps.approvals.config,
+      );
+      await deps.telegram.answerCallbackQuery({
+        callbackQueryId: decision.callbackQueryId,
+        text:
+          result.outcome === "approved" ? "Approved"
+            : result.outcome === "rejected" ? "Rejected"
+              : result.outcome === "already_decided" ? "Already decided"
+                : "Could not process this action",
+      });
+      if (result.outcome === "error") {
+        log(structuredLog("warn", "trip_bot.approval_rejected", { safe_error_code: result.reason }));
+      }
       return;
+    }
 
     case "ignore":
       log(structuredLog("info", "trip_bot.ignored", { reason: decision.reason }));

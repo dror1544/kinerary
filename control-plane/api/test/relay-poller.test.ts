@@ -16,7 +16,7 @@ import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller } from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
-import type { ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
 
 const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
 const SKIP = !databaseUrl;
@@ -67,6 +67,7 @@ class FakeTelegram implements TelegramClient {
     this.answered.push(params);
   }
   async getChatInfo(): Promise<ChatInfo | null> { return null; }
+  async getMe(): Promise<BotSelf | null> { return { id: "7000000001", username: "KineraryTestBot" }; }
   async getUpdates(): Promise<unknown[]> {
     this.polls += 1;
     return this.queued.shift() ?? [];
@@ -434,6 +435,90 @@ describe("the poll loop", () => {
         DEFAULT_STRINGS.unbound,
         "the update after the poisoned one was still processed",
       );
+    });
+  });
+});
+
+// ── Subsuming the signup poller ──────────────────────────────────────────────
+
+describe("when the trip bot IS the signup bot", () => {
+  // Telegram hands each update to exactly one getUpdates caller and answers a
+  // second concurrent one with 409, so when the two bots are one bot this loop
+  // has to carry the approval callbacks too rather than run beside
+  // telegram-poller.ts. server.ts stands its own poller down on the same
+  // comparison of resolved tokens.
+
+  const APPROVAL_CONFIG = {
+    superAdminSubjectDigest: "sha256:" + "0".repeat(64),
+    actionSecret: "test-action-secret",
+    actionTtlSeconds: 3600,
+    messagingAdapter: "fake",
+    signupRateLimitCooldownSeconds: 3600,
+  };
+
+  /** An approval-shaped callback: no interview session in this chat. */
+  function approvalTap(data: string): TelegramUpdate {
+    return {
+      update_id: 3,
+      callback_query: { id: "cbq_appr", data, from: { id: 391627336 } },
+    };
+  }
+
+  test("an approval callback is answered when the config is present", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, approvalTap("not-a-real-signed-token"));
+      assert.equal(decision.kind, "approval_callback");
+
+      await applyDecision(decision, {
+        db: fix.pool,
+        telegram: fix.telegram,
+        connector: fix.connector,
+        approvals: { config: APPROVAL_CONFIG },
+      });
+
+      // The tap is always answered, even on refusal — otherwise Telegram spins
+      // the button forever and the admin cannot tell refusal from a hang.
+      assert.equal(fix.telegram.answered.length, 1);
+      assert.equal(fix.telegram.answered[0]?.text, "Could not process this action");
+    });
+  });
+
+  test("without the config the callback is dropped, not acted on", { skip: SKIP }, async () => {
+    // The tokens are different, so this update cannot be ours. Acting on it
+    // would mean deciding an approval this process was never configured for.
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, approvalTap("not-a-real-signed-token"));
+      await applyDecision(decision, {
+        db: fix.pool,
+        telegram: fix.telegram,
+        connector: fix.connector,
+      });
+      assert.equal(fix.telegram.answered.length, 0);
+      assert.equal(fix.telegram.sent.length, 0);
+    });
+  });
+
+  test("an interview tap is never mistaken for an approval", { skip: SKIP }, async () => {
+    // The two share one update stream now, so the branch that tells them apart
+    // is load-bearing: an interview button must reach the interview even with
+    // approval handling configured.
+    await withFixture(async (fix) => {
+      await beginInterview(fix, "700100050");
+      const decision = await dispatchUpdate(
+        fix.pool,
+        tap("700100050", answerCallbackData("trip_type", "family")),
+      );
+      assert.equal(decision.kind, "interview_callback");
+
+      await applyDecision(decision, {
+        db: fix.pool,
+        telegram: fix.telegram,
+        connector: fix.connector,
+        approvals: { config: APPROVAL_CONFIG },
+      });
+
+      const session = await getSessionForChat(fix.pool, "700100050");
+      assert.equal(session.ok && session.view.nextQuestion?.id, "destination");
     });
   });
 });

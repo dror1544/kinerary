@@ -27,7 +27,9 @@ import { loadArchitectureProfile } from "../config.js";
 import { createDatabasePool } from "../database.js";
 import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
+import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
 import { HttpTelegramClient, type TelegramClient } from "./telegram-api.js";
 
@@ -61,6 +63,7 @@ const unconfigured: TelegramClient = {
   async sendChatAction() { /* no-op */ },
   async answerCallbackQuery() { /* no-op */ },
   async getChatInfo() { return null; },
+  async getMe() { return null; },
   async getUpdates() { return []; },
   async deleteWebhookIfPresent() { /* no-op */ },
 };
@@ -72,6 +75,14 @@ interface Runtime {
   telegram: TelegramClient;
   /** Set only in serve mode; its absence is what disables the poll loop. */
   db?: ReturnType<typeof createDatabasePool>;
+  botIdentity?: BotIdentity;
+  /**
+   * Present only when this relay's bot IS the signup bot. Telegram gives each
+   * update to exactly one getUpdates caller, so in that topology this loop has
+   * to carry the approval callbacks too — the API stands its own poller down
+   * on the same comparison.
+   */
+  approvals?: { config: SignupConfig };
 }
 
 async function serveRuntime(path: string): Promise<Runtime> {
@@ -103,12 +114,55 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }));
   });
 
+  const telegram = new HttpTelegramClient(botToken, log);
+
+  // Ask Telegram who we are rather than configuring it. The username and id
+  // drive the group relevance gate (@mention detection, and telling a reply to
+  // US from a reply to some other bot in the room), and a hand-written value
+  // that drifts from the actual token would fail silently — the gate would
+  // simply stop recognising mentions.
+  const identity = await telegram.getMe();
+  if (identity) {
+    log(structuredLog("info", "relay.bot_identity", {
+      username: identity.username, bot_id: identity.id,
+    }));
+  } else {
+    log(structuredLog("warn", "relay.bot_identity_unavailable", {
+      hint: "group gating falls back to trip names only; @mentions unrecognised",
+    }));
+  }
+
+  // Same bot as signup? Then this loop owns the approval callbacks too.
+  let approvals: { config: SignupConfig } | undefined;
+  if (profile.signup) {
+    const signupToken = await resolveSecretRef(profile.signup.telegram_bot_token_secret_ref);
+    if (signupToken.trim() === botToken.trim()) {
+      const [actionSecret] = await Promise.all([
+        resolveSecretRef(profile.signup.action_secret_ref),
+      ]);
+      approvals = {
+        config: {
+          superAdminSubjectDigest: profile.signup.super_admin_subject_digest,
+          actionSecret,
+          actionTtlSeconds: profile.signup.action_ttl_seconds,
+          messagingAdapter: profile.adapters.messaging,
+          signupRateLimitCooldownSeconds: profile.signup.signup_rate_limit_cooldown_seconds,
+        },
+      };
+      log(structuredLog("info", "relay.subsumes_approval_poller", {
+        hint: "this relay's bot is also the signup bot; the API stands its poller down",
+      }));
+    }
+  }
+
   return {
     gatewaySecrets: resolved,
     port: relay.port,
     host: relay.bind_host,
-    telegram: new HttpTelegramClient(botToken, log),
+    telegram,
     db,
+    botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
+    approvals,
   };
 }
 
@@ -152,6 +206,8 @@ async function main(): Promise<void> {
       db: runtime.db,
       telegram: runtime.telegram,
       connector,
+      botIdentity: runtime.botIdentity,
+      approvals: runtime.approvals,
       log,
     });
   }

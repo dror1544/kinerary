@@ -25,6 +25,12 @@ export interface ChatInfo {
   type: string;
 }
 
+/** Who this token actually belongs to, per Telegram itself. */
+export interface BotSelf {
+  id: string;
+  username: string;
+}
+
 export interface TelegramClient {
   sendMessage(params: {
     chatId: string;
@@ -36,6 +42,12 @@ export interface TelegramClient {
   sendChatAction(params: { chatId: string; action?: string }): Promise<void>;
   answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void>;
   getChatInfo(chatId: string): Promise<ChatInfo | null>;
+  /**
+   * The bot's own identity. Asked rather than configured: the group relevance
+   * gate keys @mention detection and "is this a reply to US" off it, and a
+   * hand-written value that drifted from the token would fail silently.
+   */
+  getMe(): Promise<BotSelf | null>;
   getUpdates(params: { offset: number; timeoutSeconds: number; allowedUpdates: string[] }): Promise<unknown[]>;
   deleteWebhookIfPresent(): Promise<void>;
 }
@@ -133,6 +145,14 @@ export class HttpTelegramClient implements TelegramClient {
       name: chat.title ?? chat.username ?? chat.first_name ?? chatId,
       type: chat.type ?? "private",
     };
+  }
+
+  async getMe(): Promise<BotSelf | null> {
+    const res = await this.post("getMe", {});
+    if (!res.ok) return null;
+    const me = res.result as { id?: number; username?: string };
+    if (me?.id === undefined || !me.username) return null;
+    return { id: String(me.id), username: me.username };
   }
 
   async getUpdates(params: {
