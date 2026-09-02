@@ -75,7 +75,10 @@ services:
       CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
-    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]
+    # trip_bot_creds is mounted so the stand-down check can resolve the relay's
+    # bot ref and compare it with signup's. Without it that check cannot run and
+    # the api keeps polling, which is the safe fallback but not the goal here.
+    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id, trip_bot_creds]
     configs:
       - source: architecture_profile
         target: /run/config/architecture.json
@@ -214,6 +217,16 @@ secrets:
     file: ./.local-secrets/telegram_webhook_secret
   telegram_super_admin_chat_id:
     file: ./.local-secrets/telegram_super_admin_chat_id
+  # Deliberately the SAME FILE as telegram_creds. On this deployment the trip
+  # bot and the signup bot are one bot (@Kinerary_bot), so the two secret_refs
+  # name one credential — and that identity is exactly what server.ts detects
+  # when it stands its own approval poller down in favour of the relay's loop.
+  # The schema keeps them as separate refs because they are separate roles; it
+  # is this file that says they currently coincide.
+  trip_bot_creds:
+    file: ./.local-secrets/telegram_creds
+  relay_gateway_secret:
+    file: ./.local-secrets/relay_gateway_secret
 
 configs:
   architecture_profile:
