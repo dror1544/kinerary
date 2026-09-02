@@ -172,6 +172,39 @@ pass** (7 new binding-lifecycle cases plus an end-to-end refusal case).
 Note the brief previously gave the wrong path — it is
 `control-plane/worker/control_plane_worker/provisioner.py`.
 
+## Done — the two-trip isolation matrix (Half A)
+
+`control-plane/api/test/two-trip-isolation.test.ts`, 10 tests. Every case has a
+SECOND trip present that must not be reached — a one-trip test can pass while
+the code ignores the chat id entirely, which is the failure this shape catches.
+
+Covers each surface the control plane owns: `resolveChatRoute`, the
+`source.profile` stamp in `normalizeUpdate`, `dispatchUpdate` end to end, the
+`/internal/telegram-chat-bindings/:chatId` endpoint Hermes actually calls, and
+`submitAnswerForChat`. Plus the adversarial ones: a message body naming the
+other trip's profile and id, a callback replayed from the wrong chat, a deep
+link redeemed in the wrong DM, and closing one binding while the other keeps
+serving.
+
+**These were mutation-checked, not just observed to pass.** Two deliberate
+regressions were introduced and both were caught by the intended test:
+
+| mutation | caught by |
+|---|---|
+| drop `closed_at IS NULL` from `resolveChatRoute` | "closing one binding leaves the other serving" |
+| derive `source.profile` from message text | "the wire event is stamped from the chat, not the message" |
+
+Worth repeating if these tests are ever refactored — passing tests around
+routing prove nothing unless you have seen them fail.
+
+### Half B is still open, and is not automatable here
+
+Two live Hermes profiles, asserting no private-memory leakage. That needs each
+companion allowlisted **by name** in `multiplex_profile_allowlist` plus a
+gateway restart per trip — the manual step under Open decisions. It also tests
+an UPSTREAM property (Hermes's multiplex isolation) rather than code in this
+repo, so it belongs as a one-time live verification, not a suite.
+
 Track 3 (the interview UX batch) is last — most parallelizable, least blocked.
 
 ## Getting running
@@ -336,6 +369,7 @@ the contract's buffered-delivery lane is still unimplemented.
 | `control-plane/db/migrations/0028_*.sql` | chat ↔ intake session binding |
 | `control-plane/db/migrations/0029_*.sql` | binding lifecycle — close, don't overwrite |
 | `control-plane/worker/.../provisioner.py` | `bind_chat_to_trip`, `BindingRefused` |
+| `control-plane/api/test/two-trip-isolation.test.ts` | the isolation matrix (Half A) |
 | `control-plane/deployment/relay-conformance-check.py` | wire validation |
 | `.agents/skills/hermes-multiplex-relay/SKILL.md` | Hermes multiplex/relay operations |
 | `docs/sprint5-trip-bot-router-design.md` | design, A/B, live evidence |

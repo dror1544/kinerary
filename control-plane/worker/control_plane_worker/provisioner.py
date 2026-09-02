@@ -827,6 +827,39 @@ class ProvisionerWorker:
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
                         )
+                if hermes_profile:
+                    # The assistant's wake-words, recorded as a ROUTING fact
+                    # (migration 0030). Under the relay the group relevance
+                    # gate is the router's job, not Hermes's, so the router
+                    # needs its own copy — it cannot read a Hermes profile
+                    # directory from inside a container. Written whether or not
+                    # a chat binding follows: a trip whose group is bound later
+                    # must not be left with a gate that has nothing to match.
+                    names = [
+                        n for n in (
+                            (handoff.get("assistant") or {}).get("name"),
+                            (handoff.get("assistant") or {}).get("name_en"),
+                        )
+                        if isinstance(n, str) and n.strip()
+                    ]
+                    # De-duplicated because a single-language assistant carries
+                    # the same string in both fields, and a duplicate wake-word
+                    # is just a slower match.
+                    unique_names = list(dict.fromkeys(name.strip() for name in names))
+                    if unique_names:
+                        try:
+                            with conn.transaction():
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "UPDATE control_plane.trips SET assistant_names = %s WHERE id = %s",
+                                        (unique_names, trip_id),
+                                    )
+                        except Exception:
+                            logger.warning("provisioner.assistant_names_failed", extra={
+                                "trip_id": trip_id,
+                                "consequence": "group messages will fall back to @mention/reply only",
+                            }, exc_info=True)
+
                 if hermes_profile and recipient_chat_id:
                     # Deliberately NOT inside the broad handler below. A trip
                     # whose companion installed but whose binding did not open

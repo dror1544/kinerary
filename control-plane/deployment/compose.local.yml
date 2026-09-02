@@ -30,6 +30,18 @@ services:
       # uses, so both cannot end up pointed at different databases.
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
       CONTROL_PLANE_MIGRATIONS_DIR: /app/migrations
+    # Same dev-only overlay the api service carries, and for a stronger reason:
+    # the architecture profile is mounted from the host, so a profile that
+    # grows a key (Sprint 5 added `relay`) is validated by whatever code this
+    # container runs. Without the overlay that is the image's BAKED dist, whose
+    # strict schema rejects the new key — and because api depends on migrate
+    # completing, a stale migrate takes the whole stack down even when api's
+    # own mounted dist would have been perfectly happy. Migrations are mounted
+    # for the same reason: running new code against old SQL is the other half
+    # of the same mismatch.
+    volumes:
+      - ../../control-plane/api/dist:/app/dist:ro
+      - ../../control-plane/db/migrations:/app/migrations:ro
     secrets: [control_plane_database_url]
     configs:
       - source: architecture_profile

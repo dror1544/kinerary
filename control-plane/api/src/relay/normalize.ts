@@ -44,7 +44,7 @@ export interface TelegramMessage {
   caption?: string;
   date?: number;
   message_thread_id?: number;
-  reply_to_message?: { message_id?: number };
+  reply_to_message?: { message_id?: number; from?: TelegramUser };
 }
 
 export interface TelegramUpdate {

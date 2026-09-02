@@ -33,6 +33,7 @@ import {
   startFromDeepLink,
   type InlineKeyboard,
 } from "../chat-router.js";
+import { isAddressedToAssistant } from "./addressing.js";
 import { normalizeUpdate, type TelegramUpdate } from "./normalize.js";
 import type { WireMessageEvent } from "./protocol.js";
 
@@ -67,6 +68,21 @@ export type DispatchDecision =
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
   | { kind: "ignore"; reason: string };
+
+/**
+ * Who the assistant is on this platform, for the group relevance gate.
+ *
+ * Both fields are optional and the gate degrades honestly without them: no
+ * username means @mentions cannot be recognised, no bot id means a reply is
+ * judged by "replying to some bot" rather than "replying to US". The names
+ * themselves are NOT here — they are per-trip and arrive on the route.
+ */
+export interface BotIdentity {
+  /** The bot's @username, without the @. */
+  username?: string;
+  /** The bot's own numeric Telegram id. */
+  id?: string;
+}
 
 export interface DispatchStrings {
   /** Shown when someone messages the bot with no trip and no valid link. */
@@ -124,6 +140,7 @@ export async function dispatchUpdate(
   update: TelegramUpdate,
   strings: DispatchStrings = DEFAULT_STRINGS,
   log: (line: string) => void = () => {},
+  botIdentity: BotIdentity = {},
 ): Promise<DispatchDecision> {
   if (update.callback_query) return dispatchCallback(db, update);
 
@@ -171,7 +188,30 @@ export async function dispatchUpdate(
   }
 
   const outcome = await normalizeUpdate(db, update);
-  if (outcome.kind === "event") return { kind: "to_gateway", event: outcome.event };
+  if (outcome.kind === "event") {
+    // The relevance gate. A DM is addressed by construction; a group message
+    // has to actually address the assistant, or the shared bot answers a
+    // family talking among themselves. See addressing.ts for why this cannot
+    // be left to Hermes's mention_patterns under the relay.
+    const repliedTo = message.reply_to_message?.from;
+    const isReplyToAssistant = repliedTo
+      ? botIdentity.id
+        // Precise when we know our own id: a reply to some OTHER bot in the
+        // group is not a reply to us.
+        ? String(repliedTo.id) === botIdentity.id
+        : Boolean(repliedTo.is_bot)
+      : false;
+
+    const addressed = isAddressedToAssistant({
+      chatType: outcome.event.source.chat_type,
+      text: outcome.event.text,
+      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+      botUsername: botIdentity.username,
+      isReplyToAssistant,
+    });
+    if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
+    return { kind: "to_gateway", event: outcome.event };
+  }
 
   switch (outcome.reason) {
     case "INTERVIEW": {

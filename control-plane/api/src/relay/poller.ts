@@ -36,6 +36,7 @@ import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
   DEFAULT_STRINGS,
+  type BotIdentity,
   type DispatchDecision,
   type DispatchStrings,
 } from "./dispatch.js";
@@ -53,6 +54,13 @@ export interface TripBotPollerDeps {
   telegram: TelegramClient;
   connector: InboundSink;
   strings?: DispatchStrings;
+  /**
+   * The shared bot's own @username and id, for the group relevance gate.
+   * Absent, the gate still works off the trip's assistant names — it just
+   * cannot recognise an @mention, and judges a reply by "replying to a bot"
+   * rather than "replying to us".
+   */
+  botIdentity?: BotIdentity;
   log?: (line: string) => void;
 }
 
@@ -348,7 +356,7 @@ export function startTripBotPoller(
         // behind it — one poisoned message silencing the whole bot.
         offset = Math.max(offset, update.update_id + 1);
         try {
-          const decision = await dispatchUpdate(deps.db, update, strings, log);
+          const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {});
           await applyDecision(decision, deps);
         } catch (error) {
           log(structuredLog("error", "trip_bot.update_failed", {

@@ -77,7 +77,19 @@ export function parseInbound(raw: string): ParsedInbound {
 
 export type ChatRoute =
   | { kind: "interview"; sessionId: string; tripId: string }
-  | { kind: "companion"; tripId: string; hermesProfile: string }
+  | {
+      kind: "companion";
+      tripId: string;
+      hermesProfile: string;
+      /**
+       * The assistant's wake-words (migration 0030), both languages. Carried
+       * on the route because the group relevance gate needs them on exactly
+       * the same lookup that decided the trip — a second query keyed by
+       * something else would be a second chance to disagree about which trip
+       * this chat is.
+       */
+      assistantNames: string[];
+    }
   | { kind: "unbound" };
 
 /**
@@ -110,14 +122,28 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   // and a closed binding that still resolved would be worse than having no
   // lifecycle at all — it would route a group to the trip it was deliberately
   // detached from, which on a shared bot is someone else's trip.
-  const bound = await db.query<{ trip_id: string; hermes_profile: string }>(
-    `SELECT trip_id, hermes_profile
-     FROM control_plane.telegram_chat_bindings
-     WHERE chat_id = $1 AND closed_at IS NULL`,
+  const bound = await db.query<{
+    trip_id: string;
+    hermes_profile: string;
+    assistant_names: string[] | null;
+  }>(
+    `SELECT b.trip_id, b.hermes_profile, t.assistant_names
+     FROM control_plane.telegram_chat_bindings b
+     JOIN control_plane.trips t ON t.id = b.trip_id
+     WHERE b.chat_id = $1 AND b.closed_at IS NULL`,
     [chatId],
   );
   const [binding] = bound.rows;
-  if (binding) return { kind: "companion", tripId: binding.trip_id, hermesProfile: binding.hermes_profile };
+  if (binding) {
+    return {
+      kind: "companion",
+      tripId: binding.trip_id,
+      hermesProfile: binding.hermes_profile,
+      // NULL and empty mean the same thing to the gate: no names, fall back to
+      // @mention and reply. Neither means "answer everything".
+      assistantNames: binding.assistant_names ?? [],
+    };
+  }
 
   return { kind: "unbound" };
 }
