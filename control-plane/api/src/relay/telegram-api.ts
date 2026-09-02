@@ -11,6 +11,7 @@
  */
 import { structuredLog } from "../redaction.js";
 import type { InlineKeyboard } from "../chat-router.js";
+import { toTelegramMarkdownV2 } from "./markdown.js";
 
 const TELEGRAM_API_ROOT = "https://api.telegram.org";
 
@@ -37,8 +38,21 @@ export interface TelegramClient {
     text: string;
     replyMarkup?: InlineKeyboard;
     replyTo?: string;
+    /**
+     * Set for AGENT-authored content, which is formatted in the dialect our
+     * capability descriptor advertises (markdown_v2). Left unset for the
+     * router's own replies, which are plain prose — asking Telegram to parse
+     * them as MarkdownV2 would only invite a parse error over an ordinary
+     * full stop.
+     */
+    parseMode?: "MarkdownV2";
   }): Promise<SendResult>;
-  editMessageText(params: { chatId: string; messageId: string; text: string }): Promise<SendResult>;
+  editMessageText(params: {
+    chatId: string;
+    messageId: string;
+    text: string;
+    parseMode?: "MarkdownV2";
+  }): Promise<SendResult>;
   sendChatAction(params: { chatId: string; action?: string }): Promise<void>;
   answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void>;
   getChatInfo(chatId: string): Promise<ChatInfo | null>;
@@ -101,27 +115,73 @@ export class HttpTelegramClient implements TelegramClient {
     }
   }
 
+  /**
+   * Telegram refuses the WHOLE message when MarkdownV2 does not parse, and
+   * MarkdownV2 is strict — a bare `.`, `-` or `!` outside an entity is enough.
+   * The agent formats in that dialect because our descriptor advertises it, but
+   * "formats in" is not "always emits valid".
+   *
+   * So a parse failure retries once as plain text. The asterisks show, which is
+   * ugly; the alternative is the organizer's answer vanishing entirely, which
+   * is worse and much harder to notice.
+   */
+  private isParseError(error: string | undefined): boolean {
+    return (error ?? "").toLowerCase().includes("can't parse entities");
+  }
+
   async sendMessage(params: {
     chatId: string;
     text: string;
     replyMarkup?: InlineKeyboard;
     replyTo?: string;
+    parseMode?: "MarkdownV2";
   }): Promise<SendResult> {
     const body: Record<string, unknown> = { chat_id: params.chatId, text: params.text };
     if (params.replyMarkup) body.reply_markup = params.replyMarkup;
     if (params.replyTo) body.reply_parameters = { message_id: Number(params.replyTo) };
-    const res = await this.post("sendMessage", body);
+    if (params.parseMode) {
+      // The agent emits CommonMark despite the dialect we advertise, so convert
+      // rather than forward. Sending it raw fails on the first unescaped "." —
+      // see markdown.ts.
+      body.text = toTelegramMarkdownV2(params.text);
+      body.parse_mode = params.parseMode;
+    }
+
+    let res = await this.post("sendMessage", body);
+    if (!res.ok && params.parseMode && this.isParseError(res.error)) {
+      this.log(structuredLog("warn", "telegram_api.markdown_fallback", { method: "sendMessage" }));
+      delete body.parse_mode;
+      body.text = params.text;
+      res = await this.post("sendMessage", body);
+    }
     if (!res.ok) return { ok: false, error: res.error };
     const messageId = (res.result as { message_id?: number } | undefined)?.message_id;
     return { ok: true, messageId: messageId !== undefined ? String(messageId) : undefined };
   }
 
-  async editMessageText(params: { chatId: string; messageId: string; text: string }): Promise<SendResult> {
-    const res = await this.post("editMessageText", {
+  async editMessageText(params: {
+    chatId: string;
+    messageId: string;
+    text: string;
+    parseMode?: "MarkdownV2";
+  }): Promise<SendResult> {
+    const body: Record<string, unknown> = {
       chat_id: params.chatId,
       message_id: Number(params.messageId),
       text: params.text,
-    });
+    };
+    if (params.parseMode) {
+      body.text = toTelegramMarkdownV2(params.text);
+      body.parse_mode = params.parseMode;
+    }
+
+    let res = await this.post("editMessageText", body);
+    if (!res.ok && params.parseMode && this.isParseError(res.error)) {
+      this.log(structuredLog("warn", "telegram_api.markdown_fallback", { method: "editMessageText" }));
+      delete body.parse_mode;
+      body.text = params.text;
+      res = await this.post("editMessageText", body);
+    }
     return res.ok ? { ok: true, messageId: params.messageId } : { ok: false, error: res.error };
   }
 

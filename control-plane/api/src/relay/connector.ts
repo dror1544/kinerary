@@ -219,6 +219,11 @@ export class RelayConnector {
           chatId: action.chat_id,
           text: action.content,
           replyTo: action.reply_to,
+          // Agent-authored, so it is written in the dialect TELEGRAM_DESCRIPTOR
+          // advertises. Sending it unparsed was why formatting arrived as
+          // literal asterisks: we were announcing markdown_v2 and then not
+          // honouring it.
+          parseMode: "MarkdownV2",
         });
         return sent.ok
           ? { success: true, message_id: sent.messageId }
@@ -229,6 +234,7 @@ export class RelayConnector {
           chatId: action.chat_id,
           messageId: action.message_id,
           text: action.content,
+          parseMode: "MarkdownV2",
         });
         return edited.ok ? { success: true } : { success: false, error: edited.error ?? "EDIT_FAILED" };
       }

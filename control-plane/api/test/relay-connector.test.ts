@@ -187,7 +187,12 @@ describe("RelayConnector — outbound actions", () => {
     await withConnector(async (h) => {
       const result = await roundTrip(h, { op: "send", chat_id: "900", content: "hello" });
       assert.deepEqual(result, { success: true, message_id: "555" });
-      assert.deepEqual(h.telegram.sent, [{ chatId: "900", text: "hello", replyTo: undefined }]);
+      // parseMode is part of the contract now: the descriptor advertises
+      // markdown_v2, so agent-authored content must be sent as such. Omitting
+      // it was why formatting arrived as literal asterisks.
+      assert.deepEqual(h.telegram.sent, [
+        { chatId: "900", text: "hello", replyTo: undefined, parseMode: "MarkdownV2" },
+      ]);
     });
   });
 
@@ -200,7 +205,9 @@ describe("RelayConnector — outbound actions", () => {
         content: "revised",
       });
       assert.equal(edit.success, true);
-      assert.deepEqual(h.telegram.edited, [{ chatId: "900", messageId: "12", text: "revised" }]);
+      assert.deepEqual(h.telegram.edited, [
+        { chatId: "900", messageId: "12", text: "revised", parseMode: "MarkdownV2" },
+      ]);
 
       const typing = await roundTrip(h, { op: "typing", chat_id: "900" });
       assert.equal(typing.success, true);
