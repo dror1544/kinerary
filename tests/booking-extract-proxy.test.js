@@ -170,3 +170,59 @@ describe('POST /api/bookings/extract-draft', () => {
     assert.equal(issues.find(issue => issue.id === id)?.status, 'ignored');
   });
 });
+
+// PR-28 review regression: updateLegacyFromActive() used to DELETE every
+// phase_plan_* row and re-insert, which destroyed Classic correction/enrichment
+// history. The fix switched to a keyed upsert — but an upsert with no delete
+// pass would instead let a Classic row survive after its Modern source was
+// removed, and could duplicate a row on repeated edits. These pin the reconcile.
+describe('Modern itinerary edits reconcile into the Classic plan', () => {
+  const PHASE = 'ny';
+  const DATE = '2027-03-11';
+  const planRows = async () => (await api(`/api/phases/${PHASE}/plan`, { token })).json();
+  const withText = (rows, text_en) => rows.filter((r) => r.text_en === text_en);
+
+  let keptUid;
+  let removedUid;
+
+  test('a Modern item is projected into the Classic plan', async () => {
+    const first = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני ראשון', text_en: 'Reconcile item A' },
+    });
+    const second = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני שני', text_en: 'Reconcile item B' },
+    });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    keptUid = (await first.json()).item_uid;
+    removedUid = (await second.json()).item_uid;
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item A').length, 1);
+    assert.equal(withText(rows, 'Reconcile item B').length, 1);
+  });
+
+  test('deleting the Modern item removes it from the Classic plan — no resurrection', async () => {
+    const del = await api(`/api/itinerary/items/${removedUid}`, { method: 'DELETE', token });
+    assert.equal(del.status, 200);
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item B').length, 0,
+      'the deleted Modern item is still present in the Classic projection');
+    assert.equal(withText(rows, 'Reconcile item A').length, 1,
+      'the surviving item must not be dropped by the reconcile');
+  });
+
+  test('repeated Modern edits never duplicate the Classic row', async () => {
+    for (const text_en of ['Reconcile item A v2', 'Reconcile item A v3', 'Reconcile item A v4']) {
+      const res = await api(`/api/itinerary/items/${keptUid}`, { method: 'PATCH', token, body: { text_en } });
+      assert.equal(res.status, 200);
+    }
+    const rows = await planRows();
+    const mine = rows.filter((r) => (r.text_en || '').startsWith('Reconcile item A'));
+    assert.equal(mine.length, 1, `expected exactly one Classic row for the edited item, got ${mine.length}`);
+    assert.equal(mine[0].text_en, 'Reconcile item A v4');
+  });
+});
