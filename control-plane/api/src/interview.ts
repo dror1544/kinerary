@@ -139,7 +139,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travelers",
     type: "structured",
-    prompt: "Who's coming? List each person's name, age, and family/household group.",
+    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't written in Latin script, include the English spelling of each too.",
     dataShape: "array",
     required: true,
   },

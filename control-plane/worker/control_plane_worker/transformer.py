@@ -359,7 +359,26 @@ def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
         destination = destination[:40].rstrip("-")
     if not destination:
         # A destination written entirely in non-latin script slugifies to
-        # nothing; the year still distinguishes it and the caller de-duplicates.
+        # nothing. Before falling back to a generic word, try the phase names:
+        # a trip whose destination is "יפן" usually still has a phase called
+        # "Tokyo", and "tokyo-2026" is a URL the family recognises where
+        # "trip-2026" is one they cannot tell from anyone else's (capture
+        # ledger, General #4). Phases are checked in order and the first one
+        # that slugifies to anything wins.
+        for phase in _structured_list(data, "phases"):
+            if not isinstance(phase, Mapping):
+                continue
+            for key in ("name_en", "name"):
+                candidate = _slug_words(str(phase.get(key) or ""))
+                if candidate:
+                    destination = candidate[:40].rstrip("-")
+                    break
+            if destination:
+                break
+
+    if not destination:
+        # Nothing latin anywhere in the intake; the year still distinguishes
+        # it and the caller de-duplicates.
         destination = "trip"
 
     return f"{destination}-{departure_date.year}"

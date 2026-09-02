@@ -39,6 +39,14 @@ Submit as:
 ```
 `age` is optional per traveler if genuinely unknown — omit the field rather than guessing. `family` should be a short household/family label shared by everyone in that group (e.g. two spellings of the same family name should match exactly, since it's used to group people on the site).
 
+**If the names aren't written in Latin script, ask for the English spelling too** and submit it as `name_en` (and `family_en` for the household label). Ask once, for the whole list — "and how do you spell those in English?" — rather than name by name. Each person's `username` is derived from the Latin spelling, so without it the site falls back to something the family won't recognise as themselves. Take the organizer's spelling exactly as given; a person's own transliteration of their name is not something to correct or standardise.
+
+```json
+[
+  { "name": "איתן", "name_en": "Eitan", "age": 52, "family": "שגיא", "family_en": "Sagi" }
+]
+```
+
 ## phases — required, structured (array)
 
 Where the trip goes and when, one entry per stop. Ask for: place name, date range, and — only if already booked — accommodation name and confirmation number. Skip accommodation entirely if nothing's booked yet; don't invent a placeholder.

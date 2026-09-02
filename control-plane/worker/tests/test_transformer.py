@@ -90,6 +90,37 @@ class DeriveTripSlugTests(unittest.TestCase):
 
 
 class TransformerTests(unittest.TestCase):
+    def test_non_latin_destination_falls_back_to_a_phase_name(self) -> None:
+        # "trip-2026" is a URL a family cannot tell from anyone else's; a
+        # phase name is one they recognise (capture ledger, General #4).
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("יפן"),
+            "phases": _structured([
+                {"name": "טוקיו", "name_en": "Tokyo"},
+                {"name": "Kyoto"},
+            ]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "tokyo-2026")
+
+    def test_phase_fallback_skips_phases_that_slugify_to_nothing(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("יפן"),
+            "phases": _structured([{"name": "טוקיו"}, {"name": "Kyoto"}]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "kyoto-2026")
+
+    def test_generic_fallback_remains_when_nothing_is_latin(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("יפן"),
+            "phases": _structured([{"name": "טוקיו"}]),
+        }
+        self.assertEqual(derive_trip_slug(intake, today=date(2026, 8, 20)), "trip-2026")
+
+
+
     def test_japan_fixture_produces_valid_meta(self) -> None:
         today = date(2026, 8, 20)
         config = transform_intake(JAPAN_INTAKE, today=today)
