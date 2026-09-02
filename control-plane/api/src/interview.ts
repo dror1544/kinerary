@@ -24,7 +24,41 @@ function sessionTokenDigest(token: string): string {
 // kind 'multi_choice' could not have come from v1. Releases advertise the
 // range they accept via releases.data_schema_min/max, so a bump here needs a
 // matching widening there or generatePlan finds no eligible release.
-export const INTAKE_SCHEMA_VERSION = 2;
+//
+// Bumped to 3 when `group_size` and `trip_duration` were REMOVED, headcount
+// being counted off the traveler roster and duration being the difference
+// between the two date questions (capture ledger, Step 3 #3 and #4).
+//
+// This bump is doing more work than 1 -> 2 did. That one was additive —
+// migration 0018 could widen a single release to serve both because every new
+// question was optional and transform_intake reproduced its v1 output exactly
+// when they were absent. Removing REQUIRED questions is not additive: a
+// release sealed before this change carries a transformer that lists both in
+// REQUIRED_QUESTIONS and raises on a v3 intake. The version is what makes that
+// release visibly ineligible in generatePlan instead of failing at transform
+// time, with a confirmed intake and nowhere to go. See migration 0032.
+export const INTAKE_SCHEMA_VERSION = 3;
+
+/**
+ * Question ids that USED to be asked and can still appear in a stored intake.
+ *
+ * An intake version is immutable, so every intake confirmed before v3 still
+ * carries `group_size` and `trip_duration` — and a correction to one of those
+ * trips submits the whole answer set back. Without this, the correction path's
+ * unknown-key check would reject it outright: an organizer fixing a
+ * destination on an older trip would be refused because of two fields they
+ * never touched, and the transformer's legacy readers would lose the values
+ * they still fall back to.
+ *
+ * Retired ids are carried through corrections unchanged rather than validated
+ * (there is no question definition left to validate against) and rather than
+ * dropped (that would quietly edit a confirmed record while claiming to
+ * correct one field).
+ */
+export const RETIRED_QUESTION_IDS: ReadonlySet<string> = new Set([
+  "group_size",
+  "trip_duration",
+]);
 
 export interface ChoiceOption {
   id: string;
@@ -67,36 +101,6 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "text",
     prompt: "Where is the trip? (city/region/country)",
     maxLength: 200,
-    required: true,
-  },
-  {
-    id: "group_size",
-    type: "choice",
-    prompt: "How many travelers?",
-    options: [
-      { id: "2", label: "2 people" },
-      { id: "3_to_5", label: "3–5 people" },
-      { id: "6_to_10", label: "6–10 people" },
-      { id: "more_than_10", label: "More than 10" },
-    ],
-    allowsOther: true,
-    otherPrompt: "Enter the number or range of travelers (max 40 chars):",
-    maxLength: 40,
-    required: true,
-  },
-  {
-    id: "trip_duration",
-    type: "choice",
-    prompt: "How long will the trip be?",
-    options: [
-      { id: "weekend", label: "Weekend (2–3 days)" },
-      { id: "week", label: "About a week" },
-      { id: "two_weeks", label: "Two weeks" },
-      { id: "month_or_more", label: "A month or more" },
-    ],
-    allowsOther: true,
-    otherPrompt: "Describe the duration (max 80 chars):",
-    maxLength: 80,
     required: true,
   },
   {
