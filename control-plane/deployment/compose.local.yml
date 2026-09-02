@@ -65,6 +65,13 @@ services:
       # not part of the provider-neutral architecture profile. Empty default
       # leaves the route unmounted (503) rather than failing startup.
       CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
+      # The other end of the interview MCP sidecar's own AGENT_KEY. Both sides
+      # read this SAME name on purpose — set it in one place and the sidecar's
+      # forwarded call authenticates; set it on neither and the routes stay
+      # unmounted (503) and the router answers written messages itself. Setting
+      # it on only one side is the misconfiguration worth making impossible to
+      # express, hence one name rather than two.
+      CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:-}
       # Local dev deploys from the hand-seeded `release_localdev0001`, which has
       # no sealed manifest — so generatePlan would otherwise reject it and there
       # would be no selectable release at all. This opts that box into the

@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -105,6 +105,23 @@ if (chatRoutingKey) {
   chatRouting = { db: pool, apiKey: chatRoutingKey };
 }
 
+// The interviewer agent's chat-addressed interview routes, which the MCP
+// sidecar forwards `get_interview_for_chat` / `submit_answer_for_chat` to.
+// Same tier and pattern as chatRouting above, and deliberately the SAME env
+// var the sidecar reads for its own gate (interview-mcp.ts's AGENT_KEY): the
+// two are the ends of one process-to-process secret, so a deployment that
+// sets it on one side and not the other has a sidecar presenting a key the
+// API will reject, rather than two independently-named half-configurations.
+//
+// Optional, like every other block here. Absent, the routes stay unmounted
+// and the router keeps answering written messages itself — the state the bot
+// shipped in, and what `relay.interviewer_profile` being unset also means.
+let interviewAgent: InterviewAgentDependencies | undefined;
+const interviewAgentKey = process.env.CONTROL_PLANE_INTERVIEW_AGENT_KEY;
+if (interviewAgentKey) {
+  interviewAgent = { db: pool, apiKey: interviewAgentKey };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -113,6 +130,7 @@ const app = buildApp(profile, {
   planner,
   provisioner,
   chatRouting,
+  interviewAgent,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker
