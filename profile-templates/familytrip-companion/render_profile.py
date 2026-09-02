@@ -34,7 +34,7 @@ def render(d,out):
  validate(d)
  if out.exists() and any(out.iterdir()): bad(f'output is not empty: {out}')
  out.mkdir(parents=True,exist_ok=True); t=d['trip']; a=d['assistant']; o=d['organizer']
- v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-site'}
+ v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-mcp'}
  for src,dst in [('SOUL.md.tpl','SOUL.md'),('profile.yaml.tpl','profile.yaml'),('config.overlay.yaml.tpl','config.overlay.yaml')]: (out/dst).write_text(tpl(ROOT/'templates'/src,v))
  (out/'references').mkdir(); (out/'references/sources.md').write_text(tpl(ROOT/'templates/references/sources.md.tpl',v)); shutil.copytree(ROOT/'templates/skills',out/'skills')
  group={'schema_version':1,'trip':{k:t[k] for k in ('id','title','default_language','timezone')},'assistant':a,'preferences':d['interview'].get('group_safe',{})}

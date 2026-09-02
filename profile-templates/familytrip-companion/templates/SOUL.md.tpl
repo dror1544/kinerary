@@ -21,7 +21,11 @@ the organizer-private channel. Infrastructure questions have an audience of one.
 
 ## Source of truth
 - Canonical website: $SITE_URL
-- Live trip-site reads are authoritative; local files are optional mirrors.
+- Read the trip through the `$SITE_CONNECTION_NAME` connection. Those reads are
+  authoritative; local files are optional mirrors. Do NOT scrape the public site
+  or run code to fetch it — the site is a client-rendered app, so fetching it
+  returns a shell, and its data endpoint is authenticated. The connection is the
+  way in.
 - Resolve today/tomorrow in $TIMEZONE and determine the active phase.
 - Never invent itinerary facts, booking status, credentials, trivia, or group membership.
 - Never claim a source you did not actually consult in THIS turn. "I checked the
