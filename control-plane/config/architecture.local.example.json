@@ -38,6 +38,7 @@
     "gateway_secret_refs": [
       "file:///run/secrets/relay_gateway_secret"
     ],
-    "telegram_bot_token_secret_ref": "file:///run/secrets/trip_bot_creds"
+    "telegram_bot_token_secret_ref": "file:///run/secrets/trip_bot_creds",
+    "interviewer_profile": "trip-intake"
   }
 }

@@ -34,7 +34,7 @@ import {
   type InlineKeyboard,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { normalizeUpdate, type TelegramUpdate } from "./normalize.js";
+import { normalizeUpdate, toWireEvent, type TelegramUpdate } from "./normalize.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -64,6 +64,18 @@ export type DispatchDecision =
    * this is the branch that forwards to it.
    */
   | { kind: "interview_text"; chatId: string; sessionId: string; text: string }
+  /**
+   * A written mid-interview message being handed to the interviewer agent.
+   *
+   * The deterministic layer records taps. This is the other half: an answer
+   * that needs judgement before it can be stored — `destination` resolving
+   * "Vienna and Prague" into a multi-destination trip, a date phrased in
+   * words, travelers and phases assembled from conversation.
+   *
+   * Carries the session the router resolved for the chat, so the caller can
+   * open the turn that gates the agent's write path before the event goes out.
+   */
+  | { kind: "interview_to_gateway"; chatId: string; sessionId: string; event: WireMessageEvent }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
@@ -135,12 +147,22 @@ export const DEFAULT_STRINGS: DispatchStrings = {
  * nothing. The caller owns all I/O, which is what makes the branch table above
  * testable without a bot token.
  */
+/** Router configuration that varies per deployment rather than per update. */
+export interface DispatchOptions {
+  /**
+   * The Hermes profile that serves written interview answers. Absent means no
+   * interviewer is reachable, and the router answers those messages itself.
+   */
+  interviewerProfile?: string;
+}
+
 export async function dispatchUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
   strings: DispatchStrings = DEFAULT_STRINGS,
   log: (line: string) => void = () => {},
   botIdentity: BotIdentity = {},
+  options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
   if (update.callback_query) return dispatchCallback(db, update);
 
@@ -220,7 +242,17 @@ export async function dispatchUpdate(
       // branch here.
       const route = await resolveChatRoute(db, chatId);
       if (route.kind !== "interview") return { kind: "ignore", reason: "INTERVIEW_ENDED" };
-      return { kind: "interview_text", chatId, sessionId: route.sessionId, text };
+      // With no interviewer profile configured there is nowhere to forward to,
+      // so the router answers the message itself — see interview_text.
+      if (!options.interviewerProfile) {
+        return { kind: "interview_text", chatId, sessionId: route.sessionId, text };
+      }
+      return {
+        kind: "interview_to_gateway",
+        chatId,
+        sessionId: route.sessionId,
+        event: toWireEvent(message, chatId, text, options.interviewerProfile),
+      };
     }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };

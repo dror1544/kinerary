@@ -27,8 +27,10 @@ import {
   type InlineKeyboard,
 } from "../chat-router.js";
 import {
+  closeAgentTurn,
   confirmIntakeForChat,
   getSessionForChat,
+  openAgentTurn,
   submitAnswerForChat,
   type SessionView,
 } from "../interview.js";
@@ -64,6 +66,14 @@ export interface TripBotPollerDeps {
    * rather than "replying to us".
    */
   botIdentity?: BotIdentity;
+  /**
+   * The Hermes profile that serves written interview answers, from
+   * `relay.interviewer_profile`.
+   *
+   * Absent, a written mid-interview message is answered by the router itself
+   * rather than forwarded — the state the bot shipped in.
+   */
+  interviewerProfile?: string;
   /**
    * Signup-approval handling, for the topology where the trip bot and the
    * signup bot are THE SAME BOT.
@@ -136,6 +146,32 @@ export async function applyDecision(
     case "interview_callback":
       await applyInterviewCallback(decision, deps, strings, log);
       return;
+
+    case "interview_to_gateway": {
+      // The turn opens BEFORE the event goes out. The agent may call back the
+      // moment it is handed the turn, so a turn opened afterwards could arrive
+      // second and the write would be refused for a turn that genuinely is in
+      // flight.
+      const turn = await openAgentTurn(deps.db, decision.chatId, decision.sessionId);
+      const delivered = deps.connector.pushInbound(decision.event);
+      if (delivered) {
+        log(structuredLog("info", "trip_bot.interview_forwarded", {
+          session_id: decision.sessionId,
+          turn_id: turn.id,
+        }));
+        return;
+      }
+      // Nothing queues, so the turn this opened will never be used. Closing it
+      // rather than letting it lapse means the next forward is the only open
+      // one at every instant, instead of racing a five-minute ghost.
+      await closeAgentTurn(deps.db, decision.chatId);
+      log(structuredLog("warn", "trip_bot.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
+      await deps.telegram.sendMessage({
+        chatId: decision.chatId,
+        text: strings.gatewayUnavailable,
+      });
+      return;
+    }
 
     case "interview_text": {
       // Which reply is honest depends on what is actually pending — see the
@@ -398,7 +434,9 @@ export function startTripBotPoller(
         // behind it — one poisoned message silencing the whole bot.
         offset = Math.max(offset, update.update_id + 1);
         try {
-          const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {});
+          const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
+            interviewerProfile: deps.interviewerProfile,
+          });
           await applyDecision(decision, deps);
         } catch (error) {
           log(structuredLog("error", "trip_bot.update_failed", {

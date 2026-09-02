@@ -97,13 +97,32 @@ export const architectureProfileSchema = z.object({
      */
     gateway_secret_refs: z.array(secretReference).min(1),
     /**
-     * The shared trip bot's token. Distinct from
-     * signup.telegram_bot_token_secret_ref: that is the signup/approval bot,
-     * and the two are different bots with different update streams. Pointing
-     * both at one token would put two getUpdates loops on it, which Telegram
-     * resolves by handing each update to whichever loop asked — at random.
+     * The shared trip bot's token, kept as its own ref because signup and trip
+     * are distinct ROLES — not because they are guaranteed to be distinct bots.
+     *
+     * On this deployment they are in fact the SAME bot, and an earlier version
+     * of this comment asserted the opposite. That mattered: Telegram hands each
+     * update to exactly one getUpdates caller, so two loops on one token steal
+     * from each other at random rather than sharing the work. The relay poller
+     * therefore subsumes the approval poller when the two refs resolve to the
+     * same token — detected by comparing the resolved values, since that is a
+     * fact the process can observe rather than a flag someone can set wrong.
      */
     telegram_bot_token_secret_ref: secretReference,
+    /**
+     * The Hermes profile that serves written interview answers.
+     *
+     * One shared profile, not one per trip: an inbound chat with no live
+     * binding is routed to the interviewer by design, so the same profile
+     * fronts every newcomer.
+     *
+     * OPTIONAL, and its absence is a working state rather than a broken one.
+     * With no profile configured the router keeps answering a written mid-
+     * interview message itself, which means saying plainly that it cannot
+     * record one. Forwarding only begins once there is somewhere to forward
+     * to.
+     */
+    interviewer_profile: z.string().min(1).optional(),
   }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.relay) {

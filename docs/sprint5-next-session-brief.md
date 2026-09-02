@@ -216,7 +216,60 @@ something nothing stored. `dispatch.ts` now returns a dedicated
 question's type — "tap one of the options above" only when a choice question is
 actually pending.
 
-### Closing it — decided 2026-09-02, not yet built
+### Closing it — BUILT 2026-09-02
+
+The forward path and the agent's write path both exist now. What follows is
+the record of why it is shaped the way it is; the section below it is the
+reasoning that got there, kept because the constraints have not changed.
+
+**The transport.** `dispatch.ts` returns a new `interview_to_gateway` decision
+for a written mid-interview message, carrying the wire event and the session
+the router resolved. `poller.ts` opens the turn and then pushes — in that
+order, because the agent may call back the instant it is handed the turn, and
+a turn opened afterwards could arrive second. If the gateway is down the turn
+is closed again rather than left to lapse, so the next forward is the only open
+one at every instant.
+
+`relay.interviewer_profile` gates the whole thing and is OPTIONAL. Absent, the
+router keeps answering written messages itself — the state the bot shipped in.
+Forwarding begins only when there is somewhere to forward to.
+
+**The write path.** `interview.ts` gained an `agent` `SessionLocator` variant
+alongside `token` and `chat`, so the addition is one more branch in
+`lockSession` rather than a parallel write path — the confirmed-session guards,
+validation and versioning stay shared. The turn is verified by JOIN inside the
+same transaction that locks the session, not looked up beforehand, so nothing
+can change between the check and the write.
+
+Migration 0031 holds the turns. Both halves of "open" are required on every
+read: a superseded turn is closed but may not have expired, an abandoned one
+has expired but was never closed.
+
+**Surfaces:** `/internal/interview/agent/:chatId` (GET, the session view) and
+`/internal/interview/agent/:chatId/answer` (POST), both X-API-Key, plus
+`get_interview_for_chat` and `submit_answer_for_chat` in the MCP sidecar —
+registered only when `CONTROL_PLANE_INTERVIEW_AGENT_KEY` is set.
+
+**Tests:** `interview-agent-turn.test.ts`, 12 cases, every one with a second
+chat mid-interview that must not be reached. Mutation-checked like the
+two-trip matrix:
+
+| mutation | caught by |
+|---|---|
+| drop both open-ness filters from the JOIN | "an expired turn is refused", "a closed turn is refused" |
+| bypass the agent branch entirely | 4 tests including "a turn open for one chat does not admit a write naming the other" |
+
+Note the read path survived the second mutation — `getSessionForAgent` carries
+its own copy of the predicate. That is intentional duplication, but it means a
+future refactor must mutate BOTH to prove the gate.
+
+**FUTURE — replace the agent-supplied chat id with gateway-injected trusted
+context.** The relay contract cannot carry it today; when it can, the turn
+table and the `agent` locator both collapse back into the chat-addressed path.
+This is the hardening step, and it sits alongside the mini-app sign-in already
+scoped under "Decisions taken 2026-09-02".
+
+### Why it is shaped this way — the constraints found on the way
 
 `interview_text` is deliberately shaped to become the forward-to-the-gateway
 branch. The question that blocked turning it into one was:
@@ -390,6 +443,14 @@ back into a family's chat. The old advice here (nothing points at the real
 token; the serve boot test uses a deliberately invalid one) described the state
 before 09-02 and no longer holds.
 
+**The wire has no structured return path and no free-form context slot.** The
+gateway->connector op set is `send`/`edit`/`typing`/`get_chat_info`, and
+`WireMessageEvent` carries only the fields in `protocol.ts`. So an agent cannot
+hand a value back to the router, and the router cannot hand the agent anything
+that varies per turn — the MCP connection is one static endpoint shared by
+every chat the interviewer serves (`example.setup.json`). Both shaped the
+interview write path; do not re-derive them by proposing either.
+
 **Frames are newline-delimited.** `encodeFrame` appends `\n`. The gateway reads
 by `*lines, buf = buf.split("\n")` and keeps the remainder as a partial, so a
 frame without it is received and never parsed — a silent handshake hang. Unit
@@ -450,10 +511,30 @@ for every non-issued state, so consumed / revoked / unknown all surface as
 `INVALID_TOKEN`. Correct as security behaviour; it just means the router cannot
 say "you already used that link".
 
-**The relay contract is EXPERIMENTAL** and still `contract_version: 1` upstream.
-Installed Hermes is **0.20.5**; latest upstream is **2026.8.27**, so an upgrade
-is a real compatibility event. Everything protocol-shaped is in `protocol.ts`
-behind `CONTRACT_VERSION`.
+**The relay contract is EXPERIMENTAL** and still `contract_version: 1` — on
+BOTH sides, which is the part that matters. Everything protocol-shaped is in
+`protocol.ts` behind `CONTRACT_VERSION`.
+
+The upgrade picture, checked 2026-09-02 (the previous note here said "latest
+upstream is 2026.8.27", which does not correspond to anything in the actual
+versioning):
+
+- Hermes is an **editable install from a local git checkout** at
+  `~/.hermes/hermes-agent`, not a PyPI package. PyPI's latest is 0.19.0 —
+  *behind* the installed 0.20.5, so `pip install -U` would downgrade.
+- The public `NousResearch/hermes-agent` has had its history collapsed to a
+  **single commit**, and shares no ancestor with the local checkout (9250
+  commits, no merge base). `git pull` cannot work; an upgrade means replacing
+  the tree.
+- Upstream is **0.21.0** — one minor version ahead.
+- It does **not** unlock the trusted-context field. Upstream's
+  `supports_context` is the connector supplying channel/group conversation
+  context for grounding, not an identity injected into tool calls, and
+  `agent/relay_tools.py` is NVIDIA NeMo Relay tool execution — a different
+  "relay" entirely.
+
+So the upgrade is hygiene, not a blocker-remover, against a gateway serving a
+real family group. Revisit when there is a reason.
 
 **No queueing.** Gateway down ⇒ `pushInbound` returns false and the turn is
 lost. The poller now tells the organizer rather than leaving them waiting, but

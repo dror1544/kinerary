@@ -713,6 +713,40 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
   return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
 }
 
+/**
+ * The current view of the interview whose turn the router has open for this
+ * chat — the interviewer agent's read path.
+ *
+ * Addressed and gated exactly like submitAnswerForAgent: the chat named here
+ * has to match a turn the router opened when it forwarded, and both halves of
+ * "open" are required. Reads are gated as well as writes because the session
+ * view carries the organizer's answers so far.
+ *
+ * FUTURE: replace the supplied chat id with gateway-injected trusted context
+ * once the relay contract can carry it.
+ */
+export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
+  const row = await db.query<{
+    id: string;
+    trip_id: string;
+    state: SessionState;
+    answers: AnswerStore;
+  }>(
+    `SELECT s.id, s.trip_id, s.state, s.answers
+     FROM control_plane.intake_sessions s
+     JOIN control_plane.interview_agent_turns t
+       ON t.session_id = s.id
+     WHERE t.chat_id = $1
+       AND t.closed_at IS NULL
+       AND t.expires_at > now()
+       AND s.state <> 'confirmed'`,
+    [chatId],
+  );
+  const [session] = row.rows;
+  if (!session) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
+}
+
 function buildSessionView(
   sessionId: string,
   tripId: string,
@@ -759,7 +793,8 @@ function buildSessionView(
  */
 type SessionLocator =
   | { by: "token"; token: string; expectedSessionId?: string }
-  | { by: "chat"; chatId: string };
+  | { by: "chat"; chatId: string }
+  | { by: "agent"; chatId: string };
 
 interface LockedSession {
   id: string;
@@ -802,6 +837,28 @@ async function lockSession(
     );
     return row.rows[0] ?? null;
   }
+  if (locator.by === "agent") {
+    // Joined rather than looked up separately so the turn is verified in the
+    // same transaction — and against the same row — that the write locks.
+    // Checking it beforehand would leave a gap in which the turn is closed or
+    // the session ends between the check and the write.
+    //
+    // Both halves of "open" are required here. A turn the router superseded is
+    // closed but may not have expired; an abandoned one has expired but was
+    // never closed. Either alone would admit a turn that is no longer current.
+    const row = await client.query<LockedSession>(
+      `SELECT ${columns.split(", ").map((c) => `s.${c}`).join(", ")}
+       FROM control_plane.intake_sessions s
+       JOIN control_plane.interview_agent_turns t
+         ON t.session_id = s.id
+       WHERE t.chat_id = $1
+         AND t.closed_at IS NULL
+         AND t.expires_at > now()
+       FOR UPDATE OF s`,
+      [locator.chatId],
+    );
+    return row.rows[0] ?? null;
+  }
   const row = await client.query<LockedSession>(
     `SELECT ${columns}
      FROM control_plane.intake_sessions
@@ -839,6 +896,104 @@ export async function submitAnswer(
   return submitAnswerVia(
     db,
     { by: "token", token: rawSessionToken, expectedSessionId },
+    questionId, optionId, otherText, structuredData, optionIds,
+  );
+}
+
+/**
+ * How long a forwarded turn stays open.
+ *
+ * Long enough for an agent to read the session, resolve a written answer and
+ * write it back; short enough that an abandoned turn stops being usable
+ * without anything having to notice it was abandoned.
+ */
+export const AGENT_TURN_TTL_SECONDS = 300;
+
+export interface AgentTurn {
+  id: string;
+  chatId: string;
+  sessionId: string;
+  expiresAt: Date;
+}
+
+/**
+ * Opens a turn for a chat whose written message the router is forwarding to
+ * the interviewer agent, and returns it.
+ *
+ * Called by the router at the moment it forwards, and only then. A second
+ * forward for the same chat supersedes the first rather than opening a rival
+ * row — 0031's partial unique index over the open rows would reject the
+ * second insert otherwise, and "the newest forward is the live one" is the
+ * behaviour that matches how a conversation actually moves.
+ */
+export async function openAgentTurn(
+  db: pg.Pool,
+  chatId: string,
+  sessionId: string,
+  ttlSeconds: number = AGENT_TURN_TTL_SECONDS,
+): Promise<AgentTurn> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE control_plane.interview_agent_turns
+       SET closed_at = now()
+       WHERE chat_id = $1 AND closed_at IS NULL`,
+      [chatId],
+    );
+    const id = generateId("iat");
+    const row = await client.query<{ expires_at: Date }>(
+      `INSERT INTO control_plane.interview_agent_turns(id, chat_id, session_id, expires_at)
+       VALUES ($1, $2, $3, now() + make_interval(secs => $4))
+       RETURNING expires_at`,
+      [id, chatId, sessionId, ttlSeconds],
+    );
+    await client.query("COMMIT");
+    return { id, chatId, sessionId, expiresAt: row.rows[0]!.expires_at };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/** Closes a chat's open turn, if it has one. */
+export async function closeAgentTurn(db: pg.Pool, chatId: string): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.interview_agent_turns
+     SET closed_at = now()
+     WHERE chat_id = $1 AND closed_at IS NULL`,
+    [chatId],
+  );
+}
+
+/**
+ * Records an answer on behalf of the interviewer agent, for the chat whose
+ * turn the router currently has open.
+ *
+ * Same write path and same rules as every other caller; what differs is only
+ * how the session is found. The chat named here is matched against the turn
+ * the router opened when it forwarded, inside the write transaction — see
+ * lockSession's "agent" branch. A chat with no open turn resolves to no
+ * session, so the write is refused the same way an unknown session is.
+ *
+ * FUTURE: replace the supplied chat id with gateway-injected trusted context
+ * once the relay contract can carry it, and this entry point collapses back
+ * into submitAnswerForChat.
+ */
+export async function submitAnswerForAgent(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+  optionId: string | "other" | null,
+  otherText?: string,
+  structuredData?: unknown,
+  optionIds?: readonly string[],
+): Promise<SubmitAnswerResult> {
+  return submitAnswerVia(
+    db,
+    { by: "agent", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
   );
 }

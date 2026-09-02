@@ -132,6 +132,24 @@ export async function normalizeUpdate(
   if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
   if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
 
+  return { kind: "event", event: toWireEvent(message, chatId, text, route.hermesProfile), route };
+}
+
+/**
+ * Builds the wire event for one Telegram message under a given profile.
+ *
+ * Split out because the interview path needs the same event shape but reaches
+ * it differently: its profile is the shared interviewer's rather than a trip
+ * companion's, and it is resolved by the caller. Keeping one builder means the
+ * `source.profile` stamp — the Trip Context Gateway decision on the wire — is
+ * constructed in exactly one place regardless of which route produced it.
+ */
+export function toWireEvent(
+  message: TelegramMessage,
+  chatId: string,
+  text: string,
+  profile: string,
+): WireMessageEvent {
   const hasThread = message.message_thread_id !== undefined;
   const source: WireSessionSource = {
     platform: "telegram",
@@ -143,10 +161,10 @@ export async function normalizeUpdate(
     thread_id: hasThread ? String(message.message_thread_id) : null,
     chat_topic: null,
     // The whole point of this module.
-    profile: route.hermesProfile,
+    profile,
   };
 
-  const event: WireMessageEvent = {
+  return {
     text,
     message_type: "text",
     source,
@@ -156,6 +174,4 @@ export async function normalizeUpdate(
         ? String(message.reply_to_message.message_id)
         : undefined,
   };
-
-  return { kind: "event", event, route };
 }

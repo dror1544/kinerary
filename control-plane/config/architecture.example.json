@@ -39,6 +39,7 @@
     "gateway_secret_refs": [
       "env://CONTROL_PLANE_RELAY_GATEWAY_SECRET"
     ],
-    "telegram_bot_token_secret_ref": "env://CONTROL_PLANE_TRIP_BOT_CREDS"
+    "telegram_bot_token_secret_ref": "env://CONTROL_PLANE_TRIP_BOT_CREDS",
+    "interviewer_profile": "trip-intake"
   }
 }

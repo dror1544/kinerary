@@ -76,6 +76,8 @@ interface Runtime {
   /** Set only in serve mode; its absence is what disables the poll loop. */
   db?: ReturnType<typeof createDatabasePool>;
   botIdentity?: BotIdentity;
+  /** From `relay.interviewer_profile`; absent disables interview forwarding. */
+  interviewerProfile?: string;
   /**
    * Present only when this relay's bot IS the signup bot. Telegram gives each
    * update to exactly one getUpdates caller, so in that topology this loop has
@@ -162,6 +164,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     telegram,
     db,
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
+    interviewerProfile: relay.interviewer_profile,
     approvals,
   };
 }
@@ -207,6 +210,7 @@ async function main(): Promise<void> {
       telegram: runtime.telegram,
       connector,
       botIdentity: runtime.botIdentity,
+      interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       log,
     });
