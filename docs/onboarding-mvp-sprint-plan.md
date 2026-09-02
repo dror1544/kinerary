@@ -772,6 +772,46 @@ a sealed, scanned release artifact is promoted and selected by the planner.
 **Goal:** connect one long-lived organizer companion profile to isolated trip
 contexts and test groups without creating a per-trip Telegram bot.
 
+> **Status as of 2026-09-02 — partially delivered, PR #29 open against
+> `integration/sprint-5-plus` (16 commits, unreviewed).** Working detail,
+> landmines and the bring-up runbook live in
+> `docs/sprint5-next-session-brief.md`; this box is only the scoreboard.
+>
+> **Built and in the PR:**
+> - the shared Trip Bot router — deterministic layer (`chat-router.ts`,
+>   migration 0028), relay connector, poll loop, `relay/server.ts` with
+>   distinct SERVE and CONFORMANCE modes;
+> - chat→trip binding with a real **lifecycle** (migration 0029): a
+>   reassignment closes rather than overwrites, the provisioner **refuses** to
+>   move a chat that belongs to another trip, and both production readers
+>   filter `closed_at IS NULL`;
+> - the **two-trip isolation matrix** (Half A), 10 tests, mutation-checked;
+> - a group **relevance gate** owned by the connector, because the relay does
+>   not carry Hermes's `mention_patterns` (migration 0030 stores the names);
+> - the relay poller **subsuming** the signup approval poller, detected by
+>   comparing resolved tokens — the two bots are one bot on this deployment;
+> - CommonMark→MarkdownV2 conversion for agent-authored text only;
+> - **written interview answers forwarded to the interviewer agent**, with the
+>   agent's write path gated by migration 0031's turn registry (12 tests,
+>   mutation-checked). Dormant until `relay.interviewer_profile` is set.
+>
+> **Live:** the bot went live in a real family group on 2026-09-02, and five of
+> the fixes above exist because of what that showed rather than what was
+> reasoned out.
+>
+> **Not built:** group binding via signed organizer action, `/select`, the
+> Super Bot, reviewed reassignment, allowlist automation. Isolation-matrix
+> Half B (two live Hermes profiles, no private-memory leakage) tests an
+> upstream property and belongs as a one-time live verification, not a suite.
+>
+> **Deferred with a reason:** the richer router-issued
+> organizer/trip/channel/role/lifecycle capability. What ships stamps a
+> *profile name*. Whether that suffices for the exit gate is undecided — see
+> the brief's Open decisions.
+>
+> **Track 3 (the interview UX batch below) is untouched** and is the largest
+> remaining piece of this sprint.
+
 Build:
 
 - Convert reusable `familytrip-provisioner` validation/profile logic into a
@@ -941,9 +981,131 @@ Manual tests:
   worker restart before approving a clean retry;
 - after success, open the non-production trip URL, exercise a safe companion
   request, verify monitoring, then suspend/archive and run labelled cleanup.
+- **Re-provision `japan-2026` through the full cycle onto a fresh
+  control-plane-managed container** (decided 2026-09-02). This is the first
+  trip to go end to end — signup → interview → intake → plan → approve →
+  provision → verify → activate — with no hand-seeded state anywhere in it.
+
+  The reason it is worth doing on *this* slug: the compute half already works
+  for it and the intake half never ran. `LxcProvisionAdapter` really did
+  allocate vmid 101 at `192.168.0.60` and write its `topology.yaml`, and the
+  container is serving on both the LAN and `japan-2026.ara-united.store`. But
+  the trip row is `trip_japan2026seed0000000000000a`, hand-seeded with empty
+  `title`, `destination_label`, `start_date` and `end_date` so the Sprint 5
+  router had a binding target for the live group test. A full cycle replaces
+  that stub with a row the pipeline actually produced, which is precisely the
+  "without manual database changes" clause in the exit gate below.
+
+  Three things to get right when it runs:
+
+  - **Provision onto a NEW container, not vmid 101.** Do not add `japan-2026`
+    to `PROVISIONER_VMID_MAP` to force reuse — a static entry means "legacy,
+    hand-provisioned", and using one here would skip the very allocation path
+    under test. Let Phase G allocate the next free IP in the 60-99 pool.
+  - **The existing container and its chat binding are LIVE.** A real family
+    supergroup is bound to the seed trip. Cutting over means a reviewed
+    reassignment, which is still unbuilt (see Sprint 5's "who closes a
+    binding"), so plan the binding move explicitly rather than letting the
+    provisioner attempt it — `bind_chat_to_trip` refuses to move a chat to a
+    different trip by design, and correctly so.
+  - **Keep the old container until the new one verifies**, then run labelled
+    cleanup on it. Two trips must not answer on one hostname mid-cutover.
 
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.
+
+### Decision gate after Sprint 6 — k3s substrate migration
+
+**Not scheduled work.** A proposal (Dror, 2026-09-02) to be decided once
+Sprint 6's full-cycle test has produced a known-good reference run. Deliberately
+placed after it: rebuilding the substrate before that test means debugging a new
+platform and an unproven pipeline at the same time, with no baseline to tell
+them apart.
+
+**The proposal:** run the kinerary deployment on k3s — trip sites (including the
+modern SPA) and the landing page on an internal network, control plane at the
+edge, with Hermes remaining on the Mac mini as an external local-network service
+that also hosts the MCPs.
+
+**Why it is attractive.** Most of the per-trip provisioning path stops existing:
+`pct create` over SSH, the `.60–.99` IP pool, `topology.yaml` written before
+apply so a retry does not double-allocate, `PROVISIONER_VMID_MAP`, the NPM
+record and the Cloudflare DNS entry all collapse into a Deployment + Service +
+Ingress. Cluster DNS removes IP pinning structurally rather than by convention —
+the 2026-09-02 diagnosis turned entirely on spotting that `.200` was not `.60`,
+which a name would have made self-describing. Sprint 4.7's self-recovering
+re-provision is hand-built convergence that controllers do natively, and its
+sealed release manifest maps cleanly onto image tags.
+
+**Discussion points to settle when we get here:**
+
+1. **The control plane must NOT be the ingress — it should PROGRAM the ingress.**
+   Trip sites have to keep serving while the control plane is down, mid-deploy or
+   wedged. In the data path, every control-plane deploy becomes a trip-wide
+   outage and a control-plane bug becomes a serving bug. Let Traefik be the
+   ingress and have the control plane create Ingress objects. This is the seam
+   that already exists — the provisioner writes NPM config, it does not proxy
+   traffic — and it is working. Decide explicitly rather than by default.
+
+2. **MCPs staying on the Mac preserves the 2026-09-02 failure exactly.** The
+   trip-mcp bridges and the interview sidecar are unsupervised processes with
+   pidfiles; that is why an outage silently blinded the assistant while the bot
+   kept answering at full confidence. If they stay put, `bring-up.sh` remains
+   load-bearing indefinitely. They are stateless HTTP/SSE adapters over the trip
+   site API — close to ideal pod workloads. Hermes needs to REACH them, not HOST
+   them.
+
+3. **The concrete blocker for (2):** trip-mcp's `/extract` shells out to the
+   local `hermes` binary (`HERMES_BIN`, `HERMES_EXTRACT_PROFILE=kinerary-extract`).
+   That is exactly why it is colocated today. Moving MCPs into the cluster means
+   refactoring `/extract` to call an API instead of exec'ing a binary. Scope this
+   deliberately — it is the single thing standing between us and supervised MCPs.
+
+4. **Blast radius consolidates.** One LXC per trip means one trip fails alone;
+   single-node k3s means the VM takes every trip with it. Probably acceptable at
+   this scale, but it is a real trade and should be accepted knowingly, not
+   discovered.
+
+5. **Postgres becomes a storage decision** — a proper volume story, or keep it
+   outside the cluster. Outside is a perfectly good answer.
+
+### Related, and true regardless of k3s — the control-plane/Hermes split
+
+Decided direction (Dror, 2026-09-02): the control plane eventually runs in a VM
+on Proxmox while Hermes stays on the Mac mini, so Hermes-side bring-up becomes
+REMOTE — preferably over an API and DNS names rather than IPs. Not to be resolved
+now, but these assumptions are baked into what runs today and will break at
+cutover:
+
+- **`relay.bind_host` is schema-validated as a private host**, with the stated
+  reason that binding publicly "would expose the socket that sends as the trip
+  bot to anything that can reach the port." Once the gateway and the connector
+  are on different machines that socket crosses the network. The HMAC upgrade
+  token authenticates the gateway but does not encrypt the channel, so this needs
+  mTLS or a tunnel. **The validator will REJECT a production config outright
+  rather than warn** — someone will hit that and be tempted to loosen the schema.
+  The fix is transport security, not relaxing the guard.
+- **`architecture.relay-host.json` addresses secrets as `file:///Users/elul/...`.**
+  Those paths do not exist on a VM. The `secret_ref` indirection is the right
+  seam; it needs a non-`file://` scheme. Same problem as moving the NPM
+  credentials into a compose Vault.
+- **Localhost assumptions become network hops:** the interview sidecar defaults to
+  `CONTROL_PLANE_API_BASE_URL=http://127.0.0.1:4310`, and Hermes reaches the trip
+  bridges on `127.0.0.1:3011/3012/3013` even though those bridges reach the SITES
+  by LAN IP.
+- **`bring-up.sh` splits in two.** It assumes colocation in three places:
+  `docker exec` into the postgres container, `nc -z 127.0.0.1 <port>`, and reading
+  the interviewer key out of `~/.hermes/profiles/trip-intake/config.yaml`. It
+  becomes a control-plane-side bring-up on the VM plus a Hermes-side one on the
+  mini that discovers trips over the API instead of `docker exec`. **The
+  discovery DESIGN survives intact** — "scope is whatever the control plane knows"
+  works identically over an authenticated HTTP endpoint. Only the transport
+  changes, not the boundary.
+- **Internal names, not the public ones.** The trip hostnames
+  (`japan-2026.ara-united.store`) resolve through Cloudflare, so reusing them
+  internally would hairpin trip traffic out and back. Split-horizon DNS or a
+  `.lan` zone.
+
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 

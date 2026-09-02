@@ -114,7 +114,19 @@ def build_companion_handoff(
             "default_language": meta.get("defaultLang") if meta.get("defaultLang") in ("he", "en") else "en",
             "timezone": agent.get("timezone") or "UTC",
             "canonical_site_url": canonical_site_url,
-            "site_connection_name": "trip-site",
+            # trip-mcp, not trip-site. The name here is not cosmetic: it is what
+            # SOUL.md and references/sources.md tell the assistant to call, so if it does
+            # not match the MCP server actually registered in the profile, the assistant
+            # looks for a connection that does not exist and falls back to scraping the
+            # public site (or running code to fetch it) — which is what happened on
+            # japan-2026.
+
+            # Everything that creates the server already agreed on trip-mcp:
+            # kinerary-deploy/setup-mcp.sh registers it under that name, the live
+            # shiranusa2026 profile uses it, and this template's OWN skills call it
+            # (trip-daily-planning's `get_config` via trip-mcp, trip_kml_export.py).
+            # Only the handoff contract said trip-site, so the handoff was the outlier.
+            "site_connection_name": "trip-mcp",
         },
         "assistant": {
             "name": agent["name"],

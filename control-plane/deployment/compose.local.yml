@@ -30,6 +30,18 @@ services:
       # uses, so both cannot end up pointed at different databases.
       CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
       CONTROL_PLANE_MIGRATIONS_DIR: /app/migrations
+    # Same dev-only overlay the api service carries, and for a stronger reason:
+    # the architecture profile is mounted from the host, so a profile that
+    # grows a key (Sprint 5 added `relay`) is validated by whatever code this
+    # container runs. Without the overlay that is the image's BAKED dist, whose
+    # strict schema rejects the new key — and because api depends on migrate
+    # completing, a stale migrate takes the whole stack down even when api's
+    # own mounted dist would have been perfectly happy. Migrations are mounted
+    # for the same reason: running new code against old SQL is the other half
+    # of the same mismatch.
+    volumes:
+      - ../../control-plane/api/dist:/app/dist:ro
+      - ../../control-plane/db/migrations:/app/migrations:ro
     secrets: [control_plane_database_url]
     configs:
       - source: architecture_profile
@@ -53,6 +65,13 @@ services:
       # not part of the provider-neutral architecture profile. Empty default
       # leaves the route unmounted (503) rather than failing startup.
       CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
+      # The other end of the interview MCP sidecar's own AGENT_KEY. Both sides
+      # read this SAME name on purpose — set it in one place and the sidecar's
+      # forwarded call authenticates; set it on neither and the routes stay
+      # unmounted (503) and the router answers written messages itself. Setting
+      # it on only one side is the misconfiguration worth making impossible to
+      # express, hence one name rather than two.
+      CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:-}
       # Local dev deploys from the hand-seeded `release_localdev0001`, which has
       # no sealed manifest — so generatePlan would otherwise reject it and there
       # would be no selectable release at all. This opts that box into the
@@ -63,7 +82,10 @@ services:
       CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
-    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id]
+    # trip_bot_creds is mounted so the stand-down check can resolve the relay's
+    # bot ref and compare it with signup's. Without it that check cannot run and
+    # the api keeps polling, which is the safe fallback but not the goal here.
+    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id, trip_bot_creds]
     configs:
       - source: architecture_profile
         target: /run/config/architecture.json
@@ -202,6 +224,16 @@ secrets:
     file: ./.local-secrets/telegram_webhook_secret
   telegram_super_admin_chat_id:
     file: ./.local-secrets/telegram_super_admin_chat_id
+  # Deliberately the SAME FILE as telegram_creds. On this deployment the trip
+  # bot and the signup bot are one bot (@Kinerary_bot), so the two secret_refs
+  # name one credential — and that identity is exactly what server.ts detects
+  # when it stands its own approval poller down in favour of the relay's loop.
+  # The schema keeps them as separate refs because they are separate roles; it
+  # is this file that says they currently coincide.
+  trip_bot_creds:
+    file: ./.local-secrets/telegram_creds
+  relay_gateway_secret:
+    file: ./.local-secrets/relay_gateway_secret
 
 configs:
   architecture_profile:

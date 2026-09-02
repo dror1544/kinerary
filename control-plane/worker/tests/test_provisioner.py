@@ -16,7 +16,12 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from control_plane_worker.provisioner import DeployAdapter, ProvisionerWorker
+from control_plane_worker.provisioner import (
+    BindingRefused,
+    DeployAdapter,
+    ProvisionerWorker,
+    bind_chat_to_trip,
+)
 from control_plane_worker.release_source import ReleaseSourceError
 
 DB_URL = os.environ.get("CONTROL_PLANE_TEST_DATABASE_URL")
@@ -776,6 +781,66 @@ class CompanionProfileTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(job_state["state"], "succeeded")
 
+    def test_a_chat_already_serving_another_trip_is_not_taken(self) -> None:
+        """The provisioner must not retarget a chat that is in force for another
+        trip, and must not fail the provision over it either.
+
+        Before this, the binding write was `ON CONFLICT (chat_id) DO UPDATE`
+        inside a broad `except Exception: logger.warning` — so the group got
+        silently moved to the new trip AND nothing said so. Now the provision
+        still succeeds (a companion install is a best-effort side effect and
+        must not roll back a deployed trip), the existing binding survives
+        untouched, and the new trip is left with no open binding, which is the
+        durable, queryable evidence that it is unroutable.
+        """
+        other = setup_fixture(self.conn)
+        try:
+            with self.conn.transaction():
+                self.conn.execute(
+                    """INSERT INTO control_plane.telegram_chat_bindings
+                         (id, chat_id, trip_id, hermes_profile)
+                       VALUES (%s, %s, %s, %s)""",
+                    (f"tcb_{rnd()}", self.chat_id, other["trip_id"], "companion-incumbent"),
+                )
+
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-binding-refused",
+                companion=FakeCompanionProfileAdapter(),
+            )
+            self.assertTrue(worker.run_once(), "the provision itself still succeeds")
+
+            job_state = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(job_state["state"], "succeeded")
+
+            # The incumbent binding is untouched — not closed, not retargeted.
+            open_rows = self.conn.execute(
+                """SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings
+                   WHERE chat_id = %s AND closed_at IS NULL""",
+                (self.chat_id,),
+            ).fetchall()
+            self.assertEqual(len(open_rows), 1)
+            self.assertEqual(open_rows[0]["trip_id"], other["trip_id"])
+            self.assertEqual(open_rows[0]["hermes_profile"], "companion-incumbent")
+
+            # And the new trip is detectably unroutable rather than silently so.
+            self.assertIsNone(
+                self.conn.execute(
+                    """SELECT 1 FROM control_plane.telegram_chat_bindings
+                       WHERE trip_id = %s AND closed_at IS NULL""",
+                    (self.fix["trip_id"],),
+                ).fetchone()
+            )
+        finally:
+            self.conn.rollback()
+            with self.conn.transaction():
+                self.conn.execute(
+                    "DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+                    (other["trip_id"],),
+                )
+            teardown_fixture(self.conn, other)
+
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
 class SlugPromotionTests(unittest.TestCase):
@@ -1089,3 +1154,147 @@ class ShellDeployAdapterSidecarTests(unittest.TestCase):
                 self.assertEqual([{"seed_key": "hotel_tokyo"}], json.load(fh))
             with open(os.path.join(trip_dir, "trivia_questions.json"), encoding="utf-8") as fh:
                 self.assertEqual([], json.load(fh))
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ChatBindingLifecycleTests(unittest.TestCase):
+    """A reassignment must CLOSE the old binding rather than overwrite it, and
+    must never silently retarget a chat that is actively serving another trip.
+
+    Before migration 0029 the provisioner did `ON CONFLICT (chat_id) DO UPDATE
+    SET trip_id = ...`, so a chat bound to trip A became bound to trip B with
+    no trace it had ever meant anything else — the exact behaviour the sprint
+    plan forbids.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix_a = setup_fixture(self.conn)
+        self.fix_b = setup_fixture(self.conn)
+        self.chat_id = "800900" + rnd(3)
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute(
+                "DELETE FROM control_plane.telegram_chat_bindings WHERE chat_id = %s",
+                (self.chat_id,),
+            )
+        teardown_fixture(self.conn, self.fix_a)
+        teardown_fixture(self.conn, self.fix_b)
+
+    def _rows(self) -> list[dict[str, Any]]:
+        return self.conn.execute(
+            """SELECT trip_id, hermes_profile, closed_at, closed_reason
+               FROM control_plane.telegram_chat_bindings
+               WHERE chat_id = %s
+               ORDER BY created_at, closed_at NULLS LAST""",
+            (self.chat_id,),
+        ).fetchall()
+
+    def _open_row(self) -> dict[str, Any] | None:
+        return self.conn.execute(
+            """SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings
+               WHERE chat_id = %s AND closed_at IS NULL""",
+            (self.chat_id,),
+        ).fetchone()
+
+    def test_first_binding_opens(self) -> None:
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        self.assertEqual(outcome, "created")
+        row = self._open_row()
+        self.assertEqual(row["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(row["hermes_profile"], "companion-a")
+
+    def test_reprovisioning_the_same_trip_is_a_no_op(self) -> None:
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        self.assertEqual(outcome, "unchanged")
+        # No history churn from simply re-provisioning an unchanged trip.
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_a_changed_profile_on_the_same_trip_still_leaves_a_trail(self) -> None:
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a-v2")
+        self.assertEqual(outcome, "profile_rebound")
+
+        rows = self._rows()
+        self.assertEqual(len(rows), 2, "the old row is closed, not overwritten")
+        closed = [r for r in rows if r["closed_at"] is not None]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["hermes_profile"], "companion-a")
+        self.assertEqual(closed[0]["closed_reason"], "profile_rebound")
+        self.assertEqual(self._open_row()["hermes_profile"], "companion-a-v2")
+
+    def test_retargeting_to_another_trip_is_refused(self) -> None:
+        # The case the plan calls out: this chat is actively serving trip A.
+        # A provisioning job for trip B has no signed organizer action, so it
+        # must not take the chat.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        with self.assertRaises(BindingRefused) as caught:
+            bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+        self.assertEqual(caught.exception.existing_trip_id, self.fix_a["trip_id"])
+        self.assertEqual(caught.exception.requested_trip_id, self.fix_b["trip_id"])
+
+        # And the existing binding is untouched — the refusal must not be a
+        # partial write that leaves the chat pointing nowhere.
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(self._open_row()["hermes_profile"], "companion-a")
+
+    def test_a_closed_binding_frees_the_chat_for_another_trip(self) -> None:
+        # Reassignment is not forbidden, only silent reassignment. Once the old
+        # binding is deliberately closed, the chat is available again — and the
+        # history of what it used to serve survives.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.conn.transaction():
+            self.conn.execute(
+                """UPDATE control_plane.telegram_chat_bindings
+                   SET closed_at = now(), closed_reason = 'organizer_reassigned'
+                   WHERE chat_id = %s AND closed_at IS NULL""",
+                (self.chat_id,),
+            )
+
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+        self.assertEqual(outcome, "created")
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+
+        history = [r for r in self._rows() if r["closed_at"] is not None]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(history[0]["closed_reason"], "organizer_reassigned")
+
+    def test_only_one_binding_per_chat_can_be_open(self) -> None:
+        # Migration 0029's partial unique index is the backstop under a race
+        # the FOR UPDATE lock would normally serialise.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            with self.conn.transaction():
+                self.conn.execute(
+                    """INSERT INTO control_plane.telegram_chat_bindings
+                         (id, chat_id, trip_id, hermes_profile)
+                       VALUES (%s, %s, %s, %s)""",
+                    (f"tcb_{rnd()}", self.chat_id, self.fix_b["trip_id"], "companion-b"),
+                )
+
+    def test_closed_at_and_closed_reason_cannot_disagree(self) -> None:
+        # A half-closed row would be read as open by one filter and closed by
+        # another — the constraint keeps "closed" a single fact.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            with self.conn.transaction():
+                self.conn.execute(
+                    """UPDATE control_plane.telegram_chat_bindings
+                       SET closed_at = now()
+                       WHERE chat_id = %s""",
+                    (self.chat_id,),
+                )

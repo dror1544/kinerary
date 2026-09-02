@@ -769,6 +769,38 @@ class SchemaV2Tests(unittest.TestCase):
         config = self._config(bot_tone=_choice("dry"), bot_gender=_choice("female"))
         self.assertNotIn("agent", config)
 
+    def test_a_bilingual_name_is_split_into_both_fields(self) -> None:
+        # A real answer from japan-2026. The organizer was asked for one name
+        # and gave two, because their group types both. Before this split, BOTH
+        # name and name_en held the whole string "בוטסאן / botsan", which is a
+        # wake-word matching neither of the words anyone actually types.
+        config = self._config(bot_name=_text("בוטסאן / botsan"))
+        agent = config["agent"]
+        self.assertEqual(agent["name"], "בוטסאן")
+        self.assertEqual(agent["name_en"], "botsan")
+
+    def test_the_split_does_not_depend_on_which_language_came_first(self) -> None:
+        config = self._config(bot_name=_text("Botsan | בוטסאן"))
+        agent = config["agent"]
+        self.assertEqual(agent["name"], "בוטסאן")
+        self.assertEqual(agent["name_en"], "Botsan")
+
+    def test_a_single_name_is_left_whole_in_both_fields(self) -> None:
+        # No transliteration is invented. Guessing the missing half would put a
+        # name in front of the group that the organizer never chose.
+        for single in ("ויקטור", "Victor"):
+            with self.subTest(single=single):
+                agent = self._config(bot_name=_text(single))["agent"]
+                self.assertEqual(agent["name"], single)
+                self.assertEqual(agent["name_en"], single)
+
+    def test_a_hyphenated_latin_name_is_not_split(self) -> None:
+        # The separator alone must not trigger a split — only a genuine
+        # change of script does. "Jean-Luc" is one name.
+        agent = self._config(bot_name=_text("Jean-Luc"))["agent"]
+        self.assertEqual(agent["name"], "Jean-Luc")
+        self.assertEqual(agent["name_en"], "Jean-Luc")
+
     def test_bot_limits_missing_a_language_is_dropped(self) -> None:
         config = self._config(bot_limits=_structured([
             {"he": "רק עברית"},

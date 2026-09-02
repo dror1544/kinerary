@@ -450,6 +450,55 @@ _PROACTIVE_VALUES: dict[str, Any] = {
 }
 
 _AGENT_GENDERS = frozenset({"male", "female", "neutral"})
+
+
+# An organizer whose group writes in two languages types both names into the
+# one field they are given — "בוטסאן / botsan" is a real answer from japan-2026.
+# Splitting them matters beyond tidiness: `name` and `name_en` are what a
+# bilingual group's wake-words are built from, and a field holding BOTH names at
+# once matches neither when someone types just one of them.
+_BILINGUAL_SEPARATORS = ("/", "|", "־", "-", ",")
+
+
+def _is_hebrew(text: str) -> bool:
+    """True when the string carries Hebrew letters. Script detection, not a
+    language guess — the Hebrew block is unambiguous."""
+    return any("\u0590" <= ch <= "\u05ff" for ch in text)
+
+
+def _is_latin(text: str) -> bool:
+    return any(("a" <= ch <= "z") or ("A" <= ch <= "Z") for ch in text)
+
+
+def split_bilingual_name(raw: str) -> tuple[str, str]:
+    """Splits a single free-text assistant name into (name, name_en).
+
+    Returns the same string twice when there is only one name to find — a
+    Hebrew-only or Latin-only answer is not a pair, and inventing a
+    transliteration for the missing half would put a name in front of the
+    group that the organizer never chose.
+
+    Only splits when the two sides are in DIFFERENT scripts. That is what makes
+    it safe on a name that merely contains a separator: "Jean-Luc" is one Latin
+    name on both sides of its hyphen, so it stays whole.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", ""
+
+    for sep in _BILINGUAL_SEPARATORS:
+        if sep not in text:
+            continue
+        parts = [part.strip() for part in text.split(sep) if part.strip()]
+        if len(parts) != 2:
+            continue
+        first, second = parts
+        if _is_hebrew(first) and _is_latin(second) and not _is_hebrew(second):
+            return first, second
+        if _is_latin(first) and not _is_hebrew(first) and _is_hebrew(second):
+            return second, first
+
+    return text, text
 _AGENT_TONES = frozenset({"warm", "playful", "dry"})
 
 
@@ -567,10 +616,11 @@ def _derive_agent(
     if organizers:
         agent["organizers"] = organizers
 
-    name = _text_value(data["bot_name"]).strip() if isinstance(data.get("bot_name"), Mapping) else ""
+    raw_name = _text_value(data["bot_name"]).strip() if isinstance(data.get("bot_name"), Mapping) else ""
+    name, name_en = split_bilingual_name(raw_name)
     if name:
         agent["name"] = name
-        agent["name_en"] = name
+        agent["name_en"] = name_en
         gender = _text_value(data["bot_gender"]) if isinstance(data.get("bot_gender"), Mapping) else ""
         # Hebrew conjugates by gender, so the assistant cannot build a sentence
         # without one. 'neutral' (gender-avoidant phrasing) is the honest
