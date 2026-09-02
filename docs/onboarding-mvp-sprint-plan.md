@@ -941,6 +941,35 @@ Manual tests:
   worker restart before approving a clean retry;
 - after success, open the non-production trip URL, exercise a safe companion
   request, verify monitoring, then suspend/archive and run labelled cleanup.
+- **Re-provision `japan-2026` through the full cycle onto a fresh
+  control-plane-managed container** (decided 2026-09-02). This is the first
+  trip to go end to end — signup → interview → intake → plan → approve →
+  provision → verify → activate — with no hand-seeded state anywhere in it.
+
+  The reason it is worth doing on *this* slug: the compute half already works
+  for it and the intake half never ran. `LxcProvisionAdapter` really did
+  allocate vmid 101 at `192.168.0.60` and write its `topology.yaml`, and the
+  container is serving on both the LAN and `japan-2026.ara-united.store`. But
+  the trip row is `trip_japan2026seed0000000000000a`, hand-seeded with empty
+  `title`, `destination_label`, `start_date` and `end_date` so the Sprint 5
+  router had a binding target for the live group test. A full cycle replaces
+  that stub with a row the pipeline actually produced, which is precisely the
+  "without manual database changes" clause in the exit gate below.
+
+  Three things to get right when it runs:
+
+  - **Provision onto a NEW container, not vmid 101.** Do not add `japan-2026`
+    to `PROVISIONER_VMID_MAP` to force reuse — a static entry means "legacy,
+    hand-provisioned", and using one here would skip the very allocation path
+    under test. Let Phase G allocate the next free IP in the 60-99 pool.
+  - **The existing container and its chat binding are LIVE.** A real family
+    supergroup is bound to the seed trip. Cutting over means a reviewed
+    reassignment, which is still unbuilt (see Sprint 5's "who closes a
+    binding"), so plan the binding move explicitly rather than letting the
+    provisioner attempt it — `bind_chat_to_trip` refuses to move a chat to a
+    different trip by design, and correctly so.
+  - **Keep the old container until the new one verifies**, then run labelled
+    cleanup on it. Two trips must not answer on one hostname mid-cutover.
 
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.

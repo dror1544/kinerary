@@ -566,10 +566,24 @@ contend for the same port, and it looks like a real failure. And macOS's
 `python3.9` still cannot load the worker package; `/tmp/wvenv` was rebuilt on
 `python3.12`.
 
-**`japan-2026` is not in `PROVISIONER_VMID_MAP`** — the map names `japan-2025`,
-`elul-family-usa-2026` and `los-angeles-hawaii-vegas-2026`. The only trip in
-the local control plane is `japan-2026` @ `ready_private`. Nothing needs it
-while compute is off, but a real provision for that slug would not find a vmid.
+**`japan-2026` is absent from `PROVISIONER_VMID_MAP`, and that is correct** —
+not the gap an earlier draft of this section called it. `provisioner.py` reads
+`self._vmid_map.get(slug) or self._compute.create_container(...)`, so a static
+entry means "legacy, hand-provisioned, long-lived container" and *absence*
+means "allocate a fresh one through Phase G". `japan-2026` took the second
+path: `LxcProvisionAdapter` allocated vmid 101 at `192.168.0.60` (first in the
+60-99 pool) and wrote `~/kinerary-deploy/trips/japan-2026/topology.yaml`
+before apply, so a retried job reuses the allocation rather than taking a
+second IP. `mcp_bridge.py` falls back to reading that file for the same reason.
+The container survived the outage — both `192.168.0.60:8080` and
+`japan-2026.ara-united.store` return 200.
+
+**What actually bypassed the pipeline is the trip row, not the container.**
+`trip_japan2026seed0000000000000a` is a hand-seeded stub with empty `title`,
+`destination_label`, `start_date` and `end_date`, created to give the router a
+binding target for the live group test. So the compute half of provisioning has
+been exercised for real and the intake→trip half has not, for this trip. See
+the full-cycle item added to Sprint 6.
 
 ## Key files
 
