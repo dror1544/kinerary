@@ -772,6 +772,46 @@ a sealed, scanned release artifact is promoted and selected by the planner.
 **Goal:** connect one long-lived organizer companion profile to isolated trip
 contexts and test groups without creating a per-trip Telegram bot.
 
+> **Status as of 2026-09-02 — partially delivered, PR #29 open against
+> `integration/sprint-5-plus` (16 commits, unreviewed).** Working detail,
+> landmines and the bring-up runbook live in
+> `docs/sprint5-next-session-brief.md`; this box is only the scoreboard.
+>
+> **Built and in the PR:**
+> - the shared Trip Bot router — deterministic layer (`chat-router.ts`,
+>   migration 0028), relay connector, poll loop, `relay/server.ts` with
+>   distinct SERVE and CONFORMANCE modes;
+> - chat→trip binding with a real **lifecycle** (migration 0029): a
+>   reassignment closes rather than overwrites, the provisioner **refuses** to
+>   move a chat that belongs to another trip, and both production readers
+>   filter `closed_at IS NULL`;
+> - the **two-trip isolation matrix** (Half A), 10 tests, mutation-checked;
+> - a group **relevance gate** owned by the connector, because the relay does
+>   not carry Hermes's `mention_patterns` (migration 0030 stores the names);
+> - the relay poller **subsuming** the signup approval poller, detected by
+>   comparing resolved tokens — the two bots are one bot on this deployment;
+> - CommonMark→MarkdownV2 conversion for agent-authored text only;
+> - **written interview answers forwarded to the interviewer agent**, with the
+>   agent's write path gated by migration 0031's turn registry (12 tests,
+>   mutation-checked). Dormant until `relay.interviewer_profile` is set.
+>
+> **Live:** the bot went live in a real family group on 2026-09-02, and five of
+> the fixes above exist because of what that showed rather than what was
+> reasoned out.
+>
+> **Not built:** group binding via signed organizer action, `/select`, the
+> Super Bot, reviewed reassignment, allowlist automation. Isolation-matrix
+> Half B (two live Hermes profiles, no private-memory leakage) tests an
+> upstream property and belongs as a one-time live verification, not a suite.
+>
+> **Deferred with a reason:** the richer router-issued
+> organizer/trip/channel/role/lifecycle capability. What ships stamps a
+> *profile name*. Whether that suffices for the exit gate is undecided — see
+> the brief's Open decisions.
+>
+> **Track 3 (the interview UX batch below) is untouched** and is the largest
+> remaining piece of this sprint.
+
 Build:
 
 - Convert reusable `familytrip-provisioner` validation/profile logic into a

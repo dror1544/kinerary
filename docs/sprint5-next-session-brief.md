@@ -1,21 +1,70 @@
 # Sprint 5 — next session brief
 
-Updated 2026-09-02 (third session). That session ended abruptly in a power
-outage at roughly 13:00, so it never wrote this itself — the 09-02 sections
-below were reconstructed afterwards from its commits and from the state it left
-on the machine. Read this plus
+Updated **2026-09-02 (fourth session)**. Read this plus
 `docs/sprint5-trip-bot-router-design.md` (the why, and the live evidence)
 before touching anything.
 
-## Where things stand
+Sections dated 09-02 and marked "reconstructed" were written after the fact
+from commits and machine state, because the third session ended in a power
+outage at ~13:00 and never wrote its own notes. Everything else is first-hand.
+
+## START HERE
 
 **Worktree** `.claude/worktrees/sprint-5-organizer-router`
-**Branch** `sprint/5-organizer-profile-router`
-**Stacks onto** `integration/sprint-5-plus` (from `main` @ `fc809a0`)
-**Not pushed.** Nothing is on the remote yet; no PR exists.
+**Branch** `sprint/5-organizer-profile-router` — pushed
+**PR #29** → `integration/sprint-5-plus`, 16 commits, open and unreviewed
+**Suites** control-plane 505 (499 pass / 0 fail / 6 skipped) · site 405/405 ·
+worker 261/261
 
-The routing spine is now **wired together and runnable**. A process starts, owns
-the bot's update stream, routes each update, and records button answers.
+Bring the machine back to a working state — nothing below is supervised, so
+this is needed after every reboot:
+
+```bash
+~/kinerary-deploy/bring-up.sh          # trip-mcp bridges + interview sidecar
+```
+
+Then the relay, which is a **deliberate live action** — it puts the assistant
+into a real family group, so do it only when you mean to:
+
+```bash
+cd control-plane/api
+env -u RELAY_GATEWAY_SECRET \
+  CONTROL_PLANE_ARCHITECTURE_PROFILE=$PWD/../deployment/.local-secrets/architecture.relay-host.json \
+  nohup npx tsx src/relay/server.ts > /tmp/relay.log 2>&1 &
+```
+
+### What to pick up next
+
+1. **Get PR #29 reviewed and merged.** It blocks the integration PR:
+   `integration/sprint-5-plus` sits exactly at `main`, and GitHub refuses to
+   open a PR with no diff, so the integration PR cannot exist until #29 lands.
+   Carry-forward items have nowhere to go until then.
+2. **Track 3 — the interview UX batch.** ~16 items from the first live signup
+   run, including two reproducible bugs (the dietary step throws; planned-order
+   fails to submit). Fully unblocked, and it is what makes the interview
+   bearable now that it can complete at all. `group_size` is still a live
+   question in `interview.ts` — deriving headcount from the roster is in here.
+3. **Turn the interviewer on.** Set `relay.interviewer_profile` in the relay
+   host profile and restart the relay. Everything behind it is built and
+   tested; nothing has run against real Telegram yet, so do it as its own step
+   rather than alongside another change.
+4. **Decide the onboarding flags** — see "The onboarding half" below. Until
+   `--enable-mcp-bridge` and `--companion-templates-dir` are on, a newly
+   onboarded trip is born with no companion profile and no MCP bridge.
+
+### Live service state, 2026-09-02 end of session
+
+| | |
+|---|---|
+| control-plane stack (api, worker, postgres) | up |
+| trip-mcp japan-2026 `:3013` | up, verified against the site |
+| interview MCP sidecar `:4311` | up |
+| relay connector `:4312` | **up — the bot is live in the family group** |
+| legacy bridges `:3011` / `:3012` | down, out of scope by decision |
+
+The routing spine is **wired together, runnable, and running**. A process owns
+the bot's update stream, routes each update, records button answers, and now
+forwards a written answer to the interviewer agent when one is configured.
 
 Built and committed previously:
 
@@ -377,6 +426,12 @@ Track 3 (the interview UX batch) is last — most parallelizable, least blocked.
 
 ## Getting running
 
+**After a reboot, run `~/kinerary-deploy/bring-up.sh` first.** The trip-mcp
+bridges and the interview sidecar are unsupervised background processes and do
+not come back on their own; see "Unsupervised services" for why that failure is
+worth more attention than it looks. Everything below is for working on the code
+itself, which needs none of those running.
+
 ```bash
 cd .claude/worktrees/sprint-5-organizer-router
 
@@ -542,10 +597,24 @@ the contract's buffered-delivery lane is still unimplemented.
 
 ## Open decisions
 
-- ~~**Interviewer-agent session binding**~~ — **decided 2026-09-02 by Dror.**
-  See "The wall" above for the shape of the answer. What remains open under it
-  is narrower: the mechanism by which a verified chat id reaches the agent's
-  write path, not who may write.
+- ~~**Interviewer-agent session binding**~~ — **decided AND built 2026-09-02.**
+  Migration 0031 plus the `agent` locator; see "Closing it" above. The
+  remaining item is the hardening step, not a blocker: replace the
+  agent-supplied chat id with gateway-injected trusted context once the relay
+  contract can carry it. Checked 2026-09-02: upstream Hermes 0.21.0 does not
+  carry it, so this waits on the contract, not on an upgrade.
+- **Enable the interviewer.** Built and tested, dormant until
+  `relay.interviewer_profile` is set. Never run against real Telegram. Do it as
+  its own change so a surprise has one candidate cause.
+- **Onboarding's bridge/companion flags.** `--enable-mcp-bridge` and
+  `--companion-templates-dir` both default off and the compose worker passes
+  neither, so a newly onboarded trip gets a live site with no companion profile
+  and no MCP bridge. Turning them on needs a templates dir and changes what a
+  provisioning job does to real infrastructure — a decision, not a default to
+  flip. See "The onboarding half".
+- **Supervision.** `bring-up.sh` exists but nothing runs it at boot. A launchd
+  job would close it; it is safe to automate because the script never starts
+  the relay.
 - **Allowlist automation.** Adding a companion profile is a manual config edit
   plus a gateway restart, per trip. Blocks comfortable parallel-trip testing.
   Automating it in the provisioner is unscoped — raise with Dror.
@@ -647,7 +716,7 @@ wrong, and what fixed it:
 |---|---|---|
 | control-plane API, postgres, site, server | up | came back on their own |
 | `worker` | **crash-looping ~6h** | see below |
-| relay connector `:4312` | down | **left down deliberately** |
+| relay connector `:4312` | down | left down deliberately *at the time* — started later the same day, see START HERE |
 | interview MCP sidecar `:4311` | down | hand-started by design; still down |
 
 **The worker's crash loop was the fail-loud path working as designed**, not a
