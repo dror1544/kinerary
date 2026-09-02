@@ -560,6 +560,50 @@ the contract's buffered-delivery lane is still unimplemented.
 - **Unbuilt sprint items:** group binding via signed organizer action,
   `/select`, the Super Bot, reassignment review.
 
+## Unsupervised services — the failure that wastes an evening
+
+Four long-running services are plain background processes with pid files and
+no supervision: each control-plane trip's `trip-mcp` bridge, and the interview
+MCP sidecar on `:4311`. They do not come back after a reboot.
+
+**The expensive part is not that they stop.** It is that the bots keep
+answering while their data access is gone. An assistant with no MCP does not
+fall silent — it answers from memory, at full confidence. On 2026-09-02 that
+looked exactly like cross-trip contamination, and hours went into it before
+the real cause turned up: japan-2026's bridge was correctly configured all
+along (`:3013` → `192.168.0.60:8080`) and had simply died at ~13:00. A stale
+shared `com.hermes.trip-mcp` on `:3001` from June, hardcoded to the USA trip,
+made the wrong story look right. That service has no clients at all — every
+trip profile dials 3011/3012/3013 — and is a red herring, not a leak.
+
+`kinerary-deploy/bring-up.sh` closes this. One command, idempotent, with a
+status table that separates "up", "no bridge" and "FAILED".
+
+**Its scope is defined by the control plane, not by a list.** Trips are
+discovered by querying `control_plane.trips`, so a newly provisioned trip is
+covered with no edit, and the legacy trips (japan-2025,
+los-angeles-hawaii-vegas-2026, elul-family-usa-2026) can never drift back in —
+they are not in the control plane and are out of scope by decision, 2026-09-02.
+They still have `mcp/.env` directories; the script deliberately will not touch
+them.
+
+**It never starts the relay.** Starting the relay puts the assistant into a
+live family group, which is a deliberate act, not a side effect of a recovery
+script. It reports the state and prints the command.
+
+### The onboarding half
+
+A "no bridge" row is usually NOT an operator forgetting. The pipeline already
+knows how to do this — `mcp_bridge.py`'s `ShellMcpBridgeAdapter` calls the same
+`setup-mcp.sh` for a newly provisioned trip — but it is gated behind
+`--enable-mcp-bridge` AND `--companion-templates-dir`, and **both default off**.
+The local compose worker passes neither, so every trip onboarded today lands
+with a live site, no companion profile and no bridge.
+
+Turning both on is the fix at the source, and it is unmade: it needs a
+templates dir path and it changes what a provisioning job does to real infra,
+so it is a decision rather than a default to flip quietly.
+
 ## Decisions taken 2026-09-02 (Dror)
 
 Both were open in the previous brief. Neither is implemented yet — they are

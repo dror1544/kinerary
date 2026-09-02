@@ -7,6 +7,21 @@ ShellDeployAdapter already relies on (provisioner.py's _private_url), so no
 new per-trip state is required — the two adapters just need to agree on
 deploy_root/vmid_map.
 
+GATED OFF BY DEFAULT, and that default is what most deployments actually run.
+This adapter is used only when --enable-mcp-bridge AND --companion-templates-dir
+are both passed; otherwise a NullMcpBridgeAdapter takes its place. The local
+compose worker passes neither, so a trip onboarded there gets a live site and
+no bridge — its companion answers with no access to trip data, which reads as
+a confidently wrong assistant rather than an obviously broken one.
+
+That failure is easy to mistake for a configuration leak. It cost an evening
+on 2026-09-02: japan-2026's bridge was in fact correctly configured and had
+simply died in a power outage, while a stale shared trip-mcp pointed at another
+trip made it look like cross-trip contamination. kinerary-deploy/bring-up.sh
+now reports the two states separately — "no bridge" (this step never ran) vs a
+dead process it can restart — and names this flag as the usual cause of the
+former.
+
 This is a separate, independently-gated step from CompanionProfileAdapter:
 installing the profile bundle (SOUL.md/skills/references) is a local
 filesystem operation, while this step does real SSH-to-Proxmox and
