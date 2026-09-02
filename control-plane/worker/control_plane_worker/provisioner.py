@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 import psycopg
 from psycopg.rows import dict_row
@@ -47,7 +47,7 @@ EnrichFn = Callable[[dict[str, Any], str], dict[str, Any]]
 # (source_revision, artifact_digest | None) -> a directory holding site/ server/
 # shared/ checked out at that revision. Injectable so tests do not need a git
 # repo; None means "use the real release_source.materialize_release_source".
-MaterializeFn = Callable[[str, str | None], str]
+MaterializeFn = Callable[[str, Optional[str]], str]
 
 logger = logging.getLogger(__name__)
 
