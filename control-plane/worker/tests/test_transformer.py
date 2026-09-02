@@ -193,15 +193,58 @@ class TransformerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             transform_intake(intake)
 
-    def test_rejects_missing_group_size(self) -> None:
+    def test_missing_group_size_is_derived_from_the_roster(self) -> None:
+        # The interview no longer asks headcount separately (capture ledger,
+        # Step 3 #3): it is counted off `travelers`, which is required and
+        # names each person, so the stat cannot disagree with the roster.
         intake = {k: v for k, v in JAPAN_INTAKE.items() if k != "group_size"}
-        with self.assertRaises(ValueError):
-            transform_intake(intake)
+        intake["travelers"] = _structured([
+            {"name": "Eitan", "family": "Sagi"},
+            {"name": "Noa", "family": "Sagi"},
+            {"name": "Dana", "family": "Cohen"},
+        ])
+        config = transform_intake(intake)
+        self.assertIn("3", {s["number"] for s in config["stats"]})
 
-    def test_rejects_missing_trip_duration(self) -> None:
+    def test_the_roster_wins_over_a_stored_group_size(self) -> None:
+        # A legacy intake carries both. The roster is the precise one, and an
+        # organizer who listed three people should never see "2".
+        intake = {**JAPAN_INTAKE, "travelers": _structured([
+            {"name": "Eitan", "family": "Sagi"},
+            {"name": "Noa", "family": "Sagi"},
+            {"name": "Dana", "family": "Cohen"},
+        ])}
+        self.assertEqual(intake["group_size"]["option_id"], "2")
+        config = transform_intake(intake)
+        stat_numbers = {s["number"] for s in config["stats"]}
+        self.assertIn("3", stat_numbers)
+        self.assertNotIn("2", stat_numbers)
+
+    def test_a_stored_group_size_is_still_used_with_no_roster(self) -> None:
+        # Intakes confirmed before the change carry group_size and an empty
+        # roster; nothing rewrites a confirmed version, so they must not
+        # regress to "0".
+        config = transform_intake(JAPAN_INTAKE)
+        self.assertIn("2", {s["number"] for s in config["stats"]})
+
+    def test_missing_trip_duration_is_derived_from_the_dates(self) -> None:
+        # Both date questions are required, so a new intake always has the
+        # pair duration used to stand in for (capture ledger, Step 3 #4).
         intake = {k: v for k, v in JAPAN_INTAKE.items() if k != "trip_duration"}
-        with self.assertRaises(ValueError):
-            transform_intake(intake)
+        intake["departure_date"] = _text("2026-11-01")
+        intake["return_date"] = _text("2026-11-15")
+        config = transform_intake(intake)
+        self.assertIn("14", {s["number"] for s in config["stats"]})
+
+    def test_missing_trip_duration_and_dates_falls_back_to_a_default(self) -> None:
+        # Neither asked nor derivable: the placeholder path the organizer
+        # refines later must still produce a trip, not raise.
+        intake = {
+            k: v for k, v in JAPAN_INTAKE.items()
+            if k not in ("trip_duration", "departure_date", "return_date")
+        }
+        config = transform_intake(intake)
+        self.assertIn("7", {s["number"] for s in config["stats"]})
 
     def test_group_of_families_label(self) -> None:
         intake = {**JAPAN_INTAKE, "trip_type": _choice("group_of_families")}
