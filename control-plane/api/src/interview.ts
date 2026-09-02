@@ -216,7 +216,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "bot_name",
     type: "text",
-    prompt: "What should the trip assistant be called? Give the name the family would actually type.",
+    // "the name the family would actually type" is literal: it becomes the
+    // assistant's wake-word. A group that writes in two languages types it two
+    // ways, so ask for both rather than letting the organizer cram them into
+    // one field — japan-2026's organizer answered "בוטסאן / botsan" when asked
+    // for one name, and both halves ended up in name AND name_en, matching
+    // neither of the words anyone actually types.
+    prompt:
+      "What should the trip assistant be called? Give the name the family would actually type — if your group writes in two languages, give both (for example: בוטסאן / Botsan).",
     maxLength: 80,
     required: false,
   },
