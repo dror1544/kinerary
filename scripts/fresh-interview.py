@@ -45,6 +45,9 @@ DEFAULT_API = os.environ.get("KINERARY_API", "http://127.0.0.1:4310")
 DEFAULT_PG_CONTAINER = os.environ.get("KINERARY_PG_CONTAINER", "kinerary-control-plane-local-postgres-1")
 DEFAULT_PG_USER = os.environ.get("KINERARY_PG_USER", "kinerary_control_plane")
 HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
+# The Hermes profile that actually serves interviews. Only this profile's
+# conversation is reset; sweeping them all resets unrelated chats.
+INTERVIEWER_PROFILE = os.environ.get("KINERARY_INTERVIEWER_PROFILE", "trip-intake")
 
 # Lifecycle states from which restarting an interview is non-destructive.
 # Anything further along has downstream artifacts (a plan, a container, a live
@@ -112,45 +115,53 @@ def clear_hermes_conversation(chat_id: str) -> int:
     means the interviewer may resume an old conversation. Says so rather than
     failing silently, because that symptom is confusing to diagnose later.
     """
-    import glob
     import sqlite3
 
-    # EVERY state.db, not just the top-level one. Each profile carries its own,
-    # and the routing entry that decides which conversation the interviewer
-    # resumes lives in the SERVING profile's database — not in ~/.hermes/state.db.
-    # Clearing only the latter looks like it worked and changes nothing: four
-    # consecutive "fresh" interviews on 2026-09-03 all resumed the same
-    # conversation, so the agent kept reading its own earlier "everything is
-    # approved" replies and stopped calling any tool at all.
+    # Only the INTERVIEWER profile's store. An earlier version swept every
+    # profile's state.db, which reset unrelated chats — the personal assistant
+    # and two trip companions all lost their conversation binding for this DM.
+    # Their history was intact but their continuity was not, and none of that
+    # was necessary to restart an interview.
     #
-    # Routing rows only. The session's MESSAGES are deliberately left alone,
-    # because the session id is not namespaced per profile — one id is shared
-    # by several profiles on this install, so deleting its messages would erase
-    # unrelated conversations. Dropping the routing row is enough: the next
-    # inbound turn starts a new session.
-    candidates = [os.path.join(HERMES_HOME, "state.db")]
-    candidates += sorted(glob.glob(os.path.join(HERMES_HOME, "profiles", "*", "state.db")))
-    removed = 0
-    touched = 0
-    for db in candidates:
-        if not os.path.exists(db):
-            continue
-        try:
-            conn = sqlite3.connect(db)
-            cur = conn.execute(
-                "DELETE FROM gateway_routing WHERE session_key LIKE ?", (f"%{chat_id}%",)
-            )
-            conn.commit()
-            if cur.rowcount and cur.rowcount > 0:
-                removed += cur.rowcount
-                touched += 1
-            conn.close()
-        except Exception as exc:  # noqa: BLE001 - operator-facing tool
-            print(f"  ! could not clear conversations in {db}: {exc}")
-    if not candidates:
-        print("  ! no Hermes state.db found — the interviewer may inherit an "
-              "earlier conversation")
-    return removed
+    # Deleting the routing row alone is NOT enough, which is the part that took
+    # four failed runs to find. Hermes re-binds the chat to the SAME session id
+    # rather than minting a new one, so the "fresh" interview resumed a
+    # conversation created 2026-08-25 that still held every previous attempt —
+    # and the agent, reading its own past replies saying the interview was
+    # finished, stopped calling any tool at all.
+    #
+    # So the session's MESSAGES have to go too. That is safe to do here and
+    # only here: the session id is shared across profiles, but each profile
+    # keeps its own message store, so clearing the interviewer's copy leaves
+    # the companions' and the personal assistant's untouched.
+    profile_db = os.path.join(HERMES_HOME, "profiles", INTERVIEWER_PROFILE, "state.db")
+    if not os.path.exists(profile_db):
+        print(f"  ! no state.db for profile {INTERVIEWER_PROFILE!r} — the interviewer "
+              "may resume an earlier conversation "
+              "(set KINERARY_INTERVIEWER_PROFILE if it is named differently)")
+        return 0
+    try:
+        conn = sqlite3.connect(profile_db)
+        sessions = [r[0] for r in conn.execute(
+            "SELECT json_extract(entry_json,'$.session_id') FROM gateway_routing "
+            "WHERE session_key LIKE ?", (f"%{chat_id}%",)
+        ).fetchall() if r[0]]
+        wiped = 0
+        for sid in set(sessions):
+            cur = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+            wiped += max(cur.rowcount or 0, 0)
+        cur = conn.execute(
+            "DELETE FROM gateway_routing WHERE session_key LIKE ?", (f"%{chat_id}%",)
+        )
+        conn.commit()
+        conn.close()
+        if wiped:
+            print(f"  wiped {wiped} message(s) from the interviewer's copy of "
+                  f"{len(set(sessions))} session(s)")
+        return max(cur.rowcount or 0, 0)
+    except Exception as exc:  # noqa: BLE001 - operator-facing tool
+        print(f"  ! could not reset the interviewer conversation: {exc}")
+        return 0
 
 
 def bot_username() -> str:
@@ -247,8 +258,8 @@ def main() -> int:
         print()
         for chat in chat_ids:
             n = clear_hermes_conversation(chat)
-            print(f"  cleared {n} gateway conversation binding(s) for chat {chat} "
-                  "across all Hermes profiles")
+            print(f"  cleared {n} conversation binding(s) for chat {chat} "
+                  f"in profile {INTERVIEWER_PROFILE}")
         psql(f"DELETE FROM control_plane.interview_agent_turns WHERE session_id IN "
              f"(SELECT id FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}')")
         psql(f"DELETE FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'")
