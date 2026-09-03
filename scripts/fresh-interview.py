@@ -112,24 +112,45 @@ def clear_hermes_conversation(chat_id: str) -> int:
     means the interviewer may resume an old conversation. Says so rather than
     failing silently, because that symptom is confusing to diagnose later.
     """
-    state_db = os.path.join(HERMES_HOME, "state.db")
-    if not os.path.exists(state_db):
-        print(f"  ! no {state_db} — skipping conversation reset "
-              "(the interviewer may inherit an earlier conversation)")
-        return 0
-    try:
-        import sqlite3
-        conn = sqlite3.connect(state_db)
-        cur = conn.execute(
-            "DELETE FROM gateway_routing WHERE session_key LIKE ?", (f"%{chat_id}%",)
-        )
-        conn.commit()
-        removed = cur.rowcount
-        conn.close()
-        return max(removed, 0)
-    except Exception as exc:  # noqa: BLE001 - operator-facing tool
-        print(f"  ! could not clear gateway conversations: {exc}")
-        return 0
+    import glob
+    import sqlite3
+
+    # EVERY state.db, not just the top-level one. Each profile carries its own,
+    # and the routing entry that decides which conversation the interviewer
+    # resumes lives in the SERVING profile's database — not in ~/.hermes/state.db.
+    # Clearing only the latter looks like it worked and changes nothing: four
+    # consecutive "fresh" interviews on 2026-09-03 all resumed the same
+    # conversation, so the agent kept reading its own earlier "everything is
+    # approved" replies and stopped calling any tool at all.
+    #
+    # Routing rows only. The session's MESSAGES are deliberately left alone,
+    # because the session id is not namespaced per profile — one id is shared
+    # by several profiles on this install, so deleting its messages would erase
+    # unrelated conversations. Dropping the routing row is enough: the next
+    # inbound turn starts a new session.
+    candidates = [os.path.join(HERMES_HOME, "state.db")]
+    candidates += sorted(glob.glob(os.path.join(HERMES_HOME, "profiles", "*", "state.db")))
+    removed = 0
+    touched = 0
+    for db in candidates:
+        if not os.path.exists(db):
+            continue
+        try:
+            conn = sqlite3.connect(db)
+            cur = conn.execute(
+                "DELETE FROM gateway_routing WHERE session_key LIKE ?", (f"%{chat_id}%",)
+            )
+            conn.commit()
+            if cur.rowcount and cur.rowcount > 0:
+                removed += cur.rowcount
+                touched += 1
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - operator-facing tool
+            print(f"  ! could not clear conversations in {db}: {exc}")
+    if not candidates:
+        print("  ! no Hermes state.db found — the interviewer may inherit an "
+              "earlier conversation")
+    return removed
 
 
 def bot_username() -> str:
@@ -226,7 +247,8 @@ def main() -> int:
         print()
         for chat in chat_ids:
             n = clear_hermes_conversation(chat)
-            print(f"  cleared {n} gateway conversation(s) for chat {chat}")
+            print(f"  cleared {n} gateway conversation binding(s) for chat {chat} "
+                  "across all Hermes profiles")
         psql(f"DELETE FROM control_plane.interview_agent_turns WHERE session_id IN "
              f"(SELECT id FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}')")
         psql(f"DELETE FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'")
