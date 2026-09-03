@@ -881,6 +881,17 @@ Build:
   Out of scope, homed elsewhere: per-user Telegram info-message logging
   (General #1) → Sprint 6 analytics; driving the approval gates from the Hermes
   profile via MCP (Step 3 #12) → exploration, unscheduled.
+- **How the interviewer is RUN is out of scope here — see Sprint 6.5.** The
+  first live end-to-end interview (2026-09-03) failed with the deterministic
+  layer behaving correctly throughout: the profile had drifted months behind
+  its template, still described the pre-router token flow, and inherited
+  another profile's session. Sprint 5 ships the interim that makes the write
+  path work — the MCP tools stopped taking a chat id the agent provably cannot
+  know, and the interview is addressed by the router's open turn instead. That
+  is correct for **one organizer at a time**: two concurrent interviews resolve
+  ambiguously and are refused, by design. Making it correct for many is
+  `docs/interviewer-lifecycle-design.md`, scheduled as Sprint 6.5, and its
+  seven decision points are to be settled after Sprint 5 closes.
 
 Automated tests:
 
@@ -1106,6 +1117,84 @@ cutover:
   internally would hairpin trip traffic out and back. Split-horizon DNS or a
   `.lan` zone.
 
+
+### Sprint 6.5 — Ephemeral interviewer, deterministic orchestrator, judging loop
+
+**Full design, A/B and decision points: `docs/interviewer-lifecycle-design.md`.**
+Proposed by Dror 2026-09-03 after the first live end-to-end interview failed.
+Sequenced after Sprint 5 deliberately — Sprint 5 ships an interim that is
+correct for one organizer at a time; this is what makes it correct for many.
+
+**Goal:** give the agent layer the lifecycle every other part of the pipeline
+already has. An interviewer is rendered per interview, holds no state, is
+destroyed at handover, and every interview — finished or abandoned — is
+measured and judged.
+
+**Why, in one line:** on 2026-09-03 the deterministic layer did everything
+right and the interview still failed, because the profile had drifted for
+months, described a flow that no longer existed, and inherited another
+conversation's session. None of those are bugs code review could catch; they
+are properties of long-lived hand-maintained state.
+
+Build:
+
+- **Interview lifecycle in the control plane** — `pending → rendered →
+  interviewing → { confirmed | abandoned } → judged → reaped`, owned by the
+  existing worker. Deterministic: create, render, hand over, destroy, TTL,
+  sweep. No LLM decides a transition.
+- **Per-interview rendered profile**, reusing the provisioner's existing
+  `RenderProfileAdapter`. The chat id and session id are baked in at render
+  time — which is what makes the agent's write path work at all, since the
+  agent provably cannot learn its own chat id (verified 2026-09-03: nothing
+  renders it into the prompt). Note `source.profile` resolves via
+  `profile_exists()` on disk, NOT the allowlist, so this needs no allowlist
+  edit and no gateway restart per interview.
+- **Abandonment tracking** — today an organizer who stops answering leaves a
+  row in `interviewing` forever, indistinguishable from one still in progress.
+  Record where they stopped.
+- **Interview metrics**, folded into `docs/trip-bot-analytics-and-metrics-design.md`
+  §7/§8 with bounded labels: started/completed/abandoned, abandoned-at-question
+  (the drop-off point), duration by outcome, answers-recorded, unclosed turns,
+  write failures by reason, corrections per question.
+  `interview_answers_recorded_total` is the one that would have made the
+  2026-09-03 failure visible — a turn opened, zero answers written, and the
+  session declared complete.
+- **Judge agent (strong model), offline** — never in the organizer's path, so
+  it may be slow and expensive. Runs on abandoned interviews too, since that is
+  where the material is. Emits: what went wrong, whether the fault was
+  template/model/pipeline, a proposed template diff with rationale, and a
+  survey across recent interviews for the super admin.
+- **Gated template promotion** — the judge proposes, a human promotes, through
+  the candidate → eval → promotion shape the release pipeline already uses. A
+  judge editing the live template unattended reproduces the 2026-09-03 failure
+  mode with a faster loop.
+
+Automated tests:
+
+- lifecycle transitions, including TTL-driven abandonment and idempotent reap;
+- a rendered interviewer profile carries its chat/session binding and cannot be
+  rendered without one;
+- two concurrent interviews render two profiles and neither can read or write
+  the other's intake (the two-trip matrix shape, at profile level);
+- abandonment is recorded with the question the organizer stopped at;
+- metrics labels stay within `INTAKE_QUESTIONS` (bounded-label rule);
+- a judge-proposed template change cannot reach the live template without an
+  explicit promotion.
+
+Manual tests:
+
+- a real interview abandoned halfway shows the correct drop-off question;
+- the judge's suggestions on that interview are actionable by the super admin;
+- an organizer starting a second trip gets a genuinely fresh interviewer.
+
+**Open decision points before this can start** — all seven are stated in full
+in `docs/interviewer-lifecycle-design.md`, and each changes the shape of the
+build: whether the ephemeral path replaces or coexists with the shared one;
+the interview TTL and whether "abandoned" is terminal or resumable; who may
+promote a template change and against what eval; how much transcript the judge
+may see and for how long; per-interview vs batched judging; whether the render
+step reuses the provisioner's adapter; and whether the un-namespaced session id
+is worth fixing upstream for the long-lived companion profiles that keep it.
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 
