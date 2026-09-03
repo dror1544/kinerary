@@ -29,6 +29,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
 import { HttpTelegramClient, type TelegramClient } from "./telegram-api.js";
@@ -66,6 +67,8 @@ const unconfigured: TelegramClient = {
   async getMe() { return null; },
   async getUpdates() { return []; },
   async deleteWebhookIfPresent() { /* no-op */ },
+  // Conformance mode has no bot token, so there is nothing to fetch a file with.
+  async fetchFile() { return null; },
 };
 
 interface Runtime {
@@ -189,11 +192,18 @@ function conformanceRuntime(secret: string): Runtime {
 async function main(): Promise<void> {
   const runtime = profilePath ? await serveRuntime(profilePath) : conformanceRuntime(envSecret);
 
+  // Inbound attachments are downloaded with the bot token and re-hosted here,
+  // so the platform credential never reaches the wire. The gateway fetches
+  // each reference back with its own bearer.
+  const mediaStore = new MediaStore();
+  const mediaBaseUrl = `http://${runtime.host === "0.0.0.0" ? "127.0.0.1" : runtime.host}:${runtime.port}`;
+
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
     telegram: runtime.telegram,
     port: runtime.port,
     host: runtime.host,
+    mediaStore,
     log,
   });
 
@@ -212,6 +222,7 @@ async function main(): Promise<void> {
       botIdentity: runtime.botIdentity,
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
+      media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl },
       log,
     });
   }

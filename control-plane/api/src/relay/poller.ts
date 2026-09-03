@@ -37,6 +37,7 @@ import {
 import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
+import type { MediaDeps } from "./normalize.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -74,6 +75,8 @@ export interface TripBotPollerDeps {
    * rather than forwarded — the state the bot shipped in.
    */
   interviewerProfile?: string;
+  /** Re-host plane for inbound attachments; absent keeps text-only behaviour. */
+  media?: MediaDeps;
   /**
    * Signup-approval handling, for the topology where the trip bot and the
    * signup bot are THE SAME BOT.
@@ -436,6 +439,7 @@ export function startTripBotPoller(
         try {
           const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
             interviewerProfile: deps.interviewerProfile,
+            media: deps.media,
           });
           await applyDecision(decision, deps);
         } catch (error) {

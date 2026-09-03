@@ -44,6 +44,12 @@ const CLOSE_UNAUTHORIZED = 4401;
 const MAX_PARTIAL_FRAME_BYTES = 1_000_000;
 
 export interface ConnectorOptions {
+  /**
+   * Re-host store for inbound attachments. Absent, `/relay/media/{id}` 404s —
+   * which is the correct degraded behaviour for a connector that forwards no
+   * media rather than a reason to fail startup.
+   */
+  mediaStore?: { get(id: string): { mime: string; bytes: Buffer; filename?: string } | null };
   /** HMAC verify list for the upgrade token. Multiple entries support rotation. */
   gatewaySecrets: readonly string[];
   telegram: TelegramClient;
@@ -63,7 +69,37 @@ export class RelayConnector {
   constructor(private readonly options: ConnectorOptions) {
     this.log = options.log ?? (() => {});
     this.path = options.path ?? "/relay";
-    this.http = createServer((_req, res) => {
+    this.http = createServer((req, res) => {
+      // The media plane is the one HTTP surface here: the gateway GETs a
+      // re-hosted attachment it was handed by reference on an inbound event.
+      // Same bearer scheme as the WS upgrade (contract §"Inbound media"), so
+      // an unauthenticated caller cannot read an organizer's document.
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const media = /^\/relay\/media\/([0-9a-f]{32})$/.exec(url.pathname);
+      if (media && req.method === "GET") {
+        if (!this.authorizeBearer(req)) {
+          res.writeHead(401, { "content-type": "text/plain" });
+          res.end("Unauthorized");
+          return;
+        }
+        const entry = this.options.mediaStore?.get(media[1]!);
+        if (!entry) {
+          // Unknown and expired are one answer on purpose: distinguishing them
+          // would confirm that an id was once valid.
+          res.writeHead(404, { "content-type": "text/plain" });
+          res.end("Not found");
+          return;
+        }
+        res.writeHead(200, {
+          "content-type": entry.mime || "application/octet-stream",
+          "content-length": String(entry.bytes.length),
+          ...(entry.filename
+            ? { "content-disposition": `attachment; filename="${entry.filename.replace(/"/g, "")}"` }
+            : {}),
+        });
+        res.end(entry.bytes);
+        return;
+      }
       // The relay endpoint is WS-only; a plain GET is a misconfiguration, not
       // a health check, so it should say so rather than 200.
       res.writeHead(426, { "content-type": "text/plain" });
@@ -98,14 +134,23 @@ export class RelayConnector {
    * here.
    */
   private authorizeUpgrade(request: IncomingMessage): boolean {
-    const header = request.headers.authorization;
-    if (typeof header !== "string") return false;
-    const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-    if (!match?.[1]) return false;
-    const gatewayId = verifyUpgradeToken(match[1], this.options.gatewaySecrets);
+    const gatewayId = this.bearerIdentity(request);
     if (!gatewayId) return false;
     this.log(structuredLog("info", "relay.gateway_authenticated", { gateway_id: gatewayId }));
     return true;
+  }
+
+  /** The media plane uses the same token scheme, without the connect log line. */
+  private authorizeBearer(request: IncomingMessage): boolean {
+    return this.bearerIdentity(request) !== null;
+  }
+
+  private bearerIdentity(request: IncomingMessage): string | null {
+    const header = request.headers.authorization;
+    if (typeof header !== "string") return null;
+    const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+    if (!match?.[1]) return null;
+    return verifyUpgradeToken(match[1], this.options.gatewaySecrets) ?? null;
   }
 
   private onConnection(ws: WebSocket): void {

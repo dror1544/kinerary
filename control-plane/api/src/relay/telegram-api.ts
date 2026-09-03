@@ -14,6 +14,8 @@ import type { InlineKeyboard } from "../chat-router.js";
 import { toTelegramMarkdownV2 } from "./markdown.js";
 
 const TELEGRAM_API_ROOT = "https://api.telegram.org";
+/** File downloads hang off a different path root than the method API. */
+const TELEGRAM_FILE_ROOT = "https://api.telegram.org/file";
 
 export interface SendResult {
   ok: boolean;
@@ -33,6 +35,19 @@ export interface BotSelf {
 }
 
 export interface TelegramClient {
+  /**
+   * Resolves a Telegram `file_id` to its bytes.
+   *
+   * Two calls: `getFile` yields a `file_path`, and the download URL that path
+   * belongs to embeds the bot token. That URL is why inbound media is
+   * re-hosted rather than referenced — the contract requires the platform
+   * credential never to cross the wire, and this is where it would.
+   *
+   * Returns null on any failure, including a file over the size cap. A missing
+   * attachment degrades the turn to its caption; it must not fail the update.
+   */
+  fetchFile(fileId: string, maxBytes: number): Promise<{ bytes: Buffer; mime?: string; path?: string } | null>;
+
   sendMessage(params: {
     chatId: string;
     text: string;
@@ -213,6 +228,40 @@ export class HttpTelegramClient implements TelegramClient {
     const me = res.result as { id?: number; username?: string };
     if (me?.id === undefined || !me.username) return null;
     return { id: String(me.id), username: me.username };
+  }
+
+  async fetchFile(fileId: string, maxBytes: number): Promise<{ bytes: Buffer; mime?: string; path?: string } | null> {
+    try {
+      const res = await this.post("getFile", { file_id: fileId });
+      const meta = (res.ok ? res.result : null) as { file_path?: string; file_size?: number } | null;
+      if (!meta) return null;
+      const filePath = meta?.file_path;
+      if (!filePath) return null;
+      // Cheap pre-check so an oversize file is refused before it is streamed.
+      if (typeof meta.file_size === "number" && meta.file_size > maxBytes) {
+        this.log(structuredLog("warn", "telegram_api.file_too_large", { size: meta.file_size }));
+        return null;
+      }
+      const response = await fetch(`${TELEGRAM_FILE_ROOT}/bot${this.botToken}/${filePath}`);
+      if (!response.ok) {
+        this.log(structuredLog("warn", "telegram_api.file_download_failed", { status: response.status }));
+        return null;
+      }
+      const buf = Buffer.from(await response.arrayBuffer());
+      if (buf.length > maxBytes) {
+        this.log(structuredLog("warn", "telegram_api.file_too_large", { size: buf.length }));
+        return null;
+      }
+      return {
+        bytes: buf,
+        mime: response.headers.get("content-type") ?? undefined,
+        path: filePath,
+      };
+    } catch {
+      // Never surface the URL or the error text: both carry the bot token.
+      this.log(structuredLog("warn", "telegram_api.file_fetch_error", {}));
+      return null;
+    }
   }
 
   async getUpdates(params: {

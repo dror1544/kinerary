@@ -18,6 +18,7 @@
  */
 import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
+import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
 import type { ChatType, WireMessageEvent, WireSessionSource } from "./protocol.js";
 
 /** The subset of Telegram's Update we consume. */
@@ -42,6 +43,11 @@ export interface TelegramMessage {
   chat?: TelegramChat;
   text?: string;
   caption?: string;
+  document?: { file_id?: string; file_name?: string; mime_type?: string; file_size?: number };
+  photo?: Array<{ file_id?: string; file_size?: number }>;
+  voice?: { file_id?: string; mime_type?: string };
+  audio?: { file_id?: string; mime_type?: string; file_name?: string };
+  video?: { file_id?: string; mime_type?: string; file_name?: string };
   date?: number;
   message_thread_id?: number;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
@@ -105,9 +111,121 @@ export type NormalizeOutcome =
  * asks the intake questions and records the answers with no LLM involved. The
  * caller handles that turn; it just never becomes an `inbound` frame.
  */
+/**
+ * What normalize needs to re-host an attachment. Optional throughout: a
+ * connector wired without a media plane keeps its previous behaviour, and the
+ * attachment degrades to its caption rather than failing the turn.
+ */
+export interface MediaDeps {
+  telegram: { fetchFile(fileId: string, maxBytes: number): Promise<{ bytes: Buffer; mime?: string } | null> };
+  store: { put(input: { kind: MediaKind; mime: string; size: number; filename?: string; caption?: string; bytes: Buffer }): string | null };
+  /** Public base the gateway can reach this connector on, e.g. http://127.0.0.1:4312 */
+  baseUrl: string;
+}
+
+interface Attachment {
+  fileId: string;
+  kind: MediaKind;
+  mime: string;
+  filename?: string;
+}
+
+/**
+ * Picks the one attachment a Telegram message carries, if any.
+ *
+ * Telegram sends photos as an array of sizes, largest last — the last entry is
+ * the one worth re-hosting; the thumbnails are the same image again.
+ */
+function describeAttachment(message: TelegramMessage): Attachment | null {
+  if (message.document?.file_id) {
+    return {
+      fileId: message.document.file_id,
+      kind: "document",
+      mime: message.document.mime_type || "application/octet-stream",
+      ...(message.document.file_name ? { filename: message.document.file_name } : {}),
+    };
+  }
+  if (message.photo?.length) {
+    const largest = message.photo[message.photo.length - 1];
+    if (largest?.file_id) return { fileId: largest.file_id, kind: "image", mime: "image/jpeg" };
+  }
+  if (message.voice?.file_id) {
+    return { fileId: message.voice.file_id, kind: "voice", mime: message.voice.mime_type || "audio/ogg" };
+  }
+  if (message.audio?.file_id) {
+    return {
+      fileId: message.audio.file_id,
+      kind: "audio",
+      mime: message.audio.mime_type || "audio/mpeg",
+      ...(message.audio.file_name ? { filename: message.audio.file_name } : {}),
+    };
+  }
+  if (message.video?.file_id) {
+    return {
+      fileId: message.video.file_id,
+      kind: "video",
+      mime: message.video.mime_type || "video/mp4",
+      ...(message.video.file_name ? { filename: message.video.file_name } : {}),
+    };
+  }
+  return null;
+}
+
+/** message_type reflects the first attachment's kind (contract §"Phase 2 media ingress"). */
+function messageTypeFor(kind: MediaKind): "image" | "audio" | "document" {
+  if (kind === "image") return "image";
+  if (kind === "voice" || kind === "audio") return "audio";
+  return "document";
+}
+
+/**
+ * Builds the wire event, re-hosting an attachment when one is present.
+ *
+ * A failed download degrades rather than drops: the organizer still gets their
+ * caption through, and the agent is told nothing that did not happen.
+ */
+export async function toWireEventWithMedia(
+  message: TelegramMessage,
+  chatId: string,
+  text: string,
+  profile: string,
+  attachment: Attachment | null,
+  deps?: MediaDeps,
+): Promise<WireMessageEvent> {
+  const event = toWireEvent(message, chatId, text, profile);
+  if (!attachment || !deps) return event;
+
+  const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
+  if (!file) return event;
+
+  const id = deps.store.put({
+    kind: attachment.kind,
+    mime: file.mime || attachment.mime,
+    size: file.bytes.length,
+    ...(attachment.filename ? { filename: attachment.filename } : {}),
+    ...(message.caption ? { caption: message.caption } : {}),
+    bytes: file.bytes,
+  });
+  if (!id) return event;
+
+  return {
+    ...event,
+    message_type: messageTypeFor(attachment.kind),
+    media_urls: [`${deps.baseUrl.replace(/\/$/, "")}/relay/media/${id}`],
+    media: [{
+      kind: attachment.kind,
+      mime: file.mime || attachment.mime,
+      size: file.bytes.length,
+      ...(attachment.filename ? { filename: attachment.filename } : {}),
+      ...(message.caption ? { caption: message.caption } : {}),
+    }],
+  };
+}
+
 export async function normalizeUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
+  deps?: MediaDeps,
 ): Promise<NormalizeOutcome> {
   const message = update.message ?? update.edited_message;
   if (!message) return { kind: "dropped", reason: "NO_MESSAGE" };
@@ -123,7 +241,12 @@ export async function normalizeUpdate(
   if (message.from?.is_bot) return { kind: "dropped", reason: "FROM_BOT" };
 
   const text = message.text ?? message.caption ?? "";
-  if (!text.trim()) return { kind: "dropped", reason: "NO_TEXT" };
+  const attachment = describeAttachment(message);
+
+  // An attachment with no caption is a real turn, not an empty one. Dropping
+  // it on NO_TEXT is what made "upload your trip plan" a dead end: the
+  // organizer's document vanished with no error on either side.
+  if (!text.trim() && !attachment) return { kind: "dropped", reason: "NO_TEXT" };
 
   const route = await resolveChatRoute(db, chatId);
 
@@ -132,7 +255,11 @@ export async function normalizeUpdate(
   if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
   if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
 
-  return { kind: "event", event: toWireEvent(message, chatId, text, route.hermesProfile), route };
+  return {
+    kind: "event",
+    event: await toWireEventWithMedia(message, chatId, text, route.hermesProfile, attachment, deps),
+    route,
+  };
 }
 
 /**
