@@ -775,6 +775,37 @@ export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenT
   return { ok: true, chatId: rows.rows[0]!.chat_id };
 }
 
+/**
+ * Claims the sessions that owe the organizer a router-rendered prompt.
+ *
+ * `UPDATE ... RETURNING` so the claim and the clear are one statement: two
+ * poller iterations overlapping cannot both send the same prompt, and a crash
+ * after the claim loses one prompt rather than repeating it forever. Losing
+ * one is recoverable — the organizer's next message brings the interview back
+ * through the normal path; repeating one means an organizer watching the same
+ * question arrive every few seconds.
+ */
+export async function claimDueRouterPrompts(
+  db: pg.Pool,
+  limit = 10,
+): Promise<Array<{ sessionId: string; chatId: string }>> {
+  const rows = await db.query<{ id: string; telegram_chat_id: string }>(
+    `UPDATE control_plane.intake_sessions
+        SET router_prompt_due_at = NULL
+      WHERE id IN (
+        SELECT id FROM control_plane.intake_sessions
+         WHERE router_prompt_due_at IS NOT NULL
+           AND telegram_chat_id IS NOT NULL
+         ORDER BY router_prompt_due_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+      )
+      RETURNING id, telegram_chat_id`,
+    [limit],
+  );
+  return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id }));
+}
+
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
   const row = await db.query<{
     id: string;
@@ -1041,11 +1072,22 @@ export async function submitAnswerForAgent(
   structuredData?: unknown,
   optionIds?: readonly string[],
 ): Promise<SubmitAnswerResult> {
-  return submitAnswerVia(
+  const result = await submitAnswerVia(
     db,
     { by: "agent", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
   );
+  // Hand the turn back to the router. It owns the keyboard — the agent cannot
+  // draw one, because `clarify` needs the relay `prompt` op this connector
+  // does not advertise. Without this the interview silently loses its buttons
+  // for good the first time an organizer types instead of tapping.
+  if (result.ok) {
+    await db.query(
+      "UPDATE control_plane.intake_sessions SET router_prompt_due_at = now() WHERE id = $1",
+      [result.view.sessionId],
+    );
+  }
+  return result;
 }
 
 /**

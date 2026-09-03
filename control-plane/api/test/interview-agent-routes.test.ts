@@ -25,7 +25,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { openAgentTurn, resolveChatFromOpenTurn } from "../src/interview.js";
+import { openAgentTurn, resolveChatFromOpenTurn, claimDueRouterPrompts, submitAnswerForAgent } from "../src/interview.js";
 import { buildApp, type InterviewAgentDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 
@@ -284,6 +284,62 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
           const r = await app.inject({ method: "GET", url: "/internal/interview/agent/current", headers: { "x-api-key": "wrong" } });
           assert.equal(r.statusCode, 401);
         } finally { await app.close(); }
+      });
+    });
+  });
+
+  describe("handing the turn back to the router", () => {
+    // The agent records the answer; only the router can draw the next
+    // question's buttons. Before this handoff existed, the first TYPED answer
+    // ended the tap flow for the rest of the interview, and a completed
+    // interview had no Confirm button at all — where a real organizer stopped
+    // on 2026-09-03.
+
+    test("an agent write leaves a prompt owing to that chat", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        assert.deepEqual(await claimDueRouterPrompts(pool), [], "nothing owed before the write");
+
+        const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        assert.equal(written.ok, true);
+
+        const due = await claimDueRouterPrompts(pool);
+        assert.equal(due.length, 1);
+        assert.equal(due[0]!.chatId, a.chatId);
+        assert.equal(due[0]!.sessionId, a.sessionId);
+      });
+    });
+
+    test("a prompt is claimed exactly once", async () => {
+      // Two poll ticks overlapping must not both send the same question.
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+
+        const first = await claimDueRouterPrompts(pool);
+        const second = await claimDueRouterPrompts(pool);
+        assert.equal(first.length, 1);
+        assert.deepEqual(second, [], "a second claim finds nothing");
+      });
+    });
+
+    test("only the chat that was written to is owed a prompt", async () => {
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        const due = await claimDueRouterPrompts(pool);
+        assert.equal(due.length, 1);
+        assert.notEqual(due[0]!.chatId, b.chatId);
+      });
+    });
+
+    test("a refused agent write owes nothing", async () => {
+      // No turn open, so the write fails — the router must not then ask a
+      // question as though something had been recorded.
+      await withTwoInterviews(async ({ pool, a }) => {
+        const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        assert.equal(written.ok, false);
+        assert.deepEqual(await claimDueRouterPrompts(pool), []);
       });
     });
   });
