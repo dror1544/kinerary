@@ -282,28 +282,29 @@ function buildMcpServer() {
   if (AGENT_KEY) {
     mcp.tool(
       "get_interview_for_chat",
-      "Read the interview in progress for the Telegram chat you are currently talking in. Use this " +
-        "before answering, to see which question is pending and what has already been recorded. " +
-        "Pass the chat id of the conversation you are in.",
-      {
-        chatId: z.string(),
-      },
-      async ({ chatId }) => ok(await forwardAsAgent(`/internal/interview/agent/${encodeURIComponent(chatId)}`, "GET")),
+      "Read the interview in progress in the conversation you are currently in — which question is " +
+        "pending and what has already been recorded. Call this BEFORE answering and treat what it " +
+        "returns as the truth: answers the organizer tapped were recorded without you, so your own " +
+        "conversation history is not the state of the interview. Takes no arguments; the interview " +
+        "is identified by the turn the router opened for this conversation.",
+      {},
+      async () => ok(await forwardAsAgent("/internal/interview/agent/current", "GET")),
     );
 
     mcp.tool(
       "submit_answer_for_chat",
-      "Record an answer for the interview in progress in the Telegram chat you are currently talking " +
-        "in. Use this for answers the organizer wrote in words rather than tapped: resolve what they " +
-        "meant first, then submit the resolved value. Dates must be normalised to YYYY-MM-DD before " +
+      "Record an answer for the interview in progress in the conversation you are currently in. " +
+        "Takes no chat id — the interview is identified by the turn the router opened. Use this for " +
+        "answers the organizer wrote in words rather than tapped: resolve what they " +
+        "meant first, then submit the resolved value. The answer is recorded ONLY if this call " +
+        "succeeds — never tell the organizer you saved something unless it did. Dates must be normalised to YYYY-MM-DD before " +
         "submitting, and a destination naming several places is a multi-destination trip rather than " +
         "one city. Never show the organizer a YYYY-MM-DD date — confirm your reading back in words.",
       {
-        chatId: z.string(),
         ...answerParams,
       },
-      async ({ chatId, questionId, optionId, otherText, optionIds, data }) =>
-        ok(await forwardAsAgent(`/internal/interview/agent/${encodeURIComponent(chatId)}/answer`, "POST", {
+      async ({ questionId, optionId, otherText, optionIds, data }) =>
+        ok(await forwardAsAgent("/internal/interview/agent/current/answer", "POST", {
           questionId, optionId: optionId ?? null, otherText, optionIds, data,
         })),
     );

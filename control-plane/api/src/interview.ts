@@ -729,6 +729,52 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
  * FUTURE: replace the supplied chat id with gateway-injected trusted context
  * once the relay contract can carry it.
  */
+export type ResolveOpenTurnResult =
+  | { ok: true; chatId: string }
+  | { ok: false; reason: "NOT_FOUND" | "AMBIGUOUS" };
+
+/**
+ * Finds the chat whose interview turn is open, without being told which.
+ *
+ * The interviewer agent cannot name its own chat. Verified on the live
+ * install 2026-09-03: the gateway sets `_chat_id` on the agent object but
+ * nothing renders it into the prompt, so the model has no per-turn access to
+ * it — the only place a chat id ever appeared was a stored memory belonging
+ * to a different profile. An agent asked for a chat id it cannot know either
+ * refuses, or guesses; on the first live run it guessed nothing and invented
+ * the rest of the interview instead.
+ *
+ * So the router's turn — already the sole authorization fact for these routes
+ * — becomes the selector too. This is strictly SAFER than the chat-addressed
+ * form it replaces: there, a wrong id from the model was refused only because
+ * no turn matched it; here there is no id to get wrong. Migration 0022's rule
+ * is unchanged and better honoured, because nothing the LLM says is read.
+ *
+ * Both open-ness filters are required, exactly as in the JOIN below: a
+ * superseded turn is closed but may not have expired, an abandoned one has
+ * expired but was never closed.
+ *
+ * AMBIGUOUS is deliberate rather than a "pick the newest" heuristic. Two
+ * organizers mid-interview is the case where guessing wrong writes one
+ * person's answer into the other's trip, which is the exact failure the
+ * two-trip matrix exists to prevent. Refusing is recoverable; a silent
+ * cross-write is not. LIMIT 2 is all that is needed to tell one from many.
+ */
+export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenTurnResult> {
+  const rows = await db.query<{ chat_id: string }>(
+    `SELECT t.chat_id
+     FROM control_plane.interview_agent_turns t
+     JOIN control_plane.intake_sessions s ON s.id = t.session_id
+     WHERE t.closed_at IS NULL
+       AND t.expires_at > now()
+       AND s.state <> 'confirmed'
+     LIMIT 2`,
+  );
+  if (rows.rows.length === 0) return { ok: false, reason: "NOT_FOUND" };
+  if (rows.rows.length > 1) return { ok: false, reason: "AMBIGUOUS" };
+  return { ok: true, chatId: rows.rows[0]!.chat_id };
+}
+
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
   const row = await db.query<{
     id: string;

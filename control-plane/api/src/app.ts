@@ -8,7 +8,7 @@ import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } fr
 import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
-  getSessionForAgent, submitAnswerForAgent,
+  getSessionForAgent, submitAnswerForAgent, resolveChatFromOpenTurn,
 } from "./interview.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
@@ -984,6 +984,88 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
     return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
   }
+
+  // GET|POST /internal/interview/agent/current[...] — the same two operations,
+  // for an agent that cannot name its own chat.
+  //
+  // It cannot: the gateway sets the chat id on the agent object but never
+  // renders it into the prompt, so the model has no per-turn access to it.
+  // Asking it for one produced the first live run's failure — no write at all,
+  // and an invented interview on top.
+  //
+  // Registered as literal segments so Fastify's static-over-parametric
+  // precedence keeps them off the :chatId route; a Telegram chat id is numeric
+  // and can never collide with "current" regardless.
+  //
+  // The authorization story is unchanged, and slightly stronger: these routes
+  // were always gated on the router's open turn rather than on the id the
+  // caller supplied. Removing the id removes the only thing the model could
+  // have gotten wrong.
+  async function resolveCurrentChat(reply: { code: (n: number) => { send: (b: unknown) => unknown } }): Promise<string | null> {
+    const resolved = await resolveChatFromOpenTurn(dependencies.interviewAgent!.db);
+    if (resolved.ok) return resolved.chatId;
+    // AMBIGUOUS is 409, not 404: nothing is missing, the request cannot be
+    // attributed. Telling those apart is what stops a retry loop against a
+    // second organizer's live interview.
+    reply.code(resolved.reason === "AMBIGUOUS" ? 409 : 404).send({ error: resolved.reason });
+    return null;
+  }
+
+  app.get("/internal/interview/agent/current", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const result = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  app.post("/internal/interview/agent/current/answer", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
+    const optionId = body?.optionId ?? null;
+    const otherText = body?.otherText;
+    const structuredData = body?.data;
+    const optionIds = body?.optionIds;
+
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionIds !== undefined && (!Array.isArray(optionIds) || optionIds.some((id) => typeof id !== "string"))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const result = await submitAnswerForAgent(
+      dependencies.interviewAgent.db,
+      chatId,
+      questionId,
+      optionId as string | null,
+      otherText as string | undefined,
+      structuredData,
+      optionIds as string[] | undefined,
+    );
+
+    if (!result.ok) {
+      const status = result.reason === "NOT_FOUND" ? 404
+        : result.reason === "SESSION_CONFIRMED" ? 409
+        : 400;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(200).send({ state: result.view.state, view: result.view });
+  });
 
   // GET /internal/interview/agent/:chatId — the session view for an open turn.
   app.get("/internal/interview/agent/:chatId", async (request, reply) => {
