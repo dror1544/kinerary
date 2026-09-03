@@ -20,6 +20,12 @@ which is the source of truth for what is done vs. planned.
 Every issue from Signup Run 1, with where it stands. **None of the "Fixed" rows
 are human-approved** — they are code changes on the branch, awaiting review.
 
+**2026-09-03 pass (PR #34).** Step 3 #3, #4, #7 and #13 moved to Fixed, #9 and
+General #4 advanced. Both "Bug" rows were reproduced for the first time; #7's
+reproduction was exact and #9's was not, which its row now says explicitly
+rather than claiming a cure it cannot prove. The next live run is what settles
+#9.
+
 Legend: **Fixed** = code written + tested this branch, pending approval ·
 **Partial** = part done, rest noted · **Deferred** = has a sprint (see Routing) ·
 **Open** = has a sprint, not started · **Bug** = has a sprint, not yet
@@ -57,7 +63,7 @@ does not mean "no owner" — read the row's home from Routing.
 | 1 | Telegram info messages (model switch, quota, compression…) → per-user logger, not to organizer | **Open** | → **Sprint 6 analytics** (per-user event logging). Not the Sprint 5 interview cluster. |
 | 2 | Hermes/Telegram commands shouldn't be available to a trip-group organizer | **Deferred** | Sprint 5 — Trip Context Gateway / router scoping. |
 | 3 | Multi-answer buttons render in Hebrew, should be the organizer's language | **Open** | Sprint 5. `interview.ts` / interview profile — the `clarify` option labels aren't localised. |
-| 4 | LLM-parse unclear answers · carry-forward extraction · reconcile end-summary vs `intake.json` | **Partial** | Sprint 5. Deterministic side of the concrete failure (non-Latin `destination` → slug `trip-2026`): still not fixed — `derive_trip_slug`'s `"trip"` fallback should use the first phase name. The LLM-parse / carry-forward / summary-reconcile behaviour is interview-profile work, not started. Memory `interview_llm_parse_and_summary_reconcile`. |
+| 4 | LLM-parse unclear answers · carry-forward extraction · reconcile end-summary vs `intake.json` | **Partial** | Sprint 5. Deterministic side (non-Latin `destination` → slug `trip-2026`) **fixed 2026-09-03, PR #34**: `derive_trip_slug` now tries the phase names first, preferring `name_en`, so a trip written "יפן" with a "Tokyo" phase becomes `tokyo-2026`; `"trip"` survives only when nothing in the intake is Latin. Mutation-checked. The LLM-parse / carry-forward / summary-reconcile behaviour is interview-profile work, still not started. Memory `interview_llm_parse_and_summary_reconcile`. |
 
 ### Step 2 — DM approval message
 
@@ -73,18 +79,18 @@ does not mean "no owner" — read the row's home from Routing.
 | # | Issue | Status | Detail |
 |---|---|---|---|
 | 1 | Choice questions: buttons only, no numbered list in the message text | **Open** | Sprint 5. Memory `interview_choice_questions_ux`. |
-| 2 | Don't recommend trip constraints (type/size/duration); recommend places/hotels/attractions | **Open** | Sprint 5. Interview profile. |
-| 3 | "Number of people" is confusing → ask who's coming (names + ages), derive the count | **Open** | Sprint 5. Needs an `interview.ts` schema change (derive `group_size` from `travelers`). |
-| 4 | Duration is derivable from the dates / onboarding site | **Open** | Sprint 5. `interview.ts` / landing-spa. Transformer already prefers explicit dates; the interview still asks both. |
+| 2 | Don't recommend trip constraints (type/size/duration); recommend places/hotels/attractions | **Partial** | Sprint 5. Two of the three named constraints stopped being questions at all on 2026-09-03 (PR #34) — size and duration are derived now, so nothing can recommend them. `trip_type` remains a choice question and is still interview-profile work: a "(Recommended)" tag on it is meaningless. |
+| 3 | "Number of people" is confusing → ask who's coming (names + ages), derive the count | **Fixed** | 2026-09-03, PR #34. `group_size` is gone from `INTAKE_QUESTIONS`; the headcount is counted off the `travelers` roster, which is required and names each person, so the stat can no longer disagree with the names given. Hero stat becomes an exact number where it was a range ("3", not "3–5"). QUESTIONS.md also says not to ask conversationally — reintroducing it in prose reproduces the complaint. |
+| 4 | Duration is derivable from the dates / onboarding site | **Fixed** | 2026-09-03, PR #34. `trip_duration` is gone; duration is the gap between `departure_date` and `return_date`, both required. The stored answer is still read as a fallback for an intake with no usable date pair, so pre-v3 trips do not regress. |
 | 5 | Bot asked permission to read a pasted link — should be automatic for the organizer | **Open** | Sprint 5. Hermes `trip-intake` profile approvals/capability config. |
 | 6 | If a link can't be fetched, fall back to scraping | **Open** | Sprint 5. Same as #5. |
-| 7 | **Bug** — dietary restriction step threw an error | **Bug** | Sprint 5. Not reproduced yet. Needs a repro run against the interview MCP. |
-| 8 | Schedule/planned-order should allow multiple answers + a flight-details option | **Open** | Sprint 5. `interview.ts` `phases`/anchors schema. |
-| 9 | **Bug** — schedule registration failed to submit | **Bug** | Sprint 5. Not reproduced yet. |
+| 7 | **Bug** — dietary restriction step threw an error | **Fixed** | 2026-09-03, PR #34. **Reproduced exactly.** `dietary` is `multi_choice`, which `validateAnswer` answers only from `optionIds` — and the MCP `submit_answer` tool never exposed that parameter, so every input the interviewer could send (`optionId`, `otherText`, `data`) was refused `OPTIONS_REQUIRED`. The step was unanswerable, not flaky. The parameter existed on the HTTP route and on `submit_answer_for_chat` the whole time and was never backported. Both tools now share one definition, and a coverage test asserts every question TYPE is answerable through it. |
+| 8 | Schedule/planned-order should allow multiple answers + a flight-details option | **Open** | Sprint 5. `interview.ts` `phases`/anchors schema. Untouched by the 09-03 pass — #9 fixed a submission defect, not this schema request. |
+| 9 | **Bug** — schedule registration failed to submit | **Partial** | 2026-09-03, PR #34. A real defect producing exactly this symptom is fixed: `data` was a strict array/object union, so a model handing over JSON it had just written **as a string** was rejected at the MCP boundary with nothing recorded — and the tool description already carried a "never as a string" warning, which is evidence it kept happening. `dataParam` now parses such a string; prose and JSON scalars are still refused. **But the original run's failure was never captured**, so this is a plausible cause, not a proven one. The next live run settles it. |
 | 10 | Interview should say daily-itinerary help happens on the trip bot; the interview is for structure | **Open** | Sprint 5 (also Sprint 4.5's itinerary work reduces the confusion). One line in `SOUL.md` / `QUESTIONS.md`. |
 | 11 | After CONFIRM the user is in a dead-end — no link to the site or bot | **Deferred** | Sprint 5 router; same root as Step 2 #2. Memory `onboarding_requires_clickable_start_link`. |
 | 12 | **Note** — the approval gates could be driven by the Hermes intake profile / personal bot via MCP; explore | **Open** | Exploration item, unscheduled. |
-| 13 | Verify the English spelling of non-English traveller names | **Partial** | Sprint 5. Transformer honours supplied `name_en` / `family_en` (`NonLatinNameTests`, done). The interview does not yet prompt for them. |
+| 13 | Verify the English spelling of non-English traveller names | **Fixed** | 2026-09-03, PR #34. The transformer already honoured `name_en`/`family_en`; nothing ever asked for them, so they appeared only if volunteered. The `travelers` prompt and its field guidance now ask — once for the whole list, not name by name. `username` derives from the Latin spelling, so without it the site shows people something they do not recognise. Guidance takes the organizer's transliteration as given rather than standardising it. |
 
 ### Step 4–5 — provisioning code defects (prior run)
 
