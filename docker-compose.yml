@@ -17,7 +17,9 @@ services:
       - trip_net
 
   trip-server:
-    build: ./server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
     container_name: trip-framework-server
     restart: unless-stopped
     privileged: true

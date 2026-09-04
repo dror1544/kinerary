@@ -106,6 +106,31 @@ security-relevant path (anything above, or auth in general), show the actual
 request/response proving the thing is hidden or scoped correctly — not a
 description of the code.
 
+### Restarting a live interview for a test run
+
+Testing the Trip Bot router end to end means starting the interview over
+repeatedly — four steps across three data stores, in an order that matters.
+
+```bash
+export KINERARY_TEST_LOGIN_EMAIL=... KINERARY_TEST_LOGIN_PASSWORD=...
+export KINERARY_BOT_TOKEN_FILE=control-plane/deployment/.local-secrets/telegram_creds
+scripts/fresh-interview.py --trip <slug|trip_id>          # prompts
+scripts/fresh-interview.py --trip <slug|trip_id> --yes    # doesn't
+```
+
+It clears the interview session and agent turns, **clears the chat's Hermes
+gateway conversation** (skip that and the interviewer resumes an inherited
+conversation — that is how the first live run narrated a different family's
+trip), resets the trip to `draft`, revokes the previous link, and prints a new
+`t.me` deep link.
+
+It **refuses** on a trip with a confirmed intake version, or one past
+`intake_in_progress`. Both mean real answers or a live site sit behind it, and
+an intake version is immutable by design. There is no `--force`.
+
+Credentials are the organizer's own signup login and are deliberately not
+stored in the repo.
+
 ### Testing anything that depends on today's date
 
 The trip clock, phase highlighting and "day N of M" all answer "where is this

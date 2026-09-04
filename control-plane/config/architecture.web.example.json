@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "environment": "development",
+  "public_api": { "bind_host": "0.0.0.0", "port": 4310 },
+  "worker": { "queue": "postgres", "health_bind_host": "127.0.0.1", "health_port": 4311 },
+  "database": { "connection_secret_ref": "env://CONTROL_PLANE_DATABASE_URL" },
+  "adapters": { "compute": "fake", "ingress": "fake", "agent_runtime": "fake", "messaging": "fake", "secrets": "file" },
+  "test_resources": { "enabled": false },
+  "web": {
+    "public_origin": "http://127.0.0.1:4173",
+    "runtime_origin": "http://127.0.0.1:4320",
+    "google_client_id_secret_ref": "env://GOOGLE_WEB_CLIENT_ID",
+    "google_client_secret_ref": "env://GOOGLE_WEB_CLIENT_SECRET",
+    "runtime_exchange_key_secret_ref": "env://RUNTIME_EXCHANGE_KEY",
+    "runtime_upstream_host_suffixes": ["localhost", "internal"],
+    "telegram_bot_username": "kinerary_bot",
+    "provisioning_admin_subject_digests": ["sha256:c9a2902fe9b1d10e1c0fbf586f6b6bc72c1b8d50b9ab974245d35ec499c1f318"],
+    "session_ttl_seconds": 604800
+  }
+}

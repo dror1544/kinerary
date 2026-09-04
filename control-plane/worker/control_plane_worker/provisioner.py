@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 import psycopg
 from psycopg.rows import dict_row
@@ -47,7 +47,7 @@ EnrichFn = Callable[[dict[str, Any], str], dict[str, Any]]
 # (source_revision, artifact_digest | None) -> a directory holding site/ server/
 # shared/ checked out at that revision. Injectable so tests do not need a git
 # repo; None means "use the real release_source.materialize_release_source".
-MaterializeFn = Callable[[str, str | None], str]
+MaterializeFn = Callable[[str, Optional[str]], str]
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +172,92 @@ class ShellDeployAdapter:
 
 def _generate_notif_id() -> str:
     return f"notif_{secrets.token_hex(16)}"
+
+
+def _generate_binding_id() -> str:
+    return f"tcb_{secrets.token_hex(16)}"
+
+
+class BindingRefused(Exception):
+    """A chat is already bound, in force, to a DIFFERENT trip.
+
+    Retargeting it is a reassignment, and the sprint plan requires one to be
+    confirmed by a signed organizer action and reviewed — none of which a
+    background provisioning job has or can obtain. Silently rebinding would
+    take a group that is actively using trip A and point it at trip B, so the
+    provisioner refuses and leaves the existing binding untouched.
+    """
+
+    def __init__(self, chat_id: str, existing_trip_id: str, requested_trip_id: str) -> None:
+        super().__init__("chat is already bound to another trip")
+        self.chat_id = chat_id
+        self.existing_trip_id = existing_trip_id
+        self.requested_trip_id = requested_trip_id
+
+
+def bind_chat_to_trip(
+    conn: psycopg.Connection,
+    chat_id: str,
+    trip_id: str,
+    hermes_profile: str,
+) -> str:
+    """Opens the binding that routes `chat_id` to `trip_id`, closing rather
+    than overwriting whatever was there before.
+
+    Returns the outcome as a short string for logging: "created", "unchanged",
+    or "profile_rebound".
+
+    Three cases, and the distinction between the last two is the whole point:
+
+      no open binding      -> open one.
+      same trip            -> not a reassignment. Identical profile is a
+                              no-op (a re-provision of an unchanged trip);
+                              a changed profile closes the old row and opens
+                              a new one, so even this leaves a trail.
+      a DIFFERENT trip     -> refuse. See BindingRefused.
+
+    Runs in one transaction and takes FOR UPDATE on the open row, so two
+    provisions racing for the same chat serialise here instead of both
+    believing they won. The partial unique index from migration 0029 is the
+    backstop if they somehow don't.
+    """
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT id, trip_id, hermes_profile
+                FROM control_plane.telegram_chat_bindings
+                WHERE chat_id = %s AND closed_at IS NULL
+                FOR UPDATE
+                """,
+                (chat_id,),
+            )
+            existing = cur.fetchone()
+
+            if existing is not None:
+                if existing["trip_id"] != trip_id:
+                    raise BindingRefused(chat_id, existing["trip_id"], trip_id)
+                if existing["hermes_profile"] == hermes_profile:
+                    return "unchanged"
+
+                cur.execute(
+                    """
+                    UPDATE control_plane.telegram_chat_bindings
+                    SET closed_at = now(), closed_reason = 'profile_rebound'
+                    WHERE id = %s
+                    """,
+                    (existing["id"],),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO control_plane.telegram_chat_bindings
+                  (id, chat_id, trip_id, hermes_profile)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (_generate_binding_id(), chat_id, trip_id, hermes_profile),
+            )
+            return "created" if existing is None else "profile_rebound"
 
 
 class _LeaseHeartbeat:
@@ -741,22 +827,72 @@ class ProvisionerWorker:
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
                         )
+                if hermes_profile:
+                    # The assistant's wake-words, recorded as a ROUTING fact
+                    # (migration 0030). Under the relay the group relevance
+                    # gate is the router's job, not Hermes's, so the router
+                    # needs its own copy — it cannot read a Hermes profile
+                    # directory from inside a container. Written whether or not
+                    # a chat binding follows: a trip whose group is bound later
+                    # must not be left with a gate that has nothing to match.
+                    names = [
+                        n for n in (
+                            (handoff.get("assistant") or {}).get("name"),
+                            (handoff.get("assistant") or {}).get("name_en"),
+                        )
+                        if isinstance(n, str) and n.strip()
+                    ]
+                    # De-duplicated because a single-language assistant carries
+                    # the same string in both fields, and a duplicate wake-word
+                    # is just a slower match.
+                    unique_names = list(dict.fromkeys(name.strip() for name in names))
+                    if unique_names:
+                        try:
+                            with conn.transaction():
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        "UPDATE control_plane.trips SET assistant_names = %s WHERE id = %s",
+                                        (unique_names, trip_id),
+                                    )
+                        except Exception:
+                            logger.warning("provisioner.assistant_names_failed", extra={
+                                "trip_id": trip_id,
+                                "consequence": "group messages will fall back to @mention/reply only",
+                            }, exc_info=True)
+
                 if hermes_profile and recipient_chat_id:
-                    with conn.transaction():
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """
-                                INSERT INTO control_plane.telegram_chat_bindings
-                                  (chat_id, trip_id, hermes_profile)
-                                VALUES (%s, %s, %s)
-                                ON CONFLICT (chat_id) DO UPDATE
-                                  SET trip_id = EXCLUDED.trip_id, hermes_profile = EXCLUDED.hermes_profile
-                                """,
-                                (recipient_chat_id, trip_id, hermes_profile),
-                            )
-                    logger.info("provisioner.companion_profile_bound", extra={
-                        "trip_id": trip_id, "hermes_profile": hermes_profile,
-                    })
+                    # Deliberately NOT inside the broad handler below. A trip
+                    # whose companion installed but whose binding did not open
+                    # is UNROUTABLE — the organizer messages the bot and gets
+                    # "I don't have a trip for this chat". Filing that under
+                    # the same warning as a best-effort profile install is how
+                    # a trip provisions "successfully" and is unreachable, so
+                    # it gets its own handler and error severity.
+                    try:
+                        outcome = bind_chat_to_trip(
+                            conn, recipient_chat_id, trip_id, hermes_profile,
+                        )
+                        logger.info("provisioner.companion_profile_bound", extra={
+                            "trip_id": trip_id,
+                            "hermes_profile": hermes_profile,
+                            "outcome": outcome,
+                        })
+                    except BindingRefused as refused:
+                        # Not a bug and not retryable: the chat legitimately
+                        # belongs to another trip, and moving it is a reviewed
+                        # organizer action this job has no standing to perform.
+                        logger.error("provisioner.companion_binding_refused", extra={
+                            "trip_id": trip_id,
+                            "existing_trip_id": refused.existing_trip_id,
+                            "hermes_profile": hermes_profile,
+                            "consequence": "trip is not reachable from this chat; reassignment needs an organizer action",
+                        })
+                    except Exception:
+                        logger.error("provisioner.companion_binding_failed", extra={
+                            "trip_id": trip_id,
+                            "hermes_profile": hermes_profile,
+                            "consequence": "trip provisioned but is unroutable — no open chat binding",
+                        }, exc_info=True)
         except Exception:
             logger.warning(
                 "provisioner.companion_profile_failed",

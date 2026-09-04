@@ -9,6 +9,7 @@ const path     = require('path');
 const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
+const livingJourney = require('./living-journey');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
@@ -22,6 +23,35 @@ const app = express();
 app.use(express.json({ limit: '30mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+// Nginx must never serve documents directly: unlike images/scripts, a PDF,
+// DOCX, or Markdown file can contain confirmation numbers, passenger names,
+// PINs, or other trip-private material. In Docker this is the read-only
+// ./site mount; locally it resolves to the repository's site/ directory.
+const SITE_DIR = process.env.SITE_DIR || path.join(__dirname, '..', 'site');
+const CLASSIC_STATIC_FILES = new Map([
+  ['/classic.html', 'classic.html'],
+  ['/trivia.html', 'trivia.html'],
+  ['/app.js', 'app.js'],
+  ['/styles.css', 'styles.css'],
+  ['/translations.js', 'translations.js'],
+  ['/runtime-base.js', 'runtime-base.js'],
+  ['/manifest.json', 'manifest.json'],
+  ['/apple-wallet-badge.svg', 'apple-wallet-badge.svg'],
+  ['/google-wallet-badge.svg', 'google-wallet-badge.svg'],
+  ['/brand/favicon.svg', 'brand/favicon.svg'],
+  ['/brand/kinerary-icon.svg', 'brand/kinerary-icon.svg'],
+  ['/brand/logo.svg', 'brand/logo.svg'],
+  ['/brand/logo-reversed.svg', 'brand/logo-reversed.svg'],
+  ['/brand/mark.svg', 'brand/mark.svg'],
+]);
+for (const [route, relativeFile] of CLASSIC_STATIC_FILES) {
+  app.get(route, (_req, res) => res.sendFile(path.join(SITE_DIR, relativeFile)));
+}
+// The root is the variant loader and Modern is a bundled SPA.  These routes
+// are deliberately registered before API handlers but only match their exact
+// static prefixes, so gateway-prefixed API traffic keeps reaching its routes.
+app.get('/', (_req, res) => res.sendFile(path.join(SITE_DIR, 'index.html')));
+app.use('/modern', express.static(path.join(SITE_DIR, 'modern'), { index: 'index.html' }));
 
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
@@ -83,11 +113,7 @@ async function verifyGoogleToken(idToken) {
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
-// Nginx must never serve documents directly: unlike images/scripts, a PDF,
-// DOCX, or Markdown file can contain confirmation numbers, passenger names,
-// PINs, or other trip-private material. In Docker this is the read-only
-// ./site mount; locally it resolves to the repository's site/ directory.
-const SITE_DIR = process.env.SITE_DIR || path.join(__dirname, '..', 'site');
+const MEDIA_DIR   = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media');
 const STATIC_CONFIRMATIONS_DIR = path.join(SITE_DIR, 'confirmations');
 // Not under DATA_DIR: nginx serves this directory as static content directly
 // (docker-compose mounts ./site/avatars to /app/avatars here), so it has to
@@ -113,7 +139,7 @@ const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
 const PHOTOS_FILE  = path.join(DATA_DIR, 'photos.json');
 const DB_FILE      = path.join(DATA_DIR, 'trip.db');
 
-[DATA_DIR, UPLOADS_DIR, CONF_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+[DATA_DIR, UPLOADS_DIR, CONF_DIR, MEDIA_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
 const TRIP_DIR = process.env.TRIP_DIR || path.join(__dirname, '..', 'trip');
@@ -331,6 +357,14 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 `);
+// Extraction creates a private organizer draft first. Existing installations
+// need additive migrations because CREATE TABLE IF NOT EXISTS does not change
+// their bookings table.
+for (const [col, decl] of [
+  ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
+]) {
+  try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
+}
 
 // ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
 // Snapshots trip.config.json into trip_config_versions whenever its content
@@ -403,6 +437,9 @@ for (const [col, decl] of [
   // Identifies the config day item this row was promoted from, so promoting
   // twice can't duplicate the schedule.
   ['config_ref',        'TEXT'],
+  // A compatibility-only identity for the Modern itinerary projection. It is
+  // intentionally distinct from config_ref, whose contract is config import.
+  ['itinerary_item_uid','TEXT'],
   // Ticketing state. needs_tickets/advance_booking come from enrichment;
   // booking_id (above) is set by deterministic matching against real bookings,
   // never by the model — "is this paid for" is a fact, not a judgment call.
@@ -431,6 +468,7 @@ for (const [col, decl] of [
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_config_ref ON phase_plan_items(config_ref) WHERE config_ref IS NOT NULL'); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_item_uid ON phase_plan_items(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL'); } catch {}
 // A day's headline ("Thu 13/8 — Diamond Head + Waikiki") says what the day IS;
 // grouping items by date alone loses it. Kept per (phase, date) rather than on
 // each item so it can't drift between rows of the same day.
@@ -454,9 +492,12 @@ for (const [col, decl] of [
   ['corrected_at',     'TEXT'],
   ['review_status',    "TEXT DEFAULT 'none'"],
   ['review_attempts',  'INTEGER DEFAULT 0'],
+  // Lets compatibility reconciliation delete only rows it previously wrote.
+  ['itinerary_day_key','TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_days ADD COLUMN ${col} ${decl}`); } catch {}
 }
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_day_key ON phase_plan_days(itinerary_day_key) WHERE itinerary_day_key IS NOT NULL'); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_enrich ON phase_plan_items(enrichment_status)`); } catch {}
 // GET filters by phase_id on every page load and joinBooking() looks up
 // booking_id per row; neither had an index.
@@ -832,6 +873,45 @@ function organizerOrAgentRequired(req, res, next) {
   req.user = { username: payload.username };
   next();
 }
+
+const journey = livingJourney.create({
+  db,
+  config: TRIP_CONFIG,
+  raw: TRIP_CONFIG_RAW,
+  fetchImpl: fetch,
+  mediaDir: MEDIA_DIR,
+});
+
+const heroUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, MEDIA_DIR),
+    filename: (_req, file, cb) => {
+      const ext = ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' })[file.mimetype] || path.extname(file.originalname || '').toLowerCase();
+      cb(null, `hero-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext || '.img'}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.mimetype)),
+  limits: { fileSize: 8 * 1024 * 1024 },
+});
+
+app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('hero'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'image file required' });
+  const focalX = Number(req.body?.focal_x);
+  const focalY = Number(req.body?.focal_y);
+  db.prepare(
+    "UPDATE trip_ui_settings SET hero_media_file = ?, hero_media_original_name = ?, hero_media_mime = ?, hero_focal_x = ?, hero_focal_y = ?, updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+  ).run(
+    req.file.filename,
+    req.file.originalname || null,
+    req.file.mimetype || null,
+    Number.isFinite(focalX) ? Math.max(0, Math.min(1, focalX)) : 0.5,
+    Number.isFinite(focalY) ? Math.max(0, Math.min(1, focalY)) : 0.45,
+    req.user.username
+  );
+  res.json(journey.uiSettings());
+});
+
+journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
 
 app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   const agent = TRIP_CONFIG.agent || null;
@@ -1725,36 +1805,40 @@ if (!HERMES_URL) {
 
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
-  if (!HERMES_URL) return res.status(503).json({ error: 'HERMES_URL not configured' });
+async function extractBookingDetails(req) {
+  if (!HERMES_URL) throw Object.assign(new Error('HERMES_URL not configured'), { status: 503 });
   const url = req.body?.url;
   // The site's own "Extract Details with AI" upload (site/app.js) sends
   // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
   // populated for an actual multipart caller (e.g. a direct API client).
   const pdfBase64 = req.file ? req.file.buffer.toString('base64') : req.body?.pdf_base64;
   const pdfName = req.file ? req.file.originalname : req.body?.pdf_name;
-  if (!pdfBase64 && !url) return res.status(400).json({ error: 'Provide a file or url' });
+  if (!pdfBase64 && !url) throw Object.assign(new Error('Provide a file or url'), { status: 400 });
 
+  const body = url
+    ? JSON.stringify({ url })
+    : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
+
+  const r = await fetch(`${HERMES_URL}/extract`, {
+    method: 'POST',
+    headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
+    body,
+    // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
+    // call (mcp/mcp.js) — this used to be shorter (30s), so this call
+    // could time out and error here while trip-mcp's own call was still
+    // legitimately running, producing a confusing failure under load.
+    timeout: 50000,
+  });
+  if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
+  return r.json();
+}
+
+app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
   try {
-    const body = url
-      ? JSON.stringify({ url })
-      : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
-
-    const r = await fetch(`${HERMES_URL}/extract`, {
-      method: 'POST',
-      headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
-      body,
-      // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
-      // call (mcp/mcp.js) — this used to be shorter (30s), so this call
-      // could time out and error here while trip-mcp's own call was still
-      // legitimately running, producing a confusing failure under load.
-      timeout: 50000,
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
-    res.json(await r.json());
+    res.json(await extractBookingDetails(req));
   } catch (e) {
     console.error('[extract proxy]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -1772,11 +1856,43 @@ app.get('/api/bookings', authRequired, (req, res) => {
   let sql = 'SELECT * FROM bookings';
   const params = [];
   const wheres = [];
+  // Drafts are a private organizer workflow. Members only ever receive
+  // approved bookings, even if they guess the status query parameter.
+  const canReviewDrafts = req.user?.isAgent || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
+  if (!canReviewDrafts) wheres.push("review_status = 'approved'");
   if (phase) { wheres.push('phase = ?'); params.push(phase); }
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
   sql += ' ORDER BY date_from, id';
   res.json(db.prepare(sql).all(...params));
+});
+
+app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
+  try {
+    const extracted = await extractBookingDetails(req);
+    const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
+    const type = typeof extracted.type === 'string' ? extracted.type : 'other';
+    const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
+    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
+    if (!VALID_PLAN_PHASES.has(phase) || !validTypes.has(type) || !name) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
+    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    const result = db.prepare(
+      "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
+    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json({ ok: true, booking, extracted });
+  } catch (e) {
+    console.error('[extract draft]', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
+  const result = db.prepare("UPDATE bookings SET review_status = 'approved' WHERE id = ? AND review_status = 'draft'").run(req.params.id);
+  if (!result.changes) return res.status(404).json({ error: 'draft booking not found' });
+  res.json({ ok: true });
 });
 
 app.post('/api/bookings', authRequired, (req, res) => {
@@ -2104,6 +2220,7 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   );
   const created = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
   ensurePlanDay(req.params.phase_id, date || null);
+  journey.syncFromLegacy('legacy-plan-create');
   kickEnrichmentSoon();
   res.status(201).json(joinBooking(created));
 });
@@ -2161,6 +2278,7 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   if (dateMoved) { queuePhaseReview(req.params.phase_id); kickEnrichmentSoon(); }
   const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
     .get(req.params.id, req.params.phase_id);
+  journey.syncFromLegacy('legacy-plan-update');
   res.json({ ...joinBooking(updated), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
 });
 
@@ -2169,6 +2287,7 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
   const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
   if (!row) return res.status(404).json({ error: 'not found' });
   db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
+  journey.syncFromLegacy('legacy-plan-delete');
   // Every other DELETE in this file answers {ok:true}, and mcp/mcp.js's
   // apiDelete() parses the body unconditionally — a 204 made the agent's
   // delete_plan_item throw on every successful delete.
@@ -2225,6 +2344,7 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
     'enrichment_status = excluded.enrichment_status, enrich_attempts = 0' +
     (clearCorrection ? ', label_he_prev = NULL, label_en_prev = NULL, correction_note = NULL, corrected_at = NULL' : '')
   ).run(phaseId, date, labelHe, labelEn, status);
+  journey.syncFromLegacy('legacy-plan-day-update');
   res.json(db.prepare(
     'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
     'WHERE phase_id = ? AND date = ?'
@@ -2314,6 +2434,7 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
   // phase. Queued, not run inline: a Hermes call takes ~30-90s and the laptop
   // it runs on is routinely closed — a schedule edit must not depend on that.
   queuePhaseReview(phaseId);
+  journey.syncFromLegacy('legacy-plan-swap-days');
   kickEnrichmentSoon();
   res.json({
     ok: true, phase_id: phaseId, swapped: [date_a, date_b], days,
@@ -2956,6 +3077,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
     });
   }
   kickEnrichmentSoon();
+  journey.syncFromLegacy('legacy-promote-config-days');
   res.json({ created: created.length, skipped: skipped.length, items: created });
 });
 
@@ -3077,6 +3199,7 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
     const item = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
     created.push(joinBooking(item));
   }
+  journey.syncFromLegacy('legacy-import-from-bookings');
   res.json({ created, skipped });
 });
 
@@ -3584,4 +3707,5 @@ app.use((err, _req, res, _next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Trip server running on :${PORT}`));
+const HOST = process.env.HOST || undefined;
+app.listen(PORT, HOST, () => console.log(`Trip server running on ${HOST || '*'}:${PORT}`));

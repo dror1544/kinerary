@@ -71,7 +71,88 @@ export const architectureProfileSchema = z.object({
     // supplied sender identity — see identity.ts's verifyTelegramWebhookSecret.
     webhook_secret_ref: secretReference,
   }).strict().optional(),
+  web: z.object({
+    public_origin: z.string().url(),
+    runtime_origin: z.string().url(),
+    google_client_id_secret_ref: secretReference,
+    google_client_secret_ref: secretReference,
+    runtime_exchange_key_secret_ref: secretReference,
+    runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
+    telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
+    provisioning_admin_subject_digests: z.array(z.string().regex(/^sha256:[a-f0-9]{64}$/)).min(1),
+    session_ttl_seconds: z.number().int().min(3600).max(2592000).default(604800),
+  }).strict().optional(),
+  /**
+   * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
+   * OUT to, plus the shared bot token the connector polls.
+   *
+   * Runs as its own process (relay/server.ts), so this block is optional: an
+   * API-only deployment simply omits it. Its absence is what keeps the bot
+   * dark, which is a supported state, not a broken one.
+   */
+  relay: z.object({
+    /**
+     * Private hosts only, and not merely by convention. The gateway
+     * authenticates with an HMAC upgrade token and the connector holds the bot
+     * token; binding this to a public interface would expose the socket that
+     * sends as the trip bot to anything that can reach the port.
+     */
+    bind_host: privateHost,
+    port: z.number().int().min(1024).max(65535),
+    /**
+     * Accepted upgrade-token signing secrets, newest first. A LIST because
+     * rotation has to be able to overlap: the gateway may still be presenting
+     * a token signed with the previous secret when this side restarts, and a
+     * single-valued field would drop those connections rather than carry them
+     * through the change.
+     */
+    gateway_secret_refs: z.array(secretReference).min(1),
+    /**
+     * The shared trip bot's token, kept as its own ref because signup and trip
+     * are distinct ROLES — not because they are guaranteed to be distinct bots.
+     *
+     * On this deployment they are in fact the SAME bot, and an earlier version
+     * of this comment asserted the opposite. That mattered: Telegram hands each
+     * update to exactly one getUpdates caller, so two loops on one token steal
+     * from each other at random rather than sharing the work. The relay poller
+     * therefore subsumes the approval poller when the two refs resolve to the
+     * same token — detected by comparing the resolved values, since that is a
+     * fact the process can observe rather than a flag someone can set wrong.
+     */
+    telegram_bot_token_secret_ref: secretReference,
+    /**
+     * The Hermes profile that serves written interview answers.
+     *
+     * One shared profile, not one per trip: an inbound chat with no live
+     * binding is routed to the interviewer by design, so the same profile
+     * fronts every newcomer.
+     *
+     * OPTIONAL, and its absence is a working state rather than a broken one.
+     * With no profile configured the router keeps answering a written mid-
+     * interview message itself, which means saying plainly that it cannot
+     * record one. Forwarding only begins once there is somewhere to forward
+     * to.
+     */
+    interviewer_profile: z.string().min(1).optional(),
+  }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
+  if (profile.relay) {
+    // All three services default into the same 431x range, and a collision
+    // surfaces as EADDRINUSE at boot on whichever loses the race — or, worse,
+    // as one service quietly never starting.
+    const taken = new Map<number, string>([
+      [profile.public_api.port, "public_api.port"],
+      [profile.worker.health_port, "worker.health_port"],
+    ]);
+    const clash = taken.get(profile.relay.port);
+    if (clash) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["relay", "port"],
+        message: `relay.port must not collide with ${clash}`,
+      });
+    }
+  }
   if (profile.environment === "production" && profile.test_resources.enabled) {
     ctx.addIssue({ code: "custom", path: ["test_resources"], message: "test resource selection must be disabled in production" });
   }
@@ -88,6 +169,14 @@ export const architectureProfileSchema = z.object({
       path: ["signup", "super_admin_chat_id_secret_ref"],
       message: "the telegram messaging adapter needs super_admin_chat_id_secret_ref to know where to send the approval DM",
     });
+  }
+  if (profile.web && profile.web.public_origin === profile.web.runtime_origin) {
+    ctx.addIssue({ code: "custom", path: ["web", "runtime_origin"], message: "runtime origin must be isolated from the organizer origin" });
+  }
+  if (profile.environment === "production" && profile.web) {
+    for (const [key, value] of [["public_origin", profile.web.public_origin], ["runtime_origin", profile.web.runtime_origin]] as const) {
+      if (!value.startsWith("https://")) ctx.addIssue({ code: "custom", path: ["web", key], message: "production web origins must use https" });
+    }
   }
 });
 

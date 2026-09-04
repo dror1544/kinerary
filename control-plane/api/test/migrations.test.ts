@@ -46,12 +46,20 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0019_telegram_chat_bindings.sql",
       "0020_web_portal.sql",
       "0021_password_identity.sql",
+      "0021_web_password_credentials.sql",
       "0022_interview_chat_id_hint.sql",
       "0023_country_reference.sql",
       "0024_intake_source_document.sql",
       "0025_venue_links_reference.sql",
       "0026_plans_retryable_digest.sql",
       "0027_release_manifest.sql",
+      "0028_interview_chat_binding.sql",
+      "0029_telegram_binding_lifecycle.sql",
+      "0030_trip_assistant_names.sql",
+      "0031_interview_agent_turns.sql",
+      "0032_release_accepts_intake_schema_v3.sql",
+      "0033_router_prompt_handoff.sql",
+      "0034_web_portal_addenda.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -79,12 +87,20 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0019_telegram_chat_bindings.sql",
       "0020_web_portal.sql",
       "0021_password_identity.sql",
+      "0021_web_password_credentials.sql",
       "0022_interview_chat_id_hint.sql",
       "0023_country_reference.sql",
       "0024_intake_source_document.sql",
       "0025_venue_links_reference.sql",
       "0026_plans_retryable_digest.sql",
       "0027_release_manifest.sql",
+      "0028_interview_chat_binding.sql",
+      "0029_telegram_binding_lifecycle.sql",
+      "0030_trip_assistant_names.sql",
+      "0031_interview_agent_turns.sql",
+      "0032_release_accepts_intake_schema_v3.sql",
+      "0033_router_prompt_handoff.sql",
+      "0034_web_portal_addenda.sql",
     ]);
   } finally {
     await reset(client);
