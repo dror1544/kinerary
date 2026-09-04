@@ -811,6 +811,66 @@ contexts and test groups without creating a per-trip Telegram bot.
 >
 > **Track 3 (the interview UX batch below) is untouched** and is the largest
 > remaining piece of this sprint.
+>
+> **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
+> runs in one day (`docs/signup-test-run1..6-raw-notes.md`) reached a confirmed
+> intake twice, and one of those needed two manual database unblocks. The
+> analysis is `docs/interview-design-review.md`: these are not six unrelated
+> defects but four missing pieces of the contract between the router and the
+> interviewer. Track 3's remaining UX items are absorbed into Track 4 rather
+> than fixed one at a time — fixing them one at a time is what produced runs
+> 2–6.
+
+#### Track 4 — one voice, one writer *(the sprint's priority as of 2026-09-04)*
+
+Build:
+
+- **The agent becomes the only voice; the router becomes the only writer.**
+  Four agent tools — `say`, `ask(question_id, text)`, `record(question_id,
+  value)`, `summarize` — and every other outbound agent message is dropped at
+  the relay boundary. The agent phrases each question in the organizer's own
+  language; the router attaches the keyboard and owns the record. Free-form
+  answers are extracted by the agent and never parsed by the router.
+- **`record` accepts questions that have not been asked yet**, so anything the
+  organizer volunteers early — in conversation or in an uploaded document —
+  shrinks the remaining list before it is ever spoken aloud. Run 6 asked for a
+  destination it had already recorded.
+- **An explicit phase column** (`opening → essentials → optional → recap →
+  confirmed`) with transitions and entry actions that fire exactly once,
+  replacing `deriveSessionState` and the three flags bolted onto it. `/done`
+  becomes an ordinary transition rather than an escape hatch.
+- **A floor token** — one writer at a time, the router by default — making
+  `interview_agent_turns` authoritative and retiring the handback guard,
+  prompt dedupe and settle window that currently approximate it.
+- **A watchdog:** if the floor is held and nothing organizer-visible has been
+  sent for N seconds, the router takes it back and asks the next question from
+  `intake-copy.ts`. Robotic, but never stuck.
+- **Derivable questions are never asked** — `timezone` from the destination,
+  `home_country` from the organizer, duration from the dates.
+- **The document offer becomes a phase entry action**, not a prompt
+  instruction, so the run-5 regression cannot recur by construction.
+
+Automated tests:
+
+- **A transcript harness** — the gap that let six regressions reach a person
+  rather than CI. Drive the router with a scripted organizer and a stubbed
+  agent, and assert the organizer-visible message sequence rather than units.
+  Standing assertions, each one a past run: no message sent twice; no option
+  question without a keyboard; no string outside the session's language; every
+  question asked at most once; every path reaches `confirmed` or a stated dead
+  end; no denylisted internal token reaches the chat.
+- an agent `send` that is not `say`/`ask` never reaches Telegram;
+- `record` on a question not yet asked removes it from the remaining set;
+- the watchdog fires and the interview continues after a silent agent turn.
+
+**Exit gate for Track 4:** two consecutive live runs reach `intake_confirmed`
+with no manual database intervention, and the transcript harness runs in CI on
+`integration/**`.
+
+**Open decisions** (`interview-design-review.md` §7): the watchdog interval,
+and whether tone and language discipline being *filtered* rather than
+*impossible* is an acceptable trade for a chat that reads human. Dror chose
+the human-feel direction on 2026-09-04; the trade is recorded, not settled.
 
 Build:
 
