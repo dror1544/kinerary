@@ -228,4 +228,35 @@ describe('Modern itinerary edits reconcile into the Classic plan', () => {
     assert.equal(mine.length, 1, `expected exactly one Classic row for the edited item, got ${mine.length}`);
     assert.equal(mine[0].text_en, 'Reconcile item A v4');
   });
+
+  test('Modern timeline orders exact and rough times before untimed items', async () => {
+    const date = '2027-03-12';
+    const created = [];
+    for (const [time, text_he] of [
+      [null, 'ללא שעה'],
+      ['evening', 'ערב'],
+      ['12:30', 'שתים-עשרה וחצי'],
+      ['afternoon', 'אחר הצהריים'],
+      ['08:00', 'שמונה'],
+      ['morning', 'בוקר'],
+    ]) {
+      const response = await api('/api/itinerary/items', {
+        method: 'POST', token,
+        body: { phase_id: PHASE, date, text_he, time },
+      });
+      assert.equal(response.status, 201);
+      created.push((await response.json()).item_uid);
+    }
+
+    const active = await (await api('/api/itinerary/active', { token })).json();
+    const times = active.items
+      .filter((item) => item.phase_id === PHASE && item.date === date)
+      .map((item) => item.time);
+    assert.deepEqual(times, ['08:00', 'morning', '12:30', 'afternoon', 'evening', null]);
+
+    for (const itemUid of created) {
+      const response = await api(`/api/itinerary/items/${itemUid}`, { method: 'DELETE', token });
+      assert.equal(response.status, 200);
+    }
+  });
 });

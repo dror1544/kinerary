@@ -321,7 +321,9 @@ function rowsFromLegacyPlan(db) {
     sort_order: index,
   }));
   const items = db.prepare(
-    'SELECT * FROM phase_plan_items ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
+    // Time is the primary schedule order. sort_order is only the stable
+    // tie-breaker for entries with the same clock position or no time.
+    'SELECT * FROM phase_plan_items ORDER BY date ASC, COALESCE(time_sort, 99999) ASC, sort_order ASC, id ASC'
   ).all().map((row, index) => ({
     item_uid: row.itinerary_item_uid || (row.config_ref ? `cfg_${digest(row.config_ref).slice(0, 16)}` : `legacy_${row.id}`),
     phase_id: row.phase_id,
@@ -433,7 +435,9 @@ function getVersionRows(db, revisionIdValue) {
     pickup_context: readJson(day.pickup_context, null),
   }));
   const items = db.prepare(
-    'SELECT * FROM itinerary_plan_items WHERE revision_id = ? ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, item_uid ASC'
+    // Exact and rough times share time_sort, so they must sort ahead of the
+    // manual insertion order. Untimed entries intentionally fall to the end.
+    'SELECT * FROM itinerary_plan_items WHERE revision_id = ? ORDER BY date ASC, COALESCE(time_sort, 99999) ASC, sort_order ASC, item_uid ASC'
   ).all(revisionIdValue).map((item) => ({
     ...item,
     extra_links: readJson(item.extra_links, []),
