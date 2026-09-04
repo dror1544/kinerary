@@ -139,6 +139,14 @@ services:
       # (matching the bind mounts below) at `up` time to actually turn this on.
       PROVISIONER_DEPLOY_ROOT: ${PROVISIONER_DEPLOY_ROOT:-}
       PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-}
+      # Companion profile + MCP bridge are ON by default as of 2026-09-03, so a
+      # trip onboarded here is born complete rather than as a site with no
+      # assistant behind it. The templates dir is derived from REPO_ROOT, so
+      # neither needs a value set. Set PROVISIONER_COMPANION_PROFILE_ENABLED=0
+      # or PROVISIONER_MCP_BRIDGE_ENABLED=0 to opt back out.
+      PROVISIONER_COMPANION_TEMPLATES_DIR: ${PROVISIONER_COMPANION_TEMPLATES_DIR:-}
+      PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-}
+      PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-}
       # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
       # deploy.sh's own default is a host macOS path that doesn't exist
       # inside this container, so this must be set (to /repo) whenever
