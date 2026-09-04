@@ -1,0 +1,516 @@
+/**
+ * The transcript harness — Track 4's first piece, and the reason it comes
+ * first.
+ *
+ * Six live runs on 2026-09-04 produced six regressions, every one of them
+ * found by a person on a phone rather than by CI, while 568 tests passed
+ * throughout. The reason is structural: the suite asserts units, and every
+ * defect an organizer actually hit lives in the CONVERSATION —
+ *
+ *   - the recap landing on top of a live question (run 2)
+ *   - the same question arriving five times (runs 5 and 6)
+ *   - English strings inside a Hebrew interview (runs 2, 3, 4)
+ *   - an option question arriving as a numbered list (runs 2, 6)
+ *   - a session with no reachable path to confirmation (run 6)
+ *   - the agent reading its own field ids aloud (run 5)
+ *
+ * None of those is visible to a unit test of the function that caused it.
+ * All six are visible in the sequence of messages the organizer received.
+ *
+ * So this file asserts on the transcript. `Transcript` records what the
+ * organizer would have seen, and `check()` runs every standing assertion at
+ * once — each one is a past run, named in its failure message, so a
+ * reintroduction says which run it is bringing back.
+ *
+ * Standing assertions live in one place ON PURPOSE. A conversation-level
+ * invariant that is spot-checked in the one test that thought of it is how
+ * these defects kept returning through a different route: buttons came back
+ * as numbered lists twice, in different code paths, months apart.
+ */
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { applyMigrations } from "../src/migrations.js";
+import { askText, uiString, type Language } from "../src/intake-copy.js";
+import {
+  INTAKE_QUESTIONS,
+  getSessionForChat,
+  submitAnswerForChat,
+  type IntakeQuestion,
+} from "../src/interview.js";
+import { issueEnrollment } from "../src/enrollment.js";
+import { startFromDeepLink } from "../src/chat-router.js";
+import { dispatchUpdate } from "../src/relay/dispatch.js";
+import { applyDecision } from "../src/relay/poller.js";
+import { detectInternalLeak } from "../src/relay/internal-leak.js";
+import type { TelegramUpdate } from "../src/relay/normalize.js";
+import type { WireMessageEvent } from "../src/relay/protocol.js";
+import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+
+const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const SKIP = !databaseUrl;
+const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+
+function testId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString("hex")}`;
+}
+
+// ── What the organizer saw ───────────────────────────────────────────────────
+
+interface Line {
+  text: string;
+  buttons: string[];
+  /** Which intake question this message put, if it is recognisably one. */
+  questionId: string | null;
+  /**
+   * Which language's copy table this text was drawn from.
+   *
+   * Recorded rather than checked at classification time, and that distinction
+   * matters: an earlier version of this harness classified against the
+   * session's language only, so a question drawn in the WRONG language matched
+   * nothing, came back as "not a question", and sailed past the very assertion
+   * written to catch it. Recognise first, judge second.
+   */
+  drawnIn: Language | null;
+}
+
+/**
+ * Reads a message back the way the organizer's thumb would.
+ *
+ * Button payloads are the reliable signal — `a:<id>:<opt>` answers a choice,
+ * `t:<id>:<opt>` toggles a multi-select — so a message carrying them is
+ * unambiguously that question. Text questions have no payload to read, so they
+ * are matched against the copy table in EITHER language.
+ */
+function classify(text: string, buttons: string[]): Line {
+  let questionId: string | null = null;
+  for (const data of buttons) {
+    const m = /^[at]:([a-z_]+):/.exec(data);
+    if (m) { questionId = m[1] ?? null; break; }
+  }
+  for (const q of INTAKE_QUESTIONS) {
+    for (const lang of ["en", "he"] as const) {
+      if (text.includes(askText(q, lang))) {
+        return { text, buttons, questionId: questionId ?? q.id, drawnIn: lang };
+      }
+    }
+  }
+  return { text, buttons, questionId, drawnIn: null };
+}
+
+class Transcript implements TelegramClient {
+  readonly lines: Line[] = [];
+  readonly answered: { callbackQueryId: string; text?: string }[] = [];
+  language: Language = "en";
+  queued: unknown[][] = [];
+
+  async sendMessage(params: {
+    chatId: string;
+    text: string;
+    replyMarkup?: { inline_keyboard: { text: string; callback_data: string }[][] };
+  }): Promise<SendResult> {
+    const buttons = (params.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
+    this.lines.push(classify(params.text, buttons));
+    return { ok: true, messageId: String(this.lines.length) };
+  }
+  async editMessageText(): Promise<SendResult> { return { ok: true }; }
+  async sendChatAction(): Promise<void> { /* no-op */ }
+  async answerCallbackQuery(p: { callbackQueryId: string; text?: string }): Promise<void> {
+    this.answered.push(p);
+  }
+  async getChatInfo(): Promise<ChatInfo | null> { return null; }
+  async getMe(): Promise<BotSelf | null> { return { id: "7000000001", username: "KineraryTestBot" }; }
+  async getUpdates(): Promise<unknown[]> { return this.queued.shift() ?? []; }
+  async deleteWebhookIfPresent(): Promise<void> { /* no-op */ }
+
+  get last(): Line | undefined { return this.lines[this.lines.length - 1]; }
+
+  /** Every message that put a given question. More than one is the bug. */
+  asking(questionId: string): Line[] {
+    return this.lines.filter((l) => l.questionId === questionId);
+  }
+
+  // ── Standing assertions ───────────────────────────────────────────────────
+  //
+  // Each names the run it comes from. Run them all with check().
+
+  /** Runs 5 and 6: "Again it bombarding me with messages". */
+  assertNoRepeatedMessage(): void {
+    const seen = new Map<string, number>();
+    for (const line of this.lines) {
+      const n = (seen.get(line.text) ?? 0) + 1;
+      seen.set(line.text, n);
+      assert.equal(n, 1, `run 5/6 regression — the organizer got this twice:\n  ${line.text.slice(0, 120)}`);
+    }
+  }
+
+  /** Runs 2 and 6: an option question that degraded to "reply with a number". */
+  assertOptionQuestionsAreTappable(): void {
+    const byId = new Map(INTAKE_QUESTIONS.map((q) => [q.id, q] as const));
+    for (const line of this.lines) {
+      if (!line.questionId) continue;
+      const q = byId.get(line.questionId) as IntakeQuestion | undefined;
+      if (!q || (q.type !== "choice" && q.type !== "multi_choice")) continue;
+      assert.ok(
+        line.buttons.length > 0,
+        `run 2/6 regression — "${q.id}" is a ${q.type} question and arrived with no keyboard, ` +
+          `which is what makes it degrade to a numbered list:\n  ${line.text.slice(0, 120)}`,
+      );
+    }
+  }
+
+  /**
+   * Runs 2, 3 and 4: "still mix of hebrew and english".
+   *
+   * Checks the half we can check mechanically and completely — anything the
+   * ROUTER drew has to come from the copy table for this session's language.
+   * A question rendered from the other language's table is caught exactly,
+   * with no guessing about scripts or proper nouns.
+   */
+  assertRouterTextIsInSessionLanguage(): void {
+    for (const line of this.lines) {
+      if (!line.drawnIn) continue;
+      assert.equal(
+        line.drawnIn,
+        this.language,
+        `run 2/3/4 regression — "${line.questionId}" was drawn in ${line.drawnIn} ` +
+          `inside a ${this.language} interview:\n  ${line.text.slice(0, 120)}`,
+      );
+    }
+  }
+
+  /** Run 6: it asked for a destination it had already recorded. */
+  assertNoQuestionAskedTwice(): void {
+    const counts = new Map<string, number>();
+    for (const line of this.lines) {
+      if (!line.questionId) continue;
+      counts.set(line.questionId, (counts.get(line.questionId) ?? 0) + 1);
+    }
+    for (const [id, n] of counts) {
+      assert.equal(n, 1, `run 6 regression — "${id}" was put to the organizer ${n} times`);
+    }
+  }
+
+  /** Run 5: the agent read its own field ids and tool names aloud. */
+  assertNoInternalLeak(): void {
+    for (const line of this.lines) {
+      const verdict = detectInternalLeak(line.text);
+      assert.equal(
+        verdict.leaks,
+        false,
+        `run 5 regression — internal vocabulary reached the organizer (${verdict.term}):\n  ${line.text.slice(0, 120)}`,
+      );
+    }
+  }
+
+  /** Everything except termination, which needs the session and so is separate. */
+  check(): void {
+    this.assertNoRepeatedMessage();
+    this.assertOptionQuestionsAreTappable();
+    this.assertRouterTextIsInSessionLanguage();
+    this.assertNoQuestionAskedTwice();
+    this.assertNoInternalLeak();
+  }
+}
+
+class FakeConnector {
+  readonly pushed: WireMessageEvent[] = [];
+  pushInbound(event: WireMessageEvent): boolean {
+    this.pushed.push(event);
+    return true;
+  }
+}
+
+// ── Driving a conversation ───────────────────────────────────────────────────
+
+interface Fixture {
+  pool: pg.Pool;
+  tripId: string;
+  userId: string;
+  chat: string;
+  script: Transcript;
+  connector: FakeConnector;
+}
+
+async function withConversation(fn: (fix: Fixture) => Promise<void>): Promise<void> {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  try {
+    const userId = testId("user");
+    const tripId = testId("trip");
+    await pool.query(
+      "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'Owner')",
+      [userId],
+    );
+    await pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')", [
+      tripId,
+      tripId.replace(/_/g, "-"),
+    ]);
+    await pool.query(
+      "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+      [testId("memb"), tripId, userId],
+    );
+    await fn({
+      pool,
+      tripId,
+      userId,
+      chat: "770000001",
+      script: new Transcript(),
+      connector: new FakeConnector(),
+    });
+  } finally {
+    await pool.end();
+  }
+}
+
+/** One update, all the way through: dispatch decides, applyDecision acts. */
+async function turn(fix: Fixture, update: TelegramUpdate): Promise<void> {
+  const decision = await dispatchUpdate(fix.pool, update);
+  await applyDecision(decision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+}
+
+/**
+ * The stubbed interviewer: records an answer the way the agent does, without a
+ * model.
+ *
+ * Two of the six required questions — `travelers` and `phases` — are
+ * `structured`, and the router cannot parse free text into an array. So a
+ * router-only interview CANNOT be completed by tapping and typing; it needs
+ * something that extracts. That is not a limitation of this harness, it is the
+ * shape of the product, and it is exactly why Track 4 keeps the agent rather
+ * than replacing it with a script.
+ */
+async function agentRecords(
+  fix: Fixture,
+  questionId: string,
+  value: string | unknown[],
+): Promise<void> {
+  const result = Array.isArray(value)
+    ? await submitAnswerForChat(fix.pool, fix.chat, questionId, null, undefined, value)
+    : await submitAnswerForChat(fix.pool, fix.chat, questionId, null, value);
+  assert.ok(result.ok, `the stubbed agent could not record ${questionId}: ${JSON.stringify(result)}`);
+}
+
+/**
+ * Answers everything still outstanding, thumb-first: taps a button when one is
+ * offered, hands structured questions to the stubbed agent, types otherwise.
+ *
+ * Returns when no required question remains, or throws if it stops making
+ * progress — a loop that silently gives up would turn "the interview dead-ends"
+ * into a passing test, which is the run-6 defect wearing a disguise.
+ */
+async function answerEverythingRequired(fix: Fixture): Promise<void> {
+  // What the organizer would have typed, and the stubbed agent extracts. The
+  // router refuses typed answers outright when no interviewer is configured
+  // ("that part of me is still being connected"), so a written answer has no
+  // path to the record except through the agent — which is the division Track 4
+  // formalises rather than changes.
+  const written: Record<string, string | unknown[]> = {
+    destination: "Japan",
+    departure_date: "2026-09-19",
+    return_date: "2026-10-03",
+    travelers: [{ name: "Dror", age: 44, household: "Elul" }, { name: "Noa", age: 12, household: "Elul" }],
+    phases: [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-26" }],
+  };
+
+  for (let guard = 0; guard < 40; guard += 1) {
+    const view = await getSessionForChat(fix.pool, fix.chat);
+    assert.ok(view.ok, "the session exists throughout");
+    const next = view.view.nextQuestion;
+    if (!next) return;
+
+    const line = fix.script.last;
+    const button = line?.questionId === next.id ? line.buttons.find((b) => b.startsWith("a:")) : undefined;
+    if (button) {
+      await turn(fix, taps(fix, button));
+      continue;
+    }
+    const value = written[next.id];
+    assert.ok(value !== undefined, `the harness has no answer scripted for required question "${next.id}"`);
+    await agentRecords(fix, next.id, value);
+  }
+  const stuck = await getSessionForChat(fix.pool, fix.chat);
+  const on = stuck.ok ? stuck.view.nextQuestion : null;
+  assert.fail(
+    `the interview never ran out of required questions — it is looping on ` +
+      `"${on?.id ?? "?"}" (${on?.type ?? "?"}). Last line: ${fix.script.last?.text.slice(0, 90)}`,
+  );
+}
+
+function says(fix: Fixture, text: string): TelegramUpdate {
+  return {
+    update_id: 1,
+    message: {
+      message_id: Math.floor(Math.random() * 1e6),
+      from: { id: 777, first_name: "Dror" },
+      chat: { id: fix.chat, type: "private" },
+      text,
+    },
+  };
+}
+
+function taps(fix: Fixture, data: string): TelegramUpdate {
+  return {
+    update_id: 2,
+    callback_query: {
+      id: `cbq_${Math.floor(Math.random() * 1e6)}`,
+      data,
+      from: { id: 777 },
+      message: { message_id: 7, chat: { id: fix.chat, type: "private" } },
+    },
+  };
+}
+
+/**
+ * Opens the interview the way an organizer does — by tapping the deep link.
+ *
+ * Deliberately through `dispatchUpdate` rather than by calling
+ * `startFromDeepLink` directly: the opening message is a routing decision, and
+ * a helper that skips the router would test a path no organizer ever takes.
+ */
+async function open(fix: Fixture): Promise<void> {
+  const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+  assert.ok(issued.ok);
+  await turn(fix, says(fix, `/start ${issued.token}`));
+}
+
+// ── The tests ────────────────────────────────────────────────────────────────
+
+describe("the interview transcript holds its standing invariants", () => {
+  test("the router-only tap-through path satisfies every standing assertion", { skip: SKIP }, async () => {
+    // The baseline. This is the ONE path run 1 walked and the only one that has
+    // ever worked end to end, so it is the floor: whatever Track 4 changes,
+    // this must keep passing.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await answerEverythingRequired(fix);
+
+      fix.script.check();
+      assert.ok(fix.script.lines.length > 1, "the organizer was actually spoken to");
+    });
+  });
+
+  test("the opening offers a document before it asks anyone to type", { skip: SKIP }, async () => {
+    // Run 5: "Now it asked the date of the trip without suggesting adding
+    // documents". Asking someone to type out a trip they already have written
+    // down is the single biggest waste of their patience the interview can
+    // commit, and it regressed the moment the router took over the opening.
+    await withConversation(async (fix) => {
+      await open(fix);
+      const first = fix.script.lines[0];
+      assert.ok(first, "a deep link produces an immediate reply");
+      assert.equal(first.questionId, null, "the first thing said is not a question");
+      assert.deepEqual(first.buttons, ["c:nodoc"], "one way past the offer");
+      fix.script.check();
+    });
+  });
+
+  test("a repeated message fails the harness", { skip: SKIP }, async () => {
+    // Mutation check: the bombardment assertion has to actually fire, or it is
+    // decoration. Runs 5 and 6 both got past a check that existed.
+    const script = new Transcript();
+    await script.sendMessage({ chatId: "1", text: "What day does the trip start?" });
+    await script.sendMessage({ chatId: "1", text: "What day does the trip start?" });
+    assert.throws(() => script.assertNoRepeatedMessage(), /run 5\/6 regression/);
+  });
+
+  test("an option question with no keyboard fails the harness", { skip: SKIP }, async () => {
+    // Mutation check for runs 2 and 6: the agent asking `trip_type` in prose,
+    // which degrades to "reply with the numbers separated by commas".
+    const script = new Transcript();
+    const tripType = INTAKE_QUESTIONS.find((q) => q.id === "trip_type");
+    assert.ok(tripType);
+    await script.sendMessage({ chatId: "1", text: askText(tripType, "en") });
+    assert.throws(() => script.assertOptionQuestionsAreTappable(), /run 2\/6 regression/);
+  });
+
+  test("a question drawn in the wrong language fails the harness", { skip: SKIP }, async () => {
+    // Mutation check for runs 2/3/4: the router drew English into a Hebrew
+    // interview because its strings had no language at all.
+    const script = new Transcript();
+    script.language = "he";
+    const destination = INTAKE_QUESTIONS.find((q) => q.id === "destination");
+    assert.ok(destination);
+    await script.sendMessage({ chatId: "1", text: askText(destination, "en") });
+    assert.throws(() => script.assertRouterTextIsInSessionLanguage(), /run 2\/3\/4 regression/);
+  });
+
+  test("internal vocabulary in a message fails the harness", { skip: SKIP }, async () => {
+    // Mutation check for run 5, using the exact wording that prompted the
+    // filter: field ids and "the router" read aloud to someone asking about a
+    // family holiday.
+    const script = new Transcript();
+    await script.sendMessage({
+      chatId: "1",
+      text: "`bot_gender` ו-`bot_tone` עדיין ב-optionalRemaining — ואת השאר ישאל הראוטר.",
+    });
+    assert.throws(() => script.assertNoInternalLeak(), /run 5 regression/);
+  });
+});
+
+describe("the interview always has a way to finish", () => {
+  test("/done reaches the recap without a button or an agent tool call", { skip: SKIP }, async () => {
+    // Run 6, verbatim: "Eventually got to the end of the interview no buttons
+    // only open questions asked for approval I approved but nothing happened."
+    //
+    // The session was `interviewing` with every required question answered.
+    // Reaching confirmation needed either all sixteen optional questions
+    // answered or the finish flag, which only exists on a router-drawn
+    // question — and the agent was doing the asking, so no button was on
+    // screen. This asserts the escape hatch works; Track 4's phase column is
+    // what removes the need for one.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await answerEverythingRequired(fix);
+
+      await turn(fix, says(fix, "/done"));
+      const recap = fix.script.last;
+      assert.ok(recap, "the organizer got something back");
+      assert.ok(
+        recap.buttons.includes("c:confirm"),
+        "/done puts a real Confirm button on screen, not a sentence asking for approval",
+      );
+      assert.ok(
+        recap.text.includes(uiString("recapHeader", fix.script.language)),
+        "and shows what is being confirmed",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("/done with required questions outstanding asks, it does not pretend", { skip: SKIP }, async () => {
+    // The other half of the escape hatch, and the more important one: a
+    // command that confirms an incomplete intake would write a record nobody
+    // agreed to. It asks the next required question instead.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await turn(fix, says(fix, "/done"));
+
+      const reply = fix.script.last;
+      assert.ok(reply, "the organizer got something back");
+      assert.ok(
+        !reply.buttons.includes("c:confirm"),
+        "no Confirm button while required questions are outstanding",
+      );
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.state, "interviewing", "and the session did not jump to confirmation");
+      fix.script.check();
+    });
+  });
+});
