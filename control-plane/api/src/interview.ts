@@ -24,7 +24,41 @@ function sessionTokenDigest(token: string): string {
 // kind 'multi_choice' could not have come from v1. Releases advertise the
 // range they accept via releases.data_schema_min/max, so a bump here needs a
 // matching widening there or generatePlan finds no eligible release.
-export const INTAKE_SCHEMA_VERSION = 2;
+//
+// Bumped to 3 when `group_size` and `trip_duration` were REMOVED, headcount
+// being counted off the traveler roster and duration being the difference
+// between the two date questions (capture ledger, Step 3 #3 and #4).
+//
+// This bump is doing more work than 1 -> 2 did. That one was additive —
+// migration 0018 could widen a single release to serve both because every new
+// question was optional and transform_intake reproduced its v1 output exactly
+// when they were absent. Removing REQUIRED questions is not additive: a
+// release sealed before this change carries a transformer that lists both in
+// REQUIRED_QUESTIONS and raises on a v3 intake. The version is what makes that
+// release visibly ineligible in generatePlan instead of failing at transform
+// time, with a confirmed intake and nowhere to go. See migration 0032.
+export const INTAKE_SCHEMA_VERSION = 3;
+
+/**
+ * Question ids that USED to be asked and can still appear in a stored intake.
+ *
+ * An intake version is immutable, so every intake confirmed before v3 still
+ * carries `group_size` and `trip_duration` — and a correction to one of those
+ * trips submits the whole answer set back. Without this, the correction path's
+ * unknown-key check would reject it outright: an organizer fixing a
+ * destination on an older trip would be refused because of two fields they
+ * never touched, and the transformer's legacy readers would lose the values
+ * they still fall back to.
+ *
+ * Retired ids are carried through corrections unchanged rather than validated
+ * (there is no question definition left to validate against) and rather than
+ * dropped (that would quietly edit a confirmed record while claiming to
+ * correct one field).
+ */
+export const RETIRED_QUESTION_IDS: ReadonlySet<string> = new Set([
+  "group_size",
+  "trip_duration",
+]);
 
 export interface ChoiceOption {
   id: string;
@@ -70,36 +104,6 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     required: true,
   },
   {
-    id: "group_size",
-    type: "choice",
-    prompt: "How many travelers?",
-    options: [
-      { id: "2", label: "2 people" },
-      { id: "3_to_5", label: "3–5 people" },
-      { id: "6_to_10", label: "6–10 people" },
-      { id: "more_than_10", label: "More than 10" },
-    ],
-    allowsOther: true,
-    otherPrompt: "Enter the number or range of travelers (max 40 chars):",
-    maxLength: 40,
-    required: true,
-  },
-  {
-    id: "trip_duration",
-    type: "choice",
-    prompt: "How long will the trip be?",
-    options: [
-      { id: "weekend", label: "Weekend (2–3 days)" },
-      { id: "week", label: "About a week" },
-      { id: "two_weeks", label: "Two weeks" },
-      { id: "month_or_more", label: "A month or more" },
-    ],
-    allowsOther: true,
-    otherPrompt: "Describe the duration (max 80 chars):",
-    maxLength: 80,
-    required: true,
-  },
-  {
     id: "trip_interests",
     type: "text",
     prompt: "Any specific interests or must-sees? (optional — press skip to continue)",
@@ -135,7 +139,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travelers",
     type: "structured",
-    prompt: "Who's coming? List each person's name, age, and family/household group.",
+    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't written in Latin script, include the English spelling of each too.",
     dataShape: "array",
     required: true,
   },
@@ -725,6 +729,83 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
  * FUTURE: replace the supplied chat id with gateway-injected trusted context
  * once the relay contract can carry it.
  */
+export type ResolveOpenTurnResult =
+  | { ok: true; chatId: string }
+  | { ok: false; reason: "NOT_FOUND" | "AMBIGUOUS" };
+
+/**
+ * Finds the chat whose interview turn is open, without being told which.
+ *
+ * The interviewer agent cannot name its own chat. Verified on the live
+ * install 2026-09-03: the gateway sets `_chat_id` on the agent object but
+ * nothing renders it into the prompt, so the model has no per-turn access to
+ * it — the only place a chat id ever appeared was a stored memory belonging
+ * to a different profile. An agent asked for a chat id it cannot know either
+ * refuses, or guesses; on the first live run it guessed nothing and invented
+ * the rest of the interview instead.
+ *
+ * So the router's turn — already the sole authorization fact for these routes
+ * — becomes the selector too. This is strictly SAFER than the chat-addressed
+ * form it replaces: there, a wrong id from the model was refused only because
+ * no turn matched it; here there is no id to get wrong. Migration 0022's rule
+ * is unchanged and better honoured, because nothing the LLM says is read.
+ *
+ * Both open-ness filters are required, exactly as in the JOIN below: a
+ * superseded turn is closed but may not have expired, an abandoned one has
+ * expired but was never closed.
+ *
+ * AMBIGUOUS is deliberate rather than a "pick the newest" heuristic. Two
+ * organizers mid-interview is the case where guessing wrong writes one
+ * person's answer into the other's trip, which is the exact failure the
+ * two-trip matrix exists to prevent. Refusing is recoverable; a silent
+ * cross-write is not. LIMIT 2 is all that is needed to tell one from many.
+ */
+export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenTurnResult> {
+  const rows = await db.query<{ chat_id: string }>(
+    `SELECT t.chat_id
+     FROM control_plane.interview_agent_turns t
+     JOIN control_plane.intake_sessions s ON s.id = t.session_id
+     WHERE t.closed_at IS NULL
+       AND t.expires_at > now()
+       AND s.state <> 'confirmed'
+     LIMIT 2`,
+  );
+  if (rows.rows.length === 0) return { ok: false, reason: "NOT_FOUND" };
+  if (rows.rows.length > 1) return { ok: false, reason: "AMBIGUOUS" };
+  return { ok: true, chatId: rows.rows[0]!.chat_id };
+}
+
+/**
+ * Claims the sessions that owe the organizer a router-rendered prompt.
+ *
+ * `UPDATE ... RETURNING` so the claim and the clear are one statement: two
+ * poller iterations overlapping cannot both send the same prompt, and a crash
+ * after the claim loses one prompt rather than repeating it forever. Losing
+ * one is recoverable — the organizer's next message brings the interview back
+ * through the normal path; repeating one means an organizer watching the same
+ * question arrive every few seconds.
+ */
+export async function claimDueRouterPrompts(
+  db: pg.Pool,
+  limit = 10,
+): Promise<Array<{ sessionId: string; chatId: string }>> {
+  const rows = await db.query<{ id: string; telegram_chat_id: string }>(
+    `UPDATE control_plane.intake_sessions
+        SET router_prompt_due_at = NULL
+      WHERE id IN (
+        SELECT id FROM control_plane.intake_sessions
+         WHERE router_prompt_due_at IS NOT NULL
+           AND telegram_chat_id IS NOT NULL
+         ORDER BY router_prompt_due_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1
+      )
+      RETURNING id, telegram_chat_id`,
+    [limit],
+  );
+  return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id }));
+}
+
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
   const row = await db.query<{
     id: string;
@@ -991,11 +1072,22 @@ export async function submitAnswerForAgent(
   structuredData?: unknown,
   optionIds?: readonly string[],
 ): Promise<SubmitAnswerResult> {
-  return submitAnswerVia(
+  const result = await submitAnswerVia(
     db,
     { by: "agent", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
   );
+  // Hand the turn back to the router. It owns the keyboard — the agent cannot
+  // draw one, because `clarify` needs the relay `prompt` op this connector
+  // does not advertise. Without this the interview silently loses its buttons
+  // for good the first time an organizer types instead of tapping.
+  if (result.ok) {
+    await db.query(
+      "UPDATE control_plane.intake_sessions SET router_prompt_due_at = now() WHERE id = $1",
+      [result.view.sessionId],
+    );
+  }
+  return result;
 }
 
 /**

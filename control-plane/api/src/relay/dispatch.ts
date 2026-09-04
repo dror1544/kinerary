@@ -34,7 +34,7 @@ import {
   type InlineKeyboard,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { normalizeUpdate, toWireEvent, type TelegramUpdate } from "./normalize.js";
+import { normalizeUpdate, toWireEvent, type MediaDeps, type TelegramUpdate } from "./normalize.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -154,6 +154,8 @@ export interface DispatchOptions {
    * interviewer is reachable, and the router answers those messages itself.
    */
   interviewerProfile?: string;
+  /** Present when the connector runs a media plane; absent keeps text-only behaviour. */
+  media?: MediaDeps;
 }
 
 export async function dispatchUpdate(
@@ -209,7 +211,7 @@ export async function dispatchUpdate(
     }
   }
 
-  const outcome = await normalizeUpdate(db, update);
+  const outcome = await normalizeUpdate(db, update, options.media);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
     // has to actually address the assistant, or the shared bot answers a

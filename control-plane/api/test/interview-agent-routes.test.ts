@@ -25,7 +25,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { openAgentTurn } from "../src/interview.js";
+import { openAgentTurn, resolveChatFromOpenTurn, claimDueRouterPrompts, submitAnswerForAgent } from "../src/interview.js";
 import { buildApp, type InterviewAgentDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 
@@ -176,6 +176,171 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
       } finally {
         await app.close();
       }
+    });
+  });
+
+  describe("addressing the interview without a chat id", () => {
+    // The agent cannot name its own chat: the gateway never renders the chat
+    // id into the prompt. These routes exist so it does not have to.
+
+    test("resolves the one chat whose turn is open", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        const resolved = await resolveChatFromOpenTurn(pool);
+        assert.equal(resolved.ok, true);
+        assert.equal(resolved.ok === true && resolved.chatId, a.chatId);
+      });
+    });
+
+    test("REFUSES when two chats have turns open, rather than guessing", async () => {
+      // Picking the newest here would write one organizer's answer into the
+      // other organizer's trip.
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await openAgentTurn(pool, b.chatId, b.sessionId);
+        const resolved = await resolveChatFromOpenTurn(pool);
+        assert.equal(resolved.ok, false);
+        assert.equal(resolved.ok === false && resolved.reason, "AMBIGUOUS");
+      });
+    });
+
+    test("finds nothing when no turn is open", async () => {
+      await withTwoInterviews(async ({ pool }) => {
+        const resolved = await resolveChatFromOpenTurn(pool);
+        assert.equal(resolved.ok, false);
+        assert.equal(resolved.ok === false && resolved.reason, "NOT_FOUND");
+      });
+    });
+
+    test("GET /current serves that chat's session view", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        const app = buildApp(testProfile, { interviewAgent: { db: pool, apiKey: API_KEY } });
+        try {
+          const res = await app.inject({
+            method: "GET", url: "/internal/interview/agent/current",
+            headers: { "x-api-key": API_KEY },
+          });
+          assert.equal(res.statusCode, 200);
+          assert.equal(JSON.parse(res.body).sessionId, a.sessionId);
+        } finally { await app.close(); }
+      });
+    });
+
+    test("POST /current/answer lands in that chat's session and no other", async () => {
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        const app = buildApp(testProfile, { interviewAgent: { db: pool, apiKey: API_KEY } });
+        try {
+          const res = await app.inject({
+            method: "POST", url: "/internal/interview/agent/current/answer",
+            headers: { "x-api-key": API_KEY },
+            payload: { questionId: Q, optionId: OPTION },
+          });
+          assert.equal(res.statusCode, 200);
+          const rows = await pool.query<{ id: string; answers: Record<string, unknown> }>(
+            "SELECT id, answers FROM control_plane.intake_sessions WHERE id = ANY($1)",
+            [[a.sessionId, b.sessionId]],
+          );
+          const byId = new Map(rows.rows.map((r) => [r.id, r.answers]));
+          assert.ok(byId.get(a.sessionId)![Q], "recorded on the chat with the open turn");
+          assert.equal(byId.get(b.sessionId)![Q], undefined, "the other chat is untouched");
+        } finally { await app.close(); }
+      });
+    });
+
+    test("two open turns give 409, and neither interview is written to", async () => {
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await openAgentTurn(pool, b.chatId, b.sessionId);
+        const app = buildApp(testProfile, { interviewAgent: { db: pool, apiKey: API_KEY } });
+        try {
+          const res = await app.inject({
+            method: "POST", url: "/internal/interview/agent/current/answer",
+            headers: { "x-api-key": API_KEY },
+            payload: { questionId: Q, optionId: OPTION },
+          });
+          assert.equal(res.statusCode, 409);
+          assert.equal(JSON.parse(res.body).error, "AMBIGUOUS");
+          const rows = await pool.query<{ answers: Record<string, unknown> }>(
+            "SELECT answers FROM control_plane.intake_sessions WHERE id = ANY($1)",
+            [[a.sessionId, b.sessionId]],
+          );
+          for (const r of rows.rows) assert.equal(r.answers[Q], undefined, "nothing written");
+        } finally { await app.close(); }
+      });
+    });
+
+    test("/current is auth-gated and unmounted without the block", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        const noDeps = buildApp(testProfile, {});
+        try {
+          const r = await noDeps.inject({ method: "GET", url: "/internal/interview/agent/current", headers: { "x-api-key": API_KEY } });
+          assert.equal(r.statusCode, 503);
+        } finally { await noDeps.close(); }
+        const app = buildApp(testProfile, { interviewAgent: { db: pool, apiKey: API_KEY } });
+        try {
+          const r = await app.inject({ method: "GET", url: "/internal/interview/agent/current", headers: { "x-api-key": "wrong" } });
+          assert.equal(r.statusCode, 401);
+        } finally { await app.close(); }
+      });
+    });
+  });
+
+  describe("handing the turn back to the router", () => {
+    // The agent records the answer; only the router can draw the next
+    // question's buttons. Before this handoff existed, the first TYPED answer
+    // ended the tap flow for the rest of the interview, and a completed
+    // interview had no Confirm button at all — where a real organizer stopped
+    // on 2026-09-03.
+
+    test("an agent write leaves a prompt owing to that chat", async () => {
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        assert.deepEqual(await claimDueRouterPrompts(pool), [], "nothing owed before the write");
+
+        const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        assert.equal(written.ok, true);
+
+        const due = await claimDueRouterPrompts(pool);
+        assert.equal(due.length, 1);
+        assert.equal(due[0]!.chatId, a.chatId);
+        assert.equal(due[0]!.sessionId, a.sessionId);
+      });
+    });
+
+    test("a prompt is claimed exactly once", async () => {
+      // Two poll ticks overlapping must not both send the same question.
+      await withTwoInterviews(async ({ pool, a }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+
+        const first = await claimDueRouterPrompts(pool);
+        const second = await claimDueRouterPrompts(pool);
+        assert.equal(first.length, 1);
+        assert.deepEqual(second, [], "a second claim finds nothing");
+      });
+    });
+
+    test("only the chat that was written to is owed a prompt", async () => {
+      await withTwoInterviews(async ({ pool, a, b }) => {
+        await openAgentTurn(pool, a.chatId, a.sessionId);
+        await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        const due = await claimDueRouterPrompts(pool);
+        assert.equal(due.length, 1);
+        assert.notEqual(due[0]!.chatId, b.chatId);
+      });
+    });
+
+    test("a refused agent write owes nothing", async () => {
+      // No turn open, so the write fails — the router must not then ask a
+      // question as though something had been recorded.
+      await withTwoInterviews(async ({ pool, a }) => {
+        const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+        assert.equal(written.ok, false);
+        assert.deepEqual(await claimDueRouterPrompts(pool), []);
+      });
     });
   });
 

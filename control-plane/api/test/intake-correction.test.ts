@@ -140,6 +140,63 @@ describe("correctIntake", () => {
     }
   });
 
+  test("a retired question's answer survives a correction untouched", { skip: SKIP }, async () => {
+    // JAPAN_ANSWERS is a pre-v3 intake: it carries group_size and
+    // trip_duration, which the interview no longer asks. Correcting the
+    // destination on such a trip must not be refused because of two fields the
+    // organizer never touched, and must not quietly drop them either — the
+    // transformer still falls back to both when there is no roster or no
+    // usable date pair.
+    const fix = await setupFixture(pool);
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", CORRECTED_ANSWERS);
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("unreachable");
+
+      const row = await fix.pool.query<{ data: Record<string, { option_id?: string }> }>(
+        "SELECT data FROM control_plane.intake_versions WHERE id = $1",
+        [result.versionId],
+      );
+      const data = row.rows[0]!.data;
+      assert.equal(data.group_size?.option_id, "2", "group_size carried through");
+      assert.equal(data.trip_duration?.option_id, "two_weeks", "trip_duration carried through");
+      assert.equal(data.destination?.option_id, undefined);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a genuinely unknown question id is still rejected", { skip: SKIP }, async () => {
+    // Retiring two ids widened what the correction path accepts, so this is
+    // the guard that it did not become "accept anything".
+    const fix = await setupFixture(pool);
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", {
+        ...CORRECTED_ANSWERS,
+        not_a_question: { kind: "text", schema_version: 1, text: "x" },
+      });
+      assert.equal(result.ok, false);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a retired id carrying a non-object is rejected", { skip: SKIP }, async () => {
+    // Retired answers skip validateAnswer (no question definition remains), so
+    // the shape guard is the only thing standing between them and the
+    // canonical record.
+    const fix = await setupFixture(pool);
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", {
+        ...CORRECTED_ANSWERS,
+        group_size: ["not", "an", "object"],
+      } as unknown as Record<string, unknown>);
+      assert.equal(result.ok, false);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("rejects unsafe corrected content without creating a new version", { skip: SKIP }, async () => {
     const fix = await setupFixture(pool);
     try {

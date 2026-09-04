@@ -7,8 +7,14 @@ serialized as trip.config.json for the Kinerary trip site.
 Intake question IDs (INTAKE_SCHEMA_VERSION = 2):
   trip_type      choice: family / group_of_families / couple / other
   destination    text: free-form location
-  group_size     choice: 2 / 3_to_5 / 6_to_10 / more_than_10 / other
-  trip_duration  choice: weekend / week / two_weeks / month_or_more / other
+  group_size     choice: 2 / 3_to_5 / 6_to_10 / more_than_10 / other — LEGACY.
+                 Read only when no `travelers` roster is present; the headcount
+                 stat is otherwise counted off that roster (see
+                 _resolve_group_size), which is exact where this is a range.
+  trip_duration  choice: weekend / week / two_weeks / month_or_more / other —
+                 LEGACY, and only a fallback for an intake with no usable date
+                 pair. Both date questions are required, so duration is
+                 normally the difference between them.
   trip_interests text: optional free-form interests
   departure_date text: optional "YYYY-MM-DD" — precise departure, preferred
                  over the trip_duration placeholder logic when present
@@ -71,7 +77,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 # Required question IDs that must be present in the intake data.
-REQUIRED_QUESTIONS = frozenset({"trip_type", "destination", "group_size", "trip_duration"})
+# `group_size` and `trip_duration` are deliberately NOT here: both are derived
+# from questions the interview already requires — the traveler roster and the
+# two date questions — rather than asked for separately (capture ledger, Step 3
+# #3 and #4). Intakes confirmed before that change still carry both, and both
+# resolvers still read them when present.
+REQUIRED_QUESTIONS = frozenset({"trip_type", "destination"})
 
 _TRIP_TYPE_LABELS: dict[str, str] = {
     "family": "Family",
@@ -112,12 +123,30 @@ def _resolve_trip_type(answer: Mapping[str, Any]) -> str:
     return str(answer.get("other_text") or "Trip")
 
 
-def _resolve_group_size(answer: Mapping[str, Any]) -> str:
-    """Returns a short stat number for the group size: the option label for a
+def _resolve_group_size(data: Mapping[str, Any]) -> str:
+    """Returns a short stat number for the group size, for the Hero strip.
+
+    The roster wins when there is one. Asking "how many people?" as its own
+    question was confusing to a real organizer (capture ledger, Step 3 #3) and
+    it asks for something the interview already collects precisely: `travelers`
+    is a required question listing each person. A count off that roster is both
+    exact and impossible to contradict, where the separate question could
+    disagree with the names actually given.
+
+    A stored `group_size` answer is still honoured beneath it, because intakes
+    confirmed before this change carry one and nothing rewrites a confirmed
+    version. That path keeps its original behaviour: the option label for a
     choice answer, or the leading digit run from 'other' free text (e.g. "17"
     out of "17 total; 7 for some parts of the trip") rather than the whole
-    organizer sentence — the Hero stat strip shows a number, not a quote.
+    organizer sentence — the Hero strip shows a number, not a quote.
     """
+    travelers = _structured_list(data, "travelers")
+    if travelers:
+        return str(len(travelers))
+
+    answer = data.get("group_size")
+    if not answer:
+        return "0"
     if answer.get("kind") == "choice":
         return _GROUP_SIZE_LABELS.get(answer.get("option_id", ""), str(answer.get("option_id", "")))
     text = str(answer.get("other_text") or "")
@@ -195,7 +224,12 @@ def _resolve_dates(data: Mapping[str, Any], today: date) -> tuple[date, date, in
         )
 
     departure_date = today + timedelta(days=90)
-    total_days = _resolve_duration_days(data["trip_duration"])
+    # `trip_duration` is a fallback for an intake that has no usable dates, and
+    # is no longer a question every intake carries — both date questions are
+    # required, so duration is normally derived above rather than asked for
+    # (capture ledger, Step 3 #4). Absent it, _resolve_duration_days's own
+    # default stands.
+    total_days = _resolve_duration_days(data.get("trip_duration") or {})
     return departure_date, departure_date + timedelta(days=total_days), total_days
 
 
@@ -325,7 +359,26 @@ def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
         destination = destination[:40].rstrip("-")
     if not destination:
         # A destination written entirely in non-latin script slugifies to
-        # nothing; the year still distinguishes it and the caller de-duplicates.
+        # nothing. Before falling back to a generic word, try the phase names:
+        # a trip whose destination is "יפן" usually still has a phase called
+        # "Tokyo", and "tokyo-2026" is a URL the family recognises where
+        # "trip-2026" is one they cannot tell from anyone else's (capture
+        # ledger, General #4). Phases are checked in order and the first one
+        # that slugifies to anything wins.
+        for phase in _structured_list(data, "phases"):
+            if not isinstance(phase, Mapping):
+                continue
+            for key in ("name_en", "name"):
+                candidate = _slug_words(str(phase.get(key) or ""))
+                if candidate:
+                    destination = candidate[:40].rstrip("-")
+                    break
+            if destination:
+                break
+
+    if not destination:
+        # Nothing latin anywhere in the intake; the year still distinguishes
+        # it and the caller de-duplicates.
         destination = "trip"
 
     return f"{destination}-{departure_date.year}"
@@ -1037,7 +1090,7 @@ def transform_intake(
     today = today or date.today()
     destination = _text_value(data["destination"]).strip() or "Unknown Destination"
     trip_type_label = _resolve_trip_type(data["trip_type"])
-    group_size_label = _resolve_group_size(data["group_size"])
+    group_size_label = _resolve_group_size(data)
 
     departure_date, return_date, total_days = _resolve_dates(data, today)
 

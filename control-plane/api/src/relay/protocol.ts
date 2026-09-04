@@ -115,13 +115,32 @@ export interface WireSessionSource {
 
 export type MessageTypeName = "text" | "command" | "image" | "audio" | "document";
 
+/**
+ * One inbound attachment's metadata, parallel to `media_urls` and in the same
+ * order. Contract §"Phase 2 media ingress".
+ */
+export interface WireMediaDescriptor {
+  kind: "image" | "voice" | "audio" | "video" | "document";
+  mime: string;
+  size: number;
+  filename?: string;
+  caption?: string;
+}
+
 export interface WireMessageEvent {
   text: string;
   message_type: MessageTypeName;
   source: WireSessionSource;
   message_id?: string;
   reply_to_message_id?: string;
+  /**
+   * Fetchable references, never platform URLs. A Telegram file URL embeds the
+   * bot token, so attachments are downloaded connector-side and re-hosted as
+   * `{connector}/relay/media/{id}` — the platform credential never crosses.
+   */
   media_urls?: string[];
+  /** Same order as `media_urls`. */
+  media?: WireMediaDescriptor[];
 }
 
 // ── Frames ───────────────────────────────────────────────────────────────────

@@ -12,13 +12,11 @@ Question IDs, types and requiredness below match `INTAKE_QUESTIONS` in the contr
 
 Where the trip goes. City, region, or country — whatever the organizer naturally says first is fine; you don't need to press for a more specific answer than they're ready to give.
 
-## group_size — required, choice
+## headcount and trip length — no longer asked
 
-A rough headcount band (2 / 3–5 / 6–10 / 10+) is enough here — the exact roster comes later in `travelers`. If they give an exact number, map it to the right band or use "other" with the literal number.
+There is deliberately no `group_size` or `trip_duration` question. Both are derived from answers you collect anyway: the headcount is counted off the `travelers` roster, and the length is the gap between `departure_date` and `return_date`.
 
-## trip_duration — required, choice
-
-A rough length (weekend / about a week / two weeks / a month or more) if exact dates aren't known yet. If they *do* know exact dates, you don't need to labor over this — a quick "sounds like about two weeks" and move on to the precise dates below.
+Don't reintroduce them conversationally either. Asking "how many people?" right before "who's coming?" reads as not listening, and a real organizer said so — the two answers can also disagree, and the roster is the one with names in it. If someone volunteers "there'll be about eight of us", treat it as context for the roster question, not as an answer to record.
 
 ## departure_date / return_date — both required, text
 
@@ -40,6 +38,14 @@ Submit as:
 ]
 ```
 `age` is optional per traveler if genuinely unknown — omit the field rather than guessing. `family` should be a short household/family label shared by everyone in that group (e.g. two spellings of the same family name should match exactly, since it's used to group people on the site).
+
+**If the names aren't written in Latin script, ask for the English spelling too** and submit it as `name_en` (and `family_en` for the household label). Ask once, for the whole list — "and how do you spell those in English?" — rather than name by name. Each person's `username` is derived from the Latin spelling, so without it the site falls back to something the family won't recognise as themselves. Take the organizer's spelling exactly as given; a person's own transliteration of their name is not something to correct or standardise.
+
+```json
+[
+  { "name": "איתן", "name_en": "Eitan", "age": 52, "family": "שגיא", "family_en": "Sagi" }
+]
+```
 
 ## phases — required, structured (array)
 

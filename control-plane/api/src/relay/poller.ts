@@ -30,6 +30,7 @@ import {
   closeAgentTurn,
   confirmIntakeForChat,
   getSessionForChat,
+  claimDueRouterPrompts,
   openAgentTurn,
   submitAnswerForChat,
   type SessionView,
@@ -37,6 +38,7 @@ import {
 import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
+import type { MediaDeps } from "./normalize.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -74,6 +76,8 @@ export interface TripBotPollerDeps {
    * rather than forwarded — the state the bot shipped in.
    */
   interviewerProfile?: string;
+  /** Re-host plane for inbound attachments; absent keeps text-only behaviour. */
+  media?: MediaDeps;
   /**
    * Signup-approval handling, for the topology where the trip bot and the
    * signup bot are THE SAME BOT.
@@ -329,6 +333,46 @@ async function applyInterviewCallback(
  * Sends whatever comes after an answer lands: the next question, or the
  * confirm prompt once every required question is answered.
  */
+/**
+ * Sends the next question — with its buttons — for every interview the agent
+ * has just written to.
+ *
+ * This is the return half of the router/agent split. The agent resolves what
+ * an organizer meant and records it; the router asks what comes next, because
+ * only the router can draw a keyboard. Before this existed, the first typed
+ * answer ended the tap flow permanently and a finished interview had no
+ * Confirm button at all.
+ *
+ * Failures are swallowed per session: one chat whose send fails must not stop
+ * the poll loop or block the other claims in the batch.
+ */
+async function renderDueRouterPrompts(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+): Promise<void> {
+  let due: Array<{ sessionId: string; chatId: string }>;
+  try {
+    due = await claimDueRouterPrompts(deps.db);
+  } catch {
+    log(structuredLog("warn", "trip_bot.router_prompt_claim_failed", {}));
+    return;
+  }
+  for (const { sessionId, chatId } of due) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) continue;
+      await sendNextStep(result.view, chatId, deps, strings);
+      log(structuredLog("info", "trip_bot.router_prompt_sent", {
+        session_id: sessionId,
+        state: result.view.state,
+      }));
+    } catch {
+      log(structuredLog("warn", "trip_bot.router_prompt_failed", { session_id: sessionId }));
+    }
+  }
+}
+
 async function sendNextStep(
   view: SessionView,
   chatId: string,
@@ -412,6 +456,12 @@ export function startTripBotPoller(
       });
       const elapsed = Date.now() - startedAt;
 
+      // Render anything the agent handed back. This runs every tick rather
+      // than only after an update, because the write that owes a prompt
+      // happens out-of-band: the agent calls the control-plane API directly,
+      // and this loop is the only process holding the bot connection.
+      await renderDueRouterPrompts(deps, strings, log);
+
       if (raw.length > 0) {
         backoffMs = 0;
       } else if (elapsed < longPollSeconds * 500) {
@@ -436,6 +486,7 @@ export function startTripBotPoller(
         try {
           const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
             interviewerProfile: deps.interviewerProfile,
+            media: deps.media,
           });
           await applyDecision(decision, deps);
         } catch (error) {
