@@ -35,10 +35,20 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import { extractItinerary } from "./itinerary-extract.js";
 import { lookupConsularContacts } from "./consular-lookup.js";
+import { answerParams } from "./interview-mcp-params.js";
 
 const API_BASE = (process.env.CONTROL_PLANE_API_BASE_URL || "http://127.0.0.1:4310").replace(/\/$/, "");
 const MCP_PORT = Number(process.env.INTERVIEW_MCP_PORT || "4311");
 const API_KEY = process.env.INTERVIEW_MCP_KEY || "";
+/**
+ * Service credential for the chat-addressed routes.
+ *
+ * Unset is a working state: the two `*_for_chat` tools are simply not
+ * registered, and an interviewer profile that never sees them keeps to the
+ * token-carrying tools. Registering them without a key would advertise a
+ * capability every call then fails on.
+ */
+const AGENT_KEY = process.env.CONTROL_PLANE_INTERVIEW_AGENT_KEY || "";
 
 if (!API_KEY) {
   process.stderr.write("[interview-mcp] INTERVIEW_MCP_KEY is not set — exiting\n");
@@ -59,6 +69,34 @@ async function forward(path: string, method: "GET" | "POST", bearerToken: string
     method,
     headers: {
       authorization: `Bearer ${bearerToken}`,
+      ...(method === "POST" ? { "content-type": "application/json" } : {}),
+    },
+    body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
+  });
+  const text = await response.text();
+  let parsed: unknown;
+  try { parsed = text ? JSON.parse(text) : {}; }
+  catch { parsed = { raw: text.slice(0, 500) }; }
+  if (!response.ok) {
+    throw new Error(`${method} ${path} → ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
+  }
+  return parsed;
+}
+
+/**
+ * Forwards to a chat-addressed route, which authenticates with the service key
+ * rather than a per-conversation token.
+ *
+ * These routes serve an interview the ROUTER started from a /start deep link,
+ * so there is no session token to carry — the interview is named by the chat
+ * the turn is running in, and the control plane matches that against the turn
+ * the router opened when it forwarded.
+ */
+async function forwardAsAgent(path: string, method: "GET" | "POST", body?: unknown) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      "x-api-key": AGENT_KEY,
       ...(method === "POST" ? { "content-type": "application/json" } : {}),
     },
     body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
@@ -110,21 +148,18 @@ function buildMcpServer() {
   mcp.tool(
     "submit_answer",
     "Submit or correct the organizer's answer to one question. For choice questions, pass optionId " +
-      "(or \"other\" plus otherText). For plain text questions, pass the text in otherText. For " +
+      "(or \"other\" plus otherText). For multi_choice questions (dietary), pass every chosen id " +
+      "together in optionIds. For plain text questions, pass the text in otherText. For " +
       "structured questions (travelers, phases, travel_anchors, constraints), pass a JSON array/object " +
       "in data — never as a string. A second submission for the same question overwrites the first " +
       "(corrections are allowed before CONFIRM).",
     {
       sessionId: z.string(),
       sessionToken: z.string(),
-      questionId: z.string().describe("Question id, e.g. \"destination\" or \"travelers\" — see get_session_status's nextQuestion"),
-      optionId: z.string().optional().describe("For choice questions: the chosen option id, or \"other\""),
-      otherText: z.string().optional().describe("For choice questions with optionId=\"other\", or for plain text questions"),
-      data: z.union([z.array(z.unknown()), z.record(z.string(), z.unknown())]).optional()
-        .describe("For structured questions only: an array (travelers, phases, travel_anchors) or object (constraints)"),
+      ...answerParams,
     },
-    async ({ sessionId, sessionToken, questionId, optionId, otherText, data }) =>
-      ok(await forward(`/v1/interview/${encodeURIComponent(sessionId)}/answer`, "POST", sessionToken, { questionId, optionId, otherText, data })),
+    async ({ sessionId, sessionToken, questionId, optionId, otherText, optionIds, data }) =>
+      ok(await forward(`/v1/interview/${encodeURIComponent(sessionId)}/answer`, "POST", sessionToken, { questionId, optionId: optionId ?? null, otherText, optionIds, data })),
   );
 
   // Unlike the tools above, this one does not forward to a control-plane
@@ -236,6 +271,44 @@ function buildMcpServer() {
     },
     async ({ sessionId, sessionToken }) => ok(await forward(`/v1/interview/${encodeURIComponent(sessionId)}/confirm`, "POST", sessionToken)),
   );
+
+  // ── Chat-addressed tools ───────────────────────────────────────────────────
+  //
+  // For the interview a Telegram organizer is conducting through the Trip Bot,
+  // which the router started from a /start deep link. There is no session
+  // token for it — the interview is named by the chat, and the control plane
+  // matches that against the turn the router opened when it forwarded the
+  // message. Registered only when the service key is configured.
+  if (AGENT_KEY) {
+    mcp.tool(
+      "get_interview_for_chat",
+      "Read the interview in progress in the conversation you are currently in — which question is " +
+        "pending and what has already been recorded. Call this BEFORE answering and treat what it " +
+        "returns as the truth: answers the organizer tapped were recorded without you, so your own " +
+        "conversation history is not the state of the interview. Takes no arguments; the interview " +
+        "is identified by the turn the router opened for this conversation.",
+      {},
+      async () => ok(await forwardAsAgent("/internal/interview/agent/current", "GET")),
+    );
+
+    mcp.tool(
+      "submit_answer_for_chat",
+      "Record an answer for the interview in progress in the conversation you are currently in. " +
+        "Takes no chat id — the interview is identified by the turn the router opened. Use this for " +
+        "answers the organizer wrote in words rather than tapped: resolve what they " +
+        "meant first, then submit the resolved value. The answer is recorded ONLY if this call " +
+        "succeeds — never tell the organizer you saved something unless it did. Dates must be normalised to YYYY-MM-DD before " +
+        "submitting, and a destination naming several places is a multi-destination trip rather than " +
+        "one city. Never show the organizer a YYYY-MM-DD date — confirm your reading back in words.",
+      {
+        ...answerParams,
+      },
+      async ({ questionId, optionId, otherText, optionIds, data }) =>
+        ok(await forwardAsAgent("/internal/interview/agent/current/answer", "POST", {
+          questionId, optionId: optionId ?? null, otherText, optionIds, data,
+        })),
+    );
+  }
 
   return mcp;
 }

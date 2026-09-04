@@ -31,5 +31,14 @@
     "action_ttl_seconds": 3600,
     "signup_rate_limit_cooldown_seconds": 3600,
     "webhook_secret_ref": "file:///run/secrets/telegram_webhook_secret"
+  },
+  "relay": {
+    "bind_host": "127.0.0.1",
+    "port": 4312,
+    "gateway_secret_refs": [
+      "file:///run/secrets/relay_gateway_secret"
+    ],
+    "telegram_bot_token_secret_ref": "file:///run/secrets/trip_bot_creds",
+    "interviewer_profile": "trip-intake"
   }
 }

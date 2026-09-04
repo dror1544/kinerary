@@ -8,6 +8,7 @@ import { digestTelegramId, verifyTelegramLogin, verifyTelegramWebhookSecret } fr
 import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
+  getSessionForAgent, submitAnswerForAgent, resolveChatFromOpenTurn,
 } from "./interview.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
@@ -58,6 +59,20 @@ export interface ChatRoutingDependencies {
   apiKey: string;
 }
 
+/**
+ * The interviewer agent's entry into an interview the ROUTER started.
+ *
+ * Separate from `interview` because the credential is different in kind: the
+ * interview routes take the organizer's own session token, while these take a
+ * service key held by the MCP sidecar, and the interview they act on is named
+ * by chat rather than carried by the token.
+ */
+export interface InterviewAgentDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Same trust tier as INTERVIEW_MCP_KEY. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -72,7 +87,10 @@ export interface AppDependencies {
   provisioner?: ProvisionerDependencies;
   /** Optional: mount the internal chat-routing lookup Hermes's gateway calls. */
   chatRouting?: ChatRoutingDependencies;
+  /** Optional: mount the organizer web portal routes. */
   portal?: PortalDependencies;
+  /** Optional: mount the interviewer agent's chat-addressed interview routes. */
+  interviewAgent?: InterviewAgentDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -951,6 +969,180 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // process deciding which profile's HERMES_HOME serves an inbound chat, not
   // a human. Returns only a trip id and a profile name — no trip content, no
   // credentials — so a leaked response is low-value on its own.
+  // ── The interviewer agent's interview routes ───────────────────────────────
+  //
+  // Both are addressed by chat rather than by session token, because the
+  // session was created by the router from a /start <enrollment_token> deep
+  // link and the agent was never handed a token for it.
+  //
+  // The chat named in the request is matched against the turn the router
+  // opened when it forwarded — see migration 0031 and lockSession's "agent"
+  // branch, which does that matching inside the same transaction as the write.
+  // A chat with no open turn resolves to no session and comes back 404.
+  //
+  // FUTURE: replace the supplied chat id with gateway-injected trusted context
+  // once the relay contract can carry it.
+
+  function agentAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.interviewAgent;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
+  }
+
+  // GET|POST /internal/interview/agent/current[...] — the same two operations,
+  // for an agent that cannot name its own chat.
+  //
+  // It cannot: the gateway sets the chat id on the agent object but never
+  // renders it into the prompt, so the model has no per-turn access to it.
+  // Asking it for one produced the first live run's failure — no write at all,
+  // and an invented interview on top.
+  //
+  // Registered as literal segments so Fastify's static-over-parametric
+  // precedence keeps them off the :chatId route; a Telegram chat id is numeric
+  // and can never collide with "current" regardless.
+  //
+  // The authorization story is unchanged, and slightly stronger: these routes
+  // were always gated on the router's open turn rather than on the id the
+  // caller supplied. Removing the id removes the only thing the model could
+  // have gotten wrong.
+  async function resolveCurrentChat(reply: { code: (n: number) => { send: (b: unknown) => unknown } }): Promise<string | null> {
+    const resolved = await resolveChatFromOpenTurn(dependencies.interviewAgent!.db);
+    if (resolved.ok) return resolved.chatId;
+    // AMBIGUOUS is 409, not 404: nothing is missing, the request cannot be
+    // attributed. Telling those apart is what stops a retry loop against a
+    // second organizer's live interview.
+    reply.code(resolved.reason === "AMBIGUOUS" ? 409 : 404).send({ error: resolved.reason });
+    return null;
+  }
+
+  app.get("/internal/interview/agent/current", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const result = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  app.post("/internal/interview/agent/current/answer", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
+    const optionId = body?.optionId ?? null;
+    const otherText = body?.otherText;
+    const structuredData = body?.data;
+    const optionIds = body?.optionIds;
+
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionIds !== undefined && (!Array.isArray(optionIds) || optionIds.some((id) => typeof id !== "string"))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const result = await submitAnswerForAgent(
+      dependencies.interviewAgent.db,
+      chatId,
+      questionId,
+      optionId as string | null,
+      otherText as string | undefined,
+      structuredData,
+      optionIds as string[] | undefined,
+    );
+
+    if (!result.ok) {
+      const status = result.reason === "NOT_FOUND" ? 404
+        : result.reason === "SESSION_CONFIRMED" ? 409
+        : 400;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(200).send({ state: result.view.state, view: result.view });
+  });
+
+  // GET /internal/interview/agent/:chatId — the session view for an open turn.
+  app.get("/internal/interview/agent/:chatId", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const chatId = params?.chatId;
+    if (typeof chatId !== "string" || chatId.length === 0) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const result = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // POST /internal/interview/agent/:chatId/answer — record a resolved answer.
+  //
+  // The agent's job is the judgement the deterministic layer cannot do:
+  // turning "Vienna and Prague" into a destination, a date phrased in words
+  // into a normalised one. What arrives here is the RESULT of that, and it
+  // goes through validateAnswer exactly like every other answer.
+  app.post("/internal/interview/agent/:chatId/answer", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const params = request.params as Record<string, unknown>;
+    const chatId = params?.chatId;
+    if (typeof chatId !== "string" || chatId.length === 0) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
+    const optionId = body?.optionId ?? null;
+    const otherText = body?.otherText;
+    const structuredData = body?.data;
+    const optionIds = body?.optionIds;
+
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (optionId !== null && typeof optionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    if (otherText !== undefined && typeof otherText !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // Same reason as the token-authenticated route: an id must be a literal
+    // option id, not something that stringifies into one.
+    if (optionIds !== undefined && (!Array.isArray(optionIds) || optionIds.some((id) => typeof id !== "string"))) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const result = await submitAnswerForAgent(
+      dependencies.interviewAgent.db,
+      chatId,
+      questionId,
+      optionId as string | null,
+      otherText as string | undefined,
+      structuredData,
+      optionIds as string[] | undefined,
+    );
+
+    if (!result.ok) {
+      const status = result.reason === "NOT_FOUND" ? 404
+        : result.reason === "SESSION_CONFIRMED" ? 409
+        : 400;
+      return reply.code(status).send({ error: result.reason });
+    }
+    return reply.code(200).send({ state: result.view.state, view: result.view });
+  });
+
   app.get("/internal/telegram-chat-bindings/:chatId", async (request, reply) => {
     if (!dependencies.chatRouting) {
       return reply.code(503).send({ error: "CHAT_ROUTING_NOT_CONFIGURED" });
@@ -965,8 +1157,14 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (typeof chatId !== "string" || chatId.length === 0) {
       return reply.code(400).send({ error: "INVALID_REQUEST" });
     }
+    // `closed_at IS NULL` is load-bearing, not tidiness. Migration 0029 keeps
+    // closed bindings as history, so an unfiltered read would route a group to
+    // a trip it was deliberately detached from — on a shared bot, that is
+    // another organizer's trip.
     const result = await db.query<{ trip_id: string; hermes_profile: string }>(
-      "SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1",
+      `SELECT trip_id, hermes_profile
+       FROM control_plane.telegram_chat_bindings
+       WHERE chat_id = $1 AND closed_at IS NULL`,
       [chatId],
     );
     const [row] = result.rows;
