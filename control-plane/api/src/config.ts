@@ -71,6 +71,17 @@ export const architectureProfileSchema = z.object({
     // supplied sender identity — see identity.ts's verifyTelegramWebhookSecret.
     webhook_secret_ref: secretReference,
   }).strict().optional(),
+  web: z.object({
+    public_origin: z.string().url(),
+    runtime_origin: z.string().url(),
+    google_client_id_secret_ref: secretReference,
+    google_client_secret_ref: secretReference,
+    runtime_exchange_key_secret_ref: secretReference,
+    runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
+    telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
+    provisioning_admin_subject_digests: z.array(z.string().regex(/^sha256:[a-f0-9]{64}$/)).min(1),
+    session_ttl_seconds: z.number().int().min(3600).max(2592000).default(604800),
+  }).strict().optional(),
   /**
    * The Trip Bot relay connector — the WebSocket server Hermes's gateway dials
    * OUT to, plus the shared bot token the connector polls.
@@ -158,6 +169,14 @@ export const architectureProfileSchema = z.object({
       path: ["signup", "super_admin_chat_id_secret_ref"],
       message: "the telegram messaging adapter needs super_admin_chat_id_secret_ref to know where to send the approval DM",
     });
+  }
+  if (profile.web && profile.web.public_origin === profile.web.runtime_origin) {
+    ctx.addIssue({ code: "custom", path: ["web", "runtime_origin"], message: "runtime origin must be isolated from the organizer origin" });
+  }
+  if (profile.environment === "production" && profile.web) {
+    for (const [key, value] of [["public_origin", profile.web.public_origin], ["runtime_origin", profile.web.runtime_origin]] as const) {
+      if (!value.startsWith("https://")) ctx.addIssue({ code: "custom", path: ["web", key], message: "production web origins must use https" });
+    }
   }
 });
 

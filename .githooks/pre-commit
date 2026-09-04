@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — the CLAUDE.md hard rules, on every commit path.
+#
+# Versioned deliberately: .git/hooks is not, so a hook that lives only there is
+# one fresh clone away from being gone. Enabled with
+#
+#   git config core.hooksPath .githooks
+#
+# Claude Code has its own hook into the same script (.claude/settings.json), so
+# it can steer before a commit is attempted. This one is the backstop that
+# covers Codex, Hermes, scripts and a plain `git commit` typed by hand.
+#
+# To bypass for a genuine emergency:  git commit --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CHECKS="$REPO_ROOT/scripts/preflight-checks.sh"
+[ -x "$CHECKS" ] || exit 0
+
+if ! "$CHECKS" --staged; then
+  echo
+  echo "commit refused — see the BLOCK lines above (CLAUDE.md 'Hard Rules')." >&2
+  echo "override only if you know why:  git commit --no-verify" >&2
+  exit 1
+fi

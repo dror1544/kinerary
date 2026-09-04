@@ -17,6 +17,7 @@ import { issueApproval } from "./plan-approval.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
 import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
+import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -87,6 +88,8 @@ export interface AppDependencies {
   provisioner?: ProvisionerDependencies;
   /** Optional: mount the internal chat-routing lookup Hermes's gateway calls. */
   chatRouting?: ChatRoutingDependencies;
+  /** Optional: mount the organizer web portal routes. */
+  portal?: PortalDependencies;
   /** Optional: mount the interviewer agent's chat-addressed interview routes. */
   interviewAgent?: InterviewAgentDependencies;
 }
@@ -115,6 +118,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       "/v1/interview/:sessionId/venue-links",
       "/v1/plans/:planId", "/v1/plans/:planId/approve",
       "/v1/releases",
+      "/internal/telegram-interviews/bind",
     ],
   }));
 
@@ -145,6 +149,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   //    stopgap path, see password-identity.ts's module doc.
   // Returns: { status, requestId? }
   app.post("/v1/signup", async (request, reply) => {
+    if (dependencies.portal) return reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" });
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
     }
@@ -302,7 +307,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
   // GET /v1/trips/:id — read a trip the authenticated user is a member of.
   // Header: X-Telegram-Login or X-Portal-Password-Login (base64url JSON)
-  app.get("/v1/trips/:id", async (request, reply) => {
+  if (!dependencies.portal) app.get("/v1/trips/:id", async (request, reply) => {
     if (!dependencies.signup) {
       return reply.code(503).send({ error: "SIGNUP_NOT_CONFIGURED" });
     }
@@ -1241,6 +1246,43 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
     return reply.code(200).send({ tripId: row.trip_id, hermesProfile: row.hermes_profile });
   });
+
+  // The shared Telegram bot exchanges a deep-link token for an interview and
+  // binds only that verified chat to the resulting session. No web-login
+  // identity is created or modified by this path.
+  app.post("/internal/telegram-interviews/bind", async (request, reply) => {
+    if (!dependencies.chatRouting || !dependencies.interview) return reply.code(503).send({ error: "INTERVIEW_BINDING_NOT_CONFIGURED" });
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    if (providedKey !== dependencies.chatRouting.apiKey) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const body = request.body as Record<string, unknown>;
+    const chatId = typeof body.chatId === "string" && /^-?[0-9]{1,20}$/.test(body.chatId) ? body.chatId : null;
+    const enrollmentToken = typeof body.enrollmentToken === "string" ? body.enrollmentToken : null;
+    if (!chatId || !enrollmentToken) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const active = await dependencies.interview.db.query("SELECT 1 FROM control_plane.telegram_interview_bindings WHERE chat_id = $1 AND state = 'active'", [chatId]);
+    if (active.rows[0]) return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
+    const started = await startSession(dependencies.interview.db, enrollmentToken, log);
+    if (!started.ok) return reply.code(started.reason === "TRIP_NOT_DRAFT" ? 409 : 401).send({ error: started.reason });
+    try {
+      await dependencies.interview.db.query(
+        `INSERT INTO control_plane.telegram_interview_bindings(chat_id, trip_id, session_id, state)
+         VALUES ($1, $2, $3, 'active')`, [chatId, started.view.tripId, started.sessionId]);
+    } catch (error) {
+      // A chat binding race must not reveal the newly minted bearer. Remove
+      // the losing session and return the trip to draft so the organizer can
+      // issue a fresh one-time link.
+      const client = await dependencies.interview.db.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("DELETE FROM control_plane.intake_sessions WHERE id = $1", [started.sessionId]);
+        await client.query("UPDATE control_plane.trips SET lifecycle_state = 'draft', updated_at = now() WHERE id = $1 AND lifecycle_state = 'intake_in_progress'", [started.view.tripId]);
+        await client.query("COMMIT");
+      } catch { await client.query("ROLLBACK"); } finally { client.release(); }
+      return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
+    }
+    return reply.code(201).send({ sessionId: started.sessionId, sessionToken: started.sessionToken, tripId: started.view.tripId });
+  });
+
+  if (dependencies.portal) { app.get("/v1/auth/telegram", async (_request, reply) => reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" })); registerPortalRoutes(app, dependencies.portal); }
 
   if (dependencies.close) app.addHook("onClose", dependencies.close);
   return app;

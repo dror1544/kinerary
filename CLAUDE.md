@@ -95,9 +95,13 @@ Details: `mcp/README.md`, `mcp/PROVISIONING.md`.
 ## Testing
 
 ```bash
-cd tests && npm test        # 111 tests as of this writing — all should pass before you start
+cd tests && npm test        # 405 tests / 81 suites as of 2026-09-04 — all pass
+scripts/preflight-deploy.sh # every suite at once, plus the hard rules below
 ```
-Run before claiming something works, not after. If you touch a
+Run before claiming something works, not after. `preflight-deploy.sh` skips a
+suite whose interpreter deps are missing rather than failing it, and says so —
+a check that is permanently red is a check nobody reads. It proves the build is
+deployable; it does **not** deploy. If you touch a
 security-relevant path (anything above, or auth in general), show the actual
 request/response proving the thing is hidden or scoped correctly — not a
 description of the code.
@@ -146,6 +150,55 @@ restore commits fake dates. Always `--restore` before committing; `--status`
 exits non-zero while a trip is shifted. The script refuses outright to shift a
 trip that is running right now — that would move a live trip under the people
 on it.
+
+## The hard rules are enforced, not just written
+
+Every rule in "Hard Rules" above is now checked by
+`scripts/preflight-checks.sh`, which has two callers so no commit path escapes:
+
+- **`.githooks/pre-commit`** — every commit, whoever makes it (Codex, Hermes,
+  a plain `git commit`). Enable once per clone: `git config core.hooksPath .githooks`.
+- **`.claude/settings.json` hooks** — Claude Code, early enough to steer rather
+  than refuse. `git commit` and deploy verbs additionally become a *prompt*
+  every time, because rules 1 and 2 are about intent and no script can check
+  intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
+  which strips heredocs and quotes first — matching the bare words "git" and
+  "commit" refuses any command that merely *writes documentation about* them.
+
+```bash
+scripts/preflight-checks.sh --staged   # what the commit hook runs
+scripts/preflight-checks.sh --all      # audit the whole tree
+```
+
+Blocking: binaries (rule 3), writes to `trip/` (rule 4), a broken create-trip
+symlink, a date-shifted trip, and repo↔Hermes-profile drift. Reviewed
+exceptions live in `.preflight-allow` — an entry there is a recorded decision
+with a reason, not a silent exemption.
+
+`.agents/hermes-sync.tsv` maps repo content that also lives in a profile.
+`install-hermes-skill.sh` cannot express every pairing (it requires a
+`SKILL.md` and only manages `skills/travel/`), so profile SOULs are listed
+there instead. Profile skills with **no** repo copy are warned about, not
+blocked — that is a capture backlog, not a reason nobody can commit.
+
+## Agents and run tooling
+
+Subagents in `.claude/agents/` — none can commit or deploy:
+
+| Agent | For |
+|---|---|
+| `verifier` | Works out which suites a change touches, runs them, reports real output. Has no Write/Edit on purpose. |
+| `pr-steward` | Branch/PR sweep and doc drift. Deletes only provably-merged branches, only on confirmation. |
+| `sprint-scribe` | Marks plan items `— BUILT (date)` and moves ledger rows. Surfaces unowned gaps as decisions. |
+| `run-capture` | Raw live-run notes → triaged ledger rows routed to the owning sprint. |
+| `boundary-reviewer` | The three invariants under "Security-sensitive paths", with live request/response evidence. |
+
+`sprint-scribe` and `run-capture` must never record human approval, and must
+never guess which sprint owns an item — see the standing instruction at the top
+of `docs/signup-test-execution-capture (Manual).md`.
+
+`.agents/skills/live-run/` drives the 🤖 steps of `docs/setup-test-plan.md` and
+stops at every 🧍, resumable by step. It never deploys and never tears down.
 
 ## Working style
 

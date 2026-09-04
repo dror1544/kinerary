@@ -38,3 +38,6 @@ control-plane/worker/**/__pycache__/
 control-plane/deployment/.local-secrets/
 profile-templates/**/__pycache__/
 .hermes-pr3-architecture-review.md
+
+# live-run driver state (.agents/skills/live-run) — run scratch, never committed
+.live-runs/

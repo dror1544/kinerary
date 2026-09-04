@@ -34,7 +34,7 @@ before(async () => {
     req.on('end', () => {
       lastMockRequest = { headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString() || '{}') };
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ name: 'Mock Hotel', type: 'hotel' }));
+      res.end(JSON.stringify({ phase: 'ny', name: 'Mock Hotel', type: 'hotel', confirmation: 'MOCK-42' }));
     });
   });
   await new Promise(resolve => mockHermes.listen(MOCK_PORT, resolve));
@@ -108,5 +108,121 @@ describe('POST /api/bookings/extract', () => {
     assert.match(contentType, /application\/json/);
     const data = await res.json(); // throws if this is HTML, proving the fix
     assert.ok(data.error);
+  });
+});
+
+describe('POST /api/bookings/extract-draft', () => {
+  test('creates a private organizer draft, then makes it visible only after approval', async () => {
+    const created = await api('/api/bookings/extract-draft', {
+      method: 'POST', token, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(created.status, 201);
+    const { booking } = await created.json();
+    assert.equal(booking.review_status, 'draft');
+    assert.equal(booking.confirmation, 'MOCK-42');
+
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const memberRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(memberRows.some(row => row.id === booking.id), false, 'member must not see unapproved drafts');
+
+    // A draft linked by an organizer must remain redacted in every Modern
+    // participant projection, not only in the Classic bookings list.
+    const itineraryWrite = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: 'ny', date: '2027-03-11', text_he: 'טיוטת מלון פרטית', booking_id: booking.id },
+    });
+    assert.equal(itineraryWrite.status, 201);
+    const itineraryCreated = await itineraryWrite.json();
+    const active = await (await api('/api/itinerary/active', { token: bobToken })).json();
+    assert.equal(active.items.find(item => item.item_uid === itineraryCreated.item_uid)?.booking, null);
+    const confirmations = await (await api('/api/confirmations/summary', { token: bobToken })).json();
+    assert.equal(confirmations.items.some(item => item.id === booking.id), false, 'draft confirmation leaked through Modern summary');
+
+    const approved = await api(`/api/bookings/${booking.id}/approve`, { method: 'POST', token });
+    assert.equal(approved.status, 200);
+    const visibleRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(visibleRows.some(row => row.id === booking.id), true, 'approved draft should be visible to members');
+  });
+
+  test('rejects a member attempting to create a draft', async () => {
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const res = await api('/api/bookings/extract-draft', {
+      method: 'POST', token: bobToken, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test('an ignored quality issue remains ignored after the engine recomputes', async () => {
+    const reported = await api('/api/issues/report', {
+      method: 'POST', token, body: { title: 'Keep ignored', detail: 'organizer decision' },
+    });
+    assert.equal(reported.status, 201);
+    const { id } = await reported.json();
+    const ignored = await api(`/api/issues/${id}`, { method: 'PATCH', token, body: { status: 'ignored' } });
+    assert.equal(ignored.status, 200);
+    const issues = await (await api('/api/issues', { token })).json();
+    assert.equal(issues.find(issue => issue.id === id)?.status, 'ignored');
+  });
+});
+
+// PR-28 review regression: updateLegacyFromActive() used to DELETE every
+// phase_plan_* row and re-insert, which destroyed Classic correction/enrichment
+// history. The fix switched to a keyed upsert — but an upsert with no delete
+// pass would instead let a Classic row survive after its Modern source was
+// removed, and could duplicate a row on repeated edits. These pin the reconcile.
+describe('Modern itinerary edits reconcile into the Classic plan', () => {
+  const PHASE = 'ny';
+  const DATE = '2027-03-11';
+  const planRows = async () => (await api(`/api/phases/${PHASE}/plan`, { token })).json();
+  const withText = (rows, text_en) => rows.filter((r) => r.text_en === text_en);
+
+  let keptUid;
+  let removedUid;
+
+  test('a Modern item is projected into the Classic plan', async () => {
+    const first = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני ראשון', text_en: 'Reconcile item A' },
+    });
+    const second = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני שני', text_en: 'Reconcile item B' },
+    });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    keptUid = (await first.json()).item_uid;
+    removedUid = (await second.json()).item_uid;
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item A').length, 1);
+    assert.equal(withText(rows, 'Reconcile item B').length, 1);
+  });
+
+  test('deleting the Modern item removes it from the Classic plan — no resurrection', async () => {
+    const del = await api(`/api/itinerary/items/${removedUid}`, { method: 'DELETE', token });
+    assert.equal(del.status, 200);
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item B').length, 0,
+      'the deleted Modern item is still present in the Classic projection');
+    assert.equal(withText(rows, 'Reconcile item A').length, 1,
+      'the surviving item must not be dropped by the reconcile');
+  });
+
+  test('repeated Modern edits never duplicate the Classic row', async () => {
+    for (const text_en of ['Reconcile item A v2', 'Reconcile item A v3', 'Reconcile item A v4']) {
+      const res = await api(`/api/itinerary/items/${keptUid}`, { method: 'PATCH', token, body: { text_en } });
+      assert.equal(res.status, 200);
+    }
+    const rows = await planRows();
+    const mine = rows.filter((r) => (r.text_en || '').startsWith('Reconcile item A'));
+    assert.equal(mine.length, 1, `expected exactly one Classic row for the edited item, got ${mine.length}`);
+    assert.equal(mine[0].text_en, 'Reconcile item A v4');
   });
 });
