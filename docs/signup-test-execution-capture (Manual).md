@@ -5,6 +5,13 @@ notes and the agent debriefs live in **`signup-test-run1-raw-notes.md`**
 (archived 2026-08-29); this file keeps only the triaged Status ledger below,
 which is the source of truth for what is done vs. planned.
 
+**Run 2 is in progress (2026-09-04).** Its notes are being captured live in
+**`signup-test-run2-raw-notes.md`** and are deliberately *not* in the ledger
+below yet — nothing from run 2 is triaged until the run ends. That file also
+records which run-1 rows this run was built to prove: the pinned interview
+language and the removal of "(Recommended)" (General #3-adjacent, Step 2 #3b,
+Step 3 #2), plus repro attempts for the two open bugs, Step 3 #7 and #9.
+
 **Standing instructions for every run:**
 
 - Until this is production, the interview opens with a disclaimer that it is
