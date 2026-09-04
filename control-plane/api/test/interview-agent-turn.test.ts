@@ -27,6 +27,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
+import { MediaStore } from "../src/relay/media-store.js";
 import {
   AGENT_TURN_TTL_SECONDS,
   closeAgentTurn,
@@ -257,6 +258,107 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
       assert.equal(decision.event.source.profile, "trip-intake");
       assert.equal(decision.event.source.chat_id, a.chatId);
       assert.equal(decision.event.text, "Vienna and Prague");
+    });
+  });
+
+  test("/done reaches the summary whatever the interviewer is doing", async () => {
+    // Run 6 ended with the agent asking for approval in prose, the organizer
+    // agreeing, and nothing happening — only the router's Confirm button
+    // writes an intake version, and it had never been sent. This is the path
+    // that does not depend on the agent, or on a button sent long ago.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/done"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "show_summary");
+      if (decision.kind !== "show_summary") return;
+      assert.equal(decision.chatId, a.chatId);
+      // With required questions still outstanding it does NOT jump to a recap
+      // — there is nothing valid to confirm yet — it asks the next one. The
+      // command's job is to be a route that always works, not a way past the
+      // questions the trip cannot be built without.
+      assert.equal(decision.view.state, "interviewing");
+      assert.ok(decision.view.nextQuestion?.required, "and the required question is what comes next");
+    });
+  });
+
+  test("an unrelated command is still forwarded, not swallowed", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/help"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.notEqual(decision.kind, "show_summary");
+    });
+  });
+
+  test("an uploaded document reaches the interviewer, re-hosted", async () => {
+    // Regression, 2026-09-04 run 2. This branch called the plain `toWireEvent`,
+    // so a caption-less PDF arrived as `text: ""` and the interviewer told the
+    // organizer an empty message had come through — on the one route whose own
+    // script asks for a trip-plan document. The companion route had carried
+    // media since 2026-09-03; only this one did not.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const pdf = Buffer.from("%PDF-1.4 itinerary");
+      const store = new MediaStore();
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 2,
+          message: {
+            message_id: 12,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            telegram: { async fetchFile() { return { bytes: pdf, mime: "application/pdf" }; } },
+            store,
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.message_type, "document");
+      assert.equal(decision.event.media?.[0]?.filename, "japan.pdf");
+      const url = decision.event.media_urls?.[0] ?? "";
+      assert.match(url, /^http:\/\/127\.0\.0\.1:4312\/relay\/media\/[0-9a-f]{32}$/);
+      // The point of re-hosting: the gateway is handed a reference it can
+      // fetch, never a Telegram URL carrying the bot token.
+      assert.ok(store.get(url.split("/").pop()!), "the bytes are readable through the store");
+    });
+  });
+
+  test("an attachment still forwards when the connector has no media plane", async () => {
+    // Degrade, never drop: without media deps the turn is still handed over, so
+    // the agent can say it cannot read the file rather than going silent.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+            caption: "our plan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.text, "our plan");
+      assert.equal(decision.event.media_urls, undefined);
     });
   });
 

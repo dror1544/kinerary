@@ -25,6 +25,11 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
+// `claimDueRouterPrompts(pool, 10, 0)` throughout: these are about the HANDOFF
+// — a write leaves a prompt owing, claimed exactly once, only for the chat
+// written to. The settle window that debounces a burst of writes is a
+// separate property, tested in interview.test.ts, and waiting three seconds
+// in each of these would only make them slow.
 import { openAgentTurn, resolveChatFromOpenTurn, claimDueRouterPrompts, submitAnswerForAgent } from "../src/interview.js";
 import { buildApp, type InterviewAgentDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
@@ -298,12 +303,12 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
     test("an agent write leaves a prompt owing to that chat", async () => {
       await withTwoInterviews(async ({ pool, a }) => {
         await openAgentTurn(pool, a.chatId, a.sessionId);
-        assert.deepEqual(await claimDueRouterPrompts(pool), [], "nothing owed before the write");
+        assert.deepEqual(await claimDueRouterPrompts(pool, 10, 0), [], "nothing owed before the write");
 
         const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
         assert.equal(written.ok, true);
 
-        const due = await claimDueRouterPrompts(pool);
+        const due = await claimDueRouterPrompts(pool, 10, 0);
         assert.equal(due.length, 1);
         assert.equal(due[0]!.chatId, a.chatId);
         assert.equal(due[0]!.sessionId, a.sessionId);
@@ -316,8 +321,8 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
         await openAgentTurn(pool, a.chatId, a.sessionId);
         await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
 
-        const first = await claimDueRouterPrompts(pool);
-        const second = await claimDueRouterPrompts(pool);
+        const first = await claimDueRouterPrompts(pool, 10, 0);
+        const second = await claimDueRouterPrompts(pool, 10, 0);
         assert.equal(first.length, 1);
         assert.deepEqual(second, [], "a second claim finds nothing");
       });
@@ -327,7 +332,7 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
       await withTwoInterviews(async ({ pool, a, b }) => {
         await openAgentTurn(pool, a.chatId, a.sessionId);
         await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
-        const due = await claimDueRouterPrompts(pool);
+        const due = await claimDueRouterPrompts(pool, 10, 0);
         assert.equal(due.length, 1);
         assert.notEqual(due[0]!.chatId, b.chatId);
       });
@@ -339,7 +344,7 @@ describe("interviewer agent routes", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
       await withTwoInterviews(async ({ pool, a }) => {
         const written = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
         assert.equal(written.ok, false);
-        assert.deepEqual(await claimDueRouterPrompts(pool), []);
+        assert.deepEqual(await claimDueRouterPrompts(pool, 10, 0), []);
       });
     });
   });

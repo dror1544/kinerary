@@ -61,6 +61,41 @@ function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
+/**
+ * A rejected call is an ANSWER, not a transport failure.
+ *
+ * Hermes's MCP client counts thrown tool errors toward "server unreachable",
+ * and trips a breaker after three in a row. On 2026-09-04 run 6 the agent sent
+ * two malformed `submit_answer_for_chat` calls, the API replied 400
+ * (TEXT_REQUIRED — a text question submitted with no text), the third strike
+ * landed, and the interview MCP went away for ~46 seconds. The organizer, who
+ * had just uploaded a document containing their whole trip, was then asked for
+ * the destination from scratch: the agent had told them it read everything,
+ * and nothing had been recorded at all.
+ *
+ * A 4xx is the control plane telling the agent it got the arguments wrong.
+ * That belongs in the tool's RESULT, where the agent can read it and correct
+ * itself, not in the transport, where three of them look like an outage.
+ * Genuine failures — 5xx, a dead socket — still throw, because those are the
+ * ones a breaker should count.
+ */
+function rejected(status: number, path: string, parsed: unknown): { content: { type: "text"; text: string }[] } {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        ok: false,
+        status,
+        error: parsed,
+        hint: "The control plane refused these arguments — nothing was recorded. Read the message, "
+          + "fix the arguments and call again. Do NOT tell the organizer anything was saved, and do "
+          + "not treat this as the tool being unavailable.",
+        path,
+      }, null, 2),
+    }],
+  };
+}
+
 async function forward(path: string, method: "GET" | "POST", bearerToken: string, body?: unknown) {
   // Fastify's JSON body parser rejects an empty body when content-type is
   // application/json, even for routes that never read one — default POST to
@@ -106,9 +141,23 @@ async function forwardAsAgent(path: string, method: "GET" | "POST", body?: unkno
   try { parsed = text ? JSON.parse(text) : {}; }
   catch { parsed = { raw: text.slice(0, 500) }; }
   if (!response.ok) {
-    throw new Error(`${method} ${path} → ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
+    // 5xx and above is the control plane failing; that is worth counting
+    // against the server. 4xx is the agent being told it is holding the tool
+    // wrong — see `rejected`.
+    if (response.status >= 500) {
+      throw new Error(`${method} ${path} → ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
+    }
+    return { __rejected: rejected(response.status, path, parsed) };
   }
   return parsed;
+}
+
+/** Unwraps whatever `forwardAsAgent` returned into an MCP tool result. */
+function agentResult(result: unknown) {
+  if (result && typeof result === "object" && "__rejected" in result) {
+    return (result as { __rejected: ReturnType<typeof rejected> }).__rejected;
+  }
+  return ok(result);
 }
 
 // ── MCP tool definitions ──────────────────────────────────────────────────────
@@ -288,7 +337,45 @@ function buildMcpServer() {
         "conversation history is not the state of the interview. Takes no arguments; the interview " +
         "is identified by the turn the router opened for this conversation.",
       {},
-      async () => ok(await forwardAsAgent("/internal/interview/agent/current", "GET")),
+      async () => agentResult(await forwardAsAgent("/internal/interview/agent/current", "GET")),
+    );
+
+    mcp.tool(
+      "set_interview_language_for_chat",
+      "Tell the control plane which language this interview is being conducted in, as a two-letter " +
+        "code ('en', 'he'). Call it once, as soon as the organizer's first substantive message has " +
+        "settled the language, and again only if they explicitly ask to switch. You are the only " +
+        "side that can read what they wrote: the questions, buttons, recap and file acknowledgements " +
+        "are drawn by the router, and without this it draws all of them in English — which is how a " +
+        "Hebrew interview ended up alternating languages message by message.",
+      { language: z.string().min(2).max(8).describe("two-letter language code, e.g. 'he'") },
+      async ({ language }) =>
+        agentResult(await forwardAsAgent("/internal/interview/agent/current/language", "POST", { language })),
+    );
+
+    mcp.tool(
+      "ask_question_for_chat",
+      "Put one of the intake's OPTIONAL questions to the organizer next. Takes no chat id. Use this " +
+        "instead of asking an option question yourself: the questions with fixed choices are drawn " +
+        "as real tappable buttons, which you cannot do. YOU decide which one is worth asking and " +
+        "when — they are not walked automatically, because asking all of them in order turns the " +
+        "interview into a form. Skip any whose answer you can already work out (a timezone from the " +
+        "destination, a home country from the organizer) rather than putting it to them. " +
+        "`get_interview_for_chat`'s `optionalRemaining` lists what is still open.",
+      { questionId: z.string().min(1).max(64).describe("id from optionalRemaining, e.g. 'dietary'") },
+      async ({ questionId }) =>
+        agentResult(await forwardAsAgent("/internal/interview/agent/current/ask", "POST", { questionId })),
+    );
+
+    mcp.tool(
+      "show_summary_for_chat",
+      "Ask the organizer to review and confirm. Takes no chat id, and no arguments. Call it when you " +
+        "have what the trip needs and they have nothing more to add — it makes the router send the " +
+        "recap with its Confirm / Keep planning buttons. It does NOT confirm anything: only the " +
+        "organizer's own tap on Confirm does that, and you have no tool that can. If they tap Keep " +
+        "planning the interview reopens and you carry on.",
+      {},
+      async () => agentResult(await forwardAsAgent("/internal/interview/agent/current/summary", "POST", {})),
     );
 
     mcp.tool(
@@ -304,7 +391,7 @@ function buildMcpServer() {
         ...answerParams,
       },
       async ({ questionId, optionId, otherText, optionIds, data }) =>
-        ok(await forwardAsAgent("/internal/interview/agent/current/answer", "POST", {
+        agentResult(await forwardAsAgent("/internal/interview/agent/current/answer", "POST", {
           questionId, optionId: optionId ?? null, otherText, optionIds, data,
         })),
     );

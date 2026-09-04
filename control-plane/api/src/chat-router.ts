@@ -22,6 +22,13 @@
  * either way, which is why they are built first.
  */
 import type pg from "pg";
+import {
+  askText,
+  DEFAULT_LANGUAGE,
+  optionLabel,
+  uiString,
+  type Language,
+} from "./intake-copy.js";
 import { INTAKE_QUESTIONS, startSession, type IntakeQuestion, type SessionView } from "./interview.js";
 import { structuredLog } from "./redaction.js";
 
@@ -183,6 +190,8 @@ export async function startFromDeepLink(
   chatId: string,
   payload: string | null,
   log: (line: string) => void = () => {},
+  /** The organizer's Telegram client locale, if the update carried one. */
+  languageHint?: string,
 ): Promise<StartLinkOutcome> {
   // A chat already conducting an interview must not consume a second
   // enrollment. The partial unique index on (telegram_chat_id) would reject
@@ -208,7 +217,7 @@ export async function startFromDeepLink(
     return { kind: "rejected", reason: "NOT_PRIVATE_CHAT" };
   }
 
-  const result = await startSession(db, payload, log, undefined, chatId);
+  const result = await startSession(db, payload, log, undefined, chatId, languageHint);
   if (!result.ok) {
     log(structuredLog("info", "chat_router.start_link_rejected", { safe_error_code: result.reason }));
     return { kind: "rejected", reason: result.reason };
@@ -252,11 +261,38 @@ export function answerCallbackData(questionId: string, optionId: string): string
 
 export const CONFIRM_CALLBACK_DATA = "c:confirm";
 export const KEEP_PLANNING_CALLBACK_DATA = "c:keep";
+/** "That's everything" — stop offering optional questions and show the recap. */
+export const FINISH_CALLBACK_DATA = "c:done";
+/** "A few more questions" — the organizer asks for the next optional one themselves. */
+export const MORE_CALLBACK_DATA = "c:more";
+/** "I don't have one" — skip the document offer and start the questions. */
+export const NO_DOCUMENT_CALLBACK_DATA = "c:nodoc";
+
+/** `t:<questionId>:<optionId>` — one tick of a multi-select. */
+export function toggleCallbackData(questionId: string, optionId: string): string {
+  return `t:${questionId}:${optionId}`;
+}
+
+/** `k:<questionId>` — skip this optional question. */
+export function skipCallbackData(questionId: string): string {
+  return `k:${questionId}`;
+}
+
+/** `n:<questionId>` — a multi-select is finished; move on. */
+export function multiDoneCallbackData(questionId: string): string {
+  return `n:${questionId}`;
+}
 
 export type ParsedCallback =
   | { kind: "answer"; questionId: string; optionId: string }
+  | { kind: "toggle"; questionId: string; optionId: string }
+  | { kind: "multi_done"; questionId: string }
+  | { kind: "skip"; questionId: string }
   | { kind: "confirm" }
   | { kind: "keep_planning" }
+  | { kind: "finish" }
+  | { kind: "more" }
+  | { kind: "no_document" }
   | { kind: "unknown" };
 
 /**
@@ -268,11 +304,25 @@ export type ParsedCallback =
 export function parseCallbackData(data: string): ParsedCallback {
   if (data === CONFIRM_CALLBACK_DATA) return { kind: "confirm" };
   if (data === KEEP_PLANNING_CALLBACK_DATA) return { kind: "keep_planning" };
-  const match = /^a:([A-Za-z0-9_]{1,64}):([A-Za-z0-9_]{1,64})$/.exec(data);
-  const questionId = match?.[1];
-  const optionId = match?.[2];
-  if (!questionId || !optionId) return { kind: "unknown" };
-  return { kind: "answer", questionId, optionId };
+  if (data === FINISH_CALLBACK_DATA) return { kind: "finish" };
+  if (data === MORE_CALLBACK_DATA) return { kind: "more" };
+  if (data === NO_DOCUMENT_CALLBACK_DATA) return { kind: "no_document" };
+
+  const pair = /^([at]):([A-Za-z0-9_]{1,64}):([A-Za-z0-9_]{1,64})$/.exec(data);
+  if (pair?.[2] && pair[3]) {
+    return pair[1] === "a"
+      ? { kind: "answer", questionId: pair[2], optionId: pair[3] }
+      : { kind: "toggle", questionId: pair[2], optionId: pair[3] };
+  }
+
+  const single = /^([kn]):([A-Za-z0-9_]{1,64})$/.exec(data);
+  if (single?.[2]) {
+    return single[1] === "k"
+      ? { kind: "skip", questionId: single[2] }
+      : { kind: "multi_done", questionId: single[2] };
+  }
+
+  return { kind: "unknown" };
 }
 
 /**
@@ -286,23 +336,56 @@ export function parseCallbackData(data: string): ParsedCallback {
  * because trip-type and group-size labels are long enough that two per row
  * truncate on a phone.
  */
-export function renderQuestion(question: IntakeQuestion): RenderedQuestion {
-  if (question.type !== "choice" && question.type !== "multi_choice") {
-    return { text: question.prompt, replyMarkup: null };
-  }
-  const options = question.options ?? [];
+export function renderQuestion(
+  question: IntakeQuestion,
+  selected: readonly string[] = [],
+  language: Language = DEFAULT_LANGUAGE,
+): RenderedQuestion {
   const rows: InlineButton[][] = [];
-  for (const option of options) {
-    const data = answerCallbackData(question.id, option.id);
-    // An option whose callback_data would not fit is dropped from the keyboard
-    // rather than sent truncated — a truncated payload would parse as a
-    // DIFFERENT option id and silently record the wrong answer. No intake
-    // question is anywhere near the limit today; this is here so that stops
-    // being true loudly rather than quietly.
-    if (!callbackDataFits(data)) continue;
-    rows.push([{ text: option.label, callback_data: data }]);
+
+  if (question.type === "choice" || question.type === "multi_choice") {
+    const multi = question.type === "multi_choice";
+    for (const option of question.options ?? []) {
+      const data = multi
+        ? toggleCallbackData(question.id, option.id)
+        : answerCallbackData(question.id, option.id);
+      // An option whose callback_data would not fit is dropped from the
+      // keyboard rather than sent truncated — a truncated payload would parse
+      // as a DIFFERENT option id and silently record the wrong answer. No
+      // intake question is anywhere near the limit today; this is here so that
+      // stops being true loudly rather than quietly.
+      if (!callbackDataFits(data)) continue;
+      // The tick is the whole multi-select affordance: Telegram gives no
+      // selected state of its own, so without it a second tap is
+      // indistinguishable from a first.
+      const text = optionLabel(question, option.id, language);
+      const label = multi && selected.includes(option.id) ? `✅ ${text}` : text;
+      rows.push([{ text: label, callback_data: data }]);
+    }
+    if (multi) {
+      rows.push([{ text: uiString("multiDone", language), callback_data: multiDoneCallbackData(question.id) }]);
+    }
   }
-  return { text: question.prompt, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
+
+  // Optional questions carry their own way out. Without these the only exits
+  // from an optional question were to answer it or to type something the agent
+  // had to interpret as a refusal — and a question with no visible skip reads
+  // as required, which is how "optional" quietly became "mandatory" in the
+  // 2026-09-04 run.
+  if (!question.required) {
+    rows.push([
+      // Two exits that do different things, so they have to say which is
+      // which: one passes on THIS question, the other ends the questions
+      // altogether. "Skip" alone beside "That's everything" read as two ways
+      // to do the same thing on the 2026-09-04 run.
+      { text: uiString("skip", language), callback_data: skipCallbackData(question.id) },
+      { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
+    ]);
+  }
+
+  // `askText`, never `question.prompt`: the prompt is the interviewer's field
+  // spec, examples and all, and it was being read out to organizers verbatim.
+  return { text: askText(question, language), replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
 }
 
 /**
@@ -314,16 +397,66 @@ export function renderQuestion(question: IntakeQuestion): RenderedQuestion {
  * capitals (there is no typo or near-miss to interpret), so this changes the
  * mechanism without weakening the rule. Typed CONFIRM stays accepted.
  */
-export function renderConfirmPrompt(text: string): RenderedQuestion {
+export function renderConfirmPrompt(
+  text: string,
+  language: Language = DEFAULT_LANGUAGE,
+): RenderedQuestion {
   return {
     text,
     replyMarkup: {
       inline_keyboard: [
         [
-          { text: "✅ Confirm", callback_data: CONFIRM_CALLBACK_DATA },
-          { text: "✏️ Keep planning", callback_data: KEEP_PLANNING_CALLBACK_DATA },
+          { text: uiString("confirm", language), callback_data: CONFIRM_CALLBACK_DATA },
+          { text: uiString("keepPlanning", language), callback_data: KEEP_PLANNING_CALLBACK_DATA },
         ],
       ],
+    },
+  };
+}
+
+/**
+ * The opening: an offer to read a document before anyone types anything.
+ *
+ * This used to be the interviewer's job — `SOUL.md` step 3 — and the router
+ * split quietly took it away. The router asks the required questions itself
+ * now, so it gets there first, and the organizer's first experience became
+ * "what date does the trip start?" with no hint that the PDF in their inbox
+ * would have answered it. Reported on the 2026-09-04 run 5.
+ *
+ * It belongs here for the same reason every other opening message does: the
+ * router speaks first, and can be relied on to speak at all.
+ */
+export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+  return {
+    text: uiString("documentOffer", language),
+    replyMarkup: {
+      inline_keyboard: [[
+        { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },
+      ]],
+    },
+  };
+}
+
+/**
+ * The one message that stands between "essentials done" and the summary.
+ *
+ * The router asks no optional question on its own any more — the interviewer
+ * nominates them. That is right for pacing and wrong as a single point of
+ * failure: on a live run the agent fumbled its first nomination, gave up, and
+ * told the organizer the interview could not continue. Nothing was broken,
+ * and there was no button anywhere that could have moved them forward.
+ *
+ * So the boundary itself is deterministic. Whatever the agent does or fails to
+ * do, the organizer always has both exits in front of them.
+ */
+export function renderEssentialsDone(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+  return {
+    text: uiString("essentialsDone", language),
+    replyMarkup: {
+      inline_keyboard: [[
+        { text: uiString("askMore", language), callback_data: MORE_CALLBACK_DATA },
+        { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
+      ]],
     },
   };
 }

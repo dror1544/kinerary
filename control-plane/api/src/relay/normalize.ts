@@ -28,6 +28,13 @@ export interface TelegramUser {
   first_name?: string;
   last_name?: string;
   is_bot?: boolean;
+  /**
+   * The sender's Telegram client locale ("he", "en-GB"). Present on most
+   * updates, absent on some — it is a hint about which language to DRAW in,
+   * never an identity claim and never a substitute for what the organizer
+   * actually writes.
+   */
+  language_code?: string;
 }
 
 export interface TelegramChat {
@@ -123,7 +130,7 @@ export interface MediaDeps {
   baseUrl: string;
 }
 
-interface Attachment {
+export interface Attachment {
   fileId: string;
   kind: MediaKind;
   mime: string;
@@ -136,7 +143,7 @@ interface Attachment {
  * Telegram sends photos as an array of sizes, largest last — the last entry is
  * the one worth re-hosting; the thumbnails are the same image again.
  */
-function describeAttachment(message: TelegramMessage): Attachment | null {
+export function describeAttachment(message: TelegramMessage): Attachment | null {
   if (message.document?.file_id) {
     return {
       fileId: message.document.file_id,
@@ -253,6 +260,12 @@ export async function normalizeUpdate(
   // Fail closed. On a shared bot, "no trip resolved" can never mean "use the
   // default" — the default would be somebody else's trip.
   if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
+  // Dropped here, rebuilt by dispatch.ts — which is why `describeAttachment`
+  // and `toWireEventWithMedia` are exported rather than private to this
+  // module. The interview route is the one that ASKS for a document, and it
+  // spent 2026-09-04's run handing the agent an empty message because this
+  // branch returned before the re-host and dispatch rebuilt the event without
+  // it. Whatever this branch skips, that one has to do itself.
   if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
 
   return {

@@ -2,6 +2,14 @@ import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
+import {
+  coerceLanguage,
+  DEFAULT_LANGUAGE,
+  optionLabel,
+  recapLabel,
+  uiString,
+  type Language,
+} from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
 
 function generateId(prefix: string): string {
@@ -106,7 +114,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "trip_interests",
     type: "text",
-    prompt: "Any specific interests or must-sees? (optional — press skip to continue)",
+    prompt: "Any specific interests or must-sees?",
     maxLength: 500,
     required: false,
   },
@@ -132,7 +140,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "timezone",
     type: "text",
-    prompt: "What timezone should times be shown in? (e.g. Asia/Tokyo, or just the destination city — optional, we can infer it)",
+    prompt: "What timezone should times be shown in? Asia/Tokyo, or just the destination city — we can work it out if you're not sure.",
     maxLength: 100,
     required: false,
   },
@@ -153,14 +161,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travel_anchors",
     type: "structured",
-    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers. (optional — skip if nothing's booked yet)",
+    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
     dataShape: "array",
     required: false,
   },
   {
     id: "constraints",
     type: "structured",
-    prompt: "Anything the group needs to know about — mobility needs, budget expectations, or family dynamics? (optional)",
+    prompt: "Anything the group needs to know about — mobility needs, budget expectations, or family dynamics?",
     dataShape: "object",
     required: false,
   },
@@ -289,7 +297,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // a planning session it is not built to be.
     id: "planning_help",
     type: "text",
-    prompt: "Is there anything you'd like help planning once the trip assistant is up — days you haven't worked out, places you're unsure about, bookings still to make? (optional — it won't hold up setup, the assistant picks it up afterwards)",
+    prompt: "Is there anything you'd like help planning once the trip assistant is up — days you haven't worked out, places you're unsure about, bookings still to make? It won't hold up setup.",
     maxLength: 500,
     required: false,
   },
@@ -464,27 +472,89 @@ export interface RecapEntry {
  * Returns a human-readable recap of the current answers. For 'other' answers
  * the literal organizer text is shown; it is never reclassified or summarized.
  */
-export function buildRecap(answers: AnswerStore, questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS): RecapEntry[] {
+/**
+ * Renders a structured answer as something an organizer can actually check.
+ *
+ * It used to say "5 item(s) recorded". The two questions that most need
+ * checking before an immutable version is written — who is coming, and where
+ * you are going — were the two whose content the recap hid, so the confirm
+ * step asked people to approve a number. Reported on the 2026-09-04 run.
+ *
+ * Deliberately shape-driven rather than a per-question formatter: `travelers`,
+ * `phases`, `travel_anchors` and `budget` all arrive as LLM-assembled JSON
+ * whose keys are conventional, not guaranteed, and a formatter that assumed
+ * `phases[].name` would print nothing at all the first time one came back as
+ * `title`. This reads whichever naming key is present and falls back to the
+ * value itself.
+ */
+function describeStructured(data: unknown): string {
+  const NAME_KEYS = ["name", "title", "label", "place", "city", "description"];
+  const label = (item: unknown): string => {
+    if (item === null || item === undefined) return "";
+    if (typeof item !== "object") return String(item);
+    const record = item as Record<string, unknown>;
+    const named = NAME_KEYS.map((k) => record[k]).find((v) => typeof v === "string" && v.trim() !== "");
+    if (typeof named === "string") return named.trim();
+    // No conventional name: show the first short scalar rather than nothing.
+    const scalar = Object.values(record).find(
+      (v) => (typeof v === "string" && v.trim() !== "" && v.length <= 60) || typeof v === "number",
+    );
+    return scalar === undefined ? "" : String(scalar);
+  };
+
+  if (Array.isArray(data)) {
+    if (data.length === 0) return "(none)";
+    const labels = data.map(label).filter((l) => l !== "");
+    if (labels.length === 0) return `${data.length} recorded`;
+    // Long rosters are trimmed rather than wrapped: the recap is one Telegram
+    // message and every question is on it.
+    const shown = labels.slice(0, 6).join(", ");
+    return labels.length > 6 ? `${shown} +${labels.length - 6} more` : shown;
+  }
+
+  if (data && typeof data === "object") {
+    const entries = Object.entries(data as Record<string, unknown>).filter(
+      ([, v]) => v !== null && v !== undefined && v !== "",
+    );
+    if (entries.length === 0) return "(none)";
+    const shown = entries.slice(0, 4).map(([k, v]) => `${k}: ${label(v) || String(v)}`).join(", ");
+    return entries.length > 4 ? `${shown} +${entries.length - 4} more` : shown;
+  }
+
+  return "(none)";
+}
+
+export function buildRecap(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
+  language: Language = DEFAULT_LANGUAGE,
+): RecapEntry[] {
   return questions
     .filter((q) => answers[q.id] !== undefined)
     .map((q) => {
       const ans = answers[q.id]!;
       let answerLabel: string;
       if (ans.kind === "choice") {
-        answerLabel = q.options?.find((o) => o.id === ans.option_id)?.label ?? ans.option_id;
+        answerLabel = optionLabel(q, ans.option_id, language);
       } else if (ans.kind === "choice_other") {
-        answerLabel = `Other: ${ans.other_text}`;
+        // Marked, not just quoted. Free text that reads like a preset ("family
+        // reunion" against a "Family" option) must not look like one on the
+        // screen where an immutable version gets approved.
+        answerLabel = `${uiString("otherPrefix", language)}: ${ans.other_text}`;
       } else if (ans.kind === "multi_choice") {
         answerLabel = ans.option_ids.length === 0
-          ? "(none)"
-          : ans.option_ids.map((id) => q.options?.find((o) => o.id === id)?.label ?? id).join(", ");
+          ? uiString("none", language)
+          : ans.option_ids.map((id) => optionLabel(q, id, language)).join(", ");
       } else if (ans.kind === "structured") {
-        const count = Array.isArray(ans.data) ? ans.data.length : Object.keys(ans.data as Record<string, unknown>).length;
-        answerLabel = count > 0 ? `${count} item(s) recorded` : "(none)";
+        answerLabel = describeStructured(ans.data);
       } else {
-        answerLabel = ans.text || "(skipped)";
+        answerLabel = ans.text || uiString("skipped", language);
       }
-      return { questionId: q.id, prompt: q.prompt, answerLabel };
+      // `prompt` is the AGENT's field spec — it carries examples and schema
+      // instructions no organizer should read, and reading them back on the
+      // confirmation screen is where they did the most damage. The recap gets
+      // a short noun instead.
+      return { questionId: q.id, prompt: recapLabel(q, language), answerLabel };
     });
 }
 
@@ -496,8 +566,18 @@ export interface SessionView {
   sessionId: string;
   tripId: string;
   state: SessionState;
-  /** The next unanswered required question, or null when all required questions are answered. */
+  /**
+   * The next unanswered REQUIRED question. Required questions are walked by the
+   * router on their own: every one has to be asked, so there is no judgement
+   * for the interviewer to apply.
+   */
   nextQuestion: IntakeQuestion | null;
+  /**
+   * The optional question the interviewer has nominated for the router to ask
+   * next, if any. Optional questions are asked only when nominated — see
+   * `InterviewUiState.pendingAsk`.
+   */
+  pendingAsk: IntakeQuestion | null;
   /**
    * Unanswered *optional* questions, in question order.
    *
@@ -511,20 +591,163 @@ export interface SessionView {
   optionalRemaining: IntakeQuestion[];
   /** Set when state is 'awaiting_confirmation': the recap for the organizer to review. */
   recap: RecapEntry[] | null;
+  /**
+   * The language the router should draw in — what the organizer is writing,
+   * as reported by the interviewer. English until it says otherwise.
+   */
+  language: Language;
+  /** True once the "essentials done" choice has been put to the organizer. */
+  offeredMore: boolean;
+  /** What the router last sent, so it does not send it twice running. */
+  lastPrompt: string | null;
+  /**
+   * Option ids currently selected per multi-select question.
+   *
+   * The router redraws a multi-select keyboard on every tap, and it has to
+   * show what is already ticked — otherwise the organizer cannot tell whether
+   * their last tap selected or deselected.
+   */
+  selections: Record<string, string[]>;
 }
 
-function nextUnansweredQuestion(answers: AnswerStore, questions: readonly IntakeQuestion[]): IntakeQuestion | null {
+function currentSelections(answers: AnswerStore): Record<string, string[]> {
+  const selections: Record<string, string[]> = {};
+  for (const [questionId, answer] of Object.entries(answers)) {
+    if (answer && (answer as { kind?: string }).kind === "multi_choice") {
+      selections[questionId] = [...((answer as { option_ids?: string[] }).option_ids ?? [])];
+    }
+  }
+  return selections;
+}
+
+/**
+ * Router UI intent, persisted per session (migration 0034).
+ *
+ * Not part of the intake: nothing downstream of the interview reads it. It
+ * exists so the router can tell "still collecting optional answers" apart from
+ * "ready to confirm", which the three-value `state` column cannot express.
+ */
+export interface InterviewUiState {
+  finishRequested?: boolean;
+  skipped?: string[];
+  /**
+   * The optional question the interviewer has asked the router to put next.
+   *
+   * Optional questions are not walked automatically when an interviewer is
+   * configured. WHICH one is worth asking, and whether to ask it at all, is
+   * conversational judgement: `timezone` should never be put to someone who
+   * has already said Japan. The router owns rendering because only it can draw
+   * a keyboard; the agent owns pacing because only it is in the conversation.
+   *
+   * The 2026-09-04 run 3 is what settled this. Walking the list end to end
+   * turned the interview into a form — "it completely drifted" — after run 2
+   * had shown the opposite failure, never asking an optional question at all.
+   */
+  pendingAsk?: string;
+  /**
+   * What the router last sent, as a coarse key ("q:dietary", "recap").
+   *
+   * The router is prompted to speak by every agent write, and an agent that
+   * writes five answers off one document produced five messages. Repeating
+   * what it just said is never useful, so it does not.
+   */
+  lastPrompt?: string;
+  /**
+   * Whether the organizer has already been offered the "essentials done"
+   * choice. It is sent once, at the boundary — after that the interviewer
+   * carries the conversation and a repeat would be the router nagging.
+   */
+  offeredMore?: boolean;
+}
+
+function parseUiState(raw: unknown): InterviewUiState {
+  if (typeof raw !== "object" || raw === null) return {};
+  const record = raw as Record<string, unknown>;
+  const skipped = Array.isArray(record.skipped)
+    ? record.skipped.filter((id): id is string => typeof id === "string")
+    : undefined;
+  return {
+    ...(record.finish_requested === true ? { finishRequested: true } : {}),
+    ...(skipped && skipped.length > 0 ? { skipped } : {}),
+    ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
+    ...(record.offered_more === true ? { offeredMore: true } : {}),
+    ...(typeof record.last_prompt === "string" ? { lastPrompt: record.last_prompt } : {}),
+  };
+}
+
+function serializeUiState(ui: InterviewUiState): string {
+  return JSON.stringify({
+    ...(ui.finishRequested ? { finish_requested: true } : {}),
+    ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
+    ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
+    ...(ui.offeredMore ? { offered_more: true } : {}),
+    ...(ui.lastPrompt ? { last_prompt: ui.lastPrompt } : {}),
+  });
+}
+
+function isSkipped(ui: InterviewUiState, questionId: string): boolean {
+  return (ui.skipped ?? []).includes(questionId);
+}
+
+/**
+ * The question the router should ask next: required ones in order, then the
+ * optional ones the organizer has neither answered nor skipped.
+ *
+ * Optional questions used to be invisible here — `nextQuestion` walked only
+ * required ones — which left them to the agent, and the agent can only ask
+ * them with `clarify`. Under relay routing `clarify` cannot draw a keyboard,
+ * so every optional question degraded to a numbered list the organizer had to
+ * type a number into, with Hermes's own "(Recommended)" label stuck on the
+ * first choice. Walking them here is what gives them real buttons.
+ */
+function nextUnansweredQuestion(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[],
+): IntakeQuestion | null {
   return questions.find((q) => q.required && answers[q.id] === undefined) ?? null;
 }
 
-function unansweredOptionalQuestions(answers: AnswerStore, questions: readonly IntakeQuestion[]): IntakeQuestion[] {
-  return questions.filter((q) => !q.required && answers[q.id] === undefined);
+/** The optional question the interviewer nominated, if it is still askable. */
+function pendingAskQuestion(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[],
+  ui: InterviewUiState,
+): IntakeQuestion | null {
+  if (!ui.pendingAsk || ui.finishRequested) return null;
+  const question = questions.find((q) => q.id === ui.pendingAsk);
+  if (!question || isSkipped(ui, question.id)) return null;
+  return question;
 }
 
-function deriveSessionState(answers: AnswerStore, questions: readonly IntakeQuestion[]): SessionState {
+function unansweredOptionalQuestions(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[],
+  ui: InterviewUiState = {},
+): IntakeQuestion[] {
+  return questions.filter((q) => !q.required && answers[q.id] === undefined && !isSkipped(ui, q.id));
+}
+
+/**
+ * Two conditions, not one. Answering the last required question no longer ends
+ * the interview: the organizer either has to run out of optional questions or
+ * say they are finished.
+ *
+ * Confirmation is still gated on the REQUIRED set alone (`confirmIntake`), so
+ * finishing early skips nothing that matters — this only decides whether the
+ * router asks another question or shows the recap.
+ */
+function deriveSessionState(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[],
+  ui: InterviewUiState = {},
+): SessionState {
   const allRequired = questions.filter((q) => q.required);
   const allAnswered = allRequired.every((q) => answers[q.id] !== undefined);
-  return allAnswered ? "awaiting_confirmation" : "interviewing";
+  if (!allAnswered) return "interviewing";
+  if (ui.finishRequested) return "awaiting_confirmation";
+  return unansweredOptionalQuestions(answers, questions, ui).length === 0
+    ? "awaiting_confirmation"
+    : "interviewing";
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -592,6 +815,7 @@ export async function startSession(
   log: (line: string) => void = () => {},
   telegramChatIdHint?: string,
   verifiedTelegramChatId?: string,
+  languageHint?: string,
 ): Promise<StartSessionResult> {
   const client = await db.connect();
   try {
@@ -643,11 +867,23 @@ export async function startSession(
         ? verifiedTelegramChatId
         : null;
 
+    // Telegram hands us the organizer's own client locale on the very first
+    // message, so the router can draw its FIRST question in the right language
+    // instead of waiting for the interviewer to report one. That wait is not
+    // theoretical: on the 2026-09-04 run 4 the file acknowledgement — the one
+    // message whose whole purpose is to arrive before the agent can answer —
+    // went out in English because nothing had set a language yet.
+    //
+    // A hint, not a decision. It is the phone's setting rather than what the
+    // organizer is actually writing, so `setLanguageForChat` overrides it the
+    // moment the interviewer reports what they really typed.
+    const language = coerceLanguage(languageHint);
+
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId],
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language)
+       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language],
     );
 
     await client.query("COMMIT");
@@ -659,8 +895,13 @@ export async function startSession(
       tripId: enrollment.tripId,
       state: "interviewing",
       nextQuestion: INTAKE_QUESTIONS.find((q) => q.required) ?? null,
+      pendingAsk: null,
       optionalRemaining: unansweredOptionalQuestions({}, INTAKE_QUESTIONS),
       recap: null,
+      selections: {},
+      language: language ?? DEFAULT_LANGUAGE,
+      offeredMore: false,
+      lastPrompt: null,
     };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
@@ -687,8 +928,10 @@ export async function getSession(
     user_id: string;
     state: SessionState;
     answers: AnswerStore;
+    ui_state: unknown;
+    language: string | null;
   }>(
-    `SELECT id, trip_id, user_id, state, answers
+    `SELECT id, trip_id, user_id, state, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE session_token_digest = $1`,
     [digest],
@@ -696,7 +939,7 @@ export async function getSession(
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
 
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
+  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
 }
 
 /**
@@ -719,15 +962,17 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
     trip_id: string;
     state: SessionState;
     answers: AnswerStore;
+    ui_state: unknown;
+    language: string | null;
   }>(
-    `SELECT id, trip_id, state, answers
+    `SELECT id, trip_id, state, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
     [chatId],
   );
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
+  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
 }
 
 /**
@@ -798,9 +1043,26 @@ export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenT
  * through the normal path; repeating one means an organizer watching the same
  * question arrive every few seconds.
  */
+/**
+ * How long the router waits for the interviewer to stop writing before it
+ * speaks.
+ *
+ * Every write schedules a prompt by setting `router_prompt_due_at = now()`, so
+ * an agent recording a document's worth of answers schedules one per answer.
+ * Deduplication does not help — each write genuinely produces a DIFFERENT next
+ * question — and on 2026-09-04 run 6 the organizer got nine messages in a row
+ * for it.
+ *
+ * Each write pushes the timestamp forward, so this is a debounce rather than a
+ * delay: the router speaks once, after the burst, about wherever the interview
+ * actually ended up. Short enough that a single answer still feels immediate.
+ */
+export const ROUTER_PROMPT_SETTLE_SECONDS = 3;
+
 export async function claimDueRouterPrompts(
   db: pg.Pool,
   limit = 10,
+  settleSeconds: number = ROUTER_PROMPT_SETTLE_SECONDS,
 ): Promise<Array<{ sessionId: string; chatId: string }>> {
   const rows = await db.query<{ id: string; telegram_chat_id: string }>(
     `UPDATE control_plane.intake_sessions
@@ -808,13 +1070,14 @@ export async function claimDueRouterPrompts(
       WHERE id IN (
         SELECT id FROM control_plane.intake_sessions
          WHERE router_prompt_due_at IS NOT NULL
+           AND router_prompt_due_at < now() - make_interval(secs => $2)
            AND telegram_chat_id IS NOT NULL
          ORDER BY router_prompt_due_at
          FOR UPDATE SKIP LOCKED
          LIMIT $1
       )
       RETURNING id, telegram_chat_id`,
-    [limit],
+    [limit, settleSeconds],
   );
   return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id }));
 }
@@ -825,8 +1088,10 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
     trip_id: string;
     state: SessionState;
     answers: AnswerStore;
+    ui_state: unknown;
+    language: string | null;
   }>(
-    `SELECT s.id, s.trip_id, s.state, s.answers
+    `SELECT s.id, s.trip_id, s.state, s.answers, s.ui_state, s.language
      FROM control_plane.intake_sessions s
      JOIN control_plane.interview_agent_turns t
        ON t.session_id = s.id
@@ -838,7 +1103,7 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
   );
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers) };
+  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
 }
 
 function buildSessionView(
@@ -846,22 +1111,34 @@ function buildSessionView(
   tripId: string,
   storedState: SessionState,
   answers: AnswerStore,
+  ui: InterviewUiState = {},
+  language: Language = DEFAULT_LANGUAGE,
 ): SessionView {
   if (storedState === "confirmed") {
-    return { sessionId, tripId, state: "confirmed", nextQuestion: null, optionalRemaining: [], recap: null };
+    return {
+      sessionId, tripId, state: "confirmed", nextQuestion: null, pendingAsk: null,
+      optionalRemaining: [], recap: null, selections: currentSelections(answers), language,
+      offeredMore: ui.offeredMore === true,
+      lastPrompt: ui.lastPrompt ?? null,
+    };
   }
-  const state = deriveSessionState(answers, INTAKE_QUESTIONS);
+  const state = deriveSessionState(answers, INTAKE_QUESTIONS, ui);
   return {
     sessionId,
     tripId,
     state,
     nextQuestion: state === "interviewing" ? nextUnansweredQuestion(answers, INTAKE_QUESTIONS) : null,
+    pendingAsk: state === "interviewing" ? pendingAskQuestion(answers, INTAKE_QUESTIONS, ui) : null,
     // Listed in both states, unlike nextQuestion/recap: an optional question is
     // still worth offering once the required ones are done, and in practice
     // that's when the good answers arrive — the organizer is warmed up and the
     // roster is already on the table.
-    optionalRemaining: unansweredOptionalQuestions(answers, INTAKE_QUESTIONS),
-    recap: state === "awaiting_confirmation" ? buildRecap(answers) : null,
+    optionalRemaining: unansweredOptionalQuestions(answers, INTAKE_QUESTIONS, ui),
+    recap: state === "awaiting_confirmation" ? buildRecap(answers, INTAKE_QUESTIONS, language) : null,
+    selections: currentSelections(answers),
+    language,
+    offeredMore: ui.offeredMore === true,
+    lastPrompt: ui.lastPrompt ?? null,
   };
 }
 
@@ -896,6 +1173,8 @@ interface LockedSession {
   user_id: string;
   state: SessionState;
   answers: AnswerStore;
+  ui_state: unknown;
+  language: string | null;
   source_document: unknown;
 }
 
@@ -920,7 +1199,7 @@ async function lockSession(
   client: pg.PoolClient,
   locator: SessionLocator,
 ): Promise<LockedSession | null> {
-  const columns = "id, trip_id, user_id, state, answers, source_document";
+  const columns = "id, trip_id, user_id, state, answers, ui_state, language, source_document";
   if (locator.by === "token") {
     const row = await client.query<LockedSession>(
       `SELECT ${columns}
@@ -1052,6 +1331,28 @@ export async function openAgentTurn(
   }
 }
 
+/**
+ * Does this chat already have a live turn with the interviewer?
+ *
+ * Asked before handing another one over. On 2026-09-04 run 5 the router handed
+ * back to an agent that was already mid-turn, the agent's next write scheduled
+ * another router prompt, that found nothing to ask and handed back again:
+ * nine turns and twenty-eight messages into one short interview, which the
+ * organizer described, accurately, as being bombarded.
+ *
+ * Filters on BOTH conditions, per 0031's header — a superseded turn is closed
+ * but may not have expired, and an abandoned one is expired but never closed.
+ */
+export async function hasOpenAgentTurn(db: pg.Pool, chatId: string): Promise<boolean> {
+  const row = await db.query<{ n: string }>(
+    `SELECT count(*)::text AS n
+       FROM control_plane.interview_agent_turns
+      WHERE chat_id = $1 AND closed_at IS NULL AND expires_at > now()`,
+    [chatId],
+  );
+  return (row.rows[0]?.n ?? "0") !== "0";
+}
+
 /** Closes a chat's open turn, if it has one. */
 export async function closeAgentTurn(db: pg.Pool, chatId: string): Promise<void> {
   await db.query(
@@ -1076,6 +1377,14 @@ export async function closeAgentTurn(db: pg.Pool, chatId: string): Promise<void>
  * once the relay contract can carry it, and this entry point collapses back
  * into submitAnswerForChat.
  */
+/** Marks a session as owing its organizer a router-drawn message. */
+async function scheduleRouterPrompt(db: pg.Pool, sessionId: string): Promise<void> {
+  await db.query(
+    "UPDATE control_plane.intake_sessions SET router_prompt_due_at = now() WHERE id = $1",
+    [sessionId],
+  );
+}
+
 export async function submitAnswerForAgent(
   db: pg.Pool,
   chatId: string,
@@ -1094,12 +1403,7 @@ export async function submitAnswerForAgent(
   // draw one, because `clarify` needs the relay `prompt` op this connector
   // does not advertise. Without this the interview silently loses its buttons
   // for good the first time an organizer types instead of tapping.
-  if (result.ok) {
-    await db.query(
-      "UPDATE control_plane.intake_sessions SET router_prompt_due_at = now() WHERE id = $1",
-      [result.view.sessionId],
-    );
-  }
+  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
   return result;
 }
 
@@ -1113,6 +1417,235 @@ export async function submitAnswerForAgent(
  * which session that lands in is decided here, from the chat, in the same
  * transaction that writes the answer.
  */
+/**
+ * Applies a change to the router's UI state for the interview a chat is
+ * conducting: a skipped optional question, or the organizer saying they are
+ * finished.
+ *
+ * Same authority as every other chat-scoped write — the session comes from the
+ * chat id the router read off its own authenticated Telegram connection, never
+ * from anything the message said.
+ */
+async function updateUiStateForChat(
+  db: pg.Pool,
+  chatId: string,
+  mutate: (ui: InterviewUiState) => InterviewUiState,
+): Promise<GetSessionResult> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const session = await lockSession(client, { by: "chat", chatId });
+    if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+    if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+
+    const ui = mutate(parseUiState(session.ui_state));
+    const newState = deriveSessionState(session.answers, INTAKE_QUESTIONS, ui);
+    await client.query(
+      "UPDATE control_plane.intake_sessions SET ui_state = $1, state = $2, updated_at = now() WHERE id = $3",
+      [serializeUiState(ui), newState, session.id],
+    );
+    await client.query("COMMIT");
+    return {
+      ok: true,
+      view: buildSessionView(
+        session.id, session.trip_id, newState, session.answers, ui,
+        coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
+      ),
+    };
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * The interviewer asks the router to put one optional question next.
+ *
+ * This is the pacing half of the router/agent split. The agent decides that
+ * food is worth asking about now; the router draws the keyboard, because
+ * `clarify` cannot. Nominating a question the organizer already answered is
+ * allowed — that is how a correction gets re-offered.
+ */
+export async function nominateQuestionForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<GetSessionResult> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question) return { ok: false, reason: "NOT_FOUND" };
+  const result = await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    pendingAsk: questionId,
+    // Nominating a question the organizer previously skipped un-skips it:
+    // asking for it explicitly is a clearer signal than the earlier decline.
+    ...(ui.skipped ? { skipped: ui.skipped.filter((id) => id !== questionId) } : {}),
+    // And it is not a finished interview any more.
+    finishRequested: false,
+  }));
+  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  return result;
+}
+
+/** Records what the router just sent, so it will not send the same thing again. */
+export async function recordLastPromptForChat(
+  db: pg.Pool,
+  chatId: string,
+  key: string,
+): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, lastPrompt: key }));
+}
+
+/** Records that the "essentials done" choice has been shown, so it is shown once. */
+export async function markOfferedMoreForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, offeredMore: true }));
+}
+
+/**
+ * The organizer asks for more questions themselves.
+ *
+ * Nominates the next optional question they have neither answered nor skipped
+ * — the deterministic counterpart to the interviewer choosing one, and the
+ * reason a fumbled nomination can no longer strand anybody.
+ */
+export async function askForMoreForChat(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
+  const current = await getSessionForChat(db, chatId);
+  if (!current.ok) return current;
+  const next = current.view.optionalRemaining[0];
+  if (!next) return setFinishRequestedForChat(db, chatId, true);
+  return nominateQuestionForChat(db, chatId, next.id);
+}
+
+/** Clears a nomination once the router has actually asked it. */
+export async function clearPendingAskForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => {
+    const next = { ...ui };
+    delete next.pendingAsk;
+    return next;
+  });
+}
+
+/**
+ * Records the language the interview is being conducted in.
+ *
+ * Reported by the interviewer, because it is the only side that can read what
+ * the organizer wrote. Everything the ROUTER draws — buttons, questions, the
+ * recap, the file acknowledgement — is rendered from this; before it existed
+ * a Hebrew interview got English buttons and an English confirmation screen.
+ *
+ * An unrecognised value is refused rather than stored: a language the router
+ * cannot draw would silently fall back to English at render time anyway, and
+ * storing it would make that look like a translation bug rather than a missing
+ * translation.
+ */
+export async function setLanguageForChat(
+  db: pg.Pool,
+  chatId: string,
+  rawLanguage: string,
+): Promise<GetSessionResult> {
+  const language = coerceLanguage(rawLanguage);
+  if (!language) return { ok: false, reason: "NOT_FOUND" };
+
+  const updated = await db.query<{ id: string }>(
+    `UPDATE control_plane.intake_sessions
+        SET language = $1, updated_at = now()
+      WHERE telegram_chat_id = $2 AND state <> 'confirmed'
+      RETURNING id`,
+    [language, chatId],
+  );
+  if (updated.rows.length === 0) return { ok: false, reason: "NOT_FOUND" };
+  return getSessionForChat(db, chatId);
+}
+
+/** Records that the organizer declined an optional question, so it is not asked again. */
+export async function skipQuestionForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<GetSessionResult> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  // Refusing to skip a required question here rather than trusting the caller:
+  // a skipped required question would derive to awaiting_confirmation and then
+  // fail at confirm with NOT_ALL_REQUIRED_ANSWERED, which reads to the
+  // organizer as the interview breaking at the last step.
+  if (!question || question.required) return { ok: false, reason: "NOT_FOUND" };
+  return updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    skipped: [...new Set([...(ui.skipped ?? []), questionId])],
+  }));
+}
+
+/**
+ * The organizer says they are done answering, or wants to carry on after all.
+ *
+ * `false` is what makes "Keep planning" mean something: before this it printed
+ * a sentence and left the session exactly where it was, so the recap came
+ * straight back on the next answer.
+ */
+export async function setFinishRequestedForChat(
+  db: pg.Pool,
+  chatId: string,
+  finishRequested: boolean,
+  { schedulePrompt = false }: { schedulePrompt?: boolean } = {},
+): Promise<GetSessionResult> {
+  const result = await updateUiStateForChat(db, chatId, (ui) => {
+    const next: InterviewUiState = { ...ui };
+    if (finishRequested) {
+      next.finishRequested = true;
+      // A nomination the organizer never got to is not worth re-raising once
+      // they have said they are done.
+      delete next.pendingAsk;
+    } else {
+      delete next.finishRequested;
+    }
+    return next;
+  });
+  // The router already sends its own next step when a BUTTON caused this; an
+  // agent asking for the summary has no such follow-up, so it schedules one.
+  if (result.ok && schedulePrompt) await scheduleRouterPrompt(db, result.view.sessionId);
+  return result;
+}
+
+/**
+ * Toggles one option of a multi-select question, and returns the whole
+ * resulting set.
+ *
+ * A multi_choice tap carries one option but the answer is the set, so each tap
+ * rewrites the full selection. `none` is exclusive on purpose: "None of these"
+ * alongside "Vegan" is not a preference anyone holds, and letting both stand
+ * would hand the trip assistant a contradiction to reason about.
+ */
+export async function toggleMultiChoiceForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+  optionId: string,
+): Promise<SubmitAnswerResult> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question || question.type !== "multi_choice") return { ok: false, reason: "UNKNOWN_QUESTION" };
+  if (!question.options?.some((o) => o.id === optionId)) return { ok: false, reason: "UNKNOWN_OPTION" };
+
+  const current = await getSessionForChat(db, chatId);
+  if (!current.ok) return { ok: false, reason: "NOT_FOUND" };
+  const existing = selectedOptionIds(current.view, questionId);
+
+  let next: string[];
+  if (existing.includes(optionId)) next = existing.filter((id) => id !== optionId);
+  else if (optionId === EXCLUSIVE_OPTION_ID) next = [EXCLUSIVE_OPTION_ID];
+  else next = [...existing.filter((id) => id !== EXCLUSIVE_OPTION_ID), optionId];
+
+  return submitAnswerForChat(db, chatId, questionId, null, undefined, undefined, next);
+}
+
+/** The option ids currently recorded for a multi-select question. */
+export function selectedOptionIds(view: SessionView, questionId: string): string[] {
+  return [...(view.selections[questionId] ?? [])];
+}
+
+/** "None of these" — the one option that cannot coexist with the others. */
+export const EXCLUSIVE_OPTION_ID = "none";
+
 export async function submitAnswerForChat(
   db: pg.Pool,
   chatId: string,
@@ -1153,7 +1686,8 @@ async function submitAnswerVia(
     }
 
     const updatedAnswers = { ...session.answers, [questionId]: validation.answer };
-    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS);
+    const ui = parseUiState(session.ui_state);
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
 
     await client.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, updated_at = now() WHERE id = $3",
@@ -1162,7 +1696,13 @@ async function submitAnswerVia(
 
     await client.query("COMMIT");
 
-    return { ok: true, view: buildSessionView(session.id, session.trip_id, newState, updatedAnswers) };
+    return {
+      ok: true,
+      view: buildSessionView(
+        session.id, session.trip_id, newState, updatedAnswers, ui,
+        coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
+      ),
+    };
   } catch (error) {
     try { await client.query("ROLLBACK"); } catch { /* ignore */ }
     throw error;

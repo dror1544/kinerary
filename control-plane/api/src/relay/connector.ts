@@ -23,6 +23,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { structuredLog } from "../redaction.js";
+import { detectInternalLeak } from "./internal-leak.js";
 import {
   decodeFrame,
   encodeFrame,
@@ -260,6 +261,21 @@ export class RelayConnector {
     const telegram = this.options.telegram;
     switch (action.op) {
       case "send": {
+        // Last gate before the organizer. See internal-leak.ts: the agent has
+        // been told three times not to narrate its own plumbing and each new
+        // model finds a new way to do it, so the check lives here rather than
+        // in a prompt. Suppressed, not rewritten — a half-redacted sentence is
+        // worse than a missing one.
+        const leak = detectInternalLeak(action.content);
+        if (leak.leaks) {
+          this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
+            matched: leak.term ?? "",
+          }));
+          // Reported as delivered on purpose: the gateway's per-request future
+          // has to resolve, and this is not a transport failure it could
+          // usefully retry.
+          return { success: true };
+        }
         const sent = await telegram.sendMessage({
           chatId: action.chat_id,
           text: action.content,

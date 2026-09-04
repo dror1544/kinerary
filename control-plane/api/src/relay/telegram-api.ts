@@ -67,6 +67,8 @@ export interface TelegramClient {
     messageId: string;
     text: string;
     parseMode?: "MarkdownV2";
+    /** Redraws the keyboard alongside the text — a re-ticked multi-select. */
+    replyMarkup?: InlineKeyboard;
   }): Promise<SendResult>;
   sendChatAction(params: { chatId: string; action?: string }): Promise<void>;
   answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void>;
@@ -179,12 +181,17 @@ export class HttpTelegramClient implements TelegramClient {
     messageId: string;
     text: string;
     parseMode?: "MarkdownV2";
+    replyMarkup?: InlineKeyboard;
   }): Promise<SendResult> {
     const body: Record<string, unknown> = {
       chat_id: params.chatId,
       message_id: Number(params.messageId),
       text: params.text,
     };
+    // Omitted rather than sent empty when there is no keyboard: Telegram reads
+    // an absent reply_markup as "leave it alone" and an empty one as "remove
+    // it", and removing a live question's buttons is not what an edit means.
+    if (params.replyMarkup) body.reply_markup = params.replyMarkup;
     if (params.parseMode) {
       body.text = toTelegramMarkdownV2(params.text);
       body.parse_mode = params.parseMode;

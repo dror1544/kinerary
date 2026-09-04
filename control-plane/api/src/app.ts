@@ -9,6 +9,7 @@ import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
   getSessionForAgent, submitAnswerForAgent, resolveChatFromOpenTurn,
+  nominateQuestionForChat, setFinishRequestedForChat, setLanguageForChat, INTAKE_QUESTIONS,
 } from "./interview.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
@@ -1025,6 +1026,64 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send(result.view);
   });
 
+  // The pacing half of the split: the agent says WHICH optional question is
+  // worth asking now, the router draws it. Without this the router either
+  // walks every optional question in order (a form) or never asks one at all
+  // — the two live-run failures of 2026-09-04.
+  app.post("/internal/interview/agent/current/ask", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const questionId = (request.body as Record<string, unknown> | undefined)?.questionId;
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await nominateQuestionForChat(dependencies.interviewAgent.db, chatId, questionId);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // The agent is the only side that can read what the organizer wrote, so it
+  // is the only side that can say what language the router should draw in.
+  app.post("/internal/interview/agent/current/language", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const language = (request.body as Record<string, unknown> | undefined)?.language;
+    if (typeof language !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await setLanguageForChat(dependencies.interviewAgent.db, chatId, language);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // "I have everything" — the agent asks for the recap; only the organizer's
+  // own tap on it confirms.
+  app.post("/internal/interview/agent/current/summary", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const result = await setFinishRequestedForChat(
+      dependencies.interviewAgent.db, chatId, true, { schedulePrompt: true },
+    );
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
   app.post("/internal/interview/agent/current/answer", async (request, reply) => {
     if (!dependencies.interviewAgent) {
       return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
@@ -1062,7 +1121,23 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       const status = result.reason === "NOT_FOUND" ? 404
         : result.reason === "SESSION_CONFIRMED" ? 409
         : 400;
-      return reply.code(status).send({ error: result.reason });
+      // A bare "TEXT_REQUIRED" tells the agent something is wrong and not what
+      // to do about it, so it guesses — and on 2026-09-04 run 6 it guessed
+      // twice more, tripped Hermes's MCP breaker, and an organizer who had
+      // just uploaded their whole itinerary was asked for the destination from
+      // scratch. The reply now says which argument this particular question
+      // wants, because the question set is the only thing that knows.
+      const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+      const expected = !question ? undefined
+        : question.type === "structured" ? `data (a JSON ${question.dataShape ?? "object"})`
+        : question.type === "multi_choice" ? "optionIds (an array of option ids)"
+        : question.type === "choice" ? "optionId (one option id), or optionId 'other' with otherText"
+        : "otherText (the answer as plain text)";
+      return reply.code(status).send({
+        error: result.reason,
+        ...(question ? { questionType: question.type, expectedArgument: expected } : {}),
+        ...(question?.options ? { options: question.options.map((o) => o.id) } : {}),
+      });
     }
     return reply.code(200).send({ state: result.view.state, view: result.view });
   });

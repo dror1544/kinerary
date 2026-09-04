@@ -28,13 +28,21 @@ import type pg from "pg";
 import {
   parseCallbackData,
   parseInbound,
+  renderDocumentOffer,
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
   type InlineKeyboard,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { normalizeUpdate, toWireEvent, type MediaDeps, type TelegramUpdate } from "./normalize.js";
+import {
+  describeAttachment,
+  normalizeUpdate,
+  toWireEventWithMedia,
+  type MediaDeps,
+  type TelegramUpdate,
+} from "./normalize.js";
+import { setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -49,8 +57,18 @@ export type DispatchDecision =
   | { kind: "to_gateway"; event: WireMessageEvent }
   /** The connector answers this one itself. */
   | { kind: "reply"; reply: DirectReply }
+  /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
+  | { kind: "show_summary"; chatId: string; view: SessionView }
   /** A tapped inline button that belongs to the interview flow. */
-  | { kind: "interview_callback"; chatId: string; callbackQueryId: string; data: string; sessionId: string }
+  | {
+      kind: "interview_callback";
+      chatId: string;
+      callbackQueryId: string;
+      data: string;
+      sessionId: string;
+      /** The message the button belongs to, so a multi-select can be redrawn in place. */
+      messageId?: string;
+    }
   /**
    * A WRITTEN message from a chat that is mid-interview.
    *
@@ -180,14 +198,20 @@ export async function dispatchUpdate(
   const parsed = parseInbound(text);
 
   if (parsed.kind === "start") {
-    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log);
+    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
     switch (outcome.kind) {
       case "started": {
-        // The first question rides back on the same result, so the organizer's
-        // very first tap produces a real question rather than a "hold on".
-        const question = outcome.view.nextQuestion;
-        if (!question) return { kind: "reply", reply: { chatId, text: strings.badLink } };
-        const rendered = renderQuestion(question);
+        // The opening is the document offer, not the first question. Asking
+        // for a start date before mentioning that a PDF would answer it is
+        // how run 5 began, and typing out a trip you already have written
+        // down is the single biggest waste of an organizer's patience.
+        //
+        // The first question follows the moment they answer it — by sending
+        // the document, by tapping "I don't have one", or by just typing.
+        if (!outcome.view.nextQuestion) {
+          return { kind: "reply", reply: { chatId, text: strings.badLink } };
+        }
+        const rendered = renderDocumentOffer(outcome.view.language);
         return {
           kind: "reply",
           reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
@@ -208,6 +232,23 @@ export async function dispatchUpdate(
                   : strings.badLink,
           },
         };
+    }
+  }
+
+  // A way to the summary that depends on nothing else working.
+  //
+  // Reaching the recap normally means either the interviewer calling
+  // `show_summary_for_chat` or the organizer tapping the boundary message.
+  // On 2026-09-04 run 6 neither happened: the agent asked for approval in
+  // prose, the organizer said yes, and nothing occurred — only the router's
+  // Confirm button writes an intake version, and it had never been sent. A
+  // typed command is the one path that survives an agent doing anything at
+  // all, so it exists.
+  if (parsed.kind === "command" && (parsed.name === "done" || parsed.name === "summary")) {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "interview") {
+      const result = await setFinishRequestedForChat(db, chatId, true);
+      if (result.ok) return { kind: "show_summary", chatId, view: result.view };
     }
   }
 
@@ -249,11 +290,23 @@ export async function dispatchUpdate(
       if (!options.interviewerProfile) {
         return { kind: "interview_text", chatId, sessionId: route.sessionId, text };
       }
+      // Re-hosted the same way the companion route does it. This branch used
+      // to call the plain `toWireEvent`, so an uploaded document reached the
+      // interviewer as `text: ""` — an empty message, from the one route that
+      // asks for a document in the first place. The organizer saw a successful
+      // upload and the agent saw nothing.
       return {
         kind: "interview_to_gateway",
         chatId,
         sessionId: route.sessionId,
-        event: toWireEvent(message, chatId, text, options.interviewerProfile),
+        event: await toWireEventWithMedia(
+          message,
+          chatId,
+          text,
+          options.interviewerProfile,
+          describeAttachment(message),
+          options.media,
+        ),
       };
     }
     case "UNROUTED":
@@ -284,12 +337,14 @@ async function dispatchCallback(db: pg.Pool, update: TelegramUpdate): Promise<Di
   if (parsed.kind !== "unknown" && chatId !== undefined && chatId !== null) {
     const route = await resolveChatRoute(db, String(chatId));
     if (route.kind === "interview") {
+      const messageId = (callback.message as { message_id?: unknown } | undefined)?.message_id;
       return {
         kind: "interview_callback",
         chatId: String(chatId),
         callbackQueryId: callback.id,
         data: callback.data,
         sessionId: route.sessionId,
+        ...(messageId !== undefined && messageId !== null ? { messageId: String(messageId) } : {}),
       };
     }
     // An interview-shaped callback from a chat with no live interview is

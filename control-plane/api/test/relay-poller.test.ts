@@ -4,6 +4,8 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
+import { askText } from "../src/intake-copy.js";
+import { INTAKE_QUESTIONS } from "../src/interview.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import {
   answerCallbackData,
@@ -162,20 +164,30 @@ async function beginInterview(fix: Fixture, chatId: string): Promise<string> {
 // ── The organizer flow ───────────────────────────────────────────────────────
 
 describe("the organizer's first taps are recorded", () => {
-  test("a deep link produces a real question with real buttons", { skip: SKIP }, async () => {
+  test("a deep link opens with the document offer, then the first question", { skip: SKIP }, async () => {
     // The whole point of the router owning /start. Hermes's gateway discards
     // every /start before an agent sees it, which is what made one-tap
     // onboarding structurally impossible.
+    //
+    // The opening message is the offer to read a document, not the first
+    // question: asking someone to type a trip they already have written down
+    // is the biggest waste of their patience the interview can commit, and
+    // run 5 did exactly that.
     await withFixture(async (fix) => {
       const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
       assert.ok(issued.ok);
       await turn(fix, msg("700100001", `/start ${issued.token}`));
 
-      const sent = fix.telegram.lastSent;
-      assert.ok(sent, "the organizer gets an immediate reply");
-      assert.ok(sent.hasButtons, "the first intake question is tap-answerable");
+      const offer = fix.telegram.lastSent;
+      assert.ok(offer, "the organizer gets an immediate reply");
+      assert.deepEqual(offer.buttonData, ["c:nodoc"], "one way past the offer, and no question yet");
+
+      // Declining it starts the questions, tap-answerable as before.
+      await turn(fix, tap("700100001", "c:nodoc"));
+      const question = fix.telegram.lastSent;
+      assert.ok(question?.hasButtons, "the first intake question is tap-answerable");
       assert.ok(
-        sent.buttonData.every((d) => d.startsWith("a:trip_type:")),
+        question!.buttonData.every((d) => d.startsWith("a:trip_type:")),
         "the buttons answer the question that was asked",
       );
     });
@@ -196,7 +208,13 @@ describe("the organizer's first taps are recorded", () => {
 
       // The tap is acknowledged — otherwise Telegram spins the button forever.
       assert.equal(fix.telegram.answered.length, 1);
-      assert.equal(fix.telegram.lastSent?.text, "Where is the trip? (city/region/country)");
+      // What the organizer reads is `ask`, never the interviewer's field spec
+      // in `prompt` — that spec carries examples and schema instructions, and
+      // it was being read out verbatim in a live interview.
+      assert.equal(
+        fix.telegram.lastSent?.text,
+        askText(INTAKE_QUESTIONS.find((q) => q.id === "destination")!),
+      );
       assert.equal(fix.telegram.lastSent?.hasButtons, false, "a text question carries no keyboard");
     });
   });

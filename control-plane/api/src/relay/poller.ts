@@ -23,6 +23,7 @@ import {
   findQuestion,
   parseCallbackData,
   renderConfirmPrompt,
+  renderEssentialsDone,
   renderQuestion,
   type InlineKeyboard,
 } from "../chat-router.js";
@@ -34,11 +35,21 @@ import {
   openAgentTurn,
   submitAnswerForChat,
   type SessionView,
+  askForMoreForChat,
+  clearPendingAskForChat,
+  hasOpenAgentTurn,
+  markOfferedMoreForChat,
+  recordLastPromptForChat,
+  selectedOptionIds,
+  setFinishRequestedForChat,
+  skipQuestionForChat,
+  toggleMultiChoiceForChat,
 } from "../interview.js";
 import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
+import { DEFAULT_LANGUAGE, uiString } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -47,7 +58,7 @@ import {
   type DispatchDecision,
   type DispatchStrings,
 } from "./dispatch.js";
-import type { TelegramUpdate } from "./normalize.js";
+import { toWireEvent, type TelegramUpdate } from "./normalize.js";
 import type { WireMessageEvent } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
 
@@ -147,11 +158,28 @@ export async function applyDecision(
       return;
     }
 
+    case "show_summary":
+      await sendNextStep(decision.view, decision.chatId, deps, strings);
+      return;
+
     case "interview_callback":
       await applyInterviewCallback(decision, deps, strings, log);
       return;
 
     case "interview_to_gateway": {
+      // An upload gets an immediate acknowledgement, from the router rather
+      // than the agent. The agent's reply cannot arrive until it has READ the
+      // document, which on a PDF is exactly the wait this message exists to
+      // cover — so the one side that can answer instantly answers, and it can
+      // only do that in the organizer's language because the session records
+      // it. Requested during the 2026-09-04 run 3.
+      if ((decision.event.media_urls?.length ?? 0) > 0) {
+        const view = await getSessionForChat(deps.db, decision.chatId);
+        await deps.telegram.sendMessage({
+          chatId: decision.chatId,
+          text: uiString("fileReceived", view.ok ? view.view.language : DEFAULT_LANGUAGE),
+        });
+      }
       // The turn opens BEFORE the event goes out. The agent may call back the
       // moment it is handed the turn, so a turn opened afterwards could arrive
       // second and the write would be refused for a turn that genuinely is in
@@ -260,15 +288,12 @@ async function applyInterviewCallback(
       await ack("That question is no longer part of the interview.");
       return;
     }
-    // A multi_choice tap carries ONE option, but the answer is the whole set —
-    // recording a single tap would silently discard every other selection
-    // (someone both kosher and lactose-intolerant would end up with one of the
-    // two). Accumulating a selection needs a per-chat draft and a Done button;
-    // until that exists, refusing is the only non-lossy option. Nothing renders
-    // a multi_choice keyboard today, so this is a guard, not a live path.
+    // A multi_choice answer is a set, so it arrives as `toggle` taps and a
+    // Done, never as a single `answer`. Reaching here with one means a stale
+    // keyboard from before multi-select existed.
     if (question.type === "multi_choice") {
       log(structuredLog("warn", "trip_bot.multi_choice_tap_refused", { question_id: question.id }));
-      await ack("Multi-select isn't ready yet.");
+      await ack("Tap the options, then Done.");
       return;
     }
 
@@ -280,6 +305,94 @@ async function applyInterviewCallback(
         safe_error_code: result.reason,
       }));
       await ack("I couldn't record that — try again.");
+      return;
+    }
+    await ack();
+    await sendNextStep(result.view, decision.chatId, deps, strings);
+    return;
+  }
+
+  if (parsed.kind === "toggle") {
+    const result = await toggleMultiChoiceForChat(
+      deps.db, decision.chatId, parsed.questionId, parsed.optionId,
+    );
+    if (!result.ok) {
+      log(structuredLog("warn", "trip_bot.toggle_rejected", {
+        session_id: decision.sessionId,
+        question_id: parsed.questionId,
+        safe_error_code: result.reason,
+      }));
+      await ack("I couldn't record that — try again.");
+      return;
+    }
+    await ack();
+    // Redraw in place rather than sending a new message: a multi-select takes
+    // several taps, and one message per tap would bury the question under its
+    // own keyboards.
+    const question = findQuestion(parsed.questionId);
+    if (question && decision.messageId) {
+      const rendered = renderQuestion(question, selectedOptionIds(result.view, parsed.questionId), result.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+    }
+    return;
+  }
+
+  if (parsed.kind === "multi_done" || parsed.kind === "skip") {
+    // Done on an untouched multi-select is a skip: the organizer looked at the
+    // question and had nothing to add, which is not the same as an empty
+    // selection meaning "none of these apply".
+    const view = await (async () => {
+      if (parsed.kind === "skip") {
+        return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
+      }
+      const current = await getSessionForChat(deps.db, decision.chatId);
+      if (current.ok && selectedOptionIds(current.view, parsed.questionId).length === 0) {
+        return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
+      }
+      return current;
+    })();
+    if (!view.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await sendNextStep(view.view, decision.chatId, deps, strings);
+    return;
+  }
+
+  if (parsed.kind === "no_document") {
+    // Nothing to record — the offer was a courtesy, and declining it just
+    // starts the questions.
+    const view = await getSessionForChat(deps.db, decision.chatId);
+    if (!view.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await sendNextStep(view.view, decision.chatId, deps, strings);
+    return;
+  }
+
+  if (parsed.kind === "more") {
+    const result = await askForMoreForChat(deps.db, decision.chatId);
+    if (!result.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await sendNextStep(result.view, decision.chatId, deps, strings);
+    return;
+  }
+
+  if (parsed.kind === "finish") {
+    const result = await setFinishRequestedForChat(deps.db, decision.chatId, true);
+    if (!result.ok) {
+      await ack("I couldn't do that — try again.");
       return;
     }
     await ack();
@@ -313,15 +426,22 @@ async function applyInterviewCallback(
   }
 
   if (parsed.kind === "keep_planning") {
+    // Clearing the finish request is what makes this button mean something. It
+    // used to print this sentence and leave the state untouched, so the recap
+    // returned on the very next answer and the organizer was back where they
+    // started — the loop the 2026-09-04 run hit twice.
+    const result = await setFinishRequestedForChat(deps.db, decision.chatId, false);
     await ack();
-    // Deliberately does not walk into the optional questions. The next ones in
-    // line are multi_choice (dietary, bot_proactive), which cannot be answered
-    // by a single tap — see the refusal above. Offering a question that cannot
-    // be answered correctly would be worse than an open invitation.
     await deps.telegram.sendMessage({
       chatId: decision.chatId,
-      text: "Sure — tell me what you'd like to change and we'll go from there.",
+      text: uiString("keepPlanningReply", result.ok ? result.view.language : DEFAULT_LANGUAGE),
     });
+    // With optional questions still open, offering the next one beats waiting
+    // for the organizer to invent a topic. Multi-select is tappable now, so
+    // the old reason for not doing this is gone.
+    if (result.ok && result.view.nextQuestion) {
+      await sendNextStep(result.view, decision.chatId, deps, strings);
+    }
     return;
   }
 
@@ -373,6 +493,65 @@ async function renderDueRouterPrompts(
   }
 }
 
+/**
+ * Gives the turn back to the interviewer after a tap it never saw.
+ *
+ * Taps are recorded by the router alone — no agent is involved, which is the
+ * whole point of the deterministic layer. But once the router stops walking
+ * the optional questions, a tap that leaves nothing to ask would leave the
+ * conversation silent: the organizer answered, and neither side speaks.
+ *
+ * So the router forwards a short factual note instead. It is deliberately not
+ * a script for the agent to read out — `SOUL.md` requires it to call
+ * `get_interview_for_chat` and trust that over any text, this note included.
+ */
+async function handBackToInterviewer(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+): Promise<void> {
+  if (!deps.interviewerProfile) return;
+  const log = deps.log ?? (() => {});
+  // Already talking to it. Handing a second turn to an agent that is mid-turn
+  // is how run 5 turned into a bombardment: the handback opened a turn, the
+  // agent's next write scheduled another router prompt, that found nothing to
+  // ask and handed back again — nine turns and twenty-eight messages deep
+  // before anyone stopped it.
+  if (await hasOpenAgentTurn(deps.db, chatId)) {
+    log(structuredLog("info", "trip_bot.handback_skipped", {
+      session_id: view.sessionId,
+      reason: "TURN_ALREADY_OPEN",
+    }));
+    return;
+  }
+  const turn = await openAgentTurn(deps.db, chatId, view.sessionId);
+  const delivered = deps.connector.pushInbound(
+    toWireEvent(
+      { chat: { id: chatId, type: "private" } } as never,
+      chatId,
+      "[router] The organizer just answered with a button. Nothing is queued to ask them — "
+        + "read the interview state and carry on, or ask for the summary if you have everything.",
+      deps.interviewerProfile,
+    ),
+  );
+  log(structuredLog(delivered ? "info" : "warn", "trip_bot.interview_handback", {
+    session_id: view.sessionId,
+    turn_id: turn.id,
+    ...(delivered ? {} : { safe_error_code: "GATEWAY_UNAVAILABLE" }),
+  }));
+}
+
+/**
+ * What the router says after an answer lands: the next required question, the
+ * optional question the interviewer nominated, or the confirm recap.
+ *
+ * It does NOT walk the optional questions on its own while an interviewer is
+ * configured. It did for one live run, and marching the whole optional set in
+ * schema order turned the interview into a form — the organizer was asked for
+ * a timezone having already said Japan. With an interviewer present, which
+ * optional question to raise is its call; without one there is nobody else to
+ * ask, so the walk stays as the fallback.
+ */
 async function sendNextStep(
   view: SessionView,
   chatId: string,
@@ -382,26 +561,74 @@ async function sendNextStep(
   let text: string;
   let replyMarkup: InlineKeyboard | undefined;
 
+  const autoWalkOptional = !deps.interviewerProfile;
+  const question =
+    view.nextQuestion
+    ?? view.pendingAsk
+    ?? (autoWalkOptional && view.state === "interviewing" ? view.optionalRemaining[0] ?? null : null);
+
+  // Every agent write asks the router to speak. An agent that recorded five
+  // answers off one document therefore asked five times, and the organizer got
+  // the same question five times over. Saying nothing when there is nothing
+  // new to say is the whole fix.
+  const promptKey = view.state === "awaiting_confirmation" ? "recap" : question ? `q:${question.id}` : "";
+  if (promptKey && promptKey === view.lastPrompt) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.prompt_deduped", {
+      session_id: view.sessionId,
+      prompt: promptKey,
+    }));
+    return;
+  }
+
+  if (!question && view.state !== "awaiting_confirmation") {
+    // The boundary between the required questions and the optional ones is the
+    // one place the router still speaks unprompted. Both exits — more
+    // questions, or the summary — are put in front of the organizer exactly
+    // once, so a fumbled nomination by the interviewer cannot strand them with
+    // no way forward, which is precisely what happened on 2026-09-04's run 4.
+    if (!view.offeredMore) {
+      const rendered = renderEssentialsDone(view.language);
+      await markOfferedMoreForChat(deps.db, chatId);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      return;
+    }
+    // After that it is the interviewer's conversation to carry. Saying
+    // something anyway is how the router ended up talking over it.
+    await handBackToInterviewer(view, chatId, deps);
+    return;
+  }
+
   if (view.state === "awaiting_confirmation") {
     const recap = (view.recap ?? [])
       .map((entry) => `• ${entry.prompt}\n  ${entry.answerLabel}`)
       .join("\n");
     const rendered = renderConfirmPrompt(
-      `Here's what I have:\n\n${recap}\n\nConfirm to lock this in, or keep planning to change something.`,
+      `${uiString("recapHeader", view.language)}\n\n${recap}\n\n${uiString("recapFooter", view.language)}`,
+      view.language,
     );
     text = rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
-  } else if (view.nextQuestion) {
-    const rendered = renderQuestion(view.nextQuestion);
+  } else if (question) {
+    // Selections travel with the question: re-asking a half-ticked
+    // multi-select without them would show every option unticked and invite
+    // the organizer to tap the same ones off again.
+    const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
     text = rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
+    if (view.pendingAsk?.id === question.id) await clearPendingAskForChat(deps.db, chatId);
   } else {
-    // deriveSessionState only reports `interviewing` while a required question
-    // is unanswered, so this is unreachable rather than merely unlikely.
+    // `interviewing` always has a next question now — required ones first,
+    // then optional ones not yet answered or skipped — and every other state
+    // is handled above, so this stays unreachable.
     text = "Thanks — noted.";
   }
 
   await deps.telegram.sendMessage({ chatId, text, replyMarkup });
+  if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
 }
 
 // ── The loop ─────────────────────────────────────────────────────────────────
