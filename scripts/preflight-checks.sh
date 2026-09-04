@@ -171,6 +171,41 @@ EOF
   return 1
 }
 
+# UNCOMMITTED REPO EDITS ARE NOT DRIFT. The rule protects profile content from
+# being destroyed, because ~/.hermes has no history. It does not protect the
+# profile from the repo: a repo-side edit that has not been deployed yet is
+# normal authoring, and is exactly what "capture before you deploy" asks for.
+#
+# Comparing the WORKING TREE to the profile could not tell those apart, so it
+# blocked every uncommitted improvement to a profile file — including the commit
+# that would have given that improvement its history. That inverts the rule:
+# it forced deploy-before-commit, which is the one ordering the whole section
+# exists to prevent.
+#
+# Comparing HEAD to the profile tells them apart exactly. If what is COMMITTED
+# still matches the profile, nothing the profile holds is at risk and the
+# difference is a pending deploy. If HEAD differs, the profile holds content the
+# repo does not, and that is the case worth blocking.
+profile_matches_head() {
+  # $1 repo-relative path (file or directory) · $2 the profile's copy.
+  local rel="$1" dest="$2" f relf
+  if [ -f "$rel" ]; then
+    git show "HEAD:$rel" 2>/dev/null | diff -q - "$dest" >/dev/null 2>&1
+    return $?
+  fi
+  [ -d "$rel" ] || return 1
+  # Every file the profile holds must exist at HEAD, byte-identical...
+  while IFS= read -r f; do
+    relf="$rel/${f#"$dest"/}"
+    git show "HEAD:$relf" 2>/dev/null | diff -q - "$f" >/dev/null 2>&1 || return 1
+  done < <(find "$dest" -type f)
+  # ...and HEAD must hold nothing the profile is missing.
+  while IFS= read -r relf; do
+    [ -f "$dest/${relf#"$rel"/}" ] || return 1
+  done < <(git ls-tree -r --name-only HEAD -- "$rel")
+  return 0
+}
+
 HERMES_PROFILES="${HERMES_HOME:-$HOME/.hermes}/profiles"
 if [ -d "$HERMES_PROFILES" ]; then
   # Mapped pairs (profile SOULs and anything install-hermes-skill.sh cannot express).
@@ -185,6 +220,9 @@ if [ -d "$HERMES_PROFILES" ]; then
         if server="$(served_from_other_worktree "$repo_path" "$dest")"; then
           warn "profile '$profile' is served from another checkout, not this one: $server" \
                "nothing to do here unless you meant to deploy this checkout's $repo_path"
+        elif profile_matches_head "$repo_path" "$dest"; then
+          warn "$repo_path is ahead of profile '$profile' — an undeployed edit, not drift" \
+               "deploy when the code that goes with it deploys: scripts/install-hermes-skill.sh"
         else
           block "hermes drift — $repo_path differs from profile '$profile'" \
                 "diff $repo_path $dest    # then capture the profile side or deploy the repo side"
@@ -204,6 +242,9 @@ if [ -d "$HERMES_PROFILES" ]; then
         if server="$(served_from_other_worktree "$src" "$dest")"; then
           warn "profile '$profile' runs $name from another checkout, not this one: $server" \
                "nothing to do here unless you meant to deploy this checkout's $name"
+        elif profile_matches_head "$src" "$dest"; then
+          warn "$name is ahead of profile '$profile' — an undeployed edit, not drift" \
+               "deploy when the code that goes with it deploys: scripts/install-hermes-skill.sh $name $profile"
         else
           block "hermes drift — $name differs between the repo and profile '$profile'" \
                 "scripts/install-hermes-skill.sh $name $profile --capture"
