@@ -1,0 +1,15 @@
+# hermes-sync.tsv — repo-owned content that also lives in a Hermes profile.
+#
+# ~/.hermes is not version controlled, so anything listed here has a copy in a
+# place with no history. preflight-checks.sh B5 compares each pair and BLOCKS a
+# commit while they differ, so the profile copy can never become the only copy.
+#
+# Skill directories under .agents/skills/<name> that are installed at
+# profiles/<profile>/skills/travel/<name> are discovered automatically and do
+# not need a line here. This file is for everything else — profile SOULs and
+# any other pairing install-hermes-skill.sh cannot express (it requires a
+# SKILL.md and only manages the skills/travel/ layout).
+#
+# Columns, tab-separated:  <repo path>  <profile>  <path within the profile>
+
+.agents/skills/trip-intake-interviewer/SOUL.md	trip-intake	SOUL.md
