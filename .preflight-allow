@@ -1,0 +1,10 @@
+# Reviewed exceptions to the preflight blocking checks.
+#
+# Hard rule 3 (no binaries in git) is blanket by design. An entry here is a
+# recorded, reviewed decision — not a silent one-off exemption. Each line needs
+# a reason, and the reason has to be "the test cannot exist without this file",
+# not "it is small" or "it is harmless".
+#
+# Format:  <repo-relative path>  # <reason>
+
+tests/fixtures/sample-confirmation.pdf  # PDF extraction cannot be tested without a real PDF (tests/mcp-extract.test.js:57)

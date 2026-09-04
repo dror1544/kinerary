@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - "sprint/**"
+      # Sprint 5+ stacks onto an integration branch; without this, pushes there
+      # run no CI at all and regressions only surface at the PR.
+      - "integration/**"
       - "docs/trip-fleet-control-plane-plan"
   pull_request:
     branches:
