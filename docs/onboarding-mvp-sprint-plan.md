@@ -864,6 +864,12 @@ Build:
     (Step 3 #3, #4);
   - allow multiple planned-order answers, with a flight-details option on flight
     days (Step 3 #8);
+  - **multi-select taps plus a real "other" button (#42)** — one job, not two.
+    `allowsOther` never reaches the keyboard, and `multi_choice` taps are
+    refused outright because one tap carries one option while the answer is the
+    whole set. Both need the same missing primitive: a per-chat draft that
+    accumulates taps and a Done button to commit it. Building "other" alone
+    means building that machinery again for multi-select a week later;
   - let the interviewer read a pasted link / scrape a page without prompting the
     organizer for approval (Step 3 #5, #6);
   - say plainly that day-by-day itinerary help lives on the trip bot and this
@@ -1168,6 +1174,15 @@ Build:
   the candidate → eval → promotion shape the release pipeline already uses. A
   judge editing the live template unattended reproduces the 2026-09-03 failure
   mode with a faster loop.
+- **Localised question catalogue on the same loop (#41).** All 23 prompts and
+  every option label are literal English strings today. Localising them needs
+  per-language files plus an agent that realigns the others when the English
+  source changes — which is the judge loop with a different input, so it shares
+  the mechanism rather than growing a second one. `option_id` is NEVER
+  translated: ids land in the immutable intake and are what the transformer
+  reads, so only labels vary. A language file whose source has moved is worse
+  than a missing one, because nothing looks wrong — the organizer is simply
+  asked last month's question, so staleness has to be a gate condition.
 
 Automated tests:
 
@@ -1187,14 +1202,15 @@ Manual tests:
 - the judge's suggestions on that interview are actionable by the super admin;
 - an organizer starting a second trip gets a genuinely fresh interviewer.
 
-**Open decision points before this can start** — all seven are stated in full
+**Open decision points before this can start** — all eight are stated in full
 in `docs/interviewer-lifecycle-design.md`, and each changes the shape of the
 build: whether the ephemeral path replaces or coexists with the shared one;
 the interview TTL and whether "abandoned" is terminal or resumable; who may
 promote a template change and against what eval; how much transcript the judge
 may see and for how long; per-interview vs batched judging; whether the render
-step reuses the provisioner's adapter; and whether the un-namespaced session id
-is worth fixing upstream for the long-lived companion profiles that keep it.
+step reuses the provisioner's adapter; whether the judge owns translation alignment or that is a
+separate lane (#41); and whether the un-namespaced session id is worth fixing
+upstream for the long-lived companion profiles that keep it.
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 
