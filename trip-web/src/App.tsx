@@ -20,6 +20,7 @@ import {
   Menu,
   MessageCircle,
   Navigation,
+  Pencil,
   Plane,
   Plus,
   RefreshCw,
@@ -29,6 +30,7 @@ import {
   ShieldCheck,
   Sparkles,
   TicketCheck,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -38,7 +40,10 @@ import {
   ActiveItinerary,
   Booking,
   approveBookingDraft,
+  createItineraryItem,
+  deleteItineraryItem,
   ItineraryItem,
+  ItineraryItemInput,
   TripConfig,
   createMoment,
   extractBookingDraft,
@@ -57,12 +62,16 @@ import {
   reportIssue,
   runtimeUrl,
   tokenStore,
+  updateItineraryItem,
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
 type Module = "bookings" | "map" | "budget" | "photos";
 type Lang = "he" | "en";
 type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
+type ItineraryTimeMode = "exact" | "rough" | "none";
+
+const roughTimes = ["morning", "noon", "afternoon", "evening"] as const;
 
 const tabIcons = {
   today: Home,
@@ -99,6 +108,18 @@ function daySelectorSubtitle(day: { label_he?: string | null; label_en?: string 
 
 function copy(lang: Lang, en: string, he: string) {
   return lang === "he" ? he : en;
+}
+
+function itineraryTimeLabel(value: string | null | undefined, lang: Lang) {
+  if (!value) return copy(lang, "Anytime", "בכל שעה");
+  const labels: Record<(typeof roughTimes)[number], [string, string]> = {
+    morning: ["Morning", "בוקר"],
+    noon: ["Noon", "צהריים"],
+    afternoon: ["Afternoon", "אחר הצהריים"],
+    evening: ["Evening", "ערב"],
+  };
+  const label = labels[value as keyof typeof labels];
+  return label ? (lang === "he" ? label[1] : label[0]) : value;
 }
 
 function phaseLabel(phase: string, lang: Lang) {
@@ -354,7 +375,7 @@ function TimelineItem({
   return (
     <article className={`timeline-item ${compact ? "compact" : ""}`}>
       <div className="time-rail">
-        <span>{item.time || copy(lang, "Anytime", "בכל שעה")}</span>
+        <span>{itineraryTimeLabel(item.time, lang)}</span>
         <i />
       </div>
       <div className="item-body">
@@ -590,6 +611,7 @@ function TodayView({
 function JourneyView({
   itinerary,
   config,
+  isOrganizer,
   lang,
   botName,
   telegramUsername,
@@ -597,6 +619,7 @@ function JourneyView({
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
+  isOrganizer?: boolean;
   lang: Lang;
   botName?: string;
   telegramUsername?: string | null;
@@ -638,6 +661,65 @@ function JourneyView({
     }
   }, [activePhase, selected]);
 
+  const queryClient = useQueryClient();
+  const [editing, setEditing] = useState<ItineraryItem | null | "new">(null);
+  const [draft, setDraft] = useState<ItineraryItemInput>({ phase_id: "", date: "", text_he: "", text_en: "", time: "", item_type: "activity", location_url: "" });
+  const [timeMode, setTimeMode] = useState<ItineraryTimeMode>("none");
+  const [enrichmentNote, setEnrichmentNote] = useState("");
+  const saveMutation = useMutation({
+    mutationFn: ({ itemUid, input }: { itemUid?: string; input: ItineraryItemInput }) => itemUid ? updateItineraryItem(itemUid, input) : createItineraryItem(input),
+    onSuccess: (result) => {
+      setEditing(null);
+      setEnrichmentNote(result.enrichment?.configured
+        ? copy(lang, "Saved. Kinerary is now adding the other language, location, and useful links. It can take a minute.", "נשמר. קינררי מוסיף עכשיו את השפה השנייה, מיקום וקישורים שימושיים. זה עשוי לקחת כדקה.")
+        : copy(lang, "Saved. The other language and location links will be added automatically when the trip assistant is online.", "נשמר. השפה השנייה וקישורי המיקום יתווספו אוטומטית כשהעוזר של הטיול יהיה זמין."));
+      void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
+      void queryClient.invalidateQueries({ queryKey: ["today"] });
+      if (result.enrichment?.configured) {
+        [4_000, 12_000, 30_000].forEach((delay) => window.setTimeout(() => {
+          void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
+          void queryClient.invalidateQueries({ queryKey: ["today"] });
+        }, delay));
+      }
+    },
+  });
+  const removeMutation = useMutation({
+    mutationFn: deleteItineraryItem,
+    onSuccess: () => {
+      setEditing(null);
+      void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
+      void queryClient.invalidateQueries({ queryKey: ["today"] });
+    },
+  });
+
+  const beginNew = () => {
+    const fallbackPhase = config?.phases?.[0];
+    setDraft({
+      phase_id: activePhase?.id || fallbackPhase?.id || "",
+      date: activeDate || fallbackPhase?.start || new Date().toISOString().slice(0, 10),
+      text_he: "",
+      text_en: "",
+      time: "",
+      item_type: "activity",
+      location_url: "",
+    });
+    setTimeMode("none");
+    setEditing("new");
+  };
+  const beginEdit = (item: ItineraryItem) => {
+    setDraft({
+      phase_id: item.phase_id,
+      date: item.date || activeDate,
+      text_he: item.text_he,
+      text_en: item.text_en || "",
+      time: item.time || "",
+      item_type: item.item_type || "activity",
+      location_url: item.location_url || "",
+    });
+    setTimeMode(roughTimes.includes(item.time as (typeof roughTimes)[number]) ? "rough" : item.time ? "exact" : "none");
+    setEditing(item);
+  };
+
   return (
     <section className="journey-layout">
       <aside className="destination-rail" aria-label="Trip phases">
@@ -665,6 +747,7 @@ function JourneyView({
           <span className="panel-label">{activePhase?.title || "Journey"}</span>
           <h2>{day?.label_en || day?.label_he || "Daily itinerary"}</h2>
           {day?.lodging_context?.name ? <p>Tonight: {day.lodging_context.name}</p> : null}
+          {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <div className="day-selector" aria-label="Days in selected phase">
             {(activePhase?.days || []).map((entry) => (
               <button key={`${entry.phase_id}-${entry.date}`} className={entry.date === activeDate ? "active" : ""} onClick={() => setSelected(entry.date)}>
@@ -674,9 +757,73 @@ function JourneyView({
             ))}
           </div>
         </div>
+        {isOrganizer && editing ? (
+          <form
+            className="itinerary-editor"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!draft.phase_id || !draft.date || !draft.text_he.trim()) return;
+              const time = timeMode === "none" ? null : draft.time?.trim() || null;
+              saveMutation.mutate({ itemUid: editing === "new" ? undefined : editing.item_uid, input: { ...draft, text_he: draft.text_he.trim(), text_en: null, time, location_url: draft.location_url?.trim() || null } });
+            }}
+          >
+            <div className="editor-heading">
+              <div>
+                <span className="panel-label"><Pencil size={16} /> {copy(lang, "Organizer editor", "עורך למארגנים")}</span>
+                <h3>{editing === "new" ? copy(lang, "Add to the active plan", "הוספת פריט לתוכנית הפעילה") : copy(lang, "Edit itinerary item", "עריכת פריט במסלול")}</h3>
+              </div>
+              <button className="icon-button" type="button" onClick={() => setEditing(null)} aria-label={copy(lang, "Close editor", "סגירת העורך")}><X size={18} /></button>
+            </div>
+            <div className="editor-fields">
+              <label>{copy(lang, "Phase", "שלב")}
+                <select value={draft.phase_id} onChange={(event) => setDraft({ ...draft, phase_id: event.target.value })}>
+                  {(config?.phases || phaseGroups).map((phase) => <option key={phase.id} value={phase.id}>{"title" in phase ? text(phase.title, lang) || phase.id : phase.id}</option>)}
+                </select>
+              </label>
+              <label>{copy(lang, "Date", "תאריך")}<input type="date" value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} required /></label>
+              <label>{copy(lang, "When", "מתי")}
+                <select value={timeMode} onChange={(event) => {
+                  const nextMode = event.target.value as ItineraryTimeMode;
+                  setTimeMode(nextMode);
+                  setDraft({ ...draft, time: nextMode === "rough" ? "morning" : "" });
+                }}>
+                  <option value="none">{copy(lang, "No time", "ללא שעה")}</option>
+                  <option value="exact">{copy(lang, "Exact time", "שעה מדויקת")}</option>
+                  <option value="rough">{copy(lang, "Part of day", "חלק מהיום")}</option>
+                </select>
+              </label>
+              {timeMode === "exact" ? <label>{copy(lang, "Exact time", "שעה מדויקת")}<input type="time" value={draft.time || ""} onChange={(event) => setDraft({ ...draft, time: event.target.value })} /></label> : null}
+              {timeMode === "rough" ? <label>{copy(lang, "Part of day", "חלק מהיום")}
+                <select value={draft.time || "morning"} onChange={(event) => setDraft({ ...draft, time: event.target.value })}>
+                  {roughTimes.map((time) => <option key={time} value={time}>{itineraryTimeLabel(time, lang)}</option>)}
+                </select>
+              </label> : null}
+              <label>{copy(lang, "Type", "סוג")}
+                <select value={draft.item_type || "activity"} onChange={(event) => setDraft({ ...draft, item_type: event.target.value })}>
+                  {["activity", "travel", "meal", "lodging", "free_time", "booking", "task", "note"].map((type) => <option key={type} value={type}>{type.replace("_", " ")}</option>)}
+                </select>
+              </label>
+              <label className="editor-field-wide">{copy(lang, "Activity name", "שם הפעילות")}<input value={draft.text_he} onChange={(event) => setDraft({ ...draft, text_he: event.target.value })} required /></label>
+              <p className="editor-note">{copy(lang, "Write the activity once, in Hebrew or English. After you save, Kinerary adds the other language and looks up the location, Waze, website, and tickets when available.", "כותבים את הפעילות פעם אחת, בעברית או באנגלית. לאחר השמירה קינררי מוסיף את השפה השנייה ומחפש מיקום, Waze, אתר וכרטיסים כשיש כאלה.")}</p>
+              <label className="editor-field-wide">{copy(lang, "Google Maps or location link", "קישור Google Maps או מיקום")}<input type="url" value={draft.location_url || ""} onChange={(event) => setDraft({ ...draft, location_url: event.target.value })} placeholder="https://..." /></label>
+            </div>
+            {saveMutation.isError ? <p className="form-error">{saveMutation.error instanceof Error ? saveMutation.error.message : copy(lang, "Could not save the itinerary item.", "לא ניתן לשמור את פריט המסלול.")}</p> : null}
+            <div className="editor-actions">
+              <button className="primary-action" type="submit" disabled={saveMutation.isPending || !draft.phase_id || !draft.date || !draft.text_he.trim()}>{saveMutation.isPending ? copy(lang, "Saving…", "שומר…") : copy(lang, "Save revision", "שמירת גרסה")}</button>
+              <button className="secondary-action" type="button" onClick={() => setEditing(null)}>{copy(lang, "Cancel", "ביטול")}</button>
+            </div>
+          </form>
+        ) : null}
+        {isOrganizer && enrichmentNote ? <p className="enrichment-note"><Sparkles size={16} /> {enrichmentNote}</p> : null}
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
-            <TimelineItem key={item.item_uid} item={item} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+            <div className="timeline-item-wrap" key={item.item_uid}>
+              <TimelineItem item={item} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              {isOrganizer ? <div className="timeline-editor-actions">
+                <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
+                <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
+              </div> : null}
+            </div>
           )) : <p className="empty-state">No structured items for this phase day yet.</p>}
         </div>
       </section>
@@ -1131,7 +1278,7 @@ export default function App() {
       : "";
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
-    journey: <JourneyView itinerary={itinerary.data} config={config.data} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} />,
+    journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} />,
     moments: <MomentsView todayDate={today.data?.today} />,
     more: <MoreView config={config.data} isOrganizer={me.data?.is_organizer} openModule={openModule} />,
   }[activeTab];

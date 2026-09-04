@@ -121,6 +121,22 @@ export type ActiveItinerary = {
   items: ItineraryItem[];
 };
 
+export type ItineraryItemInput = {
+  phase_id: string;
+  date: string;
+  text_he: string;
+  text_en?: string | null;
+  time?: string | null;
+  item_type?: string;
+  location_url?: string | null;
+};
+
+export type ItineraryMutation = {
+  revision: string;
+  item_uid: string;
+  enrichment?: { configured: boolean; queued: boolean };
+};
+
 export type TodayContext = {
   today: string;
   phase: "pre_trip" | "flight_day" | "active_day" | "transfer_day" | "post_trip";
@@ -169,6 +185,9 @@ export const getItinerary = () => api<unknown>("/api/itinerary/active").then((va
   days: z.array(z.any()),
   items: z.array(itemSchema),
 }).parse(value) as ActiveItinerary);
+export const createItineraryItem = (input: ItineraryItemInput) => api<ItineraryMutation>("/api/itinerary/items", { method: "POST", body: JSON.stringify(input) });
+export const updateItineraryItem = (itemUid: string, input: ItineraryItemInput) => api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify(input) });
+export const deleteItineraryItem = (itemUid: string) => api<{ ok: true; revision: string }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "DELETE" });
 export const getBookings = () => api<unknown>("/api/bookings").then((value) => z.array(bookingSchema).parse(value));
 export const extractBookingDetails = (body: FormData) => api<unknown>("/api/bookings/extract", { method: "POST", body });
 export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });

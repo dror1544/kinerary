@@ -339,7 +339,7 @@ function rowsFromLegacyPlan(db) {
     confirmation_state: row.status === 'confirmed' ? 'verified' : 'needs_review',
     duration_minutes: null,
     sort_order: Number.isFinite(Number(row.sort_order)) ? Number(row.sort_order) : index,
-    source_ref: row.config_ref || `legacy:${row.id}`,
+    source_ref: row.itinerary_item_uid ? `modern:${row.itinerary_item_uid}` : row.config_ref || `legacy:${row.id}`,
     created_by: row.created_by || 'legacy',
     extra_links: row.extra_links || null,
   })).filter((row) => row.text_he);
@@ -873,7 +873,7 @@ function confirmationSummary(db) {
   });
 }
 
-function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired }) {
+function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment }) {
   app.get('/api/ui-bootstrap', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -989,7 +989,8 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
       });
     });
     updateLegacyFromActive(db);
-    res.status(201).json({ revision: nextId, item_uid: uid });
+    const enrichment = requestItemEnrichment?.(uid) || { configured: false, queued: false };
+    res.status(201).json({ revision: nextId, item_uid: uid, enrichment });
   });
 
   app.patch('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
@@ -1022,7 +1023,10 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     });
     if (!touched) return res.status(404).json({ error: 'not found' });
     updateLegacyFromActive(db);
-    res.json({ revision: nextId, item_uid: uid });
+    const enrichment = body.text_he !== undefined
+      ? requestItemEnrichment?.(uid) || { configured: false, queued: false }
+      : undefined;
+    res.json({ revision: nextId, item_uid: uid, ...(enrichment ? { enrichment } : {}) });
   });
 
   app.delete('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {

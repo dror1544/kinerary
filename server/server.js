@@ -880,6 +880,18 @@ const journey = livingJourney.create({
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
+  requestItemEnrichment: (itemUid) => {
+    // A Modern edit projects into the Classic compatibility table. Queue just
+    // that projected row rather than re-running enrichment for the entire trip.
+    // The background worker owns model calls, so the save request remains fast.
+    if (!HERMES_URL) return { configured: false, queued: false };
+    const result = db.prepare(
+      "UPDATE phase_plan_items SET enrichment_status = 'pending', enrich_attempts = 0 " +
+      "WHERE itinerary_item_uid = ? AND (enrichment_status IS NULL OR enrichment_status IN ('none', 'failed'))"
+    ).run(itemUid);
+    kickEnrichmentSoon();
+    return { configured: true, queued: Boolean(result.changes) };
+  },
 });
 
 const heroUpload = multer({
@@ -2509,6 +2521,13 @@ function cleanLink(u) {
   return typeof u === 'string' && /^https?:\/\//i.test(u.trim()) ? u.trim() : null;
 }
 
+// Model-written itinerary text reaches every trip member. Strip markup before
+// persisting it, just as we do for generated day labels, and keep the model
+// bounded to a single itinerary-line-sized value.
+function cleanEnrichedText(value) {
+  return typeof value === 'string' && value.trim() ? stripTags(value).slice(0, 2000) : null;
+}
+
 function cleanBool(v) {
   if (v === true || v === 1 || v === 'true') return 1;
   if (v === false || v === 0 || v === 'false') return 0;
@@ -2644,18 +2663,31 @@ async function runEnrichmentPass() {
       db.prepare('UPDATE phase_plan_items SET enrich_attempts = enrich_attempts + 1 WHERE id = ?').run(item.id);
       try {
         const out = await enrichOne(item);
+        // The organizer enters one title. The enrichment service supplies the
+        // companion language without overwriting Hebrew an organizer authored.
+        // If the primary field was entered in English, replace that temporary
+        // storage value with the Hebrew translation once it is available.
+        const primaryLooksHebrew = /[\u0590-\u05FF]/.test(item.text_he || '');
+        const translatedHe = !item.text_en && !primaryLooksHebrew ? cleanEnrichedText(out.text_he) : null;
+        const translatedEn = !item.text_en ? cleanEnrichedText(out.text_en) : null;
         // Link a real booking if one plainly matches, but never overwrite a
         // link an organizer or agent already set by hand.
         const bookingId = item.booking_id || findMatchingBooking(item);
         db.prepare(
-          "UPDATE phase_plan_items SET location_url = COALESCE(?, location_url), waze_url = ?, " +
+          "UPDATE phase_plan_items SET text_he = COALESCE(?, text_he), text_en = COALESCE(?, text_en), " +
+          "location_url = COALESCE(?, location_url), waze_url = ?, " +
           'website_url = ?, ticket_url = ?, needs_tickets = ?, advance_booking = ?, ' +
           "booking_id = COALESCE(?, booking_id), enrichment_status = 'done', " +
           "enriched_at = datetime('now') WHERE id = ?"
-        ).run(cleanLink(out.maps_url), cleanLink(out.waze_url),
+        ).run(translatedHe, translatedEn, cleanLink(out.maps_url), cleanLink(out.waze_url),
               cleanLink(out.website_url), cleanLink(out.ticket_url),
               cleanBool(out.needs_tickets), cleanBool(out.advance_booking),
               bookingId, item.id);
+        // The Modern UI reads the immutable active revision, not the Classic
+        // compatibility row the worker enriches. Synchronize each completed
+        // pass so the translated title and links appear there without a manual
+        // Classic reload.
+        journey.syncFromLegacy('enrichment');
       } catch (e) {
         const attempts = db.prepare('SELECT enrich_attempts a FROM phase_plan_items WHERE id = ?').get(item.id)?.a || 0;
         if (attempts >= ENRICH_MAX_ATTEMPTS) {

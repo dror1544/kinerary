@@ -196,7 +196,10 @@ describe('Modern itinerary edits reconcile into the Classic plan', () => {
     });
     assert.equal(first.status, 201);
     assert.equal(second.status, 201);
-    keptUid = (await first.json()).item_uid;
+    const firstCreated = await first.json();
+    assert.deepEqual(firstCreated.enrichment, { configured: true, queued: true },
+      'a Modern item must start the background translation/link enrichment pass');
+    keptUid = firstCreated.item_uid;
     removedUid = (await second.json()).item_uid;
 
     const rows = await planRows();
