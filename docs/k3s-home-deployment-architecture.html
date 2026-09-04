@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kinerary — k3s Home Deployment Architecture</title>
+<meta name="description" content="Target deployment architecture for running Kinerary, Hermes, the control plane, and trip runtimes on a single-node k3s cluster in the Kinerary home lab, with optional macOS capacity and TrueNAS-backed document storage.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--paper:#f7f4ee;--surface:#fffdf8;--ink:#20242c;--muted:#5c6472;--rule:#e2ddd0;--rule-strong:#cdc6b4;--accent:#0d7a6f;--accent-soft:#e2efec;--warn:#b06f1e;--good:#2f7d4f;--shadow:0 1px 2px rgba(32,36,44,.06),0 8px 24px rgba(32,36,44,.05);--measure:76ch;--wide:1120px;--f-display:"Fraunces",Georgia,serif;--f-body:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--f-mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace}
+@media(prefers-color-scheme:dark){:root{--paper:#15171c;--surface:#1b1e24;--ink:#e6e3da;--muted:#9aa1ac;--rule:#2c3038;--rule-strong:#3c414b;--accent:#4bb8ab;--accent-soft:#17322f;--warn:#e0a75a;--good:#5cc98a;--shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.28)}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}.wrap{max-width:var(--wide);margin:0 auto;padding:0 24px}.prose{max-width:var(--measure)}header{border-bottom:1px solid var(--rule);padding:4.5rem 0 2.6rem}.eyebrow{font-family:var(--f-mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:0 0 1rem}h1,h2,h3{font-family:var(--f-display);font-weight:500;letter-spacing:-.012em}h1{font-size:clamp(2.4rem,6vw,3.7rem);line-height:1.04;margin:0 0 1rem}h2{font-size:2rem;margin:0 0 1rem}h3{font-size:1.35rem;margin:2rem 0 .5rem}.lede{font-size:1.12rem;color:var(--muted);max-width:66ch}.meta{font-family:var(--f-mono);font-size:.78rem;color:var(--muted);display:flex;gap:.5rem 1.4rem;flex-wrap:wrap}.meta b{color:var(--ink);font-weight:500}main{padding:2.8rem 0 5rem}section{margin:0 0 4rem}.toc{padding:1.3rem 1.5rem;border:1px solid var(--rule);border-radius:10px;background:var(--surface);box-shadow:var(--shadow);max-width:var(--measure);margin-bottom:3.5rem}.toc a{color:var(--ink);text-decoration:none}.toc a:hover{text-decoration:underline}.toc ol{columns:2;gap:2rem;margin:.5rem 0 0;padding-left:1.3rem}@media(max-width:700px){.toc ol{columns:1}}.figure,.card{background:var(--surface);border:1px solid var(--rule);border-radius:12px;box-shadow:var(--shadow)}.figure{padding:1.5rem;overflow:auto}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}@media(max-width:760px){.grid{grid-template-columns:1fr}}.card{padding:1.25rem}.card h3{margin:.1rem 0 .45rem;font-family:var(--f-body);font-size:1rem;font-weight:600}.tag{display:inline-block;font-family:var(--f-mono);font-size:.7rem;padding:.15rem .45rem;border-radius:999px;background:var(--accent-soft);color:var(--accent);margin-right:.35rem}.warn{color:var(--warn)}.good{color:var(--good)}pre,code{font-family:var(--f-mono)}pre{margin:0;white-space:pre;line-height:1.5;font-size:.85rem}code{font-size:.9em;background:var(--accent-soft);padding:.08rem .28rem;border-radius:4px}table{border-collapse:collapse;width:100%;font-size:.94rem}th,td{text-align:left;vertical-align:top;padding:.75rem;border-bottom:1px solid var(--rule)}th{font-family:var(--f-mono);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.note{border-left:3px solid var(--accent);padding:.75rem 1rem;background:var(--accent-soft);border-radius:0 8px 8px 0}.decision{border-left-color:var(--warn)}ul{padding-left:1.25rem}a{color:var(--accent)}footer{border-top:1px solid var(--rule);padding:2rem 0 4rem;color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<header><div class="wrap"><p class="eyebrow">Deployment architecture · Home lab</p><h1>Kinerary on k3s</h1><p class="lede">Target architecture for moving Kinerary and its Hermes AI runtime from the current Mac/Compose-oriented deployment into a reproducible k3s platform on Proxmox, while preserving the product control-plane contracts and simplifying trip provisioning.</p><div class="meta"><span><b>Status</b> Proposed target</span><span><b>Baseline</b> single-node k3s</span><span><b>Host</b> Proxmox</span><span><b>Storage</b> local SSD + TrueNAS NFS/backup</span><span><b>Public routing</b> one Kinerary hostname, path based</span></div></div></header>
+<main><div class="wrap">
+<nav class="toc"><strong>Contents</strong><ol><li><a href="#principles">Principles</a></li><li><a href="#physical">Physical topology</a></li><li><a href="#cluster">Cluster layout</a></li><li><a href="#routing">Public routing</a></li><li><a href="#hermes">Hermes model</a></li><li><a href="#storage">Storage</a></li><li><a href="#provisioning">Provisioning</a></li><li><a href="#release">Release model</a></li><li><a href="#security">Security</a></li><li><a href="#backup">Backup & restore</a></li><li><a href="#mac">Optional Mac</a></li><li><a href="#operations">Operations</a></li><li><a href="#decisions">Explicit decisions</a></li></ol></nav>
+<section id="principles" class="prose"><h2>1. Architecture principles</h2><ul><li><b>Kinerary and Hermes are one product stack, not one process.</b> Hermes is a critical application dependency, but remains an independently managed workload.</li><li><b>k3s is the only container orchestration layer in the VM.</b> The baseline does not run a parallel Docker daemon for production workloads.</li><li><b>Trips are logical tenants, not public infrastructure endpoints.</b> New trips are reached through path routing under the main Kinerary URL; they do not receive Cloudflare tunnel entries or public IPs.</li><li><b>Control-plane contracts survive the migration.</b> The provider-specific Proxmox/LXC provisioning implementation is replaced by a Kubernetes adapter; canonical plans, jobs, releases, approvals, and audit records remain.</li><li><b>Recoverability before high availability.</b> The first production cluster is intentionally one k3s server on one Proxmox VM. Backups, immutable images, and reproducible manifests are higher priority than multi-server Kubernetes.</li><li><b>Local databases; NAS for blobs and backups.</b> PostgreSQL and SQLite write paths stay on local block storage. TrueNAS NFS is used for document-like content and backup targets.</li></ul></section>
+<section id="physical"><h2>2. Physical topology</h2><div class="figure"><pre>Internet
+   │
+   ▼
+Cloudflare Tunnel / existing public edge
+   │      one public Kinerary hostname
+   ▼
+Proxmox host
+└── VM: kinerary-prod
+    ├── Debian Linux
+    ├── 4 vCPU
+    ├── 10 GB RAM initially (8–12 GB practical range)
+    ├── ~80 GB local SSD
+    └── k3s single server
+         ├── kinerary-system
+         ├── kinerary-agents
+         └── trip workloads
+
+TrueNAS
+├── NFS dataset: Kinerary documents / uploads
+└── backup datasets: PostgreSQL, trip state, Hermes state, cluster backup
+
+Old Mac mini (macOS)
+└── optional external capacity only; not required by production</pre></div><p class="prose">The baseline deliberately has no dependency on the Mac mini. The production application must continue to operate when the Mac is powered off.</p></section>
+<section id="cluster"><h2>3. k3s workload layout</h2><div class="grid"><div class="card"><h3>kinerary-system</h3><span class="tag">critical</span><ul><li>public Web SPA</li><li>control-plane API</li><li>control-plane worker</li><li>PostgreSQL</li><li>migration Jobs</li><li>Telegram relay/connector</li><li>MCP services that belong to the platform</li><li>Cloudflare tunnel connector if hosted in-cluster</li></ul></div><div class="card"><h3>kinerary-agents</h3><span class="tag">AI plane</span><ul><li>Hermes gateway/runtime</li><li>interviewer profile</li><li>family-trip companion profiles</li><li>extract/enrichment profiles</li><li>Hermes persistent runtime/workspace state</li></ul></div></div><h3>Trip tenancy</h3><p class="prose">A trip remains a tenant with its own application state and lifecycle, but <b>the companion does not receive a separate Kubernetes data volume by default</b>. Companion configuration is derived from the trip's canonical data/profile bundle and runs in the Hermes plane. Any durable Hermes conversation/workspace state belongs to the Hermes persistence model, keyed by trip/profile identity, rather than to a second per-trip storage silo.</p><div class="note"><b>Clarification of “companion-specific state”:</b> there is no proposed standalone <code>companion-data</code> PVC. If Hermes later proves that a profile must have isolated durable filesystem state, that isolation can be introduced explicitly. Until then, per-trip durable data belongs either to the trip runtime/database or to the shared Hermes state store with tenant-scoped directories/records.</div><h3>Trip runtime representation</h3><p class="prose">Implementation may use a namespace per trip or a shared <code>kinerary-trips</code> namespace with strict labels and NetworkPolicies. The initial recommendation is a shared trips namespace if the Kubernetes object count and policy model remain simple; namespace-per-trip is useful only if it materially improves security or lifecycle isolation. This is an implementation choice, not a product contract.</p></section>
+<section id="routing"><h2>4. Public routing: one URL, paths for trips</h2><p class="prose">Trips are not assigned subdomains. Cloudflare sees one stable Kinerary origin/tunnel. Traefik routes requests by path to the correct trip service.</p><div class="figure"><pre>https://kinerary.example/                 → web portal
+https://kinerary.example/api/...          → control-plane API
+https://kinerary.example/trips/japan/...  → Japan trip runtime
+https://kinerary.example/trips/italy/...  → Italy trip runtime
+
+Cloudflare tunnel
+       │
+       ▼
+    Traefik
+       │
+       ├── PathPrefix(`/api`)          → control-plane-api
+       ├── PathPrefix(`/trips/japan`)  → trip-japan service
+       └── PathPrefix(`/trips/italy`)  → trip-italy service</pre></div><p class="prose">Creating a trip therefore requires only internal Kubernetes objects. The control-plane worker does <b>not</b> create a Cloudflare tunnel, DNS record, public IP, or Nginx Proxy Manager host for every family. The public edge remains constant.</p><div class="note decision"><b>Required application work:</b> the legacy trip site/server must be verified and, where necessary, adapted to operate under a configurable base path such as <code>/trips/&lt;slug&gt;</code>. Static assets, API calls, redirects, cookies, OAuth/Telegram callback URLs, PWA paths, and deep links must all be tested behind that prefix.</div></section>
+<section id="hermes"><h2>5. Hermes integration</h2><div class="figure"><pre>Telegram / Web request
+        │
+        ▼
+Kinerary routing / MCP contract
+        │
+        ▼
+Hermes Service (ClusterIP only)
+        │
+        ├── interviewer profile
+        ├── trip companion profile
+        └── extraction/enrichment profile
+        │
+        ▼
+Kinerary APIs / approved tools / external LLM APIs</pre></div><p class="prose">Hermes is a first-class Kinerary service and is deployed in the same k3s cluster, but not as a sidecar of the API and not with Kubernetes administrator credentials. Kinerary owns tenant identity, approval, routing, and infrastructure mutation. Hermes consumes constrained application/MCP capabilities.</p><p class="prose">Start with one Hermes runtime and multiple profiles unless runtime isolation requirements force one process per profile. A single replica is appropriate until Hermes state semantics and concurrent profile ownership are explicitly proven safe for horizontal replication.</p></section>
+<section id="storage"><h2>6. Storage model</h2><table><thead><tr><th>Data</th><th>Primary storage</th><th>Reason</th></tr></thead><tbody><tr><td>Kinerary control-plane PostgreSQL</td><td>local SSD PVC</td><td>transactional DB; keep latency and filesystem semantics predictable</td></tr><tr><td>Trip SQLite / mutable runtime DB</td><td>local SSD PVC</td><td>same reason; avoid SQLite over NFS</td></tr><tr><td>Hermes runtime/workspace state</td><td>local SSD PVC</td><td>fast, reliable local state; backed up separately</td></tr><tr><td>Booking confirmations, PDFs, imported files, photos, generated exports, larger attachments</td><td><b>TrueNAS NFS</b></td><td>shared durable blob/document storage is an excellent NAS workload</td></tr><tr><td>Container images</td><td>GHCR / registry</td><td>immutable deployment artifact, not local state</td></tr><tr><td>Backups</td><td>TrueNAS</td><td>separate retention and restore target</td></tr></tbody></table><h3>TrueNAS NFS for documents</h3><p class="prose">Use a dedicated TrueNAS dataset, for example <code>kinerary-documents</code>, exported by NFS and consumed through a Kubernetes PersistentVolume/PersistentVolumeClaim. Store objects under opaque tenant-aware keys rather than filesystem paths derived directly from user input.</p><div class="figure"><pre>TrueNAS dataset: kinerary-documents
+  /trips/&lt;trip-id&gt;/booking-confirmations/...
+  /trips/&lt;trip-id&gt;/uploads/...
+  /trips/&lt;trip-id&gt;/exports/...
+
+k3s
+  └── RWX NFS PVC
+       └── document/blob service or trip server mount</pre></div><p class="prose">Prefer an application storage abstraction over arbitrary Pods writing directly to the shared filesystem. That gives Kinerary one place to enforce tenant boundaries, MIME/size validation, retention, provenance, and future migration to object storage.</p><div class="note"><b>Failure behavior:</b> an NFS outage should ideally make attachments temporarily unavailable while core account/control-plane data remains operational. Do not place PostgreSQL's data directory or a live SQLite database on this NFS share.</div></section>
+<section id="provisioning"><h2>7. Kubernetes-native provisioning</h2><p class="prose">The current worker's Proxmox/LXC/SSH/NPM/Cloudflare adapter path should be replaced for this environment by a Kubernetes runtime adapter.</p><div class="figure"><pre>Confirmed intake
+    ↓
+Planner + release selection
+    ↓
+Approved durable job
+    ↓
+Control-plane worker
+    ↓
+Kubernetes adapter
+    ├── create/update trip identity & labels
+    ├── create Secret / ConfigMap
+    ├── create PVC(s)
+    ├── create trip Deployment(s)
+    ├── create ClusterIP Service
+    ├── add/update path-based Ingress route
+    └── record readiness / resource evidence
+
+No per-trip:
+  ✗ Proxmox LXC
+  ✗ public IP
+  ✗ DNS record
+  ✗ Cloudflare tunnel
+  ✗ NPM proxy host</pre></div><p class="prose">The worker receives a dedicated Kubernetes ServiceAccount with the minimum resource verbs needed for the chosen tenancy model. Hermes never receives this ServiceAccount.</p></section>
+<section id="release"><h2>8. Release model</h2><p class="prose">Preserve Kinerary's sealed release concept. Replace “verified source tree copied to a remote runtime” with “verified source revision built into an immutable OCI image”. A promoted release should ultimately identify both the source revision and immutable image digest.</p><div class="figure"><pre>git revision
+   ↓
+release build + sanitation + compatibility checks
+   ↓
+OCI image build
+   ↓
+GHCR digest sha256:...
+   ↓
+release promoted to available
+   ↓
+planner chooses release
+   ↓
+worker deploys exact digest</pre></div><p class="prose">The deployment must not use <code>:latest</code> as a production contract.</p></section>
+<section id="security"><h2>9. Trust boundaries and secrets</h2><ul class="prose"><li>Only Web, trip paths, and specifically required callbacks are public.</li><li>PostgreSQL, worker, Hermes gateway, privileged MCP surfaces, and internal service APIs remain ClusterIP/private.</li><li>Continue using file-backed secret references such as <code>file:///run/secrets/...</code>; Kubernetes Secret volumes map naturally to the current contract.</li><li>Use SOPS/age or another encrypted-at-rest Git workflow if encrypted secret manifests are committed later. Vault is deferred until dynamic secret management provides clear value.</li><li>Add default-deny NetworkPolicies, then allow only required service-to-service flows.</li><li>Investigate and remove the legacy trip server's <code>privileged: true</code> requirement before Kubernetes production deployment. Do not translate it blindly into a privileged Pod.</li></ul></section>
+<section id="backup"><h2>10. Backup and restore</h2><div class="grid"><div class="card"><h3>Application data</h3><ul><li>scheduled <code>pg_dump</code> to TrueNAS</li><li>SQLite-consistent trip backups</li><li>Hermes state backup with restic/kopia or equivalent</li><li>NFS document dataset snapshots on TrueNAS</li></ul></div><div class="card"><h3>Platform recovery</h3><ul><li>Proxmox VM backup to TrueNAS</li><li>k3s datastore + server token backup</li><li>deployment manifests in Git</li><li>immutable images in registry</li><li>periodic restore drill, not backup-only confidence</li></ul></div></div><p class="prose">If TrueNAS is itself a VM on the same Proxmox host, it protects strongly against guest corruption and operator mistakes but not against loss of the physical Proxmox machine. Off-host replication should then be considered separately.</p></section>
+<section id="mac"><h2>11. Old Mac mini — optional only</h2><p class="prose">The Mac remains on macOS. k3s Linux nodes cannot run natively on macOS, therefore <b>the baseline architecture does not include the Mac as a cluster node</b> and does not depend on it.</p><p class="prose">Two optional future uses are allowed without changing the production design:</p><ul class="prose"><li><b>External macOS worker:</b> run non-critical build, test, enrichment, or agent tasks outside Kubernetes and invoke them through a constrained queue/API.</li><li><b>Linux VM hosted on macOS:</b> only if desired later, a Linux VM could join k3s as an agent. This is optional and does not require replacing macOS.</li></ul><div class="note">If neither option is useful, the Mac can simply remain a development/backup Hermes machine. No production requirement depends on it.</div></section>
+<section id="operations"><h2>12. Deployment and operations</h2><p class="prose">Use Kustomize first, with a repository-owned deployment tree. Do not introduce ArgoCD/Flux as a prerequisite.</p><div class="figure"><pre>deploy/
+  base/
+    web/
+    control-plane-api/
+    control-plane-worker/
+    postgres/
+    hermes/
+    trip-runtime/
+    ingress/
+  overlays/
+    home-prod/
+
+kubectl apply -k deploy/overlays/home-prod</pre></div><p class="prose">CI remains in GitHub Actions and is extended to build and publish versioned images. Production deployment consumes immutable tags/digests. Lightweight logs, resource metrics, probes, and alerting are introduced after the first end-to-end deployment path works.</p></section>
+<section id="decisions"><h2>13. Explicit decisions and deferred items</h2><table><thead><tr><th>Topic</th><th>Decision</th></tr></thead><tbody><tr><td>Trip public addressing</td><td><b>Path based under the main Kinerary URL.</b> No trip subdomains.</td></tr><tr><td>Cloudflare</td><td>One stable tunnel/origin path; new trips do not modify Cloudflare.</td></tr><tr><td>Trip public IPs</td><td>None. Trip Services are internal ClusterIP endpoints.</td></tr><tr><td>Companion storage</td><td>No standalone companion PVC by default.</td></tr><tr><td>Documents / booking confirmations</td><td>TrueNAS NFS is preferred shared durable storage.</td></tr><tr><td>PostgreSQL / SQLite</td><td>Local SSD PVC, not NFS.</td></tr><tr><td>Mac mini</td><td>Optional, macOS retained, not part of baseline k3s cluster.</td></tr><tr><td>HA Kubernetes</td><td>Deferred; recoverability first.</td></tr><tr><td>Vault, Longhorn, Ceph, service mesh, GitOps controller</td><td>Deferred until justified by an operational requirement.</td></tr></tbody></table><p class="prose">Implementation is planned in <a href="k3s-home-deployment-sprint-plan.md">k3s-home-deployment-sprint-plan.md</a>. That work is a parallel deployment track and must not silently redefine the existing onboarding/product sprint acceptance gates.</p></section>
+</div></main>
+<footer><div class="wrap">Kinerary deployment architecture · source of truth for the home-lab k3s migration proposal.</div></footer>
+</body></html>
