@@ -281,6 +281,19 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   // intake answered before these existed simply has no entry, and the
   // transformer treats an absent answer as "not provided".
   {
+    // Carried to the trip companion rather than acted on here. The interview
+    // records STRUCTURE — who, where, when — and an organizer who says "we
+    // haven't worked out what to do in Kyoto yet" is describing work the
+    // companion does after the site exists, not a gap in the intake. Without
+    // somewhere to put it, that ask is either lost or turns the interview into
+    // a planning session it is not built to be.
+    id: "planning_help",
+    type: "text",
+    prompt: "Is there anything you'd like help planning once the trip assistant is up — days you haven't worked out, places you're unsure about, bookings still to make? (optional — it won't hold up setup, the assistant picks it up afterwards)",
+    maxLength: 500,
+    required: false,
+  },
+  {
     id: "home_country",
     type: "text",
     prompt: "Which country are you (the organizer) from? This only sets which embassy the site lists for emergencies — optional; we default to your own country.",

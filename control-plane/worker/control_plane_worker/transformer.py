@@ -56,6 +56,11 @@ release serve both schema versions (see migration 0018).
   bot_tone       choice: warm/playful/dry
   bot_proactive  multi_choice: which unprompted messages it may send
   bot_limits     structured (array): [{he, en}] standing instructions
+  planning_help  text: optional. What the organizer wants help planning AFTER
+                 setup. Not acted on here — projected into
+                 agent.standing_instructions[] so the trip companion picks it
+                 up on its first turn rather than the ask being lost between
+                 the two agents. Additive-optional; no schema bump.
 
 Everything the v2 questions write into `agent.standing_instructions[]` carries
 `visibility: "organizer"` — see _instruction() for why that is blanket rather
@@ -709,6 +714,24 @@ def _derive_agent(
         he, en = raw.get("he"), raw.get("en")
         if isinstance(he, str) and he.strip() and isinstance(en, str) and en.strip():
             instructions.append(_instruction({"he": he.strip(), "en": en.strip()}))
+    # What the organizer asked for help with, handed to the companion.
+    #
+    # The interview collects STRUCTURE; an organizer who says "we haven't
+    # worked out Kyoto yet" is describing work that happens after the site
+    # exists. Carrying it as a standing instruction is what stops that ask
+    # being lost between the two agents — the companion reads it on its first
+    # turn instead of the organizer having to say it twice.
+    #
+    # Organizer-only like every instruction here (see _instruction): it is the
+    # organizer's own words about what they have not sorted out, which is not
+    # something to publish to the whole family.
+    planning_help = _text_value(data.get("planning_help", {})).strip()
+    if planning_help:
+        instructions.append(_instruction({
+            "en": f"The organizer asked for help with this after setup: {planning_help}",
+            "he": f"המארגן ביקש עזרה בזה אחרי ההקמה: {planning_help}",
+        }))
+
     if instructions:
         agent["standing_instructions"] = instructions
 

@@ -90,6 +90,37 @@ class DeriveTripSlugTests(unittest.TestCase):
 
 
 class TransformerTests(unittest.TestCase):
+    def test_planning_help_is_carried_to_the_companion(self) -> None:
+        # The interview collects structure; what the organizer still wants help
+        # with is work the trip companion does afterwards. Carrying it as a
+        # standing instruction is what stops the ask being lost between the two
+        # agents.
+        intake = {**JAPAN_INTAKE, "planning_help": _text("we haven't worked out Kyoto yet")}
+        config = transform_intake(intake)
+        instructions = config["agent"]["standing_instructions"]
+        carried = [i for i in instructions if "Kyoto" in i["text"]["en"]]
+        self.assertEqual(len(carried), 1, "the organizer's ask reaches the companion")
+        self.assertIn("Kyoto", carried[0]["text"]["he"], "both languages carry it")
+
+    def test_planning_help_is_organizer_only(self) -> None:
+        # It is the organizer's own words about what they have not sorted out —
+        # not something to publish to the whole family.
+        intake = {**JAPAN_INTAKE, "planning_help": _text("still need to book the ryokan")}
+        config = transform_intake(intake)
+        carried = [i for i in config["agent"]["standing_instructions"] if "ryokan" in i["text"]["en"]]
+        self.assertEqual(carried[0]["visibility"], "organizer")
+
+    def test_no_planning_help_adds_no_instruction(self) -> None:
+        # Additive-optional: an intake without it must transform exactly as before.
+        without = transform_intake(JAPAN_INTAKE)
+        blank = transform_intake({**JAPAN_INTAKE, "planning_help": _text("   ")})
+        self.assertEqual(
+            (without.get("agent") or {}).get("standing_instructions"),
+            (blank.get("agent") or {}).get("standing_instructions"),
+        )
+
+
+
     def test_non_latin_destination_falls_back_to_a_phase_name(self) -> None:
         # "trip-2026" is a URL a family cannot tell from anyone else's; a
         # phase name is one they recognise (capture ledger, General #4).

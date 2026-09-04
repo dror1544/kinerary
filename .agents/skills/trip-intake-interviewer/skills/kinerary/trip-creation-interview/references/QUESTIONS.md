@@ -47,6 +47,20 @@ Submit as:
 ]
 ```
 
+## planning_help — optional, text
+
+What the organizer would like help planning *after* setup — days they haven't
+worked out, places they're unsure about, bookings still to make.
+
+Ask it near the end, once the structure is settled, and keep it light: it is
+explicitly optional and must not hold up confirmation. Do **not** start
+planning with them here — this interview is for structure, and the trip
+assistant does the day-to-day planning once the site exists. Recording the ask
+is the whole job.
+
+Their answer becomes a standing instruction on the trip assistant, so it picks
+this up on its first turn rather than the organizer having to say it twice.
+
 ## phases — required, structured (array)
 
 Where the trip goes and when, one entry per stop. Ask for: place name, date range, and — only if already booked — accommodation name and confirmation number. Skip accommodation entirely if nothing's booked yet; don't invent a placeholder.
