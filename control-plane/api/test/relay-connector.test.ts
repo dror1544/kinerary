@@ -42,9 +42,19 @@ interface Harness {
   port: number;
 }
 
-async function withConnector(fn: (h: Harness) => Promise<void>): Promise<void> {
+async function withConnector(
+  fn: (h: Harness) => Promise<void>,
+  options: { interviewChats?: readonly string[] } = {},
+): Promise<void> {
   const telegram = new FakeTelegram();
-  const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0 });
+  const connector = new RelayConnector({
+    gatewaySecrets: [SECRET],
+    telegram,
+    port: 0,
+    ...(options.interviewChats
+      ? { interviewChat: async (chatId: string) => options.interviewChats!.includes(chatId) }
+      : {}),
+  });
   await connector.listen();
   const port = connector.address;
   assert.ok(port, "connector should have bound a port");
@@ -194,6 +204,41 @@ describe("RelayConnector — outbound actions", () => {
         { chatId: "900", text: "hello", replyTo: undefined, parseMode: "MarkdownV2" },
       ]);
     });
+  });
+
+  test("on an interview chat the agent cannot send at all", async () => {
+    // TRACK 4 · one voice, one writer.
+    //
+    // The agent reaches an organizer mid-interview through `say_for_chat` and
+    // `ask_question_for_chat` only, so the router keeps the keyboard, the
+    // record and the order of things. This is the same rule that lived in
+    // SOUL.md through runs 2 to 6 and failed every one of them — as
+    // chain-of-thought narration, third-person commentary about "the router",
+    // the run's own bug reports read back to the organizer, option questions
+    // degraded to numbered lists, and a prose approval request no tool could
+    // act on. Here it cannot be talked around.
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "The next question is destination — let me record that now.",
+      });
+      // Reported as delivered: the gateway blocks on a per-request future and
+      // there is nothing here it could usefully retry.
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
+    }, { interviewChats: ["900"] });
+  });
+
+  test("a companion chat is untouched by the interview rule", async () => {
+    // The restriction is about the interview, where a deterministic router owns
+    // the conversation. A trip companion has no router drawing its questions,
+    // so silencing it there would silence the product.
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "hello" });
+      assert.equal(result.success, true);
+      assert.equal(h.telegram.sent.length, 1, "the companion still speaks");
+    }, { interviewChats: ["900"] });
   });
 
   test("edit and typing are performed", async () => {

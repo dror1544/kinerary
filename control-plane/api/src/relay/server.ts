@@ -29,6 +29,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import { resolveChatRoute } from "../chat-router.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
@@ -205,6 +206,18 @@ async function main(): Promise<void> {
     host: runtime.host,
     mediaStore,
     log,
+    // Track 4: on an interview chat the agent's words reach the organizer only
+    // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
+    // keyboard, the record and the order. Resolved from the binding, never from
+    // anything the gateway says about itself — same rule as inbound routing.
+    ...(runtime.db
+      ? {
+          interviewChat: async (chatId: string) => {
+            const route = await resolveChatRoute(runtime.db!, chatId);
+            return route.kind === "interview";
+          },
+        }
+      : {}),
   });
 
   // Listen BEFORE polling. The gateway reconnects on its own every 30s, so a

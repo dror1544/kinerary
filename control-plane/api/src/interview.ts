@@ -598,6 +598,10 @@ export interface SessionView {
   language: Language;
   /** True once the "essentials done" choice has been put to the organizer. */
   offeredMore: boolean;
+  /** One message the interviewer wrote, for the router to deliver verbatim. */
+  pendingSay: string | null;
+  /** The interviewer's own wording for `pendingAsk`, if it supplied one. */
+  pendingAskText: string | null;
   /** What the router last sent, so it does not send it twice running. */
   lastPrompt: string | null;
   /**
@@ -658,6 +662,27 @@ export interface InterviewUiState {
    * carries the conversation and a repeat would be the router nagging.
    */
   offeredMore?: boolean;
+  /**
+   * One message the interviewer has written for the organizer, waiting to be
+   * sent by the router.
+   *
+   * Track 4's central move: the agent is the only VOICE, the router the only
+   * WRITER. The agent no longer sends anything itself — it writes here and the
+   * router delivers, which is what makes "one message per turn" a property of
+   * the schema rather than a rule in a prompt. A single slot, not a queue, on
+   * purpose: runs 5 and 6 were both floods, and a slot cannot flood.
+   */
+  pendingSay?: string;
+  /**
+   * The interviewer's own wording for the question in `pendingAsk`.
+   *
+   * The router owns the KEYBOARD, not the sentence. Reciting `intake-copy.ts`
+   * at people is what made run 3 read as a form — "it completely drifted" —
+   * so the agent phrases the question in the organizer's own language and the
+   * router attaches the buttons to it. Absent, the router falls back to its
+   * own copy, which is robotic but never stuck.
+   */
+  pendingAskText?: string;
 }
 
 function parseUiState(raw: unknown): InterviewUiState {
@@ -672,6 +697,8 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
     ...(record.offered_more === true ? { offeredMore: true } : {}),
     ...(typeof record.last_prompt === "string" ? { lastPrompt: record.last_prompt } : {}),
+    ...(typeof record.pending_say === "string" ? { pendingSay: record.pending_say } : {}),
+    ...(typeof record.pending_ask_text === "string" ? { pendingAskText: record.pending_ask_text } : {}),
   };
 }
 
@@ -682,6 +709,8 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
     ...(ui.offeredMore ? { offered_more: true } : {}),
     ...(ui.lastPrompt ? { last_prompt: ui.lastPrompt } : {}),
+    ...(ui.pendingSay ? { pending_say: ui.pendingSay } : {}),
+    ...(ui.pendingAskText ? { pending_ask_text: ui.pendingAskText } : {}),
   });
 }
 
@@ -902,6 +931,8 @@ export async function startSession(
       language: language ?? DEFAULT_LANGUAGE,
       offeredMore: false,
       lastPrompt: null,
+      pendingSay: null,
+      pendingAskText: null,
     };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
@@ -1120,6 +1151,8 @@ function buildSessionView(
       optionalRemaining: [], recap: null, selections: currentSelections(answers), language,
       offeredMore: ui.offeredMore === true,
       lastPrompt: ui.lastPrompt ?? null,
+      pendingSay: null,
+      pendingAskText: null,
     };
   }
   const state = deriveSessionState(answers, INTAKE_QUESTIONS, ui);
@@ -1139,6 +1172,8 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     lastPrompt: ui.lastPrompt ?? null,
+    pendingSay: ui.pendingSay ?? null,
+    pendingAskText: ui.pendingAskText ?? null,
   };
 }
 
@@ -1468,16 +1503,56 @@ async function updateUiStateForChat(
  * `clarify` cannot. Nominating a question the organizer already answered is
  * allowed — that is how a correction gets re-offered.
  */
+/**
+ * The interviewer's one message for this turn, for the router to deliver.
+ *
+ * This is Track 4's `say`. The agent used to send prose straight down the
+ * relay, which is how chain-of-thought, third-person narration about "the
+ * router", and its own correction notes all reached organizers — every one of
+ * those a prompt rule that failed live at least once. Routing the words
+ * through here makes the agent the only voice and the router the only writer,
+ * so nothing reaches Telegram that was not deliberately addressed to a person.
+ *
+ * One slot. A second call in the same turn REPLACES the first rather than
+ * queueing behind it: the agent's latest thought is the one worth sending, and
+ * a queue is the shape both bombardments had.
+ */
+export async function sayForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<GetSessionResult> {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return { ok: false, reason: "NOT_FOUND" };
+  const result = await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, pendingSay: trimmed }));
+  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  return result;
+}
+
+/** Clears the delivered message so the router does not send it twice. */
+export async function clearPendingSayForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => {
+    const next = { ...ui };
+    delete next.pendingSay;
+    return next;
+  });
+}
+
 export async function nominateQuestionForChat(
   db: pg.Pool,
   chatId: string,
   questionId: string,
+  text?: string,
 ): Promise<GetSessionResult> {
   const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "NOT_FOUND" };
+  const phrasing = text?.trim();
   const result = await updateUiStateForChat(db, chatId, (ui) => ({
     ...ui,
     pendingAsk: questionId,
+    // The agent's own wording, when it supplied one. Without it the router
+    // falls back to intake-copy.ts — correct, localised, and robotic.
+    ...(phrasing ? { pendingAskText: phrasing } : { pendingAskText: undefined }),
     // Nominating a question the organizer previously skipped un-skips it:
     // asking for it explicitly is a clearer signal than the earlier decline.
     ...(ui.skipped ? { skipped: ui.skipped.filter((id) => id !== questionId) } : {}),
@@ -1522,6 +1597,10 @@ export async function clearPendingAskForChat(db: pg.Pool, chatId: string): Promi
   await updateUiStateForChat(db, chatId, (ui) => {
     const next = { ...ui };
     delete next.pendingAsk;
+    // The agent's wording belongs to the nomination it was written for. Leaving
+    // it behind would put a sentence about dietary requirements above a
+    // timezone question the next time the router fell back to its own copy.
+    delete next.pendingAskText;
     return next;
   });
 }

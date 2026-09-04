@@ -354,17 +354,44 @@ function buildMcpServer() {
     );
 
     mcp.tool(
+      "say_for_chat",
+      "Say something to the organizer. This is the ONLY way your words reach them: on an interview " +
+        "conversation nothing you emit goes to the chat directly, so anything you do not pass " +
+        "through here or `ask_question_for_chat` is never seen. Write it as one short, warm, " +
+        "phone-friendly message in the language the interview is being conducted in, addressed to " +
+        "the organizer — not a description of what you are about to do, not a note about tools, " +
+        "questions, or how the system works. One message per turn: calling this twice replaces the " +
+        "first message rather than sending both.",
+      { text: z.string().min(1).max(2000).describe("what the organizer should read, in their language") },
+      async ({ text }) =>
+        agentResult(await forwardAsAgent("/internal/interview/agent/current/say", "POST", { text })),
+    );
+
+    mcp.tool(
       "ask_question_for_chat",
-      "Put one of the intake's OPTIONAL questions to the organizer next. Takes no chat id. Use this " +
-        "instead of asking an option question yourself: the questions with fixed choices are drawn " +
-        "as real tappable buttons, which you cannot do. YOU decide which one is worth asking and " +
+      "Put one of the intake's OPTIONAL questions to the organizer next. Takes no chat id. Ask it in " +
+        "YOUR OWN WORDS by passing `text` — the sentence is yours, the buttons are attached for " +
+        "you, so it reads like you talking rather than a form being recited. Omit `text` only if " +
+        "you have nothing better to say than the default wording. Never write the options out " +
+        "yourself or number them: they arrive as real tappable buttons, which you cannot draw. " +
+        "YOU decide which one is worth asking and " +
         "when — they are not walked automatically, because asking all of them in order turns the " +
         "interview into a form. Skip any whose answer you can already work out (a timezone from the " +
         "destination, a home country from the organizer) rather than putting it to them. " +
         "`get_interview_for_chat`'s `optionalRemaining` lists what is still open.",
-      { questionId: z.string().min(1).max(64).describe("id from optionalRemaining, e.g. 'dietary'") },
-      async ({ questionId }) =>
-        agentResult(await forwardAsAgent("/internal/interview/agent/current/ask", "POST", { questionId })),
+      {
+        questionId: z.string().min(1).max(64).describe("id from optionalRemaining, e.g. 'dietary'"),
+        text: z
+          .string()
+          .min(1)
+          .max(2000)
+          .optional()
+          .describe("your own wording for the question, in the organizer's language"),
+      },
+      async ({ questionId, text }) =>
+        agentResult(
+          await forwardAsAgent("/internal/interview/agent/current/ask", "POST", { questionId, text }),
+        ),
     );
 
     mcp.tool(

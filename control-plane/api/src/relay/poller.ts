@@ -37,6 +37,7 @@ import {
   type SessionView,
   askForMoreForChat,
   clearPendingAskForChat,
+  clearPendingSayForChat,
   hasOpenAgentTurn,
   markOfferedMoreForChat,
   recordLastPromptForChat,
@@ -466,14 +467,25 @@ async function applyInterviewCallback(
  * Failures are swallowed per session: one chat whose send fails must not stop
  * the poll loop or block the other claims in the batch.
  */
-async function renderDueRouterPrompts(
+export async function renderDueRouterPrompts(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
   log: (line: string) => void,
+  /**
+   * How long the writing has to have stopped before the router speaks.
+   *
+   * Production waits `ROUTER_PROMPT_SETTLE_SECONDS`, because an agent
+   * recording a document's worth of answers asks the router to speak once per
+   * write, and run 6 received that as a flood. Tests pass 0: they control the
+   * writes exactly, so waiting real seconds would only make the suite slow.
+   */
+  settleSeconds?: number,
 ): Promise<void> {
   let due: Array<{ sessionId: string; chatId: string }>;
   try {
-    due = await claimDueRouterPrompts(deps.db);
+    due = settleSeconds === undefined
+      ? await claimDueRouterPrompts(deps.db)
+      : await claimDueRouterPrompts(deps.db, 10, settleSeconds);
   } catch {
     log(structuredLog("warn", "trip_bot.router_prompt_claim_failed", {}));
     return;
@@ -561,6 +573,17 @@ async function sendNextStep(
   let text: string;
   let replyMarkup: InlineKeyboard | undefined;
 
+  // The interviewer's own words go out first and alone. This is the `say`
+  // half of Track 4: the agent no longer reaches Telegram directly, so if it
+  // has something to tell the organizer, THIS is the only way it arrives.
+  // Delivered verbatim and then cleared, so a message is sent exactly once
+  // however many times the router is prompted to speak.
+  if (view.pendingSay) {
+    await clearPendingSayForChat(deps.db, chatId);
+    await deps.telegram.sendMessage({ chatId, text: view.pendingSay });
+    return;
+  }
+
   const autoWalkOptional = !deps.interviewerProfile;
   const question =
     view.nextQuestion
@@ -616,7 +639,16 @@ async function sendNextStep(
     // Selections travel with the question: re-asking a half-ticked
     // multi-select without them would show every option unticked and invite
     // the organizer to tap the same ones off again.
-    const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+    // The agent's wording applies to the question IT nominated, never to a
+    // required question the router walked to on its own — otherwise a sentence
+    // written for `dietary` would end up above `departure_date`.
+    const phrasing = view.pendingAsk?.id === question.id ? view.pendingAskText : null;
+    const rendered = renderQuestion(
+      question,
+      selectedOptionIds(view, question.id),
+      view.language,
+      phrasing,
+    );
     text = rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
     if (view.pendingAsk?.id === question.id) await clearPendingAskForChat(deps.db, chatId);

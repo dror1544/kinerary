@@ -340,6 +340,19 @@ export function renderQuestion(
   question: IntakeQuestion,
   selected: readonly string[] = [],
   language: Language = DEFAULT_LANGUAGE,
+  /**
+   * The interviewer's own phrasing for this question.
+   *
+   * The router owns the KEYBOARD; it does not have to own the sentence. Run 3
+   * is why: walking `intake-copy.ts` end to end turned the interview into a
+   * form — "it completely drifted" — because every question arrived in the
+   * same flat voice regardless of what the organizer had just said. When the
+   * agent supplies wording, the buttons attach to ITS sentence, so the
+   * conversation reads like one person talking while the affordances stay
+   * deterministic. Absent, the copy table still answers: robotic, but never
+   * stuck, which is what the watchdog will depend on.
+   */
+  agentText?: string | null,
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
 
@@ -385,7 +398,8 @@ export function renderQuestion(
 
   // `askText`, never `question.prompt`: the prompt is the interviewer's field
   // spec, examples and all, and it was being read out to organizers verbatim.
-  return { text: askText(question, language), replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
+  const text = agentText?.trim() || askText(question, language);
+  return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
 }
 
 /**

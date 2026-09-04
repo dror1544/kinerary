@@ -37,13 +37,15 @@ import { askText, uiString, type Language } from "../src/intake-copy.js";
 import {
   INTAKE_QUESTIONS,
   getSessionForChat,
+  nominateQuestionForChat,
+  sayForChat,
   submitAnswerForChat,
   type IntakeQuestion,
 } from "../src/interview.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { dispatchUpdate } from "../src/relay/dispatch.js";
-import { applyDecision } from "../src/relay/poller.js";
+import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
+import { applyDecision, renderDueRouterPrompts } from "../src/relay/poller.js";
 import { detectInternalLeak } from "../src/relay/internal-leak.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
@@ -270,6 +272,24 @@ async function withConversation(fn: (fix: Fixture) => Promise<void>): Promise<vo
   } finally {
     await pool.end();
   }
+}
+
+/**
+ * Runs the router's side of a turn: whatever the agent has written is now
+ * delivered.
+ *
+ * Deliberately the real `renderDueRouterPrompts` rather than a stand-in — a
+ * harness that reimplements the router would assert on the harness. Settle
+ * window 0 because the test controls the writes exactly; production waits, and
+ * that wait is the run-6 flood fix.
+ */
+async function deliverPendingRouterPrompt(fix: Fixture): Promise<void> {
+  await renderDueRouterPrompts(
+    { db: fix.pool, telegram: fix.script, connector: fix.connector },
+    DEFAULT_STRINGS,
+    () => {},
+    0,
+  );
 }
 
 /** One update, all the way through: dispatch decides, applyDecision acts. */
@@ -510,6 +530,93 @@ describe("the interview always has a way to finish", () => {
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
       assert.equal(view.view.state, "interviewing", "and the session did not jump to confirmation");
+      fix.script.check();
+    });
+  });
+});
+
+describe("one voice, one writer", () => {
+  test("the interviewer's words reach the organizer only through say", { skip: SKIP }, async () => {
+    // Track 4's central guarantee. The agent writes; the router delivers. What
+    // makes this worth a test rather than a comment is that the same rule
+    // existed as a SOUL sentence through runs 2 to 6 and failed every time.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const before = fix.script.lines.length;
+
+      await sayForChat(fix.pool, fix.chat, "יופי, ראיתי את המסמך — נשאר רק תאריך החזרה.");
+      await deliverPendingRouterPrompt(fix);
+
+      const said = fix.script.last;
+      assert.equal(fix.script.lines.length, before + 1, "exactly one message, not a burst");
+      assert.equal(said?.text, "יופי, ראיתי את המסמך — נשאר רק תאריך החזרה.", "delivered verbatim");
+      assert.deepEqual(said?.buttons, [], "prose carries no keyboard of its own");
+    });
+  });
+
+  test("a delivered message is never sent twice, however often the router is prompted",
+    { skip: SKIP }, async () => {
+    // Both bombardments were the same shape: something scheduled the router to
+    // speak once per agent write. A single slot that clears on delivery cannot
+    // produce that, which is why it is a slot and not a queue.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
+      await deliverPendingRouterPrompt(fix);
+      const after = fix.script.lines.length;
+
+      await deliverPendingRouterPrompt(fix);
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.lines.length, after, "prompting again says nothing new");
+      fix.script.check();
+    });
+  });
+
+  test("the agent phrases the question and the router attaches the buttons", { skip: SKIP }, async () => {
+    // Run 3, verbatim: "It completely driftted" — every question arriving in
+    // the same flat voice regardless of what had just been said. The sentence
+    // is the agent's; the affordance stays deterministic.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      const mine = "שאלה אחרונה ואני נותן לך לנוח: יש מישהו בקבוצה שלא אוכל משהו?";
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "dietary", mine);
+      assert.ok(nominated.ok);
+      await deliverPendingRouterPrompt(fix);
+
+      const asked = fix.script.last;
+      assert.equal(asked?.text, mine, "the organizer reads the interviewer's sentence, not the copy table");
+      assert.equal(asked?.questionId, "dietary", "and it is still recognisably that question");
+      assert.ok(asked!.buttons.length > 0, "with real buttons the agent could never have drawn");
+      assert.ok(
+        asked!.buttons.some((b) => b.startsWith("t:dietary:")),
+        "the multi-select toggles belong to the nominated question",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("wording belongs to the question it was written for", { skip: SKIP }, async () => {
+    // The failure this prevents is specific and would be baffling to receive:
+    // a sentence written for `dietary` sitting above a date question, because
+    // the phrasing outlived the nomination.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await nominateQuestionForChat(fix.pool, fix.chat, "dietary", "יש הגבלות אכילה?");
+      await deliverPendingRouterPrompt(fix);
+      await turn(fix, taps(fix, `k:dietary`));
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.pendingAskText, null, "the wording went with the nomination");
       fix.script.check();
     });
   });

@@ -58,6 +58,16 @@ export interface ConnectorOptions {
   host?: string;
   path?: string;
   log?: (line: string) => void;
+  /**
+   * Whether a chat is mid-interview, and therefore one the agent may not write
+   * to directly.
+   *
+   * A predicate rather than a database handle on purpose: the connector's job
+   * is the wire, and giving it a pool would make every relay test carry a
+   * schema. The relay server injects the real lookup; anything without one
+   * keeps the old behaviour, which is correct for a companion-only deployment.
+   */
+  interviewChat?: (chatId: string) => Promise<boolean>;
 }
 
 export class RelayConnector {
@@ -266,6 +276,33 @@ export class RelayConnector {
         // model finds a new way to do it, so the check lives here rather than
         // in a prompt. Suppressed, not rewritten — a half-redacted sentence is
         // worse than a missing one.
+        // TRACK 4 · one voice, one writer.
+        //
+        // On an interview chat the agent has exactly two ways to reach the
+        // organizer — `say_for_chat` and `ask_question_for_chat` — and both go
+        // through the router, which owns the keyboard, the record and the
+        // order of things. Anything arriving here instead is the agent talking
+        // past all of that, and six live runs say what that produces:
+        // chain-of-thought narration, third-person commentary about "the
+        // router", its own correction notes read back to the organizer,
+        // option questions degraded to numbered lists, prose requests for an
+        // approval no tool could act on, and two floods.
+        //
+        // Every one of those was a prompt rule first, and every prompt rule
+        // failed live at least once. This is the same rule expressed where it
+        // cannot be talked around.
+        if (this.options.interviewChat && (await this.options.interviewChat(action.chat_id))) {
+          this.log(structuredLog("info", "relay.agent_send_refused", {
+            chat_id: action.chat_id,
+            reason: "INTERVIEW_ROUTES_THROUGH_ROUTER",
+            length: action.content.length,
+          }));
+          // Reported as delivered for the same reason as a suppressed leak: the
+          // gateway's per-request future has to resolve, and there is nothing
+          // here it could usefully retry.
+          return { success: true };
+        }
+
         const leak = detectInternalLeak(action.content);
         if (leak.leaks) {
           this.log(structuredLog("warn", "relay.internal_leak_suppressed", {

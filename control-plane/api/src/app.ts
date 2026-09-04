@@ -9,7 +9,8 @@ import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
   getSessionForAgent, submitAnswerForAgent, resolveChatFromOpenTurn,
-  nominateQuestionForChat, setFinishRequestedForChat, setLanguageForChat, INTAKE_QUESTIONS,
+  nominateQuestionForChat,
+  sayForChat, setFinishRequestedForChat, setLanguageForChat, INTAKE_QUESTIONS,
 } from "./interview.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
@@ -1044,10 +1045,46 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     const chatId = await resolveCurrentChat(reply);
     if (chatId === null) return reply;
 
-    const questionId = (request.body as Record<string, unknown> | undefined)?.questionId;
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
     if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // The agent's own phrasing, optional. Absent, the router draws the
+    // question from its copy table — correct and localised, but the flat voice
+    // that made run 3 read as a form.
+    const text = typeof body?.text === "string" ? body.text : undefined;
 
-    const result = await nominateQuestionForChat(dependencies.interviewAgent.db, chatId, questionId);
+    const result = await nominateQuestionForChat(
+      dependencies.interviewAgent.db,
+      chatId,
+      questionId,
+      text,
+    );
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // The agent's voice. It has no other way to reach the organizer: on an
+  // interview chat the relay drops anything the agent sends directly, so a
+  // message exists for the organizer only if it was written here on purpose.
+  app.post("/internal/interview/agent/current/say", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const text = (request.body as Record<string, unknown> | undefined)?.text;
+    if (typeof text !== "string" || text.trim().length === 0) {
+      return reply.code(400).send({
+        error: "TEXT_REQUIRED",
+        expectedArgument: "text",
+        detail: "Pass the message you want the organizer to read, as `text`.",
+      });
+    }
+
+    const result = await sayForChat(dependencies.interviewAgent.db, chatId, text);
     if (!result.ok) return reply.code(404).send({ error: result.reason });
     return reply.code(200).send(result.view);
   });
