@@ -666,6 +666,14 @@ function JourneyView({
   const [draft, setDraft] = useState<ItineraryItemInput>({ phase_id: "", date: "", text_he: "", text_en: "", time: "", item_type: "activity", location_url: "" });
   const [timeMode, setTimeMode] = useState<ItineraryTimeMode>("none");
   const [enrichmentNote, setEnrichmentNote] = useState("");
+  const editorRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    if (!editing) return;
+    const frame = window.requestAnimationFrame(() => editorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [editing]);
+
   const saveMutation = useMutation({
     mutationFn: ({ itemUid, input }: { itemUid?: string; input: ItineraryItemInput }) => itemUid ? updateItineraryItem(itemUid, input) : createItineraryItem(input),
     onSuccess: (result) => {
@@ -759,6 +767,7 @@ function JourneyView({
         </div>
         {isOrganizer && editing ? (
           <form
+            ref={editorRef}
             className="itinerary-editor"
             onSubmit={(event) => {
               event.preventDefault();
