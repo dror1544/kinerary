@@ -1,6 +1,6 @@
 # Sprint 5 — next session brief
 
-Updated **2026-09-02 (fourth session)**. Read this plus
+Updated **2026-09-03 (fifth session)**. Read this plus
 `docs/sprint5-trip-bot-router-design.md` (the why, and the live evidence)
 before touching anything.
 
@@ -10,11 +10,20 @@ outage at ~13:00 and never wrote its own notes. Everything else is first-hand.
 
 ## START HERE
 
-**Worktree** `.claude/worktrees/sprint-5-organizer-router`
-**Branch** `sprint/5-organizer-profile-router` — pushed
-**PR #29** → `integration/sprint-5-plus`, 16 commits, open and unreviewed
-**Suites** control-plane 505 (499 pass / 0 fail / 6 skipped) · site 405/405 ·
-worker 261/261
+**Worktree** `.claude/worktrees/sprint-5-organizer-router` — currently
+**detached at `03c8b4b`** (the integration head) ON PURPOSE: the running relay
+reads `src/relay/server.ts` from this tree and the API container bind-mounts
+its `dist/`, so the checkout must match what is deployed. Move it and the next
+relay restart runs different code.
+
+**PR #29 — MERGED** (`03c8b4b`). Reviewed at high effort first; one blocker
+found and fixed on the branch, three deferred by decision as #30/#31/#32, the
+rest recorded in #33.
+**PR #34** `sprint/5-interview-ux` → integration — Track 3, open.
+**PR #35** `sprint/5-onboarding-defaults` → integration — the onboarding
+flags, open.
+**Suites** control-plane 522 (516 pass / 0 fail / 6 skipped) · site 405/405 ·
+worker 273/273
 
 Bring the machine back to a working state — nothing below is supervised, so
 this is needed after every reboot:
@@ -35,22 +44,25 @@ env -u RELAY_GATEWAY_SECRET \
 
 ### What to pick up next
 
-1. **Get PR #29 reviewed and merged.** It blocks the integration PR:
-   `integration/sprint-5-plus` sits exactly at `main`, and GitHub refuses to
-   open a PR with no diff, so the integration PR cannot exist until #29 lands.
-   Carry-forward items have nowhere to go until then.
+1. ~~**Get PR #29 reviewed and merged.**~~ **DONE 2026-09-03.** The stated
+   blocker was already stale when written: `integration/sprint-5-plus` carries
+   `e3a27c5`, which `main` does not, so the integration PR was never actually
+   waiting on #29. It can be opened whenever you want it.
+
+   Review PRs #34 and #35 — both are open against the integration branch and
+   both are carry-forward for Sprint 5.
 2. **Track 3 — the interview UX batch.** ~16 items from the first live signup
    run, including two reproducible bugs (the dietary step throws; planned-order
    fails to submit). Fully unblocked, and it is what makes the interview
    bearable now that it can complete at all. `group_size` is still a live
    question in `interview.ts` — deriving headcount from the roster is in here.
-3. **Turn the interviewer on.** Set `relay.interviewer_profile` in the relay
-   host profile and restart the relay. Everything behind it is built and
-   tested; nothing has run against real Telegram yet, so do it as its own step
-   rather than alongside another change.
-4. **Decide the onboarding flags** — see "The onboarding half" below. Until
-   `--enable-mcp-bridge` and `--companion-templates-dir` are on, a newly
-   onboarded trip is born with no companion profile and no MCP bridge.
+3. ~~**Turn the interviewer on.**~~ **DONE 2026-09-03 — it is ON.**
+   `relay.interviewer_profile: "trip-intake"` is set and the relay is running
+   with it. See "Turning the interviewer on" below for what that took, because
+   it was not the one config line this list implied.
+4. ~~**Decide the onboarding flags.**~~ **DECIDED 2026-09-03: both ON**, PR
+   #35. The templates dir is now derived from `--repo-root`, so it needs no
+   configuration; opting out is explicit.
 
 ### Live service state, 2026-09-02 end of session
 
@@ -59,8 +71,13 @@ env -u RELAY_GATEWAY_SECRET \
 | control-plane stack (api, worker, postgres) | up |
 | trip-mcp japan-2026 `:3013` | up, verified against the site |
 | interview MCP sidecar `:4311` | up |
-| relay connector `:4312` | **up — the bot is live in the family group** |
+| relay connector `:4312` | **up — the bot is live in the family group, interviewer ENABLED** |
 | legacy bridges `:3011` / `:3012` | down, out of scope by decision |
+
+Updated 2026-09-03: all four of the above are up, the API was recreated to
+carry `CONTROL_PLANE_INTERVIEW_AGENT_KEY`, and the sidecar now runs from the
+WORKTREE build rather than the main checkout's (which predated Sprint 5 and
+had neither `*_for_chat` tool).
 
 The routing spine is **wired together, runnable, and running**. A process owns
 the bot's update stream, routes each update, records button answers, and now
@@ -182,6 +199,71 @@ one conversation, three of them written with a `created_at` identical to the
 microsecond. A newly served profile inherits whatever session that chat already
 had rather than starting its own. The stale japan2026 binding was removed by
 hand. Expect this again the next time a profile is added to the allowlist.
+
+## Turning the interviewer on — done 2026-09-03, and what it actually took
+
+The previous brief said this was "set `relay.interviewer_profile` and restart
+the relay". It was not, and the reason is worth keeping.
+
+**The routes it forwards to were never mounted.** `interviewAgent` is an
+optional dependency block that `app.ts` consumes at four sites, and
+`server.ts` never constructed one — so both `/internal/interview/agent/*`
+routes answered **503 INTERVIEW_AGENT_NOT_CONFIGURED in every real
+deployment**, and the sidecar's `submit_answer_for_chat` could never record
+anything. The twelve turn tests all passed because they call
+`submitAnswerForAgent`/`getSessionForAgent` directly against the database; the
+routes in front of them had no coverage at all. Fixed in `679b6cb` (in PR #29)
+and covered by `test/interview-agent-routes.test.ts`, which leads with the
+case that would have caught it.
+
+So the chain that was actually required:
+
+1. `CONTROL_PLANE_INTERVIEW_AGENT_KEY` in `~/kinerary-deploy/provisioning.env`.
+   **One name for both ends** — the API and the sidecar read the same variable,
+   so a half-configured pair (sidecar presenting a key the API rejects) cannot
+   be produced by editing one file.
+2. `docker compose up -d --no-build api`. **No image rebuild is needed** — the
+   compose file bind-mounts the host's `dist/`, so `npm run build` in the
+   worktree is enough for code; the recreate is only to inject the env var.
+3. The sidecar restarted from the **worktree** build. It had been running from
+   `/Users/elul/kinerary/control-plane/api`, whose `dist/interview-mcp.js`
+   predates Sprint 5 and contains neither `*_for_chat` tool.
+   `bring-up.sh` now passes the agent key, read from `provisioning.env`.
+4. `relay.interviewer_profile: "trip-intake"`, then restart the relay.
+
+Verified on the live stack, not only in tests:
+
+| check | result |
+|---|---|
+| `GET /internal/interview/agent/<chat>` no key | 401 (was 503 — route is mounted) |
+| wrong key | 401 AUTHENTICATION_REQUIRED |
+| correct key, chat with no open turn | 404 NOT_FOUND |
+| relay boot | bot identity `@Kinerary_bot`, polling, gateway `kinerary-trip-intake` connected, zero errors |
+| loaded config | `interviewer_profile = "trip-intake"` |
+
+**Why `trip-intake` is a valid stamp even though it is not in the allowlist.**
+`profiles_to_serve(True, ["japan2026"])` returns `['default', 'japan2026']`,
+and `default` is `~/.hermes` — the personal assistant, NOT trip-intake. But
+`source.profile` is not resolved against the served set:
+`_profile_dir_for_source` checks `profile_exists(name)` on disk and returns
+that profile's directory. `trip-intake` exists, so it resolves. This also
+means the allowlist did **not** need widening, so no profile's cron was
+activated — which is the failure mode the `familytrip` landmine warns about.
+
+**What actually changed for the family group: nothing yet.** There are ZERO
+rows in `intake_sessions`, so `resolveChatRoute` returns `interview` for no
+chat and the forward branch fires for nobody. The two open bindings (the
+יפן 2026 supergroup and the organizer DM) both route to the japan2026
+companion, untouched. The interviewer path becomes live the first time someone
+redeems a `/start` deep link.
+
+**Issue #30 is now a live exposure, not a latent one.** The relay logged
+`relay.subsumes_approval_poller` — it detected the shared bot token and the API
+stood its approval poller down. That stand-down is a config comparison with no
+liveness check, and the relay is an unsupervised hand-started process outside
+compose. **If the relay dies, signup approvals stop being processed with no
+error.** Until #30 is fixed, treat "is the relay up?" as part of "do approvals
+work?".
 
 ## Where the machine stopped — power outage, 2026-09-02 ~13:00
 
@@ -603,15 +685,15 @@ the contract's buffered-delivery lane is still unimplemented.
   agent-supplied chat id with gateway-injected trusted context once the relay
   contract can carry it. Checked 2026-09-02: upstream Hermes 0.21.0 does not
   carry it, so this waits on the contract, not on an upgrade.
-- **Enable the interviewer.** Built and tested, dormant until
-  `relay.interviewer_profile` is set. Never run against real Telegram. Do it as
-  its own change so a surprise has one candidate cause.
-- **Onboarding's bridge/companion flags.** `--enable-mcp-bridge` and
-  `--companion-templates-dir` both default off and the compose worker passes
-  neither, so a newly onboarded trip gets a live site with no companion profile
-  and no MCP bridge. Turning them on needs a templates dir and changes what a
-  provisioning job does to real infrastructure — a decision, not a default to
-  flip. See "The onboarding half".
+- ~~**Enable the interviewer.**~~ **DONE 2026-09-03.** See "Turning the
+  interviewer on" above — the config line was the last of four steps, not the
+  only one.
+- ~~**Onboarding's bridge/companion flags.**~~ **DECIDED 2026-09-03: both
+  ON** (PR #35). The templates dir is derived from `--repo-root` so it needs no
+  configuration, and opting out is explicit (`--no-companion-profile`,
+  `--no-enable-mcp-bridge`). Note this changes what a real provisioning job
+  does to real infrastructure — `PROVISIONER_COMPUTE_ENABLED` is still off, so
+  nothing provisions real compute until that is armed separately.
 - **Supervision.** `bring-up.sh` exists but nothing runs it at boot. A launchd
   job would close it; it is safe to automate because the script never starts
   the relay.
