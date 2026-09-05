@@ -1773,7 +1773,17 @@ export async function submitAnswerForAgent(
   // draw one, because `clarify` needs the relay `prompt` op this connector
   // does not advertise. Without this the interview silently loses its buttons
   // for good the first time an organizer types instead of tapping.
-  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  //
+  // The floor is reclaimed here too, and for the same reason as sayForChat: an
+  // agent recording an extracted answer well after its own first reply already
+  // released the floor is exactly what a document with several answers in it
+  // does. Scheduling alone is not enough — `sendNextStep`'s floor guard would
+  // otherwise swallow the very next-question prompt this comment says must
+  // never be lost.
+  if (result.ok) {
+    await markAwaitingMachine(db, chatId);
+    await scheduleRouterPrompt(db, result.view.sessionId);
+  }
   return result;
 }
 
@@ -1859,6 +1869,19 @@ export async function sayForChat(
 ): Promise<GetSessionResult> {
   const trimmed = text.trim();
   if (trimmed.length === 0) return { ok: false, reason: "NOT_FOUND" };
+  // The agent explicitly choosing to speak is itself the reason the floor is
+  // ours, regardless of what it was a moment ago. Found live on 2026-09-05: a
+  // document upload got an immediate "reading it now" reply — floor correctly
+  // released to the organizer afterward — and then, ~100 seconds later, once
+  // extraction had actually finished, the agent's own completion message sat
+  // in ui_state UNDELIVERED for the rest of the session. `sendNextStep`'s very
+  // first check is `awaiting === "person"` — return immediately, no send at
+  // all — and nothing there was going to flip it back, because the only thing
+  // that ever did was the ORGANIZER's next message. The floor was built to
+  // stop the ROUTER inserting itself uninvited once someone has already
+  // replied; it was never meant to silence the agent's own second, deliberate
+  // word about the same turn it is still actively working through.
+  await markAwaitingMachine(db, chatId);
   const result = await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, pendingSay: trimmed }));
   if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
   return result;
@@ -2025,7 +2048,12 @@ export async function nominateQuestionForChat(
     // And it is not a finished interview any more.
     finishRequested: false,
   }));
-  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  // Nominating a question is the agent choosing, right now, to speak — the
+  // same reclaim as sayForChat and submitAnswerForAgent, for the same reason.
+  if (result.ok) {
+    await markAwaitingMachine(db, chatId);
+    await scheduleRouterPrompt(db, result.view.sessionId);
+  }
   await advancePhaseForChat(db, chatId);
   return result;
 }
@@ -2147,9 +2175,17 @@ export async function setFinishRequestedForChat(
     }
     return next;
   });
-  // The router already sends its own next step when a BUTTON caused this; an
-  // agent asking for the summary has no such follow-up, so it schedules one.
-  if (result.ok && schedulePrompt) await scheduleRouterPrompt(db, result.view.sessionId);
+  // The router already sends its own next step when a BUTTON caused this — and
+  // by the time it runs, applyDecision's own top-of-turn call has already put
+  // the floor back with the machine, so nothing extra is needed there. An
+  // agent asking for the summary (show_summary_for_chat) has no such
+  // follow-up: it is calling this directly from its own HTTP route, outside
+  // the dispatch pipeline entirely, so it has to reclaim the floor itself —
+  // exactly the sayForChat / submitAnswerForAgent pattern.
+  if (result.ok && schedulePrompt) {
+    await markAwaitingMachine(db, chatId);
+    await scheduleRouterPrompt(db, result.view.sessionId);
+  }
   // `optional -> recap` on finish, `recap -> optional` on Keep planning. Both
   // directions of the one two-way door in the machine, and the reason run 6's
   // organizer could type approval at a session with no path to it: nothing

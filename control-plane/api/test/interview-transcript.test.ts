@@ -45,6 +45,7 @@ import {
   setFinishRequestedForChat,
   openAgentTurn,
   sayForChat,
+  submitAnswerForAgent,
   submitAnswerForChat,
   type IntakeQuestion,
 } from "../src/interview.js";
@@ -825,6 +826,86 @@ describe("the interview never goes silent", () => {
       await runWatchdog(fix, 0);
 
       fix.script.assertNoRepeatedMessage();
+      fix.script.check();
+    });
+  });
+});
+
+describe("the agent can speak more than once per organizer turn", () => {
+  test("a second, later say_for_chat is delivered, not stuck behind the first", { skip: SKIP }, async () => {
+    // The exact live bug: an upload got "Now let me read the PDF document:"
+    // (delivered correctly, floor released to the organizer) and then,
+    // ~100 seconds later, once extraction had genuinely finished, the agent's
+    // OWN completion message sat undelivered in ui_state for the rest of the
+    // session — nearly ten minutes, measured live. sendNextStep's very first
+    // check is `awaiting === "person"`, and nothing was ever going to flip it
+    // back except the organizer's NEXT message, which might be arbitrarily
+    // far away. The floor exists to stop the ROUTER inserting itself
+    // uninvited once someone has replied; it must never silence the agent's
+    // own second, deliberate word about a turn it is still working through.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.last?.text, "רגע, אני קורא את הקובץ.");
+
+      // Time passes. The agent is still processing the SAME organizer turn —
+      // no new inbound message has arrived — and now wants to say something
+      // else.
+      await sayForChat(fix.pool, fix.chat, "הכל נרשם בהצלחה.");
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(
+        fix.script.last?.text,
+        "הכל נרשם בהצלחה.",
+        "the second message must reach the organizer, not sit stuck forever",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("an agent-recorded answer after the floor released still hands back the buttons",
+    { skip: SKIP }, async () => {
+    // submitAnswerForAgent carries the same exposure as sayForChat: its own
+    // comment says losing the next-question prompt here is exactly the
+    // 2026-09-04 "buttons silently gone for good" defect. Recording an answer
+    // well after the agent's first reply already released the floor — a
+    // document with several answers in it does this routinely — must not
+    // let that guarantee quietly break again.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      // Answer the first (choice) question by tap, as normal.
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType, "the first required question is on screen");
+      await turn(fix, taps(fix, tripType));
+
+      // The organizer sends a document; the agent acknowledges it first —
+      // this releases the floor back to "person".
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "קורא את המסמך…");
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.last?.text, "קורא את המסמך…");
+
+      // Still processing the SAME turn, well after that release, the agent
+      // records what the document said — through the REAL production path
+      // (submitAnswerForAgent, what record_answers_for_chat actually calls),
+      // not the test harness's button-tap stand-in. Addressed by the open
+      // turn, same as in production.
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      const recorded = await submitAnswerForAgent(fix.pool, fix.chat, "destination", null, "Japan");
+      assert.ok(recorded.ok, `could not record: ${JSON.stringify(recorded)}`);
+      const before = fix.script.lines.length;
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(fix.script.lines.length, before + 1, "the next question was not silently dropped");
+      assert.ok(fix.script.last?.buttons.length || fix.script.last?.questionId, "and the interview kept moving");
       fix.script.check();
     });
   });

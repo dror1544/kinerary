@@ -712,6 +712,22 @@ async function sendNextStep(
   // Delivered verbatim and then cleared, so a message is sent exactly once
   // however many times the router is prompted to speak.
   if (view.pendingSay) {
+    // The one deliberate exception to "the agent may always reclaim the
+    // floor": once the recap is on screen, the organizer's only outstanding
+    // decision is Confirm or Keep planning, and nothing may bury that button.
+    // Run 7 ended exactly this way — the agent kept talking after the recap,
+    // the organizer said "approved" in prose to it, and nothing happened,
+    // because only the button writes an intake version. Discarded rather than
+    // queued: the organizer taps Keep planning to reopen the conversation, at
+    // which point a fresh, contextual reply is what belongs there, not
+    // something written before they'd even seen the recap.
+    if (view.state === "awaiting_confirmation") {
+      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.say_suppressed_during_recap", {
+        session_id: view.sessionId,
+      }));
+      await clearPendingSayForChat(deps.db, chatId);
+      return;
+    }
     // Claim before sending. If the router got here first this returns false and
     // the message waits for the organizer's next turn rather than landing on
     // top of what was just said.
