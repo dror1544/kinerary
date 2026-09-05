@@ -131,6 +131,35 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
     });
   });
 
+  test("an incomplete structured answer is rejected and leaves the question outstanding", async () => {
+    // Run 12, 2026-09-05: `travelers` recorded as a headcount with no names,
+    // structurally valid, substantively useless. The write must not land, and
+    // the question must still read as unanswered afterward — not "answered
+    // badly", which nothing downstream would ever revisit.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const result = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ count: 5, age_group: "adults" }],
+      );
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "INCOMPLETE_ANSWER");
+      assert.ok(result.ok === false && result.detail, "the agent gets told what is actually missing");
+
+      const row = await pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [a.sessionId],
+      );
+      assert.equal(row.rows[0]!.answers.travelers, undefined, "nothing was written — still outstanding, not answered badly");
+
+      // Retrying with a real name succeeds — the rejection was a bounce, not
+      // a dead end.
+      const retry = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ name: "Ella", age: 40 }],
+      );
+      assert.equal(retry.ok, true);
+    });
+  });
+
   test("a turn open for one chat does not admit a write naming the other", async () => {
     await withTwoInterviews(async ({ pool, a, b }) => {
       await openAgentTurn(pool, a.chatId, a.sessionId);

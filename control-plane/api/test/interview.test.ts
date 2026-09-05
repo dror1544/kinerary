@@ -155,6 +155,49 @@ describe("validateAnswer (unit)", () => {
     assert.equal(result.reason, "DATA_WRONG_SHAPE");
   });
 
+  test("travelers: a headcount/age summary with no names is shape-valid but rejected as incomplete", () => {
+    // Run 12, 2026-09-05: recorded as `{count: 5, age_group: "adults"}` — a
+    // real live example of schema validity (a well-formed array entry)
+    // standing in for substantive completeness (does this establish who is
+    // on the trip). It must not be silently accepted just because the shape
+    // check alone would pass it.
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ count: 5, age_group: "adults" }]);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "INCOMPLETE_ANSWER");
+    assert.ok(result.detail && result.detail.length > 0, "the agent needs to know what is actually missing");
+  });
+
+  test("travelers: at least one named entry among several is enough", () => {
+    // Not every entry needs a name — a document that names the organizer and
+    // summarizes "plus three kids" still establishes who is on the trip.
+    const result = validateAnswer(
+      "travelers", null, null, INTAKE_QUESTIONS,
+      [{ name: "נעה", age: 25 }, { count: 3, age_group: "children" }],
+    );
+    assert.equal(result.ok, true);
+  });
+
+  test("travelers: a name in any script counts, not just Latin", () => {
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "ניר", age: 56 }]);
+    assert.equal(result.ok, true);
+  });
+
+  test("travelers: a bare number or empty string as 'name' still counts as incomplete", () => {
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "5", age: 30 }]);
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unreachable");
+    assert.equal(result.reason, "INCOMPLETE_ANSWER");
+  });
+
+  test("constraints has no completeness check — an empty object still passes shape", () => {
+    // The mechanism is opt-in per question, not inferred from dataShape.
+    // constraints never declared a checkComplete, so a technically-empty-but-
+    // valid object is still accepted, same as before this existed.
+    const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS, {});
+    assert.equal(result.ok, true);
+  });
+
   test("structured question (object shape): valid object accepted", () => {
     const result = validateAnswer("constraints", null, null, INTAKE_QUESTIONS, { dietary: "vegetarian" });
     assert.equal(result.ok, true);

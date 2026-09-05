@@ -102,6 +102,77 @@ export interface IntakeQuestion {
    * question simply stays askable.
    */
   derive?: (answers: AnswerStore) => string | null;
+  /**
+   * A second, distinct question from "is this the right shape" (`dataShape`,
+   * checked before this ever runs): "does this actually establish what the
+   * question exists to establish." A structured answer can be a well-formed
+   * array or object and still be substantively empty — a real live example,
+   * 2026-09-05: `travelers` recorded as `{count: 5, age_group: "adults"}`,
+   * which satisfies `dataShape: "array"` [as one object in it] without a
+   * single name anywhere in it, even though the prompt above asks for names.
+   *
+   * Returns null when the answer is substantively complete. Returns an
+   * explanatory string when it is not — this becomes the agent-facing
+   * `detail` on the rejection (see the `INCOMPLETE_ANSWER` reason), so the
+   * agent knows exactly what is still missing and can ask for it directly,
+   * the same way it already reads and acts on `ALREADY_ANSWERED`'s detail.
+   *
+   * A rejection here does not fail the interview: nothing is written to
+   * `answers`, so the question simply stays outstanding — exactly like a
+   * shape failure — and the router's own "what's still outstanding" logic
+   * keeps offering it.
+   *
+   * Deliberately per-question and opt-in, not a generic content-validation
+   * framework: most questions need only a shape check, and inferring a
+   * completeness rule from a question's type or shape would be exactly the
+   * guess this exists to avoid making. Add one here, on the question it
+   * actually concerns, when a similar silent-shortcut risk shows up elsewhere
+   * — the mechanism already generalizes; only the check itself is per-question.
+   */
+  checkComplete?: (data: unknown) => string | null;
+  /**
+   * Marks this question safe for the router to ask entirely on its own —
+   * no agent nomination, no agent judgment, asked the moment it is next and
+   * nothing else is pending. The architectural rule: the agent owns
+   * judgment, the router owns deterministic progression.
+   *
+   * Explicitly opt-in, and meant to stay a short, deliberate list. A choice
+   * question being fixed-option is necessary but not sufficient — `dietary`
+   * is fixed-choice too, but which follow-up it needs and how it reconciles
+   * against a document is exactly the conversational judgment that stays
+   * with the agent. Router-owned is reserved for questions where the answer
+   * requires no context, no prioritization, and no interpretation: naming
+   * every one by hand, rather than inferring from type or required-ness, is
+   * what stops this from drifting the interview back into the form Track 4
+   * was built to get away from.
+   *
+   * Two effects, both from the same designation:
+   *   - `nominateQuestionForChat` refuses to let the agent nominate it
+   *     (`ROUTER_OWNED`) — there is exactly one path that ever asks it.
+   *   - the router asks it proactively (Track 8) the moment it is next,
+   *     including while an agent turn is open and doing something else
+   *     entirely (document extraction, an optional-question decision) —
+   *     productive progress instead of dead air, without waiting on or
+   *     interrupting whatever the agent is doing.
+   */
+  routerOwned?: boolean;
+}
+
+/**
+ * At least one entry in a `travelers`-shaped array actually names someone —
+ * `\p{L}` rather than a Latin-only pattern because a name is as likely to be
+ * written in Hebrew as English here. Loose on purpose: this only needs to
+ * catch the shortcut of a bare headcount, not validate that a string is a
+ * "real" name, which is not something to adjudicate from a control-plane
+ * module.
+ */
+function hasNamedTraveler(data: unknown): boolean {
+  if (!Array.isArray(data)) return false;
+  return data.some((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const name = (entry as Record<string, unknown>).name;
+    return typeof name === "string" && name.trim().length >= 2 && /\p{L}/u.test(name);
+  });
 }
 
 export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
@@ -118,6 +189,10 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     otherPrompt: "Describe the trip type briefly (max 120 chars):",
     maxLength: 120,
     required: true,
+    // Fixed three options (plus a free-text escape hatch that is itself just
+    // recorded verbatim, no interpretation) — asking which applies needs no
+    // context from the rest of the conversation. See `routerOwned` above.
+    routerOwned: true,
   },
   {
     id: "destination",
@@ -175,6 +250,11 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't written in Latin script, include the English spelling of each too.",
     dataShape: "array",
     required: true,
+    checkComplete: (data) =>
+      hasNamedTraveler(data)
+        ? null
+        : "travelers must include at least one traveler's actual name — a headcount or age summary alone " +
+          "(e.g. \"5 adults\") does not establish who is on this trip. Ask for the names directly.",
   },
   {
     id: "phases",
@@ -277,6 +357,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       { id: "neutral", label: "Neither — avoid gendered phrasing" },
     ],
     required: false,
+    // A fixed three-way pick with no bearing on anything else already
+    // answered — nothing here needs the agent's judgment. See `routerOwned`.
+    routerOwned: true,
   },
   {
     id: "bot_tone",
@@ -288,6 +371,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       { id: "dry", label: "Dry" },
     ],
     required: false,
+    routerOwned: true,
   },
   {
     id: "bot_proactive",
@@ -302,6 +386,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       { id: "packing_reminders", label: "Packing reminders the day before" },
     ],
     required: false,
+    routerOwned: true,
   },
   {
     id: "bot_limits",
@@ -391,7 +476,15 @@ export type AnswerStore = Record<string, IntakeAnswer>;
 
 export type AnswerValidationResult =
   | { ok: true; answer: IntakeAnswer }
-  | { ok: false; reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" };
+  | {
+      ok: false;
+      reason: "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "SESSION_CONFIRMED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER";
+      // Set only for INCOMPLETE_ANSWER — the question-specific explanation
+      // from `checkComplete`, carried through so the caller (ultimately the
+      // agent) knows what is actually missing rather than just that
+      // something was rejected.
+      detail?: string;
+    };
 
 export function validateAnswer(
   questionId: string,
@@ -428,6 +521,9 @@ export function validateAnswer(
     const isPlainObject = typeof structuredData === "object" && !isArray;
     if (question.dataShape === "array" && !isArray) return { ok: false, reason: "DATA_WRONG_SHAPE" };
     if (question.dataShape === "object" && !isPlainObject) return { ok: false, reason: "DATA_WRONG_SHAPE" };
+    // Shape is necessary, not sufficient — see `checkComplete`'s doc comment.
+    const incomplete = question.checkComplete?.(structuredData);
+    if (incomplete) return { ok: false, reason: "INCOMPLETE_ANSWER", detail: incomplete };
     return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: structuredData } };
   }
 
@@ -830,13 +926,25 @@ export type AwaitingParty = "person" | "machine";
  * Called on every inbound message and tap. Restarting `awaiting_since` here is
  * the point: the deadline measures how long WE have taken, never how long a
  * person has been reading.
+ *
+ * `floorSeconds`, when passed, overrides the general `AGENT_FLOOR_SECONDS`
+ * watchdog deadline for this session until the next call clears it (omitting
+ * it resets to the default, not to whatever was there before) — see
+ * `DOCUMENT_FLOOR_SECONDS`. A floor-reclaim call (the agent producing a
+ * second, later word) omits it on purpose: by the time the agent has written
+ * something once, the silent-stall risk the wider window exists for has
+ * already passed.
  */
-export async function markAwaitingMachine(db: pg.Pool, chatId: string): Promise<void> {
+export async function markAwaitingMachine(
+  db: pg.Pool,
+  chatId: string,
+  floorSeconds?: number,
+): Promise<void> {
   await db.query(
     `UPDATE control_plane.intake_sessions
-        SET awaiting = 'machine', awaiting_since = now()
+        SET awaiting = 'machine', awaiting_since = now(), awaiting_floor_seconds = $2
       WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
-    [chatId],
+    [chatId, floorSeconds ?? null],
   );
 }
 
@@ -965,11 +1073,15 @@ export type StartSessionResult =
 
 export type GetSessionResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" | "ALREADY_ANSWERED" };
+  | { ok: false; reason: "NOT_FOUND" | "ALREADY_ANSWERED" | "ROUTER_OWNED" };
 
 export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" };
+  | {
+      ok: false;
+      reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER";
+      detail?: string;
+    };
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
@@ -1477,12 +1589,28 @@ export async function claimDueRouterPrompts(
  * short enough that nobody is left looking at a silent chat wondering whether
  * it broke.
  *
- * FUTURE (agreed 2026-09-04, deliberately not built): a shorter deadline for a
- * plain typed answer than for an uploaded file, since reading a document is the
- * one turn that legitimately takes seconds. One number until there is evidence
- * that two are needed.
+ * Built 2026-09-05: a document/photo turn now gets `DOCUMENT_FLOOR_SECONDS`
+ * instead of this. Run 12 was the evidence — a real document turn ran past a
+ * minute before its first write, so this 30s floor closed it out from under a
+ * still-working agent and produced two live 404s ("the interview tools
+ * returned a 404 NOT_FOUND twice, so the document details were not saved").
+ * The interview still finished (the watchdog's own fallback question kept it
+ * moving), but Dror's verdict was that the retry-and-recover pattern itself is
+ * the UX cost: "later questions asked several times... the race between the
+ * agent and router nearly resolved."
  */
 export const AGENT_FLOOR_SECONDS = 30;
+
+/**
+ * The floor for a turn opened by a document or photo upload, set via
+ * `markAwaitingMachine`'s `floorSeconds` override at the one call site that
+ * knows a turn started with media (`interview_to_gateway` in the relay
+ * poller). Ninety seconds, not thirty: Dror's own read of run 12's timing —
+ * long enough that extracting five travelers, five phases and seven booking
+ * anchors from a PDF is not interrupted mid-read, short enough that a
+ * genuinely stuck agent is still caught inside two minutes.
+ */
+export const DOCUMENT_FLOOR_SECONDS = 90;
 
 /**
  * Takes the floor back from an interviewer that has gone quiet.
@@ -1520,7 +1648,10 @@ export async function claimStalledAgentTurns(
            -- person, which is what made the watchdog fire on conversations
            -- that were not stuck at all.
            AND s.awaiting = 'machine'
-           AND s.awaiting_since < now() - make_interval(secs => $2)
+           -- A document/photo turn carries its own, wider deadline (set by
+           -- markAwaitingMachine's floorSeconds override) — the session's own
+           -- floor wins over the caller's default when present.
+           AND s.awaiting_since < now() - make_interval(secs => COALESCE(s.awaiting_floor_seconds, $2))
            AND s.state <> 'confirmed'
            AND s.telegram_chat_id IS NOT NULL
            -- Nothing waiting to be delivered, and nothing the agent has
@@ -1541,6 +1672,32 @@ export async function claimStalledAgentTurns(
     [limit, floorSeconds],
   );
   return rows.rows.map((r) => ({ sessionId: r.session_id, chatId: r.chat_id }));
+}
+
+/**
+ * Chats currently mid-interview with the machine holding the floor — the
+ * candidate set Track 8's router-owned-question advancement scans every poll
+ * tick. A plain read, unlike `claimStalledAgentTurns`: nothing here claims,
+ * locks, or closes anything, so it can run as often as the loop likes. Most
+ * ticks find nothing to do — `sendNextStep`'s own dedupe against `lastPrompt`
+ * is what makes calling it speculatively, every tick, for every candidate,
+ * safe rather than wasteful.
+ */
+export async function listMachineAwaitingChats(
+  db: pg.Pool,
+  limit = 25,
+): Promise<Array<{ chatId: string }>> {
+  const rows = await db.query<{ telegram_chat_id: string }>(
+    `SELECT telegram_chat_id
+       FROM control_plane.intake_sessions
+      WHERE awaiting = 'machine'
+        AND state = 'interviewing'
+        AND telegram_chat_id IS NOT NULL
+      ORDER BY awaiting_since
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.rows.map((r) => ({ chatId: r.telegram_chat_id }));
 }
 
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
@@ -2145,6 +2302,14 @@ export async function nominateQuestionForChat(
   const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "NOT_FOUND" };
 
+  // The router already asks this on its own (Track 8) — there is exactly one
+  // path that ever puts a router-owned question in front of the organizer,
+  // and this is not it. Refusing here, rather than letting the nomination
+  // through, is what keeps that a fact rather than a convention: two
+  // independent decisions to ask the same fixed-choice question is exactly
+  // the class of duplicate-ask bug this session kept finding.
+  if (question.routerOwned) return { ok: false, reason: "ROUTER_OWNED" };
+
   // Never put a question the record already answers. Run 7: a tapped
   // `bot_gender` was asked again in prose, and a destination the document had
   // supplied was asked for outright. The interviewer's picture of the record is
@@ -2420,7 +2585,7 @@ async function submitAnswerVia(
     const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
     if (!validation.ok) {
       await client.query("ROLLBACK");
-      return { ok: false, reason: validation.reason };
+      return { ok: false, reason: validation.reason, ...(validation.detail ? { detail: validation.detail } : {}) };
     }
 
     const updatedAnswers = { ...session.answers, [questionId]: validation.answer };

@@ -32,6 +32,7 @@ import {
   confirmIntakeForChat,
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
+  DOCUMENT_FLOOR_SECONDS,
   claimDueRouterPrompts,
   claimFloor,
   markAwaitingMachine,
@@ -39,8 +40,10 @@ import {
   openAgentTurn,
   queueInboundMessage,
   claimSettledInboundBursts,
+  listMachineAwaitingChats,
   submitAnswerForChat,
   type SessionView,
+  type IntakeQuestion,
   askForMoreForChat,
   clearPendingAskForChat,
   clearPendingEntryForChat,
@@ -174,8 +177,17 @@ export async function applyDecision(
   // deadline starts now. Restarting it here is the whole point of scoping this
   // to the session: the clock measures how long WE take, never how long a
   // person spends reading a question.
+  //
+  // A document/photo gets the wider DOCUMENT_FLOOR_SECONDS floor — run 12's
+  // evidence that a normal 30s deadline closes the turn out from under an
+  // agent still genuinely extracting a PDF. Every other inbound kind keeps the
+  // default (undefined here clears any earlier override on this session).
   const chatId = interviewChatOf(decision);
-  if (chatId) await markAwaitingMachine(deps.db, chatId);
+  if (chatId) {
+    const isDocumentTurn = decision.kind === "interview_to_gateway" &&
+      (decision.event.media_urls?.length ?? 0) > 0;
+    await markAwaitingMachine(deps.db, chatId, isDocumentTurn ? DOCUMENT_FLOOR_SECONDS : undefined);
+  }
 
   switch (decision.kind) {
     case "reply":
@@ -694,6 +706,71 @@ export async function recoverStalledInterviews(
   }
 }
 
+/**
+ * The router-owned question that is safe to ask right now, if any at all —
+ * see `routerOwned` on `IntakeQuestion`. Shared between `sendNextStep` and
+ * `advanceRouterOwnedQuestions` so the two can never quietly disagree about
+ * what "ready" means.
+ *
+ * Deliberately does not fire on the optional side until `offeredMore` is
+ * true — the organizer has to see the essentials-done "want to add more, or
+ * finish?" transition at least once before ANY optional question, router-
+ * owned or not. Pre-empting that with a fast, judgment-free question would
+ * read exactly like the form Track 4 was built to get away from: no "you're
+ * done with the required stuff" moment, just straight into more questions.
+ */
+function nextRouterOwnedQuestion(view: SessionView): IntakeQuestion | null {
+  if (view.nextQuestion) return view.nextQuestion.routerOwned ? view.nextQuestion : null;
+  if (!view.offeredMore) return null;
+  return view.optionalRemaining.find((q) => q.routerOwned) ?? null;
+}
+
+/**
+ * Track 8: asks whatever router-owned question is next, on its own clock —
+ * during normal progression (skipping the agent round-trip a fixed-choice
+ * question never needed) and, just as importantly, while an agent turn is
+ * open and doing something else entirely (document extraction, deciding
+ * which OTHER optional question to nominate). Productive progress instead of
+ * dead air, without touching or interrupting whatever the agent is doing:
+ * a router-owned answer is recorded through the same tap-handling path as
+ * any other button, which needs no open agent turn at all.
+ *
+ * Scoped to `awaiting = 'machine'` sessions only — if the organizer holds the
+ * floor, nothing is owed yet, so there is nothing to check. Calling
+ * `sendNextStep` speculatively for every candidate, every tick, is safe
+ * rather than wasteful: its own dedupe against `lastPrompt` (and the floor
+ * claim itself) makes a redundant call a silent no-op, the same protection
+ * `renderDueRouterPrompts` and the stalled-turn watchdog already lean on.
+ *
+ * Deliberately does not fall back to `nextQuestion` generally — only a
+ * question explicitly marked `routerOwned` ever gets asked here. Asking
+ * `destination` the instant a document is queued, before the agent has had
+ * any chance to read it, would defeat the entire reason to upload one.
+ */
+export async function advanceRouterOwnedQuestions(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+): Promise<void> {
+  let candidates: Array<{ chatId: string }>;
+  try {
+    candidates = await listMachineAwaitingChats(deps.db);
+  } catch {
+    log(structuredLog("warn", "trip_bot.router_owned_scan_failed", {}));
+    return;
+  }
+  for (const { chatId } of candidates) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok || result.view.state !== "interviewing") continue;
+      if (!nextRouterOwnedQuestion(result.view)) continue;
+      await sendNextStep(result.view, chatId, deps, strings);
+    } catch {
+      log(structuredLog("warn", "trip_bot.router_owned_scan_item_failed", {}));
+    }
+  }
+}
+
 export async function renderDueRouterPrompts(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
@@ -870,6 +947,7 @@ async function sendNextStep(
   const question =
     view.nextQuestion
     ?? view.pendingAsk
+    ?? nextRouterOwnedQuestion(view)
     ?? (autoWalkOptional && view.state === "interviewing" ? view.optionalRemaining[0] ?? null : null);
 
   // Every agent write asks the router to speak. An agent that recorded five
@@ -1081,6 +1159,7 @@ export function startTripBotPoller(
         // gives the agent something to write, which the next two calls then
         // deliver or watch for a stall on.
         await flushSettledInboundBursts(deps, log);
+        await advanceRouterOwnedQuestions(deps, strings, log);
         await renderDueRouterPrompts(deps, strings, log);
         await recoverStalledInterviews(deps, strings, log);
       } catch (error) {

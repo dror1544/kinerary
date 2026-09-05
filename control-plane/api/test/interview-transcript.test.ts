@@ -38,6 +38,8 @@ import {
   INTAKE_QUESTIONS,
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
+  DOCUMENT_FLOOR_SECONDS,
+  hasOpenAgentTurn,
   applyDerivationsForChat,
   markAwaitingMachine,
   nextPhase,
@@ -54,6 +56,7 @@ import { startFromDeepLink } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import {
   applyDecision,
+  advanceRouterOwnedQuestions,
   flushSettledInboundBursts,
   recoverStalledInterviews,
   renderDueRouterPrompts,
@@ -717,15 +720,21 @@ describe("one voice, one writer", () => {
     // undelivered) and, moments later in the SAME turn, nominated the
     // question — and the two used to go out as separate Telegram messages,
     // the agent's own prose first, the router's buttoned render second.
+    //
+    // `bot_gender` itself is what run 11 actually hit, but Track 8 made it
+    // router-owned — the agent can no longer nominate it at all (see
+    // "the agent cannot nominate a router-owned question" below), so this
+    // uses `dietary` as a still-agent-nominated stand-in to keep proving the
+    // fold mechanism itself, independent of which question triggers it.
     await withConversation(async (fix) => {
       await open(fix);
       await turn(fix, taps(fix, "c:nodoc"));
       await answerEverythingRequired(fix);
 
       await markAwaitingMachine(fix.pool, fix.chat);
-      await sayForChat(fix.pool, fix.chat, "בואו נדבר קצת על האישיות של העוזר.");
+      await sayForChat(fix.pool, fix.chat, "בואו נדבר קצת על ההעדפות באוכל.");
       // Not delivered yet — nominated in the same breath, before any tick ran.
-      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "bot_gender", "איך לקרוא לעוזר — זכר, נקבה, או ניטרלי?");
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "dietary", "יש מישהו עם הגבלות אכילה?");
       assert.ok(nominated.ok);
 
       const before = fix.script.lines.length;
@@ -733,8 +742,8 @@ describe("one voice, one writer", () => {
 
       assert.equal(fix.script.lines.length, before + 1, "run 11 regression — the lead-in and the question went out separately");
       const combined = fix.script.last;
-      assert.match(combined!.text, /העוזר\.\n\nאיך לקרוא/, "the lead-in and the question are one message");
-      assert.equal(combined?.questionId, "bot_gender");
+      assert.match(combined!.text, /באוכל\.\n\nיש מישהו/, "the lead-in and the question are one message");
+      assert.equal(combined?.questionId, "dietary");
       assert.ok(combined!.buttons.length > 0, "and it still has real buttons");
       fix.script.check();
     });
@@ -756,12 +765,12 @@ describe("one voice, one writer", () => {
       assert.equal(fix.script.last?.text, "מעולה, קיבלתי את הכל.");
       const before = fix.script.lines.length;
 
-      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "bot_gender", "איך לקרוא לעוזר?");
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "dietary", "יש הגבלות אכילה?");
       assert.ok(nominated.ok);
       await deliverPendingRouterPrompt(fix);
 
       assert.equal(fix.script.lines.length, before + 1, "the nomination is its own, separate message");
-      assert.equal(fix.script.last?.text, "איך לקרוא לעוזר?", "not folded with something already on screen");
+      assert.equal(fix.script.last?.text, "יש הגבלות אכילה?", "not folded with something already on screen");
       fix.script.check();
     });
   });
@@ -874,6 +883,119 @@ describe("the interview never goes silent", () => {
 
       await runWatchdog(fix, AGENT_FLOOR_SECONDS);
       assert.equal(fix.script.lines.length, before, "a turn one second old still holds the floor");
+    });
+  });
+
+  test("a document turn holds the floor past the general deadline", { skip: SKIP }, async () => {
+    // Run 12, 2026-09-05: a real document turn ran past a minute before its
+    // first write. The general 30s floor closed it out from under the agent
+    // and produced two live 404 NOT_FOUNDs. A document/photo turn now carries
+    // its own, wider deadline (`markAwaitingMachine`'s `floorSeconds`
+    // override) — this proves the session's own floor wins even when the
+    // watchdog is invoked with the general one.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      await markAwaitingMachine(fix.pool, fix.chat, DOCUMENT_FLOOR_SECONDS);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      // Backdated past the general floor, still inside the document one.
+      await fix.pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting_since = now() - interval '40 seconds' WHERE id = $1",
+        [view.view.sessionId],
+      );
+      const before = fix.script.lines.length;
+
+      await runWatchdog(fix, AGENT_FLOOR_SECONDS);
+      assert.equal(fix.script.lines.length, before, "40 seconds into a document turn is not a stall");
+    });
+  });
+
+  test("a document turn is eventually reclaimed past its own, wider deadline", { skip: SKIP }, async () => {
+    // The other half: the wider floor is a deadline, not an exemption. A
+    // document turn that is GENUINELY stuck must still be caught — just later
+    // than a plain-text one. Mirrors "a stalled interviewer loses the floor
+    // and the router asks" above: a genuinely NEW question has to be on offer,
+    // or the "already on screen" dedupe (run 5/6's own rule) suppresses the
+    // recovery message regardless of whether the turn was reclaimed.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType, "the first question is on screen with its buttons");
+      await turn(fix, taps(fix, tripType));
+
+      await markAwaitingMachine(fix.pool, fix.chat, DOCUMENT_FLOOR_SECONDS);
+      await agentRecords(fix, "destination", "Japan");
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      await fix.pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting_since = now() - interval '91 seconds' WHERE id = $1",
+        [view.view.sessionId],
+      );
+      const before = fix.script.lines.length;
+
+      await runWatchdog(fix, AGENT_FLOOR_SECONDS);
+      assert.equal(fix.script.lines.length, before + 1, "past its own 90s floor, the router speaks");
+    });
+  });
+
+  test("an uploaded document is marked with the wider floor; a typed answer is not", { skip: SKIP }, async () => {
+    // Protects the wiring in applyDecision, not just the mechanism above: the
+    // one call site that knows a message carried media has to actually pass
+    // DOCUMENT_FLOOR_SECONDS through, and must not leak it onto a later,
+    // ordinary text turn.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+
+      const documentDecision = {
+        kind: "interview_to_gateway" as const,
+        chatId: fix.chat,
+        sessionId: view.view.sessionId,
+        event: {
+          text: "",
+          message_type: "document" as const,
+          source: {
+            platform: "telegram", chat_id: fix.chat, chat_type: "dm" as const,
+            chat_name: null, user_id: null, user_name: null, thread_id: null, chat_topic: null,
+          },
+          media_urls: ["http://127.0.0.1:4312/relay/media/deadbeef"],
+        },
+      };
+      await applyDecision(documentDecision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+
+      const afterDocument = await fix.pool.query<{ awaiting_floor_seconds: number | null }>(
+        "SELECT awaiting_floor_seconds FROM control_plane.intake_sessions WHERE id = $1",
+        [view.view.sessionId],
+      );
+      assert.equal(afterDocument.rows[0]?.awaiting_floor_seconds, DOCUMENT_FLOOR_SECONDS);
+
+      const textDecision = {
+        kind: "interview_to_gateway" as const,
+        chatId: fix.chat,
+        sessionId: view.view.sessionId,
+        event: {
+          text: "family, five of us",
+          message_type: "text" as const,
+          source: {
+            platform: "telegram", chat_id: fix.chat, chat_type: "dm" as const,
+            chat_name: null, user_id: null, user_name: null, thread_id: null, chat_topic: null,
+          },
+        },
+      };
+      await applyDecision(textDecision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+
+      const afterText = await fix.pool.query<{ awaiting_floor_seconds: number | null }>(
+        "SELECT awaiting_floor_seconds FROM control_plane.intake_sessions WHERE id = $1",
+        [view.view.sessionId],
+      );
+      assert.equal(afterText.rows[0]?.awaiting_floor_seconds, null, "an ordinary answer clears the override");
     });
   });
 
@@ -1593,6 +1715,163 @@ describe("a typing signal covers the settle-window wait", () => {
       await applyDecision(decision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
 
       assert.ok(fix.script.typingSignals > before, "a typing signal went out while the message settles");
+    });
+  });
+});
+
+describe("Track 8 — deterministic question progression", () => {
+  // The architectural rule: the agent owns judgment, the router owns
+  // deterministic progression. `trip_type`, `bot_gender`, `bot_tone` and
+  // `bot_proactive` are explicitly designated `routerOwned` — fixed-choice,
+  // zero-judgment questions that need no agent round-trip to ask. Nothing
+  // else is: a choice question being fixed-option is necessary but not
+  // sufficient (see `dietary`), and the mechanism must never widen itself to
+  // "any button question" on its own.
+
+  /**
+   * `deliverPendingRouterPrompt` deliberately omits `interviewerProfile` —
+   * every existing test using it therefore runs `sendNextStep` in
+   * `autoWalkOptional` ("no interviewer") mode, where the router marches the
+   * ENTIRE optional list on its own and the essentials-done transition is
+   * never reached at all. That is fine for tests exercising an explicit
+   * nomination (`pendingAsk` wins regardless), but wrong for these: Track 8
+   * only matters with a real interviewer configured, which is what
+   * production actually sets (`relay/server.ts`'s `interviewerProfile:
+   * relay.interviewer_profile`). This is that, for `sendNextStep`'s outbound
+   * side specifically.
+   */
+  async function deliverWithInterviewer(fix: Fixture): Promise<void> {
+    await renderDueRouterPrompts(
+      { db: fix.pool, telegram: fix.script, connector: fix.connector, interviewerProfile: "trip-intake" },
+      DEFAULT_STRINGS,
+      () => {},
+      0,
+    );
+  }
+
+  test("bot_gender is asked by the router directly, skipping past unanswered non-router-owned optionals", { skip: SKIP }, async () => {
+    // Not via the More button — "More" is the organizer explicitly asking to
+    // see the next optional thing, and it starts from the top of the list on
+    // purpose (trip_interests first). Track 8's own proactive advancement is
+    // a separate, independent path: it reaches bot_gender even though
+    // trip_interests, travel_anchors, constraints, trip_pace and dietary are
+    // ALL still unanswered and earlier in declared order — because none of
+    // those are router-owned, and bot_gender is.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await deliverWithInterviewer(fix); // essentials-done "more or finish?" message — sets offeredMore
+
+      // Steady state once the More/Finish exchange itself has resolved:
+      // nothing agent-side pending, the machine owes the next word. Tapping
+      // More would ask trip_interests first (its own, separate mechanism —
+      // "More" always starts from the top of the list); this is the state
+      // AFTER that resolves, or after the organizer is simply left with the
+      // agent quiet for a while.
+      await markAwaitingMachine(fix.pool, fix.chat);
+
+      await advanceRouterOwnedQuestions(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector }, DEFAULT_STRINGS, () => {},
+      );
+
+      assert.equal(fix.script.last?.questionId, "bot_gender", "asked directly — no nomination happened anywhere above");
+      fix.script.check();
+    });
+  });
+
+  test("the essentials-done transition still shows before any router-owned optional question", { skip: SKIP }, async () => {
+    // The regression this guards: folding the router-owned fallback into the
+    // same resolution step as `nextQuestion` must never pre-empt the one-time
+    // "you're done with the required stuff" moment — that would be exactly
+    // the formy, no-transition interview Track 4 was built to avoid.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await deliverWithInterviewer(fix);
+
+      assert.notEqual(fix.script.last?.questionId, "bot_gender", "the transition message comes first");
+      assert.ok(fix.script.last?.buttons.includes("c:more"), "and it's recognisably the more-or-finish offer");
+    });
+  });
+
+  test("the agent cannot nominate a router-owned question", { skip: SKIP }, async () => {
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      const result = await nominateQuestionForChat(fix.pool, fix.chat, "bot_gender", "own phrasing");
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "ROUTER_OWNED");
+
+      // The refusal itself queued nothing — no pendingAsk was set as a side
+      // effect of the attempt.
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.pendingAsk, null);
+    });
+  });
+
+  test("trip_type is asked proactively while a document turn is still open — the original motivating case", { skip: SKIP }, async () => {
+    // What this replaces: previously nothing asked trip_type until the agent
+    // got around to it, so a 90-second document turn was 90 seconds of dead
+    // air even though trip_type needs no document content and no judgment.
+    await withConversation(async (fix) => {
+      await open(fix);
+      const before = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(before.ok);
+
+      const documentDecision = {
+        kind: "interview_to_gateway" as const,
+        chatId: fix.chat,
+        sessionId: before.view.sessionId,
+        event: {
+          text: "",
+          message_type: "document" as const,
+          source: {
+            platform: "telegram", chat_id: fix.chat, chat_type: "dm" as const,
+            chat_name: null, user_id: null, user_name: null, thread_id: null, chat_topic: null,
+          },
+          media_urls: ["http://127.0.0.1:4312/relay/media/deadbeef"],
+        },
+      };
+      // Marks the floor machine-held with the document's own wider deadline —
+      // exactly what a real upload does before the agent ever gets a turn.
+      await applyDecision(documentDecision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+      // Opens the turn the agent would still be working in, unrelated to
+      // trip_type entirely — standing in for the document extraction itself.
+      await openAgentTurn(fix.pool, fix.chat, before.view.sessionId);
+
+      await advanceRouterOwnedQuestions(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector }, DEFAULT_STRINGS, () => {},
+      );
+
+      assert.equal(fix.script.last?.questionId, "trip_type", "asked without waiting on the still-open agent turn");
+
+      // The agent turn is untouched — Track 8 filled dead air, it did not
+      // reclaim or interrupt the agent's own work.
+      const stillOpen = await hasOpenAgentTurn(fix.pool, fix.chat);
+      assert.ok(stillOpen, "the document turn is still open, exactly as Track 6 left it");
+    });
+  });
+
+  test("advanceRouterOwnedQuestions never jumps ahead to a non-router-owned required question", { skip: SKIP }, async () => {
+    // The guard that keeps this from drifting into a form: `destination`
+    // being next must not make it fair game just because SOMETHING is next.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType);
+      await turn(fix, taps(fix, tripType!)); // trip_type answered — destination is next, and NOT router-owned
+
+      const before = fix.script.lines.length;
+      await advanceRouterOwnedQuestions(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector }, DEFAULT_STRINGS, () => {},
+      );
+      assert.equal(fix.script.lines.length, before, "nothing sent — destination needs the organizer, not a proactive ask");
     });
   });
 });

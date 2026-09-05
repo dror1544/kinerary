@@ -1072,6 +1072,14 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
             "get_interview_for_chat and pick something still outstanding, or move on.",
         });
       }
+      if (result.reason === "ROUTER_OWNED") {
+        return reply.code(409).send({
+          error: "ROUTER_OWNED",
+          questionId,
+          detail: "The router already asks this one on its own, the moment it's next — there is nothing " +
+            "for you to nominate here. It will reach the organizer without you doing anything.",
+        });
+      }
       return reply.code(404).send({ error: result.reason });
     }
     return reply.code(200).send(result.view);
@@ -1106,7 +1114,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     }
 
     const recorded: string[] = [];
-    const rejected: Array<{ questionId: string; reason: string }> = [];
+    const rejected: Array<{ questionId: string; reason: string; detail?: string }> = [];
     for (const raw of body.answers) {
       const entry = raw as Record<string, unknown>;
       const questionId = typeof entry.questionId === "string" ? entry.questionId : null;
@@ -1124,7 +1132,11 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
         entry.optionIds as readonly string[] | undefined,
       );
       if (result.ok) recorded.push(questionId);
-      else rejected.push({ questionId, reason: result.reason });
+      // INCOMPLETE_ANSWER's detail is the whole point of the rejection — a
+      // bare reason code would tell the agent something failed without
+      // telling it what to fix, and it would have no way to tell this apart
+      // from a shape error worth giving up on rather than correcting.
+      else rejected.push({ questionId, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) });
     }
 
     const view = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
