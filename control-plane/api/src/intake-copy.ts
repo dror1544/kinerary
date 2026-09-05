@@ -257,6 +257,12 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ A few more questions",
     documentOffer: "Before we start on details — if you already have a plan, a booking confirmation, tickets or a spreadsheet for this trip, send it here and I'll read it instead of making you type it all out.",
     noDocument: "I don't have one",
+    // Said when the interviewer has gone quiet and the router picks the thread
+    // back up. Deliberately says nothing about why: the organizer does not need
+    // to hear that something stalled, and "sorry, I had a problem" invites them
+    // to wonder whether their answers survived. It reads as one person
+    // gathering the thread again, because from their side it is.
+    resumed: "Let's pick this back up.",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -275,6 +281,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ עוד כמה שאלות",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
+    resumed: "נמשיך מכאן.",
   },
 };
 

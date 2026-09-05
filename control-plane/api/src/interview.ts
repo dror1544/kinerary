@@ -1113,6 +1113,70 @@ export async function claimDueRouterPrompts(
   return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id }));
 }
 
+/**
+ * How long the interviewer gets to answer before the router takes the floor
+ * back and speaks for it.
+ *
+ * Thirty seconds, chosen by Dror against the latency he actually sat through:
+ * long enough that a model reading a shared PDF is not interrupted mid-thought,
+ * short enough that nobody is left looking at a silent chat wondering whether
+ * it broke.
+ *
+ * FUTURE (agreed 2026-09-04, deliberately not built): a shorter deadline for a
+ * plain typed answer than for an uploaded file, since reading a document is the
+ * one turn that legitimately takes seconds. One number until there is evidence
+ * that two are needed.
+ */
+export const AGENT_FLOOR_SECONDS = 30;
+
+/**
+ * Takes the floor back from an interviewer that has gone quiet.
+ *
+ * Track 4 made the agent the only voice, which removed a whole class of defect
+ * and introduced exactly one: if the agent stalls or fumbles a tool call, the
+ * organizer now gets SILENCE rather than a stray message. Runs 4 and 6 both had
+ * that stall — in run 4 it announced it was "fixing" a fault it cannot fix, in
+ * run 6 it simply stopped — so this is not a hypothetical failure being
+ * pre-empted.
+ *
+ * Closing the turn is what hands the floor over: `sendNextStep` will then draw
+ * the next question from `intake-copy.ts`. Robotic, and infinitely better than
+ * nothing.
+ *
+ * Claimed with FOR UPDATE SKIP LOCKED and closed in the same statement, so two
+ * poll ticks cannot both decide to speak for the same silent agent — which
+ * would produce, of all things, the bombardment this design exists to prevent.
+ */
+export async function claimStalledAgentTurns(
+  db: pg.Pool,
+  limit = 10,
+  floorSeconds: number = AGENT_FLOOR_SECONDS,
+): Promise<Array<{ sessionId: string; chatId: string }>> {
+  const rows = await db.query<{ session_id: string; chat_id: string }>(
+    `UPDATE control_plane.interview_agent_turns
+        SET closed_at = now()
+      WHERE id IN (
+        SELECT t.id
+          FROM control_plane.interview_agent_turns t
+          JOIN control_plane.intake_sessions s ON s.id = t.session_id
+         WHERE t.closed_at IS NULL
+           AND t.opened_at < now() - make_interval(secs => $2)
+           AND s.state <> 'confirmed'
+           AND s.telegram_chat_id IS NOT NULL
+           -- Nothing waiting to be delivered. If the agent HAS written, the
+           -- router is already about to speak and the floor is not stuck; only
+           -- a turn that produced nothing at all is a stall.
+           AND s.router_prompt_due_at IS NULL
+         ORDER BY t.opened_at
+         FOR UPDATE OF t SKIP LOCKED
+         LIMIT $1
+      )
+      RETURNING session_id, chat_id`,
+    [limit, floorSeconds],
+  );
+  return rows.rows.map((r) => ({ sessionId: r.session_id, chatId: r.chat_id }));
+}
+
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {
   const row = await db.query<{
     id: string;

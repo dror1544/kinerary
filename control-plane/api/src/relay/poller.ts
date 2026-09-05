@@ -31,7 +31,9 @@ import {
   closeAgentTurn,
   confirmIntakeForChat,
   getSessionForChat,
+  AGENT_FLOOR_SECONDS,
   claimDueRouterPrompts,
+  claimStalledAgentTurns,
   openAgentTurn,
   submitAnswerForChat,
   type SessionView,
@@ -467,6 +469,71 @@ async function applyInterviewCallback(
  * Failures are swallowed per session: one chat whose send fails must not stop
  * the poll loop or block the other claims in the batch.
  */
+/**
+ * Takes the floor back from an interviewer that has gone quiet, and speaks.
+ *
+ * The one failure Track 4 introduced. Making the agent the only voice removed
+ * chain-of-thought leaks, numbered lists and both floods — but it also means a
+ * stalled agent leaves the organizer looking at nothing, where before they at
+ * least got a stray message. Runs 4 and 6 both stalled, so this is a failure
+ * that has already happened twice rather than one being pre-empted.
+ *
+ * `claimStalledAgentTurns` closes the turn; `sendNextStep` then draws the next
+ * question from `intake-copy.ts` — the router's own copy, in the interview's
+ * language. Flat next to the agent's phrasing, and infinitely better than a
+ * conversation that simply stops.
+ */
+export async function recoverStalledInterviews(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  floorSeconds?: number,
+): Promise<void> {
+  let stalled: Array<{ sessionId: string; chatId: string }>;
+  try {
+    stalled = floorSeconds === undefined
+      ? await claimStalledAgentTurns(deps.db)
+      : await claimStalledAgentTurns(deps.db, 10, floorSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.stalled_turn_claim_failed", {}));
+    return;
+  }
+  for (const { sessionId, chatId } of stalled) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) continue;
+      const view = result.view;
+
+      // Rendered here rather than through `sendNextStep`, and the reason is a
+      // real interaction the tests found: the flood dedupe suppresses a repeat
+      // of the last prompt, and a stalled agent is usually stalled on the
+      // question the router just asked. Routed through sendNextStep the
+      // watchdog would fall silent exactly when it is needed. Re-sending the
+      // identical question instead would break "no message twice" — the run-5
+      // and run-6 rule. So the recovery gets its own opening line: distinct
+      // text, same question, buttons intact.
+      const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
+      if (!question) continue;
+
+      log(structuredLog("warn", "trip_bot.agent_floor_reclaimed", {
+        session_id: sessionId,
+        after_seconds: floorSeconds ?? AGENT_FLOOR_SECONDS,
+        question_id: question.id,
+      }));
+
+      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: `${uiString("resumed", view.language)}\n\n${rendered.text}`,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
+    } catch {
+      log(structuredLog("warn", "trip_bot.stalled_turn_recovery_failed", { session_id: sessionId }));
+    }
+  }
+}
+
 export async function renderDueRouterPrompts(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
@@ -720,6 +787,11 @@ export function startTripBotPoller(
       // happens out-of-band: the agent calls the control-plane API directly,
       // and this loop is the only process holding the bot connection.
       await renderDueRouterPrompts(deps, strings, log);
+
+      // Then, and only then, speak for an agent that wrote nothing at all.
+      // Order matters: an agent that has written owes a prompt, and delivering
+      // that first means a slow-but-working turn is never mistaken for a stall.
+      await recoverStalledInterviews(deps, strings, log);
 
       if (raw.length > 0) {
         backoffMs = 0;

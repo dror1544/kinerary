@@ -843,8 +843,13 @@ Build:
   `interview_agent_turns` authoritative and retiring the handback guard,
   prompt dedupe and settle window that currently approximate it.
 - **A watchdog:** if the floor is held and nothing organizer-visible has been
-  sent for N seconds, the router takes it back and asks the next question from
+  sent for **30 seconds** (Dror, 2026-09-04, against the latency he sat
+  through), the router takes it back and asks the next question from
   `intake-copy.ts`. Robotic, but never stuck.
+  - *Future, deliberately not built:* a shorter deadline for a plain typed
+    answer than for an uploaded file, since reading a document is the one turn
+    that legitimately takes seconds. One number until there is evidence two are
+    needed.
 - **Derivable questions are never asked** — `timezone` from the destination,
   `home_country` from the organizer, duration from the dates.
 - **The document offer becomes a phase entry action**, not a prompt

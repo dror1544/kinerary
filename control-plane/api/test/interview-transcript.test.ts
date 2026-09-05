@@ -37,7 +37,9 @@ import { askText, uiString, type Language } from "../src/intake-copy.js";
 import {
   INTAKE_QUESTIONS,
   getSessionForChat,
+  AGENT_FLOOR_SECONDS,
   nominateQuestionForChat,
+  openAgentTurn,
   sayForChat,
   submitAnswerForChat,
   type IntakeQuestion,
@@ -45,7 +47,11 @@ import {
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
-import { applyDecision, renderDueRouterPrompts } from "../src/relay/poller.js";
+import {
+  applyDecision,
+  recoverStalledInterviews,
+  renderDueRouterPrompts,
+} from "../src/relay/poller.js";
 import { detectInternalLeak } from "../src/relay/internal-leak.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
@@ -107,6 +113,15 @@ class Transcript implements TelegramClient {
   readonly answered: { callbackQueryId: string; text?: string }[] = [];
   language: Language = "en";
   queued: unknown[][] = [];
+  /**
+   * Where in the transcript each question became answered.
+   *
+   * Populated by the test driver rather than read from the database, because
+   * what matters is the ORDER relative to the messages: "was this already
+   * answered when it was asked?" is a question about the transcript, and the
+   * database only knows the end state.
+   */
+  readonly answeredAt = new Map<string, number>();
 
   async sendMessage(params: {
     chatId: string;
@@ -128,6 +143,11 @@ class Transcript implements TelegramClient {
   async deleteWebhookIfPresent(): Promise<void> { /* no-op */ }
 
   get last(): Line | undefined { return this.lines[this.lines.length - 1]; }
+
+  /** Called by the driver the moment an answer is recorded, tap or extraction. */
+  noteAnswered(questionId: string): void {
+    if (!this.answeredAt.has(questionId)) this.answeredAt.set(questionId, this.lines.length);
+  }
 
   /** Every message that put a given question. More than one is the bug. */
   asking(questionId: string): Line[] {
@@ -183,16 +203,25 @@ class Transcript implements TelegramClient {
     }
   }
 
-  /** Run 6: it asked for a destination it had already recorded. */
-  assertNoQuestionAskedTwice(): void {
-    const counts = new Map<string, number>();
-    for (const line of this.lines) {
-      if (!line.questionId) continue;
-      counts.set(line.questionId, (counts.get(line.questionId) ?? 0) + 1);
-    }
-    for (const [id, n] of counts) {
-      assert.equal(n, 1, `run 6 regression — "${id}" was put to the organizer ${n} times`);
-    }
+  /**
+   * Run 6: it asked "לאן נוסעים?" after the document had already answered it.
+   *
+   * Stated as "never ask what the record already answers", not "never ask
+   * twice" — a distinction the watchdog forced, and the sharper rule for it.
+   * Re-asking an UNANSWERED question after the interviewer stalls is the
+   * recovery working; asking one the organizer has already answered is the
+   * defect, whether it happens once or five times.
+   */
+  assertNeverAsksAnsweredQuestion(): void {
+    this.lines.forEach((line, index) => {
+      if (!line.questionId) return;
+      const answeredAt = this.answeredAt.get(line.questionId);
+      assert.ok(
+        answeredAt === undefined || answeredAt > index,
+        `run 6 regression — "${line.questionId}" was put to the organizer after it was already ` +
+          `recorded (answered at line ${answeredAt}, asked again at line ${index})`,
+      );
+    });
   }
 
   /** Run 5: the agent read its own field ids and tool names aloud. */
@@ -212,7 +241,7 @@ class Transcript implements TelegramClient {
     this.assertNoRepeatedMessage();
     this.assertOptionQuestionsAreTappable();
     this.assertRouterTextIsInSessionLanguage();
-    this.assertNoQuestionAskedTwice();
+    this.assertNeverAsksAnsweredQuestion();
     this.assertNoInternalLeak();
   }
 }
@@ -318,6 +347,7 @@ async function agentRecords(
     ? await submitAnswerForChat(fix.pool, fix.chat, questionId, null, undefined, value)
     : await submitAnswerForChat(fix.pool, fix.chat, questionId, null, value);
   assert.ok(result.ok, `the stubbed agent could not record ${questionId}: ${JSON.stringify(result)}`);
+  fix.script.noteAnswered(questionId);
 }
 
 /**
@@ -352,6 +382,7 @@ async function answerEverythingRequired(fix: Fixture): Promise<void> {
     const button = line?.questionId === next.id ? line.buttons.find((b) => b.startsWith("a:")) : undefined;
     if (button) {
       await turn(fix, taps(fix, button));
+      fix.script.noteAnswered(next.id);
       continue;
     }
     const value = written[next.id];
@@ -464,6 +495,23 @@ describe("the interview transcript holds its standing invariants", () => {
     assert.ok(destination);
     await script.sendMessage({ chatId: "1", text: askText(destination, "en") });
     assert.throws(() => script.assertRouterTextIsInSessionLanguage(), /run 2\/3\/4 regression/);
+  });
+
+  test("asking a question the record already answers fails the harness", { skip: SKIP }, async () => {
+    // Mutation check for run 6's sharpest defect: it asked where they were
+    // going after the document had told it. Re-asking something still
+    // UNANSWERED is not this, and must stay allowed — that is the watchdog.
+    const script = new Transcript();
+    const destination = INTAKE_QUESTIONS.find((q) => q.id === "destination");
+    assert.ok(destination);
+    script.noteAnswered("destination");
+    await script.sendMessage({ chatId: "1", text: askText(destination, "en") });
+    assert.throws(() => script.assertNeverAsksAnsweredQuestion(), /run 6 regression/);
+
+    const fine = new Transcript();
+    await fine.sendMessage({ chatId: "1", text: askText(destination, "en") });
+    await fine.sendMessage({ chatId: "1", text: `Let's pick this back up.\n\n${askText(destination, "en")}` });
+    fine.assertNeverAsksAnsweredQuestion();
   });
 
   test("internal vocabulary in a message fails the harness", { skip: SKIP }, async () => {
@@ -617,6 +665,104 @@ describe("one voice, one writer", () => {
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
       assert.equal(view.view.pendingAskText, null, "the wording went with the nomination");
+      fix.script.check();
+    });
+  });
+});
+
+describe("the interview never goes silent", () => {
+  /** Runs the watchdog with an explicit floor, so tests need not wait real seconds. */
+  async function runWatchdog(fix: Fixture, floorSeconds: number): Promise<void> {
+    await recoverStalledInterviews(
+      { db: fix.pool, telegram: fix.script, connector: fix.connector },
+      DEFAULT_STRINGS,
+      () => {},
+      floorSeconds,
+    );
+  }
+
+  test("a stalled interviewer loses the floor and the router asks", { skip: SKIP }, async () => {
+    // The one failure Track 4 introduced. With the agent as the only voice, an
+    // agent that stalls leaves the organizer looking at nothing — which is what
+    // runs 4 and 6 both did, once while announcing it was "fixing" a fault it
+    // cannot fix. The router's own copy is flat next to the agent's phrasing
+    // and infinitely better than a conversation that stops.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+
+      // The agent takes the turn and says nothing at all.
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      const before = fix.script.lines.length;
+
+      await runWatchdog(fix, 0);
+
+      const asked = fix.script.last;
+      assert.equal(fix.script.lines.length, before + 1, "the router speaks once, not repeatedly");
+      assert.ok(asked?.questionId, "and what it says is the next question");
+      assert.equal(asked!.drawnIn, fix.script.language, "drawn from its own copy, in the interview's language");
+      fix.script.check();
+    });
+  });
+
+  test("an interviewer that has written is not treated as stalled", { skip: SKIP }, async () => {
+    // The distinction the whole watchdog turns on. An agent that recorded an
+    // answer owes a router prompt; speaking over it would recreate run 2's
+    // "it talks over the agent" defect while claiming to fix silence.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
+      const before = fix.script.lines.length;
+
+      await runWatchdog(fix, 0);
+      assert.equal(fix.script.lines.length, before, "the watchdog stayed out of it");
+
+      // And the agent's own words still arrive, unaffected.
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.last?.text, "רגע, אני קורא את הקובץ.");
+      fix.script.check();
+    });
+  });
+
+  test("the floor is not taken before the deadline", { skip: SKIP }, async () => {
+    // Thirty seconds exists so a model reading a shared PDF is not interrupted
+    // mid-thought. A watchdog that fires immediately would be the run-2 defect
+    // wearing a different name.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      const before = fix.script.lines.length;
+
+      await runWatchdog(fix, AGENT_FLOOR_SECONDS);
+      assert.equal(fix.script.lines.length, before, "a turn one second old still holds the floor");
+    });
+  });
+
+  test("two poll ticks cannot both speak for one silent agent", { skip: SKIP }, async () => {
+    // The claim is atomic for a reason: a watchdog that double-fires would
+    // produce, of all things, the bombardment this whole design exists to
+    // prevent.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+
+      await Promise.all([runWatchdog(fix, 0), runWatchdog(fix, 0)]);
+      await runWatchdog(fix, 0);
+
+      fix.script.assertNoRepeatedMessage();
       fix.script.check();
     });
   });
