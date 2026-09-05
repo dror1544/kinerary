@@ -710,6 +710,62 @@ describe("one voice, one writer", () => {
     });
   });
 
+  test("a say and a nomination in the same breath become one message, not two", { skip: SKIP }, async () => {
+    // Run 11, the organizer's own diagnosis: "several duplications on the
+    // gender question... look like the agent was ahead asked and then the
+    // router came in". Mechanism: the agent called say_for_chat (queued,
+    // undelivered) and, moments later in the SAME turn, nominated the
+    // question — and the two used to go out as separate Telegram messages,
+    // the agent's own prose first, the router's buttoned render second.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "בואו נדבר קצת על האישיות של העוזר.");
+      // Not delivered yet — nominated in the same breath, before any tick ran.
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "bot_gender", "איך לקרוא לעוזר — זכר, נקבה, או ניטרלי?");
+      assert.ok(nominated.ok);
+
+      const before = fix.script.lines.length;
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(fix.script.lines.length, before + 1, "run 11 regression — the lead-in and the question went out separately");
+      const combined = fix.script.last;
+      assert.match(combined!.text, /העוזר\.\n\nאיך לקרוא/, "the lead-in and the question are one message");
+      assert.equal(combined?.questionId, "bot_gender");
+      assert.ok(combined!.buttons.length > 0, "and it still has real buttons");
+      fix.script.check();
+    });
+  });
+
+  test("a say already delivered is untouched by a later nomination", { skip: SKIP }, async () => {
+    // The other half: real time passing between the two is exactly when two
+    // separate messages is correct — the floor-reclaim fix exists so the
+    // agent CAN speak more than once per turn. Folding must only catch the
+    // rapid, undelivered case, never reach back into something already sent.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "מעולה, קיבלתי את הכל.");
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.last?.text, "מעולה, קיבלתי את הכל.");
+      const before = fix.script.lines.length;
+
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "bot_gender", "איך לקרוא לעוזר?");
+      assert.ok(nominated.ok);
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(fix.script.lines.length, before + 1, "the nomination is its own, separate message");
+      assert.equal(fix.script.last?.text, "איך לקרוא לעוזר?", "not folded with something already on screen");
+      fix.script.check();
+    });
+  });
+
   test("wording belongs to the question it was written for", { skip: SKIP }, async () => {
     // The failure this prevents is specific and would be baffling to receive:
     // a sentence written for `dietary` sitting above a date question, because
@@ -1151,6 +1207,37 @@ describe("one organizer message gets one reply", () => {
         recapAt,
         "run 7 regression — something was sent after the Confirm keyboard",
       );
+      fix.script.check();
+    });
+  });
+
+  test("the recap still arrives when a say lands the SAME moment it does", { skip: SKIP }, async () => {
+    // Run 11: the organizer answered the last optional question, the agent
+    // tried to acknowledge it with say_for_chat, and the interview reached
+    // `awaiting_confirmation` in that same moment. sendNextStep's guard
+    // against burying the recap RETURNED as soon as it suppressed the stale
+    // say — before ever reaching the code that renders the recap. Total
+    // silence: not the ack, not the recap, not the Confirm button. Fixed by
+    // falling through instead of returning; this reproduces the exact
+    // ordering rather than the recap-already-sent case above.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      // Both happen before any delivery tick: the agent's ack is queued, and
+      // the same event that queued it also finished the interview.
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "רשמתי, תודה.");
+      const finished = await setFinishRequestedForChat(fix.pool, fix.chat, true);
+      assert.ok(finished.ok);
+      assert.equal(finished.view.state, "awaiting_confirmation", "the interview reached recap in this same turn");
+
+      await deliverPendingRouterPrompt(fix);
+
+      const last = fix.script.last;
+      assert.ok(last, "run 11 regression — nothing reached the organizer at all");
+      assert.ok(last!.buttons.includes("c:confirm"), "the recap arrived, not silence");
       fix.script.check();
     });
   });

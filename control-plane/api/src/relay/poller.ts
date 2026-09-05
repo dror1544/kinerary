@@ -831,28 +831,39 @@ async function sendNextStep(
     // which point a fresh, contextual reply is what belongs there, not
     // something written before they'd even seen the recap.
     if (view.state === "awaiting_confirmation") {
+      // Suppress the stale say and FALL THROUGH — do not return. Returning
+      // here was a real bug, not just a trade-off: it exited the whole
+      // function before the recap-rendering code below ever ran, so the one
+      // case this was built to protect (an agent write landing in the SAME
+      // moment the interview reaches recap) produced total silence instead
+      // of the recap. Live on 2026-09-05: the organizer answered the last
+      // optional question, the agent tried to acknowledge it, and NOTHING
+      // reached the chat at all — not the ack, not the recap, not the
+      // Confirm button. The point was only ever to stop the AGENT'S WORDS
+      // burying the recap, never to stop the recap itself from being sent.
       (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.say_suppressed_during_recap", {
         session_id: view.sessionId,
       }));
       await clearPendingSayForChat(deps.db, chatId);
+    } else {
+      // Claim before sending. If the router got here first this returns false
+      // and the message waits for the organizer's next turn rather than
+      // landing on top of what was just said.
+      if (!(await claimFloor(deps.db, chatId))) return;
+      await clearPendingSayForChat(deps.db, chatId);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: view.pendingSay,
+        // Agent-authored text is written in the dialect TELEGRAM_DESCRIPTOR
+        // advertises, so it has to be SENT in that dialect. The connector
+        // always did this; routing the same text through the router instead
+        // dropped it, and 2026-09-05's run 7 got raw asterisks for its
+        // trouble. Whoever delivers the agent's words owes them the same
+        // parse mode.
+        parseMode: "MarkdownV2",
+      });
       return;
     }
-    // Claim before sending. If the router got here first this returns false and
-    // the message waits for the organizer's next turn rather than landing on
-    // top of what was just said.
-    if (!(await claimFloor(deps.db, chatId))) return;
-    await clearPendingSayForChat(deps.db, chatId);
-    await deps.telegram.sendMessage({
-      chatId,
-      text: view.pendingSay,
-      // Agent-authored text is written in the dialect TELEGRAM_DESCRIPTOR
-      // advertises, so it has to be SENT in that dialect. The connector always
-      // did this; routing the same text through the router instead dropped it,
-      // and 2026-09-05's run 7 got raw asterisks for its trouble. Whoever
-      // delivers the agent's words owes them the same parse mode.
-      parseMode: "MarkdownV2",
-    });
-    return;
   }
 
   const autoWalkOptional = !deps.interviewerProfile;

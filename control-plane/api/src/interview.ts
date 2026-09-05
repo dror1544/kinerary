@@ -2156,19 +2156,38 @@ export async function nominateQuestionForChat(
     return { ok: false, reason: "ALREADY_ANSWERED" };
   }
 
-  const phrasing = text?.trim();
-  const result = await updateUiStateForChat(db, chatId, (ui) => ({
-    ...ui,
-    pendingAsk: questionId,
-    // The agent's own wording, when it supplied one. Without it the router
-    // falls back to intake-copy.ts — correct, localised, and robotic.
-    ...(phrasing ? { pendingAskText: phrasing } : { pendingAskText: undefined }),
-    // Nominating a question the organizer previously skipped un-skips it:
-    // asking for it explicitly is a clearer signal than the earlier decline.
-    ...(ui.skipped ? { skipped: ui.skipped.filter((id) => id !== questionId) } : {}),
-    // And it is not a finished interview any more.
-    finishRequested: false,
-  }));
+  const explicitPhrasing = text?.trim();
+  const result = await updateUiStateForChat(db, chatId, (ui) => {
+    // Fold in a `say_for_chat` that has not been delivered yet, rather than
+    // leaving it to go out as its own message. Raised live on 2026-09-05:
+    // "the agent was ahead asked and then the router came in" — the agent
+    // said something (queued, undelivered) and, moments later in the same
+    // breath, nominated the question — and the two were sent as SEPARATE
+    // messages, the agent's prose first, the router's buttoned render
+    // second. If `pendingSay` had already been delivered by the time this
+    // runs, it is already cleared and there is nothing to fold — a real
+    // gap in time between the two is exactly when two separate messages is
+    // the right call, which is what the floor-reclaim fix exists to allow.
+    // This only catches the rapid, same-breath case.
+    const lead = ui.pendingSay?.trim();
+    const phrasing = lead && explicitPhrasing
+      ? `${lead}\n\n${explicitPhrasing}`
+      : lead ?? explicitPhrasing;
+    return {
+      ...ui,
+      pendingAsk: questionId,
+      pendingSay: undefined,
+      // The agent's own wording, when it supplied one (or the lead-in that
+      // would otherwise have gone out separately). Without either the router
+      // falls back to intake-copy.ts — correct, localised, and robotic.
+      ...(phrasing ? { pendingAskText: phrasing } : { pendingAskText: undefined }),
+      // Nominating a question the organizer previously skipped un-skips it:
+      // asking for it explicitly is a clearer signal than the earlier decline.
+      ...(ui.skipped ? { skipped: ui.skipped.filter((id) => id !== questionId) } : {}),
+      // And it is not a finished interview any more.
+      finishRequested: false,
+    };
+  });
   // Nominating a question is the agent choosing, right now, to speak — the
   // same reclaim as sayForChat and submitAnswerForAgent, for the same reason.
   if (result.ok) {
