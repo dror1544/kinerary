@@ -87,6 +87,21 @@ export interface IntakeQuestion {
   // from conversation, not a form validating untrusted input.
   dataShape?: "array" | "object";
   required: boolean;
+  /**
+   * Works this question's answer out from what is already recorded, or returns
+   * null when it cannot.
+   *
+   * A question with a derivation is never PUT to anyone: the moment its inputs
+   * exist the answer is written, so it leaves the outstanding set without ever
+   * being asked. Run 3 is why — the router asked someone who had just said
+   * "Japan" what timezone to show times in, and the prompt itself admits the
+   * answer can be inferred. Asking for something you can work out is not
+   * diligence, it is a question the organizer has to wonder about.
+   *
+   * Derivations must be conservative. Returning null is always safe: the
+   * question simply stays askable.
+   */
+  derive?: (answers: AnswerStore) => string | null;
 }
 
 export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
@@ -143,6 +158,16 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt: "What timezone should times be shown in? Asia/Tokyo, or just the destination city — we can work it out if you're not sure.",
     maxLength: 100,
     required: false,
+    // The prompt says it out loud: "or just the destination city — we can work
+    // it out if you're not sure." So work it out. Run 3 put this question to
+    // someone who had said "Japan" one message earlier, which is what made the
+    // interview read as a form marching through a schema.
+    derive: (answers) => {
+      const destination = answers.destination;
+      if (!destination || destination.kind !== "text") return null;
+      const place = destination.text.trim();
+      return place.length > 0 ? place : null;
+    },
   },
   {
     id: "travelers",
@@ -940,7 +965,7 @@ export type StartSessionResult =
 
 export type GetSessionResult =
   | { ok: true; view: SessionView }
-  | { ok: false; reason: "NOT_FOUND" };
+  | { ok: false; reason: "NOT_FOUND" | "ALREADY_ANSWERED" };
 
 export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
@@ -1815,6 +1840,36 @@ export async function sayForChat(
 }
 
 /**
+ * Fills in every question whose answer can be worked out from what is already
+ * recorded.
+ *
+ * Called after each write, before the phase is advanced, so a derived answer
+ * counts toward "are the optional questions done" exactly like a typed one.
+ * Silent by design: the organizer is not told that a question was skipped,
+ * because from their side it was never a question.
+ *
+ * Conservative throughout — a derivation returning null leaves the question
+ * askable, and an already-answered question is never overwritten. Something
+ * the organizer actually said always outranks something we inferred.
+ */
+export async function applyDerivationsForChat(db: pg.Pool, chatId: string): Promise<string[]> {
+  const current = await answersForChat(db, chatId);
+  if (!current) return [];
+
+  const derived: string[] = [];
+  for (const question of INTAKE_QUESTIONS) {
+    if (!question.derive) continue;
+    if (current.answers[question.id] !== undefined) continue;
+    if (isSkipped(current.ui, question.id)) continue;
+    const value = question.derive(current.answers);
+    if (value === null) continue;
+    const result = await submitAnswerVia(db, { by: "chat", chatId }, question.id, null, value);
+    if (result.ok) derived.push(question.id);
+  }
+  return derived;
+}
+
+/**
  * Moves the session to the phase its answers now put it in, and records the
  * entry action owed.
  *
@@ -1832,6 +1887,10 @@ export async function advancePhaseForChat(
   if (!current.ok) return null;
   const from = current.view.phase;
   if (from === "confirmed") return null;
+
+  // Anything derivable is filled in first, so it counts toward "the optional
+  // questions are done" exactly like an answer the organizer gave.
+  await applyDerivationsForChat(db, chatId);
 
   const answers = await answersForChat(db, chatId);
   if (!answers) return null;
@@ -1916,6 +1975,18 @@ export async function nominateQuestionForChat(
 ): Promise<GetSessionResult> {
   const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
   if (!question) return { ok: false, reason: "NOT_FOUND" };
+
+  // Never put a question the record already answers. Run 7: a tapped
+  // `bot_gender` was asked again in prose, and a destination the document had
+  // supplied was asked for outright. The interviewer's picture of the record is
+  // a snapshot in its context; this is a read. Refusing here is kinder than
+  // drawing it, because the organizer would have no way to know they were
+  // answering something twice.
+  const existing = await answersForChat(db, chatId);
+  if (existing && existing.answers[questionId] !== undefined) {
+    return { ok: false, reason: "ALREADY_ANSWERED" };
+  }
+
   const phrasing = text?.trim();
   const result = await updateUiStateForChat(db, chatId, (ui) => ({
     ...ui,

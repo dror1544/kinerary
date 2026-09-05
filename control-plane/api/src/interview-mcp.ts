@@ -406,6 +406,26 @@ function buildMcpServer() {
     );
 
     mcp.tool(
+      "record_answers_for_chat",
+      "Record SEVERAL answers at once — what a shared document just told you, or several things the " +
+        "organizer said in one message. Takes no chat id. Use this the moment you have read a " +
+        "document, before you say anything: what you have read lives only in your own context until " +
+        "it is written here, and until then the organizer will be asked for it again. Each answer is " +
+        "{ questionId, and one of optionId / otherText / optionIds / data } exactly as " +
+        "submit_answer_for_chat takes them. Partial success is fine and is reported per question: " +
+        "five good answers are kept even if a sixth is malformed.",
+      {
+        answers: z
+          .array(z.object({ ...answerParams }))
+          .min(1)
+          .max(30)
+          .describe("the answers this document or message establishes"),
+      },
+      async ({ answers }) =>
+        agentResult(await forwardAsAgent("/internal/interview/agent/current/answers", "POST", { answers })),
+    );
+
+    mcp.tool(
       "submit_answer_for_chat",
       "Record an answer for the interview in progress in the conversation you are currently in. " +
         "Takes no chat id — the interview is identified by the turn the router opened. Use this for " +

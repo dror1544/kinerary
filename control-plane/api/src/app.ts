@@ -1059,8 +1059,80 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       questionId,
       text,
     );
-    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    if (!result.ok) {
+      // Answered is not "not found", and the difference matters to the agent:
+      // one means it asked for something that does not exist, the other that
+      // the organizer has already told us. Saying so plainly is what stops it
+      // asking twice, where a bare 404 would read as a fault to work around.
+      if (result.reason === "ALREADY_ANSWERED") {
+        return reply.code(409).send({
+          error: "ALREADY_ANSWERED",
+          questionId,
+          detail: "The organizer has already answered this. Do not ask it again — read " +
+            "get_interview_for_chat and pick something still outstanding, or move on.",
+        });
+      }
+      return reply.code(404).send({ error: result.reason });
+    }
     return reply.code(200).send(result.view);
+  });
+
+  // Everything a document just told us, in one call.
+  //
+  // Run 7's first report: "It started good, red the document parse it, and then
+  // asked for destination". The PDF was read into the model's context and
+  // nothing reached the RECORD, so the router — correctly — asked for a
+  // destination nobody had recorded. Extraction has to go through the same
+  // write path as any other answer, and doing that a dozen times over is
+  // friction the agent skips. So: one call, partial success reported per
+  // question, because a document that yields five good answers and one bad one
+  // should still leave five answers behind.
+  app.post("/internal/interview/agent/current/answers", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const body = request.body as { answers?: unknown } | undefined;
+    if (!Array.isArray(body?.answers) || body.answers.length === 0) {
+      return reply.code(400).send({
+        error: "ANSWERS_REQUIRED",
+        expectedArgument: "answers",
+        detail: "Pass a non-empty `answers` array of { questionId, optionId?, otherText?, optionIds?, data? }.",
+      });
+    }
+
+    const recorded: string[] = [];
+    const rejected: Array<{ questionId: string; reason: string }> = [];
+    for (const raw of body.answers) {
+      const entry = raw as Record<string, unknown>;
+      const questionId = typeof entry.questionId === "string" ? entry.questionId : null;
+      if (!questionId) {
+        rejected.push({ questionId: "?", reason: "QUESTION_ID_REQUIRED" });
+        continue;
+      }
+      const result = await submitAnswerForAgent(
+        dependencies.interviewAgent.db,
+        chatId,
+        questionId,
+        (entry.optionId as string | null) ?? null,
+        entry.otherText as string | undefined,
+        entry.data,
+        entry.optionIds as readonly string[] | undefined,
+      );
+      if (result.ok) recorded.push(questionId);
+      else rejected.push({ questionId, reason: result.reason });
+    }
+
+    const view = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
+    return reply.code(200).send({
+      recorded,
+      rejected,
+      ...(view.ok ? { view: view.view } : {}),
+    });
   });
 
   // The agent's voice. It has no other way to reach the organizer: on an

@@ -38,6 +38,7 @@ import {
   INTAKE_QUESTIONS,
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
+  applyDerivationsForChat,
   markAwaitingMachine,
   nextPhase,
   nominateQuestionForChat,
@@ -1080,6 +1081,70 @@ describe("the agent's words are delivered in the dialect they were written in", 
 
       assert.equal(fix.script.last?.text, "*יפן* נרשמה — נשאר רק תאריך החזרה.");
       assert.equal(fix.script.last?.parseMode, "MarkdownV2", "sent in the dialect it was written in");
+    });
+  });
+});
+
+describe("the interview never asks what it already knows", () => {
+  test("a derivable question is answered, never asked", { skip: SKIP }, async () => {
+    // Run 3: the router asked someone who had just said "Japan" what timezone
+    // to show times in — and the prompt itself says the answer can be worked
+    // out. A question with a derivation leaves the outstanding set without
+    // ever reaching a person.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(
+        view.view.optionalRemaining.some((q) => q.id === "timezone"),
+        false,
+        "timezone was derived from the destination, so it is not outstanding",
+      );
+      assert.deepEqual(fix.script.asking("timezone"), [], "and it was never put to the organizer");
+      fix.script.check();
+    });
+  });
+
+  test("a derivation never overwrites what the organizer said", { skip: SKIP }, async () => {
+    // Something a person actually told us always outranks something we
+    // inferred, however confident the inference.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await agentRecords(fix, "timezone", "Asia/Osaka");
+
+      const derived = await applyDerivationsForChat(fix.pool, fix.chat);
+      assert.deepEqual(derived, [], "nothing was derived over an existing answer");
+
+      const stored = await fix.pool.query<{ text: string }>(
+        "SELECT answers->'timezone'->>'text' AS text FROM control_plane.intake_sessions WHERE telegram_chat_id = $1 AND state <> 'confirmed'",
+        [fix.chat],
+      );
+      assert.equal(stored.rows[0]?.text, "Asia/Osaka", "the organizer's own answer survived");
+    });
+  });
+
+  test("nominating an answered question is refused, not drawn", { skip: SKIP }, async () => {
+    // Run 7: a tapped `bot_gender` was asked again in prose, and a destination
+    // the document had supplied was asked for outright. The router cannot make
+    // that mistake; this stops the agent making it through the router.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await agentRecords(fix, "bot_name", "יפנוטו");
+
+      const refused = await nominateQuestionForChat(fix.pool, fix.chat, "bot_name", "איך לקרוא לי?");
+      assert.equal(refused.ok, false);
+      assert.equal(refused.ok === false && refused.reason, "ALREADY_ANSWERED");
+
+      await deliverPendingRouterPrompt(fix);
+      assert.deepEqual(fix.script.asking("bot_name"), [], "and nothing about it reached the organizer");
+      fix.script.check();
     });
   });
 });
