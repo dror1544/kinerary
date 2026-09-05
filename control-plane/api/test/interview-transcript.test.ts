@@ -38,6 +38,7 @@ import {
   INTAKE_QUESTIONS,
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
+  markAwaitingMachine,
   nextPhase,
   nominateQuestionForChat,
   setFinishRequestedForChat,
@@ -72,6 +73,15 @@ function testId(prefix: string): string {
 interface Line {
   text: string;
   buttons: string[];
+  /**
+   * The dialect the message was sent in.
+   *
+   * Asserted because run 7 shipped raw asterisks: the connector always sent
+   * agent text as MarkdownV2, and routing the same text through the router
+   * instead passed no parse mode at all. A harness that only reads text cannot
+   * see that — the words are identical, the rendering is not.
+   */
+  parseMode: string | null;
   /** Which intake question this message put, if it is recognisably one. */
   questionId: string | null;
   /**
@@ -94,7 +104,7 @@ interface Line {
  * unambiguously that question. Text questions have no payload to read, so they
  * are matched against the copy table in EITHER language.
  */
-function classify(text: string, buttons: string[]): Line {
+function classify(text: string, buttons: string[], parseMode: string | null): Line {
   let questionId: string | null = null;
   for (const data of buttons) {
     const m = /^[at]:([a-z_]+):/.exec(data);
@@ -103,11 +113,11 @@ function classify(text: string, buttons: string[]): Line {
   for (const q of INTAKE_QUESTIONS) {
     for (const lang of ["en", "he"] as const) {
       if (text.includes(askText(q, lang))) {
-        return { text, buttons, questionId: questionId ?? q.id, drawnIn: lang };
+        return { text, buttons, parseMode, questionId: questionId ?? q.id, drawnIn: lang };
       }
     }
   }
-  return { text, buttons, questionId, drawnIn: null };
+  return { text, buttons, parseMode, questionId, drawnIn: null };
 }
 
 class Transcript implements TelegramClient {
@@ -129,9 +139,10 @@ class Transcript implements TelegramClient {
     chatId: string;
     text: string;
     replyMarkup?: { inline_keyboard: { text: string; callback_data: string }[][] };
+    parseMode?: string;
   }): Promise<SendResult> {
     const buttons = (params.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data);
-    this.lines.push(classify(params.text, buttons));
+    this.lines.push(classify(params.text, buttons, params.parseMode ?? null));
     return { ok: true, messageId: String(this.lines.length) };
   }
   async editMessageText(): Promise<SendResult> { return { ok: true }; }
@@ -625,6 +636,10 @@ describe("one voice, one writer", () => {
       await turn(fix, taps(fix, "c:nodoc"));
       const before = fix.script.lines.length;
 
+      // The agent only ever writes because the organizer said something, so the
+      // floor has to be ours before it speaks. Production gets this from
+      // applyDecision; a test calling sayForChat directly must say so too.
+      await markAwaitingMachine(fix.pool, fix.chat);
       await sayForChat(fix.pool, fix.chat, "יופי, ראיתי את המסמך — נשאר רק תאריך החזרה.");
       await deliverPendingRouterPrompt(fix);
 
@@ -644,6 +659,7 @@ describe("one voice, one writer", () => {
       await open(fix);
       await turn(fix, taps(fix, "c:nodoc"));
 
+      await markAwaitingMachine(fix.pool, fix.chat);
       await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
       await deliverPendingRouterPrompt(fix);
       const after = fix.script.lines.length;
@@ -725,7 +741,17 @@ describe("the interview never goes silent", () => {
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
 
-      // The agent takes the turn and says nothing at all.
+      // A real stall: the organizer wrote an answer, the agent RECORDED it and
+      // then said nothing. The next question is now different from what is on
+      // screen, which is the only case where speaking for the agent helps —
+      // re-sending a question already in front of them is suppressed, and
+      // rightly.
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType, "the first question is on screen with its buttons");
+      await turn(fix, taps(fix, tripType));
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await agentRecords(fix, "destination", "Japan");
       await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
       const before = fix.script.lines.length;
 
@@ -749,6 +775,7 @@ describe("the interview never goes silent", () => {
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
 
+      await markAwaitingMachine(fix.pool, fix.chat);
       await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
       await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
       const before = fix.script.lines.length;
@@ -772,6 +799,7 @@ describe("the interview never goes silent", () => {
       await turn(fix, taps(fix, "c:nodoc"));
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
+      await markAwaitingMachine(fix.pool, fix.chat);
       await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
       const before = fix.script.lines.length;
 
@@ -789,6 +817,7 @@ describe("the interview never goes silent", () => {
       await turn(fix, taps(fix, "c:nodoc"));
       const view = await getSessionForChat(fix.pool, fix.chat);
       assert.ok(view.ok);
+      await markAwaitingMachine(fix.pool, fix.chat);
       await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
 
       await Promise.all([runWatchdog(fix, 0), runWatchdog(fix, 0)]);
@@ -908,6 +937,149 @@ describe("the interview is somewhere, not merely computable", () => {
       assert.ok(after.ok);
       assert.equal(after.view.phase, "essentials", "the questions have started");
       fix.script.check();
+    });
+  });
+});
+
+describe("one organizer message gets one reply", () => {
+  /** The organizer has just spoken: the machine owes the next message. */
+  async function organizerSpoke(fix: Fixture): Promise<void> {
+    await markAwaitingMachine(fix.pool, fix.chat);
+  }
+
+  test("the router says nothing while it is the organizer's turn", { skip: SKIP }, async () => {
+    // Run 7: "almost every question I get at least twice, seems like one from
+    // the router and one from the agent". Both halves decided independently
+    // that something was owed. Silence while waiting on a person is correct
+    // behaviour, not a stall.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const after = fix.script.lines.length;
+
+      // No organizer message since the last reply — the floor is theirs.
+      await deliverPendingRouterPrompt(fix);
+      await deliverPendingRouterPrompt(fix);
+      assert.equal(fix.script.lines.length, after, "nothing was sent into a conversation waiting on a person");
+      fix.script.check();
+    });
+  });
+
+  test("the interviewer and the router cannot both answer one message", { skip: SKIP }, async () => {
+    // The arbitration. The agent writes AND the router has a question owed;
+    // exactly one of them reaches the organizer, because claiming the floor is
+    // a single atomic update.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await organizerSpoke(fix);
+      await sayForChat(fix.pool, fix.chat, "רגע, אני קורא את הקובץ.");
+      const before = fix.script.lines.length;
+
+      await deliverPendingRouterPrompt(fix);
+      await deliverPendingRouterPrompt(fix);
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(
+        fix.script.lines.length,
+        before + 1,
+        "run 7 regression — one organizer message produced more than one reply",
+      );
+      assert.equal(fix.script.last?.text, "רגע, אני קורא את הקובץ.", "and the agent's words won, not the copy table");
+      fix.script.check();
+    });
+  });
+
+  test("the deadline measures us, never the organizer", { skip: SKIP }, async () => {
+    // "waiting to a person response need to be handled from the session
+    // perspective not by one question". While the floor is theirs the clock is
+    // not running at all, so a watchdog cannot fire against someone reading.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const before = fix.script.lines.length;
+
+      // Floor is the organizer's. Even at a zero deadline, nothing fires.
+      await recoverStalledInterviews(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector },
+        DEFAULT_STRINGS,
+        () => {},
+        0,
+      );
+      assert.equal(fix.script.lines.length, before, "the watchdog did not count against a person");
+
+      // Once they speak and we go quiet, it does fire. The agent records the
+      // answer and says nothing, so the next question differs from what is on
+      // screen — re-sending the SAME question is suppressed, and rightly.
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType);
+      await turn(fix, taps(fix, tripType));
+      const beforeStall = fix.script.lines.length;
+      await organizerSpoke(fix);
+      await agentRecords(fix, "destination", "Japan");
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      await recoverStalledInterviews(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector },
+        DEFAULT_STRINGS,
+        () => {},
+        0,
+      );
+      assert.equal(
+        fix.script.lines.length,
+        beforeStall + 1,
+        "and it does fire when we are the ones who owe a message",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("the recap cannot be buried by the interviewer", { skip: SKIP }, async () => {
+    // Run 7 ended `awaiting_confirmation` with 14 answers and no confirmation:
+    // the Confirm keyboard was sent and then talked over, so the last thing on
+    // screen was prose asking for approval that no tool acts on.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await turn(fix, says(fix, "/done"));
+
+      const recapAt = fix.script.lines.findIndex((l) => l.buttons.includes("c:confirm"));
+      assert.ok(recapAt >= 0, "the recap reached the organizer");
+
+      // The agent tries to talk after it. The floor is the organizer's now.
+      await sayForChat(fix.pool, fix.chat, "אז מה אתה אומר?");
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(
+        fix.script.lines.length - 1,
+        recapAt,
+        "run 7 regression — something was sent after the Confirm keyboard",
+      );
+      fix.script.check();
+    });
+  });
+});
+
+describe("the agent's words are delivered in the dialect they were written in", () => {
+  test("routed agent text keeps its parse mode", { skip: SKIP }, async () => {
+    // Run 7, verbatim: "There is a regression on the markdown formatting not
+    // applied and show raw." The connector always sent agent-authored text as
+    // MarkdownV2, because that is what TELEGRAM_DESCRIPTOR advertises. Routing
+    // the same text through the router dropped it, so every converted message
+    // arrived as literal asterisks. Whoever delivers the agent's words owes
+    // them the same dialect.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await sayForChat(fix.pool, fix.chat, "*יפן* נרשמה — נשאר רק תאריך החזרה.");
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(fix.script.last?.text, "*יפן* נרשמה — נשאר רק תאריך החזרה.");
+      assert.equal(fix.script.last?.parseMode, "MarkdownV2", "sent in the dialect it was written in");
     });
   });
 });

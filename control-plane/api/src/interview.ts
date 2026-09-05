@@ -613,6 +613,11 @@ export interface SessionView {
    * derived state cannot tell the router whether it has already spoken.
    */
   pendingEntry: InterviewPhase | null;
+  /**
+   * Whose turn it is to speak. Nothing is sent while this is "person" — that
+   * is not a failure state, it is a conversation waiting on a human.
+   */
+  awaiting: AwaitingParty;
   /** One message the interviewer wrote, for the router to deliver verbatim. */
   pendingSay: string | null;
   /** The interviewer's own wording for `pendingAsk`, if it supplied one. */
@@ -784,6 +789,49 @@ function unansweredOptionalQuestions(
   ui: InterviewUiState = {},
 ): IntakeQuestion[] {
   return questions.filter((q) => !q.required && answers[q.id] === undefined && !isSkipped(ui, q.id));
+}
+
+// ── The floor ─────────────────────────────────────────────────────────────────
+
+/**
+ * Whose turn it is to speak. See `0038_interview_floor.sql` for why this is a
+ * property of the SESSION rather than of a turn or a question.
+ */
+export type AwaitingParty = "person" | "machine";
+
+/**
+ * The organizer has spoken; the machine owes the next message.
+ *
+ * Called on every inbound message and tap. Restarting `awaiting_since` here is
+ * the point: the deadline measures how long WE have taken, never how long a
+ * person has been reading.
+ */
+export async function markAwaitingMachine(db: pg.Pool, chatId: string): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.intake_sessions
+        SET awaiting = 'machine', awaiting_since = now()
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId],
+  );
+}
+
+/**
+ * We have spoken; it is the organizer's turn.
+ *
+ * Called after ANY message goes out, whoever wrote it. Claimed atomically: the
+ * update only succeeds while the floor is still ours, so two would-be speakers
+ * racing to answer one organizer message produce exactly one reply. That is
+ * the whole mechanism — run 7 got most questions twice because nothing
+ * arbitrated between the router and the interviewer.
+ */
+export async function claimFloor(db: pg.Pool, chatId: string): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE control_plane.intake_sessions
+        SET awaiting = 'person', awaiting_since = now()
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND awaiting = 'machine'`,
+    [chatId],
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 // ── Phases ────────────────────────────────────────────────────────────────────
@@ -1037,6 +1085,7 @@ export async function startSession(
       offeredMore: false,
       lastPrompt: null,
       phase: "opening",
+      awaiting: "person",
       pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
@@ -1066,11 +1115,12 @@ export async function getSession(
     user_id: string;
     state: SessionState;
     phase: string;
+    awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT id, trip_id, user_id, state, phase, answers, ui_state, language
+    `SELECT id, trip_id, user_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE session_token_digest = $1`,
     [digest],
@@ -1088,6 +1138,7 @@ export async function getSession(
       parseUiState(session.ui_state),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
+      session.awaiting === "machine" ? "machine" : "person",
     ),
   };
 }
@@ -1112,11 +1163,12 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
     trip_id: string;
     state: SessionState;
     phase: string;
+    awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT id, trip_id, state, phase, answers, ui_state, language
+    `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
     [chatId],
@@ -1133,6 +1185,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
       parseUiState(session.ui_state),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
+      session.awaiting === "machine" ? "machine" : "person",
     ),
   };
 }
@@ -1291,7 +1344,12 @@ export async function claimStalledAgentTurns(
           FROM control_plane.interview_agent_turns t
           JOIN control_plane.intake_sessions s ON s.id = t.session_id
          WHERE t.closed_at IS NULL
-           AND t.opened_at < now() - make_interval(secs => $2)
+           -- The deadline is the SESSION's, not the turn's. A turn opened
+           -- while the organizer was still reading used to age against a
+           -- person, which is what made the watchdog fire on conversations
+           -- that were not stuck at all.
+           AND s.awaiting = 'machine'
+           AND s.awaiting_since < now() - make_interval(secs => $2)
            AND s.state <> 'confirmed'
            AND s.telegram_chat_id IS NOT NULL
            -- Nothing waiting to be delivered, and nothing the agent has
@@ -1320,11 +1378,12 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
     trip_id: string;
     state: SessionState;
     phase: string;
+    awaiting: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT s.id, s.trip_id, s.state, s.phase, s.answers, s.ui_state, s.language
+    `SELECT s.id, s.trip_id, s.state, s.phase, s.awaiting, s.answers, s.ui_state, s.language
      FROM control_plane.intake_sessions s
      JOIN control_plane.interview_agent_turns t
        ON t.session_id = s.id
@@ -1346,6 +1405,7 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
       parseUiState(session.ui_state),
       coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
       isInterviewPhase(session.phase) ? session.phase : "opening",
+      session.awaiting === "machine" ? "machine" : "person",
     ),
   };
 }
@@ -1358,6 +1418,7 @@ function buildSessionView(
   ui: InterviewUiState = {},
   language: Language = DEFAULT_LANGUAGE,
   phase: InterviewPhase = "opening",
+  awaiting: AwaitingParty = "person",
 ): SessionView {
   if (storedState === "confirmed") {
     return {
@@ -1366,6 +1427,7 @@ function buildSessionView(
       offeredMore: ui.offeredMore === true,
       lastPrompt: ui.lastPrompt ?? null,
       phase: "confirmed",
+      awaiting: "person",
       pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
@@ -1393,6 +1455,7 @@ function buildSessionView(
     offeredMore: ui.offeredMore === true,
     lastPrompt: ui.lastPrompt ?? null,
     phase,
+    awaiting,
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,

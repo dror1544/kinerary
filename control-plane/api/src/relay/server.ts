@@ -30,6 +30,7 @@ import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
 import { resolveChatRoute } from "../chat-router.js";
+import { sayForChat } from "../interview.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
@@ -215,6 +216,14 @@ async function main(): Promise<void> {
           interviewChat: async (chatId: string) => {
             const route = await resolveChatRoute(runtime.db!, chatId);
             return route.kind === "interview";
+          },
+          // Anything the agent writes to an organizer mid-interview is routed
+          // through `say`, not dropped. The router still delivers it, so it
+          // keeps the keyboard, the record and the order — and a turn that
+          // spoke is no longer mistaken for a stall by the watchdog.
+          interviewSay: async (chatId: string, text: string) => {
+            const said = await sayForChat(runtime.db!, chatId, text);
+            return said.ok;
           },
         }
       : {}),

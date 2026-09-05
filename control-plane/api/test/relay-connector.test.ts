@@ -44,7 +44,10 @@ interface Harness {
 
 async function withConnector(
   fn: (h: Harness) => Promise<void>,
-  options: { interviewChats?: readonly string[] } = {},
+  options: {
+    interviewChats?: readonly string[];
+    interviewSay?: (chatId: string, text: string) => Promise<boolean>;
+  } = {},
 ): Promise<void> {
   const telegram = new FakeTelegram();
   const connector = new RelayConnector({
@@ -54,6 +57,7 @@ async function withConnector(
     ...(options.interviewChats
       ? { interviewChat: async (chatId: string) => options.interviewChats!.includes(chatId) }
       : {}),
+    ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
   });
   await connector.listen();
   const port = connector.address;
@@ -228,6 +232,55 @@ describe("RelayConnector — outbound actions", () => {
       assert.deepEqual(result, { success: true });
       assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
     }, { interviewChats: ["900"] });
+  });
+
+  test("an interview send is routed through say, not lost", async () => {
+    // Run 7: 17 refused sends against 3 say_for_chat calls. Dropping was the
+    // wrong half of the rule — the organizer silently got less conversation,
+    // and a turn that produced nothing looked STALLED, so the watchdog fired
+    // every turn and re-asked the same question. Converting keeps the
+    // invariant (the router still delivers, still owns the keyboard and the
+    // order) without losing a word.
+    const routed: Array<{ chatId: string; text: string }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "רשמתי — נשאר רק תאריך החזרה.",
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "not sent directly — the router delivers it");
+      assert.deepEqual(routed, [{ chatId: "900", text: "רשמתי — נשאר רק תאריך החזרה." }]);
+    }, {
+      interviewChats: ["900"],
+      interviewSay: async (chatId: string, text: string) => {
+        routed.push({ chatId, text });
+        return true;
+      },
+    });
+  });
+
+  test("a leaking message is dropped even on the converting path", async () => {
+    // Conversion must not become a way for internal vocabulary to reach an
+    // organizer. A message naming field ids is one they must not read,
+    // whichever door it arrives through.
+    const routed: string[] = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "`bot_gender` עדיין ב-optionalRemaining — ואת השאר ישאל הראוטר.",
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
+      assert.deepEqual(routed, [], "and it was not laundered through say either");
+    }, {
+      interviewChats: ["900"],
+      interviewSay: async (_chatId: string, text: string) => {
+        routed.push(text);
+        return true;
+      },
+    });
   });
 
   test("a companion chat is untouched by the interview rule", async () => {

@@ -188,6 +188,18 @@ interview and is the standard to avoid:
 > שנלחצה עוד לא נרשמה. אשאל על `trip_pace` בינתיים, ואת שאלות הכפתורים
 > הנותרות ישאל הראוטר.
 
+**Never describe the FORM a question will take.** Not "with buttons", not "you
+can tap", not "a list will come up" — the organizer sees the buttons when they
+arrive, and being told about them first is being told how the software works
+by the software. Raised live on 2026-09-05 against this, which is otherwise a
+good message:
+
+> יפנוטו נרשם. עכשיו השאלות על אופי יפנוטו — המין והטון — **יגיעו עם כפתורים**.
+> אחרי שתענו עליהן, נסגור את הכול ונעבור לסיכום.
+
+Everything there is fine except the three bolded words. "עכשיו כמה שאלות על
+האופי שלי" and then the question is the whole job.
+
 Say the human half instead, or say nothing. "רשמתי" and a follow-up question is
 a complete message; so is silence while the next question arrives on its own.
 

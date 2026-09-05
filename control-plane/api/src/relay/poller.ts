@@ -33,6 +33,8 @@ import {
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
   claimDueRouterPrompts,
+  claimFloor,
+  markAwaitingMachine,
   claimStalledAgentTurns,
   openAgentTurn,
   submitAnswerForChat,
@@ -118,11 +120,18 @@ export interface PollerOptions {
    * rather than repeated polling.
    */
   longPollSeconds?: number;
+  /** How often to deliver what the agent has written, independent of polling. */
+  deliverIntervalMs?: number;
   /** Cap on the backoff applied after a poll that looks like a failure. */
   maxBackoffMs?: number;
 }
 
 const DEFAULT_LONG_POLL_SECONDS = 25;
+// How often the router checks whether the agent has written something to
+// deliver. Short, because this is the gap the organizer experiences between
+// answering and seeing the next question — it used to be up to a full
+// long-poll window.
+const DEFAULT_DELIVER_INTERVAL_MS = 700;
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
 
 // ── Acting on one decision ───────────────────────────────────────────────────
@@ -133,12 +142,38 @@ const DEFAULT_MAX_BACKOFF_MS = 30_000;
  * Exported so the whole decision→effect table can be exercised against a fake
  * Telegram client, with no loop and no network.
  */
+/**
+ * The interview chat an inbound decision belongs to, if any.
+ *
+ * Only the kinds that represent the ORGANIZER having just said something. A
+ * decision that is itself an outbound reply must not hand the floor back to
+ * the machine, or the router would answer its own message.
+ */
+function interviewChatOf(decision: DispatchDecision): string | null {
+  switch (decision.kind) {
+    case "interview_callback":
+    case "interview_text":
+    case "interview_to_gateway":
+    case "show_summary":
+      return decision.chatId;
+    default:
+      return null;
+  }
+}
+
 export async function applyDecision(
   decision: DispatchDecision,
   deps: TripBotPollerDeps,
 ): Promise<void> {
   const strings = deps.strings ?? DEFAULT_STRINGS;
   const log = deps.log ?? (() => {});
+
+  // The organizer has spoken, so the machine owes the next message and the
+  // deadline starts now. Restarting it here is the whole point of scoping this
+  // to the session: the clock measures how long WE take, never how long a
+  // person spends reading a question.
+  const chatId = interviewChatOf(decision);
+  if (chatId) await markAwaitingMachine(deps.db, chatId);
 
   switch (decision.kind) {
     case "reply":
@@ -520,6 +555,21 @@ export async function recoverStalledInterviews(
       const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
       if (!question) continue;
 
+      // If this question is ALREADY the last thing on the organizer's screen,
+      // re-sending it adds nothing and costs a great deal: a stalling agent
+      // makes the watchdog fire on every turn, and the organizer gets the same
+      // question again and again. Seen live on 2026-09-05 — "Getting this over
+      // and over again: נמשיך מכאן." The recovery exists to break silence, not
+      // to fill it.
+      if (view.lastPrompt === `q:${question.id}`) {
+        (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.recovery_suppressed", {
+          session_id: sessionId,
+          question_id: question.id,
+          reason: "ALREADY_ON_SCREEN",
+        }));
+        continue;
+      }
+
       log(structuredLog("warn", "trip_bot.agent_floor_reclaimed", {
         session_id: sessionId,
         after_seconds: floorSeconds ?? AGENT_FLOOR_SECONDS,
@@ -645,14 +695,38 @@ async function sendNextStep(
   let text: string;
   let replyMarkup: InlineKeyboard | undefined;
 
+  // THE FLOOR. Nothing is sent while it is the organizer's turn — that is a
+  // conversation waiting on a human, not a fault. Run 7 got most questions
+  // twice because the router and the interviewer each decided independently
+  // that something was owed; this is the single fact that arbitrates them.
+  if (view.awaiting === "person") {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_held_by_person", {
+      session_id: view.sessionId,
+    }));
+    return;
+  }
+
   // The interviewer's own words go out first and alone. This is the `say`
   // half of Track 4: the agent no longer reaches Telegram directly, so if it
   // has something to tell the organizer, THIS is the only way it arrives.
   // Delivered verbatim and then cleared, so a message is sent exactly once
   // however many times the router is prompted to speak.
   if (view.pendingSay) {
+    // Claim before sending. If the router got here first this returns false and
+    // the message waits for the organizer's next turn rather than landing on
+    // top of what was just said.
+    if (!(await claimFloor(deps.db, chatId))) return;
     await clearPendingSayForChat(deps.db, chatId);
-    await deps.telegram.sendMessage({ chatId, text: view.pendingSay });
+    await deps.telegram.sendMessage({
+      chatId,
+      text: view.pendingSay,
+      // Agent-authored text is written in the dialect TELEGRAM_DESCRIPTOR
+      // advertises, so it has to be SENT in that dialect. The connector always
+      // did this; routing the same text through the router instead dropped it,
+      // and 2026-09-05's run 7 got raw asterisks for its trouble. Whoever
+      // delivers the agent's words owes them the same parse mode.
+      parseMode: "MarkdownV2",
+    });
     return;
   }
 
@@ -687,6 +761,7 @@ async function sendNextStep(
     // there is nothing to remember to set. `offeredMore` is still read for
     // sessions that predate the phase column and have not transitioned since.
     if (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore)) {
+      if (!(await claimFloor(deps.db, chatId))) return;
       const rendered = renderEssentialsDone(view.language);
       await clearPendingEntryForChat(deps.db, chatId);
       await markOfferedMoreForChat(deps.db, chatId);
@@ -737,6 +812,9 @@ async function sendNextStep(
     text = "Thanks — noted.";
   }
 
+  // The question or the recap. Claimed last, immediately before it goes out,
+  // so a slow render cannot leave the floor held by a message nobody sent.
+  if (!(await claimFloor(deps.db, chatId))) return;
   await deps.telegram.sendMessage({ chatId, text, replyMarkup });
   if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
 }
@@ -766,6 +844,7 @@ export function startTripBotPoller(
   const strings = deps.strings ?? DEFAULT_STRINGS;
   const longPollSeconds = options.longPollSeconds ?? DEFAULT_LONG_POLL_SECONDS;
   const maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+  const deliverIntervalMs = options.deliverIntervalMs ?? DEFAULT_DELIVER_INTERVAL_MS;
 
   let offset = 0;
   let stopped = false;
@@ -793,16 +872,10 @@ export function startTripBotPoller(
       });
       const elapsed = Date.now() - startedAt;
 
-      // Render anything the agent handed back. This runs every tick rather
-      // than only after an update, because the write that owes a prompt
-      // happens out-of-band: the agent calls the control-plane API directly,
-      // and this loop is the only process holding the bot connection.
-      await renderDueRouterPrompts(deps, strings, log);
-
-      // Then, and only then, speak for an agent that wrote nothing at all.
-      // Order matters: an agent that has written owes a prompt, and delivering
-      // that first means a slow-but-working turn is never mistaken for a stall.
-      await recoverStalledInterviews(deps, strings, log);
+      // Delivery is NOT done here — it runs on its own timer (`deliver`), so
+      // an agent reply written during a 25-second long poll is not held until
+      // that poll returns. Keeping it here as well would only add a duplicate
+      // claim attempt on a schedule the organizer cannot feel.
 
       if (raw.length > 0) {
         backoffMs = 0;
@@ -849,8 +922,44 @@ export function startTripBotPoller(
     log(structuredLog("info", "trip_bot.polling_stopped", {}));
   }
 
+  /**
+   * Delivers what the agent has written, on its OWN clock.
+   *
+   * This used to run only inside the poll loop, right after `getUpdates`
+   * returns — which coupled every agent-authored message to the Telegram
+   * long-poll cycle. The sequence that produces was reported live on
+   * 2026-09-05 as "it takes a lot of time for the next question": the
+   * organizer answers, `getUpdates` returns immediately with their message,
+   * the loop finds nothing owed yet and blocks on the NEXT poll for 25
+   * seconds, and the agent's reply — written two seconds later — waits out
+   * that whole window before anyone sees it.
+   *
+   * Nothing about delivery has anything to do with when Telegram next hands us
+   * an update, so it gets its own timer. The claims are atomic
+   * (FOR UPDATE SKIP LOCKED), so running alongside the poll loop is safe.
+   */
+  async function deliver(): Promise<void> {
+    while (!stopped) {
+      try {
+        await renderDueRouterPrompts(deps, strings, log);
+        await recoverStalledInterviews(deps, strings, log);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.deliver_tick_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+      await sleep(deliverIntervalMs);
+    }
+  }
+
   void run().catch((error) => {
     log(structuredLog("error", "trip_bot.poll_loop_crashed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+  });
+
+  void deliver().catch((error) => {
+    log(structuredLog("error", "trip_bot.deliver_loop_crashed", {
       safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
     }));
   });

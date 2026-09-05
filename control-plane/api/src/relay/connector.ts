@@ -68,6 +68,22 @@ export interface ConnectorOptions {
    * keeps the old behaviour, which is correct for a companion-only deployment.
    */
   interviewChat?: (chatId: string) => Promise<boolean>;
+  /**
+   * Delivers an agent message on an interview chat through the router.
+   *
+   * A1 dropped these outright, and the 2026-09-05 run showed why that is the
+   * wrong half of the rule: 17 refused sends against 3 `say_for_chat` calls.
+   * The agent kept writing prose, the organizer silently got less
+   * conversation, and — worse — a turn that produced nothing looked STALLED,
+   * so the watchdog fired on every turn and re-asked the same question over
+   * and over.
+   *
+   * Converting instead of dropping keeps the invariant that matters (the
+   * router is still the only writer, and still owns the keyboard, the record
+   * and the order) while removing the failure mode: nothing the agent says to
+   * the organizer is lost, and a turn that spoke is not mistaken for a stall.
+   */
+  interviewSay?: (chatId: string, text: string) => Promise<boolean>;
 }
 
 export class RelayConnector {
@@ -292,14 +308,27 @@ export class RelayConnector {
         // failed live at least once. This is the same rule expressed where it
         // cannot be talked around.
         if (this.options.interviewChat && (await this.options.interviewChat(action.chat_id))) {
-          this.log(structuredLog("info", "relay.agent_send_refused", {
+          // The leak filter still applies, and still DROPS rather than
+          // converts: a message naming field ids or tool names is one the
+          // organizer must not read, whichever door it arrives through.
+          const interviewLeak = detectInternalLeak(action.content);
+          if (interviewLeak.leaks) {
+            this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
+              matched: interviewLeak.term ?? "",
+            }));
+            return { success: true };
+          }
+          const converted =
+            this.options.interviewSay
+              ? await this.options.interviewSay(action.chat_id, action.content)
+              : false;
+          this.log(structuredLog("info", converted ? "relay.agent_send_converted" : "relay.agent_send_refused", {
             chat_id: action.chat_id,
-            reason: "INTERVIEW_ROUTES_THROUGH_ROUTER",
+            reason: converted ? "ROUTED_THROUGH_SAY" : "INTERVIEW_ROUTES_THROUGH_ROUTER",
             length: action.content.length,
           }));
-          // Reported as delivered for the same reason as a suppressed leak: the
-          // gateway's per-request future has to resolve, and there is nothing
-          // here it could usefully retry.
+          // Reported as delivered either way: the gateway's per-request future
+          // has to resolve, and there is nothing here it could usefully retry.
           return { success: true };
         }
 

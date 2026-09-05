@@ -63,6 +63,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0035_interview_ui_state.sql",
       "0036_interview_language.sql",
       "0037_interview_phase.sql",
+      "0038_interview_floor.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -107,6 +108,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0035_interview_ui_state.sql",
       "0036_interview_language.sql",
       "0037_interview_phase.sql",
+      "0038_interview_floor.sql",
     ]);
   } finally {
     await reset(client);
