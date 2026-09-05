@@ -962,6 +962,53 @@ candidate directions, neither committed to:
 **Exit gate for Track 6:** not yet defined — needs the mechanism decided
 first.
 
+Run 11 found a second symptom of the same family: `read_file failed —
+document extraction failed — File not found` on Hermes's own local temp
+cache of an uploaded document, in the same window as repeated
+`handback_skipped`/`agent_floor_reclaimed` events. Likely the same root cause
+as the stuck-button symptom — the delay before the agent actually gets to
+use something stretches long enough for Hermes's own side to have moved on.
+Not a timeout to lengthen (`INBOUND_SETTLE_SECONDS`/`AGENT_FLOOR_SECONDS`
+are not document-read timeouts); filed here rather than as its own track.
+
+#### Track 7 — the agent can still ask a choice question in prose *(scoped, not built)*
+
+Run 11, Dror: "several duplications on the gender question... it seems like
+in the optional questions the agent precedes the router." Traced precisely,
+and it is two things stacked:
+
+1. **The structural half is fixed** (this session): `say_for_chat` and
+   `ask_question_for_chat` are independent slots, and calling both in one
+   breath used to deliver as two separate Telegram messages — the agent's
+   lead-in, then the router's buttoned render. `nominateQuestionForChat` now
+   folds an undelivered `say_for_chat` into the nomination's own text when
+   the two land close together, and leaves an already-delivered one alone.
+2. **The root cause is not fixed**: the agent asking a choice question in
+   prose at all, rather than through `ask_question_for_chat`, is still only
+   forbidden by a SOUL sentence ("never ask a question that has fixed
+   options"). That rule has now failed across at least three different
+   models in this session's own logs. The fold in (1) hides the symptom when
+   the two calls happen to land together; it does nothing when the agent
+   asks in prose and NEVER calls `ask_question_for_chat` at all for that
+   question — the router (or the watchdog) still has to notice and draw it
+   separately, on its own schedule.
+
+The honest next step is a structural detector at the relay boundary — the
+same category as `internal-leak.ts`, which already scans agent text for
+banned tokens — that recognises when agent prose is asking a KNOWN
+choice/multi-choice question and either suppresses it or redirects the
+intent into a proper nomination. Not built: content classification against
+live prompts is easy to get wrong in the false-positive direction (blocking
+legitimate conversation that happens to touch the same topic), and this
+needs the same "prove it with a test before shipping it" discipline as
+everything else in this design, not a live patch under pressure.
+
+**Exit gate for Track 7:** a choice/multi-choice question is never delivered
+without buttons, regardless of how the agent tries to ask it — proven by a
+transcript-harness test that drives the agent through `say_for_chat` with
+prose that names a known option-question's topic, not just through the
+proper tool.
+
 Build:
 
 - Convert reusable `familytrip-provisioner` validation/profile logic into a
