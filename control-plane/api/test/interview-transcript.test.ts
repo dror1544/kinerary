@@ -38,7 +38,9 @@ import {
   INTAKE_QUESTIONS,
   getSessionForChat,
   AGENT_FLOOR_SECONDS,
+  nextPhase,
   nominateQuestionForChat,
+  setFinishRequestedForChat,
   openAgentTurn,
   sayForChat,
   submitAnswerForChat,
@@ -265,7 +267,28 @@ interface Fixture {
   connector: FakeConnector;
 }
 
+/**
+ * Serializes conversations across this file.
+ *
+ * Each one drops and recreates the whole schema, and the runner is free to
+ * interleave suites — which it does now that there are four. Two tests
+ * migrating the same database at once fails with "relation
+ * control_plane_schema_migrations does not exist", a confusing error that has
+ * nothing to do with what is being tested. One at a time, so a failure here
+ * always means the interview did something wrong.
+ */
+let conversations: Promise<unknown> = Promise.resolve();
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const next = conversations.then(fn, fn);
+  conversations = next.catch(() => undefined);
+  return next;
+}
+
 async function withConversation(fn: (fix: Fixture) => Promise<void>): Promise<void> {
+  return serialized(() => runConversation(fn));
+}
+
+async function runConversation(fn: (fix: Fixture) => Promise<void>): Promise<void> {
   const pool = new pg.Pool({ connectionString: databaseUrl });
   const client = await pool.connect();
   try {
@@ -321,10 +344,19 @@ async function deliverPendingRouterPrompt(fix: Fixture): Promise<void> {
   );
 }
 
-/** One update, all the way through: dispatch decides, applyDecision acts. */
+/**
+ * One full iteration of the real poll loop: dispatch decides, applyDecision
+ * acts, then anything owed to the router is delivered.
+ *
+ * The last step is not optional. Phase transitions schedule a router prompt of
+ * their own, and a harness that skipped the delivery left the session in a
+ * state production never reaches — which made the watchdog look broken when it
+ * was the test that was wrong.
+ */
 async function turn(fix: Fixture, update: TelegramUpdate): Promise<void> {
   const decision = await dispatchUpdate(fix.pool, update);
   await applyDecision(decision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+  await deliverPendingRouterPrompt(fix);
 }
 
 /**
@@ -763,6 +795,118 @@ describe("the interview never goes silent", () => {
       await runWatchdog(fix, 0);
 
       fix.script.assertNoRepeatedMessage();
+      fix.script.check();
+    });
+  });
+});
+
+describe("the interview is somewhere, not merely computable", () => {
+  test("the recap is entered once, not re-sent on every later write", { skip: SKIP }, async () => {
+    // Run 2, verbatim: the confirm recap arrived on top of a live question, and
+    // then again, and again. `awaiting_confirmation` was a PROPERTY of the
+    // answers, so once true it was true forever and every agent write re-fired
+    // the whole thing. A phase is entered once.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await turn(fix, says(fix, "/done"));
+
+      const recaps = fix.script.lines.filter((l) => l.buttons.includes("c:confirm"));
+      assert.equal(recaps.length, 1, "the recap arrived once");
+
+      // An optional answer recorded afterwards must not bring it back.
+      await sayForChat(fix.pool, fix.chat, "עוד דבר אחד קטן.");
+      await deliverPendingRouterPrompt(fix);
+      await deliverPendingRouterPrompt(fix);
+
+      const after = fix.script.lines.filter((l) => l.buttons.includes("c:confirm"));
+      assert.equal(after.length, 1, "run 2 regression — the recap re-fired");
+      fix.script.check();
+    });
+  });
+
+  test("an agent-recorded answer can finish the interview, not just a tap", { skip: SKIP }, async () => {
+    // The precise shape of run 6. Every required question was answered and the
+    // session still had no path to confirmation, because only a router-drawn
+    // button could set the finish flag and the agent was doing the asking.
+    // The phase advances on every write, whoever made it.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.phase, "optional", "required done moves the machine on by itself");
+      assert.equal(view.view.state, "interviewing", "and state agrees, because it is derived from phase");
+    });
+  });
+
+  test("the phase machine only goes forward, except Keep planning", { skip: SKIP }, async () => {
+    // A late answer must never drag a confirmed interview backwards. The one
+    // two-way door is the organizer changing their mind at the recap.
+    const answered: Record<string, never> = {};
+    assert.equal(nextPhase("confirmed", answered, INTAKE_QUESTIONS, {}), "confirmed");
+    assert.equal(nextPhase("opening", answered, INTAKE_QUESTIONS, {}), "opening");
+    assert.equal(
+      nextPhase("opening", answered, INTAKE_QUESTIONS, { openingDone: true }),
+      "essentials",
+      "any signal at all ends the opening — a document, a tap, or just typing",
+    );
+    assert.equal(
+      nextPhase("recap", answered, INTAKE_QUESTIONS, {}),
+      "optional",
+      "Keep planning reopens the questions",
+    );
+    assert.equal(
+      nextPhase("recap", answered, INTAKE_QUESTIONS, { finishRequested: true }),
+      "recap",
+      "and staying finished keeps the recap",
+    );
+  });
+
+  test("one event may cross two boundaries", { skip: SKIP }, async () => {
+    // The bug the real assertions finally showed, after four false alarms:
+    // the machine advanced ONE step per event, so recording the last required
+    // answer and asking to finish landed on `optional` instead of `recap`.
+    // "That's everything" then reported `interviewing` with no recap to show —
+    // a dead end reintroduced by the very change meant to remove dead ends.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      // Finish while sitting in `essentials`-adjacent state: the transition has
+      // to carry through optional and on to recap in one move.
+      const finished = await setFinishRequestedForChat(fix.pool, fix.chat, true, { schedulePrompt: true });
+      assert.ok(finished.ok);
+      assert.equal(finished.view.phase, "recap", "crossed both boundaries in one event");
+      assert.equal(finished.view.state, "awaiting_confirmation", "and state followed the phase");
+
+      await deliverPendingRouterPrompt(fix);
+      assert.ok(
+        fix.script.last?.buttons.includes("c:confirm"),
+        "the organizer actually gets the Confirm button, not a dead end",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("declining the document offer moves the interview on", { skip: SKIP }, async () => {
+    // Without a marker, an organizer who taps past the offer and then says
+    // nothing would sit in `opening` forever: no answer exists to move them.
+    await withConversation(async (fix) => {
+      await open(fix);
+      const before = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(before.ok);
+      assert.equal(before.view.phase, "opening");
+
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      const after = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(after.ok);
+      assert.equal(after.view.phase, "essentials", "the questions have started");
       fix.script.check();
     });
   });

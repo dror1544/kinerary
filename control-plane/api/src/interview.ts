@@ -598,6 +598,21 @@ export interface SessionView {
   language: Language;
   /** True once the "essentials done" choice has been put to the organizer. */
   offeredMore: boolean;
+  /**
+   * Where the interview is, as a phase it entered rather than a value
+   * recomputed from the answers. The source of truth; `state` is its
+   * projection into the older three-value vocabulary.
+   */
+  phase: InterviewPhase;
+  /**
+   * A phase whose entry action has not been performed yet, or null.
+   *
+   * This is what makes "shown exactly once" a property of the transition. The
+   * boundary message and the recap each used to need a flag of their own
+   * (`offered_more`, and a recap that re-fired on every write), because a
+   * derived state cannot tell the router whether it has already spoken.
+   */
+  pendingEntry: InterviewPhase | null;
   /** One message the interviewer wrote, for the router to deliver verbatim. */
   pendingSay: string | null;
   /** The interviewer's own wording for `pendingAsk`, if it supplied one. */
@@ -683,6 +698,17 @@ export interface InterviewUiState {
    * own copy, which is robotic but never stuck.
    */
   pendingAskText?: string;
+  /**
+   * True once the organizer has done anything at all after the document offer.
+   *
+   * The opening phase ends on any signal — a document, a tap on "I don't have
+   * one", or simply typing. Without a marker, an organizer who taps past the
+   * offer and says nothing would sit in `opening` forever, since no answer has
+   * been recorded to move them on.
+   */
+  openingDone?: boolean;
+  /** A phase entered whose entry action the router has not performed yet. */
+  pendingEntry?: InterviewPhase;
 }
 
 function parseUiState(raw: unknown): InterviewUiState {
@@ -699,6 +725,8 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.last_prompt === "string" ? { lastPrompt: record.last_prompt } : {}),
     ...(typeof record.pending_say === "string" ? { pendingSay: record.pending_say } : {}),
     ...(typeof record.pending_ask_text === "string" ? { pendingAskText: record.pending_ask_text } : {}),
+    ...(record.opening_done === true ? { openingDone: true } : {}),
+    ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
   };
 }
 
@@ -711,6 +739,8 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.lastPrompt ? { last_prompt: ui.lastPrompt } : {}),
     ...(ui.pendingSay ? { pending_say: ui.pendingSay } : {}),
     ...(ui.pendingAskText ? { pending_ask_text: ui.pendingAskText } : {}),
+    ...(ui.openingDone ? { opening_done: true } : {}),
+    ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
   });
 }
 
@@ -754,6 +784,81 @@ function unansweredOptionalQuestions(
   ui: InterviewUiState = {},
 ): IntakeQuestion[] {
   return questions.filter((q) => !q.required && answers[q.id] === undefined && !isSkipped(ui, q.id));
+}
+
+// ── Phases ────────────────────────────────────────────────────────────────────
+
+/**
+ * Where the interview IS, as somewhere it arrived rather than something
+ * recomputed from the answers on every read.
+ *
+ * See `0037_interview_phase.sql` for why. Briefly: a derived state has no
+ * notion of ENTERING anything, so the recap re-fired over every later question
+ * (run 2), and it can become unreachable, so run 6 answered every required
+ * question and still had no path to confirmation.
+ */
+export const INTERVIEW_PHASES = ["opening", "essentials", "optional", "recap", "confirmed"] as const;
+export type InterviewPhase = (typeof INTERVIEW_PHASES)[number];
+
+export function isInterviewPhase(value: unknown): value is InterviewPhase {
+  return typeof value === "string" && (INTERVIEW_PHASES as readonly string[]).includes(value);
+}
+
+/**
+ * The phase this session should be in, given where it is now and what has been
+ * recorded since.
+ *
+ * Only ever moves forward through the questions, with one deliberate exception:
+ * `recap -> optional`, which is "Keep planning". Everything else is a one-way
+ * door, so an answer arriving late cannot drag a confirmed interview backwards.
+ *
+ * Returns the SAME phase when nothing should move — callers compare and only
+ * run entry actions on an actual change, which is what makes "shown exactly
+ * once" a property of the transition rather than a flag someone remembered to
+ * set.
+ */
+export function nextPhase(
+  current: InterviewPhase,
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[],
+  ui: InterviewUiState = {},
+): InterviewPhase {
+  if (current === "confirmed") return "confirmed";
+
+  const requiredDone = questions.filter((q) => q.required).every((q) => answers[q.id] !== undefined);
+
+  if (current === "opening") {
+    // The opening exists to offer the document before anyone types a trip they
+    // already have written down (run 5). It ends the moment the organizer does
+    // anything at all — including sending that document.
+    return Object.keys(answers).length > 0 || ui.openingDone ? (requiredDone ? "optional" : "essentials") : "opening";
+  }
+
+  if (current === "essentials") return requiredDone ? "optional" : "essentials";
+
+  if (current === "optional") {
+    if (ui.finishRequested) return "recap";
+    // Running out is the other way in. Confirmation is gated on the REQUIRED
+    // set alone, so arriving here early skips nothing that matters.
+    return unansweredOptionalQuestions(answers, questions, ui).length === 0 ? "recap" : "optional";
+  }
+
+  // recap: the organizer either confirms (handled by confirmIntake, which sets
+  // the phase directly) or reopens the questions with Keep planning.
+  return ui.finishRequested ? "recap" : "optional";
+}
+
+/**
+ * `state` is the old three-value vocabulary, now derived FROM the phase.
+ *
+ * Kept because every existing reader, API response and confirmation guard
+ * speaks it. The phase is the source of truth; this is the projection, so the
+ * two can never disagree the way `state` and `ui_state` used to.
+ */
+export function stateForPhase(phase: InterviewPhase): SessionState {
+  if (phase === "confirmed") return "confirmed";
+  if (phase === "recap") return "awaiting_confirmation";
+  return "interviewing";
 }
 
 /**
@@ -931,6 +1036,8 @@ export async function startSession(
       language: language ?? DEFAULT_LANGUAGE,
       offeredMore: false,
       lastPrompt: null,
+      phase: "opening",
+      pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
     };
@@ -958,11 +1065,12 @@ export async function getSession(
     trip_id: string;
     user_id: string;
     state: SessionState;
+    phase: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT id, trip_id, user_id, state, answers, ui_state, language
+    `SELECT id, trip_id, user_id, state, phase, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE session_token_digest = $1`,
     [digest],
@@ -970,7 +1078,18 @@ export async function getSession(
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
 
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
+  return {
+    ok: true,
+    view: buildSessionView(
+      session.id,
+      session.trip_id,
+      session.state,
+      session.answers,
+      parseUiState(session.ui_state),
+      coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
+      isInterviewPhase(session.phase) ? session.phase : "opening",
+    ),
+  };
 }
 
 /**
@@ -992,18 +1111,30 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
     id: string;
     trip_id: string;
     state: SessionState;
+    phase: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT id, trip_id, state, answers, ui_state, language
+    `SELECT id, trip_id, state, phase, answers, ui_state, language
      FROM control_plane.intake_sessions
      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
     [chatId],
   );
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
+  return {
+    ok: true,
+    view: buildSessionView(
+      session.id,
+      session.trip_id,
+      session.state,
+      session.answers,
+      parseUiState(session.ui_state),
+      coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
+      isInterviewPhase(session.phase) ? session.phase : "opening",
+    ),
+  };
 }
 
 /**
@@ -1163,10 +1294,16 @@ export async function claimStalledAgentTurns(
            AND t.opened_at < now() - make_interval(secs => $2)
            AND s.state <> 'confirmed'
            AND s.telegram_chat_id IS NOT NULL
-           -- Nothing waiting to be delivered. If the agent HAS written, the
-           -- router is already about to speak and the floor is not stuck; only
-           -- a turn that produced nothing at all is a stall.
+           -- Nothing waiting to be delivered, and nothing the agent has
+           -- written. Only a turn that produced NOTHING AT ALL is a stall.
+           --
+           -- router_prompt_due_at alone stopped being sufficient once phase
+           -- transitions began scheduling prompts of their own: it no longer
+           -- means the agent wrote something. The two ui_state slots do mean
+           -- exactly that, so they are what the guard asks about.
            AND s.router_prompt_due_at IS NULL
+           AND s.ui_state->>'pending_say' IS NULL
+           AND s.ui_state->>'pending_ask' IS NULL
          ORDER BY t.opened_at
          FOR UPDATE OF t SKIP LOCKED
          LIMIT $1
@@ -1182,11 +1319,12 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
     id: string;
     trip_id: string;
     state: SessionState;
+    phase: string;
     answers: AnswerStore;
     ui_state: unknown;
     language: string | null;
   }>(
-    `SELECT s.id, s.trip_id, s.state, s.answers, s.ui_state, s.language
+    `SELECT s.id, s.trip_id, s.state, s.phase, s.answers, s.ui_state, s.language
      FROM control_plane.intake_sessions s
      JOIN control_plane.interview_agent_turns t
        ON t.session_id = s.id
@@ -1198,7 +1336,18 @@ export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<G
   );
   const [session] = row.rows;
   if (!session) return { ok: false, reason: "NOT_FOUND" };
-  return { ok: true, view: buildSessionView(session.id, session.trip_id, session.state, session.answers, parseUiState(session.ui_state), coerceLanguage(session.language) ?? DEFAULT_LANGUAGE) };
+  return {
+    ok: true,
+    view: buildSessionView(
+      session.id,
+      session.trip_id,
+      session.state,
+      session.answers,
+      parseUiState(session.ui_state),
+      coerceLanguage(session.language) ?? DEFAULT_LANGUAGE,
+      isInterviewPhase(session.phase) ? session.phase : "opening",
+    ),
+  };
 }
 
 function buildSessionView(
@@ -1208,6 +1357,7 @@ function buildSessionView(
   answers: AnswerStore,
   ui: InterviewUiState = {},
   language: Language = DEFAULT_LANGUAGE,
+  phase: InterviewPhase = "opening",
 ): SessionView {
   if (storedState === "confirmed") {
     return {
@@ -1215,11 +1365,17 @@ function buildSessionView(
       optionalRemaining: [], recap: null, selections: currentSelections(answers), language,
       offeredMore: ui.offeredMore === true,
       lastPrompt: ui.lastPrompt ?? null,
+      phase: "confirmed",
+      pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
     };
   }
-  const state = deriveSessionState(answers, INTAKE_QUESTIONS, ui);
+  // The phase is the authority; `state` is its projection. Deriving it here the
+  // old way as well would recreate the dual-authority problem A2 exists to
+  // remove — a session whose `state` and `ui_state` disagreed is how run 2's
+  // recap re-fired and run 6's confirmation became unreachable.
+  const state = stateForPhase(phase);
   return {
     sessionId,
     tripId,
@@ -1236,6 +1392,8 @@ function buildSessionView(
     language,
     offeredMore: ui.offeredMore === true,
     lastPrompt: ui.lastPrompt ?? null,
+    phase,
+    pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
   };
@@ -1593,6 +1751,91 @@ export async function sayForChat(
   return result;
 }
 
+/**
+ * Moves the session to the phase its answers now put it in, and records the
+ * entry action owed.
+ *
+ * Called after every write. Doing nothing when the phase has not changed is
+ * the whole point: an entry action fires on the TRANSITION, so the boundary
+ * message and the recap are each shown once without a flag per message. Run 2's
+ * recap re-fired on every subsequent write precisely because there was no
+ * transition to hang it on.
+ */
+export async function advancePhaseForChat(
+  db: pg.Pool,
+  chatId: string,
+): Promise<{ from: InterviewPhase; to: InterviewPhase } | null> {
+  const current = await getSessionForChat(db, chatId);
+  if (!current.ok) return null;
+  const from = current.view.phase;
+  if (from === "confirmed") return null;
+
+  const answers = await answersForChat(db, chatId);
+  if (!answers) return null;
+
+  // Run to a fixpoint, not a single step. One event can legitimately cross two
+  // boundaries: recording the last required answer AND asking to finish should
+  // land on `recap`, not stop at `optional` because only one transition was
+  // applied. Stopping short is what left "that's everything" reporting
+  // `interviewing`, with no recap to show.
+  //
+  // Bounded by the number of phases, so a transition pair that disagreed with
+  // each other could never spin here.
+  let to: InterviewPhase = from;
+  for (let step = 0; step < INTERVIEW_PHASES.length; step += 1) {
+    const next = nextPhase(to, answers.answers, INTAKE_QUESTIONS, answers.ui);
+    if (next === to) break;
+    to = next;
+  }
+  if (to === from) return null;
+
+  await db.query(
+    `UPDATE control_plane.intake_sessions
+        SET phase = $2, state = $3
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId, to, stateForPhase(to)],
+  );
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, pendingEntry: to }));
+  await scheduleRouterPrompt(db, current.view.sessionId);
+  return { from, to };
+}
+
+/** Reads just the answers and ui_state, for the phase machine. */
+async function answersForChat(
+  db: pg.Pool,
+  chatId: string,
+): Promise<{ answers: AnswerStore; ui: InterviewUiState } | null> {
+  const row = await db.query<{ answers: AnswerStore; ui_state: unknown }>(
+    `SELECT answers, ui_state FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId],
+  );
+  const [session] = row.rows;
+  if (!session) return null;
+  return { answers: session.answers, ui: parseUiState(session.ui_state) };
+}
+
+/** Marks an entry action as performed, so the router does not repeat it. */
+export async function clearPendingEntryForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => {
+    const next = { ...ui };
+    delete next.pendingEntry;
+    return next;
+  });
+}
+
+/**
+ * The organizer did something after the document offer, so the opening is over.
+ *
+ * Any signal counts — sending the document, declining it, or simply typing.
+ * Without this an organizer who taps past the offer and says nothing would sit
+ * in `opening` forever, since no answer has been recorded to move them on.
+ */
+export async function markOpeningDoneForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, openingDone: true }));
+  await advancePhaseForChat(db, chatId);
+}
+
 /** Clears the delivered message so the router does not send it twice. */
 export async function clearPendingSayForChat(db: pg.Pool, chatId: string): Promise<void> {
   await updateUiStateForChat(db, chatId, (ui) => {
@@ -1624,6 +1867,7 @@ export async function nominateQuestionForChat(
     finishRequested: false,
   }));
   if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  await advancePhaseForChat(db, chatId);
   return result;
 }
 
@@ -1747,6 +1991,12 @@ export async function setFinishRequestedForChat(
   // The router already sends its own next step when a BUTTON caused this; an
   // agent asking for the summary has no such follow-up, so it schedules one.
   if (result.ok && schedulePrompt) await scheduleRouterPrompt(db, result.view.sessionId);
+  // `optional -> recap` on finish, `recap -> optional` on Keep planning. Both
+  // directions of the one two-way door in the machine, and the reason run 6's
+  // organizer could type approval at a session with no path to it: nothing
+  // moved when they asked to finish.
+  const moved = await advancePhaseForChat(db, chatId);
+  if (moved) return await getSessionForChat(db, chatId);
   return result;
 }
 
@@ -1798,11 +2048,21 @@ export async function submitAnswerForChat(
   structuredData?: unknown,
   optionIds?: readonly string[],
 ): Promise<SubmitAnswerResult> {
-  return submitAnswerVia(
+  const result = await submitAnswerVia(
     db,
     { by: "chat", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
   );
+  // A recorded answer is the main thing that can move the interview on — the
+  // last required one ends `essentials`, the last optional one ends `optional`.
+  // Advancing here rather than in the caller means every writer gets it, which
+  // is what run 6 needed: an answer arriving from the AGENT has to be able to
+  // finish the interview, not just an answer arriving from a button.
+  if (result.ok) {
+    const moved = await advancePhaseForChat(db, chatId);
+    if (moved) return await getSessionForChat(db, chatId) as SubmitAnswerResult;
+  }
+  return result;
 }
 
 async function submitAnswerVia(

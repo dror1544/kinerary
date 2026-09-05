@@ -39,7 +39,9 @@ import {
   type SessionView,
   askForMoreForChat,
   clearPendingAskForChat,
+  clearPendingEntryForChat,
   clearPendingSayForChat,
+  markOpeningDoneForChat,
   hasOpenAgentTurn,
   markOfferedMoreForChat,
   recordLastPromptForChat,
@@ -370,7 +372,10 @@ async function applyInterviewCallback(
 
   if (parsed.kind === "no_document") {
     // Nothing to record — the offer was a courtesy, and declining it just
-    // starts the questions.
+    // starts the questions. It does end the opening PHASE, though: without a
+    // marker an organizer who taps past the offer and then says nothing would
+    // sit in `opening` forever, since no answer exists to move them on.
+    await markOpeningDoneForChat(deps.db, decision.chatId);
     const view = await getSessionForChat(deps.db, decision.chatId);
     if (!view.ok) {
       await ack("I couldn't do that — try again.");
@@ -676,8 +681,14 @@ async function sendNextStep(
     // questions, or the summary — are put in front of the organizer exactly
     // once, so a fumbled nomination by the interviewer cannot strand them with
     // no way forward, which is precisely what happened on 2026-09-04's run 4.
-    if (!view.offeredMore) {
+    //
+    // "Exactly once" is now the ENTRY ACTION of the `optional` phase rather
+    // than a flag of its own: entering a phase happens once by definition, so
+    // there is nothing to remember to set. `offeredMore` is still read for
+    // sessions that predate the phase column and have not transitioned since.
+    if (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore)) {
       const rendered = renderEssentialsDone(view.language);
+      await clearPendingEntryForChat(deps.db, chatId);
       await markOfferedMoreForChat(deps.db, chatId);
       await deps.telegram.sendMessage({
         chatId,
