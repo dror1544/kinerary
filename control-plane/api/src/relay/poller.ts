@@ -37,6 +37,8 @@ import {
   markAwaitingMachine,
   claimStalledAgentTurns,
   openAgentTurn,
+  queueInboundMessage,
+  claimSettledInboundBursts,
   submitAnswerForChat,
   type SessionView,
   askForMoreForChat,
@@ -212,7 +214,9 @@ export async function applyDecision(
       // document, which on a PDF is exactly the wait this message exists to
       // cover — so the one side that can answer instantly answers, and it can
       // only do that in the organizer's language because the session records
-      // it. Requested during the 2026-09-04 run 3.
+      // it. Requested during the 2026-09-04 run 3. Unaffected by the settle
+      // window below: the organizer should see this the instant the file
+      // lands, burst or not.
       if ((decision.event.media_urls?.length ?? 0) > 0) {
         const view = await getSessionForChat(deps.db, decision.chatId);
         await deps.telegram.sendMessage({
@@ -220,28 +224,14 @@ export async function applyDecision(
           text: uiString("fileReceived", view.ok ? view.view.language : DEFAULT_LANGUAGE),
         });
       }
-      // The turn opens BEFORE the event goes out. The agent may call back the
-      // moment it is handed the turn, so a turn opened afterwards could arrive
-      // second and the write would be refused for a turn that genuinely is in
-      // flight.
-      const turn = await openAgentTurn(deps.db, decision.chatId, decision.sessionId);
-      const delivered = deps.connector.pushInbound(decision.event);
-      if (delivered) {
-        log(structuredLog("info", "trip_bot.interview_forwarded", {
-          session_id: decision.sessionId,
-          turn_id: turn.id,
-        }));
-        return;
-      }
-      // Nothing queues, so the turn this opened will never be used. Closing it
-      // rather than letting it lapse means the next forward is the only open
-      // one at every instant, instead of racing a five-minute ghost.
-      await closeAgentTurn(deps.db, decision.chatId);
-      log(structuredLog("warn", "trip_bot.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
-      await deps.telegram.sendMessage({
-        chatId: decision.chatId,
-        text: strings.gatewayUnavailable,
-      });
+      // Queued, not forwarded. Run 9: five rapid messages used to mean five
+      // immediate forwards, each tearing down the turn the last one opened —
+      // Hermes kept each torn-down turn's own conversation loop running
+      // regardless, producing several uncoordinated agent invocations
+      // fighting over the same questions. Queuing lets a burst finish before
+      // exactly one turn opens for the whole thing. See
+      // `flushSettledInboundBursts` for the other half.
+      await queueInboundMessage(deps.db, decision.chatId, decision.event);
       return;
     }
 
@@ -523,6 +513,81 @@ async function applyInterviewCallback(
  * language. Flat next to the agent's phrasing, and infinitely better than a
  * conversation that simply stops.
  */
+
+/**
+ * Delivers every burst of inbound messages that has gone quiet, as ONE
+ * message through ONE opened turn.
+ *
+ * This is `queueInboundMessage`'s other half. Run 9: five rapid messages used
+ * to mean five immediate, independent forwards, each tearing down the turn
+ * the last one opened while Hermes kept the torn-down turn's own conversation
+ * loop running regardless — several uncoordinated agent invocations fighting
+ * over the same questions. Waiting for the burst to settle and forwarding it
+ * once removes the race at its source: there is only ever one turn for one
+ * burst.
+ *
+ * Text joins with newlines — five lines about five travellers reads as one
+ * paragraph, not five separate messages run together. Media rides on the
+ * LAST queued event that carried any: a document arriving mid-burst is the
+ * rare case, and whichever one is freshest is the one worth keeping if more
+ * than one somehow lands in the same window.
+ */
+export async function flushSettledInboundBursts(
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+  settleSeconds?: number,
+): Promise<void> {
+  let bursts: Awaited<ReturnType<typeof claimSettledInboundBursts>>;
+  try {
+    bursts = settleSeconds === undefined
+      ? await claimSettledInboundBursts(deps.db)
+      : await claimSettledInboundBursts(deps.db, 10, settleSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.inbound_burst_claim_failed", {}));
+    return;
+  }
+  for (const burst of bursts) {
+    try {
+      const events = burst.events as WireMessageEvent[];
+      const last = events[events.length - 1];
+      if (!last) continue;
+      const withMedia = [...events].reverse().find((e) => (e.media_urls?.length ?? 0) > 0);
+      const text = events
+        .map((e) => e.text)
+        .filter((t) => t.trim().length > 0)
+        .join("\n");
+      const combined: WireMessageEvent = {
+        ...last,
+        text,
+        ...(withMedia ? { media_urls: withMedia.media_urls, media: withMedia.media } : {}),
+      };
+
+      log(structuredLog("info", "trip_bot.inbound_burst_flushed", {
+        session_id: burst.sessionId,
+        messages_combined: events.length,
+      }));
+
+      // Same ordering as the old single-message path: the turn opens BEFORE
+      // the event goes out, so the agent may call back the moment it is
+      // handed the turn without racing a turn opened afterward.
+      const turn = await openAgentTurn(deps.db, burst.chatId, burst.sessionId);
+      const delivered = deps.connector.pushInbound(combined);
+      if (delivered) {
+        log(structuredLog("info", "trip_bot.interview_forwarded", {
+          session_id: burst.sessionId,
+          turn_id: turn.id,
+          messages_combined: events.length,
+        }));
+        continue;
+      }
+      await closeAgentTurn(deps.db, burst.chatId);
+      log(structuredLog("warn", "trip_bot.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
+    } catch {
+      log(structuredLog("warn", "trip_bot.inbound_burst_flush_failed", { session_id: burst.sessionId }));
+    }
+  }
+}
+
 export async function recoverStalledInterviews(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
@@ -957,6 +1022,10 @@ export function startTripBotPoller(
   async function deliver(): Promise<void> {
     while (!stopped) {
       try {
+        // Flushing a settled burst comes first: it is what opens the turn and
+        // gives the agent something to write, which the next two calls then
+        // deliver or watch for a stall on.
+        await flushSettledInboundBursts(deps, log);
         await renderDueRouterPrompts(deps, strings, log);
         await recoverStalledInterviews(deps, strings, log);
       } catch (error) {

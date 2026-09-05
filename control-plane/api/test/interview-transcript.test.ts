@@ -54,6 +54,7 @@ import { startFromDeepLink } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import {
   applyDecision,
+  flushSettledInboundBursts,
   recoverStalledInterviews,
   renderDueRouterPrompts,
 } from "../src/relay/poller.js";
@@ -1333,6 +1334,102 @@ describe("starting a new interview never resumes someone else's abandoned one", 
       const outcome = await startFromDeepLink(fix.pool, fix.chat, issued.token);
       assert.equal(outcome.kind, "already_in_interview", "same trip, still in progress — refused, not restarted");
       assert.equal(outcome.kind === "already_in_interview" ? outcome.tripId : null, fix.tripId);
+    });
+  });
+});
+
+describe("one burst of messages opens one turn", () => {
+  /** Sends a plain-text message on the interview_to_gateway path (an interviewer is configured). */
+  async function typesToInterviewer(fix: Fixture, text: string): Promise<void> {
+    const decision = await dispatchUpdate(
+      fix.pool,
+      says(fix, text),
+      DEFAULT_STRINGS,
+      () => {},
+      {},
+      { interviewerProfile: "trip-intake" },
+    );
+    await applyDecision(decision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+  }
+
+  test("five rapid messages open exactly one turn, combined", { skip: SKIP }, async () => {
+    // The exact shape of run 9: "אני ניר סולומון 56 / אלה אישתי בת 53 / נעה
+    // ביתי בת 25 סטודנטית / מאיה בת 23 / שי בת 14" — five family members, one
+    // per Telegram send. Seven distinct turn ids were logged for that one
+    // burst live; here, five sends must produce exactly one.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      const lines = [
+        "אני ניר סולומון 56",
+        "אלה אישתי בת 53",
+        "נעה ביתי בת 25 סטודנטית",
+        "מאיה בת 23",
+        "שי בת 14",
+      ];
+      for (const line of lines) await typesToInterviewer(fix, line);
+
+      // Nothing has been forwarded yet — the burst is still settling.
+      assert.equal(fix.connector.pushed.length, 0, "queued, not forwarded, while the burst is still arriving");
+
+      await flushSettledInboundBursts(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector },
+        () => {},
+        0,
+      );
+
+      assert.equal(
+        fix.connector.pushed.length,
+        1,
+        "run 9 regression — five messages produced more than one turn",
+      );
+      for (const line of lines) {
+        assert.ok(
+          fix.connector.pushed[0]!.text.includes(line),
+          `combined message lost a line: ${line}`,
+        );
+      }
+    });
+  });
+
+  test("a lone message still reaches the agent once the settle window passes", { skip: SKIP }, async () => {
+    // Not a burst at all — the common case — must not be held up by anything
+    // beyond the settle window itself.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      await typesToInterviewer(fix, "יפן, 5 ביולי עד 15 ביולי");
+      assert.equal(fix.connector.pushed.length, 0);
+
+      await flushSettledInboundBursts(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector },
+        () => {},
+        0,
+      );
+
+      assert.equal(fix.connector.pushed.length, 1);
+      assert.equal(fix.connector.pushed[0]!.text, "יפן, 5 ביולי עד 15 ביולי");
+    });
+  });
+
+  test("two poll ticks cannot both flush the same settled burst", { skip: SKIP }, async () => {
+    // The identical race claimDueRouterPrompts and claimStalledAgentTurns
+    // already had to guard against, on the inbound side this time: a
+    // double-flush would open two turns for one burst, recreating exactly the
+    // defect this exists to remove.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await typesToInterviewer(fix, "משפחת כהן, ארבעה נוסעים");
+
+      await Promise.all([
+        flushSettledInboundBursts({ db: fix.pool, telegram: fix.script, connector: fix.connector }, () => {}, 0),
+        flushSettledInboundBursts({ db: fix.pool, telegram: fix.script, connector: fix.connector }, () => {}, 0),
+      ]);
+
+      assert.equal(fix.connector.pushed.length, 1, "the burst was flushed exactly once");
     });
   });
 });

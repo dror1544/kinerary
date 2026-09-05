@@ -1324,6 +1324,127 @@ export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenT
  */
 export const ROUTER_PROMPT_SETTLE_SECONDS = 3;
 
+// ── Inbound settle: one turn per burst, not one per message ────────────────────
+//
+// The mirror image of the router-prompt settle window above, on the OTHER
+// side of the pipe. Run 9, 2026-09-05: "it still seems that hermes and gw are
+// competing." Five rapid Telegram messages (one line per family member)
+// produced seven overlapping agent turns, because each message forwarded
+// immediately and openAgentTurn tears down whatever turn is open before
+// starting the next — while Hermes keeps its OWN, now-orphaned conversation
+// loop for the torn-down turn running regardless. Two uncoordinated
+// invocations independently deciding to ask the same question is what
+// produced the duplicate asks; a checkbox refused because a different
+// invocation had already answered that field is what read as "buttons do not
+// move it".
+//
+// Every message in a burst still starts a real turn eventually — nothing here
+// drops anything. It only decides WHEN: not on every message, but once the
+// burst has genuinely stopped.
+
+/** How long a burst of inbound messages must go quiet before it is forwarded, as one. */
+export const INBOUND_SETTLE_SECONDS = 2;
+
+/**
+ * Interview.ts does not know the relay's wire format and deliberately does not
+ * import it — layering runs relay -> interview, never the other way. This is
+ * only what THIS module needs to touch: enough to store and hand back
+ * whatever the caller put in, opaquely. The relay layer casts it back to its
+ * own `WireMessageEvent` when combining a burst, since it is the only writer
+ * and already trusts its own shape.
+ */
+export interface QueuedInboundEvent {
+  text: string;
+}
+
+/**
+ * Adds one inbound message to the chat's burst, pushing the settle deadline
+ * forward — the same "keeps getting further away while writes keep coming"
+ * debounce as `scheduleRouterPrompt`, applied to the other direction.
+ *
+ * Deliberately does NOT open a turn or push anything to the agent. That is
+ * the relay layer's job, once, for the whole burst — which is the entire
+ * point: a message queued here is one that used to tear down and replace
+ * whatever turn was open.
+ */
+export async function queueInboundMessage(
+  db: pg.Pool,
+  chatId: string,
+  event: QueuedInboundEvent,
+): Promise<void> {
+  // Set to now(), not now()+settle — matching scheduleRouterPrompt exactly.
+  // The settle window lives entirely in claimSettledInboundBursts's WHERE
+  // clause ("has it been quiet for N seconds"), not in when this timestamp is
+  // written. Writing it as now()+N here would make the two disagree about
+  // what the timestamp MEANS, and every later message in the burst pushing it
+  // forward again is exactly the debounce this needs.
+  await db.query(
+    `UPDATE control_plane.intake_sessions
+        SET pending_inbound = pending_inbound || to_jsonb($2::jsonb),
+            inbound_settle_due_at = now()
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId, JSON.stringify(event)],
+  );
+}
+
+export interface SettledInboundBurst {
+  sessionId: string;
+  tripId: string;
+  chatId: string;
+  events: QueuedInboundEvent[];
+}
+
+/**
+ * Claims every burst that has gone quiet for `settleSeconds`, clearing the
+ * buffer atomically as part of the same claim — so two poll ticks can never
+ * both flush the same burst, the identical race `claimDueRouterPrompts`
+ * already has to guard against.
+ */
+export async function claimSettledInboundBursts(
+  db: pg.Pool,
+  limit = 10,
+  settleSeconds: number = INBOUND_SETTLE_SECONDS,
+): Promise<SettledInboundBurst[]> {
+  // A CTE, not a plain UPDATE ... RETURNING: RETURNING reflects the row AFTER
+  // the SET, so a naive `RETURNING pending_inbound` on the same statement that
+  // clears it to '[]' returns the empty array it just wrote, not the burst
+  // being claimed. `claimed` runs the SELECT (and takes the row lock) first,
+  // and the outer UPDATE joins against ITS captured pending_inbound — the
+  // clear and the read of what is being cleared happen in the same
+  // transaction without one seeing the other's result.
+  const rows = await db.query<{
+    id: string;
+    trip_id: string;
+    telegram_chat_id: string;
+    pending_inbound: QueuedInboundEvent[];
+  }>(
+    `WITH claimed AS (
+       SELECT id, trip_id, telegram_chat_id, pending_inbound
+         FROM control_plane.intake_sessions
+        WHERE inbound_settle_due_at IS NOT NULL
+          AND inbound_settle_due_at < now() - make_interval(secs => $2)
+          AND jsonb_array_length(pending_inbound) > 0
+          AND telegram_chat_id IS NOT NULL
+        ORDER BY inbound_settle_due_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT $1
+     )
+     UPDATE control_plane.intake_sessions s
+        SET pending_inbound = '[]'::jsonb, inbound_settle_due_at = NULL
+       FROM claimed c
+      WHERE s.id = c.id
+      RETURNING s.id, s.trip_id, s.telegram_chat_id, c.pending_inbound`,
+    [limit, settleSeconds],
+  );
+  return rows.rows.map((r) => ({
+    sessionId: r.id,
+    tripId: r.trip_id,
+    chatId: r.telegram_chat_id,
+    events: r.pending_inbound,
+  }));
+}
+
+
 export async function claimDueRouterPrompts(
   db: pg.Pool,
   limit = 10,
