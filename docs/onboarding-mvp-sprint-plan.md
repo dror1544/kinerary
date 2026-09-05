@@ -872,10 +872,53 @@ Automated tests:
 with no manual database intervention, and the transcript harness runs in CI on
 `integration/**`.
 
-**Open decisions** (`interview-design-review.md` §7): the watchdog interval,
-and whether tone and language discipline being *filtered* rather than
-*impossible* is an acceptable trade for a chat that reads human. Dror chose
-the human-feel direction on 2026-09-04; the trade is recorded, not settled.
+**Open decisions, resolved.** The watchdog interval is 30 seconds (Dror,
+2026-09-04). Tone/language discipline being *filtered* rather than
+*impossible* is the accepted trade for a chat that reads human — confirmed by
+run 9's own organizer verdict ("I don't mind open questions instead of the
+multiple answers"), which explicitly does not want the alternative (more
+buttons, less voice).
+
+**A1–A3+B all shipped and reached a clean `intake_confirmed` on run 9
+(2026-09-05)** — the first confirmation since run 4, and the first with no
+manual database intervention. `interview-design-review.md`'s exit gate
+("two consecutive live runs... no manual database intervention") is one run
+into two.
+
+#### Track 5 — one turn per burst, not one per message
+
+Run 9's own closing line named this exactly: **"it still seems that hermes
+and gw are competing."** An organizer who answers in five separate Telegram
+messages (one line per family member, a normal way to type on a phone)
+produces **five separate agent turns**, because `openAgentTurn` closes
+whatever turn is open for a chat before opening the next one — and Hermes does
+not know or care that we closed its turn row, so it keeps its own,
+now-orphaned conversation loop running regardless. Seven distinct turn ids
+were logged for one five-message burst. The result: the same optional
+question nominated twice by two different overlapping invocations (once with
+buttons, once without), and a checkbox tap silently refused because a
+different overlapping invocation had already finalized that question —
+visible only as an easy-to-miss Telegram toast, never a chat message. Record
+integrity held throughout (`trip_pace` was checked and found written exactly
+once); this is a conversation-level defect, not a data one.
+
+Build:
+
+- A short settle window on the INBOUND side, mirroring
+  `ROUTER_PROMPT_SETTLE_SECONDS` on the outbound side: messages arriving
+  within N seconds of each other coalesce into one forward to the agent
+  instead of each tearing down and replacing the last turn.
+- `openAgentTurn`'s close-then-open behavior is correct for a genuinely new
+  turn; the fix sits upstream of it, in deciding when an inbound message
+  really starts a new turn versus continuing one still settling.
+
+Automated tests:
+
+- A transcript-harness reproduction of the exact run-9 shape: five rapid
+  messages: assert exactly one turn opens; assert no question is asked twice.
+
+**Exit gate for Track 5:** the run-9 five-message burst, replayed live,
+produces one turn and no duplicate question.
 
 Build:
 

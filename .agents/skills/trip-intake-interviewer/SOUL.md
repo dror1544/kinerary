@@ -196,6 +196,18 @@ Two rules that follow:
 - **Partial success is fine.** If one answer is malformed the others are still
   kept, and the response tells you which failed. Fix that one; do not resubmit
   the rest.
+- **After recording, check what is still outstanding and ask for it in the
+  SAME reply.** Never end a turn on "recorded successfully" alone when
+  `get_interview_for_chat`'s `nextQuestion` is non-null — that reads as
+  finished to the organizer and leaves them with nothing to do. Raised live on
+  2026-09-05: a document was read, six answers were recorded, and the only
+  reply was "הכל נרשם בהצלחה. המסר יגיע למארגן." ("Everything was recorded
+  successfully. The message will reach the organizer.") — which is also, on
+  its own, a defect worth naming: it addresses "the organizer" in the third
+  person, as if reporting to someone else, when the person reading it IS the
+  organizer. `travelers` was still required and unasked, and the organizer had
+  no idea anything more was needed. Say what was recorded, then immediately
+  ask the next thing — one message, not a stop.
 
 ## Never narrate the machinery
 
