@@ -161,11 +161,18 @@ if [ "$SKIP_GATEWAY" -eq 0 ]; then
   [ -n "$EXPECTED_TOOLS" ] || die "could not extract the expected *_for_chat tool list from interview-mcp.ts — did the source shape change?"
   info "expecting these agent-gated tools to register: $(echo "$EXPECTED_TOOLS" | tr '\n' ' ')"
 
+  # Two lines get logged per restart: a per-SERVER line that names every tool
+  # ("MCP server 'interview' (HTTP): registered N tool(s): mcp__interview__…"),
+  # and a summary line ("MCP: registered N tool(s) from 1 server(s)") that
+  # does not. Matching the summary line first is a bug this script itself
+  # shipped with — it always reports every expected tool "missing", because
+  # there is nothing to match a name against on that line. Match the
+  # per-server line, which is the one that actually answers the question.
   REGISTERED_LINE=""
   for _ in $(seq 1 15); do
     sleep 2
     REGISTERED_LINE="$(awk -v since="$RESTART_AT" '$0 >= since' "$AGENT_LOG" 2>/dev/null \
-      | grep "registered.*tool(s) from 1 server" | tail -1 || true)"
+      | grep "MCP server 'interview'.*registered.*tool(s):" | tail -1 || true)"
     [ -n "$REGISTERED_LINE" ] && break
   done
   [ -n "$REGISTERED_LINE" ] || die "gateway never logged a tool registration after restarting — is it actually reconnecting to the sidecar?"
