@@ -428,6 +428,85 @@ textarea { min-height: 132px; resize: vertical; }
 .booking-groups { display: grid; gap: 20px; }
 .booking-group { display: grid; gap: 12px; }
 .booking-group h3 { margin: 0; font: 800 22px/1.1 var(--kit-font-display); }
+.map-stop-section { display: grid; gap: 12px; }
+.map-canvas-panel { display: grid; gap: 12px; }
+.map-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.map-control-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  border: 1px solid var(--kit-line);
+  border-radius: 999px;
+  padding: 0 12px;
+  color: var(--kit-ink);
+  background: #fffdf8;
+  font-weight: 850;
+  cursor: pointer;
+}
+.map-control-button:disabled { opacity: .45; cursor: not-allowed; }
+.map-location-counter { flex: 1 1 180px; min-width: 0; color: var(--kit-ink-soft); font-weight: 800; text-align: center; }
+.map-mode-switch { display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px; background: rgba(16, 38, 58, .08); }
+.map-mode-switch button { border: 0; border-radius: 999px; padding: 7px 10px; color: var(--kit-ink-soft); background: transparent; font-weight: 800; cursor: pointer; }
+.map-mode-switch button.active { color: white; background: var(--kit-ink); }
+.map-stop-heading { display: grid; gap: 4px; }
+.map-stop-heading h3 { margin: 0; font: 800 22px/1.1 var(--kit-font-display); }
+.map-stop-heading p { margin: 0; color: var(--kit-ink-soft); }
+.interactive-map {
+  min-height: clamp(300px, 48vw, 520px);
+  overflow: hidden;
+  border: 1px solid var(--kit-line);
+  border-radius: calc(var(--kit-radius) + 8px);
+  box-shadow: var(--kit-shadow-soft);
+}
+.map-pin-marker {
+  position: relative;
+  display: block;
+  width: 26px;
+  height: 29px;
+  border: 0;
+  padding: 0;
+  color: var(--kit-ink);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  filter: drop-shadow(0 2px 3px rgba(16,38,58,.24));
+}
+.map-pin-marker:focus-visible { outline: 3px solid rgba(14,143,134,.42); outline-offset: 4px; border-radius: 999px; }
+.map-pin-dot {
+  position: absolute;
+  top: 4px;
+  left: 3px;
+  display: block;
+  width: 20px;
+  height: 20px;
+  border: 3px solid white;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+}
+.map-pin-dot.stay { background: var(--kit-teal); }
+.map-pin-dot.stop { background: var(--kit-coral); }
+.map-pin-label {
+  position: absolute;
+  bottom: 35px;
+  left: 50%;
+  display: none;
+  width: max-content;
+  max-width: 190px;
+  border: 1px solid rgba(16,38,58,.12);
+  border-radius: 999px;
+  padding: 6px 10px;
+  overflow: hidden;
+  color: var(--kit-ink);
+  background: rgba(255,253,248,.96);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.map-pin-marker.active .map-pin-label { display: inline-block; }
 .module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
 .booking-card, .map-anchor, .extract-panel {
   display: grid;
@@ -439,7 +518,22 @@ textarea { min-height: 132px; resize: vertical; }
   box-shadow: var(--kit-shadow-soft);
 }
 .booking-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.booking-card h4, .map-anchor h3, .extract-panel h3 { margin: 0; font: 800 20px/1.16 var(--kit-font-display); }
+.booking-card h4, .map-anchor h3, .map-anchor-title, .extract-panel h3 { margin: 0; font: 800 20px/1.16 var(--kit-font-display); }
+.map-anchor-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  border: 0;
+  padding: 0;
+  color: var(--kit-ink);
+  background: transparent;
+  text-align: start;
+  cursor: pointer;
+}
+.map-anchor-title svg { flex: 0 0 auto; color: var(--kit-teal); }
+.map-anchor-title:hover { color: var(--kit-teal); text-decoration: underline; text-underline-offset: 3px; }
+.map-anchor-title:focus-visible { outline: 3px solid rgba(14,143,134,.35); outline-offset: 4px; border-radius: 4px; }
 .booking-card p, .map-anchor p, .extract-panel p { margin: 0; color: var(--kit-ink-soft); line-height: 1.5; }
 .booking-card small { color: var(--kit-muted); font-weight: 750; }
 .action-strip { display: flex; flex-wrap: wrap; gap: 8px; }

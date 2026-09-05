@@ -7,6 +7,7 @@ import {
   Camera,
   CheckCircle2,
   ChevronLeft,
+  ChevronRight,
   Clock3,
   CloudSun,
   Compass,
@@ -406,6 +407,12 @@ function TimelineItem({
   );
 }
 
+type JourneyFocus = {
+  phaseId: string;
+  date?: string;
+  itemUid?: string;
+};
+
 function CompanionPanel({
   config,
   hermes,
@@ -616,6 +623,7 @@ function JourneyView({
   botName,
   telegramUsername,
   onHeroPhaseChange,
+  focus,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
@@ -624,6 +632,7 @@ function JourneyView({
   botName?: string;
   telegramUsername?: string | null;
   onHeroPhaseChange: (phaseId: string) => void;
+  focus?: JourneyFocus | null;
 }) {
   const days = itinerary?.days || [];
   const phaseGroups = useMemo(() => {
@@ -646,6 +655,7 @@ function JourneyView({
   const activeDate = activePhase?.days.some((day) => day.date === selected) ? selected : activePhase?.days[0]?.date || "";
   const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
+  const daySpineRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (!selectedPhase && phaseGroups[0]?.id) setSelectedPhase(phaseGroups[0].id);
@@ -660,6 +670,24 @@ function JourneyView({
       setSelected(activePhase.days[0].date);
     }
   }, [activePhase, selected]);
+
+  useEffect(() => {
+    if (!focus?.phaseId) return;
+    const phase = phaseGroups.find((entry) => entry.id === focus.phaseId);
+    if (!phase) return;
+    setSelectedPhase(phase.id);
+    const targetDay = focus.date && phase.days.find((entry) => entry.date === focus.date);
+    if (targetDay) setSelected(targetDay.date);
+  }, [focus, phaseGroups]);
+
+  useEffect(() => {
+    if (!focus?.phaseId || activePhase?.id !== focus.phaseId) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = focus.itemUid ? document.getElementById(`itinerary-item-${encodeURIComponent(focus.itemUid)}`) : null;
+      (target || daySpineRef.current)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focus, activePhase?.id, activeDate, dayItems.length]);
 
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState<ItineraryItem | null | "new">(null);
@@ -750,7 +778,7 @@ function JourneyView({
           </button>
         ))}
       </aside>
-      <section className="day-spine">
+      <section ref={daySpineRef} className="day-spine">
         <div className="day-heading">
           <span className="panel-label">{activePhase?.title || "Journey"}</span>
           <h2>{day?.label_en || day?.label_he || "Daily itinerary"}</h2>
@@ -826,7 +854,7 @@ function JourneyView({
         {isOrganizer && enrichmentNote ? <p className="enrichment-note"><Sparkles size={16} /> {enrichmentNote}</p> : null}
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
-            <div className="timeline-item-wrap" key={item.item_uid}>
+            <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
               <TimelineItem item={item} lang={lang} botName={botName} telegramUsername={telegramUsername} />
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
@@ -1041,16 +1069,308 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
   );
 }
 
-function MapView({ config, lang }: { config?: TripConfig; itinerary?: ActiveItinerary; lang: Lang }) {
+export function dailyMapStops(items: ItineraryItem[] | undefined) {
+  return [...(items || [])]
+    .filter((item) => Boolean(item.date && (item.location_url || item.waze_url)))
+    .sort((a, b) => {
+      const byDate = (a.date || "").localeCompare(b.date || "");
+      if (byDate) return byDate;
+      const byTime = (a.time_sort ?? Number.MAX_SAFE_INTEGER) - (b.time_sort ?? Number.MAX_SAFE_INTEGER);
+      if (byTime) return byTime;
+      return a.item_uid.localeCompare(b.item_uid);
+    });
+}
+
+type MapPin = {
+  id: string;
+  phaseId: string;
+  date?: string;
+  itemUid?: string;
+  lat: number;
+  lng: number;
+  title: string;
+  subtitle: string;
+  kind: "stay" | "stop";
+};
+
+function rasterMapStyle(tileUrl: string, attribution: string) {
+  return {
+    version: 8,
+    sources: {
+      raster: {
+        type: "raster",
+        tiles: [tileUrl],
+        tileSize: 256,
+        attribution,
+      },
+    },
+    layers: [{ id: "raster", type: "raster", source: "raster" }],
+  } satisfies import("maplibre-gl").StyleSpecification;
+}
+
+const freeMapStyle = rasterMapStyle(
+  "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  "© OpenStreetMap contributors",
+);
+const satelliteTileUrl = import.meta.env.VITE_SATELLITE_TILE_URL?.trim() || "";
+const satelliteAttribution = import.meta.env.VITE_SATELLITE_ATTRIBUTION?.trim() || "";
+const satelliteMapStyle = satelliteTileUrl && satelliteAttribution
+  ? rasterMapStyle(satelliteTileUrl, satelliteAttribution)
+  : null;
+
+/*
+ * Satellite imagery is opt-in at build time. A provider's tile URL and its
+ * required attribution must be supplied explicitly; trip coordinates are not
+ * sent to an unreviewed third party merely because a map screen is opened.
+ */
+const mapModes = satelliteMapStyle ? (["raster", "satellite"] as const) : (["raster"] as const);
+
+function validCoordinates(lat: number, lng: number) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+export function coordinatesFromLocationUrl(locationUrl: string | null | undefined) {
+  if (!locationUrl) return null;
+  try {
+    const url = new URL(locationUrl);
+    const fromPath = url.pathname.match(/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+    const candidate = fromPath?.slice(1) || (url.searchParams.get("ll") || url.searchParams.get("q") || url.searchParams.get("query") || "").match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/)?.slice(1);
+    if (!candidate) return null;
+    const [lat, lng] = candidate.map(Number);
+    return validCoordinates(lat, lng) ? { lat, lng } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function mapPins(config: TripConfig | undefined, items: ItineraryItem[] | undefined, lang: Lang): MapPin[] {
+  const stopsByPhase = new globalThis.Map<string, MapPin[]>();
+  dailyMapStops(items).forEach((item) => {
+    const coordinates = coordinatesFromLocationUrl(item.location_url || item.waze_url);
+    if (!coordinates) return;
+    const stops = stopsByPhase.get(item.phase_id) || [];
+    stops.push({
+      id: `stop:${item.item_uid}`,
+      phaseId: item.phase_id,
+      date: item.date || undefined,
+      itemUid: item.item_uid,
+      ...coordinates,
+      title: itemTitle(item, lang),
+      subtitle: `${dateLabel(item.date!, lang)}${item.time ? ` · ${itineraryTimeLabel(item.time, lang)}` : ""}`,
+      kind: "stop",
+    });
+    stopsByPhase.set(item.phase_id, stops);
+  });
+  const configuredPhaseIds = new Set((config?.phases || []).map((phase) => phase.id));
+  const orderedPins = (config?.phases || []).flatMap((phase) => {
+    const phasePins: MapPin[] = [];
+    const lat = phase.mapStop?.lat;
+    const lng = phase.mapStop?.lng;
+    const phaseDate = phase.start || dailyMapStops(items).find((item) => item.phase_id === phase.id)?.date;
+    if (validCoordinates(lat ?? Number.NaN, lng ?? Number.NaN)) {
+      const accommodation = text(phase.accommodation?.name, lang) || phase.accommodation?.name_en || text(phase.mapStop?.name, lang) || text(phase.title, lang) || phase.id;
+      phasePins.push({
+        id: `stay:${phase.id}`,
+        phaseId: phase.id,
+        date: phaseDate || undefined,
+        lat: lat!,
+        lng: lng!,
+        title: accommodation,
+        subtitle: `${text(phase.title, lang) || phase.id} · ${copy(lang, "Accommodation", "לינה")}`,
+        kind: "stay",
+      });
+    }
+    phasePins.push(...(stopsByPhase.get(phase.id) || []));
+    return phasePins;
+  });
+  const orphanStops = dailyMapStops(items).flatMap((item) => configuredPhaseIds.has(item.phase_id) ? [] : (stopsByPhase.get(item.phase_id) || []));
+  return [...orderedPins, ...orphanStops.filter((pin, index, pins) => pins.findIndex((candidate) => candidate.id === pin.id) === index)];
+}
+
+export function wrappedMapIndex(index: number, count: number) {
+  return count > 0 ? ((index % count) + count) % count : 0;
+}
+
+function InteractiveMap({
+  pins,
+  lang,
+  onOpenItinerary,
+  focusRequest,
+}: {
+  pins: MapPin[];
+  lang: Lang;
+  onOpenItinerary: (pin: MapPin) => void;
+  focusRequest?: { pinId: string; sequence: number } | null;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<import("maplibre-gl").Map | null>(null);
+  const markerRefs = useRef<Array<import("maplibre-gl").Marker>>([]);
+  const markerElementRefs = useRef(new globalThis.Map<string, HTMLButtonElement>());
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [mapMode, setMapMode] = useState<(typeof mapModes)[number]>("raster");
+  const activePin = pins[activeIndex] || pins[0];
+
+  function syncActiveMarkerLabel(pinId: string | undefined) {
+    markerElementRefs.current.forEach((element, id) => {
+      const active = Boolean(pinId && id === pinId);
+      element.classList.toggle("active", active);
+      if (active) element.setAttribute("aria-current", "location");
+      else element.removeAttribute("aria-current");
+    });
+  }
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !pins.length) return;
+    let disposed = false;
+    let map: import("maplibre-gl").Map | undefined;
+    void Promise.all([import("maplibre-gl"), import("maplibre-gl/dist/maplibre-gl.css")]).then(([maplibregl]) => {
+      if (disposed) return;
+      const instance = new maplibregl.Map({
+        container,
+        style: mapMode === "satellite" && satelliteMapStyle ? satelliteMapStyle : freeMapStyle,
+        center: [pins[0].lng, pins[0].lat],
+        zoom: pins.length === 1 ? 12 : 5,
+      });
+      map = instance;
+      mapRef.current = instance;
+      instance.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+      // `load` waits for every vector tile. A slow/offline tile provider would
+      // leave the controls visible but never add the authoritative pins. The
+      // style is enough to render markers and fit the camera; tiles can finish
+      // loading independently afterward.
+      instance.on("style.load", () => {
+        pins.forEach((pin) => {
+          const markerButton = document.createElement("button");
+          markerButton.type = "button";
+          markerButton.className = "map-pin-marker";
+          markerButton.setAttribute("aria-label", `${pin.title} — ${pin.subtitle}`);
+          markerButton.title = pin.title;
+          const dot = document.createElement("span");
+          dot.className = `map-pin-dot ${pin.kind === "stay" ? "stay" : "stop"}`;
+          dot.setAttribute("aria-hidden", "true");
+          const label = document.createElement("span");
+          label.className = "map-pin-label";
+          label.textContent = pin.title;
+          markerButton.append(dot, label);
+          markerButton.addEventListener("click", () => {
+            const nextIndex = pins.findIndex((candidate) => candidate.id === pin.id);
+            if (nextIndex >= 0) setActiveIndex(nextIndex);
+            onOpenItinerary(pin);
+          });
+          markerElementRefs.current.set(pin.id, markerButton);
+          const marker = new maplibregl.Marker({ element: markerButton, anchor: "bottom" })
+            .setLngLat([pin.lng, pin.lat])
+            .addTo(instance);
+          markerRefs.current.push(marker);
+        });
+        syncActiveMarkerLabel(activePin?.id);
+        if (activePin) instance.jumpTo({ center: [activePin.lng, activePin.lat], zoom: 16 });
+        instance.resize();
+      });
+    });
+    return () => {
+      disposed = true;
+      markerRefs.current.forEach((marker) => marker.remove());
+      markerRefs.current = [];
+      markerElementRefs.current.clear();
+      map?.remove();
+      if (mapRef.current === map) mapRef.current = null;
+    };
+  }, [mapMode, pins]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !activePin) return;
+    syncActiveMarkerLabel(activePin.id);
+    map.flyTo({ center: [activePin.lng, activePin.lat], zoom: 16, duration: 1100, essential: true });
+  }, [activeIndex, activePin]);
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    const nextIndex = pins.findIndex((pin) => pin.id === focusRequest.pinId);
+    if (nextIndex < 0) return;
+    if (nextIndex !== activeIndex) {
+      setActiveIndex(nextIndex);
+      return;
+    }
+    const map = mapRef.current;
+    const pin = pins[nextIndex];
+    if (!map || !pin) return;
+    syncActiveMarkerLabel(pin.id);
+    map.flyTo({ center: [pin.lng, pin.lat], zoom: 16, duration: 1100, essential: true });
+  }, [focusRequest, pins]);
+
+  function moveTo(index: number) {
+    setActiveIndex(wrappedMapIndex(index, pins.length));
+  }
+
+  function showAll() {
+    const map = mapRef.current;
+    if (!map || !pins.length) return;
+    if (pins.length === 1) {
+      map.flyTo({ center: [pins[0].lng, pins[0].lat], zoom: 16, duration: 1100, essential: true });
+      return;
+    }
+    const west = Math.min(...pins.map((pin) => pin.lng));
+    const east = Math.max(...pins.map((pin) => pin.lng));
+    const south = Math.min(...pins.map((pin) => pin.lat));
+    const north = Math.max(...pins.map((pin) => pin.lat));
+    map.fitBounds([[west, south], [east, north]], { padding: 54, maxZoom: 5, duration: 1100 });
+  }
+
+  return (
+    <>
+      <div className="map-toolbar" aria-label={lang === "he" ? "ניווט בין נקודות" : "Location navigation"}>
+        <button className="map-control-button" type="button" onClick={() => moveTo(activeIndex - 1)}>
+          <ChevronLeft size={16} /> {lang === "he" ? "הקודם" : "Previous"}
+        </button>
+        <span className="map-location-counter" aria-live="polite">{activePin ? `${activeIndex + 1} / ${pins.length} · ${activePin.title}` : ""}</span>
+        <button className="map-control-button" type="button" onClick={() => moveTo(activeIndex + 1)}>
+          {lang === "he" ? "הבא" : "Next"} <ChevronRight size={16} />
+        </button>
+        <button className="map-control-button" type="button" onClick={showAll}>
+          <Globe2 size={16} /> {lang === "he" ? "הצג הכל" : "Show all"}
+        </button>
+        {mapModes.length > 1 ? (
+          <div className="map-mode-switch" role="group" aria-label={lang === "he" ? "סגנון מפה" : "Map style"}>
+            {mapModes.map((mode) => <button key={mode} className={mapMode === mode ? "active" : ""} type="button" onClick={() => setMapMode(mode)}>{mode === "satellite" ? (lang === "he" ? "לוויין" : "Satellite") : (lang === "he" ? "מפה" : "Raster")}</button>)}
+          </div>
+        ) : null}
+      </div>
+      <div ref={containerRef} className="interactive-map" aria-label={lang === "he" ? "מפת הטיול" : "Trip map"} />
+    </>
+  );
+}
+
+function MapView({ config, itinerary, lang, onOpenItinerary }: { config?: TripConfig; itinerary?: ActiveItinerary; lang: Lang; onOpenItinerary: (pin: MapPin) => void }) {
   const phaseStops = (config?.phases || []).filter((phase) => typeof phase.mapStop?.lat === "number" && typeof phase.mapStop?.lng === "number");
+  const dailyStops = dailyMapStops(itinerary?.items);
+  const pins = useMemo(() => mapPins(config, itinerary?.items, lang), [config, itinerary?.items, lang]);
+  const mapPanelRef = useRef<HTMLElement>(null);
+  const [focusRequest, setFocusRequest] = useState<{ pinId: string; sequence: number } | null>(null);
+
+  function focusPhaseOnMap(phaseId: string) {
+    setFocusRequest((current) => ({ pinId: `stay:${phaseId}`, sequence: (current?.sequence || 0) + 1 }));
+    window.requestAnimationFrame(() => mapPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
 
   return (
     <section className="module-layout">
       <div className="module-header">
         <span className="panel-label"><Map size={16} /> {moduleLabel("map", lang)}</span>
-        <h2>{lang === "he" ? "תחנות הלינה של שלבי הטיול" : "Journey phase accommodation stops"}</h2>
-        <p>{lang === "he" ? "בשלב הראשון המפה נשארת ממוקדת: תחנת הלינה הראשונה של כל שלב, עם ניווט מהיר. נקודות יומיות יתווספו בשלב הבא." : "The first map view stays intentionally focused: the first accommodation stop for each phase, with one-tap navigation. Daily locations come in the next stage."}</p>
+        <h2>{lang === "he" ? "תחנות לינה ונקודות יומיות" : "Accommodation and daily stops"}</h2>
+        <p>{lang === "he" ? "תחנות הלינה והנקודות היומיות מהמסלול מוצגות לפי הסדר, עם ניווט מהיר לקישורים שכבר אושרו." : "Accommodation anchors and dated itinerary stops appear in order, with one-tap navigation to the links already confirmed for the trip."}</p>
       </div>
+      {pins.length ? (
+        <section ref={mapPanelRef} className="map-canvas-panel">
+          <div className="map-stop-heading">
+            <h3>{lang === "he" ? "מפת הטיול" : "Trip map"}</h3>
+            <p>{lang === "he" ? "ירוק: לינה. כתום: נקודה יומית עם קואורדינטות מאומתות." : "Teal: accommodation. Coral: daily stop with verified coordinates."}</p>
+          </div>
+          <InteractiveMap pins={pins} lang={lang} onOpenItinerary={onOpenItinerary} focusRequest={focusRequest} />
+        </section>
+      ) : <p className="empty-state">{lang === "he" ? "נוסיף מפה ברגע שיהיו קואורדינטות לתחנות הטיול." : "A map will appear once the trip has confirmed stop coordinates."}</p>}
       <div className="module-grid">
         {phaseStops.map((phase) => {
           const ll = `${phase.mapStop?.lat},${phase.mapStop?.lng}`;
@@ -1060,7 +1380,15 @@ function MapView({ config, lang }: { config?: TripConfig; itinerary?: ActiveItin
           return (
             <article className="map-anchor" key={phase.id}>
               <span className="booking-type">{lang === "he" ? "שלב" : "Phase"}</span>
-              <h3>{text(phase.title, lang) || phase.id}</h3>
+              <button
+                className="map-anchor-title"
+                type="button"
+                onClick={() => focusPhaseOnMap(phase.id)}
+                aria-label={copy(lang, `Show ${text(phase.title, lang) || phase.id} on the map`, `הצגת ${text(phase.title, lang) || phase.id} במפה`)}
+              >
+                <MapPin size={18} aria-hidden="true" />
+                {text(phase.title, lang) || phase.id}
+              </button>
               <p>{accommodationName}{phase.accommodation?.address ? ` · ${phase.accommodation.address}` : ""}</p>
               <div className="action-strip">
                 <a href={destination} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a>
@@ -1071,6 +1399,26 @@ function MapView({ config, lang }: { config?: TripConfig; itinerary?: ActiveItin
         })}
       </div>
       {!phaseStops.length ? <p className="empty-state">No phase accommodation stops have been added yet.</p> : null}
+      <section className="map-stop-section">
+        <div className="map-stop-heading">
+          <h3>{lang === "he" ? "נקודות יומיות" : "Daily itinerary stops"}</h3>
+          <p>{lang === "he" ? "מוצגים רק פריטים מתוארכים עם קישור לניווט; פריטים עם קואורדינטות מופיעים גם על המפה." : "Only dated itinerary items with a saved navigation link appear here; those with coordinates are also pinned on the map."}</p>
+        </div>
+        <div className="module-grid">
+          {dailyStops.map((item) => (
+            <article className="map-anchor" key={item.item_uid}>
+              <span className="booking-type">{item.item_type}</span>
+              <h3>{itemTitle(item, lang)}</h3>
+              <p>{dateLabel(item.date!, lang)}{item.time ? ` · ${itineraryTimeLabel(item.time, lang)}` : ""}</p>
+              <div className="action-strip">
+                {item.location_url ? <a href={item.location_url} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
+                {item.waze_url ? <a href={item.waze_url} target="_blank" rel="noreferrer"><Navigation size={15} /> Waze</a> : null}
+              </div>
+            </article>
+          ))}
+        </div>
+        {!dailyStops.length ? <p className="empty-state">{lang === "he" ? "עדיין אין נקודות יומיות עם קישור ניווט." : "No dated itinerary stops have a navigation link yet."}</p> : null}
+      </section>
     </section>
   );
 }
@@ -1238,6 +1586,7 @@ export default function App() {
   const [activeModule, setActiveModule] = useState<Module | null>(isModule(initialHash) ? initialHash : null);
   const [lang, setLang] = useState<Lang>(() => preferredLang());
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
+  const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const authed = Boolean(tokenStore.get());
   const config = useQuery({ queryKey: ["config"], queryFn: getConfig, enabled: authed });
@@ -1279,6 +1628,13 @@ export default function App() {
     window.location.hash = module;
     setMenuOpen(false);
   };
+  const openMapItinerary = (pin: MapPin) => {
+    setJourneyFocus({ phaseId: pin.phaseId, date: pin.date, itemUid: pin.itemUid });
+    setActiveTab("journey");
+    setActiveModule(null);
+    window.location.hash = "journey";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
   const companionName = botDisplayName(config.data, hermes.data?.identity.name, lang);
   const heroPhaseId = !activeModule && activeTab === "journey"
     ? journeyHeroPhaseId
@@ -1287,13 +1643,13 @@ export default function App() {
       : "";
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
-    journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} />,
+    journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
     moments: <MomentsView todayDate={today.data?.today} />,
     more: <MoreView config={config.data} isOrganizer={me.data?.is_organizer} openModule={openModule} />,
   }[activeTab];
   const moduleContent = activeModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
-    map: <MapView config={config.data} lang={lang} />,
+    map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
     budget: <ModulePlaceholder module="budget" lang={lang} />,
     photos: <ModulePlaceholder module="photos" lang={lang} />,
   }[activeModule] : null;
