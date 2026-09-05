@@ -283,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
                 # Same checkout the deploy adapter tars from; the worker uses it
                 # to materialize the promoted release's source_revision.
                 repo_root=args.repo_root,
+                # Operator's chat id for the provisioning-outcome DM. Same chat
+                # as the control-plane API's approval notification, so the two
+                # halves of one run land in one place. Unset simply enqueues no
+                # operator rows.
+                operator_chat_id=os.environ.get("CONTROL_PLANE_OPERATOR_CHAT_ID", ""),
             )
             import signal, time as _time
             stopping = False

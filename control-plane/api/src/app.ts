@@ -48,6 +48,12 @@ export interface PlannerDependencies {
   db: pg.Pool;
   config: {
     approvalTtlSeconds: number;
+    /**
+     * Raw Telegram chat id the operator's provisioning notifications are sent
+     * to — the same chat as the signup super-admin DM. Optional: absent means
+     * approvals still work and simply enqueue no operator notification.
+     */
+    operatorChatId?: string;
   };
 }
 
@@ -843,8 +849,15 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     });
   });
 
-  // POST /v1/plans/:planId/approve — approve a pending plan.
-  // Header: X-Telegram-Login (trip owner only for Sprint 3)
+  // POST /v1/plans/:planId/approve — the trip owner approves a pending plan.
+  //
+  // This and the portal's POST /v1/trips/:id/plans/:planId/approve are ONE
+  // flow on two auth surfaces, not two competing paths: same decision, same
+  // authorizer (the trip owner), same effect. This one takes header auth and
+  // is what the live-run driver and docs/setup-test-plan.md call; the portal
+  // twin takes the SPA's cookie+CSRF session. There is no separate operations
+  // approval — the operator is notified, not asked.
+  // Header: X-Telegram-Login or X-Portal-Password-Login (trip owner only)
   app.post("/v1/plans/:planId/approve", async (request, reply) => {
     if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
       return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
@@ -880,7 +893,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!memberRow.rows[0]) return reply.code(403).send({ error: "NOT_OWNER" });
 
     const actorRef = `user:${identity.user_id}`;
-    const result = await issueApproval(planner.db, planId, actorRef, planner.config.approvalTtlSeconds);
+    const result = await issueApproval(planner.db, planId, actorRef, planner.config.approvalTtlSeconds, {
+      operatorChatId: planner.config.operatorChatId,
+    });
 
     if (!result.ok) {
       const status = result.reason === "PLAN_NOT_FOUND" ? 404

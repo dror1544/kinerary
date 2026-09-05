@@ -1298,3 +1298,92 @@ class ChatBindingLifecycleTests(unittest.TestCase):
                        WHERE chat_id = %s""",
                     (self.chat_id,),
                 )
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OperatorNotificationTests(unittest.TestCase):
+    """The operator's own copy of a provisioning outcome.
+
+    Observability, never a gate: these rows are written in the same transaction
+    as the outcome they report, are addressed to the operator rather than the
+    organizer, and are simply absent when no operator chat id is configured.
+    """
+
+    OPERATOR_CHAT = "operator-chat-9"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn)
+
+    def tearDown(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+
+    def _worker(self, *, operator_chat_id, fail=False):
+        return ProvisionerWorker(
+            db_url=DB_URL,
+            deploy=FakeDeployAdapter(fail=fail, error_code="FAKE_DEPLOY_FAILURE"),
+            worker_id="test-provisioner-operator",
+            operator_chat_id=operator_chat_id,
+        )
+
+    def _rows(self, notification_type):
+        self.conn.rollback()
+        return self.conn.execute(
+            "SELECT recipient, payload, state FROM control_plane.notification_outbox "
+            "WHERE trip_id = %s AND notification_type = %s",
+            (self.fix["trip_id"], notification_type),
+        ).fetchall()
+
+    def test_success_writes_an_operator_copy_alongside_the_organizer_one(self) -> None:
+        self._worker(operator_chat_id=self.OPERATOR_CHAT).run_once()
+
+        operator = self._rows("operator_provisioning_complete")
+        self.assertEqual(len(operator), 1)
+        self.assertEqual(operator[0]["recipient"], self.OPERATOR_CHAT)
+        self.assertEqual(operator[0]["state"], "pending")
+        self.assertIn("private_url", operator[0]["payload"])
+        self.assertEqual(operator[0]["payload"]["trip_id"], self.fix["trip_id"])
+
+        # The organizer's row is untouched and still addressed elsewhere.
+        organizer = self._rows("provisioning_complete")
+        self.assertEqual(len(organizer), 1)
+        self.assertNotEqual(organizer[0]["recipient"], self.OPERATOR_CHAT)
+
+    def test_no_operator_chat_id_writes_no_operator_row(self) -> None:
+        self._worker(operator_chat_id=None).run_once()
+        self.assertEqual(self._rows("operator_provisioning_complete"), [])
+        # The organizer still gets theirs — the two are independent.
+        self.assertEqual(len(self._rows("provisioning_complete")), 1)
+
+    def test_empty_operator_chat_id_is_treated_as_unset(self) -> None:
+        # __main__ passes os.environ.get(..., "") — an unset env var must not
+        # produce a row addressed to the empty string.
+        self._worker(operator_chat_id="").run_once()
+        self.assertEqual(self._rows("operator_provisioning_complete"), [])
+
+    def test_exhausted_failure_writes_an_operator_copy_with_the_error_code(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET attempt = max_attempts - 1 WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+
+        self._worker(operator_chat_id=self.OPERATOR_CHAT, fail=True).run_once()
+
+        operator = self._rows("operator_provisioning_failed")
+        self.assertEqual(len(operator), 1)
+        self.assertEqual(operator[0]["recipient"], self.OPERATOR_CHAT)
+        self.assertEqual(operator[0]["payload"]["safe_error_code"], "FAKE_DEPLOY_FAILURE")
+
+    def test_retriable_failure_writes_no_operator_row(self) -> None:
+        # Still has retries left, so it is not an outcome worth reporting yet.
+        self._worker(operator_chat_id=self.OPERATOR_CHAT, fail=True).run_once()
+        self.assertEqual(self._rows("operator_provisioning_failed"), [])

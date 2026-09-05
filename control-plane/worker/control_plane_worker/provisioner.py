@@ -376,9 +376,15 @@ class ProvisionerWorker:
         enrich: EnrichFn | None = None,
         repo_root: str | None = None,
         materialize: MaterializeFn | None = None,
+        operator_chat_id: str | None = None,
     ) -> None:
         self._db_url = db_url
         self._deploy = deploy
+        # Raw Telegram chat id for the operator's own copy of the provisioning
+        # outcome. None (the default, and every existing test) enqueues no
+        # operator row at all — the organizer notification is unaffected either
+        # way, and nothing in the job path reads these rows back.
+        self._operator_chat_id = operator_chat_id or None
         self._worker_id = worker_id or f"{self.DEFAULT_WORKER_ID_PREFIX}_{secrets.token_hex(8)}"
         self._companion = companion or NullCompanionProfileAdapter()
         self._mcp_bridge = mcp_bridge or NullMcpBridgeAdapter()
@@ -785,6 +791,11 @@ class ProvisionerWorker:
                     (_generate_notif_id(), trip_id, recipient_chat_id, notif_payload),
                 )
 
+                self._enqueue_operator_notification(
+                    cur, trip_id, "operator_provisioning_complete",
+                    {"private_url": private_url},
+                )
+
         # Companion-profile creation and its chat binding are best-effort
         # side effects performed after the transaction above durably commits
         # — the same "commit first, external side effect after" shape as
@@ -900,6 +911,58 @@ class ProvisionerWorker:
                 exc_info=True,
             )
 
+    def _enqueue_operator_notification(
+        self,
+        cur: Any,
+        trip_id: str,
+        notification_type: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """The operator's own copy of a provisioning outcome.
+
+        Addressed to the configured operator chat, never to the organizer —
+        which is why it may carry identifiers and a safe error code that the
+        organizer-facing row deliberately withholds. Written in the same
+        transaction as the outcome it reports, so the two cannot disagree.
+
+        Observability only: nothing in the job path reads these rows back, and
+        no operator chat id configured means no row at all rather than a row
+        the dispatcher would mark 'skipped'.
+        """
+        if not self._operator_chat_id:
+            return
+        cur.execute(
+            """
+            SELECT t.title, t.destination_label, t.slug, u.display_name AS organizer_name
+            FROM control_plane.trips t
+            LEFT JOIN control_plane.trip_memberships tm
+              ON tm.trip_id = t.id AND tm.role = 'owner' AND tm.status = 'active'
+            LEFT JOIN control_plane.users u ON u.id = tm.user_id
+            WHERE t.id = %s
+            """,
+            (trip_id,),
+        )
+        row = cur.fetchone() or {}
+        payload: dict[str, Any] = {
+            "trip_id": trip_id,
+            "trip_title": row.get("title") or row.get("destination_label"),
+            "trip_slug": row.get("slug"),
+            "organizer": row.get("organizer_name"),
+        }
+        payload.update(extra or {})
+        cur.execute(
+            """
+            INSERT INTO control_plane.notification_outbox
+              (id, trip_id, kind, recipient, payload, signup_request_id,
+               notification_type, adapter, state)
+            VALUES (%s, %s, %s, %s, %s::jsonb, NULL, %s, 'provisioner', 'pending')
+            """,
+            (
+                _generate_notif_id(), trip_id, notification_type,
+                self._operator_chat_id, json.dumps(payload), notification_type,
+            ),
+        )
+
     def _fail(
         self,
         conn: psycopg.Connection,
@@ -993,3 +1056,15 @@ class ProvisionerWorker:
                         """,
                         (_generate_notif_id(), job_id, recipient_chat_id, notif_payload),
                     )
+
+                    if self._operator_chat_id:
+                        cur.execute(
+                            "SELECT trip_id FROM control_plane.jobs WHERE id = %s",
+                            (job_id,),
+                        )
+                        job_row = cur.fetchone()
+                        if job_row:
+                            self._enqueue_operator_notification(
+                                cur, job_row["trip_id"], "operator_provisioning_failed",
+                                {"safe_error_code": error_code},
+                            )

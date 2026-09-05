@@ -3,7 +3,6 @@ import { z } from "zod";
 export type Me = {
   id: string;
   displayName: string;
-  isProvisioningAdmin: boolean;
 };
 
 export type InviteSummary = {
@@ -24,7 +23,7 @@ export type TripSummary = {
   lifecycleState: string;
   nextAction: string;
   interview: { sessionId: string; state: string } | null;
-  provisioning: { planId: string; planStatus: string; reviewState: string | null; jobState: string | null; safeErrorCode: string | null } | null;
+  provisioning: { planId: string; planStatus: string; jobState: string | null; releaseId: string | null; digest: string; safeErrorCode: string | null } | null;
   runtimeReady: boolean;
   permissions: { role: string; dashboard: boolean; runtime: boolean; invite: boolean; requestProvisioning: boolean };
   invites?: InviteSummary[];
@@ -62,12 +61,12 @@ const tripSchema: z.ZodType<TripSummary> = z.object({
   id: z.string(), title: z.string(), destination: z.string().nullable(), startDate: z.string().nullable(), endDate: z.string().nullable(),
   tripType: z.string(), lifecycleState: z.string(), nextAction: z.string(),
   interview: z.object({ sessionId: z.string(), state: z.string() }).nullable(),
-  provisioning: z.object({ planId: z.string(), planStatus: z.string(), reviewState: z.string().nullable(), jobState: z.string().nullable(), safeErrorCode: z.string().nullable() }).nullable(),
+  provisioning: z.object({ planId: z.string(), planStatus: z.string(), jobState: z.string().nullable(), releaseId: z.string().nullable(), digest: z.string(), safeErrorCode: z.string().nullable() }).nullable(),
   runtimeReady: z.boolean(),
   permissions: z.object({ role: z.string(), dashboard: z.boolean(), runtime: z.boolean(), invite: z.boolean(), requestProvisioning: z.boolean() }),
   invites: z.array(inviteSchema).optional(),
 });
-const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string(), isProvisioningAdmin: z.boolean() });
+const meSchema: z.ZodType<Me> = z.object({ id: z.string(), displayName: z.string() });
 
 export function signIn(returnTo: string) {
   window.location.assign(`/v1/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);

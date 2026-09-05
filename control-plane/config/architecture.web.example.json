@@ -14,7 +14,6 @@
     "runtime_exchange_key_secret_ref": "env://RUNTIME_EXCHANGE_KEY",
     "runtime_upstream_host_suffixes": ["localhost", "internal"],
     "telegram_bot_username": "kinerary_bot",
-    "provisioning_admin_subject_digests": ["sha256:c9a2902fe9b1d10e1c0fbf586f6b6bc72c1b8d50b9ab974245d35ec499c1f318"],
     "session_ttl_seconds": 604800
   }
 }

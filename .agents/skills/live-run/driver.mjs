@@ -157,6 +157,9 @@ const steps = {
     state.planId = planId; save();
 
     warn("approving a plan is a real decision — this driver places the call because you started it");
+  // The approval also enqueues an operator Telegram DM, in its own transaction.
+  // Observability, not a gate: nothing below waits for it, and a run in which it
+  // never arrives is still a passing run.
     const a = await call("POST", `/v1/plans/${planId}/approve`, { body: {} });
     if (a.status !== 200 && a.status !== 201) die(`approve returned ${a.status}`);
     record(9, { kind: "ai", planId, approve: a.status });

@@ -11,12 +11,66 @@ interface OutboxRow {
   max_attempts: number;
 }
 
+function payloadString(row: OutboxRow, key: string): string | null {
+  const value = row.payload?.[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Wording for the `operator_*` types. These are addressed to the operator's own
+ * chat id, NOT to an organizer, which is why they may carry identifiers and
+ * diagnostics that the organizer-facing text above deliberately withholds.
+ *
+ * They are observability only. Nothing in the provisioning pipeline reads,
+ * waits for, or branches on whether one of these was delivered.
+ */
+function operatorMessageTextFor(row: OutboxRow): string | null {
+  const title = payloadString(row, "trip_title") ?? payloadString(row, "trip_slug") ?? "Untitled trip";
+  const lines = [
+    `Trip: ${title}${payloadString(row, "trip_id") ? ` (${payloadString(row, "trip_id")})` : ""}`,
+  ];
+  const organizer = payloadString(row, "organizer");
+  if (organizer) lines.push(`Organizer: ${organizer}`);
+
+  if (row.notification_type === "operator_provisioning_approved") {
+    const planId = payloadString(row, "plan_id");
+    if (!planId) return null;
+    lines.unshift("🟡 Provisioning approved by the organizer");
+    lines.push(`Plan: ${planId}`);
+    const digest = payloadString(row, "plan_digest");
+    if (digest) lines.push(`Digest: ${digest}`);
+    const releaseId = payloadString(row, "release_id");
+    if (releaseId) lines.push(`Release: ${releaseId}`);
+    lines.push("Status: provisioning queued");
+    return lines.join("\n");
+  }
+
+  if (row.notification_type === "operator_provisioning_complete") {
+    lines.unshift("🟢 Provisioning complete");
+    const url = payloadString(row, "private_url");
+    if (url) lines.push(`Site: ${url}`);
+    lines.push("Status: ready_private");
+    return lines.join("\n");
+  }
+
+  if (row.notification_type === "operator_provisioning_failed") {
+    lines.unshift("🔴 Provisioning failed");
+    // Operator-addressed, so the safe error code belongs here — the organizer
+    // copy of this same event deliberately omits it.
+    lines.push(`Status: ${payloadString(row, "safe_error_code") ?? "PROVISIONING_FAILED"}`);
+    return lines.join("\n");
+  }
+
+  return null;
+}
+
 /**
  * Builds the DM text for one trip-notification outbox row, or null for a
  * notification_type this dispatcher doesn't know how to word yet (the row is
  * marked 'skipped', not retried forever).
  */
 function messageTextFor(row: OutboxRow): string | null {
+  if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === "provisioning_complete") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
     if (!url) return null;

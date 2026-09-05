@@ -79,7 +79,9 @@ export const architectureProfileSchema = z.object({
     runtime_exchange_key_secret_ref: secretReference,
     runtime_upstream_host_suffixes: z.array(z.string().min(1).max(253).regex(/^[A-Za-z0-9.-]+$/)).min(1),
     telegram_bot_username: z.string().regex(/^[A-Za-z0-9_]{5,32}$/),
-    provisioning_admin_subject_digests: z.array(z.string().regex(/^sha256:[a-f0-9]{64}$/)).min(1),
+    // There is deliberately no provisioning-admin allowlist here. Provisioning
+    // is approved by the trip's own organizer; the operator is notified, not
+    // asked. See docs/landing-page-plan.md.
     session_ttl_seconds: z.number().int().min(3600).max(2592000).default(604800),
   }).strict().optional(),
   /**

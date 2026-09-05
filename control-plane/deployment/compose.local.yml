@@ -176,6 +176,12 @@ services:
       # SSO is ruled out and Google is unconfigured. Stopgap until a real
       # member/organizer signup flow exists.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      # Operator's Telegram chat id for the provisioning-outcome DM. The API
+      # sends the matching approval DM to the same chat, resolved from the
+      # profile's signup.super_admin_chat_id_secret_ref. Empty simply enqueues
+      # no operator rows — this is observability, never a gate: no part of
+      # provisioning waits on, retries for, or branches on these notifications.
+      CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}

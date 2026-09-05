@@ -30,8 +30,9 @@ Hermes-agent runtime, and Telegram as the first messaging adapter. Those are
 The first release deliberately supports one happy-path organizer and one demo
 trip at a time, but it must use durable IDs, membership scoping, idempotency,
 and per-trip records from the beginning. For the local MVP, a super-admin
-approval is required before a verified signup becomes a usable draft. Manual
-approval is also expected at the later provision and public-activation gates.
+approval is required before a verified signup becomes a usable draft. The
+provision gate is the **organizer's own** — superseded 2026-09-05, see below.
+The public-activation gate is unscoped; see `docs/activation-scope.md`.
 
 ### MVP signup-approval gate
 
@@ -595,6 +596,44 @@ this sprint still **not built** — deferred as a follow-on, since the exit gate
 ("a sealed, scanned release artifact is promoted and selected by the planner")
 does not hinge on them.
 
+**Technical debt — lifecycle enforcement is declared, not enforced (recorded
+2026-09-05, deliberately NOT refactored).**
+
+`control-plane/api/src/lifecycle.ts` declares the trip state machine and
+exports `canTransitionTrip` / `assertTripTransition`. Both have **zero
+production callers** — the only importer in the tree is
+`test/lifecycle.test.ts`, which tests the table against itself.
+`tripStates`, `TripState`, `jobStates` and `JobState` have no references at
+all. Meanwhile **eight separate writers** move trips between states:
+`signup.ts:279`, `interview.ts:572` and `:832`, `planner.ts:152` and `:289`,
+`plan-approval.ts:71`, `intake-correction.ts:164`, and
+`provisioner.py`'s `_complete`. Four read the current state first; four write
+blind.
+
+The declared table is also **wrong**, not merely unenforced — so centralizing
+means correcting it, not just calling it:
+
+- `retryProvision` and `correctIntake` both perform backward edges to
+  `intake_confirmed` that `allowedTransitions` forbids outright;
+- `provisioner.py` jumps `provisioning_approved → ready_private`, skipping
+  `provisioning`, which the table requires;
+- `pending_signup_approval` has no writer at all.
+
+Half the enum is unreachable: `pending_signup_approval`, `provisioning`,
+`activation_approved`, `active`, `completed`, `sealed`.
+
+**The rule, as Dror set it:** *before adding significant new lifecycle
+transitions or writers, centralize lifecycle transition enforcement so the
+declared state machine becomes authoritative rather than documentation-only.*
+Avoid new ad-hoc writers; do not refactor the existing ones unless a concrete
+correctness issue forces it. The guarded transitions are adequate for the
+current live flow.
+
+*Honest note:* the organizer-reject route added 2026-09-05 writes
+`planned → intake_confirmed`, a backward edge this table forbids. It is a
+repointed existing transaction (the former ops-reject), not a new writer — but
+it is one more instance, and it is counted above.
+
 Build — **operational gaps found in the Phase H run** (each needed a hand DB
 edit or a destroy-and-recreate before this sprint):
 
@@ -933,7 +972,7 @@ handback begins, masking the settle-window wait and the agent's own latency —
 Dror's own suggestion, unprompted: "the writing… signal give the feeling
 there is someone on the other side."
 
-#### Track 6 — the watchdog can close a turn out from under a still-working agent *(scoped, not built)*
+#### Track 6 — the watchdog can close a turn out from under a still-working agent *(partially mitigated 2026-09-05; root cause open)*
 
 Run 10: a `bot_tone` question rendered by the 30-second watchdog got tapped,
 and nothing happened until the organizer typed a message. Root cause, read
@@ -970,6 +1009,52 @@ as the stuck-button symptom — the delay before the agent actually gets to
 use something stretches long enough for Hermes's own side to have moved on.
 Not a timeout to lengthen (`INBOUND_SETTLE_SECONDS`/`AGENT_FLOOR_SECONDS`
 are not document-read timeouts); filed here rather than as its own track.
+
+**Direction set by Dror, 2026-09-05.** Track 6 is fixed independently of the
+provisioning-approval work. A **partial mitigation landed the same day** —
+`DOCUMENT_FLOOR_SECONDS` gives a document/photo turn 90 seconds instead of 30,
+session-scoped via migration `0040` and cleared by the next ordinary turn. Its
+own commit is explicit that this is *"a wider guess, not a fix: nothing here
+lets the control plane tell 'still working' from 'stuck', which is what Track 6
+actually needs."* The root cause is therefore still open, and two things are
+settled about the eventual fix so they are not re-derived later:
+
+- **The 30-second floor is wrong for document ingestion.** Run 12 measured a
+  real document turn taking over a minute of genuine Hermes work before its
+  first write — the 30s floor closed the turn out from under a still-working
+  agent, and Hermes's next two tool calls returned `404 NOT_FOUND`, so the
+  document's answers were never recorded and the agent could not say so. The
+  watchdog followed its own rule correctly; the rule is what is wrong for this
+  turn kind. The 90s floor widens the window; it does not close the gap.
+- **Do not solve it by raising an arbitrary timeout.** The fix is in the turn
+  semantics: make a long-running document extraction distinguishable from a
+  genuinely stalled or failed turn, and make retries idempotent from the
+  interviewer's and the organizer's point of view. Retries currently surface to
+  the user as repeated interview questions, which is the part that actually
+  damages onboarding.
+
+**Exit gate for Track 6:** a slow document turn is never closed by the
+watchdog, and a retried turn never re-asks a question the organizer already
+answered. This is an onboarding-reliability issue and should be resolved
+**before live onboarding scales**.
+
+**But not by building more watchdog machinery.**
+`docs/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
+in its *Stop* column — "this is precisely what a graph migration deletes" — and
+§2.1 reads run 12's two `404 NOT_FOUND`s as an **`ExecutionContext` failure**,
+stated exactly: `/internal/interview/agent/current/*` resolves "which interview
+am I in" by looking for an open turn, the watchdog had closed it, and the
+watchdog's only way to ask "is the agent still working?" is to guess from
+elapsed time. *"You cannot supervise a lifecycle you do not own, you can only
+guess at it, and every guess is a threshold someone will eventually exceed."*
+
+That is the same conclusion as the directive above, one layer down: "fix the
+turn semantics" **is** owning execution identity and lifecycle. So Track 6's
+remaining work should be met by the `ExecutionContext` contract — which the
+review recommends starting now, in parallel with onboarding rather than after
+it — and not by another floor, settle or watchdog threshold. The 90s document
+floor stands as the interim widening; nothing further should be added to that
+machinery.
 
 #### Track 7 — the agent can still ask a choice question in prose *(scoped, not built)*
 
@@ -1128,7 +1213,47 @@ Exit gate: private verification demonstrates one group, one logical binding,
 one organizer profile and one exact trip context/MCP identity, with a two-trip
 isolation test passing.
 
+#### Track 8 — router-owned deterministic progression, with answer-completeness validation — **BUILT (2026-09-05)**, one gap open
+
+Agreed and built on 2026-09-05, independently of the provisioning-approval
+convergence — nothing in this track is in scope for the approval branch. Both
+halves landed in `6205b2d`:
+
+- **Router-owned deterministic progression. — BUILT.** `routerOwned` marks the
+  four questions needing neither context nor interpretation — `trip_type`,
+  `bot_gender`, `bot_tone`, `bot_proactive` — and the router alone asks them:
+  `nominateQuestionForChat` refuses them outright, and a per-tick scan asks them
+  the moment they are next, including while an agent turn is open doing
+  something else. That covers both the 3–5 minute gaps between fixed-choice
+  questions and the dead air during document extraction, as one mechanism
+  rather than two. Deliberately explicit that fixed-option is necessary but not
+  sufficient: `dietary` is fixed-option and stays with the agent.
+- **Lightweight answer-completeness validation. — BUILT.** `checkComplete`, an
+  opt-in per-question check rejecting with `INCOMPLETE_ANSWER` plus a detail
+  string the agent can act on. Schema validity and substantive completeness are
+  different questions — `travelers` recorded as `{count: 5, age_group: "adults"}`
+  satisfied the first while establishing nobody at all, which is why the
+  organizer was later asked about allergies with no roster to attach them to.
+  Nothing is written on rejection, so the question stays outstanding rather than
+  answered badly.
+
+**Known gap, open:** SOUL has not been told about router-owned questions, so
+the agent is blocked from *nominating* them but not from *narrating* them in
+prose. That is Track 7's problem one layer up, and it is untested live.
+
+**Exit gate for Track 8:** the four router-owned questions are never asked by
+the agent in prose, and no answer advances the interview without satisfying its
+own completeness check. Not met while the SOUL gap above stands.
+
 ### Sprint 6 — Verification, explicit activation, dashboard, and demo rehearsal
+
+> **Activation is superseded pending scoping (2026-09-05, Dror).** The separate
+> expiring activation plan and its distinct approval, described below, predate
+> `docs/activation-scope.md`. `activation_approved` and `active` are declared in
+> the schema but have no writer, and whether they survive at all is an open
+> product question. Do not build against this section's activation design until
+> that scoping lands. The rest of the sprint (verification, dashboard, demo
+> rehearsal) is unaffected.
 
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
