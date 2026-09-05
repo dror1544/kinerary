@@ -171,38 +171,40 @@ EOF
   return 1
 }
 
-# UNCOMMITTED REPO EDITS ARE NOT DRIFT. The rule protects profile content from
-# being destroyed, because ~/.hermes has no history. It does not protect the
-# profile from the repo: a repo-side edit that has not been deployed yet is
-# normal authoring, and is exactly what "capture before you deploy" asks for.
+# WHAT THE RULE ACTUALLY PROTECTS: ~/.hermes must never hold the ONLY copy of
+# something. It has no history, so content that exists there and nowhere else is
+# one deploy away from being gone. That is the whole risk.
 #
-# Comparing the WORKING TREE to the profile could not tell those apart, so it
-# blocked every uncommitted improvement to a profile file — including the commit
-# that would have given that improvement its history. That inverts the rule:
-# it forced deploy-before-commit, which is the one ordering the whole section
-# exists to prevent.
+# It follows that drift has a DIRECTION, and only one of the two matters:
 #
-# Comparing HEAD to the profile tells them apart exactly. If what is COMMITTED
-# still matches the profile, nothing the profile holds is at risk and the
-# difference is a pending deploy. If HEAD differs, the profile holds content the
-# repo does not, and that is the case worth blocking.
-profile_matches_head() {
-  # $1 repo-relative path (file or directory) · $2 the profile's copy.
-  local rel="$1" dest="$2" f relf
-  if [ -f "$rel" ]; then
-    git show "HEAD:$rel" 2>/dev/null | diff -q - "$dest" >/dev/null 2>&1
+#   profile has content the repo does not  ->  uncaptured. Block.
+#   repo has content the profile does not  ->  undeployed. Warn.
+#
+# Comparing the two copies for equality cannot tell those apart, so it blocked
+# on both. That inverted the rule it enforces: an improvement to a profile file
+# blocked its own commit, forcing deploy-before-commit — the one ordering
+# "capture before you deploy" exists to prevent. Comparing against HEAD only
+# moved the problem one commit later, since a committed-but-undeployed change
+# differs from the profile too.
+#
+# Git answers the real question exactly, and cheaply. Hash the profile's copy:
+# if git already has that blob, this content was committed at some point, so it
+# is captured and nothing is at risk. If git has never seen it, the profile is
+# the only copy — which is the case worth stopping a commit for.
+profile_content_is_captured() {
+  # $1 the profile's copy (file or directory). No repo path needed: the question
+  # is whether git knows this CONTENT, not where it currently lives.
+  local dest="$1" f hash
+  if [ -f "$dest" ]; then
+    hash="$(git hash-object "$dest" 2>/dev/null)" || return 1
+    git cat-file -e "$hash" 2>/dev/null
     return $?
   fi
-  [ -d "$rel" ] || return 1
-  # Every file the profile holds must exist at HEAD, byte-identical...
+  [ -d "$dest" ] || return 1
   while IFS= read -r f; do
-    relf="$rel/${f#"$dest"/}"
-    git show "HEAD:$relf" 2>/dev/null | diff -q - "$f" >/dev/null 2>&1 || return 1
+    hash="$(git hash-object "$f" 2>/dev/null)" || return 1
+    git cat-file -e "$hash" 2>/dev/null || return 1
   done < <(find "$dest" -type f)
-  # ...and HEAD must hold nothing the profile is missing.
-  while IFS= read -r relf; do
-    [ -f "$dest/${relf#"$rel"/}" ] || return 1
-  done < <(git ls-tree -r --name-only HEAD -- "$rel")
   return 0
 }
 
@@ -220,8 +222,8 @@ if [ -d "$HERMES_PROFILES" ]; then
         if server="$(served_from_other_worktree "$repo_path" "$dest")"; then
           warn "profile '$profile' is served from another checkout, not this one: $server" \
                "nothing to do here unless you meant to deploy this checkout's $repo_path"
-        elif profile_matches_head "$repo_path" "$dest"; then
-          warn "$repo_path is ahead of profile '$profile' — an undeployed edit, not drift" \
+        elif profile_content_is_captured "$dest"; then
+          warn "$repo_path differs from profile '$profile' — the profile's copy is in git history, so this is undeployed, not uncaptured" \
                "deploy when the code that goes with it deploys: scripts/install-hermes-skill.sh"
         else
           block "hermes drift — $repo_path differs from profile '$profile'" \
@@ -242,8 +244,8 @@ if [ -d "$HERMES_PROFILES" ]; then
         if server="$(served_from_other_worktree "$src" "$dest")"; then
           warn "profile '$profile' runs $name from another checkout, not this one: $server" \
                "nothing to do here unless you meant to deploy this checkout's $name"
-        elif profile_matches_head "$src" "$dest"; then
-          warn "$name is ahead of profile '$profile' — an undeployed edit, not drift" \
+        elif profile_content_is_captured "$dest"; then
+          warn "$name differs from profile '$profile' — the profile's copy is in git history, so this is undeployed, not uncaptured" \
                "deploy when the code that goes with it deploys: scripts/install-hermes-skill.sh $name $profile"
         else
           block "hermes drift — $name differs between the repo and profile '$profile'" \
