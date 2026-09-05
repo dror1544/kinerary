@@ -320,9 +320,28 @@ def main() -> int:
             print(f"  cleared {n} conversation binding(s) for chat {chat} "
                   f"in profile {INTERVIEWER_PROFILE}")
         print(f"  {reset_profile_memories()}")
+
+        # Scoped by TRIP, and separately by every CHAT this reset touches — not
+        # trip alone. A chat can carry a session left over from a DIFFERENT
+        # trip's earlier, unconfirmed round: run 7's abandoned
+        # awaiting_confirmation session was still bound to this chat when run 8
+        # reset a brand-new trip, and the router — which resolves purely by
+        # telegram_chat_id — served that stale session on the very first
+        # /start. Cleaning up only `trip_id = X` cannot see it, because X was
+        # never that session's trip.
+        chat_list_sql = ",".join(f"'{c}'" for c in chat_ids)
+        session_filter = f"trip_id = '{trip_id}'"
+        if chat_list_sql:
+            session_filter += f" OR telegram_chat_id IN ({chat_list_sql})"
+        stale = psql(
+            "SELECT coalesce(string_agg(id||' ('||state||', trip '||trip_id||')', '; '), '') "
+            f"FROM control_plane.intake_sessions WHERE ({session_filter}) AND trip_id <> '{trip_id}'"
+        )
+        if stale:
+            print(f"  ALSO clearing stale session(s) on the same chat from another trip: {stale}")
         psql(f"DELETE FROM control_plane.interview_agent_turns WHERE session_id IN "
-             f"(SELECT id FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}')")
-        psql(f"DELETE FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'")
+             f"(SELECT id FROM control_plane.intake_sessions WHERE {session_filter})")
+        psql(f"DELETE FROM control_plane.intake_sessions WHERE {session_filter}")
         print("  deleted interview session(s) and agent turns")
         psql(f"UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = '{trip_id}'")
         print("  trip reset to draft")

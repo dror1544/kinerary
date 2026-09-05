@@ -1148,3 +1148,110 @@ describe("the interview never asks what it already knows", () => {
     });
   });
 });
+
+describe("starting a new interview never resumes someone else's abandoned one", () => {
+  test("a stale, unconfirmed session from a DIFFERENT trip is superseded", { skip: SKIP }, async () => {
+    // The exact shape of the 2026-09-05 bug. Run 7 left chat 391627336 bound to
+    // an unconfirmed, abandoned session for its own trip. Run 8 approved a
+    // BRAND NEW signup, reset it, and tapped a freshly-minted, valid deep
+    // link for that new trip on the SAME chat — and got run 7's leftover
+    // recap-adjacent state instead of the document offer. The chat had never
+    // been told to forget the old trip because nothing routes by trip; it
+    // routes by chat alone.
+    await withConversation(async (fix) => {
+      // An abandoned interview for an EARLIER, unrelated trip on this chat.
+      const staleTripId = testId("trip");
+      await fix.pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')", [staleTripId, staleTripId.replace(/_/g, "-")]);
+      await fix.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), staleTripId, fix.userId],
+      );
+      const staleIssued = await issueEnrollment(fix.pool, fix.userId, staleTripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(staleIssued.ok);
+      await turn(fix, says(fix, `/start ${staleIssued.token}`));
+      const before = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(before.ok);
+      assert.equal(before.view.tripId, staleTripId, "the stale interview is the one currently bound to this chat");
+
+      // Backdated to simulate genuine abandonment. A freshly-started session
+      // is never stale by design — that is exactly what protects a live
+      // interview from run 7's fate happening to IT: the two existing tests
+      // this staleness gate had to keep passing both start a second session
+      // milliseconds after the first and expect it refused, not superseded.
+      await fix.pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting_since = now() - interval '1 hour' WHERE id = $1",
+        [before.view.sessionId],
+      );
+
+      // A brand-new, valid enrollment for fix.tripId — a DIFFERENT trip.
+      const freshIssued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(freshIssued.ok);
+      const outcome = await startFromDeepLink(fix.pool, fix.chat, freshIssued.token);
+
+      assert.equal(outcome.kind, "started", "the fresh, valid link must start the NEW trip's interview");
+      assert.equal(outcome.kind === "started" ? outcome.tripId : null, fix.tripId);
+
+      const stale = await fix.pool.query(
+        "SELECT 1 FROM control_plane.intake_sessions WHERE trip_id = $1",
+        [staleTripId],
+      );
+      assert.equal(stale.rowCount, 0, "the stale session was removed, not left to be found again");
+    });
+  });
+
+  test("a recently-active session for a different trip is NOT superseded", { skip: SKIP }, async () => {
+    // The other half of the staleness gate, and the one the two pre-existing
+    // tests (chat-router.test.ts, two-trip-isolation.test.ts) already covered
+    // for a session with NO gap at all. This is the middle case: an organizer
+    // genuinely mid-interview, paused a few minutes to go find a document,
+    // must not have that interview pulled out from under them because an
+    // unrelated token for another trip happens to be presented on their chat
+    // in that window.
+    await withConversation(async (fix) => {
+      const otherTripId = testId("trip");
+      await fix.pool.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')", [otherTripId, otherTripId.replace(/_/g, "-")]);
+      await fix.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), otherTripId, fix.userId],
+      );
+      const active = await issueEnrollment(fix.pool, fix.userId, otherTripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(active.ok);
+      await turn(fix, says(fix, `/start ${active.token}`));
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+
+      // Five minutes of silence — well under STALE_SESSION_MINUTES.
+      await fix.pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting_since = now() - interval '5 minutes' WHERE id = $1",
+        [view.view.sessionId],
+      );
+
+      const fresh = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(fresh.ok);
+      const outcome = await startFromDeepLink(fix.pool, fix.chat, fresh.token);
+
+      assert.equal(outcome.kind, "already_in_interview", "a five-minute pause must not read as abandonment");
+      const survives = await fix.pool.query("SELECT 1 FROM control_plane.intake_sessions WHERE id = $1", [view.view.sessionId]);
+      assert.equal(survives.rowCount, 1, "the paused interview was not deleted");
+    });
+  });
+
+  test("a repeated link for the SAME trip is still refused, and the token stays unconsumed",
+    { skip: SKIP }, async () => {
+    // The behaviour this must NOT change: tapping a link a second time for an
+    // interview genuinely still in progress must not restart it from zero.
+    await withConversation(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(issued.ok);
+      const first = await startFromDeepLink(fix.pool, fix.chat, issued.token);
+      assert.equal(first.kind, "started");
+
+      // Starting the trip moved it out of 'draft', so a second real enrollment
+      // cannot even be issued for it — tapping the SAME link again is the
+      // realistic repeat here, and the interview must not restart from zero.
+      const outcome = await startFromDeepLink(fix.pool, fix.chat, issued.token);
+      assert.equal(outcome.kind, "already_in_interview", "same trip, still in progress — refused, not restarted");
+      assert.equal(outcome.kind === "already_in_interview" ? outcome.tripId : null, fix.tripId);
+    });
+  });
+});

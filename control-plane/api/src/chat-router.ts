@@ -29,7 +29,14 @@ import {
   uiString,
   type Language,
 } from "./intake-copy.js";
-import { INTAKE_QUESTIONS, startSession, type IntakeQuestion, type SessionView } from "./interview.js";
+import {
+  closeStaleSessionForChat,
+  INTAKE_QUESTIONS,
+  startSession,
+  type IntakeQuestion,
+  type SessionView,
+} from "./interview.js";
+import { peekEnrollmentTripId } from "./enrollment.js";
 import { structuredLog } from "./redaction.js";
 
 // ── Inbound text ─────────────────────────────────────────────────────────────
@@ -185,6 +192,30 @@ export type StartLinkOutcome =
  * a routing fact, never a credential. Whoever holds the link starts the
  * interview, exactly as the enrollment design already specifies.
  */
+/**
+ * How long a session must have gone untouched, by either side, before a
+ * fresh enrollment for a different trip may replace it.
+ *
+ * Well above any plausible "reading the question" pause and well below "this
+ * looks abandoned" — a real interview has activity within seconds to low
+ * minutes throughout, so this only ever engages for something that has
+ * genuinely gone quiet.
+ */
+const STALE_SESSION_MINUTES = 10;
+
+/**
+ * Whether a session's most recent activity, by either party, is old enough to
+ * treat it as abandoned rather than as an interview still in progress.
+ */
+async function isSessionStale(db: pg.Pool, sessionId: string): Promise<boolean> {
+  const row = await db.query<{ stale: boolean }>(
+    `SELECT awaiting_since < now() - make_interval(mins => $2) AS stale
+       FROM control_plane.intake_sessions WHERE id = $1`,
+    [sessionId, STALE_SESSION_MINUTES],
+  );
+  return row.rows[0]?.stale === true;
+}
+
 export async function startFromDeepLink(
   db: pg.Pool,
   chatId: string,
@@ -201,7 +232,52 @@ export async function startFromDeepLink(
   // usable once they finish or abandon the first.
   const existing = await resolveChatRoute(db, chatId);
   if (existing.kind === "interview") {
-    return { kind: "already_in_interview", sessionId: existing.sessionId, tripId: existing.tripId };
+    // Same trip: genuinely already in this interview. Refuse without
+    // consuming the token, so it stays usable if this was an accidental
+    // double-tap. This branch is unconditional and always wins — nothing
+    // below ever second-guesses it.
+    //
+    // A DIFFERENT trip needs a second question answered before it can be
+    // treated as "supersede", and getting this wrong is dangerous in a
+    // specific way: `chatId` here is not necessarily the redeeming
+    // organizer's OWN chat. The two-trip isolation matrix has a live test for
+    // exactly the attack this must never permit — organizer B's chat, already
+    // mid-interview, must not be pulled out from under them because someone
+    // (attacker, misdirected link, ownership doesn't even enter into it)
+    // presents organizer A's token there. Ownership cannot be the signal that
+    // decides this either way: two signups made minutes apart by the SAME
+    // physical person on this deployment get two entirely different
+    // control-plane `user_id`s, checked and confirmed empirically — so
+    // "same owner" would fail to permit the exact case this exists for.
+    //
+    // The signal that actually holds: whether the EXISTING interview looks
+    // abandoned. `awaiting_since` moves on every message either side sends
+    // (`markAwaitingMachine`, `claimFloor`), so it is a genuine "last activity
+    // of any kind" clock. A real, ongoing interview has activity within
+    // seconds to low minutes; run 7's session, still sitting here when run 8
+    // tapped a fresh link, had been silent for hours. STALE_SESSION_MINUTES is
+    // set well above any plausible "still reading the question" pause, so an
+    // organizer who steps away mid-interview and comes straight back is never
+    // at risk — only a session nobody has touched in a long time is eligible.
+    const targetTripId = payload ? await peekEnrollmentTripId(db, payload) : null;
+    const isStale = targetTripId && targetTripId !== existing.tripId
+      ? await isSessionStale(db, existing.sessionId)
+      : false;
+
+    if (!isStale) {
+      return { kind: "already_in_interview", sessionId: existing.sessionId, tripId: existing.tripId };
+    }
+
+    log(structuredLog("info", "chat_router.stale_session_superseded", {
+      stale_session_id: existing.sessionId,
+      stale_trip_id: existing.tripId,
+      new_trip_id: targetTripId,
+    }));
+    // `peekEnrollmentTripId` reads the token's target WITHOUT consuming it,
+    // purely to make the trip comparison above; `startSession` below
+    // re-validates and consumes it for real a moment later, so nothing here
+    // is trusted for the actual decision to enroll.
+    await closeStaleSessionForChat(db, existing.sessionId);
   }
 
   if (!payload) return { kind: "rejected", reason: "NO_PAYLOAD" };

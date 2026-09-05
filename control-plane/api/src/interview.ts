@@ -1258,6 +1258,31 @@ export type ResolveOpenTurnResult =
  * two-trip matrix exists to prevent. Refusing is recoverable; a silent
  * cross-write is not. LIMIT 2 is all that is needed to tell one from many.
  */
+/**
+ * Removes an unconfirmed session left occupying a chat by an earlier,
+ * unrelated trip attempt — never a confirmed one, and never the caller's own.
+ *
+ * Why deleting is safe here and would not be anywhere else: `intake_versions`
+ * is the durable, immutable record, created only on confirmation.
+ * `intake_sessions` in any other state is draft scratch — abandoning it costs
+ * nothing that was ever final. This is production's version of what
+ * `fresh-interview.py --yes` already does by hand for test resets; the
+ * production path needed the same guarantee, because a real organizer can
+ * just as easily start a second signup on the same Telegram account after
+ * abandoning a first one.
+ *
+ * Callers MUST have already confirmed the session belongs to a trip other
+ * than the one about to start — this has no opinion on that, it only deletes
+ * what it is given.
+ */
+export async function closeStaleSessionForChat(db: pg.Pool, sessionId: string): Promise<void> {
+  await db.query("DELETE FROM control_plane.interview_agent_turns WHERE session_id = $1", [sessionId]);
+  await db.query(
+    "DELETE FROM control_plane.intake_sessions WHERE id = $1 AND state <> 'confirmed'",
+    [sessionId],
+  );
+}
+
 export async function resolveChatFromOpenTurn(db: pg.Pool): Promise<ResolveOpenTurnResult> {
   const rows = await db.query<{ chat_id: string }>(
     `SELECT t.chat_id
