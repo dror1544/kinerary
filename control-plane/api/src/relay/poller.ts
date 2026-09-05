@@ -58,7 +58,7 @@ import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
-import { DEFAULT_LANGUAGE, uiString } from "../intake-copy.js";
+import { askText, DEFAULT_LANGUAGE, optionLabel, uiString } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -231,6 +231,12 @@ export async function applyDecision(
       // fighting over the same questions. Queuing lets a burst finish before
       // exactly one turn opens for the whole thing. See
       // `flushSettledInboundBursts` for the other half.
+      //
+      // The settle window is deliberate latency, and Dror named the fix for
+      // it unprompted: "the writing… signal give the feeling there is
+      // someone on the other side and smooth the 2 sec delay." Best-effort —
+      // if it fails, the organizer waits the same two seconds either way.
+      await deps.telegram.sendChatAction({ chatId: decision.chatId }).catch(() => {});
       await queueInboundMessage(deps.db, decision.chatId, decision.event);
       return;
     }
@@ -338,6 +344,23 @@ async function applyInterviewCallback(
       return;
     }
     await ack();
+    // Collapse the keyboard the instant it is answered. Raised live on
+    // 2026-09-05: a single-choice tap left its own buttons sitting on screen
+    // exactly as before, with nothing to say the tap had registered — "on a
+    // multiple answer question after clicking a button no immediate response
+    // is done feeling it stuck". The organizer's next message is often the
+    // NEXT question anyway, arriving on its own schedule; this is the one
+    // piece of feedback that can be immediate regardless of how long that
+    // takes, because it needs nothing from the agent at all.
+    if (decision.messageId) {
+      const picked = optionLabel(question, parsed.optionId, result.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${askText(question, result.view.language)}\n\n✅ ${picked}`,
+        replyMarkup: undefined,
+      });
+    }
     await sendNextStep(result.view, decision.chatId, deps, strings);
     return;
   }
@@ -376,21 +399,38 @@ async function applyInterviewCallback(
     // Done on an untouched multi-select is a skip: the organizer looked at the
     // question and had nothing to add, which is not the same as an empty
     // selection meaning "none of these apply".
+    const question = findQuestion(parsed.questionId);
+    const beforeFinalize = await getSessionForChat(deps.db, decision.chatId);
+    const chosenBefore = beforeFinalize.ok ? selectedOptionIds(beforeFinalize.view, parsed.questionId) : [];
     const view = await (async () => {
       if (parsed.kind === "skip") {
         return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
       }
-      const current = await getSessionForChat(deps.db, decision.chatId);
-      if (current.ok && selectedOptionIds(current.view, parsed.questionId).length === 0) {
+      if (chosenBefore.length === 0) {
         return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
       }
-      return current;
+      return beforeFinalize;
     })();
     if (!view.ok) {
       await ack("I couldn't do that — try again.");
       return;
     }
     await ack();
+    // Same collapse as a single-choice answer, once the multi-select is
+    // actually finalized rather than mid-tick: the live keyboard with its
+    // ticks is what the organizer needs while choosing, and exactly what
+    // should stop inviting taps the moment Done or Skip is pressed.
+    if (question && decision.messageId) {
+      const summary = chosenBefore.length > 0
+        ? chosenBefore.map((id) => optionLabel(question, id, view.view.language)).join(", ")
+        : uiString("skipped", view.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${askText(question, view.view.language)}\n\n✅ ${summary}`,
+        replyMarkup: undefined,
+      });
+    }
     await sendNextStep(view.view, decision.chatId, deps, strings);
     return;
   }
@@ -723,6 +763,10 @@ async function handBackToInterviewer(
     }));
     return;
   }
+  // Same reasoning as the settle-window ack: a handback can take a while —
+  // the agent may be mid-turn on several optional questions — and this is the
+  // one thing that can be immediate regardless.
+  await deps.telegram.sendChatAction({ chatId }).catch(() => {});
   const turn = await openAgentTurn(deps.db, chatId, view.sessionId);
   const delivered = deps.connector.pushInbound(
     toWireEvent(

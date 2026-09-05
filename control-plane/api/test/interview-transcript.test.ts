@@ -148,8 +148,18 @@ class Transcript implements TelegramClient {
     this.lines.push(classify(params.text, buttons, params.parseMode ?? null));
     return { ok: true, messageId: String(this.lines.length) };
   }
-  async editMessageText(): Promise<SendResult> { return { ok: true }; }
-  async sendChatAction(): Promise<void> { /* no-op */ }
+  readonly edited: Array<{ messageId: string; text: string; replyMarkup: unknown }> = [];
+  typingSignals = 0;
+  async editMessageText(params: {
+    chatId: string;
+    messageId: string;
+    text: string;
+    replyMarkup?: { inline_keyboard: unknown[][] };
+  }): Promise<SendResult> {
+    this.edited.push({ messageId: params.messageId, text: params.text, replyMarkup: params.replyMarkup });
+    return { ok: true };
+  }
+  async sendChatAction(): Promise<void> { this.typingSignals += 1; }
   async answerCallbackQuery(p: { callbackQueryId: string; text?: string }): Promise<void> {
     this.answered.push(p);
   }
@@ -1430,6 +1440,72 @@ describe("one burst of messages opens one turn", () => {
       ]);
 
       assert.equal(fix.connector.pushed.length, 1, "the burst was flushed exactly once");
+    });
+  });
+});
+
+describe("tapped keyboards collapse instead of sitting there answered", () => {
+  test("a single-choice tap removes its own buttons and shows what was picked", { skip: SKIP }, async () => {
+    // Run 10: "on a multiple answer question after clicking a button no
+    // immediate response is done feeling it stuck... when a single selection
+    // button is pressed... it should collapse the menu". A tap always
+    // records instantly; what was missing was any visible sign of that,
+    // independent of how long the NEXT question takes to arrive.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+
+      const tripType = fix.script.last?.buttons.find((b) => b.startsWith("a:trip_type:"));
+      assert.ok(tripType);
+      await turn(fix, taps(fix, tripType));
+
+      const edit = fix.script.edited.at(-1);
+      assert.ok(edit, "the original question message was edited");
+      assert.equal(edit!.replyMarkup, undefined, "its keyboard is gone");
+      assert.match(edit!.text, /✅/, "and it shows what was chosen");
+    });
+  });
+
+  test("finishing a multi-select removes its keyboard too", { skip: SKIP }, async () => {
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await nominateQuestionForChat(fix.pool, fix.chat, "dietary");
+      await deliverPendingRouterPrompt(fix);
+      const toggle = fix.script.last?.buttons.find((b) => b.startsWith("t:dietary:"));
+      assert.ok(toggle, "dietary is on screen with its toggle buttons");
+      await turn(fix, taps(fix, toggle));
+
+      const done = fix.script.last?.buttons.find((b) => b.startsWith("n:dietary"));
+      assert.ok(done, "and its Done button");
+      await turn(fix, taps(fix, done));
+
+      const edit = fix.script.edited.at(-1);
+      assert.ok(edit, "the multi-select message was edited on Done");
+      assert.equal(edit!.replyMarkup, undefined, "its keyboard is gone");
+    });
+  });
+});
+
+describe("a typing signal covers the settle-window wait", () => {
+  test("queuing a message sends a typing indicator immediately", { skip: SKIP }, async () => {
+    // Dror's own suggestion, unprompted: "the writing… signal give the
+    // feeling there is someone on the other side and smooth the 2 sec
+    // delay."
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      const before = fix.script.typingSignals;
+
+      const decision = await dispatchUpdate(
+        fix.pool, says(fix, "hello"), DEFAULT_STRINGS, () => {}, {},
+        { interviewerProfile: "trip-intake" },
+      );
+      await applyDecision(decision, { db: fix.pool, telegram: fix.script, connector: fix.connector });
+
+      assert.ok(fix.script.typingSignals > before, "a typing signal went out while the message settles");
     });
   });
 });

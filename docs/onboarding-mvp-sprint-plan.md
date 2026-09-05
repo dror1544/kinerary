@@ -920,6 +920,48 @@ Automated tests:
 **Exit gate for Track 5:** the run-9 five-message burst, replayed live,
 produces one turn and no duplicate question.
 
+**Track 5, live: two clean `intake_confirmed` runs in a row (run 9, run 10)**
+— `interview-design-review.md`'s exit gate ("two consecutive live runs... no
+manual database intervention") is now met.
+
+Two small UX fixes shipped alongside Track 5 from run 10's report, both
+low-risk and independent of the deeper issue below: a tapped keyboard now
+collapses (removes its buttons, shows what was picked) instead of sitting
+there answered but unchanged, on both single-choice and multi-select Done;
+and a Telegram typing indicator fires the instant a message is queued or a
+handback begins, masking the settle-window wait and the agent's own latency —
+Dror's own suggestion, unprompted: "the writing… signal give the feeling
+there is someone on the other side."
+
+#### Track 6 — the watchdog can close a turn out from under a still-working agent *(scoped, not built)*
+
+Run 10: a `bot_tone` question rendered by the 30-second watchdog got tapped,
+and nothing happened until the organizer typed a message. Root cause, read
+from the relay log: `claimStalledAgentTurns` closes the DB's row for
+whatever turn was open the moment 30 seconds pass with nothing sent — but the
+interviewer was not actually silent, it was still working through several
+optional questions in one long Hermes-side turn our side has no visibility
+into. Closing our OWN turn record while the real conversation is still
+running is what Track 5 fixed for RAPID bursts; this is the same family of
+mismatch on a slower timescale — our notion of "the current turn" and
+Hermes's own, actually-running one drift apart, and a handback or a tap can
+land in the gap between them (`handback_skipped: TURN_ALREADY_OPEN` fired
+three times around the same window run 10 hit this).
+
+Not scoped in detail yet, because the right fix depends on something we do
+not currently have: a signal FROM Hermes that it is still actively working,
+so the watchdog can tell "stalled" from "slow" before closing anything. Two
+candidate directions, neither committed to:
+
+- A lightweight heartbeat/progress tool call the agent can make mid-turn,
+  extending the floor deadline without saying anything to the organizer.
+- Loosen `claimStalledAgentTurns` to check for RECENT (not necessarily
+  organizer-facing) tool activity on the turn before deciding it is stalled,
+  if that activity is visible to us at all.
+
+**Exit gate for Track 6:** not yet defined — needs the mechanism decided
+first.
+
 Build:
 
 - Convert reusable `familytrip-provisioner` validation/profile logic into a
