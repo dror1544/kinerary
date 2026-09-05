@@ -200,6 +200,18 @@ of `docs/signup-test-execution-capture (Manual).md`.
 `.agents/skills/live-run/` drives the 🤖 steps of `docs/setup-test-plan.md` and
 stops at every 🧍, resumable by step. It never deploys and never tears down.
 
+`.agents/skills/interview-stack-deploy/` restarts the four services the Trip
+Bot interview needs (control-plane API, interview MCP sidecar, trip-intake
+gateway, relay) with the checks a 2026-09-05 live run found missing: it reads
+the interview-agent key from `provisioning.env` itself rather than trusting
+the calling shell, confirms the key landed **inside** the API container rather
+than assuming a restart worked, and — the one that actually matters — extracts
+the expected `*_for_chat` tool names straight from `interview-mcp.ts` and
+greps the **gateway's own** post-restart log line for each one, so "the agent
+can speak" is read off the gateway rather than inferred from an upstream
+process being alive. It refuses to restart the relay under a live conversation
+(`awaiting = 'machine'`, updated recently) unless told to anyway.
+
 ## Working style
 
 Write the test first where it's practical. Prefer fixing something at its
