@@ -1219,6 +1219,19 @@ def transform_intake(
 
     phases = _derive_phases(_structured_list(data, "phases"))
 
+    # A day-by-day from the dated anchors, for every phase that does not
+    # already have one. Extracted days WIN: `extract_itinerary`'s pass over an
+    # uploaded document is richer than anything derivable from a list of
+    # bookings, so this fills empty phases rather than competing for the slot.
+    # It exists because that extraction is unreachable from the chat-scoped
+    # interview, so in practice the slot is always empty — but the precedence
+    # is written the right way round so it stays correct when that is fixed.
+    anchor_days = derive_days_from_anchors({"phases": phases}, data)
+    for phase in phases:
+        derived = anchor_days.get(str(phase.get("id")))
+        if derived and not phase.get("days"):
+            phase["days"] = derived
+
     # Only a count, never the organizer's free text — same reasoning as above.
     travel_anchors = _structured_list(data, "travel_anchors")
     if travel_anchors:
@@ -1409,6 +1422,88 @@ def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
             if start <= when < end or (closed_end and start <= when <= end):
                 return str(phase.get("id")) or None
     return None
+
+
+_ANCHOR_TIME_RE = re.compile(r"\bat\s+([0-2]?\d:[0-5]\d)\b", re.IGNORECASE)
+
+#: Anchor types that describe WHERE you sleep or WHAT a quote costs, not
+#: something that happens at a time on a day. Hotels already own the phase's
+#: `accommodation`; a proposal is a whole-trip figure.
+_NON_ITINERARY_ANCHORS = {"hotel", "car", "proposal"}
+
+
+def derive_days_from_anchors(
+    config: Mapping[str, Any], data: Mapping[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """A day-by-day built from the anchors, deterministically. No model.
+
+    `phases[].days[]` had exactly one producer — `extract_itinerary`, an LLM
+    pass over an uploaded document — and it is unreachable from the chat-scoped
+    interview (no `_for_chat` twin), so no control-plane trip has ever had one.
+    Meanwhile the organizer's plan was already sitting in `travel_anchors`,
+    dated, timed and structured:
+
+        activity | Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00
+        activity | TeamLab Planets — 20 Sep 2026 at 18:00
+        activity | Sagano Romantic Train, one-way — 25 Sep 2026 at 14:02
+
+    Nothing about turning that into days needs a model. The date parsing and
+    the date→phase mapping are the same ones `derive_bookings` has been using
+    correctly all along; this reuses them rather than adding a second parser
+    that can disagree with the first.
+
+    Returns {phase_id: days[]}. Only anchors that are events are used —
+    a hotel is the phase's `accommodation`, not a thing you do at 10:00.
+
+    DELIBERATELY NOT a replacement for document extraction. This can only
+    surface what the organizer stated as a discrete dated item; a PDF's prose
+    itinerary is richer and still wants `extract_itinerary`. When both exist
+    the extracted days win (see the caller) — this fills the gap, it does not
+    compete for the slot.
+    """
+    phases = list(config.get("phases") or [])
+    by_phase: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        anchor_type = str(raw.get("type") or "").strip().lower()
+        if anchor_type in _NON_ITINERARY_ANCHORS:
+            continue
+        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
+        if not detail:
+            continue
+        when = _extract_anchor_date(detail)
+        if not when:
+            continue  # undated: it is a booking, not a moment in the plan
+        phase_id = _phase_id_for_date(phases, when)
+        if not phase_id:
+            continue  # outside every phase — the Bookings tab still shows it
+        time_match = _ANCHOR_TIME_RE.search(detail)
+        # The date and time are now represented structurally, so strip them
+        # from the label rather than printing "at 10:00" beside a 10:00 slot.
+        label = _ANCHOR_DATE_RE.sub("", detail)
+        label = _ANCHOR_TIME_RE.sub("", label)
+        label = label.strip(" \u2014-—,;:").strip()
+        if not label:
+            continue
+        text = {"he": label, "en": label}
+        day = by_phase.setdefault(phase_id, {}).setdefault(when.isoformat(), [])
+        day.append({
+            "time": time_match.group(1) if time_match else None,
+            "text": text,
+        })
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for phase_id, days in by_phase.items():
+        rendered = []
+        for iso, items in sorted(days.items()):
+            # Timed items first in clock order, undated-within-the-day last —
+            # "some time that day" reads correctly at the bottom, not at 00:00.
+            items.sort(key=lambda i: (i["time"] is None, i["time"] or ""))
+            rendered.append({"date": iso, "items": items})
+        out[phase_id] = rendered
+    return out
 
 
 def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:

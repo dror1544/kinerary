@@ -7,6 +7,7 @@ from datetime import date
 
 from control_plane_worker.transformer import (
     _resolve_organizers,
+    derive_days_from_anchors,
     derive_bookings,
     derive_trip_slug,
     transform_intake,
@@ -1351,3 +1352,93 @@ class ResolveOrganizersTests(unittest.TestCase):
         # structured travelers answer beside them, must not regress.
         transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
         self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])
+
+
+class DeriveDaysFromAnchorsTests(unittest.TestCase):
+    """A day-by-day built from the dated anchors, with no model involved.
+
+    `phases[].days[]` had exactly one producer — `extract_itinerary`, an LLM
+    pass over an uploaded document — which is unreachable from the chat-scoped
+    interview (no `_for_chat` twin). So no control-plane trip has ever had a
+    day-by-day, while the organizer's plan sat in `travel_anchors` already
+    dated, timed and structured. Nothing about projecting that needs a model.
+    """
+
+    PHASES = [
+        {"id": "tokyo", "dates": {"start": "2026-09-19", "end": "2026-09-23"}},
+        {"id": "kyoto", "dates": {"start": "2026-09-24", "end": "2026-09-27"}},
+    ]
+
+    def _days(self, anchors):
+        return derive_days_from_anchors(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )
+
+    def test_run_13s_anchors_land_on_the_right_days_and_phases(self) -> None:
+        out = self._days([
+            {"type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"},
+            {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"},
+            {"type": "activity", "detail": "Sagano Romantic Train, one-way — 25 Sep 2026 at 14:02"},
+        ])
+        self.assertEqual(sorted(out), ["kyoto", "tokyo"])
+        tokyo = out["tokyo"]
+        self.assertEqual([d["date"] for d in tokyo], ["2026-09-20"])
+        self.assertEqual(
+            [(i["time"], i["text"]["en"]) for i in tokyo[0]["items"]],
+            [("10:00", "Tokyo Skytree e-ticket"), ("18:00", "TeamLab Planets")],
+        )
+
+    def test_the_date_and_time_are_stripped_from_the_label(self) -> None:
+        # They are represented structurally now; printing "at 10:00" beside a
+        # 10:00 slot is the same fact twice.
+        out = self._days([{"type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"}])
+        text = out["tokyo"][0]["items"][0]["text"]["en"]
+        self.assertEqual(text, "Tokyo Skytree e-ticket")
+        self.assertNotIn("2026", text)
+        self.assertNotIn("10:00", text)
+
+    def test_timed_items_sort_before_untimed_ones_within_a_day(self) -> None:
+        out = self._days([
+            {"type": "activity", "detail": "Something all day — 20 Sep 2026"},
+            {"type": "activity", "detail": "Skytree — 20 Sep 2026 at 10:00"},
+        ])
+        times = [i["time"] for i in out["tokyo"][0]["items"]]
+        self.assertEqual(times, ["10:00", None], "'some time that day' belongs last, not at 00:00")
+
+    def test_hotels_and_proposals_are_not_itinerary_items(self) -> None:
+        # A hotel is the phase's accommodation; a proposal is a whole-trip
+        # quote whose dates are range endpoints, not a moment in the plan.
+        out = self._days([
+            {"type": "hotel", "detail": "OMO3 Asakusa — 19 Sep 2026 to 23 Sep 2026"},
+            {"type": "car", "detail": "Rental — 20 Sep 2026"},
+            {"type": "proposal", "detail": "Whole trip quote — 19 Sep 2026"},
+        ])
+        self.assertEqual(out, {})
+
+    def test_an_undated_anchor_stays_a_booking(self) -> None:
+        # It is still real and still shows on the Bookings tab; it just has no
+        # day to sit on, and guessing one would be worse than omitting it.
+        self.assertEqual(self._days([{"type": "activity", "detail": "Museum tickets, sometime"}]), {})
+
+    def test_an_anchor_outside_every_phase_is_not_forced_into_one(self) -> None:
+        # derive_bookings parks such a row on phase 1 because bookings.phase is
+        # NOT NULL. A day-by-day has no such constraint, and putting a
+        # 30 September event in the Tokyo tab would simply be wrong.
+        self.assertEqual(self._days([{"type": "activity", "detail": "Something — 30 Sep 2026 at 09:00"}]), {})
+
+    def test_extracted_days_win_over_derived_ones(self) -> None:
+        # The precedence written the right way round: an uploaded document's
+        # itinerary is richer than a list of bookings, so this fills empty
+        # phases rather than competing for the slot.
+        intake = dict(JAPAN_INTAKE)
+        intake["phases"] = {"kind": "structured", "schema_version": 3, "data": [{
+            "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+            "days": [{"date": "2026-09-20", "items": [
+                {"time": "09:00", "text": {"he": "מהמסמך", "en": "From the document"}}]}],
+        }]}
+        intake["travel_anchors"] = {"kind": "structured", "schema_version": 3, "data": [
+            {"type": "activity", "detail": "Skytree — 20 Sep 2026 at 10:00"}]}
+        cfg = transform_intake(intake)
+        items = cfg["phases"][0]["days"][0]["items"]
+        self.assertEqual([i["text"]["en"] for i in items], ["From the document"])
