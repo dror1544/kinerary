@@ -546,6 +546,9 @@ class ChatIdRecipientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            # A4: a binding is opened whenever an organizer chat id is known,
+            # companion or not, so these fixtures now leave one behind.
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
 
@@ -732,21 +735,45 @@ class CompanionProfileTests(unittest.TestCase):
             companion=DecliningAdapter(),
         )
         worker.run_once()
+        # A4 inverted this assertion deliberately. It used to demand NO
+        # binding when the companion declined — the coupling that, on
+        # 2026-09-06, let one failed component take routing down with it. The
+        # binding is now opened with a NULL profile: the chat belongs to this
+        # trip either way, and the companion can be retried without first
+        # reconstructing routing.
         row = self.conn.execute(
-            "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+            "SELECT hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
             (self.fix["trip_id"],),
         ).fetchone()
-        self.assertIsNone(row)
+        self.assertIsNotNone(row, "routing should not wait on the assistant")
+        self.assertIsNone(row["hermes_profile"], "bound, but with no assistant behind it")
+        # And the binding must NOT be mistaken for health.
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (state["reachability"], state["unreachable_reason"]),
+            ("unreachable", "COMPANION_TEMPLATES_ABSENT"),
+        )
 
-    def test_default_null_adapter_skips_companion_profile_without_error(self) -> None:
+    def test_default_null_adapter_binds_the_chat_but_claims_no_health(self) -> None:
         worker = ProvisionerWorker(db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-companion-default")
         result = worker.run_once()
         self.assertTrue(result)
         row = self.conn.execute(
-            "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+            "SELECT hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
             (self.fix["trip_id"],),
         ).fetchone()
-        self.assertIsNone(row)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["hermes_profile"])
+        state = self.conn.execute(
+            "SELECT reachability FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(state["reachability"], "unreachable")
 
     def test_mcp_bridge_is_called_with_the_slug_and_installed_profile_name(self) -> None:
         companion = FakeCompanionProfileAdapter()

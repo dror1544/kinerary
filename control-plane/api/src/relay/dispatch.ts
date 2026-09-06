@@ -117,6 +117,7 @@ export interface BotIdentity {
 export interface DispatchStrings {
   /** Shown when someone messages the bot with no trip and no valid link. */
   unbound: string;
+  companionPending: string;
   /** Shown for a bare `/start` with no deep-link payload. */
   noPayload: string;
   /** Shown when a deep link is expired, already used, or unknown. */
@@ -142,6 +143,13 @@ export interface DispatchStrings {
 export const DEFAULT_STRINGS: DispatchStrings = {
   unbound:
     "I don't have a trip for this chat yet. Open the link from your Kinerary signup to get started.",
+  // Bound, but the assistant behind it is not ready. Says what is true — the
+  // trip exists, the site is up — without claiming an assistant that cannot
+  // answer. The alternative, `unbound`'s "I don't have a trip for this chat",
+  // is what a real organizer was told on 2026-09-06 about a trip that had
+  // provisioned perfectly.
+  companionPending:
+    "Your trip is set up and the site is ready — I'm still finishing your assistant. Try me again shortly.",
   noPayload:
     "Welcome to Kinerary. To start planning, open the link from your signup email or message — it carries the code I need.",
   badLink: "That link isn't valid any more. Ask for a fresh one and I'll pick up from there.",
@@ -311,6 +319,8 @@ export async function dispatchUpdate(
     }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    case "COMPANION_PENDING":
+      return { kind: "reply", reply: { chatId, text: strings.companionPending } };
     default:
       return { kind: "ignore", reason: outcome.reason };
   }

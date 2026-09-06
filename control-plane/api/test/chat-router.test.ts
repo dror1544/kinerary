@@ -313,6 +313,28 @@ describe("resolveChatRoute (DB)", () => {
     });
   });
 
+  test("a chat bound with no companion yet resolves the trip, not 'unbound'", { skip: SKIP }, async () => {
+    // A4 (migration 0043). Routing and the assistant behind it are separate
+    // components. A binding with a NULL profile means "this chat belongs to
+    // this trip, and its assistant is not installed" — which must NOT collapse
+    // into `unbound`, because `unbound` makes the router answer "I don't have
+    // a trip for this chat". That sentence was told to a real organizer on
+    // 2026-09-06 about a trip that had provisioned perfectly.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, NULL)",
+        ["555000333", fix.tripId],
+      );
+      const route = await resolveChatRoute(fix.pool, "555000333");
+      assert.equal(route.kind, "companion", "the trip is known — this is not an unbound chat");
+      assert.equal(route.kind === "companion" && route.tripId, fix.tripId);
+      assert.equal(
+        route.kind === "companion" && route.hermesProfile, null,
+        "and the missing assistant is represented, not papered over",
+      );
+    });
+  });
+
   test("a bound chat with no live interview routes to the companion", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await fix.pool.query(

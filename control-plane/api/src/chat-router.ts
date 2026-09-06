@@ -94,7 +94,15 @@ export type ChatRoute =
   | {
       kind: "companion";
       tripId: string;
-      hermesProfile: string;
+      /**
+       * NULL when the chat is bound to a trip whose companion has not been
+       * installed (migration 0043). Routing and the assistant behind it are
+       * separate components, separately retryable — see A4 in
+       * docs/onboarding-to-active-plan.md. Callers must handle the gap
+       * rather than assume a profile, which is why this is nullable here
+       * instead of being defaulted to "" somewhere quieter.
+       */
+      hermesProfile: string | null;
       /**
        * The assistant's wake-words (migration 0030), both languages. Carried
        * on the route because the group relevance gate needs them on exactly
@@ -138,7 +146,7 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   // detached from, which on a shared bot is someone else's trip.
   const bound = await db.query<{
     trip_id: string;
-    hermes_profile: string;
+    hermes_profile: string | null;
     assistant_names: string[] | null;
   }>(
     `SELECT b.trip_id, b.hermes_profile, t.assistant_names

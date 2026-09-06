@@ -279,10 +279,16 @@ def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
     trip_id: str,
-    hermes_profile: str,
+    hermes_profile: str | None,
 ) -> str:
     """Opens the binding that routes `chat_id` to `trip_id`, closing rather
     than overwriting whatever was there before.
+
+    `hermes_profile` may be None: the chat belongs to the trip whether or not
+    an assistant has been installed behind it yet (migration 0043). That is
+    NOT a claim the trip is reachable — `trips.reachability` is, and it is
+    written elsewhere. Binding an unserved chat is what lets the companion be
+    retried later without first reconstructing routing.
 
     Returns the outcome as a short string for logging: "created", "unchanged",
     or "profile_rebound".
@@ -882,6 +888,14 @@ class ProvisionerWorker:
         # signup.ts's notification send. A failure here must never roll back
         # a successful provisioning run; it's logged and the trip is still
         # ready_private, just without an assigned companion yet.
+        # The companion profile and the chat binding are two independent
+        # components, attempted in that order and recovered separately (A4).
+        # Until 2026-09-06 the binding sat inside `if hermes_profile`, so a
+        # companion failure took routing down with it and left the organizer
+        # with "I don't have a trip for this chat" — one broken component
+        # presenting as two. `hermes_profile` stays None when the companion
+        # did not install, and the binding is opened anyway.
+        hermes_profile: str | None = None
         try:
             provenance = self._load_intake_provenance(conn, intake_version_id)
             handoff = build_companion_handoff(
@@ -927,12 +941,12 @@ class ProvisionerWorker:
                         reason="COMPANION_TEMPLATES_ABSENT",
                         consequence="no companion profile adapter is configured for this deployment",
                     )
-                if hermes_profile:
+                else:
                     # Independently gated and independently non-fatal: a
-                    # trip-mcp wiring failure must not block the chat
-                    # binding below — the organizer should still land in
-                    # the right companion profile-home even if that
-                    # profile can't reach trip-mcp tools yet.
+                    # trip-mcp wiring failure must not block the chat binding
+                    # below — the organizer should still land in the right
+                    # companion profile-home even if that profile can't reach
+                    # trip-mcp tools yet.
                     try:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
                         logger.info(
@@ -945,14 +959,12 @@ class ProvisionerWorker:
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
                         )
-                if hermes_profile:
+
                     # The assistant's wake-words, recorded as a ROUTING fact
                     # (migration 0030). Under the relay the group relevance
                     # gate is the router's job, not Hermes's, so the router
                     # needs its own copy — it cannot read a Hermes profile
-                    # directory from inside a container. Written whether or not
-                    # a chat binding follows: a trip whose group is bound later
-                    # must not be left with a gate that has nothing to match.
+                    # directory from inside a container.
                     names = [
                         n for n in (
                             (handoff.get("assistant") or {}).get("name"),
@@ -960,9 +972,6 @@ class ProvisionerWorker:
                         )
                         if isinstance(n, str) and n.strip()
                     ]
-                    # De-duplicated because a single-language assistant carries
-                    # the same string in both fields, and a duplicate wake-word
-                    # is just a slower match.
                     unique_names = list(dict.fromkeys(name.strip() for name in names))
                     if unique_names:
                         try:
@@ -977,70 +986,12 @@ class ProvisionerWorker:
                                 "trip_id": trip_id,
                                 "consequence": "group messages will fall back to @mention/reply only",
                             }, exc_info=True)
-
-                if hermes_profile and not recipient_chat_id:
-                    # A companion exists and nobody can talk to it. Recorded
-                    # rather than passed over in silence, because the retry is
-                    # a different one from every other reason here: nothing is
-                    # broken, an organizer chat id is simply not known yet.
-                    _record_reachability(
-                        conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
-                        consequence="a companion exists but no organizer chat id is known to bind it to",
-                    )
-
-                if hermes_profile and recipient_chat_id:
-                    # Deliberately NOT inside the broad handler below. A trip
-                    # whose companion installed but whose binding did not open
-                    # is UNROUTABLE — the organizer messages the bot and gets
-                    # "I don't have a trip for this chat". Filing that under
-                    # the same warning as a best-effort profile install is how
-                    # a trip provisions "successfully" and is unreachable, so
-                    # it gets its own handler and error severity.
-                    try:
-                        outcome = bind_chat_to_trip(
-                            conn, recipient_chat_id, trip_id, hermes_profile,
-                        )
-                        logger.info("provisioner.companion_profile_bound", extra={
-                            "trip_id": trip_id,
-                            "hermes_profile": hermes_profile,
-                            "outcome": outcome,
-                        })
-                        # The ONE place 'reachable' is ever written, and it is
-                        # written by the code that opened the binding rather
-                        # than by anything later reading that a binding row
-                        # exists. A binding can outlive the profile it points
-                        # at; "a row is present" is not the same claim as "the
-                        # organizer can talk to this trip".
-                        _record_reachability(conn, trip_id, reachable=True)
-                    except BindingRefused as refused:
-                        # Not a bug and not retryable: the chat legitimately
-                        # belongs to another trip, and moving it is a reviewed
-                        # organizer action this job has no standing to perform.
-                        logger.error("provisioner.companion_binding_refused", extra={
-                            "trip_id": trip_id,
-                            "existing_trip_id": refused.existing_trip_id,
-                            "hermes_profile": hermes_profile,
-                            "consequence": "trip is not reachable from this chat; reassignment needs an organizer action",
-                        })
-                        _record_reachability(
-                            conn, trip_id, reachable=False, reason="BINDING_REFUSED",
-                            consequence="the chat is bound to another trip; reassignment needs an organizer action",
-                        )
-                    except Exception:
-                        logger.error("provisioner.companion_binding_failed", extra={
-                            "trip_id": trip_id,
-                            "hermes_profile": hermes_profile,
-                            "consequence": "trip provisioned but is unroutable — no open chat binding",
-                        }, exc_info=True)
-                        _record_reachability(
-                            conn, trip_id, reachable=False, reason="BINDING_FAILED",
-                            consequence="the chat binding write failed; the trip has a companion nobody is routed to",
-                        )
         except Exception:
             # Everything above raised past its own handler — in practice
-            # `install()` itself, which is how B1 (no `hermes`/`node` in the
-            # worker image) presents. Recorded with the reason an operator
-            # would act on rather than left as a stack trace.
+            # `install()` itself, which is how B1 (no `hermes`/`node` reachable
+            # from the worker) presents. Recorded with the reason an operator
+            # would act on rather than left as a stack trace. Execution
+            # continues to the binding below ON PURPOSE.
             logger.warning(
                 "provisioner.companion_profile_failed",
                 extra={"trip_id": trip_id},
@@ -1048,8 +999,64 @@ class ProvisionerWorker:
             )
             _record_reachability(
                 conn, trip_id, reachable=False, reason="COMPANION_INSTALL_FAILED",
-                consequence="the companion profile could not be created; the trip has no assistant and no binding",
+                consequence="the companion profile could not be created; the trip has no assistant",
             )
+
+        # ── The chat binding, attempted whatever the companion did ──────────
+        if not recipient_chat_id:
+            if hermes_profile:
+                # A companion exists and nobody can talk to it. A different
+                # retry from every other reason here: nothing is broken, an
+                # organizer chat id is simply not known yet.
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
+                    consequence="a companion exists but no organizer chat id is known to bind it to",
+                )
+        else:
+            try:
+                outcome = bind_chat_to_trip(conn, recipient_chat_id, trip_id, hermes_profile)
+                if hermes_profile:
+                    logger.info("provisioner.companion_profile_bound", extra={
+                        "trip_id": trip_id,
+                        "hermes_profile": hermes_profile,
+                        "outcome": outcome,
+                    })
+                    # The ONE place 'reachable' is ever written, and it is
+                    # written by the code that opened the binding to a profile
+                    # that actually installed — never later, from the presence
+                    # of a binding row. A binding can outlive the profile it
+                    # points at, and can now legitimately exist without one.
+                    _record_reachability(conn, trip_id, reachable=True)
+                else:
+                    logger.info("provisioner.chat_bound_without_companion", extra={
+                        "trip_id": trip_id,
+                        "outcome": outcome,
+                        "consequence": "routing exists; the assistant behind it does not yet",
+                    })
+            except BindingRefused as refused:
+                # Not a bug and not retryable: the chat legitimately belongs to
+                # another trip, and moving it is a reviewed organizer action
+                # this job has no standing to perform.
+                logger.error("provisioner.companion_binding_refused", extra={
+                    "trip_id": trip_id,
+                    "existing_trip_id": refused.existing_trip_id,
+                    "hermes_profile": hermes_profile,
+                    "consequence": "trip is not reachable from this chat; reassignment needs an organizer action",
+                })
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason="BINDING_REFUSED",
+                    consequence="the chat is bound to another trip; reassignment needs an organizer action",
+                )
+            except Exception:
+                logger.error("provisioner.companion_binding_failed", extra={
+                    "trip_id": trip_id,
+                    "hermes_profile": hermes_profile,
+                    "consequence": "trip provisioned but is unroutable — no open chat binding",
+                }, exc_info=True)
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason="BINDING_FAILED",
+                    consequence="the chat binding write failed; the trip has no routing",
+                )
 
     def _enqueue_operator_notification(
         self,

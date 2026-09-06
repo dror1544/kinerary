@@ -79,7 +79,7 @@ function tap(chatId: string | null, data: string, fromId = 777): TelegramUpdate 
   };
 }
 
-async function bindCompanion(fix: Fixture, chatId: string, profile: string): Promise<void> {
+async function bindCompanion(fix: Fixture, chatId: string, profile: string | null): Promise<void> {
   await fix.pool.query(
     "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
     [chatId, fix.tripId, profile],
@@ -128,6 +128,29 @@ describe("dispatchUpdate — the branch table", () => {
       const decision = await dispatchUpdate(fix.pool, msg("700000444", "hello?"));
       assert.equal(decision.kind, "reply");
       assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
+    });
+  });
+
+  test("a bound chat with no assistant yet is answered honestly, not told it has no trip", { skip: SKIP }, async () => {
+    // The whole point of A4, at the only layer the organizer sees. On
+    // 2026-09-06 a trip provisioned perfectly — site up, HTTP 200 — and the
+    // organizer messaging the bot was told "I don't have a trip for this
+    // chat", because the companion install had failed and routing was gated
+    // behind it. Routing now exists independently, so the honest answer is
+    // available: we know your trip, the assistant is not ready yet.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000666", null);
+      const decision = await dispatchUpdate(fix.pool, msg("700000666", "מתי הטיסה שלנו?"));
+      assert.equal(decision.kind, "reply");
+      assert.equal(
+        decision.kind === "reply" && decision.reply.text,
+        DEFAULT_STRINGS.companionPending,
+      );
+      assert.notEqual(
+        decision.kind === "reply" && decision.reply.text,
+        DEFAULT_STRINGS.unbound,
+        "never claim the trip is unknown — it is bound, and the site is already up",
+      );
     });
   });
 

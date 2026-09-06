@@ -107,7 +107,7 @@ export function displayName(user: TelegramUser | undefined): string | null {
 
 export type NormalizeOutcome =
   | { kind: "event"; event: WireMessageEvent; route: ChatRoute }
-  | { kind: "dropped"; reason: "NO_MESSAGE" | "NO_CHAT_ID" | "NO_TEXT" | "FROM_BOT" | "UNROUTED" | "INTERVIEW" };
+  | { kind: "dropped"; reason: "NO_MESSAGE" | "NO_CHAT_ID" | "NO_TEXT" | "FROM_BOT" | "UNROUTED" | "INTERVIEW" | "COMPANION_PENDING" };
 
 /**
  * Normalizes one Telegram update into a wire event, or explains why it will
@@ -267,6 +267,13 @@ export async function normalizeUpdate(
   // branch returned before the re-host and dispatch rebuilt the event without
   // it. Whatever this branch skips, that one has to do itself.
   if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
+
+  // Bound to a trip, but no assistant installed behind it yet (migration
+  // 0043). Distinct from UNROUTED on purpose: "I don't have a trip for this
+  // chat" would be a lie — we know exactly which trip this is, and the
+  // organizer's site is already up. Answering honestly is the difference
+  // between a system that looks broken and one that says what it is doing.
+  if (!route.hermesProfile) return { kind: "dropped", reason: "COMPANION_PENDING" };
 
   return {
     kind: "event",
