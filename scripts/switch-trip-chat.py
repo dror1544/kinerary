@@ -65,6 +65,21 @@ class Refused(Exception):
     """A guard fired. The message is for the operator, not a stack trace."""
 
 
+def profile_name_for(slug: str) -> str:
+    """Mirror of `companion_profile._slugify_profile_name`.
+
+    Hermes profile names must match ^[a-z][a-z0-9]{2,31}$, so a trip slug's
+    hyphens are stripped: japan-2026-2 -> japan20262. Deriving it here rather
+    than copying `hermes_profile` from an earlier binding, which is what the
+    first version of this script did — and which silently bound a NULL profile
+    for any trip that had never been bound before, i.e. exactly the trip you
+    are switching TO on a first round."""
+    compact = "".join(ch for ch in slug.lower() if ch.isalnum())[:32] or "trip"
+    if not compact[0].isalpha():
+        compact = f"t{compact}"[:32]
+    return compact
+
+
 def psql(sql: str) -> str:
     proc = subprocess.run(
         ["docker", "exec", PG_CONTAINER, "psql", "-U", PG_USER, "-d", PG_USER, "-tAc", sql],
@@ -145,7 +160,10 @@ def switch(chat_id: str, target_ref: str, apply: bool) -> None:
     print(f"  chat            {chat_id}")
     print(f"  currently       {old_slug or '(unbound)'}")
     print(f"  would become    {slug}")
-    print(f"  companion       {'yes' if has_companion else 'NO — the trip will be bound but unreachable'}")
+    profile_preview = profile_name_for(slug)
+    on_disk = os.path.isdir(os.path.expanduser(f"~/.hermes/profiles/{profile_preview}"))
+    print(f"  companion       {profile_preview}"
+          + ("" if on_disk else "  (NOT installed — will bind with no profile)"))
     if not apply:
         print("\nNothing changed. Re-run with --yes to apply.")
         return
@@ -167,20 +185,19 @@ def switch(chat_id: str, target_ref: str, apply: bool) -> None:
             "  SELECT 1 FROM control_plane.telegram_chat_bindings "
             f"  WHERE trip_id = {q(old_trip_id)} AND closed_at IS NULL)"
         )
+    profile = profile_name_for(slug)
+    installed = os.path.isdir(os.path.expanduser(f"~/.hermes/profiles/{profile}"))
     stmts.append(
         "INSERT INTO control_plane.telegram_chat_bindings (id, chat_id, trip_id, hermes_profile) "
-        f"SELECT 'tcb_' || md5(random()::text), {q(chat_id)}, {q(trip_id)}, "
-        "       (SELECT hermes_profile FROM control_plane.telegram_chat_bindings "
-        f"        WHERE trip_id = {q(trip_id)} ORDER BY created_at DESC LIMIT 1)"
+        f"VALUES ('tcb_' || md5(random()::text), {q(chat_id)}, {q(trip_id)}, "
+        f"{q(profile) if installed else 'NULL'})"
     )
     # Only a trip with a companion may claim reachable — same rule the
     # provisioner follows, for the same reason.
     stmts.append(
         "UPDATE control_plane.trips SET "
-        "  reachability = CASE WHEN COALESCE(array_length(assistant_names, 1), 0) > 0 "
-        "                      THEN 'reachable' ELSE 'unreachable' END, "
-        "  unreachable_reason = CASE WHEN COALESCE(array_length(assistant_names, 1), 0) > 0 "
-        "                            THEN NULL ELSE 'COMPANION_INSTALL_FAILED' END, "
+        f"  reachability = {q('reachable') if installed else q('unreachable')}, "
+        f"  unreachable_reason = {'NULL' if installed else q('COMPANION_INSTALL_FAILED')}, "
         "  reachability_checked_at = now() "
         f"WHERE id = {q(trip_id)}"
     )
