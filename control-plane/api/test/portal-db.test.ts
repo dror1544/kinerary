@@ -6,8 +6,9 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`;

@@ -32,8 +32,9 @@ import {
   getSessionStatus,
 } from "../src/interview.js";
 import { applyMigrations } from "../src/migrations.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const DB_URL = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

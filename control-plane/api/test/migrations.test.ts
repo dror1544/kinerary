@@ -6,8 +6,9 @@ import pg from "pg";
 import { isCanonicalRecordSafe } from "../src/canonical.js";
 import { applyMigrations } from "../src/migrations.js";
 import { loadCanonicalFixtures } from "./canonical-fixtures.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
 async function reset(client: pg.PoolClient) {

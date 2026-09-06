@@ -19,8 +19,9 @@ import { applyDecision, startTripBotPoller } from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

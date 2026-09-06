@@ -9,8 +9,9 @@ import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "..
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

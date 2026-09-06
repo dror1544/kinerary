@@ -36,8 +36,9 @@ import {
   submitAnswerForAgent,
   submitAnswerForChat,
 } from "../src/interview.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

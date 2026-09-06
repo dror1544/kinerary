@@ -7,8 +7,9 @@ import { buildApp, type ChatRoutingDependencies, type InterviewDependencies } fr
 import { validateArchitectureProfile } from "../src/config.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { applyMigrations } from "../src/migrations.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const apiKey = "test-interview-binding-key";

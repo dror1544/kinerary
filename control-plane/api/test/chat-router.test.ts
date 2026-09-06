@@ -21,6 +21,7 @@ import {
   resolveChatRoute,
   startFromDeepLink,
 } from "../src/chat-router.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Pure decision logic — no database required ───────────────────────────────
 
@@ -243,7 +244,7 @@ describe("findQuestion", () => {
 
 // ── Routing and the deep link — database required ───────────────────────────
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

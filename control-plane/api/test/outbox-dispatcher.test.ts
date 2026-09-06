@@ -6,8 +6,9 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { FakeNotificationAdapter } from "../src/adapters/notification.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

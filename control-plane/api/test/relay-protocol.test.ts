@@ -18,6 +18,7 @@ import {
   verifyUpgradeToken,
 } from "../src/relay/protocol.js";
 import { displayName, mapChatType, normalizeUpdate, type TelegramUpdate } from "../src/relay/normalize.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Upgrade-token auth: cross-language conformance ───────────────────────────
 
@@ -259,7 +260,7 @@ describe("displayName", () => {
 
 // ── Normalization + the routing stamp — database required ────────────────────
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
