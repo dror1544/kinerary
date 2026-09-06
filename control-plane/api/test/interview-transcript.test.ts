@@ -775,6 +775,72 @@ describe("one voice, one writer", () => {
     });
   });
 
+  test("a say arriving AFTER the nomination cannot strand the question", { skip: SKIP }, async () => {
+    // Run 13, twice in one hour, and the stall that produced it:
+    //
+    //   23:04:47  ask_question_for_chat completes — trip_pace nominated
+    //   23:04:50  the agent's turn ends; its closing text becomes pendingSay
+    //   23:04:50  the router sends that say, claims the floor, returns
+    //   ...       floor_held_by_person, every pass, for ELEVEN MINUTES
+    //   23:15:43  the organizer types "מה עכשיו?"
+    //
+    // `trip_pace` was never drawn and never answered. The closing text had
+    // TOLD the organizer it was asked, so the silence read as being ignored.
+    //
+    // This is the reverse order of the fold above, and the one no
+    // nomination-time fold can catch: at nomination time there was no say to
+    // fold, and by the time the say arrived the nomination had already been
+    // made. Only the render pass sees both.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      const nominated = await nominateQuestionForChat(fix.pool, fix.chat, "dietary", "יש הגבלות אכילה?");
+      assert.ok(nominated.ok);
+      // The agent's closing sentence, landing after the ask — the raw-send
+      // path converts it to a say, exactly as the relay does in production.
+      await sayForChat(fix.pool, fix.chat, "רשמתי הכל. שאלתי עכשיו על הגבלות אכילה.");
+
+      const before = fix.script.lines.length;
+      await deliverPendingRouterPrompt(fix);
+
+      assert.equal(fix.script.lines.length, before + 1, "one utterance, one message");
+      const combined = fix.script.last;
+      assert.equal(combined?.questionId, "dietary", "the QUESTION went out, not just the say");
+      assert.ok(combined!.buttons.length > 0, "with its buttons — the whole point of drawing it");
+      assert.match(combined!.text, /שאלתי עכשיו/, "and the agent's words led it rather than being dropped");
+      fix.script.check();
+    });
+  });
+
+  test("the question still goes out when the say that follows it is deduped away", { skip: SKIP }, async () => {
+    // The floor is the thing that actually broke: sending the say claimed it
+    // and returned, so nothing could speak again until the organizer did.
+    // Whatever else the fold does, the interview must not be left waiting on
+    // a person who is waiting on it.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await nominateQuestionForChat(fix.pool, fix.chat, "dietary", "יש הגבלות אכילה?");
+      await sayForChat(fix.pool, fix.chat, "רשמתי הכל.");
+      await deliverPendingRouterPrompt(fix);
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      assert.equal(view.view.pendingAsk, null, "the nomination was consumed, not left queued behind the floor");
+      assert.equal(view.view.pendingSay, null, "and the say was consumed with it");
+      assert.equal(
+        fix.script.asking("dietary").length, 1,
+        "asked exactly once — not narrated in prose and then never drawn",
+      );
+    });
+  });
+
   test("wording belongs to the question it was written for", { skip: SKIP }, async () => {
     // The failure this prevents is specific and would be baffling to receive:
     // a sentence written for `dietary` sitting above a date question, because
@@ -1776,6 +1842,65 @@ describe("Track 8 — deterministic question progression", () => {
       );
 
       assert.equal(fix.script.last?.questionId, "bot_gender", "asked directly — no nomination happened anywhere above");
+      fix.script.check();
+    });
+  });
+
+  test("a router-owned question yields while the agent is mid-conversation", { skip: SKIP }, async () => {
+    // Run 13: "it again competing with the agent on the questions." An open
+    // agent turn is not evidence the agent is busy elsewhere — it is equally
+    // the state of an agent composing the very next thing it means to say,
+    // and asking over that is the form-like interview Track 8 was explicitly
+    // told not to drift back into.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await deliverWithInterviewer(fix); // essentials-done transition
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      // A plain conversational turn — no media, so the default floor.
+      await markAwaitingMachine(fix.pool, fix.chat);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+      assert.equal(await hasOpenAgentTurn(fix.pool, fix.chat), true);
+
+      const before = fix.script.lines.length;
+      await advanceRouterOwnedQuestions(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector, interviewerProfile: "trip-intake" },
+        DEFAULT_STRINGS,
+        () => {},
+      );
+
+      assert.equal(fix.script.lines.length, before, "the router said nothing over the interviewer");
+    });
+  });
+
+  test("a router-owned question is still asked while the agent reads a document", { skip: SKIP }, async () => {
+    // The other half, and the reason the narrowing is by what the turn is FOR
+    // rather than whether one exists: an agent reading a document will be a
+    // while, and a fixed-choice question asked meanwhile costs it nothing.
+    // This is the case Track 8 was built for; it must survive the fix above.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+      await deliverWithInterviewer(fix);
+
+      const view = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(view.ok);
+      // The longer floor is what `applyDecision` stamps for a turn carrying
+      // media, and it is the signal that this is async work rather than talk.
+      await markAwaitingMachine(fix.pool, fix.chat, DOCUMENT_FLOOR_SECONDS);
+      await openAgentTurn(fix.pool, fix.chat, view.view.sessionId);
+
+      await advanceRouterOwnedQuestions(
+        { db: fix.pool, telegram: fix.script, connector: fix.connector, interviewerProfile: "trip-intake" },
+        DEFAULT_STRINGS,
+        () => {},
+      );
+
+      assert.equal(fix.script.last?.questionId, "bot_gender", "dead air filled, document turn untouched");
       fix.script.check();
     });
   });

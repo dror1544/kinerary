@@ -247,7 +247,16 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travelers",
     type: "structured",
-    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't written in Latin script, include the English spelling of each too.",
+    // The Latin spelling is the INTERVIEWER's job, not the organizer's. An
+    // earlier version asked the organizer to supply it, and run 13 is why
+    // that was wrong: having listed five people in Hebrew, they were then
+    // asked to write all five names again in English — the same information,
+    // typed twice, for a field they never asked for. Transliterating Hebrew
+    // is exactly the low-stakes judgment the agent is good at, and a proposed
+    // spelling the organizer can glance at and correct costs them one word
+    // ("Sagi, not Sagie") instead of a whole list. Answers overwrite, so a
+    // correction arriving later is a plain re-submit of this question.
+    prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
     dataShape: "array",
     required: true,
     checkComplete: (data) =>
@@ -1686,9 +1695,9 @@ export async function claimStalledAgentTurns(
 export async function listMachineAwaitingChats(
   db: pg.Pool,
   limit = 25,
-): Promise<Array<{ chatId: string }>> {
-  const rows = await db.query<{ telegram_chat_id: string }>(
-    `SELECT telegram_chat_id
+): Promise<Array<{ chatId: string; isAsyncWork: boolean }>> {
+  const rows = await db.query<{ telegram_chat_id: string; awaiting_floor_seconds: number | null }>(
+    `SELECT telegram_chat_id, awaiting_floor_seconds
        FROM control_plane.intake_sessions
       WHERE awaiting = 'machine'
         AND state = 'interviewing'
@@ -1697,7 +1706,15 @@ export async function listMachineAwaitingChats(
       LIMIT $1`,
     [limit],
   );
-  return rows.rows.map((r) => ({ chatId: r.telegram_chat_id }));
+  return rows.rows.map((r) => ({
+    chatId: r.telegram_chat_id,
+    // A non-default floor is only ever set for a turn carrying media — see
+    // `applyDecision`. It is therefore the one durable signal for "the agent
+    // is off doing async work" as opposed to "the agent is mid-conversation",
+    // and Track 8 needs exactly that distinction to know whether speaking
+    // would be filling dead air or talking over the interviewer.
+    isAsyncWork: r.awaiting_floor_seconds !== null,
+  }));
 }
 
 export async function getSessionForAgent(db: pg.Pool, chatId: string): Promise<GetSessionResult> {

@@ -29,6 +29,11 @@
  * someone might genuinely discuss a wifi router — but its Hebrew
  * transliteration is, because "הראוטר" in a trip interview is only ever this
  * system talking about itself.
+ *
+ * Two lists, two leak classes: the agent describing its own plumbing
+ * (INTERNAL_TERMS, below) and the harness describing its own scheduling
+ * (GATEWAY_STATUS_PHRASES). Both reach the organizer through the same door,
+ * so both are stopped at it.
  */
 import { INTAKE_QUESTIONS } from "../interview.js";
 
@@ -48,6 +53,38 @@ const INTERNAL_TERMS: readonly string[] = [
   "intake_sessions",
   "הראוטר",
   "הרואטר",
+];
+
+/**
+ * The gateway's own busy-acknowledgement sentences.
+ *
+ * A different leak class from the list above, and worth its own constant: it
+ * is not the agent narrating itself, it is the HARNESS narrating itself. When
+ * an inbound message arrives while a run is active, the Hermes gateway sends
+ * the chat a status line of its own — and on 2026-09-05 run 13 an organizer
+ * who had just answered the question they were asked got back:
+ *
+ *     ↪ Redirected current run. I'll adjust using your correction.
+ *
+ * There was no correction. They answered. The router had handed their reply
+ * to an agent that was already mid-run, and the gateway announced its own
+ * scheduling decision as though it were a reply — telling the organizer, in
+ * English, in a Hebrew interview, that something they did not do had happened.
+ *
+ * `display.busy_ack_enabled: false` in the trip-intake profile turns these off
+ * at the source, which is the actual fix. This is the fail-safe: the profile
+ * is not version controlled, the ack is on by default, and one `config.yaml`
+ * reset would put it back with nothing to catch it. Matching the sentences is
+ * safe because they are fixed English strings about runs and subagents —
+ * nothing an organizer discussing a family holiday would ever write.
+ */
+const GATEWAY_STATUS_PHRASES: readonly string[] = [
+  "redirected current run",
+  "steered into current run",
+  "interrupting current task",
+  "queued for the next turn",
+  "subagent working",
+  "compressing context",
 ];
 
 /**
@@ -71,6 +108,9 @@ export function detectInternalLeak(text: string): LeakVerdict {
   const lowered = text.toLowerCase();
   for (const term of INTERNAL_TERMS) {
     if (lowered.includes(term.toLowerCase())) return { leaks: true, term };
+  }
+  for (const phrase of GATEWAY_STATUS_PHRASES) {
+    if (lowered.includes(phrase)) return { leaks: true, term: phrase };
   }
   const idMatch = QUESTION_ID_PATTERN.exec(text);
   if (idMatch) return { leaks: true, term: `\`${idMatch[1]}\`` };
