@@ -76,7 +76,10 @@ done
 # ── 0. Preconditions ─────────────────────────────────────────────────────────
 step "Preconditions"
 [ -f "$PROVISIONING_ENV" ] || die "missing $PROVISIONING_ENV — cannot read the interview agent key"
-[ -f "$RELAY_ARCH_PROFILE" ] || die "missing $RELAY_ARCH_PROFILE"
+[ -f "$RELAY_ARCH_PROFILE" ] || die "missing $RELAY_ARCH_PROFILE
+    .local-secrets/ is gitignored, so a 'git worktree remove' takes it with the
+    worktree and no git operation can bring it back. If that is what happened:
+        scripts/backup-local-secrets.sh --restore"
 command -v docker >/dev/null || die "docker not on PATH"
 info "repo root: $REPO_ROOT"
 
