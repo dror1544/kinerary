@@ -1910,7 +1910,7 @@ app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings', authRequired, (req, res) => {
+app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
   if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
   const result = db.prepare(
@@ -1921,7 +1921,7 @@ app.post('/api/bookings', authRequired, (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
-app.patch('/api/bookings/:id', authRequired, (req, res) => {
+app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
   const updates = [];
   const params = [];
@@ -1934,7 +1934,7 @@ app.patch('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/bookings/:id', authRequired, (req, res) => {
+app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const row = db.prepare('SELECT seed_key FROM bookings WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (row.seed_key) return res.status(403).json({ error: 'seed bookings cannot be deleted' });
@@ -1942,7 +1942,7 @@ app.delete('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, confUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pdf file required' });
   db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, conf_file: req.file.filename });
@@ -1999,7 +1999,7 @@ const pkpassUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/wallet-apple', organizerOrAgentRequired, pkpassUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pkpass file required' });
   db.prepare('UPDATE bookings SET pkpass_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, pkpass_file: req.file.filename });

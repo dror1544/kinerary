@@ -3,16 +3,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createBooking,
+  deleteBooking,
   extractBookingDetails,
   getAuthenticatedDocument,
   createItineraryItem,
   deleteItineraryItem,
   tokenStore,
   updateItineraryItem,
+  updateBooking,
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
 } from "./api";
-import App, { BookingCreatePanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
+import App, { BookingCreatePanel, BookingEditPanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -126,7 +128,7 @@ describe("Modern trip SPA", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses authenticated booking creation and document-upload endpoints", async () => {
+  it("uses authenticated booking management and document-upload endpoints", async () => {
     localStorage.clear();
     tokenStore.set("organizer-token");
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, id: 12 }) });
@@ -135,19 +137,68 @@ describe("Modern trip SPA", () => {
     const wallet = new File(["pass"], "boarding.pkpass", { type: "application/vnd.apple.pkpass" });
 
     await createBooking({ phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01" });
+    await updateBooking(12, { phase: "tokyo", type: "flight", name: "JL 12 revised" });
     await uploadBookingConfirmation(12, confirmation);
     await uploadBookingAppleWallet(12, wallet);
+    await deleteBooking(12);
 
     expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
       ["/api/bookings", "POST"],
+      ["/api/bookings/12", "PATCH"],
       ["/api/bookings/12/confirmation", "POST"],
       ["/api/bookings/12/wallet-apple", "POST"],
+      ["/api/bookings/12", "DELETE"],
     ]);
     const postHeaders = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(postHeaders.get("Authorization")).toBe("Bearer organizer-token");
     expect(fetchMock.mock.calls[0][1]?.body).toBe(JSON.stringify({ phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01" }));
-    expect(fetchMock.mock.calls[1][1]?.body).toBeInstanceOf(FormData);
+    expect(fetchMock.mock.calls[1][1]?.body).toBe(JSON.stringify({ phase: "tokyo", type: "flight", name: "JL 12 revised" }));
     expect(fetchMock.mock.calls[2][1]?.body).toBeInstanceOf(FormData);
+    expect(fetchMock.mock.calls[3][1]?.body).toBeInstanceOf(FormData);
+    vi.unstubAllGlobals();
+  });
+
+  it("lets an organizer edit a booking, replace documents, and explicitly confirm deletion", async () => {
+    localStorage.clear();
+    tokenStore.set("organizer-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const booking = { id: 12, phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01", confirmation: "OLD-12" };
+    const close = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BookingEditPanel booking={booking} lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }] }} onClose={close} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.change(screen.getByLabelText(/booking name/i), { target: { value: "JL 12 revised" } });
+    fireEvent.click(screen.getByText(/wallet and files/i));
+    fireEvent.change(screen.getByLabelText(/replace confirmation pdf/i), { target: { files: [new File(["pdf"], "revised.pdf", { type: "application/pdf" })] } });
+    fireEvent.change(screen.getByLabelText(/replace apple wallet file/i), { target: { files: [new File(["pass"], "revised.pkpass", { type: "application/vnd.apple.pkpass" })] } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(close).toHaveBeenCalled());
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["/api/bookings/12", "PATCH"],
+      ["/api/bookings/12/confirmation", "POST"],
+      ["/api/bookings/12/wallet-apple", "POST"],
+    ]);
+    const patchBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(patchBody).toMatchObject({ phase: "tokyo", name: "JL 12 revised", confirmation: "OLD-12" });
+
+    cleanup();
+    const deleteClose = vi.fn();
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BookingEditPanel booking={booking} lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }] }} onClose={deleteClose} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^delete booking$/i }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/linked journey cards/i);
+    fireEvent.click(screen.getByRole("button", { name: /yes, delete/i }));
+    await waitFor(() => expect(deleteClose).toHaveBeenCalled());
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe("/api/bookings/12");
+    expect(fetchMock.mock.calls.at(-1)?.[1]?.method).toBe("DELETE");
     vi.unstubAllGlobals();
   });
 

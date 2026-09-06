@@ -206,6 +206,8 @@ export const extractBookingDetails = (body: FormData) => api<ExtractedBooking>("
 export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });
 export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
 export const createBooking = (input: BookingInput) => api<{ ok: true; id: number }>("/api/bookings", { method: "POST", body: JSON.stringify(input) });
+export const updateBooking = (id: number, input: BookingInput) => api<{ ok: true }>(`/api/bookings/${id}`, { method: "PATCH", body: JSON.stringify(input) });
+export const deleteBooking = (id: number) => api<{ ok: true }>(`/api/bookings/${id}`, { method: "DELETE" });
 export const uploadBookingConfirmation = (id: number, file: File) => {
   const body = new FormData();
   body.set("file", file);

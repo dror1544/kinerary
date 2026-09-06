@@ -43,6 +43,7 @@ import {
   Booking,
   approveBookingDraft,
   createBooking,
+  deleteBooking,
   createItineraryItem,
   deleteItineraryItem,
   ItineraryItem,
@@ -66,6 +67,7 @@ import {
   reportIssue,
   runtimeUrl,
   tokenStore,
+  updateBooking,
   updateItineraryItem,
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
@@ -1096,9 +1098,96 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
   );
 }
 
+function bookingDraft(booking: Booking) {
+  return {
+    phase: booking.phase || "",
+    type: booking.type,
+    name: booking.name,
+    date_from: booking.date_from || "",
+    date_to: booking.date_to || "",
+    passengers: booking.passengers || "",
+    confirmation: booking.confirmation || "",
+    notes: booking.notes || "",
+    location_url: booking.location_url || "",
+    google_wallet_url: booking.google_wallet_url || "",
+    apple_wallet_url: booking.apple_wallet_url || "",
+  };
+}
+
+export function BookingEditPanel({ booking, config, lang, onClose }: { booking: Booking; config?: TripConfig; lang: Lang; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [draft, setDraft] = useState(() => bookingDraft(booking));
+  const [confirmationFile, setConfirmationFile] = useState<File | null>(null);
+  const [walletFile, setWalletFile] = useState<File | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const invalidateBookingViews = () => {
+    queryClient.invalidateQueries({ queryKey: ["bookings"] });
+    queryClient.invalidateQueries({ queryKey: ["itinerary"] });
+    queryClient.invalidateQueries({ queryKey: ["today"] });
+    queryClient.invalidateQueries({ queryKey: ["confirmations"] });
+  };
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      await updateBooking(booking.id, draft);
+      if (confirmationFile) await uploadBookingConfirmation(booking.id, confirmationFile);
+      if (walletFile) await uploadBookingAppleWallet(booking.id, walletFile);
+    },
+    onSuccess: () => {
+      invalidateBookingViews();
+      onClose();
+    },
+  });
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteBooking(booking.id),
+    onSuccess: () => {
+      invalidateBookingViews();
+      onClose();
+    },
+  });
+
+  return (
+    <form className="booking-edit-panel" onSubmit={(event) => { event.preventDefault(); saveMutation.mutate(); }}>
+      <div className="booking-form-header">
+        <div>
+          <span className="panel-label"><Pencil size={16} /> {lang === "he" ? "עריכת הזמנה" : "Edit booking"}</span>
+          <h3>{booking.name}</h3>
+        </div>
+        <button className="icon-action" type="button" onClick={onClose} aria-label={lang === "he" ? "סגירת עריכת הזמנה" : "Close booking editor"}><X size={18} /></button>
+      </div>
+      <div className="booking-create-fields">
+        <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></select></label>
+        <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
+        <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
+        <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
+        <label>{lang === "he" ? "נוסעים" : "Travelers"}<input value={draft.passengers} onChange={(event) => setDraft({ ...draft, passengers: event.target.value })} /></label>
+        <label>{lang === "he" ? "מספר אישור" : "Confirmation number"}<input value={draft.confirmation} onChange={(event) => setDraft({ ...draft, confirmation: event.target.value })} /></label>
+        <label className="editor-field-wide">{lang === "he" ? "קישור Google Maps" : "Google Maps link"}<input type="url" value={draft.location_url} onChange={(event) => setDraft({ ...draft, location_url: event.target.value })} placeholder="https://..." /></label>
+        <label className="editor-field-wide">{lang === "he" ? "הערות לארגון" : "Organizer notes"}<input value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></label>
+      </div>
+      <details className="booking-more-fields">
+        <summary>{lang === "he" ? "ארנק וקבצים" : "Wallet and files"}</summary>
+        <div className="booking-create-fields">
+          <label>{lang === "he" ? "קישור Google Wallet" : "Google Wallet link"}<input type="url" value={draft.google_wallet_url} onChange={(event) => setDraft({ ...draft, google_wallet_url: event.target.value })} placeholder="https://..." /></label>
+          <label>{lang === "he" ? "קישור Apple Wallet" : "Apple Wallet link"}<input type="url" value={draft.apple_wallet_url} onChange={(event) => setDraft({ ...draft, apple_wallet_url: event.target.value })} placeholder="https://..." /></label>
+          <label>{lang === "he" ? "החלפת אישור PDF" : "Replace confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => setConfirmationFile(event.target.files?.[0] || null)} /></label>
+          <label>{lang === "he" ? "החלפת קובץ Apple Wallet" : "Replace Apple Wallet file"}<input type="file" accept=".pkpass,application/vnd.apple.pkpass" onChange={(event) => setWalletFile(event.target.files?.[0] || null)} /></label>
+        </div>
+      </details>
+      <div className="booking-edit-actions">
+        <button className="primary-action" type="submit" disabled={saveMutation.isPending || !draft.phase || !draft.name.trim()}>{saveMutation.isPending ? (lang === "he" ? "שומר…" : "Saving…") : (lang === "he" ? "שמירת שינויים" : "Save changes")}</button>
+        {!confirmDelete ? <button className="secondary-action danger-text" type="button" onClick={() => setConfirmDelete(true)}>{lang === "he" ? "מחיקת הזמנה" : "Delete booking"}</button> : <div className="booking-delete-confirm" role="alert"><span>{lang === "he" ? "כרטיסי מסלול מקושרים יאבדו את קישורי ההזמנה. למחוק?" : "Linked Journey cards will lose their booking links. Delete it?"}</span><button className="secondary-action danger-text" type="button" disabled={deleteMutation.isPending} onClick={() => deleteMutation.mutate()}>{deleteMutation.isPending ? (lang === "he" ? "מוחק…" : "Deleting…") : (lang === "he" ? "כן, למחוק" : "Yes, delete")}</button><button className="secondary-action" type="button" onClick={() => setConfirmDelete(false)}>{lang === "he" ? "ביטול" : "Cancel"}</button></div>}
+      </div>
+      {saveMutation.isError ? <p className="form-error">{saveMutation.error instanceof Error ? saveMutation.error.message : (lang === "he" ? "לא ניתן לשמור את ההזמנה" : "Could not save the booking")}</p> : null}
+      {deleteMutation.isError ? <p className="form-error">{deleteMutation.error instanceof Error ? deleteMutation.error.message : (lang === "he" ? "לא ניתן למחוק את ההזמנה" : "Could not delete the booking")}</p> : null}
+    </form>
+  );
+}
+
 function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
   const queryClient = useQueryClient();
   const [filter, setFilter] = useState<BookingFilter>("phase");
+  const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
   const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
   const today = useQuery({ queryKey: ["today"], queryFn: getToday });
   const allRows = bookings.data || [];
@@ -1165,6 +1254,8 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
                   <BookingActions booking={booking} />
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
+                  {isOrganizer ? <button className="secondary-action" type="button" onClick={() => setEditingBookingId((current) => current === booking.id ? null : booking.id)}><Pencil size={15} /> {lang === "he" ? "עריכה" : "Edit"}</button> : null}
+                  {isOrganizer && editingBookingId === booking.id ? <BookingEditPanel booking={booking} config={config} lang={lang} onClose={() => setEditingBookingId(null)} /> : null}
                 </article>
               ))}
             </div>

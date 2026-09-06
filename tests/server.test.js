@@ -514,6 +514,32 @@ describe('/api/bookings CRUD', () => {
     assert.equal(created.cost, 75);
   });
 
+  test('booking writes reject an authenticated family member', async () => {
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    const bobToken = (await login.json()).token;
+    const created = await api('/api/bookings', {
+      method: 'POST', token: bobToken,
+      body: { phase: 'ny', type: 'attraction', name: 'Unauthorized reservation' },
+    });
+    assert.equal(created.status, 403);
+
+    const rows = await (await api('/api/bookings', { token })).json();
+    const booking = rows.find(b => b.name === 'Statue of Liberty Tour');
+    assert.ok(booking, 'organizer booking should exist before the denied update');
+    const changed = await api(`/api/bookings/${booking.id}`, {
+      method: 'PATCH', token: bobToken, body: { name: 'Changed by member' },
+    });
+    assert.equal(changed.status, 403);
+    const deleted = await api(`/api/bookings/${booking.id}`, { method: 'DELETE', token: bobToken });
+    assert.equal(deleted.status, 403);
+    const uploadedConfirmation = await api(`/api/bookings/${booking.id}/confirmation`, { method: 'POST', token: bobToken });
+    assert.equal(uploadedConfirmation.status, 403);
+    const uploadedWallet = await api(`/api/bookings/${booking.id}/wallet-apple`, { method: 'POST', token: bobToken });
+    assert.equal(uploadedWallet.status, 403);
+    const unchanged = await (await api('/api/bookings', { token })).json();
+    assert.equal(unchanged.find(b => b.id === booking.id)?.name, 'Statue of Liberty Tour');
+  });
+
   test('PATCH updates a non-seed booking', async () => {
     // Get the id of the attraction we just created
     const all = await (await api('/api/bookings', { token })).json();
