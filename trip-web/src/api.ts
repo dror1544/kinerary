@@ -167,6 +167,10 @@ const bookingSchema = z.object({
 
 export type Booking = z.infer<typeof bookingSchema>;
 export type BookingInput = Pick<Booking, "phase" | "type" | "name"> & Partial<Pick<Booking, "date_from" | "date_to" | "passengers" | "confirmation" | "notes" | "location_url" | "google_wallet_url" | "apple_wallet_url">>;
+export type ExtractedBooking = Partial<BookingInput> & {
+  pin?: string | null;
+  cost?: number | string | null;
+};
 
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
@@ -198,7 +202,7 @@ export async function getAuthenticatedDocument(path: string) {
   if (!response.ok) throw new Error(`Could not retrieve document (${response.status})`);
   return response.blob();
 }
-export const extractBookingDetails = (body: FormData) => api<unknown>("/api/bookings/extract", { method: "POST", body });
+export const extractBookingDetails = (body: FormData) => api<ExtractedBooking>("/api/bookings/extract", { method: "POST", body });
 export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });
 export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
 export const createBooking = (input: BookingInput) => api<{ ok: true; id: number }>("/api/bookings", { method: "POST", body: JSON.stringify(input) });

@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import {
   createBooking,
+  extractBookingDetails,
   getAuthenticatedDocument,
   createItineraryItem,
   deleteItineraryItem,
@@ -11,7 +12,7 @@ import {
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
 } from "./api";
-import App, { classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
+import App, { BookingCreatePanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
 
 describe("Modern trip SPA", () => {
   it("shows the login experience when no runtime token exists", () => {
@@ -141,6 +142,53 @@ describe("Modern trip SPA", () => {
     expect(fetchMock.mock.calls[0][1]?.body).toBe(JSON.stringify({ phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01" }));
     expect(fetchMock.mock.calls[1][1]?.body).toBeInstanceOf(FormData);
     expect(fetchMock.mock.calls[2][1]?.body).toBeInstanceOf(FormData);
+    vi.unstubAllGlobals();
+  });
+
+  it("extracts a confirmation in the background-ready booking form without creating a draft", async () => {
+    localStorage.clear();
+    tokenStore.set("organizer-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ phase: "tokyo", type: "hotel", name: "Mock Hotel" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("file", new File(["pdf"], "confirmation.pdf", { type: "application/pdf" }));
+
+    const extracted = await extractBookingDetails(body);
+
+    expect(extracted).toMatchObject({ phase: "tokyo", type: "hotel", name: "Mock Hotel" });
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([["/api/bookings/extract", "POST"]]);
+    const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("Authorization")).toBe("Bearer organizer-token");
+    expect(headers.has("Content-Type")).toBe(false);
+    expect(fetchMock.mock.calls[0][1]?.body).toBe(body);
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps booking creation compact, then lets an organizer fill fields while extraction runs", async () => {
+    localStorage.clear();
+    tokenStore.set("organizer-token");
+    let resolveExtraction: (value: { ok: boolean; status: number; json: () => Promise<unknown> }) => void;
+    const fetchMock = vi.fn().mockImplementation(() => new Promise((resolve) => { resolveExtraction = resolve; }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BookingCreatePanel isOrganizer lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }] }} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /add booking/i }));
+    expect(screen.getByRole("heading", { name: /everything in one place/i })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/confirmation pdf/i), { target: { files: [new File(["pdf"], "confirmation.pdf", { type: "application/pdf" })] } });
+    fireEvent.click(screen.getByRole("button", { name: /extract details into form/i }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(/working in the background/i);
+    fireEvent.change(screen.getByLabelText(/booking name/i), { target: { value: "Manual name while extracting" } });
+    expect(screen.getByLabelText(/booking name/i)).toHaveValue("Manual name while extracting");
+    expect(screen.getByRole("button", { name: /save booking/i })).not.toBeDisabled();
+
+    resolveExtraction!({ ok: true, status: 200, json: async () => ({ phase: "tokyo", type: "hotel", name: "Extracted hotel" }) });
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    expect(screen.getByLabelText(/booking name/i)).toHaveValue("Extracted hotel");
     vi.unstubAllGlobals();
   });
 });

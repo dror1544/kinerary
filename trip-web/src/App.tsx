@@ -49,7 +49,7 @@ import {
   ItineraryItemInput,
   TripConfig,
   createMoment,
-  extractBookingDraft,
+  extractBookingDetails,
   getAuthenticatedDocument,
   getBookings,
   getConfig,
@@ -994,12 +994,41 @@ function BookingActions({ booking }: { booking: Booking }) {
   );
 }
 
-function BookingCreatePanel({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
   const defaultPhase = config?.phases?.[0]?.id || "";
   const [draft, setDraft] = useState({ phase: defaultPhase, type: "flight", name: "", date_from: "", date_to: "", passengers: "", confirmation: "", location_url: "", google_wallet_url: "", apple_wallet_url: "" });
   const [confirmationFile, setConfirmationFile] = useState<File | null>(null);
   const [walletFile, setWalletFile] = useState<File | null>(null);
+  const [extractUrl, setExtractUrl] = useState("");
+  const [isOpen, setIsOpen] = useState(false);
+  const formGeneration = useRef(0);
   const queryClient = useQueryClient();
+  const extractMutation = useMutation({
+    mutationFn: async (generation: number) => {
+      const body = new FormData();
+      if (confirmationFile) body.set("file", confirmationFile);
+      if (extractUrl.trim()) body.set("url", extractUrl.trim());
+      return { extracted: await extractBookingDetails(body), generation };
+    },
+    onSuccess: ({ extracted, generation }) => {
+      // Saving starts a fresh form. A late background extraction must never
+      // write its old confirmation's data into that next booking.
+      if (generation !== formGeneration.current) return;
+      const validTypes = new Set(["flight", "hotel", "car", "attraction", "other"]);
+      setDraft((current) => ({
+        ...current,
+        phase: extracted.phase || current.phase,
+        type: extracted.type && validTypes.has(extracted.type) ? extracted.type : current.type,
+        name: extracted.name || current.name,
+        date_from: extracted.date_from || current.date_from,
+        date_to: extracted.date_to || current.date_to,
+        passengers: extracted.passengers || current.passengers,
+        confirmation: extracted.confirmation || current.confirmation,
+        location_url: extracted.location_url || current.location_url,
+      }));
+      setExtractUrl("");
+    },
+  });
   const mutation = useMutation({
     mutationFn: async () => {
       const created = await createBooking({ ...draft, phase: draft.phase || defaultPhase });
@@ -1008,19 +1037,36 @@ function BookingCreatePanel({ config, isOrganizer, lang }: { config?: TripConfig
       return created;
     },
     onSuccess: () => {
+      formGeneration.current += 1;
       setDraft({ phase: defaultPhase, type: "flight", name: "", date_from: "", date_to: "", passengers: "", confirmation: "", location_url: "", google_wallet_url: "", apple_wallet_url: "" });
       setConfirmationFile(null);
       setWalletFile(null);
+      setExtractUrl("");
+      setIsOpen(false);
       queryClient.invalidateQueries({ queryKey: ["bookings"] });
     },
   });
 
   if (!isOrganizer) return null;
+  if (!isOpen) return <button className="booking-add-trigger" type="button" onClick={() => setIsOpen(true)}><Plus size={18} /> {lang === "he" ? "הוספת הזמנה" : "Add booking"}</button>;
   return (
     <form className="extract-panel" onSubmit={(event) => { event.preventDefault(); if (draft.phase || defaultPhase) mutation.mutate(); }}>
-      <span className="panel-label"><Plus size={16} /> {lang === "he" ? "הוספה ידנית" : "Add manually"}</span>
-      <h3>{lang === "he" ? "הזמנה, אישור וארנק באותו מקום" : "Keep the booking, confirmation, and wallet together"}</h3>
-      <p>{lang === "he" ? "הפריטים מתפרסמים מיד לחברי הטיול. אפשר לצרף אישור PDF או כרטיס Apple Wallet כבר עכשיו." : "This publishes the booking for trip members. Add its confirmation PDF or Apple Wallet pass now, if you have them."}</p>
+      <div className="booking-form-header">
+        <div>
+          <span className="panel-label"><Plus size={16} /> {lang === "he" ? "הזמנה חדשה" : "New booking"}</span>
+          <h3>{lang === "he" ? "כל הפרטים במקום אחד" : "Everything in one place"}</h3>
+        </div>
+        <button className="icon-action" type="button" onClick={() => setIsOpen(false)} aria-label={lang === "he" ? "סגירת טופס הוספת הזמנה" : "Close add booking form"}><X size={18} /></button>
+      </div>
+      <p>{lang === "he" ? "אפשר למלא ידנית, או לצרף אישור ולתת לנו למלא את הפרטים. לפני השמירה תמיד אפשר לעבור על הכול ולתקן." : "Fill this in yourself, or attach a confirmation and let us fill the details. You can always review and correct everything before saving."}</p>
+      <div className="booking-extract-fields">
+        <label>{lang === "he" ? "אישור PDF" : "Confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => setConfirmationFile(event.target.files?.[0] || null)} /></label>
+        <label>{lang === "he" ? "או קישור להזמנה" : "Or booking link"}<input type="url" value={extractUrl} onChange={(event) => setExtractUrl(event.target.value)} placeholder="https://..." /></label>
+        <button className="secondary-action" type="button" disabled={extractMutation.isPending || (!confirmationFile && !extractUrl.trim())} onClick={() => extractMutation.mutate(formGeneration.current)}>{extractMutation.isPending ? <><span className="loading-spinner" aria-hidden="true" /> {lang === "he" ? "מחלץ פרטים…" : "Extracting details…"}</> : (lang === "he" ? "חילוץ פרטים למילוי הטופס" : "Extract details into form")}</button>
+      </div>
+      {extractMutation.isPending ? <p className="extract-progress" role="status"><span className="loading-spinner" aria-hidden="true" />{lang === "he" ? "החילוץ עובד ברקע — אפשר להמשיך למלא ולשמור את ההזמנה." : "Extraction is working in the background — you can keep filling in and save the booking."}</p> : null}
+      {extractMutation.isError ? <p className="form-error">{extractMutation.error instanceof Error ? extractMutation.error.message : (lang === "he" ? "לא ניתן לחלץ את פרטי ההזמנה" : "Could not extract booking details")}</p> : null}
+      {extractMutation.isSuccess ? <p className="saved-note">{lang === "he" ? "הפרטים חולצו — כדאי לעבור עליהם לפני השמירה." : "Details extracted — please review them before saving."}</p> : null}
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>
         <label>{lang === "he" ? "סוג" : "Type"}<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></select></label>
@@ -1030,62 +1076,18 @@ function BookingCreatePanel({ config, isOrganizer, lang }: { config?: TripConfig
         <label>{lang === "he" ? "נוסעים" : "Travelers"}<input value={draft.passengers} onChange={(event) => setDraft({ ...draft, passengers: event.target.value })} /></label>
         <label>{lang === "he" ? "מספר אישור" : "Confirmation number"}<input value={draft.confirmation} onChange={(event) => setDraft({ ...draft, confirmation: event.target.value })} /></label>
         <label className="editor-field-wide">{lang === "he" ? "קישור Google Maps" : "Google Maps link"}<input type="url" value={draft.location_url} onChange={(event) => setDraft({ ...draft, location_url: event.target.value })} placeholder="https://..." /></label>
-        <label>{lang === "he" ? "קישור Google Wallet" : "Google Wallet link"}<input type="url" value={draft.google_wallet_url} onChange={(event) => setDraft({ ...draft, google_wallet_url: event.target.value })} placeholder="https://..." /></label>
-        <label>{lang === "he" ? "קישור Apple Wallet" : "Apple Wallet link"}<input type="url" value={draft.apple_wallet_url} onChange={(event) => setDraft({ ...draft, apple_wallet_url: event.target.value })} placeholder="https://..." /></label>
-        <label>{lang === "he" ? "אישור PDF" : "Confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => setConfirmationFile(event.target.files?.[0] || null)} /></label>
-        <label>{lang === "he" ? "קובץ Apple Wallet" : "Apple Wallet file"}<input type="file" accept=".pkpass,application/vnd.apple.pkpass" onChange={(event) => setWalletFile(event.target.files?.[0] || null)} /></label>
       </div>
+      <details className="booking-more-fields">
+        <summary>{lang === "he" ? "אפשרויות נוספות (ארנק)" : "More options (wallet)"}</summary>
+        <div className="booking-create-fields">
+          <label>{lang === "he" ? "קישור Google Wallet" : "Google Wallet link"}<input type="url" value={draft.google_wallet_url} onChange={(event) => setDraft({ ...draft, google_wallet_url: event.target.value })} placeholder="https://..." /></label>
+          <label>{lang === "he" ? "קישור Apple Wallet" : "Apple Wallet link"}<input type="url" value={draft.apple_wallet_url} onChange={(event) => setDraft({ ...draft, apple_wallet_url: event.target.value })} placeholder="https://..." /></label>
+          <label>{lang === "he" ? "קובץ Apple Wallet" : "Apple Wallet file"}<input type="file" accept=".pkpass,application/vnd.apple.pkpass" onChange={(event) => setWalletFile(event.target.files?.[0] || null)} /></label>
+        </div>
+      </details>
       <button className="primary-action" type="submit" disabled={mutation.isPending || !(draft.phase || defaultPhase) || !draft.name.trim()}>{mutation.isPending ? (lang === "he" ? "שומר…" : "Saving…") : (lang === "he" ? "שמירת הזמנה" : "Save booking")}</button>
       {mutation.isError ? <p className="form-error">{mutation.error instanceof Error ? mutation.error.message : (lang === "he" ? "לא ניתן לשמור את ההזמנה" : "Could not save the booking")}</p> : null}
       {mutation.isSuccess ? <p className="saved-note">{lang === "he" ? "ההזמנה נשמרה ומוכנה לחברי הטיול." : "Booking saved and ready for trip members."}</p> : null}
-    </form>
-  );
-}
-
-function BookingExtractPanel({ isOrganizer }: { isOrganizer?: boolean }) {
-  const [url, setUrl] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [result, setResult] = useState<Booking | null>(null);
-  const queryClient = useQueryClient();
-  const mutation = useMutation({
-    mutationFn: () => {
-      const body = new FormData();
-      if (file) body.set("file", file);
-      if (url.trim()) body.set("url", url.trim());
-      return extractBookingDraft(body);
-    },
-    onSuccess: (value) => {
-      setResult(value.booking);
-      queryClient.invalidateQueries({ queryKey: ["bookings"] });
-    },
-  });
-
-  if (!isOrganizer) return null;
-  return (
-    <form
-      className="extract-panel"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (!file && !url.trim()) return;
-        mutation.mutate();
-      }}
-    >
-      <span className="panel-label"><Upload size={16} /> Extract</span>
-      <h3>Pull booking details from a PDF or URL</h3>
-      <p>Creates an organizer-only draft. Check it, then approve it for trip members.</p>
-      <label>
-        Confirmation PDF
-        <input type="file" accept="application/pdf" onChange={(event) => setFile(event.target.files?.[0] || null)} />
-      </label>
-      <label>
-        Or booking URL
-        <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://..." />
-      </label>
-      <button className="primary-action" type="submit" disabled={mutation.isPending || (!file && !url.trim())}>
-        {mutation.isPending ? "Extracting..." : "Create draft for review"}
-      </button>
-      {mutation.isError ? <p className="form-error">{mutation.error instanceof Error ? mutation.error.message : "Extraction failed"}</p> : null}
-      {result ? <p className="extract-result">Draft created: <strong>{result.name}</strong>. It is visible only to organizers until approved.</p> : null}
     </form>
   );
 }
@@ -1131,10 +1133,7 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
           <span>{needsReview} need review</span>
         </div>
       </div>
-      <div className="organizer-booking-tools">
-        <BookingCreatePanel config={config} isOrganizer={isOrganizer} lang={lang} />
-        <BookingExtractPanel isOrganizer={isOrganizer} />
-      </div>
+      <div className="organizer-booking-tools"><BookingCreatePanel config={config} isOrganizer={isOrganizer} lang={lang} /></div>
       <div className="filter-row" aria-label="Booking filters">
         {([
           ["phase", lang === "he" ? "לפי שלב" : "By phase"],
