@@ -80,7 +80,94 @@ PY
 # after a partial success is a safe error rather than a silent clobber. Report
 # it as already-present instead of failing the whole provisioning run: the
 # profile from the earlier attempt is still there and still correct.
+# Locate a python that can read YAML. Only the Hermes venv's has it on a
+# stock macOS, and this script already requires the Hermes install to exist.
+find_yaml_python() {
+  for candidate in \
+      "$HOME/.hermes/hermes-agent/venv/bin/python3" \
+      "$(command -v python3 || true)" \
+      /usr/bin/python3; do
+    [ -x "$candidate" ] || continue
+    "$candidate" -c 'import yaml' >/dev/null 2>&1 && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+# ACTIVATE, not just materialize.
+#
+# `render_profile.py` writes `config.overlay.yaml` and an INSTALL.md that says
+# to "deliberately merge" it. Nothing did. A profile created by the automated
+# path therefore had NO config.yaml at all, and the first message routed to it
+# died with "No LLM provider configured" — the trip provisioned, the companion
+# installed, the binding opened, and the organizer got an error. Found live
+# 2026-09-06 on japan20262.
+#
+# "Deliberately" is why the template refuses to do this itself: the overlay
+# carries `SET_VIA_SECURE_CONFIG` placeholders for things only a real
+# deployment can fill (trip-mcp's URL, set later by the MCP bridge). So the
+# merge is deliberate here rather than blind: any subtree still holding a
+# placeholder is DROPPED, never written. A missing key is a capability the
+# companion does not have yet; a placeholder key is one it thinks it has.
+merge_overlay() {
+  local name="$1"
+  local home="$HOME/.hermes/profiles/$name"
+  local overlay="$home/config.overlay.yaml"
+  local config="$home/config.yaml"
+  [ -f "$overlay" ] || { printf 'companion-install-host: no overlay to merge\n' >&2; return 0; }
+
+  local py
+  py="$(find_yaml_python)" || {
+    printf 'companion-install-host: no python with PyYAML; %s left unconfigured\n' "$name" >&2
+    return 0
+  }
+
+  "$py" - "$overlay" "$config" <<'PYMERGE'
+import sys, yaml
+overlay_path, config_path = sys.argv[1], sys.argv[2]
+PLACEHOLDER = "SET_VIA_SECURE_CONFIG"
+
+def has_placeholder(node):
+    if isinstance(node, dict):
+        return any(has_placeholder(v) for v in node.values())
+    if isinstance(node, list):
+        return any(has_placeholder(v) for v in node)
+    return isinstance(node, str) and PLACEHOLDER in node
+
+
+def strip(node):
+    """Drop any subtree still carrying an unresolved placeholder.
+
+    The WHOLE subtree, not just the offending key. `mcp_servers.trip-mcp` with
+    its url removed is not a safer trip-mcp — it is a server entry that cannot
+    connect, which is the "thinks it has a capability" state this exists to
+    prevent. The MCP bridge writes that entry properly when it runs."""
+    if isinstance(node, dict):
+        return {k: strip(v) for k, v in node.items() if not has_placeholder(v)}
+    if isinstance(node, list):
+        return [strip(v) for v in node if not has_placeholder(v)]
+    return node
+
+overlay = strip(yaml.safe_load(open(overlay_path)) or {}) or {}
+try:
+    existing = yaml.safe_load(open(config_path)) or {}
+except FileNotFoundError:
+    existing = {}
+
+# The profile's own config wins: this fills gaps, it does not overwrite a
+# choice someone already made in the target profile.
+merged = dict(overlay)
+merged.update(existing)
+with open(config_path, "w") as fh:
+    yaml.safe_dump(merged, fh, sort_keys=False, allow_unicode=True)
+print(f"merged overlay -> {config_path} (model={merged.get('model', {}).get('default', 'NONE')})", file=sys.stderr)
+PYMERGE
+}
+
 if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then
+  # Idempotent, and it repairs: a profile installed before the merge existed
+  # is still missing its provider, and a retry should fix that rather than
+  # report success and change nothing.
+  merge_overlay "$PROFILE_NAME"
   printf 'ALREADY_PRESENT %s\n' "$PROFILE_NAME"
   exit 0
 fi
@@ -89,5 +176,7 @@ fi
   --input "$HANDOFF" \
   --output "$WORK/rendered" \
   --install-profile "$PROFILE_NAME" >/dev/null
+
+merge_overlay "$PROFILE_NAME"
 
 printf 'INSTALLED %s\n' "$PROFILE_NAME"
