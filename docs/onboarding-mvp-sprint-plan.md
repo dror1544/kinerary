@@ -333,6 +333,42 @@ approved intake into a running private trip, with a working URL delivered to
 the organizer and basic family access. No JSON editing, no repository access,
 no deployment commands required from the organizer or family.
 
+> **Exit gate REACHED 2026-09-06 — the first successful provisioning run in
+> this project's history.** `control_plane.jobs` had been 0 for the whole
+> project; seven trips had reached `intake_confirmed` and not one had ever been
+> planned. Run 13's trip went the whole way: plan → organizer approval → job →
+> transform → slug promotion (`draft-sreq-b5293…` → `japan-2026-2`, deduped
+> against the existing `japan-2026`) → real LXC `trip-japan-2026-2` (vmid 104,
+> 192.168.0.61) → NPM → Cloudflare. Both `http://192.168.0.61:8080` and
+> `https://japan-2026-2.ara-united.store` answer **HTTP 200**. Job succeeded on
+> attempt 1; trip is `ready_private`.
+>
+> **But the trip is unroutable, and not for the reason predicted.**
+> `activation-scope.md`'s B1 (no `hermes`/`node` in the worker) never got a
+> chance to fire, because a defect one step upstream skipped the companion
+> first: `_resolve_organizers` (`transformer.py:649-656`) matches
+> `organizer_identity` only against `{name, name_en, username}` — **never
+> `name + family`**. The organizer answered "ניר סולומון" against a participant
+> named "ניר"/"Nir"/`nir`, so nothing matched, `agent.organizers` was unset,
+> `build_companion_handoff` returned `None`, and the companion was skipped.
+> `assistant_names` is empty and `telegram_chat_bindings` is 0 — the organizer
+> messages the bot and gets "I don't have a trip for this chat."
+>
+> It is also **silent**: the skip logs at `info`, the worker configures no
+> logging, so the root logger sits at `WARNING` and the entire successful run
+> emitted one line. Nothing anywhere says the trip has no companion. B1 is
+> still real and fires next once this is fixed — see
+> `docs/companion-install-plan.md`.
+>
+> **Deploy gap found the same day:** `interview-stack-deploy` recreates only
+> `api`. The worker's code arrives via a bind mount defaulting to a different
+> checkout, so the first attempt failed three times with `intake is missing
+> required questions: ['group_size', 'trip_duration']` — API on schema v3,
+> worker on v2. The schema-version guard cannot help when the two halves come
+> from different trees. Resolved for now by consolidating onto
+> `integration/sprint-5-plus` so the default mount is correct; the deploy
+> script still does not deploy the worker.
+
 This is the sprint whose exit gate is the product-alignment acceptance test
 from the PR #10 comment (2026-08-20). Release-artifact hardening (immutable
 build pipeline, sanitation scans, sealed manifests, promotion rules) is
@@ -907,6 +943,18 @@ Automated tests:
 - `record` on a question not yet asked removes it from the remaining set;
 - the watchdog fires and the interview continues after a silent agent turn.
 
+**Defect found 2026-09-06, run 13 — fixed.** The "one writer" contract had a
+hole that stalled two interviews for eleven minutes each. `sendNextStep`
+delivered a pending `say` and returned *before* working out what to ask; the
+send claims the floor, so a nomination made seconds earlier was stranded behind
+a floor that now belonged to the organizer, and nothing spoke again until they
+did. `trip_pace` was nominated, never drawn, never answered — while the agent's
+closing text had told the organizer it was asked. `nominateQuestionForChat`
+already folded a say into a nomination, but only one still pending when the
+nomination ran; here the say arrived *after* the ask, which no nomination-time
+fold can win. The fold now also happens at render time, where both values come
+from the same session row in the same pass and write order stops mattering.
+
 **Exit gate for Track 4:** two consecutive live runs reach `intake_confirmed`
 with no manual database intervention, and the transcript harness runs in CI on
 `integration/**`.
@@ -1223,10 +1271,18 @@ halves landed in `6205b2d`:
   four questions needing neither context nor interpretation — `trip_type`,
   `bot_gender`, `bot_tone`, `bot_proactive` — and the router alone asks them:
   `nominateQuestionForChat` refuses them outright, and a per-tick scan asks them
-  the moment they are next, including while an agent turn is open doing
-  something else. That covers both the 3–5 minute gaps between fixed-choice
-  questions and the dead air during document extraction, as one mechanism
-  rather than two. Deliberately explicit that fixed-option is necessary but not
+  the moment they are next. That covers both the 3–5 minute gaps between
+  fixed-choice questions and the dead air during document extraction, as one
+  mechanism rather than two.
+  **Narrowed 2026-09-06 after run 13** ("it again competing with the agent on
+  the questions"). As first built the scan also fired *while an agent turn was
+  open doing something else* — but an open turn is equally the state of an
+  agent composing its next message, so a fixed-choice question could land on
+  top of the interviewer. The two are now separated by what the turn is FOR: a
+  turn carrying media is real async work (the only thing that stamps
+  `awaiting_floor_seconds`) and the scan still fills that dead air; any other
+  open turn is a conversation the interviewer owns, and the router yields
+  (`trip_bot.router_owned_yielded`). With no turn open it fires freely. Deliberately explicit that fixed-option is necessary but not
   sufficient: `dietary` is fixed-option and stays with the agent.
 - **Lightweight answer-completeness validation. — BUILT.** `checkComplete`, an
   opt-in per-question check rejecting with `INCOMPLETE_ANSWER` plus a detail
@@ -1254,6 +1310,14 @@ own completeness check. Not met while the SOUL gap above stands.
 > product question. Do not build against this section's activation design until
 > that scoping lands. The rest of the sprint (verification, dashboard, demo
 > rehearsal) is unaffected.
+
+> **Verification aggregator, 2026-09-06:** `ready_private` was reached for the
+> first time on 2026-09-06 with **no** aggregator in front of it, and the run
+> demonstrates exactly what this bullet exists to prevent — the trip was marked
+> `ready_private` and reported success while having no companion profile, no
+> chat binding and no `runtime_routes` row. "Messaging binding" is already in
+> the required list below; that requirement is now evidenced rather than
+> anticipated. See Sprint 4's status box.
 
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
