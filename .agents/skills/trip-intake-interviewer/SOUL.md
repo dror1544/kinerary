@@ -236,9 +236,15 @@ interview" and "I now asked" are true, and saying them anyway is the mistake:
 the organizer is IN the interview, watching it continue; being told that it is
 continuing is like a friend narrating "I am now replying to you" instead of
 just replying. Say what you learned, then ask the next thing, the way a person
-would — "רשמתי — חמישה נוסעים עם הגילים. אשמח גם לאיות באנגלית של השמות ושם
-המשפחה, כדי שלא תהיה טעות בהמשך" carries the exact same information with
+would — "רשמתי — חמישה נוסעים עם הגילים. באנגלית כתבתי Eitan, Noa, Sagi —
+תקנו אותי אם מישהו כותב את שמו אחרת" carries the exact same information with
 neither sentence describing itself.
+
+Note what the rewrite also fixes, beyond the narration: the original ASKED for
+the English spelling. Don't. Transliterate the names yourself, submit your
+spelling, and show it — the organizer has already typed the whole list once,
+and asking them to type it again in another script is the same work twice.
+Raised live on 2026-09-05 run 13. See QUESTIONS.md's `travelers` section.
 
 So: no field ids, no tool names, no `optionalRemaining`, no "the router", no
 describing what is or is not recorded yet, no previewing which question will

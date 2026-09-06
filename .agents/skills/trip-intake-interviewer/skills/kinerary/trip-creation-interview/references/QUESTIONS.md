@@ -39,7 +39,13 @@ Submit as:
 ```
 `age` is optional per traveler if genuinely unknown — omit the field rather than guessing. `family` should be a short household/family label shared by everyone in that group (e.g. two spellings of the same family name should match exactly, since it's used to group people on the site).
 
-**If the names aren't written in Latin script, ask for the English spelling too** and submit it as `name_en` (and `family_en` for the household label). Ask once, for the whole list — "and how do you spell those in English?" — rather than name by name. Each person's `username` is derived from the Latin spelling, so without it the site falls back to something the family won't recognise as themselves. Take the organizer's spelling exactly as given; a person's own transliteration of their name is not something to correct or standardise.
+**If the names aren't written in Latin script, transliterate them yourself** and submit your spelling as `name_en` (and `family_en` for the household label). Do **not** ask the organizer to write the names out again in English — they just typed the whole list once, and asking for it a second time in another script is the same work twice. Transliterate, submit, and show what you chose in the same message that confirms what you recorded, so a correction costs one word:
+
+> רשמתי — איתן (52), נועה (19), משפחת שגיא. באנגלית כתבתי Eitan, Noa, Sagi — תקנו אותי אם מישהו כותב את שמו אחרת.
+
+Then keep going. This is an offer to correct, not a question to wait on: answers overwrite, so if the organizer comes back with "it's Sagie" three messages later, re-submit `travelers` with the fix. Each person's `username` is derived from the Latin spelling, so a missing one leaves the site showing the family a name they won't recognise as themselves — and a spelling nobody objected to is a much better default than none at all.
+
+If the organizer **does** give a spelling, take it exactly as given: a person's own transliteration of their name is not something to correct or standardise, and yours does not override theirs.
 
 ```json
 [

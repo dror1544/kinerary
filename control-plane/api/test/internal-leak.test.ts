@@ -50,4 +50,34 @@ describe("internal leak detection", () => {
   test("an empty message is not a leak", () => {
     assert.equal(detectInternalLeak("").leaks, false);
   });
+
+  test("catches the gateway's own busy acknowledgements", () => {
+    // Verbatim from run 13: the organizer answered the question they were
+    // asked, their reply landed while the agent was mid-run, and the HARNESS
+    // told them it had adjusted using a correction they never made.
+    assert.equal(
+      detectInternalLeak("\u21aa Redirected current run. I'll adjust using your correction.").leaks,
+      true,
+    );
+    for (const text of [
+      "\u23e9 Steered into current run (2 min elapsed). Your message arrives after the next tool call.",
+      "\u23f3 Queued for the next turn. I'll respond once the current task finishes.",
+      "\u23f3 Subagent working \u2014 your message is queued for when it finishes (use /stop to cancel everything).",
+      "\u23f3 Compressing context \u2014 your message is queued for when it finishes.",
+      "\u26a1 Interrupting current task. I'll respond to your message shortly.",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, true, text);
+    }
+  });
+
+  test("the busy-ack phrases do not swallow real trip sentences", () => {
+    for (const text of [
+      "We can redirect the drive through Kyoto if the weather turns.",
+      "There is a running track near the hotel.",
+      "Let's queue the museum for the last day.",
+      "\u05d0\u05e0\u05d7\u05e0\u05d5 \u05d1\u05d0\u05de\u05e6\u05e2 \u05d4\u05d8\u05d9\u05d5\u05dc \u2014 \u05e0\u05de\u05e9\u05d9\u05da \u05de\u05db\u05d0\u05df.",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, false, text);
+    }
+  });
 });

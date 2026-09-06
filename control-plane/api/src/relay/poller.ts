@@ -746,24 +746,49 @@ function nextRouterOwnedQuestion(view: SessionView): IntakeQuestion | null {
  * question explicitly marked `routerOwned` ever gets asked here. Asking
  * `destination` the instant a document is queued, before the agent has had
  * any chance to read it, would defeat the entire reason to upload one.
+ *
+ * WHAT "WHILE A TURN IS OPEN" IS NARROWED TO, AND WHY
+ *
+ * "An agent turn is open" was the wrong proxy for "the agent is busy with
+ * something else". It is also true while the agent is mid-conversation,
+ * composing the very next thing it means to say — and in that state a
+ * router-owned question does not fill dead air, it talks over the
+ * interviewer. Run 13, verbatim: "it again competing with the agent on the
+ * questions."
+ *
+ * So the two cases are separated by what the turn is FOR, not by whether one
+ * exists. A turn carrying media is genuine async work: the agent is reading a
+ * document and will be a while, and a fixed-choice question asked meanwhile
+ * costs it nothing. Any other open turn is a conversation in progress, and
+ * the interviewer owns that until it hands the floor back.
+ *
+ * With no turn open at all, this fires freely — that is the latency half of
+ * Track 8, and there is nobody to compete with.
  */
 export async function advanceRouterOwnedQuestions(
   deps: TripBotPollerDeps,
   strings: DispatchStrings,
   log: (line: string) => void,
 ): Promise<void> {
-  let candidates: Array<{ chatId: string }>;
+  let candidates: Array<{ chatId: string; isAsyncWork: boolean }>;
   try {
     candidates = await listMachineAwaitingChats(deps.db);
   } catch {
     log(structuredLog("warn", "trip_bot.router_owned_scan_failed", {}));
     return;
   }
-  for (const { chatId } of candidates) {
+  for (const { chatId, isAsyncWork } of candidates) {
     try {
       const result = await getSessionForChat(deps.db, chatId);
       if (!result.ok || result.view.state !== "interviewing") continue;
       if (!nextRouterOwnedQuestion(result.view)) continue;
+      if (!isAsyncWork && (await hasOpenAgentTurn(deps.db, chatId))) {
+        log(structuredLog("info", "trip_bot.router_owned_yielded", {
+          session_id: result.view.sessionId,
+          reason: "AGENT_MID_CONVERSATION",
+        }));
+        continue;
+      }
       await sendNextStep(result.view, chatId, deps, strings);
     } catch {
       log(structuredLog("warn", "trip_bot.router_owned_scan_item_failed", {}));
@@ -892,6 +917,25 @@ async function sendNextStep(
     return;
   }
 
+  // What there is to ask, worked out BEFORE the say is handled — because
+  // whether the say goes out alone depends on it. See the fold below.
+  const autoWalkOptional = !deps.interviewerProfile;
+  const question =
+    view.nextQuestion
+    ?? view.pendingAsk
+    ?? nextRouterOwnedQuestion(view)
+    ?? (autoWalkOptional && view.state === "interviewing" ? view.optionalRemaining[0] ?? null : null);
+
+  // Every agent write asks the router to speak. An agent that recorded five
+  // answers off one document therefore asked five times, and the organizer got
+  // the same question five times over. Saying nothing when there is nothing
+  // new to say is the whole fix.
+  const promptKey = view.state === "awaiting_confirmation" ? "recap" : question ? `q:${question.id}` : "";
+  const questionIsNew = Boolean(question) && promptKey !== view.lastPrompt;
+
+  /** The agent's words, folded in above the question rather than sent alone. */
+  let leadIn: string | null = null;
+
   // The interviewer's own words go out first and alone. This is the `say`
   // half of Track 4: the agent no longer reaches Telegram directly, so if it
   // has something to tell the organizer, THIS is the only way it arrives.
@@ -922,10 +966,42 @@ async function sendNextStep(
         session_id: view.sessionId,
       }));
       await clearPendingSayForChat(deps.db, chatId);
+    } else if (questionIsNew) {
+      // THE FOLD, and the reason `question` is computed above rather than
+      // below: a say and a question outstanding at the same moment are one
+      // utterance — "here's what I recorded, and here's the next thing" —
+      // and sending the say ALONE ends the router's turn, because the send
+      // claims the floor and the question is left behind a floor that now
+      // belongs to the organizer. Nothing speaks again until they do.
+      //
+      // That is not hypothetical. Run 13, 2026-09-05, read off the agent log
+      // and the turn table:
+      //
+      //   23:04:47.591  ask_question_for_chat completes — trip_pace nominated,
+      //                 with the agent's own phrasing, floor reclaimed
+      //   23:04:50.553  the agent's turn ends; its closing text reaches the
+      //                 relay and becomes pendingSay
+      //   23:04:50.6    the router delivers that say, claims the floor, returns
+      //   ...           floor_held_by_person, every pass, for ELEVEN MINUTES
+      //   23:15:43      the organizer gives up and types "מה עכשיו?"
+      //
+      // `trip_pace` was never asked and never answered. The organizer had been
+      // TOLD it was asked — the closing text said so — which is why the stall
+      // read as the bot ignoring them rather than as the bot being stuck.
+      //
+      // `nominateQuestionForChat` already folds a say into the nomination, but
+      // only one that is still pending when the nomination runs. Here the say
+      // arrived AFTER the ask, which no nomination-time fold can catch. This
+      // one is race-free by construction: both values are read from the same
+      // session row in the same pass, so the order they were written in stops
+      // mattering.
+      leadIn = view.pendingSay;
+      await clearPendingSayForChat(deps.db, chatId);
     } else {
-      // Claim before sending. If the router got here first this returns false
-      // and the message waits for the organizer's next turn rather than
-      // landing on top of what was just said.
+      // Nothing new to ask, so the say IS the message. Claim before sending:
+      // if the router got here first this returns false and the message waits
+      // for the organizer's next turn rather than landing on top of what was
+      // just said.
       if (!(await claimFloor(deps.db, chatId))) return;
       await clearPendingSayForChat(deps.db, chatId);
       await deps.telegram.sendMessage({
@@ -943,18 +1019,6 @@ async function sendNextStep(
     }
   }
 
-  const autoWalkOptional = !deps.interviewerProfile;
-  const question =
-    view.nextQuestion
-    ?? view.pendingAsk
-    ?? nextRouterOwnedQuestion(view)
-    ?? (autoWalkOptional && view.state === "interviewing" ? view.optionalRemaining[0] ?? null : null);
-
-  // Every agent write asks the router to speak. An agent that recorded five
-  // answers off one document therefore asked five times, and the organizer got
-  // the same question five times over. Saying nothing when there is nothing
-  // new to say is the whole fix.
-  const promptKey = view.state === "awaiting_confirmation" ? "recap" : question ? `q:${question.id}` : "";
   if (promptKey && promptKey === view.lastPrompt) {
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.prompt_deduped", {
       session_id: view.sessionId,
@@ -1009,7 +1073,14 @@ async function sendNextStep(
     // The agent's wording applies to the question IT nominated, never to a
     // required question the router walked to on its own — otherwise a sentence
     // written for `dietary` would end up above `departure_date`.
-    const phrasing = view.pendingAsk?.id === question.id ? view.pendingAskText : null;
+    const nominated = view.pendingAsk?.id === question.id ? view.pendingAskText : null;
+    // A folded say leads; the nomination's own phrasing follows. Both are the
+    // agent's words for this same moment, so they belong in one message in
+    // the order they were written — exactly what nominateQuestionForChat
+    // produces when it wins its race, produced here whether it did or not.
+    const phrasing = leadIn && nominated
+      ? `${leadIn}\n\n${nominated}`
+      : leadIn ?? nominated;
     const rendered = renderQuestion(
       question,
       selectedOptionIds(view, question.id),
