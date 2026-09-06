@@ -1,9 +1,21 @@
 # Hermes multiplexing — what is per-profile, what is process-global
 
-**Status: investigation and design. Nothing here is implemented.** Written
-2026-09-06, after a trip companion answered correctly from its reference files
-while telling the organizer "I can't read the live site" — because its MCP
-server had never connected, and never could.
+> **Status: SUPERSEDED as a plan; retained as analysis and as the rejected
+> alternative.** The chosen architecture is
+> `per-trip-gateway-architecture.md` — one Hermes gateway *process* per trip,
+> sharing one installation. **§4 below (per-profile MCP inside one multiplexed
+> gateway) will not be built.**
+>
+> Kept, in full, deliberately. §1–§3 are measurements of the running system and
+> remain true; §5's session-ID collision is a real observed bug; and §4 is the
+> record of what the alternative would have cost, which is the reason the
+> alternative was rejected. A design discarded without its reasoning is a design
+> that gets re-proposed.
+
+**Originally written 2026-09-06** as investigation and design, after a trip
+companion answered correctly from its reference files while telling the
+organizer "I can't read the live site" — because its MCP server had never
+connected, and never could.
 
 Sibling to `activation-scope.md`: both record a boundary that has to be decided
 before code is written against it. Read `onboarding-to-active-plan.md` for where
@@ -99,7 +111,12 @@ store — and no tools at all. It can describe the trip from the handoff written
 at provision time, and cannot read anything live: no bookings, no photos, no
 comments, no updates. Every answer is as old as the last provision.
 
-## 4. Design — making MCP profile-scoped
+## 4. Design — making MCP profile-scoped — REJECTED
+
+> **Not being built.** Every mechanism below exists to answer one question:
+> *whose tools are these?* A gateway process that serves exactly one trip never
+> asks it. Superseded by `per-trip-gateway-architecture.md`; retained because
+> the cost sized here is what justified rejecting it.
 
 A bounded upstream change in Hermes, not a Kinerary patch. Sized here so the
 decision in §6 is informed rather than guessed.
@@ -217,7 +234,7 @@ Kinerary mitigates today by having `fresh-interview.py` clear the chat's
 gateway conversation between runs — a workaround for exactly this, and a sign
 the hazard is real rather than theoretical.
 
-## 6. Recommendation
+## 6. Recommendation — superseded by §7
 
 Deferred to the reader of §4: the change is **bounded but not small**, and it
 is genuinely upstream.
@@ -235,3 +252,34 @@ maintain.
 The honest risk comparison is that **there is nothing to leak today**, so this
 work buys capability, not safety. It should be scheduled as a feature and
 reviewed as one.
+
+## 7. Outcome — why §4 was rejected
+
+Written 2026-09-06, after §1–§6.
+
+§2.2's finding was that MCP connections are process-global while everything
+else is correctly per-profile. §4 took that as a defect to repair inside the
+process. Inspecting the running system afterwards showed the repair was
+unnecessary: **six Hermes gateway processes, one installation, were already
+running on the provisioning Mac**, each with its own `HERMES_HOME`, and
+`hermes_cli/main.py:521` sets that home *before any module is imported*.
+
+Process-global state is only a problem when a process serves more than one
+trip. Give each trip its own process and every mechanism in §4 — registry
+keying, per-turn tool visibility, fail-closed dispatch, scope capture in
+`MCPServerTask`, per-profile cleanup — has nothing left to decide.
+
+Measured, same day:
+
+- **~25 MB RSS per idle gateway**, stable over three days of uptime.
+- `hermes --profile japan20262 mcp test trip-mcp` → **41 tools, connected in
+  400ms**, against the trip's own container with the trip's own key.
+
+The second result also relocates the original bug. `profiles/japan20262/config.yaml`
+had correct `mcp_servers` config the whole time. Nothing was wrong with it; no
+process had ever been started that would read it.
+
+§5 (the session-ID collision) is not superseded — but under per-trip processes
+it dissolves rather than needing the fix proposed there, because separate
+profile homes remove the shared session store the collision requires. See
+`per-trip-gateway-architecture.md` §8.
