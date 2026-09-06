@@ -1671,3 +1671,111 @@ class ReachabilityTests(unittest.TestCase):
                             )
         finally:
             self._cleanup(fix)
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
+    """An organizer with no Telegram identity is still reachable.
+
+    The password signup stopgap creates no telegram `user_identities` row, and
+    the deep-link path deliberately does NOT write the verified chat into
+    `trips.notification_chat_id_hint` (that column is for UNVERIFIED hints).
+    So on 2026-09-06 a trip whose entire interview happened in chat 391627336
+    finished provisioning with "no organizer chat id", an installed companion
+    nobody was bound to, and reachability NO_ORGANIZER_CHAT.
+
+    The chat was never unknown. It was in `intake_sessions.telegram_chat_id`,
+    verified, the whole time.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self.chat_id = "830000" + rnd(3)
+        # An interview conducted in a known, verified chat — and an owner with
+        # NO telegram identity, which is what the password stopgap produces.
+        # `enrollment_id` is required but nothing here reads it; the session
+        # exists only to carry the chat the interview happened in.
+        self.session_id = f"sess_{rnd()}"
+        self.enrollment_id = f"ienr_{rnd()}"
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.interview_enrollments
+                     (id, trip_id, user_id, token_digest, state, expires_at, consumed_at)
+                   VALUES (%s, %s, %s, %s, 'consumed', now() + interval '1 day', now())""",
+                (self.enrollment_id, self.fix["trip_id"], self.fix["user_id"], sha256(rnd(32))),
+            )
+            self.conn.execute(
+                """INSERT INTO control_plane.intake_sessions
+                     (id, trip_id, user_id, enrollment_id, state, telegram_chat_id)
+                   VALUES (%s, %s, %s, %s, 'confirmed', %s)""",
+                (self.session_id, self.fix["trip_id"], self.fix["user_id"],
+                 self.enrollment_id, self.chat_id),
+            )
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.intake_sessions WHERE id = %s", (self.session_id,))
+            self.conn.execute("DELETE FROM control_plane.interview_enrollments WHERE id = %s", (self.enrollment_id,))
+            self.conn.execute(
+                "DELETE FROM control_plane.user_identities WHERE user_id = %s", (self.fix["user_id"],),
+            )
+        teardown_fixture(self.conn, self.fix)
+
+    def test_the_interview_chat_binds_the_companion(self) -> None:
+        companion = FakeCompanionProfileAdapter()
+        ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-interview-chat",
+            companion=companion,
+        ).run_once()
+
+        row = self.conn.execute(
+            "SELECT chat_id, hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "the interview's own chat should have bound the companion")
+        self.assertEqual(row["chat_id"], self.chat_id)
+        self.assertIsNotNone(row["hermes_profile"])
+
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual((state["reachability"], state["unreachable_reason"]), ("reachable", None))
+
+    def test_a_verified_telegram_identity_still_wins(self) -> None:
+        # Provenance order, not convenience: an identity on the account is a
+        # stronger claim about WHO the organizer is than the chat a link was
+        # opened in, so it must not be displaced by this fix.
+        identity_chat = "840000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (f"idnt_{rnd()}", self.fix["user_id"], sha256(identity_chat), identity_chat),
+            )
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-identity-wins",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            row = self.conn.execute(
+                "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+                "WHERE trip_id = %s AND closed_at IS NULL",
+                (self.fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(row["chat_id"], identity_chat)
+        finally:
+            pass  # tearDown removes the identity; see its comment.

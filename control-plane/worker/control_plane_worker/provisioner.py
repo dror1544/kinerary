@@ -849,19 +849,45 @@ class ProvisionerWorker:
                 # 'skipped' rather than retrying forever.
                 cur.execute(
                     """
-                    SELECT ui.provider_subject_id, t.notification_chat_id_hint
+                    SELECT ui.provider_subject_id,
+                           s.telegram_chat_id AS interview_chat_id,
+                           t.notification_chat_id_hint
                     FROM control_plane.trip_memberships tm
                     JOIN control_plane.trips t ON t.id = tm.trip_id
                     LEFT JOIN control_plane.user_identities ui
                       ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
+                    LEFT JOIN LATERAL (
+                        SELECT telegram_chat_id
+                        FROM control_plane.intake_sessions
+                        WHERE trip_id = tm.trip_id AND telegram_chat_id IS NOT NULL
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                    ) s ON TRUE
                     WHERE tm.trip_id = %s AND tm.role = 'owner' AND tm.status = 'active'
                     LIMIT 1
                     """,
                     (trip_id,),
                 )
                 owner_row = cur.fetchone()
+                # Preference order is by PROVENANCE, not convenience:
+                #   1. a verified Telegram identity on the owner's account;
+                #   2. the chat the interview was actually conducted in —
+                #      equally verified, because Telegram gave us that id when
+                #      the organizer opened the deep link there (chat_router
+                #      passes it as `verifiedTelegramChatId`, and deliberately
+                #      does NOT write it to the unverified hint column);
+                #   3. the unverified hint from migration 0022, last.
+                #
+                # (2) was missing until 2026-09-06 and is the COMMON case: an
+                # organizer using the password signup stopgap has no Telegram
+                # identity, so a trip whose entire interview happened in a
+                # known chat still ended with "no organizer chat id" and an
+                # unbindable companion. The chat was never unknown — it was in
+                # intake_sessions the whole time.
                 recipient_chat_id = (
-                    (owner_row["provider_subject_id"] or owner_row["notification_chat_id_hint"])
+                    (owner_row["provider_subject_id"]
+                     or owner_row["interview_chat_id"]
+                     or owner_row["notification_chat_id_hint"])
                     if owner_row else None
                 )
 
@@ -1172,21 +1198,47 @@ class ProvisionerWorker:
                     # string, not an address) was never actually deliverable.
                     cur.execute(
                         """
-                        SELECT ui.provider_subject_id, t.notification_chat_id_hint
+                        SELECT ui.provider_subject_id,
+                               s.telegram_chat_id AS interview_chat_id,
+                               t.notification_chat_id_hint
                         FROM control_plane.jobs j
                         JOIN control_plane.trip_memberships tm
                           ON tm.trip_id = j.trip_id AND tm.role = 'owner' AND tm.status = 'active'
                         JOIN control_plane.trips t ON t.id = j.trip_id
                         LEFT JOIN control_plane.user_identities ui
                           ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
+                        LEFT JOIN LATERAL (
+                            SELECT telegram_chat_id
+                            FROM control_plane.intake_sessions
+                            WHERE trip_id = j.trip_id AND telegram_chat_id IS NOT NULL
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                        ) s ON TRUE
                         WHERE j.id = %s
                         LIMIT 1
                         """,
                         (job_id,),
                     )
                     owner_row = cur.fetchone()
+                    # Preference order is by PROVENANCE, not convenience:
+                    #   1. a verified Telegram identity on the owner's account;
+                    #   2. the chat the interview was actually conducted in —
+                    #      equally verified, because Telegram gave us that id when
+                    #      the organizer opened the deep link there (chat_router
+                    #      passes it as `verifiedTelegramChatId`, and deliberately
+                    #      does NOT write it to the unverified hint column);
+                    #   3. the unverified hint from migration 0022, last.
+                    #
+                    # (2) was missing until 2026-09-06 and is the COMMON case: an
+                    # organizer using the password signup stopgap has no Telegram
+                    # identity, so a trip whose entire interview happened in a
+                    # known chat still ended with "no organizer chat id" and an
+                    # unbindable companion. The chat was never unknown — it was in
+                    # intake_sessions the whole time.
                     recipient_chat_id = (
-                        (owner_row["provider_subject_id"] or owner_row["notification_chat_id_hint"])
+                        (owner_row["provider_subject_id"]
+                         or owner_row["interview_chat_id"]
+                         or owner_row["notification_chat_id_hint"])
                         if owner_row else None
                     )
 

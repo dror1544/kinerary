@@ -241,9 +241,11 @@ def main(argv: list[str] | None = None) -> int:
                 # Loudly, at startup. The whole point is not to discover a
                 # missing capability one organizer's trip at a time.
                 companion_adapter.preflight()
-                logger.info("worker.companion_adapter_selected", extra={
-                    "adapter": "ssh", "host": args.companion_ssh_host,
-                })
+                print(
+                    f"companion adapter: ssh -> {args.companion_ssh_user}@{args.companion_ssh_host}"
+                    " (provisioning only; forced-command key)",
+                    flush=True,
+                )
                 mcp_bridge_adapter = (
                     ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
                     if args.enable_mcp_bridge else NullMcpBridgeAdapter()

@@ -33,6 +33,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER="$REPO_ROOT/profile-templates/familytrip-companion/render_profile.py"
 
+# A forced command runs with a non-interactive, non-login PATH — no shell rc is
+# sourced — so `hermes` at ~/.local/bin is not found the way it is in a
+# terminal. `render_profile.py` shells `hermes profile create` itself, so the
+# child needs this too, not just the check below. Set explicitly here rather
+# than depending on the caller: the wrapper deriving its own environment is the
+# same principle as it deriving its own paths.
+PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+export PATH
+
 die() { printf 'companion-install-host: %s\n' "$1" >&2; exit 2; }
 
 [ -f "$RENDER" ] || die "render_profile.py not found at $RENDER"
