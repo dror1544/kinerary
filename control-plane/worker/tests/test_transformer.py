@@ -6,6 +6,7 @@ import unittest
 from datetime import date
 
 from control_plane_worker.transformer import (
+    _resolve_organizers,
     derive_bookings,
     derive_trip_slug,
     transform_intake,
@@ -1245,3 +1246,108 @@ class DeriveBookingsLinkTests(unittest.TestCase):
         cfg["phases"][0]["venues"] = []
         hotel = next(b for b in derive_bookings(cfg, JAPAN_INTAKE) if b["type"] == "hotel")
         self.assertIsNone(hotel["location_url"])
+
+
+class ResolveOrganizersTests(unittest.TestCase):
+    """Which of the travellers is the organizer, from what they typed.
+
+    Load-bearing far past its size: no organizer means `_derive_agent` writes
+    no `agent.organizers`, which means `build_companion_handoff` returns None,
+    which means the companion profile is never installed and the provisioned
+    trip has no chat binding. The organizer messages the bot and is told "I
+    don't have a trip for this chat" — a trip that provisioned "successfully"
+    and cannot be reached.
+    """
+
+    #: Run 13's actual roster, as transformed on 2026-09-06.
+    SOLOMONS = [
+        {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "ella", "name": "אלה", "name_en": "Ella", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "maya", "name": "מאיה", "name_en": "Maya", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "shai", "name": "שי", "name_en": "Shai", "family": "סולומון", "family_en": "Solomon"},
+    ]
+
+    def _resolve(self, stated: str, participants=None) -> list[str]:
+        return _resolve_organizers(
+            {"organizer_identity": _text(stated)}, participants or list(self.SOLOMONS)
+        )
+
+    def test_the_run_13_answer_that_matched_nobody(self) -> None:
+        # Verbatim. This returned [] on 2026-09-06 and cost the trip its
+        # companion; it is the whole reason this class exists.
+        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+
+    def test_full_name_in_either_script(self) -> None:
+        # Answering with your full name is the NORMAL case, not an edge one.
+        self.assertEqual(self._resolve("Nir Solomon"), ["nir"])
+        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+
+    def test_full_name_across_scripts(self) -> None:
+        # Rosters are mixed in practice — a Hebrew given name whose household
+        # label was only ever transliterated, or the reverse.
+        self.assertEqual(self._resolve("ניר Solomon"), ["nir"])
+        self.assertEqual(self._resolve("Nir סולומון"), ["nir"])
+
+    def test_the_forms_that_already_worked_still_do(self) -> None:
+        for stated in ("ניר", "Nir", "nir"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_case_and_spacing_do_not_decide_reachability(self) -> None:
+        for stated in ("  nir  solomon ", "NIR SOLOMON", "Nir  Solomon"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_a_bare_family_name_names_a_household_not_a_person(self) -> None:
+        # Five people share it. Matching would hand one of them — whichever
+        # the roster listed first — the organizer's private channel.
+        self.assertEqual(self._resolve("סולומון"), [])
+        self.assertEqual(self._resolve("Solomon"), [])
+
+    def test_an_ambiguous_answer_is_refused_rather_than_guessed(self) -> None:
+        twins = [
+            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
+            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+        ]
+        self.assertEqual(self._resolve("שי", twins), [])
+        # ...and the family name is exactly what disambiguates them.
+        self.assertEqual(self._resolve("שי כהן", twins), ["shai_a"])
+
+    def test_someone_who_is_not_on_the_trip_matches_nobody(self) -> None:
+        self.assertEqual(self._resolve("Dana Levi"), [])
+
+    def test_no_answer_is_not_a_match(self) -> None:
+        self.assertEqual(_resolve_organizers({}, list(self.SOLOMONS)), [])
+        self.assertEqual(self._resolve("   "), [])
+
+    def test_the_shape_the_transformer_actually_produces(self) -> None:
+        # The tests above hand `_resolve_organizers` a roster carrying
+        # `family: "סולומון"`. `_build_participants` does not produce that: it
+        # SLUGIFIES family to "solomon" and drops `family_en` entirely. So a
+        # fix verified only against the shape above still leaves the live path
+        # broken — which is exactly what happened on the first attempt at this
+        # fix, caught by the provisioner integration test rather than here.
+        transformed = [
+            {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"},
+            {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "solomon"},
+        ]
+        intake = {
+            "organizer_identity": _text("ניר סולומון"),
+            "travelers": {"kind": "structured", "schema_version": 3, "data": [
+                {"name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+            ]},
+        }
+        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+
+        # And the English pair, which the slug happens to resemble but which
+        # must resolve through the raw roster rather than by luck.
+        intake["organizer_identity"] = _text("Nir Solomon")
+        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+
+    def test_a_roster_with_no_raw_travelers_still_resolves_a_bare_name(self) -> None:
+        # Older intakes, and any path that hands over participants without the
+        # structured travelers answer beside them, must not regress.
+        transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
+        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])

@@ -632,6 +632,50 @@ def _apply_dietary(
     return instructions
 
 
+def _normalize_identity(value: Any) -> str:
+    """Casefolded, whitespace-collapsed form used to compare stated names.
+
+    Internal whitespace is collapsed rather than merely stripped so "ניר
+    סולומון" and "ניר  סולומון" are the same needle. A name is typed by a
+    person, once, into a chat.
+    """
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any]) -> set[str]:
+    """Every way an organizer might write THIS participant's own name.
+
+    `aliases` carries the raw intake traveler entry for the same person, and
+    is not optional decoration: `_build_participants` SLUGIFIES `family`
+    ("סולומון" becomes "solomon") and drops `family_en` altogether, so by the
+    time a participant exists the roster no longer holds the household label
+    in the form the organizer actually typed. Matching the transformed
+    participant alone finds "ניר solomon" and misses "ניר סולומון" — which is
+    the same bug in a second dimension, found while fixing the first.
+
+    Deliberately excludes the bare family/household label: "סולומון" names a
+    household of five, not a person, and matching it would pick whichever of
+    them the roster happened to list first — precisely the silent
+    wrong-person failure `_resolve_organizers` exists to avoid.
+    """
+    sources = (participant, *aliases)
+    names = {_normalize_identity(src.get("name")) for src in sources}
+    names |= {_normalize_identity(src.get("name_en")) for src in sources}
+    families = {_normalize_identity(src.get("family")) for src in sources}
+    families |= {_normalize_identity(src.get("family_en")) for src in sources}
+    names.discard("")
+    families.discard("")
+
+    forms = set(names)
+    forms.add(_normalize_identity(participant.get("username")))
+    # Every given-name form against every household form, which covers the
+    # mixed-script rosters that happen in practice — a Hebrew given name whose
+    # household label was only ever transliterated, or the reverse.
+    forms |= {f"{n} {f}" for n in names for f in families}
+    forms.discard("")
+    return forms
+
+
 def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, Any]]) -> list[str]:
     """Matches the organizer_identity answer to a participant username.
 
@@ -640,21 +684,47 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     yields a config that cannot deploy at all; and a username that happens to
     belong to *someone else* silently hands them the organizer's private
     channel. No organizer block is the recoverable failure of the three.
+
+    An AMBIGUOUS answer is treated the same way as no answer, for the same
+    reason: two participants matching "שי" means the roster cannot tell which
+    of them is speaking, and picking the first is the wrong-person failure
+    with extra steps.
     """
     answer = data.get("organizer_identity")
-    stated = _text_value(answer).strip() if isinstance(answer, Mapping) else ""
-    if not stated:
+    needle = _normalize_identity(_text_value(answer)) if isinstance(answer, Mapping) else ""
+    if not needle:
         return []
-    needle = stated.casefold()
+
+    # The raw roster, keyed by every given-name form it carries, so a
+    # participant can be matched back to the entry the organizer actually
+    # typed — the one that still holds the household label unslugified.
+    raw_by_name: dict[str, Mapping[str, Any]] = {}
+    travelers = data.get("travelers")
+    entries = travelers.get("data") if isinstance(travelers, Mapping) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        for key in ("name", "name_en"):
+            form = _normalize_identity(entry.get(key))
+            if form:
+                raw_by_name.setdefault(form, entry)
+
+    matched: list[str] = []
     for participant in participants:
-        candidates = {
-            str(participant.get("name", "")).strip().casefold(),
-            str(participant.get("name_en", "")).strip().casefold(),
-            str(participant.get("username", "")).strip().casefold(),
-        }
-        if needle in candidates and needle:
-            return [participant["username"]]
-    return []
+        username = participant.get("username")
+        if not username:
+            continue
+        aliases = [
+            raw for raw in (
+                raw_by_name.get(_normalize_identity(participant.get("name"))),
+                raw_by_name.get(_normalize_identity(participant.get("name_en"))),
+            ) if raw is not None
+        ]
+        if needle in _identity_forms(participant, *aliases):
+            matched.append(username)
+
+    unique = list(dict.fromkeys(matched))
+    return unique if len(unique) == 1 else []
 
 
 def _derive_agent(

@@ -71,6 +71,86 @@ class DeployAdapter(Protocol):
     ) -> str: ...
 
 
+# ── Reachability ─────────────────────────────────────────────────────────────
+
+#: Why a provisioned trip cannot be reached from Telegram. A closed set on
+#: purpose: an operator reading `unreachable_reason` needs to know which
+#: component to retry, and free text does not answer that.
+UNREACHABLE_REASONS = {
+    # The organizer's answer matched no participant, or matched more than one.
+    # `_resolve_organizers` refuses to guess, so there is no organizer to give
+    # a private channel to. This is what actually happened on 2026-09-06.
+    "ORGANIZER_UNRESOLVED",
+    # The assistant questions were never answered, so there is no companion to
+    # name. Legitimate for a trip whose organizer skipped them.
+    "ASSISTANT_UNCONFIGURED",
+    # This deployment has no companion templates directory, so the Null
+    # adapter is in play and no profile was ever going to be created.
+    "COMPANION_TEMPLATES_ABSENT",
+    # `render_profile.py` failed — today, because the worker image carries
+    # neither `hermes` nor `node` (activation-scope.md B1).
+    "COMPANION_INSTALL_FAILED",
+    # A companion exists but there is no organizer chat id to bind it to.
+    "NO_ORGANIZER_CHAT",
+    # The chat is already bound to a different trip; moving it is a reviewed
+    # organizer action this job has no standing to perform.
+    "BINDING_REFUSED",
+    # The binding write itself failed.
+    "BINDING_FAILED",
+}
+
+
+def _record_reachability(
+    conn: Any,
+    trip_id: str,
+    *,
+    reachable: bool,
+    reason: str | None = None,
+    consequence: str = "",
+) -> None:
+    """Records whether this trip can be reached, and logs it if it cannot.
+
+    Two things this deliberately is NOT. It is not part of `lifecycle_state`:
+    `activation_approved`/`active` sit unused in that enum and
+    `docs/activation-scope.md` says not to implement them merely because they
+    exist. And it is never DERIVED — not from an open binding row, not from
+    `assistant_names` being populated. A binding can outlive the profile it
+    points at, which is exactly the false-healthy state that makes an
+    independent retry impossible to reason about.
+
+    Unreachable logs at WARNING because the whole failure this addresses was
+    an `info` line nobody saw: the successful run of 2026-09-06 emitted one
+    log line in total, and none of them said the trip was unreachable.
+    """
+    assert reachable or reason in UNREACHABLE_REASONS, f"unknown reason {reason!r}"
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE control_plane.trips
+                          SET reachability = %s,
+                              unreachable_reason = %s,
+                              reachability_checked_at = now()
+                        WHERE id = %s""",
+                    ("reachable" if reachable else "unreachable",
+                     None if reachable else reason, trip_id),
+                )
+    except Exception:
+        # Never fail a provisioning run over its own observability.
+        logger.warning("provisioner.reachability_write_failed",
+                       extra={"trip_id": trip_id}, exc_info=True)
+        return
+
+    if reachable:
+        logger.info("provisioner.trip_reachable", extra={"trip_id": trip_id})
+    else:
+        logger.warning("provisioner.trip_unreachable", extra={
+            "trip_id": trip_id,
+            "reason": reason,
+            "consequence": consequence or "the organizer cannot reach this trip from Telegram",
+        })
+
+
 class ShellDeployAdapter:
     """Calls kinerary-deploy/deploy.sh via subprocess.
 
@@ -815,11 +895,38 @@ class ProvisionerWorker:
                 canonical_site_url=private_url,
             )
             if handoff is None:
+                # Two different failures wore one label until 2026-09-06, and
+                # the distinction is the difference between "the organizer
+                # skipped the assistant questions" (fine) and "we could not
+                # work out which traveller they are" (a defect that cost a
+                # trip its companion). Say which.
+                agent_block = config.get("agent") or {}
+                reason = (
+                    "ORGANIZER_UNRESOLVED" if agent_block.get("name")
+                    else "ASSISTANT_UNCONFIGURED"
+                )
                 logger.info("provisioner.companion_profile_skipped", extra={
-                    "trip_id": trip_id, "reason": "assistant_questions_unanswered",
+                    "trip_id": trip_id, "reason": reason,
                 })
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason=reason,
+                    consequence=(
+                        "organizer_identity matched no participant, so no companion was created"
+                        if reason == "ORGANIZER_UNRESOLVED"
+                        else "the assistant questions were not answered, so there is no companion to create"
+                    ),
+                )
             else:
                 hermes_profile = self._companion.install(handoff)
+                if not hermes_profile:
+                    # The Null adapter, or an adapter that declined. Nothing
+                    # raised, so without this the run would report success
+                    # with no companion and nothing said about it.
+                    _record_reachability(
+                        conn, trip_id, reachable=False,
+                        reason="COMPANION_TEMPLATES_ABSENT",
+                        consequence="no companion profile adapter is configured for this deployment",
+                    )
                 if hermes_profile:
                     # Independently gated and independently non-fatal: a
                     # trip-mcp wiring failure must not block the chat
@@ -871,6 +978,16 @@ class ProvisionerWorker:
                                 "consequence": "group messages will fall back to @mention/reply only",
                             }, exc_info=True)
 
+                if hermes_profile and not recipient_chat_id:
+                    # A companion exists and nobody can talk to it. Recorded
+                    # rather than passed over in silence, because the retry is
+                    # a different one from every other reason here: nothing is
+                    # broken, an organizer chat id is simply not known yet.
+                    _record_reachability(
+                        conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
+                        consequence="a companion exists but no organizer chat id is known to bind it to",
+                    )
+
                 if hermes_profile and recipient_chat_id:
                     # Deliberately NOT inside the broad handler below. A trip
                     # whose companion installed but whose binding did not open
@@ -888,6 +1005,13 @@ class ProvisionerWorker:
                             "hermes_profile": hermes_profile,
                             "outcome": outcome,
                         })
+                        # The ONE place 'reachable' is ever written, and it is
+                        # written by the code that opened the binding rather
+                        # than by anything later reading that a binding row
+                        # exists. A binding can outlive the profile it points
+                        # at; "a row is present" is not the same claim as "the
+                        # organizer can talk to this trip".
+                        _record_reachability(conn, trip_id, reachable=True)
                     except BindingRefused as refused:
                         # Not a bug and not retryable: the chat legitimately
                         # belongs to another trip, and moving it is a reviewed
@@ -898,17 +1022,33 @@ class ProvisionerWorker:
                             "hermes_profile": hermes_profile,
                             "consequence": "trip is not reachable from this chat; reassignment needs an organizer action",
                         })
+                        _record_reachability(
+                            conn, trip_id, reachable=False, reason="BINDING_REFUSED",
+                            consequence="the chat is bound to another trip; reassignment needs an organizer action",
+                        )
                     except Exception:
                         logger.error("provisioner.companion_binding_failed", extra={
                             "trip_id": trip_id,
                             "hermes_profile": hermes_profile,
                             "consequence": "trip provisioned but is unroutable — no open chat binding",
                         }, exc_info=True)
+                        _record_reachability(
+                            conn, trip_id, reachable=False, reason="BINDING_FAILED",
+                            consequence="the chat binding write failed; the trip has a companion nobody is routed to",
+                        )
         except Exception:
+            # Everything above raised past its own handler — in practice
+            # `install()` itself, which is how B1 (no `hermes`/`node` in the
+            # worker image) presents. Recorded with the reason an operator
+            # would act on rather than left as a stack trace.
             logger.warning(
                 "provisioner.companion_profile_failed",
                 extra={"trip_id": trip_id},
                 exc_info=True,
+            )
+            _record_reachability(
+                conn, trip_id, reachable=False, reason="COMPANION_INSTALL_FAILED",
+                consequence="the companion profile could not be created; the trip has no assistant and no binding",
             )
 
     def _enqueue_operator_notification(

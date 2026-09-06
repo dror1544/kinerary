@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import unittest
 from typing import Any
@@ -633,6 +634,20 @@ COMPANION_INTAKE = {
 }
 
 
+# The same intake, answered the way run 13's organizer actually answered it:
+# a full name, given + family. COMPANION_INTAKE above says "Noa" — a bare first
+# name, the one form that already resolved — so it could not have caught this.
+FULL_NAME_ORGANIZER_INTAKE = {
+    **COMPANION_INTAKE,
+    "travelers": {"kind": "structured", "schema_version": 1, "data": [
+        {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+        {"name": "נעה", "name_en": "Noa", "age": 25, "family": "סולומון", "family_en": "Solomon"},
+    ]},
+    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "ניר סולומון"},
+    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["נעה"]}},
+}
+
+
 class FakeCompanionProfileAdapter:
     def __init__(self) -> None:
         self.installed: list[dict] = []
@@ -906,8 +921,17 @@ class SlugPromotionTests(unittest.TestCase):
 
             slugs = {self._slug_of(taken["trip_id"]), self._slug_of(second["trip_id"])}
             self.assertEqual(len(slugs), 2, f"slugs collided: {slugs}")
-            # Both derive from the same Japan intake, so one takes the suffix.
-            self.assertTrue(any(s.endswith("-2") for s in slugs), slugs)
+            # Both derive from the same Japan intake, so at least one takes a
+            # numeric suffix. Which number is NOT asserted: this database is
+            # shared with real trips, and the first real provisioning run
+            # (2026-09-06) took `japan-2026-2`, after which this test demanded
+            # a suffix that was no longer available and failed on data rather
+            # than behaviour. The property is "collisions are suffixed", not
+            # "the suffix is 2".
+            self.assertTrue(
+                any(re.fullmatch(r"japan-2026-\d+", s) for s in slugs),
+                f"expected a numeric-suffixed slug among {slugs}",
+            )
         finally:
             teardown_fixture(self.conn, second)
             teardown_fixture(self.conn, taken)
@@ -1387,3 +1411,236 @@ class OperatorNotificationTests(unittest.TestCase):
         # Still has retries left, so it is not an outcome worth reporting yet.
         self._worker(operator_chat_id=self.OPERATOR_CHAT, fail=True).run_once()
         self.assertEqual(self._rows("operator_provisioning_failed"), [])
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OrganizerFullNameReachesCompanionTests(unittest.TestCase):
+    """Proves the A1 fix carries all the way to companion invocation.
+
+    The unit tests in test_transformer.py prove `_resolve_organizers` returns
+    a username. That is necessary and not sufficient: what broke on
+    2026-09-06 was the chain BEHIND it — no organizer, so `_derive_agent`
+    writes no `agent.organizers`, so `build_companion_handoff` returns None,
+    so `install()` is never called and no chat binding is written. This
+    asserts the call actually happens, which is the only thing that makes the
+    trip reachable.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self.identity_id = f"idnt_{rnd()}"
+        self.chat_id = "810000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (self.identity_id, self.fix["user_id"], sha256(self.chat_id), self.chat_id),
+            )
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
+        teardown_fixture(self.conn, self.fix)
+
+    def test_a_full_name_answer_reaches_install_and_binds_the_chat(self) -> None:
+        companion = FakeCompanionProfileAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-fullname",
+            companion=companion,
+        )
+        worker.run_once()
+
+        self.assertEqual(
+            len(companion.installed), 1,
+            "the companion was never invoked — organizer resolution stopped the chain again",
+        )
+        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "ניר")
+
+        row = self.conn.execute(
+            "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "provisioned but unroutable — no open chat binding")
+        self.assertEqual(row["chat_id"], self.chat_id)
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ReachabilityTests(unittest.TestCase):
+    """A2: a trip that cannot be reached must say so, and say why.
+
+    The failure this exists to end: on 2026-09-06 a provisioning run reported
+    success at every level the system records — job 'succeeded', lifecycle
+    'ready_private', site answering 200 — while the organizer messaging the
+    bot got "I don't have a trip for this chat". Nothing disagreed with
+    "ready", because nothing recorded reachability. The whole run emitted one
+    log line.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def _reachability(self, trip_id: str) -> tuple[str, str | None]:
+        row = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (trip_id,),
+        ).fetchone()
+        return row["reachability"], row["unreachable_reason"]
+
+    def _with_chat(self, fix: dict) -> str:
+        chat_id = "820000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (f"idnt_{rnd()}", fix["user_id"], sha256(chat_id), chat_id),
+            )
+        return chat_id
+
+    def _cleanup(self, fix: dict) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (fix["trip_id"],))
+            self.conn.execute(
+                "DELETE FROM control_plane.user_identities WHERE user_id = %s AND provider = 'telegram'",
+                (fix["user_id"],),
+            )
+        teardown_fixture(self.conn, fix)
+
+    def test_a_trip_starts_unknown_rather_than_healthy(self) -> None:
+        # The fail-safe default. A trip nobody has checked must not claim to
+        # be reachable, and 'unknown' is distinguishable from 'unreachable' —
+        # one means nobody asked, the other means we asked and the answer was
+        # no.
+        fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
+        try:
+            self.assertEqual(self._reachability(fix["trip_id"]), ("unknown", None))
+        finally:
+            self._cleanup(fix)
+
+    def test_a_bound_companion_records_reachable_with_no_reason(self) -> None:
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        chat_id = self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-ok",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            self.assertEqual(self._reachability(fix["trip_id"]), ("reachable", None))
+            row = self.conn.execute(
+                "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+                "WHERE trip_id = %s AND closed_at IS NULL", (fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(row["chat_id"], chat_id)
+        finally:
+            self._cleanup(fix)
+
+    def test_an_unresolved_organizer_is_named_as_the_reason(self) -> None:
+        # The 2026-09-06 failure exactly: assistant answers present, so there
+        # IS a companion to build, but organizer_identity resolves to nobody.
+        intake = {
+            **FULL_NAME_ORGANIZER_INTAKE,
+            "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Someone Not On This Trip"},
+        }
+        fix = setup_fixture(self.conn, intake=intake)
+        self._with_chat(fix)
+        try:
+            companion = FakeCompanionProfileAdapter()
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-org",
+                companion=companion,
+            ).run_once()
+            self.assertEqual(companion.installed, [], "no organizer, so nothing to install")
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "ORGANIZER_UNRESOLVED"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_a_failing_companion_install_is_named_as_the_reason(self) -> None:
+        # How B1 (no hermes/node in the worker image) presents.
+        class ExplodingAdapter:
+            def install(self, handoff: dict) -> str | None:
+                raise RuntimeError("render_profile.py exited 127: hermes: not found")
+
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-b1",
+                companion=ExplodingAdapter(),
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "COMPANION_INSTALL_FAILED"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_no_companion_adapter_is_named_rather_than_passed_over(self) -> None:
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-null",
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "COMPANION_TEMPLATES_ABSENT"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_a_companion_with_nobody_to_bind_to_is_named(self) -> None:
+        # No telegram identity for the owner: a companion exists and cannot be
+        # reached. A different retry from every other reason here — nothing is
+        # broken, an organizer chat id is simply not known yet.
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-nochat",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "NO_ORGANIZER_CHAT"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_the_database_refuses_an_unreachable_trip_with_no_reason(self) -> None:
+        # The invariant, enforced where it cannot be forgotten: "unreachable"
+        # without a reason is the silent failure this whole change exists to
+        # end, and "reachable, but here is why it is not" is incoherent.
+        fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
+        try:
+            for reachability, reason in (("unreachable", None), ("reachable", "BINDING_FAILED")):
+                with self.subTest(reachability=reachability, reason=reason):
+                    with self.assertRaises(psycopg.errors.CheckViolation):
+                        with self.conn.transaction():
+                            self.conn.execute(
+                                "UPDATE control_plane.trips SET reachability = %s, unreachable_reason = %s WHERE id = %s",
+                                (reachability, reason, fix["trip_id"]),
+                            )
+        finally:
+            self._cleanup(fix)
