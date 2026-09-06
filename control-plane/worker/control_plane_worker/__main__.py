@@ -75,6 +75,23 @@ def build_parser() -> argparse.ArgumentParser:
                            help="path to profile-templates/familytrip-companion. Defaults to the copy inside "
                                 "--repo-root; pass --no-companion-profile to skip companion-profile creation "
                                 "entirely (PROVISIONER_COMPANION_TEMPLATES_DIR)")
+    # Host-side companion materialization. Present because the Hermes install a
+    # profile must be created in is macOS-native and serves those profiles from
+    # the host, so a containerised worker cannot do it locally. Provisioning /
+    # install time ONLY — nothing about an already-provisioned trip, its
+    # routing, its binding or the Hermes runtime touches this. Expected to be
+    # replaced wholesale by the K3s orchestrator path; the adapter contract is
+    # what is durable, not the transport.
+    provision.add_argument("--companion-ssh-host", default=os.environ.get("PROVISIONER_COMPANION_SSH_HOST"),
+                           help="host to materialize companion profiles on, over a forced-command SSH key "
+                                "(PROVISIONER_COMPANION_SSH_HOST). Unset keeps the local render_profile.py path.")
+    provision.add_argument("--companion-ssh-user", default=os.environ.get("PROVISIONER_COMPANION_SSH_USER"),
+                           help="user for --companion-ssh-host (PROVISIONER_COMPANION_SSH_USER)")
+    provision.add_argument("--companion-ssh-key", default=os.environ.get("PROVISIONER_COMPANION_SSH_KEY"),
+                           help="private key for --companion-ssh-host (PROVISIONER_COMPANION_SSH_KEY)")
+    provision.add_argument("--companion-ssh-known-hosts", default=os.environ.get("PROVISIONER_COMPANION_SSH_KNOWN_HOSTS"),
+                           help="known_hosts file; without one the first connection is accept-new "
+                                "(PROVISIONER_COMPANION_SSH_KNOWN_HOSTS)")
     provision.add_argument("--no-companion-profile", action="store_true",
                            default=os.environ.get("PROVISIONER_COMPANION_PROFILE_ENABLED") == "0",
                            help="skip companion-profile creation, restoring the pre-2026-09 behaviour of deploying "
@@ -207,7 +224,31 @@ def main(argv: list[str] | None = None) -> int:
                 companion_templates_dir = None
             args.companion_templates_dir = companion_templates_dir
 
-            if args.companion_templates_dir:
+            # Host-side wins when configured: a worker that CAN reach a host
+            # with the real Hermes install should not fall back to a local
+            # render that cannot work from inside a container.
+            ssh_configured = bool(
+                args.companion_ssh_host and args.companion_ssh_user and args.companion_ssh_key
+            )
+            if ssh_configured and not args.no_companion_profile:
+                from .companion_profile import SshCompanionProfileAdapter
+                companion_adapter = SshCompanionProfileAdapter(
+                    host=args.companion_ssh_host,
+                    user=args.companion_ssh_user,
+                    key_path=args.companion_ssh_key,
+                    known_hosts=args.companion_ssh_known_hosts,
+                )
+                # Loudly, at startup. The whole point is not to discover a
+                # missing capability one organizer's trip at a time.
+                companion_adapter.preflight()
+                logger.info("worker.companion_adapter_selected", extra={
+                    "adapter": "ssh", "host": args.companion_ssh_host,
+                })
+                mcp_bridge_adapter = (
+                    ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
+                    if args.enable_mcp_bridge else NullMcpBridgeAdapter()
+                )
+            elif args.companion_templates_dir:
                 companion_adapter = RenderProfileAdapter(templates_dir=args.companion_templates_dir)
                 mcp_bridge_adapter = (
                     ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)

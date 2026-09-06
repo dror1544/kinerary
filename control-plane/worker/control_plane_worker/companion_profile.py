@@ -170,6 +170,108 @@ class NullCompanionProfileAdapter:
         return None
 
 
+class SshCompanionProfileAdapter:
+    """Materializes a companion on a host reachable over SSH.
+
+    ONE fulfilment of `CompanionProfileAdapter`, not a new contract. The
+    provisioning contract is and stays "materialize this companion from this
+    validated handoff"; that this particular implementation gets there by SSH
+    is an implementation detail of one deployment shape.
+
+    WHY IT EXISTS. The Hermes install the profile must be created in is a macOS
+    arm64 venv pinned to absolute host paths, and the gateway that serves those
+    profiles runs on that same host. A containerised Hermes could neither
+    execute it nor create profiles for the build that actually runs them, so
+    `RenderProfileAdapter` — which shells `render_profile.py` locally — cannot
+    work from inside the worker container.
+
+    WHAT IT IS NOT. This is a provisioning/install-time mechanism only.
+    Nothing about a trip that is already provisioned depends on it: not its
+    routing, not its chat binding, not the Hermes runtime, not a live
+    conversation. `install()` is called from exactly one place, the
+    provisioner's completion path, and if SSH is unavailable the consequence
+    is a recorded `COMPANION_INSTALL_FAILED` on a trip that still deploys,
+    still serves its site, and still binds its chat (A4).
+
+    A BRIDGE, DELIBERATELY. The planned K3s direction makes a trip companion an
+    orchestrated deployable unit; that becomes another implementation of this
+    same `install()` and this class is deleted. Nothing above the adapter
+    should learn that SSH was ever involved — which is why the failure it
+    raises is an ordinary RuntimeError and the reason recorded upstream is
+    COMPANION_INSTALL_FAILED rather than anything mentioning a host.
+
+    TRUST. The host wrapper is the boundary, not this class: it ignores
+    `SSH_ORIGINAL_COMMAND` entirely, accepts no arguments, derives every path
+    itself, and charset-checks the profile name before it becomes one. The
+    key is expected to be installed with a forced command, so even a fully
+    compromised worker can only hand this wrapper a handoff on stdin.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key_path: str,
+        *,
+        port: int = 22,
+        timeout: int = 180,
+        known_hosts: str | None = None,
+    ) -> None:
+        self._host = host
+        self._user = user
+        self._key_path = key_path
+        self._port = port
+        self._timeout = timeout
+        self._known_hosts = known_hosts
+
+    def preflight(self) -> None:
+        """Fails loudly at startup rather than once per job.
+
+        The 2026-09-06 failure mode this answers: a missing capability that
+        only shows up when a real organizer's trip is being provisioned, one
+        job at a time, as a warning nobody is watching.
+        """
+        if not os.path.isfile(self._key_path):
+            raise RuntimeError(
+                f"companion SSH key not found at {self._key_path} — "
+                "the worker cannot materialize companion profiles"
+            )
+
+    def install(self, handoff: Mapping[str, Any]) -> Optional[str]:
+        payload = json.dumps(dict(handoff), ensure_ascii=False)
+        # No remote command: the key's forced command decides what runs. Even
+        # if this list gained an attacker-controlled entry it could not choose
+        # the program — but there is nothing to append to in the first place.
+        argv = [
+            "ssh",
+            "-i", self._key_path,
+            "-p", str(self._port),
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "IdentitiesOnly=yes",
+            # Host-key policy is explicit either way rather than left to the
+            # ambient ~/.ssh/known_hosts of whatever user the worker runs as.
+            *(("-o", f"UserKnownHostsFile={self._known_hosts}", "-o", "StrictHostKeyChecking=yes")
+              if self._known_hosts else
+              ("-o", "StrictHostKeyChecking=accept-new")),
+            f"{self._user}@{self._host}",
+        ]
+        result = subprocess.run(
+            argv, input=payload, capture_output=True, text=True, timeout=self._timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"companion install over ssh exited {result.returncode}: "
+                f"{(result.stderr or result.stdout)[:500]}"
+            )
+        # The wrapper's contract: one line, a verb and the profile name.
+        line = (result.stdout or "").strip().splitlines()[-1] if result.stdout.strip() else ""
+        verb, _, name = line.partition(" ")
+        if verb not in {"INSTALLED", "ALREADY_PRESENT"} or not name:
+            raise RuntimeError(f"unrecognized companion install result: {line[:200]!r}")
+        return name
+
+
 class RenderProfileAdapter:
     """Shells out to profile-templates/familytrip-companion/render_profile.py
     --install-profile, mirroring ShellDeployAdapter's subprocess pattern.
