@@ -53,6 +53,24 @@ export interface ConnectorOptions {
   mediaStore?: { get(id: string): { mime: string; bytes: Buffer; filename?: string } | null };
   /** HMAC verify list for the upgrade token. Multiple entries support rotation. */
   gatewaySecrets: readonly string[];
+  /**
+   * The gateway that receives turns no per-trip gateway serves.
+   *
+   * Under the per-trip architecture (`docs/per-trip-gateway-architecture.md`)
+   * a gateway's authenticated id IS the Hermes profile it serves, and routing
+   * is exact. This option exists for exactly one transitional reason: the
+   * multiplexing gateway serves every profile from one process under one id,
+   * so nothing it serves would ever match.
+   *
+   * Declared rather than inferred. A "if only one gateway is connected, send
+   * it everything" rule would look equivalent and behave very differently the
+   * moment the single connected gateway happened to be a trip's own — it would
+   * hand that companion another trip's conversation. Naming the multiplexing
+   * gateway makes the exception visible, auditable, and deletable: remove this
+   * option when `multiplex_profiles` goes off and routing becomes strict with
+   * no further change.
+   */
+  fallbackGatewayId?: string;
   telegram: TelegramClient;
   port: number;
   host?: string;
@@ -89,7 +107,16 @@ export interface ConnectorOptions {
 export class RelayConnector {
   private readonly wss: WebSocketServer;
   private readonly http: Server;
-  private readonly sockets = new Set<WebSocket>();
+  /**
+   * Connected gateways, keyed by the Hermes profile each one serves.
+   *
+   * The key comes from the authenticated upgrade token, never from anything a
+   * gateway says about itself in-band — same authority rule the tenant stamp
+   * follows in `normalize.ts`. A Set per key rather than a single socket
+   * because a restarting gateway can briefly overlap with itself, and dropping
+   * the old socket early would lose the turn in flight on it.
+   */
+  private readonly gateways = new Map<string, Set<WebSocket>>();
   private readonly log: (line: string) => void;
   private readonly path: string;
 
@@ -148,7 +175,16 @@ export class RelayConnector {
         socket.destroy();
         return;
       }
-      this.wss.handleUpgrade(request, socket, head, (ws) => this.onConnection(ws));
+      // The identity is re-derived rather than carried from authorizeUpgrade:
+      // one place decides what a token means, and the routing key is that
+      // decision rather than a copy of it.
+      const gatewayId = this.bearerIdentity(request);
+      if (!gatewayId) {
+        socket.write(`HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+      this.wss.handleUpgrade(request, socket, head, (ws) => this.onConnection(ws, gatewayId));
     });
   }
 
@@ -180,9 +216,20 @@ export class RelayConnector {
     return verifyUpgradeToken(match[1], this.options.gatewaySecrets) ?? null;
   }
 
-  private onConnection(ws: WebSocket): void {
-    this.sockets.add(ws);
-    this.log(structuredLog("info", "relay.gateway_connected", { sockets: this.sockets.size }));
+  private onConnection(ws: WebSocket, gatewayId: string): void {
+    let peers = this.gateways.get(gatewayId);
+    if (!peers) {
+      peers = new Set<WebSocket>();
+      this.gateways.set(gatewayId, peers);
+    }
+    peers.add(ws);
+    this.log(
+      structuredLog("info", "relay.gateway_connected", {
+        gateway_id: gatewayId,
+        gateways: this.gateways.size,
+        sockets: this.socketCount,
+      }),
+    );
 
     // Newline-delimited over the socket, NOT one frame per WS message. The
     // gateway happens to send one per message today, but the protocol is
@@ -203,8 +250,20 @@ export class RelayConnector {
       for (const frame of split.frames) void this.onFrame(ws, frame);
     });
     ws.on("close", () => {
-      this.sockets.delete(ws);
-      this.log(structuredLog("info", "relay.gateway_disconnected", { sockets: this.sockets.size }));
+      const set = this.gateways.get(gatewayId);
+      set?.delete(ws);
+      // Drop the empty key rather than leave it: `canReachProfile` answers off
+      // this map, and a key with no sockets would report a stopped trip as
+      // reachable — precisely the false healthy state migration 0042 exists to
+      // stop us from reporting.
+      if (set && set.size === 0) this.gateways.delete(gatewayId);
+      this.log(
+        structuredLog("info", "relay.gateway_disconnected", {
+          gateway_id: gatewayId,
+          gateways: this.gateways.size,
+          sockets: this.socketCount,
+        }),
+      );
     });
     ws.on("error", (error) => {
       this.log(
@@ -378,7 +437,14 @@ export class RelayConnector {
   }
 
   /**
-   * Pushes one normalized event to the connected gateway(s).
+   * Pushes one normalized event to the gateway that serves its trip.
+   *
+   * Addressed, not broadcast. `source.profile` is the trip context decided by
+   * `normalize.ts` from the chat binding, and under one-gateway-process-per-trip
+   * it is also the destination: the profile a gateway serves is the identity it
+   * authenticated as. Sending a turn to a gateway that serves a different trip
+   * would put one family's conversation in front of another family's companion,
+   * so a turn with no gateway of its own goes nowhere rather than everywhere.
    *
    * Returns whether it reached at least one socket. A `false` is significant:
    * the turn is lost, because nothing here queues. Buffered delivery is part
@@ -387,18 +453,62 @@ export class RelayConnector {
    * will never come.
    */
   pushInbound(event: WireMessageEvent): boolean {
+    const profile = event.source.profile;
+    const targets = this.socketsFor(profile);
     let delivered = false;
-    for (const ws of this.sockets) {
+    for (const ws of targets) {
       if (ws.readyState !== ws.OPEN) continue;
       this.send(ws, { type: "inbound", event });
       delivered = true;
     }
     if (!delivered) {
       this.log(
-        structuredLog("warn", "relay.inbound_undelivered", { chat_id_present: Boolean(event.source.chat_id) }),
+        structuredLog("warn", "relay.inbound_undelivered", {
+          chat_id_present: Boolean(event.source.chat_id),
+          profile_present: Boolean(profile),
+          gateways: this.gateways.size,
+        }),
       );
     }
     return delivered;
+  }
+
+  /**
+   * Whether a turn for this trip would reach a gateway right now.
+   *
+   * The router asks before it accepts a turn, so an organizer whose companion
+   * is not running is told so instead of waiting on an answer that cannot come
+   * (`COMPANION_PENDING`). This reads live socket state on purpose: a binding
+   * row proves a companion was installed, never that it is serving.
+   */
+  canReachProfile(profile: string): boolean {
+    for (const ws of this.socketsFor(profile)) {
+      if (ws.readyState === ws.OPEN) return true;
+    }
+    return false;
+  }
+
+  /**
+   * The sockets allowed to receive a turn for `profile`.
+   *
+   * Exact match first; the declared fallback gateway only when the trip has no
+   * gateway of its own. An unstamped event resolves to nothing but the
+   * fallback — with no trip context there is no correct destination to pick,
+   * and picking one anyway is the mistake the stamp exists to prevent.
+   */
+  private socketsFor(profile: string | undefined): Iterable<WebSocket> {
+    const own = profile ? this.gateways.get(profile) : undefined;
+    if (own && own.size > 0) return own;
+    const fallbackId = this.options.fallbackGatewayId;
+    if (fallbackId) return this.gateways.get(fallbackId) ?? [];
+    return [];
+  }
+
+  /** Open sockets across every connected gateway. */
+  private get socketCount(): number {
+    let total = 0;
+    for (const peers of this.gateways.values()) total += peers.size;
+    return total;
   }
 
   private send(ws: WebSocket, frame: Parameters<typeof encodeFrame>[0]): void {
@@ -415,8 +525,15 @@ export class RelayConnector {
 
   get connectedGateways(): number {
     let open = 0;
-    for (const ws of this.sockets) if (ws.readyState === ws.OPEN) open += 1;
+    for (const peers of this.gateways.values()) {
+      for (const ws of peers) if (ws.readyState === ws.OPEN) open += 1;
+    }
     return open;
+  }
+
+  /** The profiles with a gateway connected — the trips that are reachable. */
+  get servedProfiles(): readonly string[] {
+    return [...this.gateways.keys()];
   }
 
   async listen(): Promise<void> {
@@ -435,8 +552,8 @@ export class RelayConnector {
   }
 
   async close(): Promise<void> {
-    for (const ws of this.sockets) ws.close();
-    this.sockets.clear();
+    for (const peers of this.gateways.values()) for (const ws of peers) ws.close();
+    this.gateways.clear();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
   }

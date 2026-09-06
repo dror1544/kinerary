@@ -334,6 +334,68 @@ describe("normalizeUpdate (DB)", () => {
     });
   });
 
+  test("a bound trip whose gateway is not running is COMPANION_PENDING", { skip: SKIP }, async () => {
+    // A binding proves a companion was INSTALLED. It never proves one is
+    // SERVING, and conflating the two is what reports a healthy trip the
+    // organizer cannot actually talk to (A2/A4, migration 0042). With one
+    // gateway process per trip, "is it running" is a live socket question, so
+    // ask it here rather than let the turn vanish into an unrouted push.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000777", fix.tripId, "companion-stopped"],
+      );
+
+      const outcome = await normalizeUpdate(
+        fix.pool,
+        textUpdate("600000777", "when do we land?"),
+        undefined,
+        () => false,
+      );
+      assert.deepEqual(outcome, { kind: "dropped", reason: "COMPANION_PENDING" });
+    });
+  });
+
+  test("a bound trip whose gateway IS running produces the event", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000888", fix.tripId, "companion-running"],
+      );
+
+      const asked: string[] = [];
+      const outcome = await normalizeUpdate(
+        fix.pool,
+        textUpdate("600000888", "when do we land?"),
+        undefined,
+        (profile) => {
+          asked.push(profile);
+          return true;
+        },
+      );
+      assert.equal(outcome.kind, "event");
+      if (outcome.kind !== "event") return;
+      assert.equal(outcome.event.source.profile, "companion-running");
+      // Asked about the trip resolved from the binding, not about anything the
+      // message claimed.
+      assert.deepEqual(asked, ["companion-running"]);
+    });
+  });
+
+  test("with no reachability check supplied, a bound trip still routes", { skip: SKIP }, async () => {
+    // The parameter is optional so the check can ship inert: callers that do
+    // not pass one keep exactly today's behaviour.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000999", fix.tripId, "companion-unchecked"],
+      );
+
+      const outcome = await normalizeUpdate(fix.pool, textUpdate("600000999", "hi"));
+      assert.equal(outcome.kind, "event");
+    });
+  });
+
   test("an unbound chat produces no event at all — fail closed", { skip: SKIP }, async () => {
     // On a shared bot, "no trip resolved" can never fall back to a default:
     // the default would be another organizer's trip.

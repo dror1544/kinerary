@@ -182,6 +182,14 @@ export interface DispatchOptions {
   interviewerProfile?: string;
   /** Present when the connector runs a media plane; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * Whether a trip's companion gateway is connected right now.
+   *
+   * Injected rather than looked up so the router keeps its property of
+   * performing no I/O of its own. Absent means "assume reachable", which is
+   * what every caller did before per-trip gateway processes existed.
+   */
+  canReachProfile?: (profile: string) => boolean;
 }
 
 export async function dispatchUpdate(
@@ -260,7 +268,7 @@ export async function dispatchUpdate(
     }
   }
 
-  const outcome = await normalizeUpdate(db, update, options.media);
+  const outcome = await normalizeUpdate(db, update, options.media, options.canReachProfile);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
     // has to actually address the assistant, or the shared bot answers a

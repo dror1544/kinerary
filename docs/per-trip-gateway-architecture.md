@@ -144,6 +144,25 @@ to keep in sync. `hermes gateway enroll` persists `GATEWAY_RELAY_ID` /
 (`hermes_cli/gateway_enroll.py:234`), so the identity a gateway presents is
 provisioned, not asserted.
 
+### The one declared exception
+
+The gateway running today does not follow that rule and cannot:
+`profiles/trip-intake/.env` carries `GATEWAY_RELAY_ID=kinerary-trip-intake`,
+while the profile it is stamped with is `trip-intake`. More fundamentally, a
+multiplexing gateway serves *every* profile under *one* id, so no identity rule
+could ever match it.
+
+`relay.multiplex_gateway_id` names it: the gateway that receives turns no
+per-trip gateway claims.
+
+Declared, not inferred. "If only one gateway is connected, send it everything"
+looks equivalent and behaves very differently the moment that single gateway is
+a *trip's own* — it would hand one family's companion another family's
+conversation, which is the failure this architecture exists to make
+structurally impossible. Naming the multiplexing gateway makes the exception
+visible, auditable, and deletable: unset the key and routing is exact, with no
+code change.
+
 ### Defence in depth
 
 With `multiplex_profiles` **off**, `gateway/run.py:7810` honours
@@ -364,17 +383,30 @@ for free (`replicas: 0` plus an activator). Another reason not to build it now.
 Ordered so the acceptance path keeps working at every step, and so the riskiest
 change is the last one rather than the first.
 
-**1. Connector: key sockets by gateway id.**
-`Map<gatewayId, Set<WebSocket>>` in `connector.ts`; `pushInbound` routes by
-`event.source.profile`. **Fall back to broadcast when the map has exactly one
-gateway.** Behaviour-identical with today's single gateway, so this ships and
-sits in production unexercised. Unit-test the routing directly.
+**1. Connector: key sockets by gateway id.** — **BUILT (2026-09-06)**
+`Map<profile, Set<WebSocket>>` in `connector.ts`, keyed off the authenticated
+upgrade token; `pushInbound` routes by `event.source.profile`, with
+`relay.multiplex_gateway_id` taking what no per-trip gateway claims. Inert on
+today's deployment once that key names `kinerary-trip-intake`. Six routing
+tests, including the cutover case (a trip's own gateway taking its traffic away
+from the multiplexing one) and disconnect/reconnect.
 
-**2. Reachability: no socket ⇒ `COMPANION_PENDING`.**
-Connector exposes "is a gateway connected for profile X". `normalize.ts` uses
-it alongside the existing `!route.hermesProfile` check. Same reason code, same
-organizer-facing string, one more true condition. Also unexercised at this
-point — no second gateway exists yet.
+One pre-existing test changed rather than being added to: *"an event reaches a
+connected gateway with its profile intact"* dialled as `gw_1` and pushed an
+event for `companion-japan`, which passed only because delivery was a
+broadcast. It now dials as the profile it serves. The test's intent survives;
+what it asserted about addressing did not, which is the point.
+
+**2. Reachability: no socket ⇒ `COMPANION_PENDING`.** — **BUILT (2026-09-06)**
+`connector.canReachProfile(profile)` answers from live socket state;
+`normalize.ts` takes it as an optional `ReachabilityCheck` and applies it after
+the existing `!route.hermesProfile` test. Same reason code, same organizer-
+facing string, one more true condition. Optional so it ships inert: a caller
+that passes nothing keeps today's behaviour exactly.
+
+Asked per update rather than cached — a gateway can stop between one message
+and the next, and a stale "reachable" spends the organizer's turn on a socket
+that is gone.
 
 **3. Stand up one trip gateway by hand: japan-2026-2.**
 `gateway enroll` + `install` + `start` for `japan20262`, `multiplex_profiles`

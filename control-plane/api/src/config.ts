@@ -136,6 +136,21 @@ export const architectureProfileSchema = z.object({
      * to.
      */
     interviewer_profile: z.string().min(1).optional(),
+    /**
+     * The authenticated id of the ONE gateway still serving many profiles from
+     * a single process, if there is one.
+     *
+     * Turns are addressed to the gateway whose id matches the trip's Hermes
+     * profile (`docs/per-trip-gateway-architecture.md`). A multiplexing gateway
+     * serves every profile under one id, so nothing it serves would ever match
+     * and it would go silent the moment routing became exact. Declaring it here
+     * says "send this gateway anything no trip's own gateway claims".
+     *
+     * TRANSITIONAL, and meant to be deleted. It is unset once every active trip
+     * has its own gateway process; at that point routing is exact with no code
+     * change, and an unreachable trip is reported rather than absorbed.
+     */
+    multiplex_gateway_id: z.string().min(1).optional(),
   }).strict().optional(),
 }).strict().superRefine((profile, ctx) => {
   if (profile.relay) {

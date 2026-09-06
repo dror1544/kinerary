@@ -84,6 +84,12 @@ interface Runtime {
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
   /**
+   * From `relay.multiplex_gateway_id`. Absent means routing is exact and a
+   * trip with no gateway of its own is reported unreachable rather than
+   * served by somebody else's process.
+   */
+  multiplexGatewayId?: string;
+  /**
    * Present only when this relay's bot IS the signup bot. Telegram gives each
    * update to exactly one getUpdates caller, so in that topology this loop has
    * to carry the approval callbacks too — the API stands its own poller down
@@ -170,6 +176,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     db,
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
     interviewerProfile: relay.interviewer_profile,
+    multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
   };
 }
@@ -207,6 +214,7 @@ async function main(): Promise<void> {
     host: runtime.host,
     mediaStore,
     log,
+    ...(runtime.multiplexGatewayId ? { fallbackGatewayId: runtime.multiplexGatewayId } : {}),
     // Track 4: on an interview chat the agent's words reach the organizer only
     // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
     // keyboard, the record and the order. Resolved from the binding, never from
@@ -253,6 +261,9 @@ async function main(): Promise<void> {
     port: runtime.port,
     host: runtime.host,
     polling: Boolean(runtime.db),
+    // Says out loud which routing regime this process is in. "Exact" is the
+    // destination state; a named multiplex gateway is the transition.
+    routing: runtime.multiplexGatewayId ? "fallback" : "exact",
   }));
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {

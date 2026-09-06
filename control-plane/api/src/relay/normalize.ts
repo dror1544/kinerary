@@ -229,10 +229,20 @@ export async function toWireEventWithMedia(
   };
 }
 
+/**
+ * Whether a turn for this trip would reach a running companion right now.
+ *
+ * Supplied by the connector, which answers from live socket state. Optional:
+ * a caller that passes nothing keeps the pre-per-trip behaviour, where a
+ * binding was taken to imply a destination.
+ */
+export type ReachabilityCheck = (profile: string) => boolean;
+
 export async function normalizeUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
   deps?: MediaDeps,
+  canReach?: ReachabilityCheck,
 ): Promise<NormalizeOutcome> {
   const message = update.message ?? update.edited_message;
   if (!message) return { kind: "dropped", reason: "NO_MESSAGE" };
@@ -274,6 +284,21 @@ export async function normalizeUpdate(
   // organizer's site is already up. Answering honestly is the difference
   // between a system that looks broken and one that says what it is doing.
   if (!route.hermesProfile) return { kind: "dropped", reason: "COMPANION_PENDING" };
+
+  // Installed is not running. Under one gateway process per trip
+  // (`docs/per-trip-gateway-architecture.md`) a stopped companion is an
+  // ordinary, recoverable state — `gateway start`, no re-provision — and the
+  // organizer is owed the same honest answer as for a trip whose companion was
+  // never installed: same reason code, same reply, no new vocabulary.
+  //
+  // Deliberately NOT its own reason: from the organizer's side "my assistant
+  // isn't answering yet" is one situation, and splitting it would leak our
+  // process model into their chat. The distinction that matters operationally
+  // is already recorded — as reachability (migration 0042), where it can be
+  // acted on.
+  if (canReach && !canReach(route.hermesProfile)) {
+    return { kind: "dropped", reason: "COMPANION_PENDING" };
+  }
 
   return {
     kind: "event",

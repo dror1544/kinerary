@@ -77,6 +77,14 @@ import type { TelegramClient } from "./telegram-api.js";
 /** Just the part of RelayConnector this needs, so tests need no socket. */
 export interface InboundSink {
   pushInbound(event: WireMessageEvent): boolean;
+  /**
+   * Whether a turn for this trip would reach a running companion.
+   *
+   * Optional so a test double can stay two lines. Absent means "assume
+   * reachable" — the behaviour every caller had before trips got their own
+   * gateway processes.
+   */
+  canReachProfile?(profile: string): boolean;
 }
 
 export interface TripBotPollerDeps {
@@ -1187,6 +1195,12 @@ export function startTripBotPoller(
           const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
             interviewerProfile: deps.interviewerProfile,
             media: deps.media,
+            // Asked per update rather than cached: a gateway can stop between
+            // one message and the next, and a stale "reachable" spends the
+            // organizer's turn on a socket that is gone.
+            ...(deps.connector.canReachProfile
+              ? { canReachProfile: (profile: string) => deps.connector.canReachProfile!(profile) }
+              : {}),
           });
           await applyDecision(decision, deps);
         } catch (error) {
