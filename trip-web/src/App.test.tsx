@@ -1,8 +1,17 @@
 import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
-import { createItineraryItem, deleteItineraryItem, tokenStore, updateItineraryItem } from "./api";
-import App, { classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, wrappedMapIndex } from "./App";
+import {
+  createBooking,
+  getAuthenticatedDocument,
+  createItineraryItem,
+  deleteItineraryItem,
+  tokenStore,
+  updateItineraryItem,
+  uploadBookingAppleWallet,
+  uploadBookingConfirmation,
+} from "./api";
+import App, { classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
 
 describe("Modern trip SPA", () => {
   it("shows the login experience when no runtime token exists", () => {
@@ -88,6 +97,50 @@ describe("Modern trip SPA", () => {
     const postHeaders = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(postHeaders.get("Authorization")).toBe("Bearer organizer-token");
     expect(fetchMock.mock.calls[0][1]?.body).toBe(JSON.stringify(input));
+    vi.unstubAllGlobals();
+  });
+
+  it("does not surface unsafe external booking links", () => {
+    expect(safeExternalUrl("javascript:alert(1)")).toBe("");
+    expect(safeExternalUrl("https://maps.example/stop")).toBe("https://maps.example/stop");
+  });
+
+  it("fetches protected booking documents with the stored bearer token", async () => {
+    localStorage.clear();
+    tokenStore.set("member-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, blob: async () => new Blob(["pdf"], { type: "application/pdf" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getAuthenticatedDocument("/api/bookings/confirmation/booking-12.pdf");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/bookings/confirmation/booking-12.pdf");
+    const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("Authorization")).toBe("Bearer member-token");
+    vi.unstubAllGlobals();
+  });
+
+  it("uses authenticated booking creation and document-upload endpoints", async () => {
+    localStorage.clear();
+    tokenStore.set("organizer-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, id: 12 }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const confirmation = new File(["pdf"], "confirmation.pdf", { type: "application/pdf" });
+    const wallet = new File(["pass"], "boarding.pkpass", { type: "application/vnd.apple.pkpass" });
+
+    await createBooking({ phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01" });
+    await uploadBookingConfirmation(12, confirmation);
+    await uploadBookingAppleWallet(12, wallet);
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["/api/bookings", "POST"],
+      ["/api/bookings/12/confirmation", "POST"],
+      ["/api/bookings/12/wallet-apple", "POST"],
+    ]);
+    const postHeaders = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(postHeaders.get("Authorization")).toBe("Bearer organizer-token");
+    expect(fetchMock.mock.calls[0][1]?.body).toBe(JSON.stringify({ phase: "tokyo", type: "flight", name: "JL 12", date_from: "2026-05-01" }));
+    expect(fetchMock.mock.calls[1][1]?.body).toBeInstanceOf(FormData);
+    expect(fetchMock.mock.calls[2][1]?.body).toBeInstanceOf(FormData);
     vi.unstubAllGlobals();
   });
 });

@@ -166,6 +166,7 @@ const bookingSchema = z.object({
 });
 
 export type Booking = z.infer<typeof bookingSchema>;
+export type BookingInput = Pick<Booking, "phase" | "type" | "name"> & Partial<Pick<Booking, "date_from" | "date_to" | "passengers" | "confirmation" | "notes" | "location_url" | "google_wallet_url" | "apple_wallet_url">>;
 
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
@@ -189,9 +190,28 @@ export const createItineraryItem = (input: ItineraryItemInput) => api<ItineraryM
 export const updateItineraryItem = (itemUid: string, input: ItineraryItemInput) => api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify(input) });
 export const deleteItineraryItem = (itemUid: string) => api<{ ok: true; revision: string }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "DELETE" });
 export const getBookings = () => api<unknown>("/api/bookings").then((value) => z.array(bookingSchema).parse(value));
+export async function getAuthenticatedDocument(path: string) {
+  const headers = new Headers();
+  const token = tokenStore.get();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(runtimeUrl(path), { headers });
+  if (!response.ok) throw new Error(`Could not retrieve document (${response.status})`);
+  return response.blob();
+}
 export const extractBookingDetails = (body: FormData) => api<unknown>("/api/bookings/extract", { method: "POST", body });
 export const extractBookingDraft = (body: FormData) => api<{ ok: true; booking: Booking; extracted: unknown }>("/api/bookings/extract-draft", { method: "POST", body });
 export const approveBookingDraft = (id: number) => api<{ ok: true }>(`/api/bookings/${id}/approve`, { method: "POST" });
+export const createBooking = (input: BookingInput) => api<{ ok: true; id: number }>("/api/bookings", { method: "POST", body: JSON.stringify(input) });
+export const uploadBookingConfirmation = (id: number, file: File) => {
+  const body = new FormData();
+  body.set("file", file);
+  return api<{ ok: true; conf_file: string }>(`/api/bookings/${id}/confirmation`, { method: "POST", body });
+};
+export const uploadBookingAppleWallet = (id: number, file: File) => {
+  const body = new FormData();
+  body.set("file", file);
+  return api<{ ok: true; pkpass_file: string }>(`/api/bookings/${id}/wallet-apple`, { method: "POST", body });
+};
 export const getMoments = () => api<Array<{ id: string; caption: string; body?: string | null; date?: string | null; visibility: string; author: string }>>("/api/moments");
 export const createMoment = (input: { caption: string; body?: string; date?: string; visibility?: "draft" | "published" }) => api("/api/moments", { method: "POST", body: JSON.stringify(input) });
 export const getHermes = () => api<{ identity: { name: string }; available: boolean; ask_in_telegram: boolean; telegram_username: string | null; verification_freshness: { open_issues: number; checked_at: string } }>("/api/hermes/status");

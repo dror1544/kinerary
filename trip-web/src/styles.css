@@ -333,7 +333,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   margin-top: 14px;
 }
 .item-actions:empty { display: none; }
-.item-action {
+.item-action, .item-actions .document-action button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -425,6 +425,10 @@ textarea { min-height: 132px; resize: vertical; }
   cursor: pointer;
 }
 .filter-chip.active { border-color: var(--kit-teal); color: white; background: var(--kit-teal); }
+.organizer-booking-tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.booking-create-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.booking-create-fields label { display: grid; gap: 6px; color: var(--kit-ink-soft); font-weight: 800; }
+.booking-create-fields input, .booking-create-fields select { min-height: 44px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); padding: 0 12px; color: var(--kit-ink); background: white; }
 .booking-groups { display: grid; gap: 20px; }
 .booking-group { display: grid; gap: 12px; }
 .booking-group h3 { margin: 0; font: 800 22px/1.1 var(--kit-font-display); }
@@ -537,7 +541,7 @@ textarea { min-height: 132px; resize: vertical; }
 .booking-card p, .map-anchor p, .extract-panel p { margin: 0; color: var(--kit-ink-soft); line-height: 1.5; }
 .booking-card small { color: var(--kit-muted); font-weight: 750; }
 .action-strip { display: flex; flex-wrap: wrap; gap: 8px; }
-.action-strip a {
+.action-strip a, .action-strip button {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -548,7 +552,10 @@ textarea { min-height: 132px; resize: vertical; }
   color: var(--kit-ink);
   background: #fffdf8;
   font-weight: 850;
+  cursor: pointer;
 }
+.document-action { display: grid; gap: 4px; }
+.document-action small { max-width: 190px; font-size: 11px; }
 .extract-panel label { display: grid; gap: 6px; color: var(--kit-ink-soft); font-weight: 800; }
 .extract-panel input {
   min-height: 44px;
@@ -741,7 +748,7 @@ textarea { min-height: 132px; resize: vertical; }
   .clock-orb { width: 68px; height: 68px; }
   .bot-actions .primary-action, .bot-actions .secondary-action { width: 100%; }
   .timeline-item { grid-template-columns: 72px minmax(0, 1fr); }
-  .editor-fields { grid-template-columns: 1fr; }
+  .editor-fields, .booking-create-fields { grid-template-columns: 1fr; }
   .editor-field-wide { grid-column: auto; }
   .time-rail { padding-inline: 8px; font-size: 12px; }
   .item-body { padding: 15px; }

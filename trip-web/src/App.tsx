@@ -10,6 +10,7 @@ import {
   ChevronRight,
   Clock3,
   CloudSun,
+  Download,
   Compass,
   ExternalLink,
   GalleryHorizontalEnd,
@@ -41,6 +42,7 @@ import {
   ActiveItinerary,
   Booking,
   approveBookingDraft,
+  createBooking,
   createItineraryItem,
   deleteItineraryItem,
   ItineraryItem,
@@ -48,6 +50,7 @@ import {
   TripConfig,
   createMoment,
   extractBookingDraft,
+  getAuthenticatedDocument,
   getBookings,
   getConfig,
   getConfirmations,
@@ -64,6 +67,8 @@ import {
   runtimeUrl,
   tokenStore,
   updateItineraryItem,
+  uploadBookingAppleWallet,
+  uploadBookingConfirmation,
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
@@ -191,6 +196,16 @@ function itemTitle(item: ItineraryItem, lang: Lang) {
 function safeFileUrl(path: string, file?: string | null) {
   if (!file) return "";
   return runtimeUrl(`${path}/${encodeURIComponent(file)}`);
+}
+
+export function safeExternalUrl(value?: string | null) {
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return ["https:", "http:"].includes(url.protocol) ? url.toString() : "";
+  } catch {
+    return "";
+  }
 }
 
 function tripLogoUrl(value?: string) {
@@ -367,10 +382,16 @@ function TimelineItem({
   const title = itemTitle(item, lang);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
   const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", item.booking?.pkpass_file);
+  const locationUrl = safeExternalUrl(item.location_url);
+  const wazeUrl = safeExternalUrl(item.waze_url);
+  const ticketUrl = safeExternalUrl(item.ticket_url);
+  const websiteUrl = safeExternalUrl(item.website_url);
+  const googleWalletUrl = safeExternalUrl(item.booking?.google_wallet_url);
+  const itemAppleWalletUrl = safeExternalUrl(item.booking?.apple_wallet_url) || appleWalletUrl;
   const askUrl = telegramUrl(telegramUsername, `${botName || "Trip companion"}, question about this plan: ${title}`);
   const extraLinks = (item.extra_links || []).map((link) => ({
     label: extraLinkLabel(link, lang),
-    url: link.url || link.href || "",
+    url: safeExternalUrl(link.url || link.href),
   })).filter((link) => link.url);
 
   return (
@@ -389,16 +410,16 @@ function TimelineItem({
         <h3>{title}</h3>
         <div className="item-meta">
           {item.booking?.confirmation ? <span><CheckCircle2 size={14} /> {copy(lang, "Confirmation stored", "אישור שמור")}</span> : null}
-          {item.location_url ? <a href={item.location_url} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
-          {item.waze_url ? <a href={item.waze_url} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
+          {locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={14} /> {copy(lang, "Map", "מפה")}</a> : null}
+          {wazeUrl ? <a href={wazeUrl} target="_blank" rel="noreferrer"><Navigation size={14} /> Waze</a> : null}
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
         <div className="item-actions" aria-label={`Actions for ${title}`}>
-          {confirmationUrl ? <a className="item-action" href={confirmationUrl} target="_blank" rel="noreferrer"><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</a> : null}
-          {item.ticket_url ? <a className="item-action" href={item.ticket_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
-          {item.website_url ? <a className="item-action" href={item.website_url} target="_blank" rel="noreferrer"><Globe2 size={15} /> {copy(lang, "Site", "אתר")}</a> : null}
-          {item.booking?.google_wallet_url ? <a className="item-action" href={item.booking.google_wallet_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
-          {item.booking?.apple_wallet_url || appleWalletUrl ? <a className="item-action" href={item.booking?.apple_wallet_url || appleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a> : null}
+          {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking?.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</>} /> : null}
+          {ticketUrl ? <a className="item-action" href={ticketUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
+          {websiteUrl ? <a className="item-action" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={15} /> {copy(lang, "Site", "אתר")}</a> : null}
+          {googleWalletUrl ? <a className="item-action" href={googleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
+          {itemAppleWalletUrl ? (item.booking?.pkpass_file ? <AuthenticatedDocumentAction url={appleWalletUrl} filename={item.booking.pkpass_file} download label={<><TicketCheck size={15} /> Apple Wallet</>} /> : <a className="item-action" href={itemAppleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a>) : null}
           {extraLinks.map((link) => <a key={`${link.label}-${link.url}`} className="item-action" href={link.url} target="_blank" rel="noreferrer"><ExternalLink size={15} /> {link.label}</a>)}
           {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {copy(lang, "Ask", "שאלו")}</a> : null}
         </div>
@@ -928,16 +949,96 @@ function bookingState(booking: Booking) {
   return "needs-review";
 }
 
+function AuthenticatedDocumentAction({ url, filename, download, label }: { url: string; filename: string; download?: boolean; label: React.ReactNode }) {
+  const [error, setError] = useState("");
+  const open = async () => {
+    setError("");
+    const documentWindow = download ? null : window.open("", "_blank");
+    if (documentWindow) documentWindow.opener = null;
+    try {
+      const blob = await getAuthenticatedDocument(url);
+      const objectUrl = URL.createObjectURL(blob);
+      if (download) {
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = filename;
+        link.click();
+      } else if (documentWindow) {
+        documentWindow.location.replace(objectUrl);
+      } else {
+        window.location.assign(objectUrl);
+      }
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    } catch (reason) {
+      documentWindow?.close();
+      setError(reason instanceof Error ? reason.message : "Could not retrieve document");
+    }
+  };
+  return <span className="document-action"><button type="button" onClick={open}>{label}</button>{error ? <small className="form-error">{error}</small> : null}</span>;
+}
+
 function BookingActions({ booking }: { booking: Booking }) {
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", booking.conf_file);
   const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", booking.pkpass_file);
+  const locationUrl = safeExternalUrl(booking.location_url);
+  const googleWalletUrl = safeExternalUrl(booking.google_wallet_url);
+  const walletUrl = safeExternalUrl(booking.apple_wallet_url) || appleWalletUrl;
   return (
     <div className="action-strip">
-      {confirmationUrl ? <a href={confirmationUrl} target="_blank" rel="noreferrer"><ShieldCheck size={15} /> Confirmation</a> : null}
-      {booking.location_url ? <a href={booking.location_url} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
-      {booking.google_wallet_url ? <a href={booking.google_wallet_url} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
-      {booking.apple_wallet_url || appleWalletUrl ? <a href={booking.apple_wallet_url || appleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a> : null}
+      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> Confirmation</>} /> : null}
+      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} download label={<><Download size={15} /> Download</>} /> : null}
+      {locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
+      {googleWalletUrl ? <a href={googleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
+      {walletUrl ? (booking.pkpass_file ? <AuthenticatedDocumentAction url={appleWalletUrl} filename={booking.pkpass_file} download label={<><TicketCheck size={15} /> Apple Wallet</>} /> : <a href={walletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a>) : null}
     </div>
+  );
+}
+
+function BookingCreatePanel({ config, isOrganizer, lang }: { config?: TripConfig; isOrganizer?: boolean; lang: Lang }) {
+  const defaultPhase = config?.phases?.[0]?.id || "";
+  const [draft, setDraft] = useState({ phase: defaultPhase, type: "flight", name: "", date_from: "", date_to: "", passengers: "", confirmation: "", location_url: "", google_wallet_url: "", apple_wallet_url: "" });
+  const [confirmationFile, setConfirmationFile] = useState<File | null>(null);
+  const [walletFile, setWalletFile] = useState<File | null>(null);
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: async () => {
+      const created = await createBooking({ ...draft, phase: draft.phase || defaultPhase });
+      if (confirmationFile) await uploadBookingConfirmation(created.id, confirmationFile);
+      if (walletFile) await uploadBookingAppleWallet(created.id, walletFile);
+      return created;
+    },
+    onSuccess: () => {
+      setDraft({ phase: defaultPhase, type: "flight", name: "", date_from: "", date_to: "", passengers: "", confirmation: "", location_url: "", google_wallet_url: "", apple_wallet_url: "" });
+      setConfirmationFile(null);
+      setWalletFile(null);
+      queryClient.invalidateQueries({ queryKey: ["bookings"] });
+    },
+  });
+
+  if (!isOrganizer) return null;
+  return (
+    <form className="extract-panel" onSubmit={(event) => { event.preventDefault(); if (draft.phase || defaultPhase) mutation.mutate(); }}>
+      <span className="panel-label"><Plus size={16} /> {lang === "he" ? "הוספה ידנית" : "Add manually"}</span>
+      <h3>{lang === "he" ? "הזמנה, אישור וארנק באותו מקום" : "Keep the booking, confirmation, and wallet together"}</h3>
+      <p>{lang === "he" ? "הפריטים מתפרסמים מיד לחברי הטיול. אפשר לצרף אישור PDF או כרטיס Apple Wallet כבר עכשיו." : "This publishes the booking for trip members. Add its confirmation PDF or Apple Wallet pass now, if you have them."}</p>
+      <div className="booking-create-fields">
+        <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></select></label>
+        <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required placeholder={lang === "he" ? "לדוגמה: טיסת JL 12" : "For example: Flight JL 12"} /></label>
+        <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
+        <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
+        <label>{lang === "he" ? "נוסעים" : "Travelers"}<input value={draft.passengers} onChange={(event) => setDraft({ ...draft, passengers: event.target.value })} /></label>
+        <label>{lang === "he" ? "מספר אישור" : "Confirmation number"}<input value={draft.confirmation} onChange={(event) => setDraft({ ...draft, confirmation: event.target.value })} /></label>
+        <label className="editor-field-wide">{lang === "he" ? "קישור Google Maps" : "Google Maps link"}<input type="url" value={draft.location_url} onChange={(event) => setDraft({ ...draft, location_url: event.target.value })} placeholder="https://..." /></label>
+        <label>{lang === "he" ? "קישור Google Wallet" : "Google Wallet link"}<input type="url" value={draft.google_wallet_url} onChange={(event) => setDraft({ ...draft, google_wallet_url: event.target.value })} placeholder="https://..." /></label>
+        <label>{lang === "he" ? "קישור Apple Wallet" : "Apple Wallet link"}<input type="url" value={draft.apple_wallet_url} onChange={(event) => setDraft({ ...draft, apple_wallet_url: event.target.value })} placeholder="https://..." /></label>
+        <label>{lang === "he" ? "אישור PDF" : "Confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => setConfirmationFile(event.target.files?.[0] || null)} /></label>
+        <label>{lang === "he" ? "קובץ Apple Wallet" : "Apple Wallet file"}<input type="file" accept=".pkpass,application/vnd.apple.pkpass" onChange={(event) => setWalletFile(event.target.files?.[0] || null)} /></label>
+      </div>
+      <button className="primary-action" type="submit" disabled={mutation.isPending || !(draft.phase || defaultPhase) || !draft.name.trim()}>{mutation.isPending ? (lang === "he" ? "שומר…" : "Saving…") : (lang === "he" ? "שמירת הזמנה" : "Save booking")}</button>
+      {mutation.isError ? <p className="form-error">{mutation.error instanceof Error ? mutation.error.message : (lang === "he" ? "לא ניתן לשמור את ההזמנה" : "Could not save the booking")}</p> : null}
+      {mutation.isSuccess ? <p className="saved-note">{lang === "he" ? "ההזמנה נשמרה ומוכנה לחברי הטיול." : "Booking saved and ready for trip members."}</p> : null}
+    </form>
   );
 }
 
@@ -1030,7 +1131,10 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
           <span>{needsReview} need review</span>
         </div>
       </div>
-      <BookingExtractPanel isOrganizer={isOrganizer} />
+      <div className="organizer-booking-tools">
+        <BookingCreatePanel config={config} isOrganizer={isOrganizer} lang={lang} />
+        <BookingExtractPanel isOrganizer={isOrganizer} />
+      </div>
       <div className="filter-row" aria-label="Booking filters">
         {([
           ["phase", lang === "he" ? "לפי שלב" : "By phase"],
