@@ -1001,6 +1001,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
   const [walletFile, setWalletFile] = useState<File | null>(null);
   const [extractUrl, setExtractUrl] = useState("");
   const [isOpen, setIsOpen] = useState(false);
+  const [extractionError, setExtractionError] = useState("");
   const formGeneration = useRef(0);
   const queryClient = useQueryClient();
   const extractMutation = useMutation({
@@ -1027,7 +1028,9 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
         location_url: extracted.location_url || current.location_url,
       }));
       setExtractUrl("");
+      setExtractionError("");
     },
+    onError: (reason) => setExtractionError(reason instanceof Error ? reason.message : (lang === "he" ? "לא ניתן לחלץ את פרטי ההזמנה" : "Could not extract booking details")),
   });
   const mutation = useMutation({
     mutationFn: async () => {
@@ -1042,6 +1045,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       setConfirmationFile(null);
       setWalletFile(null);
       setExtractUrl("");
+      setExtractionError("");
       setIsOpen(false);
       queryClient.invalidateQueries({ queryKey: ["bookings"] });
     },
@@ -1060,12 +1064,12 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       </div>
       <p>{lang === "he" ? "אפשר למלא ידנית, או לצרף אישור ולתת לנו למלא את הפרטים. לפני השמירה תמיד אפשר לעבור על הכול ולתקן." : "Fill this in yourself, or attach a confirmation and let us fill the details. You can always review and correct everything before saving."}</p>
       <div className="booking-extract-fields">
-        <label>{lang === "he" ? "אישור PDF" : "Confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => setConfirmationFile(event.target.files?.[0] || null)} /></label>
-        <label>{lang === "he" ? "או קישור להזמנה" : "Or booking link"}<input type="url" value={extractUrl} onChange={(event) => setExtractUrl(event.target.value)} placeholder="https://..." /></label>
-        <button className="secondary-action" type="button" disabled={extractMutation.isPending || (!confirmationFile && !extractUrl.trim())} onClick={() => extractMutation.mutate(formGeneration.current)}>{extractMutation.isPending ? <><span className="loading-spinner" aria-hidden="true" /> {lang === "he" ? "מחלץ פרטים…" : "Extracting details…"}</> : (lang === "he" ? "חילוץ פרטים למילוי הטופס" : "Extract details into form")}</button>
+        <label>{lang === "he" ? "אישור PDF" : "Confirmation PDF"}<input type="file" accept="application/pdf" onChange={(event) => { setConfirmationFile(event.target.files?.[0] || null); setExtractionError(""); }} /></label>
+        <label>{lang === "he" ? "או קישור להזמנה" : "Or booking link"}<input type="url" value={extractUrl} onChange={(event) => { setExtractUrl(event.target.value); setExtractionError(""); }} placeholder="https://..." /></label>
+        <button className="secondary-action" type="button" disabled={extractMutation.isPending || (!confirmationFile && !extractUrl.trim())} onClick={() => { setExtractionError(""); extractMutation.mutate(formGeneration.current); }}>{extractMutation.isPending ? <><span className="loading-spinner" aria-hidden="true" /> {lang === "he" ? "מחלץ פרטים…" : "Extracting details…"}</> : (lang === "he" ? "חילוץ פרטים למילוי הטופס" : "Extract details into form")}</button>
       </div>
       {extractMutation.isPending ? <p className="extract-progress" role="status"><span className="loading-spinner" aria-hidden="true" />{lang === "he" ? "החילוץ עובד ברקע — אפשר להמשיך למלא ולשמור את ההזמנה." : "Extraction is working in the background — you can keep filling in and save the booking."}</p> : null}
-      {extractMutation.isError ? <p className="form-error">{extractMutation.error instanceof Error ? extractMutation.error.message : (lang === "he" ? "לא ניתן לחלץ את פרטי ההזמנה" : "Could not extract booking details")}</p> : null}
+      {extractionError ? <div className="extract-error" role="alert"><AlertTriangle size={18} aria-hidden="true" /><div><strong>{lang === "he" ? "החילוץ נכשל" : "Extraction failed"}</strong><span>{extractionError}</span></div></div> : null}
       {extractMutation.isSuccess ? <p className="saved-note">{lang === "he" ? "הפרטים חולצו — כדאי לעבור עליהם לפני השמירה." : "Details extracted — please review them before saving."}</p> : null}
       <div className="booking-create-fields">
         <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>

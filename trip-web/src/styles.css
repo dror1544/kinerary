@@ -435,6 +435,11 @@ textarea { min-height: 132px; resize: vertical; }
 .booking-more-fields { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); }
 .booking-more-fields summary { color: var(--kit-teal); font-weight: 850; cursor: pointer; }
 .extract-progress { display: inline-flex; align-items: center; gap: 8px; color: var(--kit-teal) !important; font-weight: 800; }
+.extract-error { display: flex; align-items: flex-start; gap: 10px; padding: 13px 14px; border: 1px solid #f3b6af; border-radius: var(--kit-radius); color: #9f1f16; background: #fff1f0; font-weight: 750; }
+.extract-error svg { flex: 0 0 auto; margin-top: 2px; }
+.extract-error div { display: grid; gap: 3px; }
+.extract-error strong { font-weight: 900; }
+.extract-error span { overflow-wrap: anywhere; }
 .loading-spinner { display: inline-block; width: 16px; height: 16px; flex: 0 0 auto; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: booking-spinner .75s linear infinite; }
 @keyframes booking-spinner { to { transform: rotate(360deg); } }
 .booking-create-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }

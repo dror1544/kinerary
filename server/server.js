@@ -1804,6 +1804,10 @@ app.delete('/api/budget/:id', authRequired, (req, res) => {
 // ── BOOKINGS ──────────────────────────────────────────────────────────────────
 
 const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
+// Booking extraction is provider-agnostic. The legacy variables remain as a
+// compatibility fallback while deployments move to the neutral names.
+const EXTRACTION_SERVICE_URL = (process.env.EXTRACTION_SERVICE_URL || HERMES_URL || '').replace(/\/$/, '');
+const EXTRACTION_SERVICE_KEY = process.env.EXTRACTION_SERVICE_API_KEY || HERMES_KEY;
 
 // With no enrichment worker, a row left 'pending' shows a permanent
 // "Finding links…" spinner. On a control-plane-provisioned trip the links
@@ -1818,7 +1822,7 @@ if (!HERMES_URL) {
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 async function extractBookingDetails(req) {
-  if (!HERMES_URL) throw Object.assign(new Error('HERMES_URL not configured'), { status: 503 });
+  if (!EXTRACTION_SERVICE_URL) throw Object.assign(new Error('Booking extraction is not available right now'), { status: 503 });
   const url = req.body?.url;
   // The site's own "Extract Details with AI" upload (site/app.js) sends
   // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
@@ -1831,17 +1835,16 @@ async function extractBookingDetails(req) {
     ? JSON.stringify({ url })
     : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
 
-  const r = await fetch(`${HERMES_URL}/extract`, {
+  const r = await fetch(`${EXTRACTION_SERVICE_URL}/extract`, {
     method: 'POST',
-    headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
+    headers: { 'X-API-Key': EXTRACTION_SERVICE_KEY, 'Content-Type': 'application/json' },
     body,
-    // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
-    // call (mcp/mcp.js) — this used to be shorter (30s), so this call
-    // could time out and error here while trip-mcp's own call was still
-    // legitimately running, producing a confusing failure under load.
+    // Longer than the extraction service's CLI bridge timeout — this call
+    // must not fail while the provider still has a legitimate request in
+    // progress, which would otherwise look like a failed upload.
     timeout: 50000,
   });
-  if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
+  if (!r.ok) throw Object.assign(new Error(`Booking extraction service returned an error (status ${r.status})`), { status: 502 });
   return r.json();
 }
 

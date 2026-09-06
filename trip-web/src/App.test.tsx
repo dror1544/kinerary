@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createBooking,
   extractBookingDetails,
@@ -13,6 +13,12 @@ import {
   uploadBookingConfirmation,
 } from "./api";
 import App, { BookingCreatePanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  localStorage.clear();
+});
 
 describe("Modern trip SPA", () => {
   it("shows the login experience when no runtime token exists", () => {
@@ -189,6 +195,30 @@ describe("Modern trip SPA", () => {
     resolveExtraction!({ ok: true, status: 200, json: async () => ({ phase: "tokyo", type: "hotel", name: "Extracted hotel" }) });
     await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
     expect(screen.getByLabelText(/booking name/i)).toHaveValue("Extracted hotel");
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a detailed extraction failure visible until its input changes", async () => {
+    localStorage.clear();
+    tokenStore.set("organizer-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 503, json: async () => ({ error: "Booking extraction is not available right now" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BookingCreatePanel isOrganizer lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }] }} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /add booking/i }));
+    fireEvent.change(screen.getByLabelText(/or booking link/i), { target: { value: "https://example.com/confirmation" } });
+    fireEvent.click(screen.getByRole("button", { name: /extract details into form/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveClass("extract-error");
+    expect(alert).toHaveTextContent(/extraction failed/i);
+    expect(alert).toHaveTextContent(/not available right now/i);
+    fireEvent.change(screen.getByLabelText(/or booking link/i), { target: { value: "https://example.com/another-confirmation" } });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });
 });
