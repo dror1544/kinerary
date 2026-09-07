@@ -1,10 +1,12 @@
 import type pg from "pg";
 import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
-import { organizerIntroText, type ProactiveSettings } from "./companion-intro.js";
+import { organizerIntroMessages, type ProactiveSettings } from "./companion-intro.js";
+import { issueGroupBindingToken } from "./group-binding.js";
 
 interface OutboxRow {
   id: string;
+  trip_id: string | null;
   notification_type: string;
   recipient: string | null;
   payload: Record<string, unknown> | null;
@@ -70,7 +72,7 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  * notification_type this dispatcher doesn't know how to word yet (the row is
  * marked 'skipped', not retried forever).
  */
-function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | null {
+function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | string[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === "provisioning_complete") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
@@ -81,7 +83,7 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | nul
     // rather than being skipped for missing fields they were never given.
     const assistantName = payloadString(row, "assistant_name");
     if (!assistantName) return `Your trip site is ready: ${url}`;
-    return organizerIntroText({
+    return organizerIntroMessages({
       assistantName,
       tripTitle: payloadString(row, "trip_title"),
       siteUrl: url,
@@ -91,6 +93,7 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | nul
       tripSlug: payloadString(row, "trip_slug"),
       organizerName: payloadString(row, "organizer"),
       proactive: (row.payload?.proactive as ProactiveSettings | undefined) ?? null,
+      groupBindingToken: options?.groupBindingToken ?? null,
     });
   }
   if (row.notification_type === "provisioning_failed") {
@@ -123,6 +126,17 @@ export interface DispatchOptions {
    * that paragraph.
    */
   botUsername?: string | null;
+  /** How long an issued group-binding token stays valid. Defaults to 30 days. */
+  groupBindingTtlSeconds?: number;
+  /**
+   * The trip's group-binding token, issued just before this message is worded.
+   *
+   * Not stored on the outbox row: the row is written by the provisioner, in a
+   * transaction, before anyone knows whether the organizer will ever want a
+   * group. Issuing it at send time also means the token's clock starts when the
+   * organizer actually receives it.
+   */
+  groupBindingToken?: string | null;
 }
 
 export async function dispatchPendingTripNotifications(
@@ -132,7 +146,7 @@ export async function dispatchPendingTripNotifications(
   options?: DispatchOptions,
 ): Promise<number> {
   const { rows } = await db.query<OutboxRow>(
-    `SELECT id, notification_type, recipient, payload, attempt, max_attempts
+    `SELECT id, trip_id, notification_type, recipient, payload, attempt, max_attempts
      FROM control_plane.notification_outbox
      WHERE state = 'pending' AND trip_id IS NOT NULL
      ORDER BY created_at
@@ -141,8 +155,32 @@ export async function dispatchPendingTripNotifications(
 
   let dispatched = 0;
   for (const row of rows) {
-    const text = messageTextFor(row, options);
-    if (!row.recipient || !text) {
+    // The organizer's introduction carries a group-binding token, so one is
+    // issued here — addressed to the chat this message is going to, which for a
+    // DM is the organizer's own Telegram user id. That is what later makes a
+    // forwarded token useless: only this recipient can redeem it.
+    let groupBindingToken: string | null = null;
+    if (
+      row.notification_type === "provisioning_complete"
+      && row.trip_id
+      && row.recipient
+      && typeof row.payload?.assistant_name === "string"
+    ) {
+      try {
+        const issued = await issueGroupBindingToken(db, row.trip_id, row.recipient, {
+          ttlSeconds: options?.groupBindingTtlSeconds ?? 30 * 24 * 3600,
+        });
+        if (issued.ok) groupBindingToken = issued.token;
+      } catch (error) {
+        // Never a gate. An introduction without the group step is still worth
+        // sending — the organizer can ask for a token at any time.
+        log(structuredLog("warn", "outbox.group_token_unavailable", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+    }
+    const text = messageTextFor(row, { ...options, groupBindingToken });
+    if (!row.recipient || !text || (Array.isArray(text) && text.length === 0)) {
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE id = $1 AND state = 'pending'",
         [row.id],
@@ -150,7 +188,17 @@ export async function dispatchPendingTripNotifications(
       continue;
     }
     try {
-      await notification.sendMessage({ chatId: row.recipient, text });
+      // A list when the introduction hands over a group-binding token: the
+      // token goes in its own message so it is one long-press and one Copy,
+      // rather than a drag-select across a paragraph on a phone.
+      //
+      // Sent in order, and the row is only marked sent once ALL of them are.
+      // A retry may therefore repeat the prose — which is the right trade:
+      // a duplicated paragraph is noise, while a token that never arrived is
+      // an organizer who cannot set up their group at all.
+      for (const part of Array.isArray(text) ? text : [text]) {
+        await notification.sendMessage({ chatId: row.recipient, text: part });
+      }
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'sent', sent_at = now(), updated_at = now() WHERE id = $1",
         [row.id],

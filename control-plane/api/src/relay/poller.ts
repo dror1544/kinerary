@@ -324,10 +324,14 @@ export async function applyDecision(
     case "group_intro": {
       const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
       log(structuredLog("info", "trip_bot.group_intro_sent", { ok: sent.ok }));
+      // The copyable line, on its own, after the instructions that point at it.
+      if (sent.ok && decision.followUp) {
+        await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.followUp });
+      }
       // Pinning is best-effort by design. An unpinned introduction is a worse
       // introduction, never a failed arrival — and the overwhelmingly common
       // reason it fails is simply that nobody made the bot an admin.
-      if (sent.ok && sent.messageId && deps.telegram.pinChatMessage) {
+      if (decision.pin !== false && sent.ok && sent.messageId && deps.telegram.pinChatMessage) {
         const pinned = await deps.telegram.pinChatMessage({
           chatId: decision.chatId,
           messageId: sent.messageId,

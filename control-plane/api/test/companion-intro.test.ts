@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   groupAddUrl,
+  groupBindingCommand,
+  organizerIntroMessages,
   groupIntroText,
   organizerIntroText,
   type CompanionIntroFacts,
@@ -160,5 +162,70 @@ describe("groupIntroText", () => {
     const text = groupIntroText({ ...BASE, assistantName: "ריו", language: "he" }, { includePassword: true });
     assert.match(text, /[֐-׿]/);
     assert.match(text, /trip-seed-pw/);
+  });
+});
+
+describe("the group-binding token in the organizer's message", () => {
+  const WITH_TOKEN = { ...BASE, tripSlug: "japan-2026", groupBindingToken: "KIN-ABCD2345" };
+
+  test("the token is its OWN message, so it can be copied in one gesture", () => {
+    // A token buried in a paragraph has to be selected by dragging handles
+    // across a phone screen, and getting it slightly wrong produces a token
+    // that simply does not work with nothing to explain why. One long-press,
+    // one Copy.
+    const messages = organizerIntroMessages(WITH_TOKEN);
+    assert.equal(messages.length, 2);
+    assert.equal(messages[1], "/group KIN-ABCD2345");
+    assert.doesNotMatch(messages[0]!, /KIN-ABCD2345/, "the prose does not repeat it");
+    assert.match(messages[0]!, /next message/i, "and points at where it is");
+  });
+
+  test("the copyable line is the COMMAND, not the bare token", () => {
+    // Telegram privacy mode: a bot that is not an admin receives commands but
+    // not ordinary text in a group. The command form is the one that arrives
+    // even on the "post it again after making me admin" retry.
+    assert.equal(groupBindingCommand("KIN-ABCD2345"), "/group KIN-ABCD2345");
+  });
+
+  test("states the admin step before the step that needs it", () => {
+    const text = organizerIntroText(WITH_TOKEN);
+    assert.match(text, /admin/i);
+    assert.ok(
+      text.indexOf("admin") < text.indexOf("next message"),
+      "the admin step is stated before the line to post",
+    );
+  });
+
+  test("says the mistake is recoverable, because it is the likely one", () => {
+    const text = organizerIntroText(WITH_TOKEN);
+    assert.match(text, /again/i);
+  });
+
+  test("with no token issued, there is one message and no invented step", () => {
+    const messages = organizerIntroMessages({ ...BASE, tripSlug: "japan-2026" });
+    assert.equal(messages.length, 1);
+    const text = messages[0]!;
+    assert.doesNotMatch(text, /KIN-/);
+    // The add-link half still stands on its own.
+    assert.match(text, /startgroup/);
+  });
+
+  test("the token still reaches the organizer when no add-link can be built", () => {
+    // No bot username means no deep link, but binding an already-added bot is
+    // exactly the case the token exists for.
+    const messages = organizerIntroMessages({ ...WITH_TOKEN, botUsername: null });
+    assert.doesNotMatch(messages[0]!, /t\.me/);
+    assert.equal(messages[1], "/group KIN-ABCD2345");
+  });
+
+  test("Hebrew carries the same steps, and the same copyable line", () => {
+    const messages = organizerIntroMessages({ ...WITH_TOKEN, assistantName: "ריו", language: "he" });
+    assert.match(messages[0]!, /[֐-׿]/);
+    assert.ok(
+      messages[0]!.indexOf("מנהל") < messages[0]!.indexOf("הבאה"),
+      "admin step first in Hebrew too",
+    );
+    // The command is not translated: it is typed at a machine, not read.
+    assert.equal(messages[1], "/group KIN-ABCD2345");
   });
 });

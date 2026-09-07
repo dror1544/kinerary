@@ -111,10 +111,58 @@ the bot's `my_chat_member` join event, not on a timer.
 - `assistant.proactive` — already present; §1's schedule line is rendered from
   it, and omitted entirely when it is empty rather than saying "no schedule"
 
-## 7. Not in scope
+## 7. Binding the group — BUILT (2026-09-07)
+
+§5 said the group message is sent on the bot's join event. That was half an
+answer, because it assumed the group was already bound to the trip. **Nothing
+bound it.** Before this, `telegram_chat_bindings` had exactly one production
+writer — `bind_chat_to_trip`, called once at provisioning with the organizer's
+own DM. A family group had no path to a binding at all; the only way to make
+one was `scripts/switch-trip-chat.py`, which is explicitly test-only.
+
+The gap is structural, not an oversight of implementation. One shared bot means
+a group cannot say which trip it belongs to, and nothing said inside a group
+proves who the organizer is — on a shared bot, "whoever spoke first" hands one
+family's trip to another.
+
+A token crosses it, by learning each fact where it is actually knowable:
+
+- **Which trip** — decided when the token is issued, in the organizer's own DM,
+  where the control plane already knows both of them.
+- **Which group** — decided when it is redeemed, by the act of posting it there.
+- **That the organizer is in that group** — the same act proves it.
+
+`issued_to_telegram_user_id` is what makes a leaked token useless: the sender
+must be the organizer it was issued to, so a forwarded or screenshotted token
+binds nothing. There is no case where that check is skipped, because the token
+is handed over in the organizer's own DM.
+
+**Reusable, deliberately.** The organizer is told to make the bot an admin
+before posting, because pinning needs it. They will sometimes forget, and the
+recovery has to be "post it again" — a single-use token would turn a forgotten
+step into a support request. Re-posting re-runs the arrival: bind, greet, pin.
+
+**A command, not a bare token.** `/group KIN-XXXXXXXX`. Telegram's privacy mode
+means a bot that is not an admin receives only commands, replies and mentions in
+a group — a token pasted as ordinary text would never reach us, and the case
+that breaks is precisely the retry above. A bare token is still accepted,
+because it costs nothing and works once the bot IS an admin.
+
+**Its own message.** The token arrives as a second message containing only the
+line to post, so copying it is one long-press rather than a drag-select across a
+paragraph on a phone.
+
+**Refusals are one message.** Distinguishing "no such token" from "that token is
+not yours" would confirm a guess to whoever is guessing, in a room the organizer
+does not control. And a chat already bound to a DIFFERENT trip is refused
+outright: a token is not authority over a binding somebody else made.
+
+`/group` in the organizer's DM issues a fresh one at any time; asking again
+supersedes rather than accumulates.
+
+## 8. Not in scope
 
 Re-sending on re-provision (an organizer who re-runs setup should not get a
-second identical DM), and the `?startgroup` payload being used to bind the
-group to the trip automatically. The second is tempting and is a separate
-decision: it is a binding created from a link, which is a trust question, not
-a convenience one.
+second identical DM), and the `?startgroup` payload being used to bind
+automatically. The second is now moot as well as deferred — the token does the
+binding, with an identity check a link payload could not carry.

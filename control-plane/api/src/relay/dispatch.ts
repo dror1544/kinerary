@@ -37,7 +37,12 @@ import {
   companionIntroFacts,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { groupIntroText } from "../companion-intro.js";
+import { groupBindingCommand, groupIntroText } from "../companion-intro.js";
+import {
+  extractGroupBindingToken,
+  issueGroupBindingToken,
+  redeemGroupBindingToken,
+} from "../group-binding.js";
 import { structuredLog } from "../redaction.js";
 import {
   botJoinedGroup,
@@ -74,6 +79,16 @@ export type DispatchDecision =
       kind: "group_intro";
       chatId: string;
       text: string;
+      /**
+       * A second message sent right after, carrying only a line to copy.
+       *
+       * Its own message on purpose: a token inside a paragraph has to be
+       * drag-selected on a phone, and a slightly wrong selection produces a
+       * token that does not work with nothing to say why.
+       */
+      followUp?: string;
+      /** Whether to attempt pinning. False for a DM, where there is nothing to pin for. */
+      pin?: boolean;
     }
   /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
   | { kind: "show_summary"; chatId: string; view: SessionView }
@@ -166,6 +181,25 @@ export interface DispatchStrings {
   writtenAnswerUnsupported: string;
   /** Shown when a turn could not be handed to the gateway, so no answer is coming. */
   gatewayUnavailable: string;
+  /**
+   * The organizer's group-binding token, with what to do with it.
+   *
+   * A function rather than a template string because the token is the whole
+   * message: everything around it exists to get it posted in the right place,
+   * after the right step.
+   */
+  groupTokenIssued: (token: string) => string;
+  /** Asked for a token somewhere it cannot be issued — not a DM, or no trip. */
+  groupTokenUnavailable: string;
+  /**
+   * ONE message for every reason a token was refused.
+   *
+   * Distinguishing "no such token" from "that token is not yours" would confirm
+   * a guess to whoever is guessing, in a room the organizer does not control.
+   */
+  groupTokenRefused: string;
+  /** Bound, but the trip has no introduction facts stored to greet with. */
+  groupBoundNoIntro: string;
 }
 
 /**
@@ -175,6 +209,23 @@ export interface DispatchStrings {
  * on differently, and guessing would be worse than a single honest sentence.
  */
 export const DEFAULT_STRINGS: DispatchStrings = {
+  groupTokenIssued: (token: string) =>
+    [
+      "To connect me to your family group:",
+      "",
+      "1. Add me to the group",
+      "2. Make me an admin — I need that to pin the welcome message",
+      "3. Post this line in the group:",
+      "",
+      token,
+      "",
+      "If you post it before making me an admin, that's fine — just post it again afterwards and I'll set things up properly.",
+    ].join("\n"),
+  groupTokenUnavailable:
+    "I can only set up a group from your own chat with me, once your trip site is ready.",
+  groupTokenRefused:
+    "That code didn't work here. Ask the trip organizer to send you a fresh one.",
+  groupBoundNoIntro: "This group is connected to the trip.",
   unbound:
     "I don't have a trip for this chat yet. Open the link from your Kinerary signup to get started.",
   // Bound, but the assistant behind it is not ready. Says what is true — the
@@ -237,6 +288,8 @@ export interface DispatchOptions {
    * Defaults to true, matching the organizer's stated intent on 2026-09-07.
    */
   groupIntroIncludesPassword?: boolean;
+  /** How long a group-binding token stays valid. Defaults to a week. */
+  groupBindingTtlSeconds?: number;
 }
 
 export async function dispatchUpdate(
@@ -354,6 +407,90 @@ export async function dispatchUpdate(
   // Confirm button writes an intake version, and it had never been sent. A
   // typed command is the one path that survives an agent doing anything at
   // all, so it exists.
+  // A binding token posted in a group, normally as `/group KIN-XXXXXXXX`.
+  //
+  // Checked BEFORE routing, because the whole point is that this group is not
+  // routed yet — the ordinary path would answer UNROUTED and tell the organizer
+  // the bot has no trip for the very group they are binding. And before the
+  // `/group` ISSUANCE branch below, because in a group `/group <token>` means
+  // redeem, not "send me another token".
+  //
+  // WHY A COMMAND AND NOT A BARE TOKEN. Telegram privacy mode: a bot that is
+  // not an admin receives only commands, replies and mentions in a group. A
+  // token pasted as ordinary text would never reach us — and the case that
+  // breaks is precisely the one this flow promises to recover, "you posted it
+  // before making me an admin, post it again". Under privacy mode that second
+  // post would vanish too. A command is delivered either way.
+  //
+  // A bare token is still accepted, because it costs nothing and works once the
+  // bot IS an admin (admins see every message). The instructions teach the
+  // command, which is the form that always arrives.
+  const postedToken = message.chat?.type !== "private"
+    ? extractGroupBindingToken(text)
+    : null;
+  if (postedToken) {
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const redeemed = senderId
+      ? await redeemGroupBindingToken(db, postedToken, chatId, senderId)
+      : ({ ok: false, reason: "WRONG_SENDER" } as const);
+    if (!redeemed.ok) {
+      log(structuredLog("info", "trip_bot.group_binding_refused", { reason: redeemed.reason }));
+      // Deliberately one message for every refusal. Distinguishing "that token
+      // does not exist" from "that token is not yours" would confirm a guess to
+      // whoever is guessing, in a room the organizer does not control.
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenRefused } };
+    }
+    log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
+    const facts = await companionIntroFacts(db, redeemed.tripId);
+    const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
+    if (!facts || !assistantName) {
+      return { kind: "reply", reply: { chatId, text: strings.groupBoundNoIntro } };
+    }
+    return {
+      kind: "group_intro",
+      chatId,
+      text: groupIntroText(
+        {
+          assistantName,
+          tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
+          siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
+          language: facts.language === "he" ? "he" : "en",
+          loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
+          proactive: (facts.proactive as never) ?? null,
+        },
+        { includePassword: options.groupIntroIncludesPassword ?? true },
+      ),
+    };
+  }
+
+  // The organizer asking for a group-binding token, in their own DM. Router-
+  // owned rather than agent-owned for the same reason the introduction is: the
+  // token is a credential, and one the agent got slightly wrong is a token that
+  // binds nothing and an organizer who cannot tell why.
+  if (parsed.kind === "command" && (parsed.name === "group" || parsed.name === "bind")) {
+    const route = await resolveChatRoute(db, chatId);
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    if (route.kind !== "companion" || !senderId || message.chat?.type !== "private") {
+      // Asked somewhere it cannot be answered. Silence would read as broken.
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
+    }
+    const issued = await issueGroupBindingToken(db, route.tripId, senderId, {
+      ttlSeconds: options.groupBindingTtlSeconds ?? 7 * 24 * 3600,
+    });
+    if (!issued.ok) {
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
+    }
+    // Two messages: the instructions, then the line to copy on its own.
+    return {
+      kind: "group_intro",
+      chatId,
+      text: strings.groupTokenIssued(issued.token),
+      followUp: groupBindingCommand(issued.token),
+      pin: false,
+    };
+  }
+
   if (parsed.kind === "command" && (parsed.name === "done" || parsed.name === "summary")) {
     const route = await resolveChatRoute(db, chatId);
     if (route.kind === "interview") {

@@ -40,6 +40,15 @@ export interface CompanionIntroFacts {
   tripSlug?: string | null;
   organizerName?: string | null;
   proactive?: ProactiveSettings | null;
+  /**
+   * The group-binding token, when one has been issued for this trip.
+   *
+   * Adding the bot to a group is only half the job — the group still has to be
+   * bound to the trip, and nothing said inside a group proves who the organizer
+   * is. This token is the other half: issued here, in the channel where their
+   * identity is already established, and redeemed by posting it there.
+   */
+  groupBindingToken?: string | null;
   /** The group's own invite link, when the bot could read one. Group message only. */
   groupInviteUrl?: string | null;
 }
@@ -137,13 +146,19 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
     if (schedule.length) {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
-    if (addUrl) {
-      parts.push(
-        "",
-        "כדי שאהיה גם בקבוצה המשפחתית — הקישור הזה מוסיף אותי לקבוצה:",
-        addUrl,
-        "בוחרים קבוצה קיימת, או פותחים קבוצה חדשה ואז מוסיפים אותי.",
-      );
+    if (addUrl || facts.groupBindingToken) {
+      parts.push("", "כדי שאהיה גם בקבוצה המשפחתית:");
+      if (addUrl) {
+        parts.push(`1. מוסיפים אותי עם הקישור הזה: ${addUrl}`, "   (בוחרים קבוצה קיימת, או פותחים חדשה ואז מוסיפים)");
+      }
+      parts.push(`${addUrl ? "2" : "1"}. הופכים אותי למנהל, כדי שאוכל להצמיד את הודעת הפתיחה`);
+      if (facts.groupBindingToken) {
+        parts.push(
+          `${addUrl ? "3" : "2"}. שולחים לקבוצה את השורה שבהודעה הבאה שלי`,
+          "",
+          "שלחתם לפני שהפכתם אותי למנהל? לא נורא — שלחו שוב אחר כך ואשלים את ההגדרה.",
+        );
+      }
     }
     return parts.join("\n");
   }
@@ -165,13 +180,21 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
   if (schedule.length) {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
-  if (addUrl) {
+  if (addUrl || facts.groupBindingToken) {
+    parts.push("", "To bring me into the family group:");
+    if (addUrl) {
+      parts.push(`1. Add me with this link: ${addUrl}`, "   (pick an existing group, or make a new one first)");
+    }
     parts.push(
-      "",
-      "To bring me into the family group, this link adds me:",
-      addUrl,
-      "Pick an existing group, or make a new one first and then add me.",
+      `${addUrl ? "2" : "1"}. Make me an admin, so I can pin the welcome message`,
     );
+    if (facts.groupBindingToken) {
+      parts.push(
+        `${addUrl ? "3" : "2"}. Post the line in my next message into the group`,
+        "",
+        "Posted it before making me an admin? No problem — post it again afterwards and I'll finish setting up.",
+      );
+    }
   }
   return parts.join("\n");
 }
@@ -243,4 +266,35 @@ export function groupIntroText(
     parts.push("", `I'll post ${listJoin(schedule, "en")} here without being asked.`);
   }
   return parts.join("\n");
+}
+
+/**
+ * The command that binds a group, as its own message.
+ *
+ * Separate from the instructions on purpose. A token buried in a paragraph has
+ * to be selected by dragging handles across a phone screen, and getting it
+ * slightly wrong produces a token that simply does not work with nothing to
+ * explain why. A message containing ONLY the line to post is one long-press
+ * and one Copy.
+ *
+ * It is the full command rather than the bare token because that is what has to
+ * be pasted: under Telegram's privacy mode a bot that is not yet an admin
+ * receives commands but not ordinary text, so the command form is the one that
+ * always arrives — including on the "post it again after making me an admin"
+ * retry this flow promises.
+ */
+export function groupBindingCommand(token: string): string {
+  return `/group ${token}`;
+}
+
+/**
+ * The organizer's introduction, as the messages to send in order.
+ *
+ * One message when there is no token to hand over, two when there is — the
+ * second being nothing but the line to copy.
+ */
+export function organizerIntroMessages(facts: CompanionIntroFacts): string[] {
+  const messages = [organizerIntroText(facts)];
+  if (facts.groupBindingToken) messages.push(groupBindingCommand(facts.groupBindingToken));
+  return messages;
 }
