@@ -30,7 +30,9 @@ import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
 import { resolveChatRoute } from "../chat-router.js";
-import { sayForChat } from "../interview.js";
+import { sayForChat,
+  agentAlreadySpokeThisTurn,
+} from "../interview.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
@@ -230,6 +232,15 @@ async function main(): Promise<void> {
           // keeps the keyboard, the record and the order — and a turn that
           // spoke is no longer mistaken for a stall by the watchdog.
           interviewSay: async (chatId: string, text: string) => {
+            // Prose INSTEAD of speaking is a message worth rescuing — that is
+            // why this conversion exists, and dropping it once cost an
+            // organizer 17 lost sends and a watchdog re-asking the same
+            // question. Prose AFTER the agent has already used a real speaking
+            // tool is a different thing: it is the agent thinking out loud,
+            // and delivering it is how an organizer gets told the assistant is
+            // "waiting for your answer" to a question the router never sent
+            // (2026-09-07, live). Migration 0047 lets the two be told apart.
+            if (await agentAlreadySpokeThisTurn(runtime.db!, chatId)) return false;
             const said = await sayForChat(runtime.db!, chatId, text);
             return said.ok;
           },

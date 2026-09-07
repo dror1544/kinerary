@@ -937,6 +937,36 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
   });
 
 
+  test("the confirmed intake version carries the language the interview was held in", { skip: SKIP }, async () => {
+    // Run 14, live: an interview held entirely in Hebrew produced a trip with
+    // defaultLang 'en', and the companion greeted the family in English with a
+    // Hebrew assistant name inside the English sentence.
+    //
+    // The session knew — set_interview_language_for_chat had recorded 'he'.
+    // But a session is transient (deleted on reset, superseded on correction)
+    // while the transformer reads the intake VERSION, which is immutable. The
+    // one place that knew the answer was not the place that needed it.
+    const fix = await setupFixture(pool);
+    try {
+      const token = await issuedEnrollmentToken(fix);
+      const started = await startSession(fix.pool, token, () => {}, undefined, CHAT_ID);
+      if (!started.ok) throw new Error("unreachable");
+      await setLanguageForChat(fix.pool, CHAT_ID, "he");
+      await answerAllRequiredQuestions(fix.pool, started.sessionToken);
+
+      const confirmed = await confirmIntake(fix.pool, started.sessionToken);
+      assert.equal(confirmed.ok, true);
+
+      const { rows } = await fix.pool.query<{ language: string | null }>(
+        "SELECT language FROM control_plane.intake_versions WHERE trip_id = $1 ORDER BY version DESC LIMIT 1",
+        [fix.draftTripId],
+      );
+      assert.equal(rows[0]?.language, "he");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("Telegram's own locale draws the first message before the agent reports one", { skip: SKIP }, async () => {
     // The file acknowledgement exists to arrive BEFORE the model has read
     // anything — so it cannot wait for the interviewer to report a language.

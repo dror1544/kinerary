@@ -919,11 +919,110 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(len(instructions), 1)
         self.assertEqual(instructions[0]["text"], {"he": "שניהם", "en": "Both"})
 
+    # ── language ──────────────────────────────────────────────────────────────
+
+    def test_the_interview_language_becomes_the_trip_language(self) -> None:
+        """Run 14, live: the entire interview was held in Hebrew, the session
+        recorded language='he' — and the trip came out with defaultLang 'en',
+        because this value was hardcoded. The companion then greeted the
+        organizer and the family in English, with a Hebrew assistant name
+        embedded in it.
+
+        The language is not a preference to re-ask for. It was established by
+        the organizer's own first message and every message after it.
+        """
+        config = transform_intake(
+            {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language="he",
+        )
+        self.assertEqual(config["meta"]["defaultLang"], "he")
+
+    def test_no_language_still_means_english(self) -> None:
+        # Every intake version written before the language was carried has none,
+        # and must keep transforming exactly as it did.
+        config = transform_intake({**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["defaultLang"], "en")
+
+    def test_an_unrecognised_language_falls_back_rather_than_propagating(self) -> None:
+        # Fails safe, matching the shared schema rule: an unknown value resolves
+        # to the most conservative option instead of reaching the site as a
+        # language code nothing can render.
+        for bogus in ("", "  ", "klingon", "EN-GB", None):
+            with self.subTest(bogus=bogus):
+                config = transform_intake(
+                    {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language=bogus,
+                )
+                self.assertEqual(config["meta"]["defaultLang"], "en")
+
+    def test_the_language_is_case_and_space_insensitive(self) -> None:
+        for supplied in ("HE", " he ", "He"):
+            with self.subTest(supplied=supplied):
+                config = transform_intake(
+                    {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language=supplied,
+                )
+                self.assertEqual(config["meta"]["defaultLang"], "he")
+
     # ── organizer ─────────────────────────────────────────────────────────────
 
     def test_organizer_identity_resolves_to_a_username(self) -> None:
         config = self._config(organizer_identity=_text("eitan"))
         self.assertEqual(config["agent"]["organizers"], ["eitan"])
+
+    def test_a_hebrew_given_name_alone_resolves(self) -> None:
+        """Run 14, live: the interview asked who the organizer is and the
+        organizer typed "ניר". The roster held name="ניר סולומון",
+        name_en="Nir", username="nir" — so the ENGLISH given name matched (it
+        is already bare in name_en) and the HEBREW one did not, purely because
+        `name` carries the full name and `name_en` carries only the first.
+
+        The trip provisioned, the site came up, and the companion was never
+        built: ORGANIZER_UNRESOLVED. Answering with your own first name, in the
+        language the whole interview was conducted in, is not an edge case.
+        """
+        config = self._config(
+            # The roster exactly as run 14 produced it: full Hebrew `name`,
+            # given-name-only `name_en`.
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון", "family_en": "Solomon"},
+            ]),
+            organizer_identity=_text("ניר"),
+        )
+        self.assertEqual(config["agent"]["organizers"], ["nir"])
+
+    def test_a_given_name_two_travelers_share_stays_unresolved(self) -> None:
+        """The reason given names were not matched in the first place, and the
+        reason adding them is still safe: ambiguity resolves to nobody, never
+        to whoever the roster happens to list first."""
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
+                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+            ]),
+            organizer_identity=_text("ניר"),
+        )
+        self.assertNotIn("agent", config)
+
+    def test_a_full_name_still_wins_over_a_shared_given_name(self) -> None:
+        # Adding given-name forms must not make a precise answer ambiguous.
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
+                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+            ]),
+            organizer_identity=_text("ניר כהן"),
+        )
+        self.assertEqual(len(config["agent"]["organizers"]), 1)
+
+    def test_the_household_label_alone_still_resolves_to_nobody(self) -> None:
+        # A family name is not a person. Unchanged by given-name matching.
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון"},
+                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון"},
+            ]),
+            organizer_identity=_text("סולומון"),
+        )
+        self.assertNotIn("agent", config)
 
     def test_unmatched_organizer_identity_writes_no_organizers(self) -> None:
         # driver.mjs hard-fails on an organizer absent from participants[], and

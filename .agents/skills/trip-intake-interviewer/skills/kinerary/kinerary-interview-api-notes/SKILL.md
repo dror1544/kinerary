@@ -35,10 +35,18 @@ You hold **no `sessionId` or `sessionToken`** — only the `_for_chat` variants 
 
 ## `say_for_chat` — calling pattern
 
-`say_for_chat` is a deferred MCP tool. Call it directly as
-`mcp__interview__say_for_chat` (the `tool_call` wrapper also works but adds no
-value). Accepts one argument: `text`. **One call per turn** — a second call
-replaces the first message, it does not append.
+`say_for_chat` is a deferred MCP tool. **Call it directly as
+`mcp__interview__say_for_chat`.** Accepts one argument: `text`. **One call per
+turn** — a second call replaces the first message, it does not append.
+
+**Availability quirk (observed 2026-09-07):** the tool sometimes transiently
+reports "does not exist" as a direct call, then works on retry. Sequence:
+1. Try `mcp__interview__say_for_chat` directly.
+2. If "does not exist", try via `tool_call(name="mcp__interview__say_for_chat", ...)`.
+3. If `tool_call` errors with "not a deferrable tool", retry step 1 — that
+   error means the tool IS in the direct list; the direct call will succeed.
+
+Do not tell the organizer anything is broken unless all three steps fail.
 
 ## Session lifetime and the 404 boundary
 
@@ -104,3 +112,19 @@ When the organizer uploads a booking PDF:
    manually and include them in the `phases` data array under a `venues` key.
 5. `lookup_consular_contacts` is also unavailable — skip silently; the site
    falls back to generic emergency numbers.
+
+## `selections` — reading pre-answered button questions
+
+When the organizer taps a router button (e.g. `dietary`, `trip_pace`), the
+answer is stored in `view.selections` immediately — before you submit it.
+
+**Pattern:**
+1. After any state read, scan `view.selections` for keys that still appear in
+   `optionalRemaining`.
+2. For each match, call `submit_answer_for_chat` with the correct arg
+   (`optionIds` for multi_choice, `optionId` for choice).
+3. Do NOT re-ask the organizer — they already tapped.
+
+Observed 2026-09-07: `dietary` was answered via buttons (`kosher_style`,
+`lactose_free`) and sat in `selections` unrecorded until the agent read state
+and submitted. Without this step the intake record stays empty for that field.

@@ -30,6 +30,7 @@ Use this alongside the core Kinerary interview skill when an organizer shares do
 - For dietary selections, `none` is exclusive. If state contains a real restriction, ask who it applies to and record `dietary_scope` immediately while the detail is fresh.
 - If the organizer says “kosher,” use the `kosher` option, not `kosher_style`; kosher-style means no pork or shellfish while ordinary beef and chicken remain acceptable.
 - If a written answer resolves a choice, submit the exact option id. Do not display or recreate the option list yourself.
+- **Check `view.selections` on every state read.** Router button answers (dietary, trip_pace, etc.) appear in `selections` immediately when tapped. Submit them with `submit_answer_for_chat` before continuing — do not ask the organizer again and do not leave them unrecorded.
 
 ## Conversational pacing
 

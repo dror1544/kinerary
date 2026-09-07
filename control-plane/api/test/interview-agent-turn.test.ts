@@ -35,6 +35,8 @@ import {
   openAgentTurn,
   submitAnswerForAgent,
   submitAnswerForChat,
+  agentAlreadySpokeThisTurn,
+  sayForChat
 } from "../src/interview.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
@@ -471,6 +473,53 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
       assert.equal(decision.event.source.chat_id, a.chatId);
       assert.equal(decision.event.source.profile, "trip-intake");
       assert.equal(decision.sessionId, a.sessionId);
+    });
+  });
+});
+
+describe("prose instead of speaking, versus prose after speaking", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  test("a turn starts with the agent having said nothing", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("say_for_chat counts as speaking", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const said = await sayForChat(pool, a.chatId, "כמעט סיימנו");
+      assert.equal(said.ok, true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+    });
+  });
+
+  test("a NEW turn starts silent again", async () => {
+    // Per turn, not per session. An agent that spoke properly once must not be
+    // muted for the rest of the interview.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await sayForChat(pool, a.chatId, "first");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("with no open turn, nothing is claimed to have been said", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("one chat's speaking does not silence another's", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await openAgentTurn(pool, b.chatId, b.sessionId);
+      await sayForChat(pool, a.chatId, "only a");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, b.chatId), false);
     });
   });
 });

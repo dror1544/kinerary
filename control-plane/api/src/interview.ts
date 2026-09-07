@@ -2157,6 +2157,43 @@ async function updateUiStateForChat(
  * queueing behind it: the agent's latest thought is the one worth sending, and
  * a queue is the shape both bombardments had.
  */
+/**
+ * Marks the agent as having spoken properly in its current turn (0047).
+ *
+ * Called from the real speaking tools, never from the prose conversion — the
+ * whole point is to tell the two apart. Silent when there is no open turn: an
+ * agent speaking outside one has bigger problems than this flag.
+ */
+async function markAgentSpoke(db: pg.Pool, chatId: string): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.interview_agent_turns
+        SET agent_spoke_at = COALESCE(agent_spoke_at, now())
+      WHERE chat_id = $1 AND closed_at IS NULL`,
+    [chatId],
+  );
+}
+
+/**
+ * Whether the agent has already spoken through a real tool in this turn.
+ *
+ * The conversion of raw prose into a say consults this. Prose INSTEAD of
+ * speaking is a message worth rescuing — that is why the conversion exists.
+ * Prose AFTER speaking is the agent thinking out loud, and delivering it is how
+ * an organizer gets told the assistant is "waiting for your answer" to a
+ * question the router never sent.
+ */
+export async function agentAlreadySpokeThisTurn(db: pg.Pool, chatId: string): Promise<boolean> {
+  const { rows } = await db.query<{ spoke: boolean }>(
+    `SELECT agent_spoke_at IS NOT NULL AS spoke
+       FROM control_plane.interview_agent_turns
+      WHERE chat_id = $1 AND closed_at IS NULL
+      ORDER BY opened_at DESC
+      LIMIT 1`,
+    [chatId],
+  );
+  return rows[0]?.spoke ?? false;
+}
+
 export async function sayForChat(
   db: pg.Pool,
   chatId: string,
@@ -2178,7 +2215,10 @@ export async function sayForChat(
   // word about the same turn it is still actively working through.
   await markAwaitingMachine(db, chatId);
   const result = await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, pendingSay: trimmed }));
-  if (result.ok) await scheduleRouterPrompt(db, result.view.sessionId);
+  if (result.ok) {
+    await scheduleRouterPrompt(db, result.view.sessionId);
+    await markAgentSpoke(db, chatId);
+  }
   return result;
 }
 
@@ -2375,6 +2415,7 @@ export async function nominateQuestionForChat(
   if (result.ok) {
     await markAwaitingMachine(db, chatId);
     await scheduleRouterPrompt(db, result.view.sessionId);
+    await markAgentSpoke(db, chatId);
   }
   await advancePhaseForChat(db, chatId);
   return result;
@@ -2727,12 +2768,23 @@ async function confirmIntakeVia(
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
     await client.query(
-      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document)
-       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb)`,
+      `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document, language)
+       VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb, $9)`,
       [
         versionId, session.trip_id, nextVersion, artifactRef, intakeDigest,
         INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers),
         session.source_document ? JSON.stringify(session.source_document) : null,
+        // The language the interview was actually held in, copied onto the
+        // version because the SESSION does not survive: it is deleted on reset
+        // and superseded on correction, while the transformer reads the
+        // version. Until migration 0046 the one place that knew this was not
+        // the place that needed it, and a wholly Hebrew interview produced a
+        // trip that greeted the family in English.
+        //
+        // NOT part of the digest: the digest covers the organizer's ANSWERS,
+        // and two confirmations of identical answers must stay identical
+        // whatever language they were typed in.
+        session.language ?? null,
       ],
     );
 

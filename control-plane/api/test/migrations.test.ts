@@ -72,6 +72,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0043_binding_without_companion.sql",
       "0044_companion_intro_facts.sql",
       "0045_group_binding_tokens.sql",
+      "0046_intake_version_language.sql",
+      "0047_agent_spoke_on_turn.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -124,6 +126,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0043_binding_without_companion.sql",
       "0044_companion_intro_facts.sql",
       "0045_group_binding_tokens.sql",
+      "0046_intake_version_language.sql",
+      "0047_agent_spoke_on_turn.sql",
     ]);
   } finally {
     await reset(client);

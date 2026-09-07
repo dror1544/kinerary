@@ -672,6 +672,20 @@ def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any])
     # mixed-script rosters that happen in practice — a Hebrew given name whose
     # household label was only ever transliterated, or the reverse.
     forms |= {f"{n} {f}" for n in names for f in families}
+    # The GIVEN NAME on its own, taken as the first token of any multi-part
+    # name. Run 14, live: the organizer answered "ניר" and matched nothing,
+    # while "Nir" would have matched — not because English is privileged, but
+    # because `name_en` happens to hold only the given name while `name` holds
+    # the full one. The organizer answered with their own first name, in the
+    # language the entire interview was conducted in, and the companion was
+    # never built.
+    #
+    # Safe to add precisely because ambiguity already fails closed: two
+    # travellers sharing a given name resolve to nobody rather than to whoever
+    # the roster lists first, which is the guarantee `_resolve_organizers`
+    # exists to keep. This widens what can match, never what happens when more
+    # than one does.
+    forms |= {n.split(" ", 1)[0] for n in names if " " in n}
     forms.discard("")
     return forms
 
@@ -1165,9 +1179,25 @@ def _derive_budget(
     return budget
 
 
+SUPPORTED_LANGUAGES = ("en", "he")
+
+
+def _resolve_language(language: str | None) -> str:
+    """The trip's language, or English when there is nothing usable.
+
+    Fails safe in the same direction as `shared/needs-schema.js`: an
+    unrecognised value resolves to the conservative option rather than
+    propagating. A language code nothing can render reaches the site as broken
+    text in every string at once.
+    """
+    candidate = (language or "").strip().lower()
+    return candidate if candidate in SUPPORTED_LANGUAGES else "en"
+
+
 def transform_intake(
     data: Mapping[str, Any],
     today: date | None = None,
+    language: str | None = None,
 ) -> dict[str, Any]:
     """Convert intake answers into a trip.config.json dict.
 
@@ -1175,6 +1205,15 @@ def transform_intake(
     The departure date is set to 90 days from *today* (or the supplied
     reference date); this is a placeholder the organizer refines later via
     the intake correction path.
+
+    `language` is the language the INTERVIEW was held in, carried on the intake
+    version. It is not a preference anyone is asked for: it was established by
+    the organizer's first message and every message after it. Until 2026-09-07
+    it was not carried at all and this function hardcoded English, so an
+    interview conducted entirely in Hebrew produced a trip whose companion
+    greeted the family in English — with a Hebrew assistant name embedded in
+    the English sentence. Absent still means English, because every intake
+    version written before this carries nothing.
     """
     missing = REQUIRED_QUESTIONS - set(data.keys())
     if missing:
@@ -1252,7 +1291,7 @@ def transform_intake(
             "title": title,
             "title_en": title,
             "brand": brand,
-            "defaultLang": "en",
+            "defaultLang": _resolve_language(language),
             "departure": departure_iso,
             "returnDate": return_date.strftime("%Y-%m-%d"),
             "totalDays": total_days,

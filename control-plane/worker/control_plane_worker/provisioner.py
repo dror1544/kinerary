@@ -538,8 +538,13 @@ class ProvisionerWorker:
             # Load intake answers from intake_versions.data.
             answers = self._load_intake_data(conn, intake_version_id)
 
-            # Transform to trip.config.json.
-            config = transform_intake(answers)
+            # Transform to trip.config.json. The language comes from the
+            # intake VERSION, not the session — the session does not survive a
+            # reset or a correction, and this runs long after either.
+            config = transform_intake(
+                answers,
+                language=self._load_intake_language(conn, intake_version_id),
+            )
 
             # Deterministic destination enrichment (Sprint 4.5): currency /
             # emergency numbers for the country, lat-lng per phase, a hero
@@ -745,6 +750,22 @@ class ProvisionerWorker:
         raise ValueError(
             f"no free slug for base {base!r} after {SLUG_COLLISION_LIMIT} attempts"
         )
+
+    def _load_intake_language(
+        self, conn: psycopg.Connection, intake_version_id: str
+    ) -> str | None:
+        """The language the interview was held in (migration 0046).
+
+        NULL for every version confirmed before that column existed, which the
+        transformer reads as English — the behaviour those trips already have.
+        """
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT language FROM control_plane.intake_versions WHERE id = %s",
+                (intake_version_id,),
+            )
+            row = cur.fetchone()
+            return (row or {}).get("language")
 
     def _load_intake_data(self, conn: psycopg.Connection, intake_version_id: str) -> dict:
         with conn.cursor(row_factory=dict_row) as cur:
