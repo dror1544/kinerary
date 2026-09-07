@@ -70,6 +70,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0041_drop_plan_operations_reviews.sql",
       "0042_trip_reachability.sql",
       "0043_binding_without_companion.sql",
+      "0044_companion_intro_facts.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -120,6 +121,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0041_drop_plan_operations_reviews.sql",
       "0042_trip_reachability.sql",
       "0043_binding_without_companion.sql",
+      "0044_companion_intro_facts.sql",
     ]);
   } finally {
     await reset(client);

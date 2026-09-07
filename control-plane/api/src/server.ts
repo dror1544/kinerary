@@ -158,7 +158,16 @@ if (signup) {
   const timer = setInterval(() => {
     if (dispatching) return;
     dispatching = true;
-    dispatchPendingTripNotifications(pool, notification, (line) => process.stderr.write(`${line}\n`))
+    dispatchPendingTripNotifications(
+      pool,
+      notification,
+      (line) => process.stderr.write(`${line}\n`),
+      // For the add-to-group link in a companion introduction. Read from the
+      // profile rather than stored per outbox row: it belongs to the
+      // deployment, and a row written before a bot rename would otherwise hand
+      // an organizer a link to a handle that no longer resolves.
+      { botUsername: profile.web?.telegram_bot_username ?? null },
+    )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
           safe_error_code: error instanceof Error ? error.name : "UNKNOWN",

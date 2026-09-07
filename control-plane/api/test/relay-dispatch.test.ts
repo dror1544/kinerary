@@ -411,3 +411,127 @@ describe("chat-addressed session writes", () => {
     });
   });
 });
+
+describe("the companion arriving in a group", { skip: SKIP }, () => {
+  const joinUpdate = (chatId: string, status = "member", botId = "8463178587") => ({
+    update_id: 90,
+    my_chat_member: {
+      chat: { id: chatId, type: "supergroup" },
+      from: { id: 77, is_bot: false, first_name: "Dror" },
+      old_chat_member: { user: { id: Number(botId), is_bot: true }, status: "left" },
+      new_chat_member: { user: { id: Number(botId), is_bot: true }, status },
+    },
+  }) as never;
+
+  test("introduces itself in a group that is bound to a trip", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000777";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio",
+          trip_title: "Japan 2026",
+          private_url: "https://japan-2026.example",
+          language: "en",
+          login_password: "seed-pw",
+          proactive: { morning_briefing: "07:30" },
+        })],
+      );
+
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.equal(decision.chatId, chatId);
+      assert.match(decision.text, /Rio/);
+      assert.match(decision.text, /https:\/\/japan-2026\.example/);
+      assert.match(decision.text, /seed-pw/);
+      assert.match(decision.text, /07:30/);
+      // It is already in the group; offering an add-to-group link would be absurd.
+      assert.doesNotMatch(decision.text, /startgroup/);
+    });
+  });
+
+  test("the password can be withheld from the group by one option", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000888";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio", private_url: "https://japan-2026.example",
+          language: "en", login_password: "seed-pw", organizer: "Dror",
+        })],
+      );
+
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+        { groupIntroIncludesPassword: false },
+      );
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.doesNotMatch(decision.text, /seed-pw/);
+      assert.match(decision.text, /Dror/);
+    });
+  });
+
+  test("an unbound group is told so, not left in silence", async () => {
+    // People just invited it into a room. Saying nothing reads as broken.
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate("-1002000999"), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "reply");
+    });
+  });
+
+  test("a promotion to admin is not a second arrival", async () => {
+    // Re-introducing on every permissions change would be noise in a live
+    // family group.
+    await withFixture(async (fix) => {
+      const chatId = "-1002000111";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      const promoted = {
+        update_id: 91,
+        my_chat_member: {
+          chat: { id: chatId, type: "supergroup" },
+          old_chat_member: { user: { id: 8463178587, is_bot: true }, status: "member" },
+          new_chat_member: { user: { id: 8463178587, is_bot: true }, status: "administrator" },
+        },
+      } as never;
+      const decision = await dispatchUpdate(
+        fix.pool, promoted, undefined, undefined, { id: "8463178587" },
+      );
+      assert.notEqual(decision.kind, "group_intro");
+    });
+  });
+
+  test("a trip with no stored intro facts stays quiet rather than inventing a name", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000222";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "ignore");
+    });
+  });
+});

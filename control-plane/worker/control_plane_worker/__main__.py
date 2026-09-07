@@ -331,6 +331,10 @@ def main(argv: list[str] | None = None) -> int:
                 # halves of one run land in one place. Unset simply enqueues no
                 # operator rows.
                 operator_chat_id=os.environ.get("CONTROL_PLANE_OPERATOR_CHAT_ID", ""),
+                # The same value the compute adapter bakes into the new site's
+                # .env, read from one place so the password the organizer is
+                # told and the password the site accepts cannot drift apart.
+                seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
             )
             import signal, time as _time
             stopping = False

@@ -1,6 +1,7 @@
 import type pg from "pg";
 import type { NotificationAdapter } from "./signup.js";
 import { structuredLog } from "./redaction.js";
+import { organizerIntroText, type ProactiveSettings } from "./companion-intro.js";
 
 interface OutboxRow {
   id: string;
@@ -69,12 +70,28 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  * notification_type this dispatcher doesn't know how to word yet (the row is
  * marked 'skipped', not retried forever).
  */
-function messageTextFor(row: OutboxRow): string | null {
+function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
   if (row.notification_type === "provisioning_complete") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
     if (!url) return null;
-    return `Your trip site is ready: ${url}`;
+    // The full introduction when the provisioner supplied the facts for one,
+    // and the original one-liner when it did not. Rows enqueued before this
+    // existed carry only `private_url`, and they still have to send something
+    // rather than being skipped for missing fields they were never given.
+    const assistantName = payloadString(row, "assistant_name");
+    if (!assistantName) return `Your trip site is ready: ${url}`;
+    return organizerIntroText({
+      assistantName,
+      tripTitle: payloadString(row, "trip_title"),
+      siteUrl: url,
+      language: payloadString(row, "language") === "he" ? "he" : "en",
+      loginPassword: payloadString(row, "login_password"),
+      botUsername: options?.botUsername ?? null,
+      tripSlug: payloadString(row, "trip_slug"),
+      organizerName: payloadString(row, "organizer"),
+      proactive: (row.payload?.proactive as ProactiveSettings | undefined) ?? null,
+    });
   }
   if (row.notification_type === "provisioning_failed") {
     // Deliberately no error code/detail here — payload.safe_error_code is an
@@ -95,10 +112,24 @@ function messageTextFor(row: OutboxRow): string | null {
  * If this ever runs from more than one API process concurrently, this needs
  * an atomic claim (UPDATE ... FOR UPDATE SKIP LOCKED) instead.
  */
+/** Deployment facts the wording needs but the outbox row cannot carry. */
+export interface DispatchOptions {
+  /**
+   * The shared bot's @username, for the add-to-group deep link.
+   *
+   * Resolved once from `getMe` rather than stored per row: it belongs to the
+   * deployment, and a row written before a bot rename would otherwise hand the
+   * organizer a link to a handle that no longer exists. Absent simply omits
+   * that paragraph.
+   */
+  botUsername?: string | null;
+}
+
 export async function dispatchPendingTripNotifications(
   db: pg.Pool,
   notification: NotificationAdapter,
   log: (line: string) => void = () => {},
+  options?: DispatchOptions,
 ): Promise<number> {
   const { rows } = await db.query<OutboxRow>(
     `SELECT id, notification_type, recipient, payload, attempt, max_attempts
@@ -110,7 +141,7 @@ export async function dispatchPendingTripNotifications(
 
   let dispatched = 0;
   for (const row of rows) {
-    const text = messageTextFor(row);
+    const text = messageTextFor(row, options);
     if (!row.recipient || !text) {
       await db.query(
         "UPDATE control_plane.notification_outbox SET state = 'skipped', updated_at = now() WHERE id = $1 AND state = 'pending'",

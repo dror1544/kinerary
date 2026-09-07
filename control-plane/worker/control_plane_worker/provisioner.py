@@ -463,6 +463,7 @@ class ProvisionerWorker:
         repo_root: str | None = None,
         materialize: MaterializeFn | None = None,
         operator_chat_id: str | None = None,
+        seed_password: str | None = None,
     ) -> None:
         self._db_url = db_url
         self._deploy = deploy
@@ -471,6 +472,12 @@ class ProvisionerWorker:
         # operator row at all — the organizer notification is unaffected either
         # way, and nothing in the job path reads these rows back.
         self._operator_chat_id = operator_chat_id or None
+        # The shared site login, carried into the organizer's introduction so
+        # they can be TOLD the password rather than walked through finding it.
+        # It is the SAME value the compute adapter bakes into the site's .env —
+        # passed here rather than re-read, so the two can never disagree.
+        # Empty (the default, and every existing test) simply omits the line.
+        self._seed_password = seed_password or None
         self._worker_id = worker_id or f"{self.DEFAULT_WORKER_ID_PREFIX}_{secrets.token_hex(8)}"
         self._companion = companion or NullCompanionProfileAdapter()
         self._mcp_bridge = mcp_bridge or NullMcpBridgeAdapter()
@@ -891,7 +898,39 @@ class ProvisionerWorker:
                     if owner_row else None
                 )
 
-                notif_payload = json.dumps({"private_url": private_url})
+                # The facts the organizer's introduction is composed from
+                # (docs/companion-introduction-design.md). Composed API-side,
+                # from these — never by the agent, because every line is a fact
+                # that is worse than useless if invented.
+                #
+                # `login_password` is the shared seed login. It is already on
+                # the site's .env; carrying it here is what lets the organizer
+                # be TOLD it rather than having to be walked through finding
+                # it. Absent, the wording falls back to "log in from the site".
+                agent_cfg = config.get("agent") or {}
+                meta_cfg = config.get("meta") or {}
+                intro_facts = {
+                    "private_url": private_url,
+                    "assistant_name": agent_cfg.get("name"),
+                    "trip_title": meta_cfg.get("title"),
+                    "trip_slug": slug,
+                    "language": meta_cfg.get("defaultLang")
+                    if meta_cfg.get("defaultLang") in ("he", "en") else "en",
+                    "login_password": self._seed_password or None,
+                    "proactive": agent_cfg.get("proactive") or {},
+                }
+                notif_payload = json.dumps(intro_facts)
+
+                # The same facts kept on the trip (migration 0044), because the
+                # GROUP introduction cannot be composed now — there is no group
+                # yet, and there may not be one for days. When the organizer
+                # finally adds the bot to a family group, this run is long over
+                # and the seed password exists nowhere else the control plane
+                # can read.
+                cur.execute(
+                    "UPDATE control_plane.trips SET companion_intro = %s::jsonb WHERE id = %s",
+                    (notif_payload, trip_id),
+                )
                 cur.execute(
                     """
                     INSERT INTO control_plane.notification_outbox
