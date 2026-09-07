@@ -130,6 +130,99 @@ export type ChatRoute =
  * trip context at all, and the caller must accept nothing from it except a
  * verified `/start` token.
  */
+/**
+ * Moves a chat's routing state from one chat id to another.
+ *
+ * Telegram changes a chat's id when a group becomes a supergroup, and it does
+ * that on its own — when the group grows, or gains a feature nobody thought of
+ * as a migration. Every routing key we hold is the chat id, so without this the
+ * companion answers "I don't have a trip for this chat" in a room it was
+ * working in a minute earlier, and nothing in the conversation explains why.
+ *
+ * Telegram announces the change twice — `migrate_to_chat_id` on a message in
+ * the old chat, `migrate_from_chat_id` on one in the new chat. Handling either
+ * is sufficient; handling both is why this is idempotent.
+ *
+ * Returns whether anything moved. `false` covers "nothing was bound here" and
+ * the refusal below, which the caller treats identically: there is nothing to
+ * tell the organizer either way.
+ */
+/**
+ * The facts a companion introduces itself with, kept on the trip by
+ * provisioning (migration 0044) so a group join days later can still compose
+ * one. Null when the trip predates the column or was never provisioned.
+ *
+ * Never served to a client. It carries the shared site login, and
+ * `sanitizeConfig`'s blanket rule is that no raw trip value reaches a
+ * response — this is read by the router, for a message the router sends.
+ */
+export async function companionIntroFacts(
+  db: pg.Pool,
+  tripId: string,
+): Promise<Record<string, unknown> | null> {
+  const { rows } = await db.query<{ companion_intro: Record<string, unknown> | null }>(
+    "SELECT companion_intro FROM control_plane.trips WHERE id = $1",
+    [tripId],
+  );
+  return rows[0]?.companion_intro ?? null;
+}
+
+export async function migrateChatBinding(
+  db: pg.Pool,
+  fromChatId: string,
+  toChatId: string,
+): Promise<boolean> {
+  if (!fromChatId || !toChatId || fromChatId === toChatId) return false;
+
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Fail closed on a destination that is already routed. A replayed update,
+    // or an id that belongs to another trip, would otherwise let this repoint a
+    // live group at a different family's trip — the one outcome worse than the
+    // stale binding this function exists to repair.
+    const taken = await client.query(
+      `SELECT 1 FROM control_plane.telegram_chat_bindings
+        WHERE chat_id = $1 AND closed_at IS NULL
+        UNION ALL
+       SELECT 1 FROM control_plane.intake_sessions
+        WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      [toChatId],
+    );
+    if (taken.rowCount) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+
+    const bindings = await client.query(
+      `UPDATE control_plane.telegram_chat_bindings
+          SET chat_id = $2
+        WHERE chat_id = $1 AND closed_at IS NULL`,
+      [fromChatId, toChatId],
+    );
+    // Sessions are moved defensively, not because it is known to happen: an
+    // interview is held in a DM, and a DM never becomes a supergroup. It costs
+    // one statement to be right if that ever stops being true, and leaving a
+    // second chat-id-keyed table behind is how the next stale-routing bug gets
+    // written.
+    const sessions = await client.query(
+      `UPDATE control_plane.intake_sessions
+          SET telegram_chat_id = $2
+        WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      [fromChatId, toChatId],
+    );
+
+    await client.query("COMMIT");
+    return (bindings.rowCount ?? 0) + (sessions.rowCount ?? 0) > 0;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<ChatRoute> {
   const live = await db.query<{ id: string; trip_id: string }>(
     `SELECT id, trip_id

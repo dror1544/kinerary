@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink } from "../src/chat-router.js";
+import { migrateChatBinding, resolveChatRoute, startFromDeepLink } from "../src/chat-router.js";
 import {
   CONTRACT_VERSION,
   decodeFrame,
@@ -504,6 +504,72 @@ describe("normalizeUpdate (DB)", () => {
       if (outcome.kind !== "event") return;
       assert.equal(outcome.event.source.chat_type, "group");
       assert.equal(outcome.event.source.chat_name, "Japan Trip");
+    });
+  });
+});
+
+describe("supergroup migration", { skip: SKIP }, () => {
+  test("a binding follows the chat when Telegram upgrades a group to a supergroup", async () => {
+    // Raised before it bit us, 2026-09-07. Telegram changes the chat id when a
+    // group becomes a supergroup — and it does that on its own, when the group
+    // grows or gains a feature nobody thought of as a migration. The binding is
+    // keyed on chat id, so the companion would answer "I don't have a trip for
+    // this chat" in a room it was working in a minute earlier, and neither the
+    // organizer nor the family would have any idea why.
+    //
+    // Telegram announces it twice: `migrate_to_chat_id` on a message in the OLD
+    // chat, `migrate_from_chat_id` on one in the NEW chat. Either is enough.
+    await withFixture(async (fix) => {
+      const oldChat = "-100111";
+      const newChat = "-1002000111";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, $3)`,
+        [oldChat, fix.tripId, "companion-japan"],
+      );
+
+      assert.equal(await migrateChatBinding(fix.pool, oldChat, newChat), true);
+
+      const before = await resolveChatRoute(fix.pool, oldChat);
+      assert.equal(before.kind, "unbound", "the old id stops routing");
+
+      const after = await resolveChatRoute(fix.pool, newChat);
+      assert.equal(after.kind, "companion");
+      if (after.kind !== "companion") return;
+      assert.equal(after.tripId, fix.tripId);
+      assert.equal(after.hermesProfile, "companion-japan", "and it keeps its companion");
+    });
+  });
+
+  test("migrating a chat with no binding changes nothing and says so", async () => {
+    await withFixture(async (fix) => {
+      assert.equal(await migrateChatBinding(fix.pool, "-100999", "-1002000999"), false);
+      assert.equal((await resolveChatRoute(fix.pool, "-1002000999")).kind, "unbound");
+    });
+  });
+
+  test("it will not overwrite a binding the destination already has", async () => {
+    // Fail closed. If the new id is already bound — a replayed update, or an id
+    // that belongs to another trip — moving the old binding on top of it would
+    // silently repoint a live group at a different family's trip. That is the
+    // one outcome worse than the stale binding this function exists to fix.
+    await withFixture(async (fix) => {
+      const oldChat = "-100222";
+      const newChat = "-1002000222";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-old')`,
+        [oldChat, fix.tripId],
+      );
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-already-there')`,
+        [newChat, fix.tripId],
+      );
+
+      assert.equal(await migrateChatBinding(fix.pool, oldChat, newChat), false);
+      const after = await resolveChatRoute(fix.pool, newChat);
+      assert.equal(after.kind === "companion" && after.hermesProfile, "companion-already-there");
     });
   });
 });
