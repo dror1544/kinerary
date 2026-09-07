@@ -653,6 +653,44 @@ function canonicalIntakePayload(tripId: string, answers: AnswerStore): string {
   });
 }
 
+/**
+ * Splits the question set into what is still missing and what is already known.
+ *
+ * `SessionView` cannot answer this: `nextQuestion` is only the NEXT required
+ * question, so a view-derived "outstanding" would hide every other required one
+ * from `interpret`. That would defeat the case the redesign is most confident
+ * about — one message settling several questions at once ("just the four of us,
+ * Japan, Sept 19th to Oct 3rd"). Retired ids are in neither list.
+ */
+export function partitionQuestions(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
+): { outstanding: string[]; answered: string[] } {
+  const outstanding: string[] = [];
+  const answered: string[] = [];
+  for (const q of questions) {
+    if (RETIRED_QUESTION_IDS.has(q.id)) continue;
+    if (answers[q.id] === undefined) outstanding.push(q.id);
+    else answered.push(q.id);
+  }
+  return { outstanding, answered };
+}
+
+/** `partitionQuestions` for a live chat. Null when there is no open session. */
+export async function questionStateForChat(
+  db: pg.Pool,
+  chatId: string,
+): Promise<{ outstanding: string[]; answered: string[] } | null> {
+  const rows = await db.query<{ answers: AnswerStore }>(
+    `SELECT answers FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId],
+  );
+  const answers = rows.rows[0]?.answers;
+  if (!answers) return null;
+  return partitionQuestions(answers);
+}
+
 export function computeIntakeDigest(tripId: string, answers: AnswerStore): string {
   const payload = canonicalIntakePayload(tripId, answers);
   return `sha256:${sha256hex(payload)}`;
@@ -1542,8 +1580,26 @@ export const INBOUND_SETTLE_SECONDS = 2;
  * own `WireMessageEvent` when combining a burst, since it is the only writer
  * and already trusts its own shape.
  */
+/**
+ * One message inside a settling burst, as it is stored in `pending_inbound`.
+ *
+ * This type used to say `{ text: string }`, which was not true: the relay
+ * queues the whole `WireMessageEvent` and `flushSettledInboundBursts` cast it
+ * straight back with `as WireMessageEvent[]`. The declaration being narrower
+ * than the data hid `message_id` — already carried from Telegram by
+ * `normalize.ts` — from everything downstream, and `interpret` needs it to key
+ * an interpretation to the messages that caused it (docs/interview-without-an-agent.md §6).
+ *
+ * Structural rather than an import of `WireMessageEvent`: the interview does
+ * not otherwise know the relay's wire protocol, and the fields below are the
+ * ones it actually reads. Extra keys survive the round trip regardless — this
+ * is jsonb.
+ */
 export interface QueuedInboundEvent {
   text: string;
+  /** Telegram's message id, when it gave one. Absent for synthesised events. */
+  message_id?: string;
+  media_urls?: string[];
 }
 
 /**

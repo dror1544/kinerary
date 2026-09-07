@@ -12,6 +12,7 @@ import {
   nominateQuestionForChat,
   sayForChat, setFinishRequestedForChat, setLanguageForChat, INTAKE_QUESTIONS,
 } from "./interview.js";
+import { isInterpretPath } from "./interpret.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
@@ -1023,6 +1024,53 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // were always gated on the router's open turn rather than on the id the
   // caller supplied. Removing the id removes the only thing the model could
   // have gotten wrong.
+  // ONE WRITER PER SESSION (docs/interview-without-an-agent.md §5).
+  //
+  // A session on the interpret path is driven by the router alone; the agent
+  // may not write into it. Running both writers in one session would preserve
+  // exactly the competing-writer failure the redesign exists to remove, and
+  // would make any measurement of the new path a property of the mixture.
+  //
+  // The guard is here, on the route prefix, rather than in the six MCP tool
+  // handlers — and that placement is the point. Those handlers live in
+  // `interview-mcp.ts`, a SEPARATELY DEPLOYED sidecar process that can be
+  // stale, and every one of them reaches the interview by forwarding to these
+  // routes. Guarding the sidecar would put the check in the one place that is
+  // not authoritative, and would be six chances for a seventh tool to forget.
+  //
+  // POSTs only. `get_interview_for_chat` is read-only and stays available: an
+  // agent still running against a converted session should be able to see the
+  // state it is refused permission to change.
+  //
+  // The refusal is typed and loud rather than a silent no-op. An agent writing
+  // into a converted session is a deployment fault, and a quiet 200 would hide
+  // it for exactly as long as it takes to matter.
+  app.addHook("preHandler", async (request, reply) => {
+    const url = String(request.url ?? "").split("?")[0] ?? "";
+    if (request.method !== "POST") return;
+    if (!url.startsWith("/internal/interview/agent/")) return;
+    const db = dependencies.interviewAgent?.db;
+    if (!db) return;
+
+    // Both route shapes: ".../current/..." resolves the same way the routes do,
+    // ".../<chatId>/..." names its chat directly.
+    const rest = url.slice("/internal/interview/agent/".length).split("/");
+    let chatId: string | null = null;
+    if (rest[0] === "current") {
+      const resolved = await resolveChatFromOpenTurn(db);
+      chatId = resolved.ok ? resolved.chatId : null;
+    } else if (rest[0]) {
+      chatId = decodeURIComponent(rest[0]);
+    }
+    // Unresolvable here is not this hook's problem to report — the route says
+    // 404 or 409 for it with the reason it actually found.
+    if (!chatId) return;
+
+    if (await isInterpretPath(db, chatId)) {
+      return reply.code(409).send({ error: "SESSION_NOT_AGENT_WRITABLE" });
+    }
+  });
+
   async function resolveCurrentChat(reply: { code: (n: number) => { send: (b: unknown) => unknown } }): Promise<string | null> {
     const resolved = await resolveChatFromOpenTurn(dependencies.interviewAgent!.db);
     if (resolved.ok) return resolved.chatId;

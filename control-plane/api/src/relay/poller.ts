@@ -51,12 +51,26 @@ import {
   markOpeningDoneForChat,
   hasOpenAgentTurn,
   markOfferedMoreForChat,
+  questionStateForChat,
   recordLastPromptForChat,
   selectedOptionIds,
   setFinishRequestedForChat,
   skipQuestionForChat,
   toggleMultiChoiceForChat,
 } from "../interview.js";
+import {
+  applyProposals,
+  burstKey,
+  claimInterpretation,
+  interpretBurst,
+  isInterpretPath,
+  markInterpretationCommitted,
+  recordInterpretationResult,
+  storedOutcomes,
+  submitArgsFor,
+  type ProposedAnswer,
+} from "../interpret.js";
+import type { StructuredModelRunner } from "../model-runner.js";
 import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
@@ -110,6 +124,13 @@ export interface TripBotPollerDeps {
   interviewerProfile?: string;
   /** Re-host plane for inbound attachments; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * The bounded-call runner behind the interpret path
+   * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
+   * fall back to the router's own questions — which is a working interview,
+   * just a slower one, and is deliberately not an error.
+   */
+  modelRunner?: StructuredModelRunner;
   /**
    * Signup-approval handling, for the topology where the trip bot and the
    * signup bot are THE SAME BOT.
@@ -661,6 +682,168 @@ export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEv
   };
 }
 
+/**
+ * The interview without an agent: interpret one settled burst, write what
+ * survives the gate, then let the router ask what it always would have.
+ *
+ * Every message the organizer sees still comes from `intake-copy.ts` by way of
+ * `sendNextStep`. Nothing the model returns reaches a screen — its whole output
+ * is `ProposedAnswer[]`, and `applyProposals` decides what any of it is allowed
+ * to write. That is the entire difference from the agent path.
+ *
+ * Failure is a value at every step. No runner, a rate limit, unparseable
+ * output, low confidence, evidence that is not in the message — each of them
+ * lands in the same place: the router asks its own question. A slower
+ * interview, never a silent one.
+ *
+ * Design: docs/interview-without-an-agent.md §3, §4, §6.
+ */
+async function runInterpretPath(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  combined: WireMessageEvent,
+  log: (line: string) => void,
+): Promise<void> {
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const sourceText = combined.text ?? "";
+  const messageIds = combined.message_id ? [combined.message_id] : [];
+  const key = burstKey(messageIds, sourceText);
+
+  const ask = async () => {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
+  };
+
+  // Idempotency (§6). A redelivered burst, or a retry after the relay died
+  // mid-call, finds the row rather than paying for a second model call and
+  // writing the answers twice.
+  const claim = await claimInterpretation(deps.db, {
+    sessionId: burst.sessionId,
+    chatId: burst.chatId,
+    burstKey: key,
+    sourceText,
+  });
+  if (!claim.fresh && claim.row.committedAt) {
+    log(structuredLog("info", "interview.interpret_replayed", {
+      session_id: burst.sessionId,
+      burst_key: key,
+    }));
+    // Committed already, but the organizer may never have seen the question
+    // that followed — asking again is safe (the flood dedupe suppresses a
+    // genuine repeat), staying silent is not.
+    await ask();
+    return;
+  }
+
+  const state = await questionStateForChat(deps.db, burst.chatId);
+  if (!state) return;
+  const session = await getSessionForChat(deps.db, burst.chatId);
+  const language = session.ok ? session.view.language : DEFAULT_LANGUAGE;
+
+  const interpretationId = claim.fresh ? claim.id : claim.row.id;
+  let proposals: ProposedAnswer[];
+  let malformed = 0;
+
+  if (!claim.fresh) {
+    // The crash window: the model answered, the commit did not land. Resume
+    // from what was stored rather than asking again — the answer is already
+    // paid for and re-asking could return something different.
+    proposals = claim.row.proposals;
+    log(structuredLog("info", "interview.interpret_resumed", {
+      session_id: burst.sessionId,
+      burst_key: key,
+      proposals: proposals.length,
+    }));
+  } else if (!deps.modelRunner) {
+    await recordInterpretationResult(deps.db, interpretationId, {
+      failureReason: "NOT_CONFIGURED",
+      attempts: 0,
+      durationMs: 0,
+    });
+    await markInterpretationCommitted(deps.db, interpretationId, { askAnyway: state.outstanding.slice(0, 1) });
+    await ask();
+    return;
+  } else {
+    const result = await interpretBurst(deps.modelRunner, {
+      sourceText,
+      outstanding: state.outstanding,
+      language,
+      messageIds,
+    });
+    if (!result.ok) {
+      log(structuredLog("warn", "interview.interpret_failed", {
+        session_id: burst.sessionId,
+        reason: result.reason,
+        attempts: result.attempts,
+        ms: result.ms,
+      }));
+      await recordInterpretationResult(deps.db, interpretationId, {
+        failureReason: result.reason,
+        attempts: result.attempts,
+        durationMs: result.ms,
+      });
+      await markInterpretationCommitted(deps.db, interpretationId, { askAnyway: state.outstanding.slice(0, 1) });
+      await ask();
+      return;
+    }
+    proposals = result.payload.proposals;
+    malformed = result.payload.malformed;
+    await recordInterpretationResult(deps.db, interpretationId, {
+      proposals,
+      attempts: result.attempts,
+      durationMs: result.ms,
+    });
+    log(structuredLog("info", "interview.interpret_ok", {
+      session_id: burst.sessionId,
+      proposals: proposals.length,
+      unclear: result.payload.unclear.length,
+      malformed,
+      attempts: result.attempts,
+      ms: result.ms,
+    }));
+  }
+
+  const decisions = applyProposals(proposals, {
+    sourceText,
+    outstanding: state.outstanding,
+    answered: state.answered,
+    unclear: [],
+  });
+
+  for (const accepted of decisions.accepted) {
+    const args = submitArgsFor(accepted.proposal.value);
+    const written = await submitAnswerForChat(
+      deps.db,
+      burst.chatId,
+      accepted.questionId,
+      args.optionId,
+      args.otherText,
+      args.structuredData,
+      args.optionIds,
+    );
+    if (!written.ok) {
+      // The gate passed it and the write refused it — the two validators
+      // disagreeing is worth seeing, not swallowing.
+      log(structuredLog("warn", "interview.interpret_write_refused", {
+        session_id: burst.sessionId,
+        question_id: accepted.questionId,
+        reason: written.reason,
+      }));
+    }
+  }
+
+  log(structuredLog("info", "interview.interpret_committed", {
+    session_id: burst.sessionId,
+    accepted: decisions.accepted.length,
+    rejected: decisions.rejected.length,
+    reasons: decisions.rejected.map((r) => r.reason),
+  }));
+  await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
+
+  // The floor was taken when the burst arrived; the router speaks now.
+  await ask();
+}
+
 export async function flushSettledInboundBursts(
   deps: TripBotPollerDeps,
   log: (line: string) => void,
@@ -697,6 +880,14 @@ export async function flushSettledInboundBursts(
       if ((combined.media_urls?.length ?? 0) > 0) {
         await markAwaitingMachine(deps.db, burst.chatId, DOCUMENT_FLOOR_SECONDS);
       }
+      // THE FORK. A session on the interpret path never opens an agent turn:
+      // one writer per session (docs/interview-without-an-agent.md §5), and the
+      // turn IS the agent's licence to write.
+      if (await isInterpretPath(deps.db, burst.chatId)) {
+        await runInterpretPath(deps, burst, combined, log);
+        continue;
+      }
+
       const turn = await openAgentTurn(deps.db, burst.chatId, burst.sessionId);
       const delivered = deps.connector.pushInbound(combined);
       if (delivered) {
