@@ -252,7 +252,7 @@ async function main(): Promise<void> {
       botIdentity: runtime.botIdentity,
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
-      media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl },
+      media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
       log,
     });
   }

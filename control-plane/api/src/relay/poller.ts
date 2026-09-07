@@ -192,8 +192,16 @@ export async function applyDecision(
   // default (undefined here clears any earlier override on this session).
   const chatId = interviewChatOf(decision);
   if (chatId) {
+    // The ATTACHMENT decides this, not the re-host. `media_urls` is populated
+    // only when re-hosting succeeded, so reading the floor off it gave a failed
+    // upload the ordinary 30s budget — the case where the agent has the most to
+    // do and the least to work with. Run 14: the watchdog closed such a turn 28
+    // seconds in, and every write the agent made after that was refused, so the
+    // organizer was told their answer could not be saved. `media_urls` is kept
+    // in the test as well, for a companion-route event that carries media
+    // without this flag.
     const isDocumentTurn = decision.kind === "interview_to_gateway" &&
-      (decision.event.media_urls?.length ?? 0) > 0;
+      (decision.hadAttachment || (decision.event.media_urls?.length ?? 0) > 0);
     await markAwaitingMachine(deps.db, chatId, isDocumentTurn ? DOCUMENT_FLOOR_SECONDS : undefined);
   }
 
@@ -309,6 +317,22 @@ export async function applyDecision(
       });
       if (result.outcome === "error") {
         log(structuredLog("warn", "trip_bot.approval_rejected", { safe_error_code: result.reason }));
+      }
+      return;
+    }
+
+    case "group_intro": {
+      const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
+      log(structuredLog("info", "trip_bot.group_intro_sent", { ok: sent.ok }));
+      // Pinning is best-effort by design. An unpinned introduction is a worse
+      // introduction, never a failed arrival — and the overwhelmingly common
+      // reason it fails is simply that nobody made the bot an admin.
+      if (sent.ok && sent.messageId && deps.telegram.pinChatMessage) {
+        const pinned = await deps.telegram.pinChatMessage({
+          chatId: decision.chatId,
+          messageId: sent.messageId,
+        });
+        log(structuredLog("info", "trip_bot.group_intro_pin", { pinned }));
       }
       return;
     }
@@ -1161,7 +1185,11 @@ export function startTripBotPoller(
       const raw = await deps.telegram.getUpdates({
         offset,
         timeoutSeconds: longPollSeconds,
-        allowedUpdates: ["message", "callback_query"],
+        // `my_chat_member` is how the bot learns it was added to a group — the
+        // moment the companion should introduce itself. Additive: an update
+        // type left out of this list is not delivered to anyone else either,
+        // it is simply dropped, so nothing loses traffic by its being here.
+        allowedUpdates: ["message", "callback_query", "my_chat_member"],
       });
       const elapsed = Date.now() - startedAt;
 

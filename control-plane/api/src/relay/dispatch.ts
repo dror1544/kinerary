@@ -33,10 +33,16 @@ import {
   resolveChatRoute,
   startFromDeepLink,
   type InlineKeyboard,
+  migrateChatBinding,
+  companionIntroFacts,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
+import { groupIntroText } from "../companion-intro.js";
+import { structuredLog } from "../redaction.js";
 import {
+  botJoinedGroup,
   describeAttachment,
+  migrationOf,
   normalizeUpdate,
   toWireEventWithMedia,
   type MediaDeps,
@@ -57,6 +63,18 @@ export type DispatchDecision =
   | { kind: "to_gateway"; event: WireMessageEvent }
   /** The connector answers this one itself. */
   | { kind: "reply"; reply: DirectReply }
+  | {
+      /**
+       * The bot has just been added to a group bound to a trip: send the
+       * arrival message, then pin it if the group made us an admin.
+       *
+       * Separate from `reply` because pinning needs the sent message's id back,
+       * and `reply` deliberately discards it.
+       */
+      kind: "group_intro";
+      chatId: string;
+      text: string;
+    }
   /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
   | { kind: "show_summary"; chatId: string; view: SessionView }
   /** A tapped inline button that belongs to the interview flow. */
@@ -93,7 +111,23 @@ export type DispatchDecision =
    * Carries the session the router resolved for the chat, so the caller can
    * open the turn that gates the agent's write path before the event goes out.
    */
-  | { kind: "interview_to_gateway"; chatId: string; sessionId: string; event: WireMessageEvent }
+  | {
+      kind: "interview_to_gateway";
+      chatId: string;
+      sessionId: string;
+      event: WireMessageEvent;
+      /**
+       * The organizer attached a file to this message.
+       *
+       * Distinct from `event.media_urls` being non-empty, which additionally
+       * requires the re-host to have SUCCEEDED. The two were conflated until
+       * run 14: a failed re-host silently downgraded a document turn to the
+       * ordinary agent floor, so the agent got less time exactly when it had
+       * more to do. What the agent can DO depends on the bytes arriving; how
+       * long it may take depends on the organizer having sent a file at all.
+       */
+      hadAttachment: boolean;
+    }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
@@ -190,6 +224,19 @@ export interface DispatchOptions {
    * what every caller did before per-trip gateway processes existed.
    */
   canReachProfile?: (profile: string) => boolean;
+  /**
+   * Whether the group's arrival message carries the shared site password.
+   *
+   * The trip login IS shared by design, and the arrival message is pinned so a
+   * member who joins later can scroll back to it — that is the argument for.
+   * Against: a password in a group is durable, searchable, and visible to
+   * everyone ever added to that group, including after the trip. Both are true,
+   * the choice is the deployment's, and turning it off changes nothing else
+   * about the message (the group is told who to ask instead).
+   *
+   * Defaults to true, matching the organizer's stated intent on 2026-09-07.
+   */
+  groupIntroIncludesPassword?: boolean;
 }
 
 export async function dispatchUpdate(
@@ -201,6 +248,53 @@ export async function dispatchUpdate(
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
   if (update.callback_query) return dispatchCallback(db, update);
+
+  // Added to a group. If that group is already bound to a trip, this is the
+  // companion's arrival and it introduces itself; if it is not, saying so is
+  // better than sitting silent in a room people just invited it into.
+  const joined = botJoinedGroup(update, botIdentity.id);
+  if (joined) {
+    const route = await resolveChatRoute(db, joined.chatId);
+    if (route.kind !== "companion") {
+      return { kind: "reply", reply: { chatId: joined.chatId, text: strings.unbound } };
+    }
+    const facts = await companionIntroFacts(db, route.tripId);
+    const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
+    // No stored facts means a trip provisioned before migration 0044, or one
+    // that never finished. Nothing to introduce, and inventing a name here is
+    // exactly what this module refuses to do.
+    if (!facts || !assistantName) return { kind: "ignore", reason: "NO_INTRO_FACTS" };
+    return {
+      kind: "group_intro",
+      chatId: joined.chatId,
+      text: groupIntroText(
+        {
+          assistantName,
+          tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
+          siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
+          language: facts.language === "he" ? "he" : "en",
+          loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
+          proactive: (facts.proactive as never) ?? null,
+        },
+        { includePassword: options.groupIntroIncludesPassword ?? true },
+      ),
+    };
+  }
+
+  // A supergroup migration is repaired BEFORE anything is routed. Telegram
+  // delivers it as an ordinary message with no text, so the branches below
+  // would drop it on NO_TEXT and the binding would quietly go stale — the
+  // companion falling silent in a live family group with nothing in the
+  // conversation to explain it.
+  const migration = migrationOf(update.message ?? update.edited_message);
+  if (migration) {
+    const moved = await migrateChatBinding(db, migration.from, migration.to);
+    log(structuredLog("info", "trip_bot.chat_migrated", { moved }));
+    // Nothing to say to anyone: from the family's side the group simply kept
+    // working, which is the whole point.
+    return { kind: "ignore", reason: moved ? "CHAT_MIGRATED" : "CHAT_MIGRATION_NOOP" };
+  }
 
   const message = update.message ?? update.edited_message;
   const rawChatId = message?.chat?.id;
@@ -311,16 +405,18 @@ export async function dispatchUpdate(
       // interviewer as `text: ""` — an empty message, from the one route that
       // asks for a document in the first place. The organizer saw a successful
       // upload and the agent saw nothing.
+      const attachment = describeAttachment(message);
       return {
         kind: "interview_to_gateway",
         chatId,
         sessionId: route.sessionId,
+        hadAttachment: attachment !== null,
         event: await toWireEventWithMedia(
           message,
           chatId,
           text,
           options.interviewerProfile,
-          describeAttachment(message),
+          attachment,
           options.media,
         ),
       };

@@ -20,6 +20,7 @@ import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
 import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
 import type { ChatType, WireMessageEvent, WireSessionSource } from "./protocol.js";
+import { structuredLog } from "../redaction.js";
 
 /** The subset of Telegram's Update we consume. */
 export interface TelegramUser {
@@ -58,6 +59,32 @@ export interface TelegramMessage {
   date?: number;
   message_thread_id?: number;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
+  /**
+   * Telegram's two announcements of a group becoming a supergroup. The chat id
+   * changes, so every routing key we hold for this chat is about to be stale.
+   * `migrate_to_chat_id` arrives on a message in the OLD chat, and
+   * `migrate_from_chat_id` on one in the NEW chat — both, in practice.
+   */
+  migrate_to_chat_id?: number | string;
+  migrate_from_chat_id?: number | string;
+}
+
+/**
+ * The (from, to) chat ids of a supergroup migration announced by this message,
+ * or null when it announces none.
+ *
+ * Read off either field, because Telegram sends both and whichever arrives
+ * first should be the one that repairs the routing.
+ */
+export function migrationOf(message: TelegramMessage | undefined): { from: string; to: string } | null {
+  if (!message) return null;
+  const here = message.chat?.id;
+  if (here === undefined || here === null || here === "") return null;
+  const to = message.migrate_to_chat_id;
+  if (to !== undefined && to !== null && to !== "") return { from: String(here), to: String(to) };
+  const from = message.migrate_from_chat_id;
+  if (from !== undefined && from !== null && from !== "") return { from: String(from), to: String(here) };
+  return null;
 }
 
 export interface TelegramUpdate {
@@ -70,6 +97,50 @@ export interface TelegramUpdate {
     from?: TelegramUser;
     message?: TelegramMessage;
   };
+  /**
+   * The bot's own membership in a chat changed — added to a group, removed,
+   * or promoted. Delivered only when `my_chat_member` is in `allowedUpdates`.
+   */
+  my_chat_member?: {
+    chat?: TelegramChat;
+    from?: TelegramUser;
+    new_chat_member?: { user?: TelegramUser; status?: string };
+    old_chat_member?: { user?: TelegramUser; status?: string };
+  };
+}
+
+/**
+ * Whether this update is "the bot has just been added to a group".
+ *
+ * `member` and `administrator` are both arrivals; the difference is only
+ * whether the organizer granted rights on the way in. `left` and `kicked` are
+ * departures, and `restricted` is neither — treat anything unrecognised as not
+ * an arrival, so an unfamiliar status can never trigger an introduction.
+ */
+export function botJoinedGroup(
+  update: TelegramUpdate,
+  botId: string | undefined,
+): { chatId: string; canPin: boolean } | null {
+  const event = update.my_chat_member;
+  if (!event) return null;
+  const chat = event.chat;
+  if (!chat?.id || (chat.type !== "group" && chat.type !== "supergroup")) return null;
+
+  // It has to be US. `my_chat_member` is only ever about the bot, but the id is
+  // there and checking it costs nothing — and a shared bot that introduced
+  // itself because some OTHER bot joined would be a strange thing to debug.
+  const who = event.new_chat_member?.user?.id;
+  if (botId && who !== undefined && String(who) !== botId) return null;
+
+  const status = event.new_chat_member?.status;
+  if (status !== "member" && status !== "administrator") return null;
+
+  const was = event.old_chat_member?.status;
+  // Already inside. A promote-to-admin is not an arrival, and re-introducing
+  // on every permissions change would be noise in a live family group.
+  if (was === "member" || was === "administrator") return null;
+
+  return { chatId: String(chat.id), canPin: status === "administrator" };
 }
 
 /**
@@ -128,6 +199,14 @@ export interface MediaDeps {
   store: { put(input: { kind: MediaKind; mime: string; size: number; filename?: string; caption?: string; bytes: Buffer }): string | null };
   /** Public base the gateway can reach this connector on, e.g. http://127.0.0.1:4312 */
   baseUrl: string;
+  /**
+   * Optional, and the reason it exists: a failed re-host used to be completely
+   * silent on this side. `fetchFile` logs its own failures, but the two
+   * degrade-and-continue returns below logged nothing, so "the organizer's
+   * document did not reach the agent" was invisible in every log we keep. Run
+   * 14 spent an hour reconstructing it from a floor value in the database.
+   */
+  log?: (line: string) => void;
 }
 
 export interface Attachment {
@@ -203,7 +282,17 @@ export async function toWireEventWithMedia(
   if (!attachment || !deps) return event;
 
   const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
-  if (!file) return event;
+  if (!file) {
+    // Degrade, never drop: the turn still goes over so the agent can say it
+    // could not read the file, rather than the organizer's upload vanishing.
+    // But it must not vanish from the LOGS too.
+    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+      stage: "fetch",
+      kind: attachment.kind,
+      has_filename: Boolean(attachment.filename),
+    }));
+    return event;
+  }
 
   const id = deps.store.put({
     kind: attachment.kind,
@@ -213,7 +302,14 @@ export async function toWireEventWithMedia(
     ...(message.caption ? { caption: message.caption } : {}),
     bytes: file.bytes,
   });
-  if (!id) return event;
+  if (!id) {
+    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+      stage: "store",
+      kind: attachment.kind,
+      size: file.bytes.length,
+    }));
+    return event;
+  }
 
   return {
     ...event,

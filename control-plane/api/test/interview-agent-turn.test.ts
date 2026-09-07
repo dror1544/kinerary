@@ -366,6 +366,71 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
     });
   });
 
+  test("a document turn is a document turn even when re-hosting fails", async () => {
+    // 2026-09-06 run 14. `isDocumentTurn` was read off `media_urls`, which is
+    // only populated when re-hosting SUCCEEDS. A failed re-host therefore
+    // silently downgraded the turn to the ordinary 30s floor — and the agent,
+    // which now has MORE to do (notice the file is unreadable, say so, record
+    // whatever it can), got LESS time to do it. The watchdog closed the turn
+    // 28 seconds in, and every write the agent made afterwards was refused;
+    // the organizer was told "I could not save the answer".
+    //
+    // The attachment is what makes it a document turn. Whether the bytes
+    // arrived decides what the agent can DO, never how long it may take.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            // Every failure mode of fetchFile reduces to this.
+            telegram: { async fetchFile() { return null; } },
+            store: new MediaStore(),
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.deepEqual(decision.event.media_urls, undefined, "re-hosting failed, as set up");
+      assert.equal(decision.hadAttachment, true, "and the turn still knows a file was sent");
+    });
+  });
+
+  test("a plain text turn is not a document turn", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 4,
+          message: {
+            message_id: 14,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            text: "we are going to Japan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.hadAttachment, false);
+    });
+  });
+
   test("an attachment still forwards when the connector has no media plane", async () => {
     // Degrade, never drop: without media deps the turn is still handed over, so
     // the agent can say it cannot read the file rather than going silent.
