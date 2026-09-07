@@ -22,6 +22,7 @@ from control_plane_worker.provisioner import (
     DeployAdapter,
     ProvisionerWorker,
     bind_chat_to_trip,
+    attach_profile_to_orphan_bindings,
 )
 from control_plane_worker.release_source import ReleaseSourceError
 
@@ -1783,3 +1784,83 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
             self.assertEqual(row["chat_id"], identity_chat)
         finally:
             pass  # tearDown removes the identity; see its comment.
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OrphanBindingAdoptionTests(unittest.TestCase):
+    """A chat bound before the companion existed must not wait forever."""
+
+    def setUp(self) -> None:
+        self.conn = psycopg.connect(DB_URL, autocommit=True)
+        self.trip_id = f"trip_{secrets.token_hex(16)}"
+        self.other_trip_id = f"trip_{secrets.token_hex(16)}"
+        with self.conn.cursor() as cur:
+            for tid in (self.trip_id, self.other_trip_id):
+                cur.execute(
+                    "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES (%s, %s, 'ready_private')",
+                    (tid, tid.replace("_", "-")),
+                )
+
+    def tearDown(self) -> None:
+        with self.conn.cursor() as cur:
+            for tid in (self.trip_id, self.other_trip_id):
+                cur.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (tid,))
+                cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (tid,))
+        self.conn.close()
+
+    def _bind(self, chat_id: str, trip_id: str, profile: str | None) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)"
+                " VALUES (%s, %s, %s, %s)",
+                (f"tcb_{secrets.token_hex(16)}", chat_id, trip_id, profile),
+            )
+
+    def _profile_of(self, chat_id: str) -> str | None:
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT hermes_profile FROM control_plane.telegram_chat_bindings"
+                " WHERE chat_id = %s AND closed_at IS NULL",
+                (chat_id,),
+            )
+            row = cur.fetchone()
+            return row["hermes_profile"] if row else None
+
+    def test_a_group_bound_before_the_companion_gets_it_afterwards(self) -> None:
+        # 2026-09-07, live: the organizer bound their family group with a token
+        # while the companion did not yet exist, so the row stored NULL. The
+        # companion arrived twenty minutes later on a retry and bound only the
+        # organizer's DM. The group answered "I'm still finishing your
+        # assistant" permanently, because nothing was going to finish it there.
+        self._bind("-1004305582269", self.trip_id, None)
+        adopted = attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan")
+        self.assertEqual(adopted, 1)
+        self.assertEqual(self._profile_of("-1004305582269"), "companion-japan")
+
+    def test_a_binding_that_already_has_a_profile_is_left_alone(self) -> None:
+        # Pointing at another profile is a decision, not a gap.
+        self._bind("391627336", self.trip_id, "companion-existing")
+        attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-new")
+        self.assertEqual(self._profile_of("391627336"), "companion-existing")
+
+    def test_another_trip_s_orphan_is_not_adopted(self) -> None:
+        # The one that would be a real leak: handing this trip's companion to a
+        # chat belonging to somebody else's trip.
+        self._bind("-100999", self.other_trip_id, None)
+        adopted = attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan")
+        self.assertEqual(adopted, 0)
+        self.assertIsNone(self._profile_of("-100999"))
+
+    def test_a_closed_binding_is_not_revived(self) -> None:
+        self._bind("-100888", self.trip_id, None)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "UPDATE control_plane.telegram_chat_bindings SET closed_at = now() WHERE chat_id = %s",
+                ("-100888",),
+            )
+        self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 0)
+
+    def test_every_waiting_chat_is_adopted_at_once(self) -> None:
+        for chat in ("-100111", "-100222", "391627336"):
+            self._bind(chat, self.trip_id, None)
+        self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 3)

@@ -277,3 +277,86 @@ test("an unrecognized operator_ type is skipped, not retried forever", { skip },
     try { await resetDb(cleanup); } finally { cleanup.release(); await pool.end(); }
   }
 });
+
+test("site-ready says only that, and mints no binding token", { skip }, async () => {
+  // The ordering bug this exists to prevent, live on 2026-09-07: the
+  // introduction was enqueued INSIDE the provisioning transaction while the
+  // companion installs AFTER it commits. The organizer received a group-binding
+  // token before there was any companion to bind to, bound their family group,
+  // and the binding stored NULL — answering "I'm still finishing your
+  // assistant" permanently.
+  //
+  // provisioning_complete now carries the URL and nothing else. It cannot
+  // introduce an assistant that does not exist yet, and it cannot hand out a
+  // token for one.
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const tripId = await insertTrip(pool);
+    await insertOutboxRow(pool, tripId, "provisioning_complete", "555000111", {
+      private_url: "https://example.test/trip",
+    });
+
+    const sent: Array<{ chatId: string; text: string }> = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { botUsername: "Kinerary_bot" });
+
+    assert.equal(sent.length, 1, "one message, not an introduction plus a token");
+    assert.match(sent[0]!.text, /https:\/\/example\.test\/trip/);
+    assert.doesNotMatch(sent[0]!.text, /KIN-/, "no binding token");
+
+    const { rowCount } = await pool.query(
+      "SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1",
+      [tripId],
+    );
+    assert.equal(rowCount, 0, "and none was minted");
+  } finally {
+    await pool.end();
+  }
+});
+
+test("companion-ready introduces the assistant and hands over the token", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const tripId = await insertTrip(pool);
+    await insertOutboxRow(pool, tripId, "companion_ready", "555000111", {
+      private_url: "https://example.test/trip",
+      assistant_name: "Rio",
+      trip_title: "Japan 2026",
+      trip_slug: "japan-2026",
+      language: "en",
+      login_password: "seed-pw",
+    });
+
+    const sent: Array<{ chatId: string; text: string }> = [];
+    await dispatchPendingTripNotifications(pool, {
+      async sendApprovalRequest() {},
+      async sendMessage(p) { sent.push(p); },
+    }, () => {}, { botUsername: "Kinerary_bot" });
+
+    // Two messages: the introduction, then the line to copy on its own.
+    assert.equal(sent.length, 2);
+    assert.match(sent[0]!.text, /Rio/);
+    assert.match(sent[0]!.text, /seed-pw/);
+    assert.match(sent[1]!.text, /^\/group KIN-/, "the copyable command, alone");
+
+    const { rowCount } = await pool.query(
+      "SELECT 1 FROM control_plane.telegram_group_binding_tokens WHERE trip_id = $1",
+      [tripId],
+    );
+    assert.equal(rowCount, 1, "exactly one live token for the trip");
+  } finally {
+    await pool.end();
+  }
+});

@@ -275,6 +275,42 @@ class BindingRefused(Exception):
         self.requested_trip_id = requested_trip_id
 
 
+def attach_profile_to_orphan_bindings(
+    conn: psycopg.Connection, trip_id: str, hermes_profile: str
+) -> int:
+    """Gives the trip's companion to every open binding that has none.
+
+    A binding can legitimately exist without a profile (migration 0043): routing
+    and the assistant behind it are separate components. The gap is what happens
+    when the profile arrives LATER — nothing went back for the bindings made
+    before it.
+
+    Live on 2026-09-07: the organizer bound their family group with a token
+    while the companion did not yet exist, so the row stored NULL. The companion
+    was installed twenty minutes later, on a retry, and bound only the
+    organizer's DM. The group kept answering "I'm still finishing your
+    assistant" — honestly, and permanently, because nothing was ever going to
+    finish it for that chat.
+
+    One companion serves every chat on its trip, so a binding orphaned by
+    ordering is simply out of date. Scoped to this trip's OWN open bindings, and
+    only those with no profile: a chat pointing at some other profile is a
+    decision, not a gap, and is left alone.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE control_plane.telegram_chat_bindings
+               SET hermes_profile = %s
+             WHERE trip_id = %s
+               AND closed_at IS NULL
+               AND hermes_profile IS NULL
+            """,
+            (hermes_profile, trip_id),
+        )
+        return cur.rowcount or 0
+
+
 def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
@@ -751,6 +787,32 @@ class ProvisionerWorker:
             f"no free slug for base {base!r} after {SLUG_COLLISION_LIMIT} attempts"
         )
 
+    def _enqueue_companion_intro(
+        self,
+        conn: "psycopg.Connection",
+        trip_id: str,
+        recipient_chat_id: str,
+        intro_facts: dict,
+    ) -> None:
+        """Queues the organizer's companion introduction.
+
+        Separate from `provisioning_complete` on purpose: that one says the SITE
+        is ready and is true the moment the deploy lands. This one says the
+        ASSISTANT is ready and hands over a token for binding a group to it, so
+        it must not exist until the companion does.
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO control_plane.notification_outbox
+                  (id, trip_id, kind, recipient, payload, signup_request_id,
+                   notification_type, adapter, state)
+                VALUES (%s, %s, 'companion_ready', %s, %s::jsonb,
+                        NULL, 'companion_ready', 'provisioner', 'pending')
+                """,
+                (_generate_notif_id(), trip_id, recipient_chat_id, json.dumps(intro_facts)),
+            )
+
     def _load_intake_language(
         self, conn: psycopg.Connection, intake_version_id: str
     ) -> str | None:
@@ -930,6 +992,12 @@ class ProvisionerWorker:
                 # it. Absent, the wording falls back to "log in from the site".
                 agent_cfg = config.get("agent") or {}
                 meta_cfg = config.get("meta") or {}
+                # NOT enqueued here. See the companion block below: the
+                # introduction hands over a group-binding token, and a token
+                # that exists before the companion does is a race the organizer
+                # loses — they bind a group to a trip with no assistant, and the
+                # binding stores NULL forever. Enqueued after the companion is
+                # actually bound instead.
                 intro_facts = {
                     "private_url": private_url,
                     "assistant_name": agent_cfg.get("name"),
@@ -940,7 +1008,11 @@ class ProvisionerWorker:
                     "login_password": self._seed_password or None,
                     "proactive": agent_cfg.get("proactive") or {},
                 }
-                notif_payload = json.dumps(intro_facts)
+                # The site-ready line only. Without `assistant_name` the
+                # dispatcher words this as the plain "your trip site is ready",
+                # which is exactly what is true at this point: the site is up,
+                # the assistant is not yet.
+                notif_payload = json.dumps({"private_url": private_url})
 
                 # The same facts kept on the trip (migration 0044), because the
                 # GROUP introduction cannot be composed now — there is no group
@@ -1102,6 +1174,28 @@ class ProvisionerWorker:
             try:
                 outcome = bind_chat_to_trip(conn, recipient_chat_id, trip_id, hermes_profile)
                 if hermes_profile:
+                    # Every OTHER chat already bound to this trip and still
+                    # waiting for a companion — a family group bound by token
+                    # before the profile existed, most often. Without this they
+                    # answer COMPANION_PENDING for good.
+                    adopted = attach_profile_to_orphan_bindings(conn, trip_id, hermes_profile)
+                    if adopted:
+                        logger.info("provisioner.orphan_bindings_adopted", extra={
+                            "trip_id": trip_id, "count": adopted,
+                        })
+                    # NOW the introduction, because now there is something to
+                    # introduce. It carries a group-binding token, and a token
+                    # delivered before this point lets the organizer bind a
+                    # group to a trip with no assistant — which stores NULL and
+                    # answers COMPANION_PENDING for good. Live on 2026-09-07.
+                    #
+                    # A companion that never installs therefore sends no
+                    # introduction at all: the organizer gets the site-ready
+                    # message and nothing that claims an assistant is waiting
+                    # for them.
+                    self._enqueue_companion_intro(
+                        conn, trip_id, recipient_chat_id, intro_facts,
+                    )
                     logger.info("provisioner.companion_profile_bound", extra={
                         "trip_id": trip_id,
                         "hermes_profile": hermes_profile,

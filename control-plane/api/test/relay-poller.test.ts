@@ -15,7 +15,9 @@ import {
 } from "../src/chat-router.js";
 import { getSessionForChat } from "../src/interview.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
-import { applyDecision, startTripBotPoller } from "../src/relay/poller.js";
+import { applyDecision, startTripBotPoller,
+  combineBurst,
+} from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
@@ -539,5 +541,73 @@ describe("when the trip bot IS the signup bot", () => {
       const session = await getSessionForChat(fix.pool, "700100050");
       assert.equal(session.ok && session.view.nextQuestion?.id, "destination");
     });
+  });
+});
+
+describe("combining a burst of messages into one turn", () => {
+  // The pure part of flushSettledInboundBursts: what several inbound events
+  // become when the organizer sends them in one go. Extracted so the shape can
+  // be asserted without a database, a socket or a settle window.
+  const ev = (text: string, files: string[] = []): WireMessageEvent => ({
+    text,
+    message_type: files.length ? "document" : "text",
+    source: {
+      platform: "telegram", chat_id: "391627336", chat_type: "dm", chat_name: null,
+      user_id: "77", user_name: "Dror", thread_id: null, chat_topic: null, profile: "trip-intake",
+    },
+    ...(files.length
+      ? {
+          media_urls: files.map((f) => `http://127.0.0.1:4312/relay/media/${f}`),
+          media: files.map((f) => ({ kind: "document" as const, mime: "text/markdown", size: 10, filename: `${f}.md` })),
+        }
+      : {}),
+  });
+
+  test("every uploaded file survives, in the order they were sent", () => {
+    // 2026-09-07, live: the organizer uploaded five files describing their
+    // trip. The combiner kept the media of the LAST event that had any and
+    // discarded the rest, so the agent received one document and answered about
+    // one document. From the organizer's side it read as the assistant
+    // ignoring four files it had visibly accepted.
+    const combined = combineBurst([
+      ev("here is the plan", ["aaa"]),
+      ev("", ["bbb"]),
+      ev("", ["ccc"]),
+      ev("and the flights", ["ddd"]),
+      ev("", ["eee"]),
+    ]);
+    assert.equal(combined?.media_urls?.length, 5, "all five files reach the agent");
+    assert.equal(combined?.media?.length, 5);
+    assert.match(combined!.media_urls![0]!, /aaa$/, "and in upload order");
+    assert.match(combined!.media_urls![4]!, /eee$/);
+  });
+
+  test("text from every message is kept, blank ones skipped", () => {
+    const combined = combineBurst([ev("first"), ev(""), ev("second")]);
+    assert.equal(combined?.text, "first\nsecond");
+  });
+
+  test("a burst with no files carries no media keys at all", () => {
+    const combined = combineBurst([ev("just talking"), ev("more")]);
+    assert.equal(combined?.media_urls, undefined);
+    assert.equal(combined?.media, undefined);
+  });
+
+  test("a mix of files and plain messages keeps both", () => {
+    const combined = combineBurst([ev("look at this", ["aaa"]), ev("what do you think?")]);
+    assert.equal(combined?.media_urls?.length, 1);
+    assert.equal(combined?.text, "look at this\nwhat do you think?");
+  });
+
+  test("an empty burst combines to nothing", () => {
+    assert.equal(combineBurst([]), null);
+  });
+
+  test("the combined event keeps the LAST message's identity", () => {
+    // message_id and reply context come from the most recent message: that is
+    // the one the organizer is actually looking at.
+    const combined = combineBurst([ev("older"), ev("newest", ["zzz"])]);
+    assert.equal(combined?.source.chat_id, "391627336");
+    assert.equal(combined?.message_type, "document");
   });
 });

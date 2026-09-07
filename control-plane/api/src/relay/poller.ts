@@ -620,6 +620,46 @@ async function applyInterviewCallback(
  * rare case, and whichever one is freshest is the one worth keeping if more
  * than one somehow lands in the same window.
  */
+/**
+ * Folds a settled burst of inbound messages into the single event the agent
+ * sees.
+ *
+ * The organizer sends several things in one go — a sentence, then four files,
+ * then another sentence — and each arrives as its own Telegram update. They are
+ * one utterance, so they become one turn.
+ *
+ * EVERY FILE IS KEPT. Until 2026-09-07 this took the media of the last event
+ * that had any and discarded the rest: an organizer who uploaded five documents
+ * describing their trip had four silently dropped, and the assistant answered
+ * about one. From their side it read as being ignored, on files the bot had
+ * visibly accepted.
+ *
+ * Identity comes from the LAST message — that is the one the organizer is
+ * looking at — while text and media accumulate across all of them, in the order
+ * they were sent.
+ */
+export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEvent | null {
+  const last = events[events.length - 1];
+  if (!last) return null;
+
+  const mediaUrls = events.flatMap((e) => e.media_urls ?? []);
+  const media = events.flatMap((e) => e.media ?? []);
+  const text = events
+    .map((e) => e.text)
+    .filter((t) => t.trim().length > 0)
+    .join("\n");
+
+  return {
+    ...last,
+    text,
+    // Absent rather than empty when nothing was attached: an empty array is a
+    // claim that media was considered, and downstream reads `?.length` either
+    // way.
+    ...(mediaUrls.length ? { media_urls: mediaUrls } : {}),
+    ...(media.length ? { media } : {}),
+  };
+}
+
 export async function flushSettledInboundBursts(
   deps: TripBotPollerDeps,
   log: (line: string) => void,
@@ -637,18 +677,8 @@ export async function flushSettledInboundBursts(
   for (const burst of bursts) {
     try {
       const events = burst.events as WireMessageEvent[];
-      const last = events[events.length - 1];
-      if (!last) continue;
-      const withMedia = [...events].reverse().find((e) => (e.media_urls?.length ?? 0) > 0);
-      const text = events
-        .map((e) => e.text)
-        .filter((t) => t.trim().length > 0)
-        .join("\n");
-      const combined: WireMessageEvent = {
-        ...last,
-        text,
-        ...(withMedia ? { media_urls: withMedia.media_urls, media: withMedia.media } : {}),
-      };
+      const combined = combineBurst(events);
+      if (!combined) continue;
 
       log(structuredLog("info", "trip_bot.inbound_burst_flushed", {
         session_id: burst.sessionId,
@@ -658,6 +688,14 @@ export async function flushSettledInboundBursts(
       // Same ordering as the old single-message path: the turn opens BEFORE
       // the event goes out, so the agent may call back the moment it is
       // handed the turn without racing a turn opened afterward.
+      // A burst carrying files is a document turn, and gets the wider floor —
+      // more so than a single upload, since the agent now has several to read.
+      // This path builds its own event rather than going through
+      // `applyDecision`, so it has to say so itself; without this the five-file
+      // burst above ran on the ordinary 30-second budget.
+      if ((combined.media_urls?.length ?? 0) > 0) {
+        await markAwaitingMachine(deps.db, burst.chatId, DOCUMENT_FLOOR_SECONDS);
+      }
       const turn = await openAgentTurn(deps.db, burst.chatId, burst.sessionId);
       const delivered = deps.connector.pushInbound(combined);
       if (delivered) {

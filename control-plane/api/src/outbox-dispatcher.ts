@@ -74,13 +74,22 @@ function operatorMessageTextFor(row: OutboxRow): string | null {
  */
 function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | string[] | null {
   if (row.notification_type.startsWith("operator_")) return operatorMessageTextFor(row);
-  if (row.notification_type === "provisioning_complete") {
+  if (row.notification_type === "provisioning_complete" || row.notification_type === "companion_ready") {
     const url = row.payload && typeof row.payload.private_url === "string" ? row.payload.private_url : null;
     if (!url) return null;
-    // The full introduction when the provisioner supplied the facts for one,
-    // and the original one-liner when it did not. Rows enqueued before this
-    // existed carry only `private_url`, and they still have to send something
-    // rather than being skipped for missing fields they were never given.
+    // Two different pieces of news, and the difference matters to the
+    // organizer. `provisioning_complete` says the SITE is up — true the moment
+    // the deploy lands, and all it carries is the URL. `companion_ready` says
+    // the ASSISTANT is up, and is the only one that introduces itself and hands
+    // over a group-binding token, because it is the only one enqueued after a
+    // companion actually exists.
+    //
+    // A trip whose companion never installs therefore gets the first message
+    // and not the second: no introduction claiming an assistant is waiting, and
+    // no token to bind a group to a trip that has none.
+    //
+    // The `assistant_name` test also carries the back-compat case: rows written
+    // before any of this exist with only `private_url`, and still send.
     const assistantName = payloadString(row, "assistant_name");
     if (!assistantName) return `Your trip site is ready: ${url}`;
     return organizerIntroMessages({
@@ -160,8 +169,11 @@ export async function dispatchPendingTripNotifications(
     // DM is the organizer's own Telegram user id. That is what later makes a
     // forwarded token useless: only this recipient can redeem it.
     let groupBindingToken: string | null = null;
+    // Only the companion introduction carries a token — the site-ready message
+    // must never mint one, because at that point there is no companion for a
+    // bound group to reach.
     if (
-      row.notification_type === "provisioning_complete"
+      row.notification_type === "companion_ready"
       && row.trip_id
       && row.recipient
       && typeof row.payload?.assistant_name === "string"

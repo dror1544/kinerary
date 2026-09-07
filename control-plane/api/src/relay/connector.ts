@@ -36,6 +36,32 @@ import {
 } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
 
+/**
+ * A `Content-Disposition` value that Node will actually accept.
+ *
+ * Node throws ERR_INVALID_CHAR for any non-ASCII byte in a header value, and
+ * this header is built from a filename the ORGANIZER chose and Telegram
+ * carried. On 2026-09-07 that was a Hebrew filename on an uploaded trip plan:
+ * the throw happened inside the HTTP request handler, took the whole relay
+ * process down, and the bot went silent mid-interview with nothing in the
+ * interview logs to explain it — the failure was in the media plane, triggered
+ * by the gateway fetching a document the organizer had uploaded successfully.
+ *
+ * RFC 6266 already answers this: `filename` is the ASCII-only fallback and
+ * `filename*` carries the real name as percent-encoded UTF-8. Both are sent.
+ *
+ * Also strips the characters that would let a filename escape its own header —
+ * quotes end the quoted-string early, CR/LF inject a header outright.
+ */
+export function contentDispositionFor(filename: string | undefined): string {
+  const name = (filename ?? "").trim();
+  if (!name) return "attachment";
+  // The ASCII fallback: printable ASCII only, minus the quoting hazards.
+  const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "");
+  const extended = encodeURIComponent(name);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${extended}`;
+}
+
 /** Close codes. 4401 is the contract's "unauthorized"; the gateway keys revocation off it. */
 const CLOSE_UNAUTHORIZED = 4401;
 
@@ -147,9 +173,7 @@ export class RelayConnector {
         res.writeHead(200, {
           "content-type": entry.mime || "application/octet-stream",
           "content-length": String(entry.bytes.length),
-          ...(entry.filename
-            ? { "content-disposition": `attachment; filename="${entry.filename.replace(/"/g, "")}"` }
-            : {}),
+          "content-disposition": contentDispositionFor(entry.filename),
         });
         res.end(entry.bytes);
         return;
