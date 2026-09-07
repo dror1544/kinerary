@@ -116,3 +116,33 @@ export function detectInternalLeak(text: string): LeakVerdict {
   if (idMatch) return { leaks: true, term: `\`${idMatch[1]}\`` };
   return { leaks: false };
 }
+
+/**
+ * Whether the agent's own wording is in the language the interview is being
+ * held in.
+ *
+ * The interviewer is told, firmly and repeatedly, to hold one language for the
+ * whole conversation. It mostly does — and then a provider rate-limits, the
+ * fallback model takes over mid-interview, and the organizer starts getting
+ * English in a Hebrew conversation. Run 15 reported exactly that: "some of the
+ * messages from the bot came in English."
+ *
+ * The router's own copy is fully localised, so this only ever concerns text the
+ * AGENT supplied — a `say`, or the phrasing it attached to a question it
+ * nominated. When that text is in the wrong language the router has a correct
+ * translation of its own to fall back on, which is better than passing through
+ * a sentence the organizer cannot read.
+ *
+ * Deliberately crude, and only in the direction that is safe. A Hebrew
+ * interview whose agent text contains NO Hebrew letters at all is wrong —
+ * place names, confirmation numbers and the odd English word are normal, but a
+ * whole sentence without a single Hebrew character is not a sentence in
+ * Hebrew. The reverse is not checked: Hebrew appearing in an English interview
+ * is far more likely to be a traveller's name than a language slip.
+ */
+export function agentTextIsInLanguage(text: string, language: string): boolean {
+  if (language !== "he") return true;
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  return /[\u0590-\u05FF]/.test(trimmed);
+}

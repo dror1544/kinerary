@@ -10,6 +10,7 @@ import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
+import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -336,6 +337,14 @@ describe("chat-addressed session writes", () => {
             return_date: { kind: "text", schema_version: 2, text: "2026-09-13" },
             travelers: { kind: "structured", schema_version: 2, data: [{ name: "Dror" }] },
             phases: { kind: "structured", schema_version: 2, data: [{ name: "Tokyo" }] },
+            bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+            bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+            bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+            // The assistant's identity became required on 2026-09-07, so a
+            // session that can confirm has to carry it.
+            bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+            bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+            bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
           }),
           "700002004",
         ],
@@ -533,5 +542,37 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       );
       assert.equal(decision.kind, "ignore");
     });
+  });
+});
+
+describe("the agent answering in the wrong language", () => {
+  test("Hebrew interview, Hebrew agent text — kept", () => {
+    assert.equal(agentTextIsInLanguage("רשמתי, ממשיכים", "he"), true);
+  });
+
+  test("Hebrew interview, all-English agent text — rejected", () => {
+    // Run 15: "some of the messages from the bot came in English", in an
+    // interview held entirely in Hebrew, after a rate-limit swapped the model
+    // mid-conversation. The router's own copy is fully localised, so falling
+    // back to it beats passing through a sentence the organizer cannot read.
+    assert.equal(agentTextIsInLanguage("Got it — what pace suits you?", "he"), false);
+  });
+
+  test("a Hebrew sentence carrying English words is still Hebrew", () => {
+    // Place names, confirmation numbers and the odd English word are normal.
+    // The test is whether ANY Hebrew is present, not whether all of it is.
+    assert.equal(agentTextIsInLanguage("רשמתי את OMO3 Asakusa ל-19/9", "he"), true);
+  });
+
+  test("an English interview is never second-guessed", () => {
+    // The reverse direction is not checked: Hebrew inside an English interview
+    // is far more likely to be a traveller's name than a language slip.
+    assert.equal(agentTextIsInLanguage("משפחת סולומון is confirmed", "en"), true);
+    assert.equal(agentTextIsInLanguage("plain english", "en"), true);
+  });
+
+  test("empty text is not a language failure", () => {
+    assert.equal(agentTextIsInLanguage("", "he"), true);
+    assert.equal(agentTextIsInLanguage("   ", "he"), true);
   });
 });

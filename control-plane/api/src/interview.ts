@@ -175,6 +175,68 @@ function hasNamedTraveler(data: unknown): boolean {
   });
 }
 
+/**
+ * An IANA timezone for a destination the organizer described in their own words.
+ *
+ * The `timezone` question derives from `destination` rather than asking someone
+ * who just said where they are going. Until 2026-09-07 that derivation copied
+ * the destination TEXT — so a trip to "Japan — Tokyo, Hakone, Kyoto, Osaka"
+ * stored that whole phrase as its timezone, which is not a timezone, and every
+ * consumer downstream got a string it could not use. Run 15 reported it simply
+ * as "it did not resolve the time zone".
+ *
+ * Deliberately a lookup rather than a guess. Returning null when nothing matches
+ * leaves the question outstanding for the interviewer to ask, which is the
+ * recoverable outcome; inventing a plausible zone would silently show every time
+ * on the trip in the wrong one.
+ *
+ * Matched on the destination text in either script, longest key first so
+ * "New York" wins over "York" and a city beats its country.
+ */
+const DESTINATION_ZONES: ReadonlyArray<readonly [string, string]> = [
+  // Japan
+  ["tokyo", "Asia/Tokyo"], ["kyoto", "Asia/Tokyo"], ["osaka", "Asia/Tokyo"],
+  ["hakone", "Asia/Tokyo"], ["japan", "Asia/Tokyo"], ["יפן", "Asia/Tokyo"],
+  ["טוקיו", "Asia/Tokyo"],
+  // United States — by zone, because the country spans several
+  ["new york", "America/New_York"], ["boston", "America/New_York"],
+  ["washington", "America/New_York"], ["orlando", "America/New_York"],
+  ["miami", "America/New_York"], ["ניו יורק", "America/New_York"],
+  ["chicago", "America/Chicago"], ["dallas", "America/Chicago"],
+  ["houston", "America/Chicago"], ["austin", "America/Chicago"],
+  ["denver", "America/Denver"], ["phoenix", "America/Phoenix"],
+  ["las vegas", "America/Los_Angeles"], ["los angeles", "America/Los_Angeles"],
+  ["san francisco", "America/Los_Angeles"], ["seattle", "America/Los_Angeles"],
+  ["לאס וגאס", "America/Los_Angeles"], ["לוס אנג'לס", "America/Los_Angeles"],
+  ["hawaii", "Pacific/Honolulu"], ["honolulu", "Pacific/Honolulu"],
+  // Europe
+  ["london", "Europe/London"], ["paris", "Europe/Paris"], ["rome", "Europe/Rome"],
+  ["milan", "Europe/Rome"], ["barcelona", "Europe/Madrid"], ["madrid", "Europe/Madrid"],
+  ["amsterdam", "Europe/Amsterdam"], ["berlin", "Europe/Berlin"],
+  ["athens", "Europe/Athens"], ["greece", "Europe/Athens"], ["יוון", "Europe/Athens"],
+  ["לונדון", "Europe/London"], ["פריז", "Europe/Paris"], ["רומא", "Europe/Rome"],
+  // Home
+  ["israel", "Asia/Jerusalem"], ["ישראל", "Asia/Jerusalem"],
+  ["tel aviv", "Asia/Jerusalem"], ["תל אביב", "Asia/Jerusalem"],
+  // Elsewhere this product has seen
+  ["thailand", "Asia/Bangkok"], ["bangkok", "Asia/Bangkok"],
+  ["dubai", "Asia/Dubai"], ["cyprus", "Asia/Nicosia"],
+  ["georgia", "Asia/Tbilisi"], ["tbilisi", "Asia/Tbilisi"],
+];
+
+export function ianaZoneFor(destination: string | null | undefined): string | null {
+  const haystack = (destination ?? "").toLowerCase();
+  if (!haystack.trim()) return null;
+  let best: { key: string; zone: string } | null = null;
+  for (const [key, zone] of DESTINATION_ZONES) {
+    if (!haystack.includes(key)) continue;
+    // Longest match wins: a city is more specific than its country, and
+    // "new york" must not lose to a shorter accidental substring.
+    if (!best || key.length > best.key.length) best = { key, zone };
+  }
+  return best?.zone ?? null;
+}
+
 export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "trip_type",
@@ -240,8 +302,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     derive: (answers) => {
       const destination = answers.destination;
       if (!destination || destination.kind !== "text") return null;
-      const place = destination.text.trim();
-      return place.length > 0 ? place : null;
+      return ianaZoneFor(destination.text);
     },
   },
   {
@@ -340,6 +401,13 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     required: false,
   },
   {
+    // The assistant's name, voice and tone are REQUIRED as of 2026-09-07, at the
+    // organizer's request after run 15: "bot personality is important questions
+    // and not optional". They are also load-bearing rather than decorative —
+    // `build_companion_handoff` returns None without a name, so an unanswered
+    // bot_name means no companion is built at all, and the trip arrives as a
+    // site with nothing behind it. Asking for three short taps is cheaper than
+    // that outcome.
     id: "bot_name",
     type: "text",
     // "the name the family would actually type" is literal: it becomes the
@@ -351,7 +419,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt:
       "What should the trip assistant be called? Give the name the family would actually type — if your group writes in two languages, give both (for example: בוטסאן / Botsan).",
     maxLength: 80,
-    required: false,
+    required: true,
   },
   {
     // Hebrew conjugates verbs by gender, so the assistant cannot form a
@@ -365,7 +433,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       { id: "female", label: "Female" },
       { id: "neutral", label: "Neither — avoid gendered phrasing" },
     ],
-    required: false,
+    required: true,
     // A fixed three-way pick with no bearing on anything else already
     // answered — nothing here needs the agent's judgment. See `routerOwned`.
     routerOwned: true,
@@ -379,7 +447,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       { id: "playful", label: "Playful" },
       { id: "dry", label: "Dry" },
     ],
-    required: false,
+    required: true,
     routerOwned: true,
   },
   {

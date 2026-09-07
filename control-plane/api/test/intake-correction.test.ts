@@ -49,6 +49,9 @@ const JAPAN_ANSWERS = {
   return_date: { kind: "text", schema_version: 1, text: "2026-09-20" },
   travelers: { kind: "structured", schema_version: 1, data: [{ name: "Eitan", age: 52, family: "Sagi" }] },
   phases: { kind: "structured", schema_version: 1, data: [{ name: "Tokyo", start: "2026-09-06", end: "2026-09-20" }] },
+  bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+  bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+  bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
 };
 
 const CORRECTED_ANSWERS = {

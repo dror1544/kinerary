@@ -418,6 +418,16 @@ async function agentRecords(
  * progress — a loop that silently gives up would turn "the interview dead-ends"
  * into a passing test, which is the run-6 defect wearing a disguise.
  */
+/**
+ * Option ids for required CHOICE questions, used when the script has not put
+ * buttons on screen for them this turn. bot_gender and bot_tone became required
+ * on 2026-09-07; both are choice questions, so free text is not an answer.
+ */
+const CHOSEN_OPTIONS: Record<string, string> = {
+  bot_gender: "neutral",
+  bot_tone: "warm",
+};
+
 async function answerEverythingRequired(fix: Fixture): Promise<void> {
   // What the organizer would have typed, and the stubbed agent extracts. The
   // router refuses typed answers outright when no interviewer is configured
@@ -430,6 +440,9 @@ async function answerEverythingRequired(fix: Fixture): Promise<void> {
     return_date: "2026-10-03",
     travelers: [{ name: "Dror", age: 44, household: "Elul" }, { name: "Noa", age: 12, household: "Elul" }],
     phases: [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-26" }],
+    // Required as of 2026-09-07. bot_gender and bot_tone are choice questions
+    // and go through the tap path above; only the name is typed.
+    bot_name: "Rio",
   };
 
   for (let guard = 0; guard < 40; guard += 1) {
@@ -442,6 +455,15 @@ async function answerEverythingRequired(fix: Fixture): Promise<void> {
     const button = line?.questionId === next.id ? line.buttons.find((b) => b.startsWith("a:")) : undefined;
     if (button) {
       await turn(fix, taps(fix, button));
+      fix.script.noteAnswered(next.id);
+      continue;
+    }
+    // A choice question the script did not put buttons on this turn still has
+    // to be answerable, and its answer is an option id rather than free text.
+    const chosen = CHOSEN_OPTIONS[next.id];
+    if (chosen) {
+      const result = await submitAnswerForChat(fix.pool, fix.chat, next.id, chosen);
+      assert.ok(result.ok, `the stubbed agent could not record ${next.id}: ${JSON.stringify(result)}`);
       fix.script.noteAnswered(next.id);
       continue;
     }
@@ -1816,14 +1838,18 @@ describe("Track 8 — deterministic question progression", () => {
     );
   }
 
-  test("bot_gender is asked by the router directly, skipping past unanswered non-router-owned optionals", { skip: SKIP }, async () => {
+  test("bot_proactive is asked by the router directly, skipping past unanswered non-router-owned optionals", { skip: SKIP }, async () => {
     // Not via the More button — "More" is the organizer explicitly asking to
     // see the next optional thing, and it starts from the top of the list on
     // purpose (trip_interests first). Track 8's own proactive advancement is
-    // a separate, independent path: it reaches bot_gender even though
+    // a separate, independent path: it reaches bot_proactive even though
     // trip_interests, travel_anchors, constraints, trip_pace and dietary are
     // ALL still unanswered and earlier in declared order — because none of
-    // those are router-owned, and bot_gender is.
+    // those are router-owned, and bot_proactive is.
+      //
+      // Was bot_gender until 2026-09-07, when the assistant identity became
+      // required and so is already answered here. bot_proactive is the
+      // router-owned question that is still optional.
     await withConversation(async (fix) => {
       await open(fix);
       await turn(fix, taps(fix, "c:nodoc"));
@@ -1842,7 +1868,7 @@ describe("Track 8 — deterministic question progression", () => {
         { db: fix.pool, telegram: fix.script, connector: fix.connector }, DEFAULT_STRINGS, () => {},
       );
 
-      assert.equal(fix.script.last?.questionId, "bot_gender", "asked directly — no nomination happened anywhere above");
+      assert.equal(fix.script.last?.questionId, "bot_proactive", "asked directly — no nomination happened anywhere above");
       fix.script.check();
     });
   });
@@ -1901,7 +1927,10 @@ describe("Track 8 — deterministic question progression", () => {
         () => {},
       );
 
-      assert.equal(fix.script.last?.questionId, "bot_gender", "dead air filled, document turn untouched");
+      // bot_proactive since 2026-09-07: the identity questions became required
+      // and are answered before this point, so the router-owned question still
+      // outstanding here is the proactive one.
+      assert.equal(fix.script.last?.questionId, "bot_proactive", "dead air filled, document turn untouched");
       fix.script.check();
     });
   });

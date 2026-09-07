@@ -303,6 +303,9 @@ describe("the confirm button is a real confirmation", () => {
       return_date: { kind: "text", schema_version: 2, text: "2026-09-13" },
       travelers: { kind: "structured", schema_version: 2, data: [{ name: "Dror" }] },
       phases: { kind: "structured", schema_version: 2, data: [{ name: "Tokyo" }] },
+      bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+      bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+      bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
     };
     await fix.pool.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = 'awaiting_confirmation' WHERE telegram_chat_id = $2",

@@ -71,6 +71,7 @@ import {
   type DispatchStrings,
 } from "./dispatch.js";
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
+import { agentTextIsInLanguage } from "./internal-leak.js";
 import type { WireMessageEvent } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
 
@@ -1152,9 +1153,23 @@ async function sendNextStep(
     // agent's words for this same moment, so they belong in one message in
     // the order they were written — exactly what nominateQuestionForChat
     // produces when it wins its race, produced here whether it did or not.
-    const phrasing = leadIn && nominated
+    const agentPhrasing = leadIn && nominated
       ? `${leadIn}\n\n${nominated}`
       : leadIn ?? nominated;
+    // The agent's words, unless they are in the wrong language. The router's own
+    // copy is fully localised, so falling back to it beats passing through a
+    // sentence the organizer cannot read. Run 15: "some of the messages from the
+    // bot came in English" — in an interview held entirely in Hebrew, after a
+    // rate-limit swapped the model mid-conversation.
+    const wrongLanguage = agentPhrasing !== null && agentPhrasing !== undefined
+      && !agentTextIsInLanguage(agentPhrasing, view.language);
+    if (wrongLanguage) {
+      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.agent_phrasing_dropped", {
+        reason: "WRONG_LANGUAGE",
+        language: view.language,
+      }));
+    }
+    const phrasing = wrongLanguage ? null : agentPhrasing;
     const rendered = renderQuestion(
       question,
       selectedOptionIds(view, question.id),

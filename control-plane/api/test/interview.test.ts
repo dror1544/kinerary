@@ -30,6 +30,7 @@ import {
   skipQuestionForChat,
   toggleMultiChoiceForChat,
   getSessionStatus,
+  ianaZoneFor,
 } from "../src/interview.js";
 import { applyMigrations } from "../src/migrations.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -293,12 +294,26 @@ describe("validateAnswer (unit)", () => {
     }
   });
 
-  test("every question added in schema v2 is optional", () => {
-    // A required question here would block confirmation for an organizer who
-    // simply doesn't want an assistant yet.
+  test("the schema-v2 questions that do not shape the assistant stay optional", () => {
+    // ORIGINALLY: every v2 question was optional, because "a required question
+    // here would block confirmation for an organizer who simply doesn't want an
+    // assistant yet."
+    //
+    // CHANGED 2026-09-07, at the organizer's request after run 15 ("bot
+    // personality is important questions and not optional"). The premise had
+    // been overtaken: a trip without an assistant is no longer a supported
+    // shape of this product but a broken one. `build_companion_handoff` returns
+    // None without a name, so an unanswered bot_name means no companion is
+    // built and the trip arrives as a site with nothing behind it — which run
+    // 14 spent an hour diagnosing as ORGANIZER_UNRESOLVED.
+    //
+    // bot_name / bot_gender / bot_tone are therefore required. The rest stay
+    // optional, and the reason still holds for them: proactive scheduling and
+    // standing limits are refinements, and an organizer who skips them still
+    // gets a working assistant.
     for (const id of [
       "trip_pace", "dietary", "dietary_scope", "organizer_identity",
-      "bot_name", "bot_gender", "bot_tone", "bot_proactive", "bot_limits",
+      "bot_proactive", "bot_limits",
     ]) {
       const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
       assert.ok(q, `${id} must exist`);
@@ -506,6 +521,12 @@ async function answerAllRequiredQuestions(pool: pg.Pool, sessionToken: string): 
   await submitAnswer(pool, sessionToken, "travelers", null, undefined, undefined, [
     { name: "Test Traveler", age: 30, family: "Test" },
   ]);
+  // The assistant's identity became REQUIRED on 2026-09-07 (see the note on
+  // bot_name in interview.ts), so answering "everything required" now includes
+  // it.
+  await submitAnswer(pool, sessionToken, "bot_name", "Rio");
+  await submitAnswer(pool, sessionToken, "bot_gender", "neutral");
+  await submitAnswer(pool, sessionToken, "bot_tone", "warm");
   await submitAnswer(pool, sessionToken, "phases", null, undefined, undefined, [
     { name: "Test City", start: "2026-09-06", end: "2026-09-20" },
   ]);
@@ -685,7 +706,9 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       if (!started.ok) throw new Error("unreachable");
 
       const ids = started.view.optionalRemaining.map((q) => q.id);
-      for (const expected of ["dietary", "trip_pace", "bot_name", "bot_limits", "timezone"]) {
+      // bot_name/gender/tone moved to REQUIRED on 2026-09-07, so they belong to
+      // nextQuestion now rather than this list.
+      for (const expected of ["dietary", "trip_pace", "bot_proactive", "bot_limits", "timezone"]) {
         assert.ok(ids.includes(expected), `optionalRemaining must include ${expected}, got ${ids.join(", ")}`);
       }
       assert.ok(!ids.includes("destination"), "required questions belong to nextQuestion, not this list");
@@ -1252,7 +1275,12 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       await submitAnswer(fix.pool, sessionToken, "departure_date", "2026-09-06");
       await submitAnswer(fix.pool, sessionToken, "return_date", "2026-09-20");
       await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [{ name: "Test", age: 30, family: "Test" }]);
-      const last = await submitAnswer(fix.pool, sessionToken, "phases", null, undefined, undefined, [{ name: "Test City", start: "2026-09-06", end: "2026-09-20" }]);
+      await submitAnswer(fix.pool, sessionToken, "phases", null, undefined, undefined, [{ name: "Test City", start: "2026-09-06", end: "2026-09-20" }]);
+      // The assistant's identity is required as of 2026-09-07, so it is part of
+      // "all required questions" and one of these is now the last.
+      await submitAnswer(fix.pool, sessionToken, "bot_name", "Rio");
+      await submitAnswer(fix.pool, sessionToken, "bot_gender", "neutral");
+      const last = await submitAnswer(fix.pool, sessionToken, "bot_tone", "warm");
 
       assert.equal(last.ok, true);
       if (!last.ok) throw new Error("unreachable");
@@ -1638,5 +1666,56 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
     } finally {
       await teardownFixture(fix);
     }
+  });
+});
+
+describe("deriving a timezone from what the organizer said", () => {
+  test("resolves a real IANA zone, not the destination text", () => {
+    // Run 15, live: "it did not resolve the time zone". The derivation copied
+    // the destination TEXT, so a trip to "Japan — Tokyo, Hakone, Kyoto, Osaka"
+    // stored that whole phrase as its timezone. Not a timezone, and unusable by
+    // everything downstream.
+    assert.equal(ianaZoneFor("Japan — Tokyo, Hakone, Kyoto, Osaka"), "Asia/Tokyo");
+    assert.equal(ianaZoneFor("New York"), "America/New_York");
+    assert.equal(ianaZoneFor("Hawaii"), "Pacific/Honolulu");
+  });
+
+  test("a city beats the country it is in", () => {
+    // The US spans several zones, so "USA" alone is not answerable but
+    // "Chicago" is. Longest match wins.
+    assert.equal(ianaZoneFor("Chicago, USA"), "America/Chicago");
+    assert.equal(ianaZoneFor("Kyoto, Japan"), "Asia/Tokyo");
+  });
+
+  test("reads Hebrew destinations too", () => {
+    // The organizer answers in their own language; the destination is data, not
+    // a language signal, and it must still resolve.
+    assert.equal(ianaZoneFor("יפן"), "Asia/Tokyo");
+    assert.equal(ianaZoneFor("לאס וגאס"), "America/Los_Angeles");
+  });
+
+  test("an unknown destination resolves to nothing, not to a guess", () => {
+    // The recoverable outcome: the question stays outstanding and the
+    // interviewer asks. Inventing a plausible zone would silently show every
+    // time on the trip wrongly, and nobody would know to check.
+    assert.equal(ianaZoneFor("somewhere lovely"), null);
+    assert.equal(ianaZoneFor(""), null);
+    assert.equal(ianaZoneFor("   "), null);
+    assert.equal(ianaZoneFor(undefined), null);
+  });
+
+  test("a trip spanning two zones resolves to one of them, not to nothing", () => {
+    // "Las Vegas and Hawaii" is genuinely two zones and this returns a single
+    // value — the longest match, which is arbitrary between them. Recorded
+    // rather than asserted as correct: one plausible zone beats no zone, and a
+    // trip that really needs per-phase times needs per-phase zones, which is a
+    // larger change than this derivation.
+    const zone = ianaZoneFor("Las Vegas and Hawaii");
+    assert.ok(zone === "America/Los_Angeles" || zone === "Pacific/Honolulu", zone ?? "null");
+  });
+
+  test("case does not matter", () => {
+    assert.equal(ianaZoneFor("TOKYO"), "Asia/Tokyo");
+    assert.equal(ianaZoneFor("tel aviv"), "Asia/Jerusalem");
   });
 });
