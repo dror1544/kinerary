@@ -597,6 +597,26 @@ textarea { min-height: 132px; resize: vertical; }
 }
 
 .more-layout { display: grid; gap: 20px; }
+.participants-panel {
+  display: grid;
+  gap: 16px;
+  border: 1px solid rgba(14,143,134,.18);
+  border-radius: var(--kit-radius);
+  padding: 18px;
+  background: linear-gradient(135deg, rgba(14,143,134,.075), rgba(255,255,255,.9));
+}
+.participants-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.participants-heading h3 { margin: 6px 0 0; font-size: 22px; }
+.participant-count { display: grid; min-width: 36px; height: 36px; place-items: center; border-radius: 50%; color: white; background: var(--kit-teal); font-weight: 850; }
+.participants-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.participant-card { display: flex; align-items: center; gap: 10px; min-width: 0; border-radius: 14px; padding: 10px; background: rgba(255,255,255,.8); }
+.participant-card > div { display: grid; min-width: 0; gap: 2px; }
+.participant-card strong, .participant-card small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.participant-card small { color: var(--kit-muted); }
+.person-avatar { display: block; flex: 0 0 auto; border-radius: 50%; object-fit: cover; object-position: top; background: #dff5f2; }
+.person-avatar.regular { width: 46px; height: 46px; }
+.person-avatar.small { width: 36px; height: 36px; }
+.avatar-initial { display: grid; place-items: center; color: white; font-weight: 850; }
 .organizer-tools h3 { margin: 0 0 14px; }
 .upload-control {
   position: relative;
@@ -654,6 +674,10 @@ textarea { min-height: 132px; resize: vertical; }
   gap: 12px;
 }
 .menu-head img { width: 148px; height: auto; }
+.signed-in-user { display: flex; align-items: center; gap: 12px; border: 1px solid rgba(14,143,134,.2); border-radius: var(--kit-radius); padding: 12px; background: rgba(14,143,134,.06); }
+.signed-in-user > div { display: grid; min-width: 0; gap: 2px; }
+.signed-in-user strong, .signed-in-user small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.signed-in-user small { color: var(--kit-muted); }
 .menu-head button, .menu-section button, .menu-section a {
   min-height: 46px;
   border: 1px solid var(--kit-line);

@@ -14,7 +14,7 @@ import {
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
 } from "./api";
-import App, { BookingCreatePanel, BookingEditPanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, safeExternalUrl, wrappedMapIndex } from "./App";
+import App, { avatarUrl, BookingCreatePanel, BookingEditPanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, MoreView, safeExternalUrl, wrappedMapIndex } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -112,6 +112,31 @@ describe("Modern trip SPA", () => {
   it("does not surface unsafe external booking links", () => {
     expect(safeExternalUrl("javascript:alert(1)")).toBe("");
     expect(safeExternalUrl("https://maps.example/stop")).toBe("https://maps.example/stop");
+  });
+
+  it("uses a safe avatar source and lists the trip participants", () => {
+    expect(avatarUrl("alice", "Alice2.png")).toBe("/avatars/Alice2.png");
+    expect(avatarUrl("alice", "../../private.png")).toBe("/avatars/Alice.png");
+    expect(avatarUrl("alice", null, "https://images.example/alice.jpg")).toBe("https://images.example/alice.jpg");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MoreView
+          lang="en"
+          currentUser={{ username: "alice", name: "אליס", name_en: "Alice" }}
+          config={{ participants: [
+            { username: "alice", name: "אליס", name_en: "Alice", color: "#123456" },
+            { username: "ben", name: "בן", name_en: "Ben", color: "#654321" },
+          ] }}
+          openModule={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("heading", { name: /who is coming/i })).toBeInTheDocument();
+    expect(screen.getByText("Alice")).toBeInTheDocument();
+    expect(screen.getByText("Ben")).toBeInTheDocument();
+    expect(screen.getByText("You")).toBeInTheDocument();
   });
 
   it("fetches protected booking documents with the stored bearer token", async () => {

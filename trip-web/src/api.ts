@@ -107,6 +107,16 @@ export const itemSchema = z.object({
 
 export type TripConfig = z.infer<typeof configSchema>;
 export type ItineraryItem = z.infer<typeof itemSchema>;
+export type CurrentUser = {
+  username: string;
+  name?: string | null;
+  name_en?: string | null;
+  family?: string | null;
+  color?: string | null;
+  avatar_file?: string | null;
+  google_picture?: string | null;
+  is_organizer?: boolean;
+};
 export type ItineraryDay = {
   phase_id: string;
   date: string;
@@ -182,7 +192,7 @@ export async function login(username: string, password: string) {
 }
 
 export const getConfig = () => api<unknown>("/api/config").then((value) => configSchema.parse(value));
-export const getMe = () => api<{ username: string; name?: string; name_en?: string; is_organizer?: boolean }>("/api/auth/me");
+export const getMe = () => api<CurrentUser>("/api/auth/me");
 export const getUiSettings = () => api<{ design_variant: "classic" | "modern"; hero: { url: string | null; focal_x: number; focal_y: number } }>("/api/ui-settings");
 export const getToday = () => api<TodayContext>("/api/today");
 export const getItinerary = () => api<unknown>("/api/itinerary/active").then((value) => z.object({

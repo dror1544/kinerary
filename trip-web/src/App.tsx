@@ -34,6 +34,7 @@ import {
   TicketCheck,
   Trash2,
   Upload,
+  Users,
   X,
 } from "lucide-react";
 import brandLogo from "./assets/brand/logo.svg";
@@ -41,6 +42,7 @@ import brandMark from "./assets/brand/mark.svg";
 import {
   ActiveItinerary,
   Booking,
+  CurrentUser,
   approveBookingDraft,
   createBooking,
   deleteBooking,
@@ -198,6 +200,48 @@ function itemTitle(item: ItineraryItem, lang: Lang) {
 function safeFileUrl(path: string, file?: string | null) {
   if (!file) return "";
   return runtimeUrl(`${path}/${encodeURIComponent(file)}`);
+}
+
+function defaultAvatarFile(username: string) {
+  const normalized = username.toLowerCase();
+  return `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}.png`;
+}
+
+export function avatarUrl(username: string, avatarFile?: string | null, googlePicture?: string | null) {
+  if (!avatarFile && googlePicture) {
+    const external = safeExternalUrl(googlePicture);
+    if (external) return external;
+  }
+  const file = avatarFile && /^[A-Za-z0-9._-]+$/.test(avatarFile) ? avatarFile : defaultAvatarFile(username);
+  return runtimeUrl(`/avatars/${encodeURIComponent(file)}`);
+}
+
+function personName(person: Pick<CurrentUser, "username" | "name" | "name_en">, lang: Lang) {
+  return lang === "he"
+    ? person.name || person.name_en || person.username
+    : person.name_en || person.name || person.username;
+}
+
+export function PersonAvatar({
+  username,
+  name,
+  color,
+  avatarFile,
+  googlePicture,
+  size = "regular",
+}: {
+  username: string;
+  name: string;
+  color?: string | null;
+  avatarFile?: string | null;
+  googlePicture?: string | null;
+  size?: "small" | "regular";
+}) {
+  const [failed, setFailed] = useState(false);
+  const source = avatarUrl(username, avatarFile, googlePicture);
+  const initial = name.trim().charAt(0).toUpperCase() || username.charAt(0).toUpperCase();
+  if (failed) return <span className={`person-avatar ${size} avatar-initial`} style={{ backgroundColor: color || "var(--kit-teal)" }} aria-label={name}>{initial}</span>;
+  return <img className={`person-avatar ${size}`} src={source} alt="" onError={() => setFailed(true)} />;
 }
 
 export function safeExternalUrl(value?: string | null) {
@@ -1633,7 +1677,7 @@ function ModulePlaceholder({ module, lang }: { module: Module; lang: Lang }) {
   );
 }
 
-function MoreView({ config, isOrganizer, openModule }: { config?: TripConfig; isOrganizer?: boolean; openModule: (module: Module) => void }) {
+export function MoreView({ config, currentUser, isOrganizer, lang, openModule }: { config?: TripConfig; currentUser?: CurrentUser; isOrganizer?: boolean; lang: Lang; openModule: (module: Module) => void }) {
   const [busy, setBusy] = useState(false);
   const queryClient = useQueryClient();
 
@@ -1675,6 +1719,30 @@ function MoreView({ config, isOrganizer, openModule }: { config?: TripConfig; is
         <h2>Classic remains one tap away while Modern reaches parity.</h2>
         <p>{config?.meta?.title || "This trip"} keeps budget and costs outside the daily itinerary.</p>
       </div>
+      <section className="participants-panel" aria-labelledby="participants-heading">
+        <div className="participants-heading">
+          <div>
+            <span className="panel-label"><Users size={16} /> {copy(lang, "Travelers", "משתתפי הטיול")}</span>
+            <h3 id="participants-heading">{copy(lang, "Who is coming", "מי משתתף בטיול")}</h3>
+          </div>
+          <span className="participant-count">{config?.participants?.length || 0}</span>
+        </div>
+        <div className="participants-grid">
+          {config?.participants?.map((participant) => {
+            const displayName = personName(participant, lang);
+            const isCurrentUser = currentUser?.username === participant.username;
+            return (
+              <article className="participant-card" key={participant.username}>
+                <PersonAvatar username={participant.username} name={displayName} color={participant.color} size="regular" />
+                <div>
+                  <strong>{displayName}</strong>
+                  <small>{isCurrentUser ? copy(lang, "You", "את/ה") : `@${participant.username}`}</small>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
       {isOrganizer ? (
         <section className="organizer-tools">
           <h3>Presentation</h3>
@@ -1715,6 +1783,7 @@ function MoreView({ config, isOrganizer, openModule }: { config?: TripConfig; is
 function AppMenu({
   open,
   lang,
+  currentUser,
   isOrganizer,
   setOpen,
   setLang,
@@ -1723,6 +1792,7 @@ function AppMenu({
 }: {
   open: boolean;
   lang: Lang;
+  currentUser?: CurrentUser;
   isOrganizer?: boolean;
   setOpen: (open: boolean) => void;
   setLang: (lang: Lang) => void;
@@ -1737,6 +1807,21 @@ function AppMenu({
           <img src={brandLogo} alt="Kinerary" />
           <button type="button" onClick={() => setOpen(false)} aria-label="Close menu"><X size={20} /></button>
         </div>
+        {currentUser ? (
+          <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>
+            <PersonAvatar
+              username={currentUser.username}
+              name={personName(currentUser, lang)}
+              color={currentUser.color}
+              avatarFile={currentUser.avatar_file}
+              googlePicture={currentUser.google_picture}
+            />
+            <div>
+              <strong>{personName(currentUser, lang)}</strong>
+              <small>{currentUser.is_organizer ? copy(lang, "Trip organizer", "מארגן הטיול") : `@${currentUser.username}`}</small>
+            </div>
+          </section>
+        ) : null}
         <div className="menu-section">
           <small>{lang === "he" ? "ניווט" : "Navigation"}</small>
           {(Object.keys(tabIcons) as Tab[]).map((tab) => (
@@ -1843,7 +1928,7 @@ export default function App() {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
     journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
     moments: <MomentsView todayDate={today.data?.today} />,
-    more: <MoreView config={config.data} isOrganizer={me.data?.is_organizer} openModule={openModule} />,
+    more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];
   const moduleContent = activeModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
@@ -1857,7 +1942,7 @@ export default function App() {
     <div className="modern-trip-app">
       <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} />
       <main className="app-content">{content}</main>
-      <AppMenu open={menuOpen} lang={lang} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} />
+      <AppMenu open={menuOpen} lang={lang} currentUser={me.data} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} />
       <nav className="bottom-nav" aria-label="Primary">
         {tabs.map((tab) => {
           const Icon = tabIcons[tab];
