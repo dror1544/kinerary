@@ -298,7 +298,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // `resumed`, it says nothing about fault: not answering a question is a
     // normal thing to do in a conversation, usually because you were asking
     // about something else.
-    stillNeed: "Still need this one:",
+    // Said once, at the boundary, for a required answer the interview cannot
+    // finish without — not every time a message misses it. The difference
+    // between this and nagging is entirely about when it is said.
+    beforeWeFinish: "Before I can put your trip together, there's one thing I still need:",
     // The three messages of an interview that can end.
     //
     // All three exist to answer the question someone actually has, which is
@@ -345,7 +348,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "אז — שלחו לי כל מה שיש לכם, או תגידו ונתחיל בשאלות.",
     ].join("\n"),
     resumed: "נמשיך מכאן.",
-    stillNeed: "עוד צריך את זה:",
+    beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
     expired: "סגרתי את השיחה בינתיים. כל מה שסיפרתם שמור ומחכה.",

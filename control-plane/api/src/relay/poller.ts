@@ -58,6 +58,10 @@ import {
   claimSessionsDueWarning,
   expiredSessionLanguage,
   touchSessionDeadline,
+  answersForChat,
+  deferQuestionForChat,
+  deferredRequired,
+  undeferAllForChat,
   selectedOptionIds,
   setFinishRequestedForChat,
   skipQuestionForChat,
@@ -939,20 +943,42 @@ async function runInterpretPath(
   // since. Here somebody has — which is precisely what makes re-asking an
   // answer rather than noise.
   if (unanswered && onScreenQuestion?.required && !state.answered.includes(onScreen)) {
-    const after = await getSessionForChat(deps.db, burst.chatId);
-    if (after.ok && after.view.awaiting === "machine" && after.view.lastPrompt === `q:${onScreen}`) {
-      const rendered = renderQuestion(onScreenQuestion, selectedOptionIds(after.view, onScreen), after.view.language);
-      if (await claimFloor(deps.db, burst.chatId)) {
+    await deferQuestionForChat(deps.db, burst.chatId, onScreen);
+    log(structuredLog("info", "interview.required_deferred", {
+      session_id: burst.sessionId,
+      question_id: onScreen,
+    }));
+  }
+
+  // THE BOUNDARY. Nothing left to ask, but a required answer is still missing:
+  // bring the deferred questions back, once, and say why they are back.
+  //
+  // This is where the earlier fix belongs. Re-asking the instant a reply missed
+  // fixed the silence and created nagging — "עוד צריך את זה: מתי הטיול מתחיל?"
+  // after every message about something else. Deferring costs nothing, because
+  // `confirmIntake` refuses without a required answer regardless, so the only
+  // question was ever WHEN to come back for it: immediately, which pesters, or
+  // at the point it actually blocks something, which informs.
+  const afterCommit = await getSessionForChat(deps.db, burst.chatId);
+  if (afterCommit.ok && !afterCommit.view.nextQuestion) {
+    const store = await answersForChat(deps.db, burst.chatId);
+    const missing = store ? deferredRequired(store.answers) : [];
+    if (missing.length > 0) {
+      await undeferAllForChat(deps.db, burst.chatId);
+      log(structuredLog("info", "interview.required_raised_at_boundary", {
+        session_id: burst.sessionId,
+        missing: missing.map((q) => q.id),
+      }));
+      const view = await getSessionForChat(deps.db, burst.chatId);
+      if (view.ok && await claimFloor(deps.db, burst.chatId)) {
+        const question = view.view.nextQuestion ?? missing[0]!;
+        const rendered = renderQuestion(question, selectedOptionIds(view.view, question.id), view.view.language);
         await deps.telegram.sendMessage({
           chatId: burst.chatId,
-          text: `${uiString("stillNeed", after.view.language)}\n\n${rendered.text}`,
+          text: `${uiString("beforeWeFinish", view.view.language)}\n\n${rendered.text}`,
           replyMarkup: rendered.replyMarkup ?? undefined,
         });
-        await recordLastPromptForChat(deps.db, burst.chatId, `q:${onScreen}`);
-        log(structuredLog("info", "interview.required_reasked", {
-          session_id: burst.sessionId,
-          question_id: onScreen,
-        }));
+        await recordLastPromptForChat(deps.db, burst.chatId, `q:${question.id}`);
       }
       return;
     }
@@ -1620,6 +1646,36 @@ export function startTripBotPoller(
         // time would otherwise be retried forever and block every update
         // behind it — one poisoned message silencing the whole bot.
         offset = Math.max(offset, update.update_id + 1);
+        // WHAT TELEGRAM ACTUALLY HANDED US, before anything interprets it.
+        //
+        // Three times running an organizer reported sending a PDF and the relay
+        // saw only text. Every downstream stage logs its own failure — a failed
+        // re-host warns, a failed dispatch errors — and all of them were
+        // silent, which left "the file never arrived" and "we dropped it
+        // somewhere before the first log line" indistinguishable. They are not
+        // the same problem and they have different fixes, so the earliest
+        // possible point says what it received.
+        //
+        // Shape only: which fields are present and how big. No text, no
+        // filenames, no chat id — this runs on every message of every
+        // interview, and a diagnostic that logs content is a diagnostic that
+        // has to be turned off again.
+        {
+          const m = (update as { message?: Record<string, unknown> }).message;
+          if (m) {
+            log(structuredLog("info", "trip_bot.update_shape", {
+              has_text: typeof m.text === "string",
+              has_caption: typeof m.caption === "string",
+              has_document: Boolean(m.document),
+              has_photo: Array.isArray(m.photo) && m.photo.length > 0,
+              has_video: Boolean(m.video),
+              has_audio: Boolean(m.audio) || Boolean(m.voice),
+              text_len: typeof m.text === "string" ? m.text.length : 0,
+              doc_size: (m.document as { file_size?: number } | undefined)?.file_size ?? 0,
+              doc_mime: (m.document as { mime_type?: string } | undefined)?.mime_type ?? null,
+            }));
+          }
+        }
         try {
           const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
             interviewerProfile: deps.interviewerProfile,

@@ -1038,6 +1038,15 @@ export interface InterviewUiState {
   finishRequested?: boolean;
   skipped?: string[];
   /**
+   * Required questions that were asked and not answered, stepped aside so the
+   * interview can move on instead of repeating one after every message.
+   *
+   * Distinct from `skipped`, which is final and applies only to optional
+   * questions. A deferred question is still owed: `deferredRequired` brings it
+   * back at the boundary, and `confirmIntake` refuses without it either way.
+   */
+  deferred?: string[];
+  /**
    * The optional question the interviewer has asked the router to put next.
    *
    * Optional questions are not walked automatically when an interviewer is
@@ -1105,9 +1114,18 @@ function parseUiState(raw: unknown): InterviewUiState {
   const skipped = Array.isArray(record.skipped)
     ? record.skipped.filter((id): id is string => typeof id === "string")
     : undefined;
+  // Both directions are an explicit allowlist, which is the right shape — but
+  // it means a field added to the interface and to a writer, and NOT added
+  // here, is written and then silently dropped on the next read. That is what
+  // happened to `deferred` first time out: the defer call succeeded, the
+  // question came straight back, and nothing anywhere said why.
+  const deferred = Array.isArray(record.deferred)
+    ? record.deferred.filter((id): id is string => typeof id === "string")
+    : undefined;
   return {
     ...(record.finish_requested === true ? { finishRequested: true } : {}),
     ...(skipped && skipped.length > 0 ? { skipped } : {}),
+    ...(deferred && deferred.length > 0 ? { deferred } : {}),
     ...(typeof record.pending_ask === "string" ? { pendingAsk: record.pending_ask } : {}),
     ...(record.offered_more === true ? { offeredMore: true } : {}),
     ...(typeof record.last_prompt === "string" ? { lastPrompt: record.last_prompt } : {}),
@@ -1122,6 +1140,7 @@ function serializeUiState(ui: InterviewUiState): string {
   return JSON.stringify({
     ...(ui.finishRequested ? { finish_requested: true } : {}),
     ...(ui.skipped && ui.skipped.length > 0 ? { skipped: ui.skipped } : {}),
+    ...(ui.deferred && ui.deferred.length > 0 ? { deferred: ui.deferred } : {}),
     ...(ui.pendingAsk ? { pending_ask: ui.pendingAsk } : {}),
     ...(ui.offeredMore ? { offered_more: true } : {}),
     ...(ui.lastPrompt ? { last_prompt: ui.lastPrompt } : {}),
@@ -1147,11 +1166,66 @@ function isSkipped(ui: InterviewUiState, questionId: string): boolean {
  * type a number into, with Hermes's own "(Recommended)" label stuck on the
  * first choice. Walking them here is what gives them real buttons.
  */
+/**
+ * The next required question worth putting now.
+ *
+ * `deferred` holds required questions the organizer was asked and did not
+ * answer. They step aside rather than being repeated: repeating one on every
+ * message is nagging, and the first live run of the re-ask produced exactly
+ * that — "עוד צריך את זה: מתי הטיול מתחיל?" after every message that was about
+ * something else.
+ *
+ * Stepping aside is not dropping. When nothing un-deferred is left,
+ * `deferredRequired` below brings them all back at the boundary, before the
+ * summary, where "I still need these to finish" is information rather than
+ * pestering. `confirmIntake` refuses without them regardless, so the interview
+ * cannot end having quietly lost one.
+ */
 function nextUnansweredQuestion(
   answers: AnswerStore,
   questions: readonly IntakeQuestion[],
+  ui: InterviewUiState = {},
 ): IntakeQuestion | null {
-  return questions.find((q) => q.required && answers[q.id] === undefined) ?? null;
+  const deferred = new Set(ui.deferred ?? []);
+  const unanswered = questions.filter((q) => q.required && answers[q.id] === undefined);
+  return unanswered.find((q) => !deferred.has(q.id)) ?? null;
+}
+
+/**
+ * Required questions still unanswered, whether deferred or not — what the
+ * interview cannot finish without. Empty means the summary is reachable.
+ */
+export function deferredRequired(
+  answers: AnswerStore,
+  questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
+): IntakeQuestion[] {
+  return questions.filter((q) => q.required && answers[q.id] === undefined);
+}
+
+/**
+ * Steps a required question aside for now. Never touches `answers`, so the
+ * question is still outstanding everywhere that matters — only the ORDER of
+ * asking changes.
+ */
+export async function deferQuestionForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<void> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.required) return;
+  await updateUiStateForChat(db, chatId, (ui) => ({
+    ...ui,
+    deferred: [...new Set([...(ui.deferred ?? []), questionId])],
+  }));
+}
+
+/**
+ * Brings every deferred question back. Called at the boundary, when there is
+ * nothing else left to ask and the interview would otherwise try to finish.
+ */
+export async function undeferAllForChat(db: pg.Pool, chatId: string): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, deferred: [] }));
 }
 
 /** The optional question the interviewer nominated, if it is still askable. */
@@ -2058,7 +2132,7 @@ function buildSessionView(
     sessionId,
     tripId,
     state,
-    nextQuestion: state === "interviewing" ? nextUnansweredQuestion(answers, INTAKE_QUESTIONS) : null,
+    nextQuestion: state === "interviewing" ? nextUnansweredQuestion(answers, INTAKE_QUESTIONS, ui) : null,
     pendingAsk: state === "interviewing" ? pendingAskQuestion(answers, INTAKE_QUESTIONS, ui) : null,
     // Listed in both states, unlike nextQuestion/recap: an optional question is
     // still worth offering once the required ones are done, and in practice
@@ -2577,13 +2651,13 @@ export async function advancePhaseForChat(
 }
 
 /** Reads just the answers and ui_state, for the phase machine. */
-async function answersForChat(
+export async function answersForChat(
   db: pg.Pool,
   chatId: string,
 ): Promise<{ answers: AnswerStore; ui: InterviewUiState } | null> {
   const row = await db.query<{ answers: AnswerStore; ui_state: unknown }>(
     `SELECT answers, ui_state FROM control_plane.intake_sessions
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
   );
   const [session] = row.rows;

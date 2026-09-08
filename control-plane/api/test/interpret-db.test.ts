@@ -494,7 +494,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
     );
   }
 
-  test("a REQUIRED question is re-asked in different words, with its buttons", async () => {
+  test("a REQUIRED question steps aside instead of being repeated", async () => {
     await withTwoInterviews(async ({ pool, a }) => {
       await setInterpretPath(pool, a.chatId, true);
       // Hebrew, because "some of the bot's messages came in English" is a real
@@ -506,14 +506,19 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
       const opening = telegram.sent.length;
       assert.ok(opening > 0, "the router says something to begin with");
 
-      // Answer nothing. Before the fix this sent NOTHING at all.
-      await say(pool, a.chatId, "תסתכל במסמך שהעלתי", telegram);
-      assert.ok(telegram.sent.length > opening, "the organizer spoke and got a reply");
+      const first = await getSessionForChat(pool, a.chatId);
+      const asked = first.ok ? first.view.nextQuestion?.id : null;
+      assert.ok(asked, "a required question is on screen");
 
-      const last = telegram.sent[telegram.sent.length - 1]!;
-      assert.ok(last.text.startsWith(uiString("stillNeed", "he")), "a distinct opening, not the bare question again");
-      assert.equal(/[A-Za-z]{4,}/.test(last.text), false, `still Hebrew: ${last.text}`);
-      assert.ok(last.buttons > 0, "the question keeps its keyboard");
+      // Answer nothing. It must neither go silent NOR repeat the question:
+      // repeating produced "עוד צריך את זה: מתי הטיול מתחיל?" after every
+      // message about something else, which is nagging.
+      await say(pool, a.chatId, "תסתכל במסמך שהעלתי", telegram);
+
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.notEqual(after.ok && after.view.nextQuestion?.id, asked, "the interview moved on");
+      const repeated = telegram.sent.filter((m) => m.text.includes(uiString("beforeWeFinish", "he")));
+      assert.equal(repeated.length, 0, "and did not announce a blocker mid-interview");
     });
   });
 
