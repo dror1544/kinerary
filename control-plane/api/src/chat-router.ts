@@ -619,7 +619,15 @@ export function renderConfirmPrompt(
  */
 export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
   return {
-    text: uiString("documentOffer", language),
+    // One message, not two: an opening that arrives as a pair of notifications
+    // reads as a bot talking AT someone, and the keyboard has to hang off
+    // whatever is on screen last anyway.
+    //
+    // The introduction makes the document offer itself, in the paragraph about
+    // what to send — `documentOffer` is no longer appended, because saying it
+    // twice in one breath is how an opening starts sounding like terms and
+    // conditions. See `introduction` in intake-copy.ts for what it has to do.
+    text: uiString("introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },

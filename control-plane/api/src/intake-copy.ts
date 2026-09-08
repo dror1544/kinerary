@@ -257,6 +257,34 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ A few more questions",
     documentOffer: "Before we start on details — if you already have a plan, a booking confirmation, tickets or a spreadsheet for this trip, send it here and I'll read it instead of making you type it all out.",
     noDocument: "I don't have one",
+    // THE FIRST THING ANYONE SEES.
+    //
+    // It exists because of what it is asking for: names, dates, dietary needs,
+    // who is coming, booking confirmations with reference numbers on them.
+    // Someone handing that over is owed three answers before they hand over
+    // anything — who is asking, what happens to it, and what they get at the
+    // end — and until this existed the opening was a single line about
+    // documents, which answers none of them.
+    //
+    // Deliberately concrete about the endgame. "A personalised site and an
+    // assistant" is a promise; "a site everyone on the trip can open, and a bot
+    // you add to the family group that answers questions while you are there"
+    // is a picture, and a picture is what makes someone willing to type their
+    // children's names into a chat window.
+    //
+    // The documents paragraph says "you can ask me for it later" because that
+    // is the difference between handing something over and giving it away.
+    introduction: [
+      "Hi — I'm the assistant that sets your trip up. One conversation, and it's done.",
+      "",
+      "I'll ask about the trip: where, when, who's coming, how you like to travel. It isn't a form — answer in your own words, in whatever language you're comfortable in, and skip anything you'd rather not say.",
+      "",
+      "If you already have flight confirmations, hotel bookings, tickets or a plan you wrote, send them here. I'll read them and use them, so I don't ask you for what you already have written down. Everything you send stays with your trip — ask me for any of it later here in the chat, or find it on the trip site.",
+      "",
+      "At the end you get two things: a private trip website for everyone coming, and an assistant of your own. You can add it to the family group chat, and during the trip it answers questions, keeps the plan, and remembers what everyone booked.",
+      "",
+      "So — send me anything you've got, or just say the word and I'll start asking.",
+    ].join("\n"),
     // Said when the interviewer has gone quiet and the router picks the thread
     // back up. Deliberately says nothing about why: the organizer does not need
     // to hear that something stalled, and "sorry, I had a problem" invites them
@@ -289,6 +317,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ עוד כמה שאלות",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
+    introduction: [
+      "היי — אני העוזר שמקים לכם את הטיול. שיחה אחת, וזהו.",
+      "",
+      "אשאל אתכם על הטיול: לאן, מתי, מי מגיע ואיך אתם אוהבים לטייל. זה לא טופס — ענו במילים שלכם, בכל שפה שנוח לכם, ואם משהו לא מתאים פשוט דלגו.",
+      "",
+      "אם כבר יש לכם אישורי טיסה, הזמנות מלון, כרטיסים או תוכנית שכתבתם — שלחו לכאן. אקרא ואשתמש בזה, כדי לא לשאול אתכם על מה שכבר כתוב אצלכם. כל מה שתשלחו נשמר עם הטיול — תוכלו לבקש ממני כל דבר מזה גם אחר כך כאן בצ'אט, או למצוא אותו באתר הטיול.",
+      "",
+      "בסוף מקבלים שני דברים: אתר טיול פרטי לכל מי שנוסע, ועוזר אישי משלכם. אפשר להוסיף אותו לקבוצה המשפחתית, ובמהלך הטיול הוא עונה על שאלות, מחזיק את התוכנית וזוכר מה כל אחד הזמין.",
+      "",
+      "אז — שלחו לי כל מה שיש לכם, או תגידו ונתחיל בשאלות.",
+    ].join("\n"),
     resumed: "נמשיך מכאן.",
     stillNeed: "עוד צריך את זה:",
   },

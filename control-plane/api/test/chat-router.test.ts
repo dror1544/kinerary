@@ -6,7 +6,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { confirmIntake, submitAnswer, INTAKE_QUESTIONS } from "../src/interview.js";
-import { askText } from "../src/intake-copy.js";
+import { askText, uiString } from "../src/intake-copy.js";
 import {
   answerCallbackData,
   callbackDataFits,
@@ -193,6 +193,50 @@ describe("renderQuestion", () => {
 
     const en = renderDocumentOffer();
     assert.notEqual(en.text, he.text, "and it is a real translation, not a fallback");
+  });
+
+  /**
+   * The opening has to earn the data it is about to ask for.
+   *
+   * It asks for children's names, dietary needs, dates, and booking
+   * confirmations with reference numbers on them. Someone handing that over is
+   * owed three answers first — who is asking, what happens to what they send,
+   * and what they get at the end — and for a long time the opening was one
+   * line about documents, which answers none of them.
+   *
+   * Asserted as four claims rather than a string match, so the wording stays
+   * free to improve and the promises cannot quietly go missing.
+   */
+  test("the opening introduces itself, says what happens to a document, and names the endgame", () => {
+    for (const language of ["he", "en"] as const) {
+      const { text } = renderDocumentOffer(language);
+
+      // 1. Who is asking.
+      assert.match(text, language === "he" ? /אני העוזר/ : /I'm the assistant/, language);
+
+      // 2. What it will ask about, and that it is a conversation, not a form.
+      assert.match(text, language === "he" ? /לא טופס/ : /isn't a form/, language);
+
+      // 3. What happens to what you send — used AND retrievable afterwards.
+      //    "You can have it back" is the difference between handing something
+      //    over and giving it away, and is the half most easily dropped.
+      assert.match(text, language === "he" ? /נשמר עם הטיול/ : /stays with your trip/, language);
+      assert.match(text, language === "he" ? /באתר הטיול/ : /on the trip site/, language);
+
+      // 4. The endgame, concretely: a site AND an assistant that joins the
+      //    family group. A promise of "something personalised" is not what
+      //    makes someone willing to type their family into a chat window.
+      assert.match(text, language === "he" ? /אתר טיול פרטי/ : /private trip website/, language);
+      assert.match(text, language === "he" ? /לקבוצה המשפחתית/ : /family group chat/, language);
+    }
+  });
+
+  test("the opening does not make the same offer twice", () => {
+    // The introduction already says what to send. Appending `documentOffer`
+    // after it repeated the whole invitation one paragraph later, which is how
+    // an opening starts reading as terms and conditions.
+    const { text } = renderDocumentOffer("he");
+    assert.equal(text.includes(uiString("documentOffer", "he")), false);
   });
 
   test("a question is drawn in the interview's language, buttons included", () => {
