@@ -99,6 +99,38 @@ describe("evidenceAppears", () => {
     assert.equal(evidenceAppears("יפן", "אנחנו נוסעים ליפן בספטמבר"), true);
     assert.equal(evidenceAppears("איטליה", "אנחנו נוסעים ליפן בספטמבר"), false);
   });
+
+  // A document answer legitimately gathers from several places. Found on the
+  // real Japan booking PDF: the phases proposal quoted five stop-and-date lines
+  // that sit pages apart, and a contiguous check rejected the four most
+  // valuable proposals while accepting only the four that came from one line.
+  const BOOKING = [
+    "Entire Trip",
+    "Sep 19 - Oct 03",
+    "Tokyo",
+    "Sep 19 - Sep 23",
+    "¥300,105.00",
+    "Hakone",
+    "Sep 23 - Sep 24",
+    "Kyoto",
+    "Sep 24 - Sep 27",
+  ].join("\n");
+
+  test("evidence gathered from several lines is accepted", () => {
+    assert.equal(evidenceAppears("Tokyo\nSep 19 - Sep 23\nHakone\nSep 23 - Sep 24", BOOKING), true);
+  });
+
+  test("but every line must be there — one invented line fails the whole claim", () => {
+    assert.equal(evidenceAppears("Tokyo\nSep 19 - Sep 23\nNagoya", BOOKING), false);
+  });
+
+  test("a single invented line fails just as it always did", () => {
+    assert.equal(evidenceAppears("Osaka", BOOKING), false);
+  });
+
+  test("trivial lines cannot carry a claim on their own", () => {
+    assert.equal(evidenceAppears(".\n-\n.", BOOKING), false);
+  });
 });
 
 describe("parseInterpretPayload — the schema is this function", () => {

@@ -173,19 +173,37 @@ function fold(text: string): string {
   return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+/** One line of a claim, folded and stripped of surrounding punctuation. */
+function claimLine(line: string): string {
+  return fold(line).replace(/^[\p{P}\p{S}]+/u, "").replace(/[\p{P}\p{S}]+$/u, "").trim();
+}
+
 /**
- * Is this evidence actually a span of what the organizer wrote?
+ * Is this evidence actually taken from the source?
  *
- * Cheap, and it catches the specific failure where a model fills a field from
- * its own prior rather than from the message it was given — the class that
- * produced a confident answer about a different family's trip. Whitespace and
- * case are folded, and surrounding punctuation is trimmed from the claim, so a
- * model quoting "Tel Aviv," against a source saying "Tel Aviv" still matches.
+ * EVERY LINE must appear. For a typed message that is the same contiguous-span
+ * check it always was, because a typed message's evidence is one line. For a
+ * DOCUMENT it is the rule that makes the check usable at all: a real answer
+ * draws on several places in a file. Extracting phases from the Japan booking
+ * PDF quoted five stop-and-date lines that sit pages apart, and a contiguous
+ * check rejected the four most valuable proposals on the document — phases,
+ * anchors, budget, interests — while accepting only the four that happened to
+ * come from one line each.
+ *
+ * The check it still performs is the one worth having: a hotel the model
+ * invented, or a date carried in from its own prior, appears in none of the
+ * source and fails. What it no longer does is insist the model quote a
+ * contiguous block of a document that was never written contiguously.
+ *
+ * A line too short to mean anything cannot carry the claim on its own — at
+ * least one substantial line is required, so "." is not evidence of a trip.
  */
 export function evidenceAppears(evidence: string, source: string): boolean {
-  const claim = fold(evidence).replace(/^[\p{P}\p{S}]+/u, "").replace(/[\p{P}\p{S}]+$/u, "").trim();
-  if (!claim) return false;
-  return fold(source).includes(claim);
+  const haystack = fold(source);
+  const lines = evidence.split("\n").map(claimLine).filter((l) => l.length > 0);
+  if (lines.length === 0) return false;
+  if (!lines.some((l) => l.length >= 3)) return false;
+  return lines.every((line) => haystack.includes(line));
 }
 
 // ── The gate ─────────────────────────────────────────────────────────────────
@@ -448,6 +466,98 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
 // ── The call ─────────────────────────────────────────────────────────────────
 
 export const INTERPRET_TASK = "interpret";
+export const EXTRACT_INTAKE_TASK = "extract";
+
+/**
+ * What a document says, as proposals for the interview's own questions.
+ *
+ * Deliberately the SAME `ProposedAnswer` contract as `interpret`, which is the
+ * whole reason this is cheap: a flight confirmation and a typed sentence both
+ * arrive as proposals, both go through `applyProposals` and `validateAnswer`,
+ * and neither can write an option id that does not exist or a date the router
+ * would refuse. A document is not a privileged source — it is a source with
+ * more in it.
+ *
+ * Distinct from `extractItinerary`, which answers "what happens on each day"
+ * for the trip SITE. This answers "what does the interview still need to ask".
+ * They read the same file for different questions, and merging them would mean
+ * one prompt doing two jobs badly.
+ */
+export function buildExtractIntakePrompt(args: {
+  documentText: string;
+  outstanding: readonly string[];
+  language: string;
+  questions?: readonly IntakeQuestion[];
+}): string {
+  const all = args.questions ?? INTAKE_QUESTIONS;
+  const asked = all.filter((q) => args.outstanding.includes(q.id));
+  return [
+    `Someone planning a trip has uploaded a document — a booking confirmation, a`,
+    `flight itinerary, tickets, or a plan they wrote. Their language is ${args.language}.`,
+    `Answer as many of the questions below as the document genuinely answers.`,
+    `Answer ONLY with JSON.`,
+    ``,
+    `This is the point of the whole exercise: anything you can read here is`,
+    `something they will not be asked to type. But a wrong answer is worse than`,
+    `no answer, because they may not notice it.`,
+    ``,
+    `Rules:`,
+    `- Answer only what the document actually says. Do not infer a return date`,
+    `  from a hotel checkout, or guess who is travelling from a booking name.`,
+    `- "evidence" must be text copied VERBATIM from the document — the line the`,
+    `  answer came from. Never paraphrase or translate it.`,
+    `- "value" is the normalised answer: an ISO date, an option id, a clean name.`,
+    `- Booking documents in Hebrew often come out of a PDF with the Hebrew`,
+    `  reversed and run together with Latin text ("אין ק'צ19 Sep, 2026" is a`,
+    `  check-in date). Read through it; do not treat it as corrupt.`,
+    `- "confidence" is how sure you are the document MEANS this, not how`,
+    `  readable it was.`,
+    `- A document that answers nothing is a valid result: {"proposals":[]}.`,
+    ``,
+    `Questions the interview still needs:`,
+    ...asked.map(describeQuestion),
+    ``,
+    `Return exactly:`,
+    `{"proposals":[{"questionId":"...","value":{"kind":"text","text":"..."},`,
+    ` "confidence":0.0,"evidence":"..."}],"unclear":[{"questionId":"...","why":"..."}]}`,
+    ``,
+    `value kinds: {"kind":"choice","optionId":"x"} | {"kind":"choice_other","otherText":"x"}`,
+    ` | {"kind":"multi_choice","optionIds":["x"]} | {"kind":"text","text":"x"}`,
+    ` | {"kind":"structured","data":...}`,
+    ``,
+    `No commentary.`,
+    ``,
+    `Document:`,
+    args.documentText,
+  ].join("\n");
+}
+
+/**
+ * One-shot. Failure is a value: the organizer is told the document could not be
+ * read, and the interview carries on asking — which is exactly where it was
+ * before anyone uploaded anything.
+ */
+export async function extractIntakeFromDocument(
+  runner: StructuredModelRunner,
+  args: {
+    documentText: string;
+    outstanding: readonly string[];
+    language: string;
+    questions?: readonly IntakeQuestion[];
+    timeoutMs?: number;
+  },
+): Promise<InterpretResult> {
+  const result = await runner.run<InterpretPayload>({
+    task: EXTRACT_INTAKE_TASK,
+    prompt: buildExtractIntakePrompt(args),
+    parse: (raw) => parseInterpretPayload(raw, []),
+    ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
+  });
+  if (!result.ok) {
+    return { ok: false, reason: result.reason, detail: result.detail, attempts: result.attempts, ms: result.ms };
+  }
+  return { ok: true, payload: result.value, attempts: result.attempts, ms: result.ms };
+}
 
 export interface InterpretBurstArgs extends BuildInterpretPromptArgs {
   messageIds?: readonly string[];
