@@ -196,7 +196,17 @@ export type NormalizeOutcome =
  */
 export interface MediaDeps {
   telegram: { fetchFile(fileId: string, maxBytes: number): Promise<{ bytes: Buffer; mime?: string } | null> };
-  store: { put(input: { kind: MediaKind; mime: string; size: number; filename?: string; caption?: string; bytes: Buffer }): string | null };
+  store: {
+    put(input: { kind: MediaKind; mime: string; size: number; filename?: string; caption?: string; bytes: Buffer }): string | null;
+    /**
+     * Reading an upload back out by id. Optional because normalisation itself
+     * only ever writes — it is the interview that needs the bytes again, to
+     * read a booking PDF rather than merely hand its URL to something else.
+     * Local by id rather than an HTTP fetch of our own URL: one less round
+     * trip, and nothing that could be pointed somewhere other than the store.
+     */
+    get?(id: string): { bytes: Buffer; mime: string; filename?: string } | null;
+  };
   /** Public base the gateway can reach this connector on, e.g. http://127.0.0.1:4312 */
   baseUrl: string;
   /**

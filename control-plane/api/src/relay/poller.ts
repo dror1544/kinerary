@@ -62,6 +62,7 @@ import {
   deferQuestionForChat,
   deferredRequired,
   undeferAllForChat,
+  buildRecap,
   selectedOptionIds,
   setFinishRequestedForChat,
   skipQuestionForChat,
@@ -69,6 +70,7 @@ import {
 } from "../interview.js";
 import {
   applyProposals,
+  extractIntakeFromDocument,
   burstKey,
   claimInterpretation,
   interpretBurst,
@@ -80,11 +82,19 @@ import {
   type ProposedAnswer,
 } from "../interpret.js";
 import type { StructuredModelRunner } from "../model-runner.js";
+import { documentText } from "../document-text.js";
+
+/**
+ * Reading a booking PDF and turning it into answers took ~94 seconds on the
+ * real Japan document. Generous, because the alternative to waiting is asking
+ * the organizer to type what is already in the file.
+ */
+const DOCUMENT_EXTRACT_TIMEOUT_MS = Number(process.env.DOCUMENT_EXTRACT_TIMEOUT_MS || 240_000);
 import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
-import { askText, DEFAULT_LANGUAGE, optionLabel, uiString } from "../intake-copy.js";
+import { askText, DEFAULT_LANGUAGE, optionLabel, uiString, type Language } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -716,6 +726,174 @@ export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEv
   };
 }
 
+/** The attachments in a burst, resolved back out of the relay's media store. */
+function documentsInBurst(
+  combined: WireMessageEvent,
+  deps: TripBotPollerDeps,
+): { bytes: Uint8Array; mime: string; filename?: string }[] {
+  const store = deps.media?.store;
+  if (!store?.get) return [];
+  const out: { bytes: Uint8Array; mime: string; filename?: string }[] = [];
+  for (const url of combined.media_urls ?? []) {
+    // The wire carries `{connector}/relay/media/{id}` — a URL rather than the
+    // bytes, because a Telegram file URL embeds the bot token and must never
+    // cross. Reading it back locally by id skips an HTTP round trip to
+    // ourselves and, more to the point, cannot be redirected anywhere.
+    const id = url.split("/").pop() ?? "";
+    const stored = id ? store.get(id) : null;
+    if (!stored) continue;
+    out.push({
+      bytes: new Uint8Array(stored.bytes),
+      mime: stored.mime,
+      ...(stored.filename ? { filename: stored.filename } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * Read what was uploaded, say what it said, and ask only for what is left.
+ *
+ * The shape of this is the product requirement, in order: acknowledge
+ * immediately (reading takes about ninety seconds and silence for that long
+ * reads as broken), read, report back what was taken so it can be corrected,
+ * then carry on with the questions the document could not answer.
+ *
+ * Every extracted answer goes through `applyProposals` exactly like a typed
+ * one. A document is not a privileged source — nothing here can write an
+ * option id that does not exist, and a proposal quoting text that is not in
+ * the file is refused before it is validated.
+ */
+async function runDocumentPath(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  documents: { bytes: Uint8Array; mime: string; filename?: string }[],
+  state: { outstanding: string[]; answered: string[] },
+  language: Language,
+  log: (line: string) => void,
+): Promise<void> {
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const say = async (text: string) => {
+    await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => {});
+  };
+
+  await say(uiString("documentReading", language));
+
+  const texts: string[] = [];
+  let unreadable = 0;
+  for (const doc of documents) {
+    const read = await documentText(doc.bytes, doc.mime, doc.filename);
+    if (read.ok) {
+      texts.push(read.text);
+      log(structuredLog("info", "interview.document_read", {
+        session_id: burst.sessionId,
+        pages: read.pages,
+        chars: read.text.length,
+        truncated: read.truncated,
+      }));
+    } else {
+      unreadable += 1;
+      log(structuredLog("warn", "interview.document_unreadable", {
+        session_id: burst.sessionId,
+        reason: read.reason,
+        detail: read.detail,
+      }));
+    }
+  }
+
+  const ask = async () => {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
+  };
+
+  if (texts.length === 0) {
+    await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
+    await ask();
+    return;
+  }
+
+  // Several files are read as ONE document. Five uploads describing one trip
+  // are one trip: extracting each separately would produce five competing
+  // `phases` proposals and let the last one win on nothing better than order.
+  const source = texts.join("\n\n");
+
+  if (!deps.modelRunner) {
+    await say(uiString("documentNothing", language));
+    await ask();
+    return;
+  }
+
+  const result = await extractIntakeFromDocument(deps.modelRunner, {
+    documentText: source,
+    outstanding: state.outstanding,
+    language,
+    timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS,
+  });
+
+  if (!result.ok) {
+    log(structuredLog("warn", "interview.document_extract_failed", {
+      session_id: burst.sessionId,
+      reason: result.reason,
+      ms: result.ms,
+    }));
+    await say(uiString("documentNothing", language));
+    await ask();
+    return;
+  }
+
+  const decisions = applyProposals(result.payload.proposals, {
+    sourceText: source,
+    outstanding: state.outstanding,
+    answered: state.answered,
+    unclear: result.payload.unclear,
+  });
+
+  const recorded: string[] = [];
+  for (const accepted of decisions.accepted) {
+    const args = submitArgsFor(accepted.proposal.value);
+    const written = await submitAnswerForChat(
+      deps.db, burst.chatId, accepted.questionId,
+      args.optionId, args.otherText, args.structuredData, args.optionIds,
+    );
+    if (written.ok) recorded.push(accepted.questionId);
+    else {
+      log(structuredLog("warn", "interview.document_write_refused", {
+        session_id: burst.sessionId,
+        question_id: accepted.questionId,
+        reason: written.reason,
+      }));
+    }
+  }
+
+  log(structuredLog("info", "interview.document_committed", {
+    session_id: burst.sessionId,
+    accepted: decisions.accepted.length,
+    rejected: decisions.rejected.length,
+    reasons: decisions.rejected.map((r) => r.reason),
+    ms: result.ms,
+  }));
+
+  if (recorded.length === 0) {
+    await say(uiString("documentNothing", language));
+    await ask();
+    return;
+  }
+
+  // WHAT IT TOOK, in the organizer's own recap format, so they can correct it.
+  // An answer they never gave and cannot see is worse than being asked twice.
+  const view = await getSessionForChat(deps.db, burst.chatId);
+  if (view.ok) {
+    const answers = await answersForChat(deps.db, burst.chatId);
+    const lines = buildRecap(answers?.answers ?? {}, INTAKE_QUESTIONS, language)
+      .filter((entry) => recorded.includes(entry.questionId))
+      .map((entry) => `• ${entry.prompt}: ${entry.answerLabel}`);
+    if (lines.length > 0) {
+      await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
+    }
+  }
+  await ask();
+}
+
 /**
  * The interview without an agent: interpret one settled burst, write what
  * survives the gate, then let the router ask what it always would have.
@@ -788,6 +966,19 @@ async function runInterpretPath(
   if (!state) return;
   const session = await getSessionForChat(deps.db, burst.chatId);
   const language = session.ok ? session.view.language : DEFAULT_LANGUAGE;
+
+  // A DOCUMENT. Read it, and let what it says answer questions.
+  //
+  // Handled before the text branch and instead of it: someone who uploads a
+  // booking and types "it's all in here" has said nothing interpretable, and
+  // the file is the message. The whole exchange — acknowledge, read, report
+  // back, ask only for what is left — is the reason accepting a file is worth
+  // anything, and until now the bot accepted files and read none of them.
+  const documents = documentsInBurst(combined, deps);
+  if (documents.length > 0) {
+    await runDocumentPath(deps, burst, documents, state, language, log);
+    return;
+  }
   // Which question is currently on the organizer's screen. Needed after the
   // commit, to decide whether the interview may move past it — see `pace`.
   const onScreen = session.ok && session.view.lastPrompt?.startsWith("q:")
