@@ -53,6 +53,7 @@ import {
   markOfferedMoreForChat,
   questionStateForChat,
   recordLastPromptForChat,
+  INTAKE_QUESTIONS,
   selectedOptionIds,
   setFinishRequestedForChat,
   skipQuestionForChat,
@@ -709,6 +710,21 @@ async function runInterpretPath(
   const messageIds = combined.message_id ? [combined.message_id] : [];
   const key = burstKey(messageIds, sourceText);
 
+  // TAKE THE FLOOR FIRST, before anything slow.
+  //
+  // The organizer has just written, so it is the machine's turn — and on the
+  // agent path that transition came free with `openAgentTurn`, which this path
+  // deliberately never calls. Without it `sendNextStep` returns silently at its
+  // `awaiting === "person"` guard and `claimFloor` refuses, so every answer
+  // would be recorded correctly and the interview would go quiet: the exact
+  // symptom of runs 14–15, arrived at from the opposite direction.
+  //
+  // A document burst has already been given the wider DOCUMENT_FLOOR_SECONDS
+  // by the caller; do not narrow it here.
+  if ((combined.media_urls?.length ?? 0) === 0) {
+    await markAwaitingMachine(deps.db, burst.chatId, AGENT_FLOOR_SECONDS);
+  }
+
   const ask = async () => {
     const after = await getSessionForChat(deps.db, burst.chatId);
     if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
@@ -739,6 +755,11 @@ async function runInterpretPath(
   if (!state) return;
   const session = await getSessionForChat(deps.db, burst.chatId);
   const language = session.ok ? session.view.language : DEFAULT_LANGUAGE;
+  // Which question is currently on the organizer's screen. Needed after the
+  // commit, to decide whether the interview may move past it — see `pace`.
+  const onScreen = session.ok && session.view.lastPrompt?.startsWith("q:")
+    ? session.view.lastPrompt.slice(2)
+    : null;
 
   const interpretationId = claim.fresh ? claim.id : claim.row.id;
   let proposals: ProposedAnswer[];
@@ -839,6 +860,35 @@ async function runInterpretPath(
     reasons: decisions.rejected.map((r) => r.reason),
   }));
   await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
+
+  // PACING. An OPTIONAL question that was on screen and did not get answered
+  // is put behind us, so the interview moves to the next one.
+  //
+  // Without this the interview stalls, and the first end-to-end run showed it:
+  // every required question answered, then fifteen turns in a row on
+  // `travel_anchors` because the organizer's replies did not answer it and
+  // `optionalRemaining[0]` is always the same question. The flood dedupe
+  // suppressed the repeat, so the organizer saw nothing at all — the interview
+  // simply went quiet on a path that was working perfectly.
+  //
+  // On the agent path this was the agent's job: `ask_question_for_chat` decides
+  // WHICH optional question is worth asking now, what app.ts calls "the pacing
+  // half of the split". Removing the agent removed the pacing with it, and this
+  // is the deterministic rule that replaces it: each optional question is
+  // offered exactly once, in order, and then the interview goes on.
+  //
+  // Required questions are deliberately NOT skipped — the interview cannot
+  // proceed without them, so it re-asks, which is the behaviour it already had.
+  if (onScreen && !decisions.accepted.some((a) => a.questionId === onScreen)) {
+    const question = INTAKE_QUESTIONS.find((q) => q.id === onScreen);
+    if (question && !question.required && !state.answered.includes(onScreen)) {
+      await skipQuestionForChat(deps.db, burst.chatId, onScreen);
+      log(structuredLog("info", "interview.optional_passed_over", {
+        session_id: burst.sessionId,
+        question_id: onScreen,
+      }));
+    }
+  }
 
   // The floor was taken when the burst arrived; the router speaks now.
   await ask();
