@@ -11,6 +11,7 @@
  * problem, and keeping the two apart means the interesting half stays testable
  * without a model and this half stays testable without a prompt.
  */
+import { inflateRawSync } from "node:zlib";
 import { extractText, getDocumentProxy } from "unpdf";
 
 /** Beyond this a document is almost certainly not a trip plan. */
@@ -84,10 +85,15 @@ export function looksLikeIdentityDocument(text: string, filename: string | undef
 }
 
 /** Types worth attempting. Anything else is refused by name, not guessed at. */
-export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "html" | "text" | null {
+export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "docx" | "html" | "text" | null {
   const m = (mime ?? "").toLowerCase();
   const name = (filename ?? "").toLowerCase();
   if (m.includes("pdf") || name.endsWith(".pdf")) return "pdf";
+  // A Word plan is one of the most common things an organizer already has —
+  // the USA trip's own folder holds תוכנית_טיול_ארהב_יולי_2026.docx. Legacy
+  // `.doc` is deliberately NOT here: it is a binary OLE format needing a real
+  // parser, and almost nobody produces one by accident any more.
+  if (m.includes("wordprocessingml") || name.endsWith(".docx")) return "docx";
   // HTML earns its own kind rather than falling into `text`, because
   // `text/html` decoded raw is 90% markup and a model asked to read it spends
   // its attention on div soup. Real case: the USA trip's ESTA applications are
@@ -109,6 +115,88 @@ export function documentKindFor(mime: string | undefined, filename: string | und
     return "text";
   }
   return null;
+}
+
+/**
+ * One file out of a ZIP archive, or null.
+ *
+ * Hand-rolled rather than a dependency, because a `.docx` is the only reason
+ * this exists and the part of ZIP it needs is small: find the entry in the
+ * central directory, seek to its local header, inflate. `zlib.inflateRawSync`
+ * does the actual work.
+ *
+ * Deliberately not a general ZIP reader — no encryption, no ZIP64, no
+ * directory traversal, no recursion. It reads one named entry from an archive
+ * an organizer sent, and anything it does not understand it declines.
+ */
+export function readZipEntry(bytes: Uint8Array, entryName: string): Buffer | null {
+  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  // End of central directory, searched from the back — the comment field means
+  // it is not at a fixed offset.
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66_000; i -= 1) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+
+  const entries = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const wanted = Buffer.from(entryName, "utf8");
+
+  for (let n = 0; n < entries; n += 1) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(p + 10);
+    const compressedSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOffset = buf.readUInt32LE(p + 42);
+    const name = buf.subarray(p + 46, p + 46 + nameLen);
+
+    if (name.equals(wanted)) {
+      if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== 0x04034b50) return null;
+      // The LOCAL header's name/extra lengths, not the central one — they
+      // differ often enough that using the central directory's values here
+      // reads from the wrong offset.
+      const lNameLen = buf.readUInt16LE(localOffset + 26);
+      const lExtraLen = buf.readUInt16LE(localOffset + 28);
+      const start = localOffset + 30 + lNameLen + lExtraLen;
+      const data = buf.subarray(start, start + compressedSize);
+      try {
+        if (method === 0) return Buffer.from(data);
+        if (method === 8) return inflateRawSync(data);
+      } catch {
+        return null;
+      }
+      return null;
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+/**
+ * The readable text of a Word document.
+ *
+ * `word/document.xml` inside the archive, with paragraph and break tags turned
+ * into newlines before every other tag is dropped — otherwise a trip plan's
+ * every line runs into one paragraph and the dates stop being readable as
+ * dates.
+ */
+export function docxToText(bytes: Uint8Array): string | null {
+  const xml = readZipEntry(bytes, "word/document.xml");
+  if (!xml) return null;
+  return xml
+    .toString("utf8")
+    .replace(/<w:tab\b[^>]*\/>/g, "\t")
+    .replace(/<\/w:(p|tr)>/g, "\n")
+    .replace(/<w:br\b[^>]*\/>/g, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
 }
 
 /**
@@ -180,6 +268,10 @@ export async function documentText(
   let pages = 1;
   if (kind === "text") {
     raw = new TextDecoder().decode(bytes);
+  } else if (kind === "docx") {
+    const extracted = docxToText(bytes);
+    if (extracted === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .docx" };
+    raw = extracted;
   } else if (kind === "html") {
     raw = htmlToText(new TextDecoder().decode(bytes));
   } else {

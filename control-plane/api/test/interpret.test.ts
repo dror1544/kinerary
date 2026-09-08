@@ -641,3 +641,29 @@ describe("htmlToText", () => {
     assert.match(htmlToText("<p>Bed &amp; Breakfast&nbsp;&#8212; 2 nights</p>"), /Bed & Breakfast/);
   });
 });
+
+describe("invisible characters are not content", () => {
+  const RLM = "\u200f";
+  const source = RLM + "\u2022 \u05dc\u05d7\u05e0\u05d4 - \u05dc\u05d0 \u05d9\u05d5\u05ea\u05e8 \u05de-20-30 \u05d3\u05e7\u05d5\u05ea\n"
+    + RLM + "\u2022 \u05d9\u05d5\u05e1\u05d9 \u05d5\u05d7\u05e0\u05d4 (75/73)";
+
+  // A Word plan in Hebrew carries a bidi mark on nearly every bullet. They
+  // render as nothing, so a model quoting a line back returns the words and not
+  // the marks — and a byte comparison then calls the quote invented. Live on
+  // the USA trip's own plan: constraints, travel_anchors and budget_detail were
+  // all extracted correctly from Hebrew bullets and all three were refused.
+  test("a quote missing the document's bidi marks still matches", () => {
+    const quoted = "\u2022 \u05dc\u05d7\u05e0\u05d4 - \u05dc\u05d0 \u05d9\u05d5\u05ea\u05e8 \u05de-20-30 \u05d3\u05e7\u05d5\u05ea";
+    assert.equal(evidenceAppears(quoted, source), true);
+  });
+
+  test("and an invented Hebrew line is still refused", () => {
+    const invented = "\u2022 \u05dc\u05d9\u05d5\u05e1\u05d9 - \u05e9\u05e2\u05ea\u05d9\u05d9\u05dd \u05e8\u05e6\u05d5\u05e3";
+    assert.equal(evidenceAppears(invented, source), false);
+  });
+
+  test("a soft hyphen or BOM in the source does not hide a real quote", () => {
+    assert.equal(evidenceAppears("Breckenridge", "Brecken\u00adridge"), true);
+    assert.equal(evidenceAppears("Dallas", "\ufeffDallas"), true);
+  });
+});

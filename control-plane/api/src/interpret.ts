@@ -270,8 +270,24 @@ export function parseInterpretPayload(raw: unknown, allowedMessageIds: readonly 
 
 // ── Evidence ─────────────────────────────────────────────────────────────────
 
+/**
+ * INVISIBLE CHARACTERS ARE NOT CONTENT.
+ *
+ * Hebrew documents are full of bidi control marks — RLM, LRM, the embedding
+ * and isolate family — and a Word plan written in Hebrew has one at the start
+ * of nearly every bullet. They render as nothing, so a model quoting a line
+ * back reproduces the words and not the marks, and a byte comparison then says
+ * the quote is not in the document.
+ *
+ * Found on the USA trip's own plan: `constraints`, `travel_anchors` and
+ * `budget_detail` were all extracted correctly from Hebrew bullets and all
+ * three were refused as EVIDENCE_NOT_IN_SOURCE. The evidence was right there.
+ * Soft hyphens and the BOM go for the same reason.
+ */
+const INVISIBLE = /[‎‏‪-‮⁦-⁩­﻿​-‍]/g;
+
 function fold(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, " ").trim();
+  return text.replace(INVISIBLE, "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 /** One line of a claim, folded and stripped of surrounding punctuation. */
