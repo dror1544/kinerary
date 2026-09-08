@@ -13,7 +13,7 @@ import {
   type ProposedAnswer,
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
-import { INTAKE_QUESTIONS, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
+import { INTAKE_QUESTIONS, buildRecap, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
 import { documentText, htmlToText, looksLikeIdentityDocument } from "../src/document-text.js";
 
 // A small question set standing in for INTAKE_QUESTIONS, so these tests say
@@ -665,5 +665,62 @@ describe("invisible characters are not content", () => {
   test("a soft hyphen or BOM in the source does not hide a real quote", () => {
     assert.equal(evidenceAppears("Breckenridge", "Brecken\u00adridge"), true);
     assert.equal(evidenceAppears("Dallas", "\ufeffDallas"), true);
+  });
+});
+
+/**
+ * The recap is shown to be CHECKED, so it must be readable.
+ *
+ * Found by the document end-to-end harness on its first run: the budget line
+ * read "items: [object Object],[object Object],[object Object]" — in the very
+ * message asking the organizer to correct anything the document got wrong.
+ * `budget_detail` is an object whose `items` is an array, which is an ordinary
+ * shape and was the first one tried.
+ */
+describe("buildRecap never shows [object Object]", () => {
+  function labelFor(questionId: string, data: unknown): string {
+    const answers = { [questionId]: { kind: "structured" as const, schema_version: 3, data } };
+    return buildRecap(answers, INTAKE_QUESTIONS, "he").find((e) => e.questionId === questionId)?.answerLabel ?? "";
+  }
+
+  test("an object holding an array of objects reads as words", () => {
+    const label = labelFor("budget_detail", {
+      currency: "JPY",
+      party_size: 5,
+      items: [{ label: "hotels", amount: 300105 }, { label: "flights", amount: 22000 }],
+    });
+    assert.equal(/\[object Object\]/.test(label), false, label);
+    assert.match(label, /JPY/);
+    assert.match(label, /hotels/);
+  });
+
+  test("an array of objects with names reads as the names", () => {
+    const label = labelFor("phases", [
+      { name: "Tokyo", start: "2026-09-19" },
+      { name: "Kyoto", start: "2026-09-24" },
+    ]);
+    assert.match(label, /Tokyo/);
+    assert.match(label, /Kyoto/);
+  });
+
+  // Dropping an undescribable entry beats printing a placeholder: the
+  // organizer is being asked to spot mistakes, and "[object Object]" is noise
+  // that makes the whole line untrustworthy.
+  test("a value it cannot describe is dropped, not stringified", () => {
+    const label = labelFor("constraints", { mobility: "wheelchair", opaque: { a: { b: {} } } });
+    assert.equal(/\[object Object\]/.test(label), false, label);
+    assert.match(label, /wheelchair/);
+  });
+
+  test("deeply nested nonsense still never leaks a placeholder", () => {
+    for (const data of [
+      { a: [[{}], [{}]] },
+      { a: [{ b: [{ c: {} }] }] },
+      [{ x: [{}, {}] }],
+      { only: {} },
+    ]) {
+      const label = labelFor("constraints", data);
+      assert.equal(/\[object Object\]/.test(label), false, JSON.stringify(data) + " -> " + label);
+    }
   });
 });

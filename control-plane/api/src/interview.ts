@@ -902,6 +902,20 @@ function describeStructured(data: unknown): string {
   const label = (item: unknown): string => {
     if (item === null || item === undefined) return "";
     if (typeof item !== "object") return String(item);
+    // A NESTED ARRAY, summarised rather than stringified.
+    //
+    // Without this the object branch below fell through to `String(v)` and put
+    // "[object Object],[object Object]" on the organizer's screen — live, in
+    // the message whose whole job is showing what was taken from their
+    // document so they can correct it. `budget_detail` is an object whose
+    // `items` is an array, which is an ordinary shape and was the first one
+    // tried.
+    if (Array.isArray(item)) {
+      const inner = item.map(label).filter((l) => l !== "");
+      if (inner.length === 0) return item.length > 0 ? `${item.length}` : "";
+      const shown = inner.slice(0, 3).join(", ");
+      return inner.length > 3 ? `${shown} +${inner.length - 3}` : shown;
+    }
     const record = item as Record<string, unknown>;
     const named = NAME_KEYS.map((k) => record[k]).find((v) => typeof v === "string" && v.trim() !== "");
     if (typeof named === "string") return named.trim();
@@ -927,8 +941,16 @@ function describeStructured(data: unknown): string {
       ([, v]) => v !== null && v !== undefined && v !== "",
     );
     if (entries.length === 0) return "(none)";
-    const shown = entries.slice(0, 4).map(([k, v]) => `${k}: ${label(v) || String(v)}`).join(", ");
-    return entries.length > 4 ? `${shown} +${entries.length - 4} more` : shown;
+    // `String(v)` was the fallback here and it is the hazard: for any object it
+    // produces "[object Object]", which is worse than showing nothing at all —
+    // the organizer is being asked to check this for mistakes. An entry that
+    // cannot be described is dropped instead.
+    const described = entries
+      .map(([k, v]) => [k, label(v)] as const)
+      .filter(([, v]) => v !== "");
+    if (described.length === 0) return "(none)";
+    const shown = described.slice(0, 4).map(([k, v]) => `${k}: ${v}`).join(", ");
+    return described.length > 4 ? `${shown} +${described.length - 4} more` : shown;
   }
 
   return "(none)";
