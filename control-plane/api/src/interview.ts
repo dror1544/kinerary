@@ -1838,6 +1838,27 @@ export async function queueInboundMessage(
   chatId: string,
   event: QueuedInboundEvent,
 ): Promise<void> {
+  // A DOCUMENT SILENCES THE PENDING QUESTION.
+  //
+  // Reading a booking takes about two minutes, and the burst does not even
+  // settle for two seconds — so a router prompt already owing fires in that
+  // gap and asks for the destination while the answer is being read out of the
+  // file. Live on 2026-09-08: the organizer uploaded a PDF and was immediately
+  // asked the trip type and the destination, both of which were in it.
+  //
+  // Clearing the deadline rather than adding a "hold" flag, because the
+  // document path calls `sendNextStep` when it is done and that schedules
+  // whatever is genuinely still needed. Nothing is lost — the question is
+  // asked later, if the document did not already answer it, which is the
+  // entire point of accepting one.
+  if ((event.media_urls?.length ?? 0) > 0) {
+    await db.query(
+      `UPDATE control_plane.intake_sessions
+          SET router_prompt_due_at = NULL
+        WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+      [chatId],
+    );
+  }
   // Set to now(), not now()+settle — matching scheduleRouterPrompt exactly.
   // The settle window lives entirely in claimSettledInboundBursts's WHERE
   // clause ("has it been quiet for N seconds"), not in when this timestamp is

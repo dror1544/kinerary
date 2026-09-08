@@ -835,8 +835,14 @@ async function runDocumentPath(
       session_id: burst.sessionId,
       reason: result.reason,
       ms: result.ms,
+      // The detail was already being carried and thrown away, which made the
+      // first live BAD_OUTPUT unexplainable: the model answered, the parser
+      // refused it, and nothing anywhere said what it had actually returned.
+      // Truncated, and it is model output about a document the organizer chose
+      // to share — enough to diagnose the shape, not a copy of their booking.
+      detail: (result.detail ?? "").slice(0, 300),
     }));
-    await say(uiString("documentNothing", language));
+    await say(uiString("documentExtractFailed", language));
     await ask();
     return;
   }

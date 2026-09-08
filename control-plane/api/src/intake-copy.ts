@@ -314,6 +314,12 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentRead: "Here's what I took from it:",
     documentCorrect: "If any of that is wrong, just tell me and I'll fix it. Otherwise we'll carry on.",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
+    // NOT the same as finding nothing, and it took a live run to see why that
+    // matters: the organizer sent a booking PDF full of dates and hotels and
+    // was told there was nothing about the trip in it. There was. The reading
+    // worked and the step after it failed, and telling them otherwise makes
+    // the bot look like it cannot read while quietly blaming their file.
+    documentExtractFailed: "I read it, but I couldn't make sense of it just now — that's on me, not the file. I'll ask instead, and you can send it again later if you like.",
     documentUnreadable: "I couldn't read that one — it may be a scan or a photo rather than a text document. Send a different file if you have one, or we can carry on and I'll ask instead.",
     // The three messages of an interview that can end.
     //
@@ -366,6 +372,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentRead: "הנה מה שלקחתי מהמסמך:",
     documentCorrect: "אם משהו מזה לא נכון, פשוט תגידו לי ואתקן. אחרת נמשיך.",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
+    documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",

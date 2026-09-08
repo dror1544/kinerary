@@ -104,12 +104,113 @@ function parseValue(raw: unknown): ProposedValue | null {
       const text = str(v.text);
       return text ? { kind: "text", text } : null;
     }
-    case "structured":
+    case "structured": {
+      // `dataJson` is the schema-friendly form and the one a constrained model
+      // returns: strict structured output cannot express "any JSON here", so
+      // the payload travels as a STRING and is decoded here. That is the
+      // design's own rule applied one level down — the parser is the schema,
+      // and a model that cannot produce well-formed JSON inside a string was
+      // never going to produce it inline either.
+      if (typeof v.dataJson === "string") {
+        try {
+          return { kind: "structured", data: JSON.parse(v.dataJson) };
+        } catch {
+          return null;
+        }
+      }
+      // Inline `data` stays accepted: a runner with no schema enforcement, and
+      // every test written before `dataJson` existed, both use it.
       return v.data === undefined ? null : { kind: "structured", data: v.data };
+    }
     default:
       return null;
   }
 }
+
+/**
+ * The proposals payload as a schema a provider can ENFORCE — the Codex CLI's
+ * `--output-schema`.
+ *
+ * Written to OpenAI's strict rules, the same ones `EXTRACT_OUTPUT_SCHEMA` is
+ * written to: every key in `required`, `additionalProperties: false`
+ * throughout, optional expressed as nullable. There is a test asserting that
+ * recursively, because the first attempt at the itinerary schema was rejected
+ * before the model was ever called and cost a whole run to find.
+ *
+ * This is the answer to a BAD_OUTPUT on a live document: asking for a shape in
+ * prose is a request, and a 114-second request that comes back malformed has
+ * cost the organizer two minutes for nothing. A schema is not a request.
+ */
+export const INTERPRET_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["proposals", "unclear"],
+  properties: {
+    proposals: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["questionId", "value", "confidence", "evidence"],
+        properties: {
+          questionId: { type: "string" },
+          confidence: { type: "number" },
+          evidence: { type: "string" },
+          value: {
+            anyOf: [
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "optionId"],
+                properties: { kind: { type: "string", enum: ["choice"] }, optionId: { type: "string" } },
+              },
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "otherText"],
+                properties: { kind: { type: "string", enum: ["choice_other"] }, otherText: { type: "string" } },
+              },
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "optionIds"],
+                properties: {
+                  kind: { type: "string", enum: ["multi_choice"] },
+                  optionIds: { type: "array", items: { type: "string" } },
+                },
+              },
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "text"],
+                properties: { kind: { type: "string", enum: ["text"] }, text: { type: "string" } },
+              },
+              {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "dataJson"],
+                properties: {
+                  kind: { type: "string", enum: ["structured"] },
+                  // A STRING holding JSON. See `parseValue`.
+                  dataJson: { type: "string" },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    unclear: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["questionId", "why"],
+        properties: { questionId: { type: "string" }, why: { type: "string" } },
+      },
+    },
+  },
+};
 
 /**
  * Parses one model reply. Returns null only when the TOP LEVEL is unusable —
@@ -454,7 +555,10 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     ``,
     `value kinds: {"kind":"choice","optionId":"x"} | {"kind":"choice_other","otherText":"x"}`,
     ` | {"kind":"multi_choice","optionIds":["x"]} | {"kind":"text","text":"x"}`,
-    ` | {"kind":"structured","data":...}`,
+    ` | {"kind":"structured","dataJson":"<the JSON, as a string>"}`,
+    ``,
+    `A structured answer travels as a STRING in "dataJson" — write the JSON and`,
+    `escape it, e.g. "dataJson":"[{\"name\":\"Dana\"}]".`,
     ``,
     `No commentary.`,
     ``,
@@ -523,7 +627,11 @@ export function buildExtractIntakePrompt(args: {
     ``,
     `value kinds: {"kind":"choice","optionId":"x"} | {"kind":"choice_other","otherText":"x"}`,
     ` | {"kind":"multi_choice","optionIds":["x"]} | {"kind":"text","text":"x"}`,
-    ` | {"kind":"structured","data":...}`,
+    ` | {"kind":"structured","dataJson":"<the JSON, as a string>"}`,
+    ``,
+    `A structured answer travels as a STRING in "dataJson" — write the JSON and`,
+    `escape it, e.g. "dataJson":"[{\"place\":\"Tokyo\"}]". Keep it compact:`,
+    `the fields the question asks for, not everything the document contains.`,
     ``,
     `No commentary.`,
     ``,
@@ -550,6 +658,7 @@ export async function extractIntakeFromDocument(
   const result = await runner.run<InterpretPayload>({
     task: EXTRACT_INTAKE_TASK,
     prompt: buildExtractIntakePrompt(args),
+    schema: INTERPRET_OUTPUT_SCHEMA,
     parse: (raw) => parseInterpretPayload(raw, []),
     ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
   });
@@ -572,6 +681,7 @@ export async function interpretBurst(
   const result = await runner.run<InterpretPayload>({
     task: INTERPRET_TASK,
     prompt: buildInterpretPrompt(args),
+    schema: INTERPRET_OUTPUT_SCHEMA,
     parse: (raw) => parseInterpretPayload(raw, messageIds),
   });
   if (!result.ok) return { ok: false, reason: result.reason, detail: result.detail, attempts: result.attempts, ms: result.ms };
