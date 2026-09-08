@@ -434,6 +434,28 @@ export function openRouterKey(env: NodeJS.ProcessEnv = process.env): string {
 export const DEFAULT_EXTRACT_MODEL = "minimax/minimax-m3";
 
 /**
+ * The interpret model. MiniMax M3 as well — a starting point for §8's
+ * benchmark, not a settled choice.
+ *
+ * Cost is not the reason and barely matters here: an interpret prompt is the
+ * outstanding questions plus one message, and its answer is a short JSON
+ * object. Latency is the open question, and the only thing that answers it is
+ * the measurement. If p95 disappoints, a smaller model is the obvious next
+ * thing to try — which is a one-line config change precisely because the task
+ * is pinned separately from `extract`.
+ */
+export const DEFAULT_INTERPRET_MODEL = "minimax/minimax-m3";
+
+/**
+ * Never route through `openrouter/auto`. It picks a model per request, which
+ * is the fallback problem wearing a different hat: two runs of the same
+ * interview could be served by two different models with no signal that
+ * anything varied. Named here so the reason survives someone noticing that
+ * `auto` exists and looks convenient.
+ */
+export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto", "openrouter/auto-beta"]);
+
+/**
  * Both task runners, from the environment. Undefined when nothing is
  * configured — the interpret path then falls back to the router's own
  * questions and extraction to its Hermes profile, which are working behaviours
@@ -454,6 +476,10 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
   const byTask: Record<string, StructuredModelRunner> = {};
 
   const build = (kind: string, model: string, timeoutMs: number, task: string): StructuredModelRunner | undefined => {
+    // A model that picks a model is the fallback problem again. Refused here
+    // rather than trusted to configuration, because the failure it produces is
+    // silent — see FORBIDDEN_MODELS.
+    if (FORBIDDEN_MODELS.has(model)) return undefined;
     if (kind === "openrouter") {
       if (!key) return undefined;
       return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
@@ -464,10 +490,13 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
   };
 
   const interpretKind = (env.INTERPRET_RUNNER || "").trim().toLowerCase();
-  const interpretModel = (env.INTERPRET_MODEL || "").trim();
-  if (interpretKind && interpretModel) {
-    const runner = build(interpretKind, interpretModel, Number(env.INTERPRET_TIMEOUT_MS || DEFAULT_TIMEOUT_MS), "interpret");
-    if (runner) byTask.interpret = runner;
+  if (interpretKind) {
+    const interpretModel =
+      (env.INTERPRET_MODEL || "").trim() || (interpretKind === "openrouter" ? DEFAULT_INTERPRET_MODEL : "");
+    if (interpretModel) {
+      const runner = build(interpretKind, interpretModel, Number(env.INTERPRET_TIMEOUT_MS || DEFAULT_TIMEOUT_MS), "interpret");
+      if (runner) byTask.interpret = runner;
+    }
   }
 
   const extractKind = (env.EXTRACT_RUNNER || "").trim().toLowerCase();

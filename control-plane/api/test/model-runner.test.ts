@@ -266,6 +266,23 @@ describe("modelRunnerFromEnv", () => {
     assert.equal(interpret.ok === false && interpret.reason, "NOT_CONFIGURED");
   });
 
+  test("interpret defaults to MiniMax too, so both tasks are one key away", async () => {
+    const runner = modelRunnerFromEnv({ INTERPRET_RUNNER: "openrouter", OPENROUTER_API_KEY: "sk-x" });
+    assert.ok(runner);
+    const extract = await runner.run({ task: "extract", prompt: "", parse: identity });
+    assert.equal(extract.ok === false && extract.reason, "NOT_CONFIGURED", "extract is not implied by interpret");
+  });
+
+  // A model that picks a model is the fallback problem wearing a hat.
+  test("openrouter/auto is refused, not configured", async () => {
+    const runner = modelRunnerFromEnv({
+      OPENROUTER_API_KEY: "sk-x",
+      EXTRACT_RUNNER: "openrouter",
+      EXTRACT_MODEL: "openrouter/auto",
+    });
+    assert.equal(runner, undefined);
+  });
+
   test("each task is pinned separately", async () => {
     const runner = modelRunnerFromEnv({
       OPENROUTER_API_KEY: "sk-x",
