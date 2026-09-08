@@ -299,6 +299,22 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // normal thing to do in a conversation, usually because you were asking
     // about something else.
     stillNeed: "Still need this one:",
+    // The three messages of an interview that can end.
+    //
+    // All three exist to answer the question someone actually has, which is
+    // never "what is the session state" but "did I lose my answers". So all
+    // three say no, in the first or second line, before anything else.
+    expiringSoon:
+      "I'll close this conversation in about 10 minutes if I don't hear from you — nothing is lost, everything you've told me is saved. Send anything to keep going.",
+    expired:
+      "I've closed our conversation for now. Everything you told me is saved and waiting.",
+    // Said when someone writes into a closed interview. It has to point at the
+    // one thing that can reopen it, and name it the way they met it: this
+    // conversation began by opening a link, so that is what "start again"
+    // means. Vaguer wording ("please start a new session") leaves them looking
+    // for a button that does not exist.
+    expiredWriteAfter:
+      "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -330,6 +346,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     stillNeed: "עוד צריך את זה:",
+    expiringSoon:
+      "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
+    expired: "סגרתי את השיחה בינתיים. כל מה שסיפרתם שמור ומחכה.",
+    expiredWriteAfter:
+      "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
   },
 };
 

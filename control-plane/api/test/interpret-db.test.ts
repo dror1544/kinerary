@@ -24,11 +24,15 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import {
   INTAKE_QUESTIONS,
+  claimExpiredSessions,
+  claimSessionsDueWarning,
+  expiredSessionLanguage,
   getSessionForChat,
   openAgentTurn,
   questionStateForChat,
   queueInboundMessage,
   submitAnswerForChat,
+  touchSessionDeadline,
 } from "../src/interview.js";
 import { flushSettledInboundBursts } from "../src/relay/poller.js";
 import { uiString } from "../src/intake-copy.js";
@@ -344,6 +348,103 @@ describe("one writer per session", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABAS
       const after = await questionStateForChat(pool, a.chatId);
       assert.ok(after?.answered.includes("trip_type"));
       assert.equal(after?.outstanding.includes("trip_type"), false);
+    });
+  });
+});
+
+/**
+ * An interview that can end.
+ *
+ * Nothing in `intake_sessions` used to expire: someone who opened a link,
+ * answered two questions and put their phone down left a session sitting open
+ * and writable indefinitely. Three events now exist — a warning, a close, and
+ * an answer for whoever writes afterwards — and each has to happen exactly once.
+ */
+describe("interview session expiry", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  /** Drags a session's deadline into the past, or into the warning window. */
+  async function setDeadline(pool: pg.Pool, chatId: string, sql: string) {
+    await pool.query(
+      `UPDATE control_plane.intake_sessions SET expires_at = ${sql} WHERE telegram_chat_id = $1`,
+      [chatId],
+    );
+  }
+
+  test("a live conversation never expires under the person having it", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setDeadline(pool, a.chatId, "now() + interval '30 seconds'");
+      await touchSessionDeadline(pool, a.chatId, 3600);
+      assert.deepEqual(await claimExpiredSessions(pool), [], "writing pushed the deadline out");
+      assert.deepEqual(await claimSessionsDueWarning(pool, 10, 600), [], "and out of the warning window");
+    });
+  });
+
+  test("the warning fires once, not on every tick", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await setDeadline(pool, a.chatId, "now() + interval '5 minutes'");
+      await setDeadline(pool, b.chatId, "now() + interval '5 hours'");
+
+      const first = await claimSessionsDueWarning(pool, 10, 600);
+      assert.deepEqual(first.map((s) => s.chatId), [a.chatId], "only the one inside the window");
+      assert.deepEqual(await claimSessionsDueWarning(pool, 10, 600), [], "claimed, so not again");
+    });
+  });
+
+  test("writing after a warning earns a fresh one next time", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setDeadline(pool, a.chatId, "now() + interval '5 minutes'");
+      assert.equal((await claimSessionsDueWarning(pool, 10, 600)).length, 1);
+
+      await touchSessionDeadline(pool, a.chatId, 3600);
+      await setDeadline(pool, a.chatId, "now() + interval '5 minutes'");
+      assert.equal((await claimSessionsDueWarning(pool, 10, 600)).length, 1, "the warning was reset by writing");
+    });
+  });
+
+  test("expiry claims once, and carries the interview's own language", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await pool.query("UPDATE control_plane.intake_sessions SET language='he' WHERE telegram_chat_id=$1", [a.chatId]);
+      await setDeadline(pool, a.chatId, "now() - interval '1 minute'");
+      await setDeadline(pool, b.chatId, "now() + interval '5 hours'");
+
+      const expired = await claimExpiredSessions(pool);
+      assert.deepEqual(expired.map((s) => s.chatId), [a.chatId]);
+      assert.equal(expired[0]?.language, "he", "telling someone in English that their Hebrew interview closed is its own insult");
+      assert.deepEqual(await claimExpiredSessions(pool), [], "claimed, so not again");
+    });
+  });
+
+  test("an expired session answers for its chat — but only while nothing is live", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await setDeadline(pool, a.chatId, "now() - interval '1 minute'");
+      await claimExpiredSessions(pool);
+
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), "en");
+      assert.equal(await expiredSessionLanguage(pool, b.chatId), null, "a live session is not expired");
+    });
+  });
+
+  // Getting this wrong locks people out permanently, which is worse than the
+  // bug it fixes: a new deep link leaves the expired session in place, so a
+  // naive "is there an expired session here" would refuse every message of the
+  // replacement interview forever.
+  test("a replacement interview on the same chat is not refused", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setDeadline(pool, a.chatId, "now() - interval '1 minute'");
+      await claimExpiredSessions(pool);
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), "en", "closed, as expected");
+
+      // A fresh link: a new session on the same chat, expired one left alone.
+      await seedInterview(pool, a.chatId);
+      assert.equal(await expiredSessionLanguage(pool, a.chatId), null, "the new interview speaks for the chat now");
+    });
+  });
+
+  test("a confirmed interview is never warned or expired", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await pool.query("UPDATE control_plane.intake_sessions SET state='confirmed' WHERE telegram_chat_id=$1", [a.chatId]);
+      await setDeadline(pool, a.chatId, "now() - interval '1 hour'");
+      assert.deepEqual(await claimExpiredSessions(pool), []);
+      assert.deepEqual(await claimSessionsDueWarning(pool, 10, 600), []);
     });
   });
 });

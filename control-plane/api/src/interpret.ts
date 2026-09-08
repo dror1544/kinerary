@@ -376,6 +376,17 @@ export interface BuildInterpretPromptArgs {
   sourceText: string;
   outstanding: readonly string[];
   language: string;
+  /**
+   * The question actually on the organizer's screen, if any.
+   *
+   * Without it a bare reply is unreadable. Live on 2026-09-08 the organizer was
+   * asked for a departure date and answered "13/9" — the model returned zero
+   * proposals and two `unclear`, which was the right call given what it knew:
+   * a lone date could be the departure, the return, or neither. In context it
+   * was not ambiguous at all, and the context was ours to supply and we did
+   * not. Short answers are most of how people actually reply.
+   */
+  onScreen?: string | null;
   questions?: readonly IntakeQuestion[];
 }
 
@@ -387,10 +398,22 @@ export interface BuildInterpretPromptArgs {
 export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
   const all = args.questions ?? INTAKE_QUESTIONS;
   const asked = all.filter((q) => args.outstanding.includes(q.id));
+  const onScreen = args.onScreen && args.outstanding.includes(args.onScreen)
+    ? all.find((q) => q.id === args.onScreen)
+    : undefined;
   return [
     `You are reading one message from someone planning a trip, written in ${args.language}.`,
     `Decide which of the questions below it answers. Answer ONLY with JSON.`,
     ``,
+    ...(onScreen
+      ? [
+          `They were just asked "${onScreen.prompt.replace(/\s+/g, " ").trim()}" (id: ${onScreen.id}),`,
+          `and this message is their reply to it. So read a short or bare answer as answering`,
+          `THAT question — "13/9" to a date question is that date, "4" to a how-many question is`,
+          `four. Only look elsewhere if the message plainly is not about it.`,
+          ``,
+        ]
+      : []),
     `Rules:`,
     `- Propose a question only if the message actually answers it. Silence is correct.`,
     `- "evidence" must be text copied VERBATIM from the message. Never paraphrase it,`,

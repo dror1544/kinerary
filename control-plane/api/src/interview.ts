@@ -673,6 +673,137 @@ function canonicalIntakePayload(tripId: string, answers: AnswerStore): string {
  * there to make impossible. The decision has to be made when the session is
  * created, or it is not really a decision.
  */
+// ── Session expiry ────────────────────────────────────────────────────────────
+
+/**
+ * How long an interview may sit idle before it closes, and how long before that
+ * the organizer is warned. Idle, not absolute — see migration 0049.
+ */
+export const SESSION_TTL_SECONDS = Number(process.env.INTERVIEW_SESSION_TTL_SECONDS || 60 * 60);
+export const SESSION_WARN_BEFORE_SECONDS = Number(process.env.INTERVIEW_SESSION_WARN_SECONDS || 10 * 60);
+
+/**
+ * Pushes the idle deadline out. Called for every inbound message, before
+ * anything slow — a conversation that is happening must never expire under the
+ * person having it, including while a model call is in flight.
+ *
+ * Clears `expiry_warned_at` too: if they were warned and then wrote, the
+ * warning did its job and the next idle stretch deserves its own.
+ */
+export async function touchSessionDeadline(
+  db: pg.Pool,
+  chatId: string,
+  ttlSeconds: number = SESSION_TTL_SECONDS,
+): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.intake_sessions
+        SET expires_at = now() + make_interval(secs => $2),
+            expiry_warned_at = NULL
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+    [chatId, ttlSeconds],
+  );
+}
+
+export interface ExpiringSession {
+  sessionId: string;
+  chatId: string;
+  language: Language;
+}
+
+/**
+ * Claims sessions inside the warning window, marking them warned in the same
+ * statement so two poll ticks cannot both warn — the identical race
+ * `claimSettledInboundBursts` and `claimDueRouterPrompts` already guard.
+ */
+export async function claimSessionsDueWarning(
+  db: pg.Pool,
+  limit = 10,
+  warnBeforeSeconds: number = SESSION_WARN_BEFORE_SECONDS,
+): Promise<ExpiringSession[]> {
+  const rows = await db.query<{ id: string; telegram_chat_id: string; language: Language }>(
+    `WITH claimed AS (
+       SELECT id FROM control_plane.intake_sessions
+        WHERE state <> 'confirmed'
+          AND expired_at IS NULL
+          AND expiry_warned_at IS NULL
+          AND telegram_chat_id IS NOT NULL
+          AND expires_at IS NOT NULL
+          AND expires_at > now()
+          AND expires_at <= now() + make_interval(secs => $2)
+        ORDER BY expires_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT $1
+     )
+     UPDATE control_plane.intake_sessions s
+        SET expiry_warned_at = now()
+       FROM claimed c
+      WHERE s.id = c.id
+      RETURNING s.id, s.telegram_chat_id, s.language`,
+    [limit, warnBeforeSeconds],
+  );
+  return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id, language: r.language }));
+}
+
+/** Claims sessions past their deadline, closing them in the same statement. */
+export async function claimExpiredSessions(db: pg.Pool, limit = 10): Promise<ExpiringSession[]> {
+  const rows = await db.query<{ id: string; telegram_chat_id: string; language: Language }>(
+    `WITH claimed AS (
+       SELECT id FROM control_plane.intake_sessions
+        WHERE state <> 'confirmed'
+          AND expired_at IS NULL
+          AND telegram_chat_id IS NOT NULL
+          AND expires_at IS NOT NULL
+          AND expires_at <= now()
+        ORDER BY expires_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT $1
+     )
+     UPDATE control_plane.intake_sessions s
+        SET expired_at = now()
+       FROM claimed c
+      WHERE s.id = c.id
+      RETURNING s.id, s.telegram_chat_id, s.language`,
+    [limit],
+  );
+  return rows.rows.map((r) => ({ sessionId: r.id, chatId: r.telegram_chat_id, language: r.language }));
+}
+
+/**
+ * The language of an expired session on this chat, or null if there is none.
+ *
+ * Answers "someone wrote — is there a closed interview behind this chat?" The
+ * language matters: telling someone their session closed, in English, when the
+ * whole interview was in Hebrew, is its own small insult.
+ */
+export async function expiredSessionLanguage(db: pg.Pool, chatId: string): Promise<Language | null> {
+  // The NOT EXISTS is load-bearing, and getting it wrong locks people out: a
+  // new deep link creates a NEW session and leaves the expired one where it
+  // is, so a query that only asks "is there an expired session here" would
+  // answer yes forever and refuse every message of the replacement interview.
+  // An expired session only speaks for a chat that has nothing live on it.
+  const rows = await db.query<{ language: Language }>(
+    `SELECT s.language
+       FROM control_plane.intake_sessions s
+      WHERE s.telegram_chat_id = $1
+        AND s.expired_at IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM control_plane.intake_sessions live
+           WHERE live.telegram_chat_id = $1 AND live.expired_at IS NULL
+        )
+      ORDER BY s.expired_at DESC LIMIT 1`,
+    [chatId],
+  );
+  const [row] = rows.rows;
+  if (!row) return null;
+  // `language` is nullable and NULL for any session started without a Telegram
+  // language hint — which is most of them. Returning it raw would make null
+  // mean two different things, "no expired session" and "expired, language
+  // unknown", and the caller reads null as the first: the guard would never
+  // fire for exactly the sessions most likely to hit it. Found by the test,
+  // not by reading the code.
+  return row.language ?? DEFAULT_LANGUAGE;
+}
+
 export function interpretPathDefault(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env.INTERPRET_PATH_DEFAULT || "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes";

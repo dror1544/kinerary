@@ -54,6 +54,10 @@ import {
   questionStateForChat,
   recordLastPromptForChat,
   INTAKE_QUESTIONS,
+  claimExpiredSessions,
+  claimSessionsDueWarning,
+  expiredSessionLanguage,
+  touchSessionDeadline,
   selectedOptionIds,
   setFinishRequestedForChat,
   skipQuestionForChat,
@@ -214,6 +218,27 @@ export async function applyDecision(
   // agent still genuinely extracting a PDF. Every other inbound kind keeps the
   // default (undefined here clears any earlier override on this session).
   const chatId = interviewChatOf(decision);
+
+  // WRITING INTO A CLOSED INTERVIEW.
+  //
+  // Answered here, before the floor is touched or anything is queued, because
+  // the alternative is worse than silence: the message would be recorded
+  // against a session nobody is going to finish, and the organizer would get
+  // no reply and no reason.
+  //
+  // Only reached when the chat has NO live session — a fresh deep link makes a
+  // new one and leaves the expired one alone, so `expiredSessionLanguage`
+  // checks for that. A `/start` never lands here anyway: it is a `reply`
+  // decision with its own text, not an interview one.
+  if (chatId) {
+    const closedIn = await expiredSessionLanguage(deps.db, chatId);
+    if (closedIn) {
+      await deps.telegram.sendMessage({ chatId, text: uiString("expiredWriteAfter", closedIn) });
+      log(structuredLog("info", "interview.write_after_expiry", { chat_id_present: true }));
+      return;
+    }
+  }
+
   if (chatId) {
     // The ATTACHMENT decides this, not the re-host. `media_urls` is populated
     // only when re-hosting succeeded, so reading the floor off it gave a failed
@@ -288,6 +313,10 @@ export async function applyDecision(
       // someone on the other side and smooth the 2 sec delay." Best-effort —
       // if it fails, the organizer waits the same two seconds either way.
       await deps.telegram.sendChatAction({ chatId: decision.chatId }).catch(() => {});
+      // The deadline moves before anything slow. A conversation that is
+      // happening must never expire under the person having it — including
+      // while a model call or a document read is still in flight.
+      await touchSessionDeadline(deps.db, decision.chatId);
       await queueInboundMessage(deps.db, decision.chatId, decision.event);
       return;
     }
@@ -789,6 +818,7 @@ async function runInterpretPath(
       sourceText,
       outstanding: state.outstanding,
       language,
+      onScreen,
       messageIds,
     });
     if (!result.ok) {
@@ -991,6 +1021,41 @@ export async function flushSettledInboundBursts(
     } catch {
       log(structuredLog("warn", "trip_bot.inbound_burst_flush_failed", { session_id: burst.sessionId }));
     }
+  }
+}
+
+/**
+ * Warns an idle interview that it is about to close, and closes it when it is.
+ *
+ * Two claims rather than one pass, because they are different events with
+ * different copy and each must happen exactly once — both claim-and-mark in a
+ * single statement, the same `FOR UPDATE SKIP LOCKED` discipline every other
+ * claim here uses, so two ticks cannot both warn or both close.
+ *
+ * Neither message asks a question or carries a keyboard: there is nothing to
+ * tap, and the way back in is to write. Both lead with "nothing is lost",
+ * because that is the only thing the person actually wants to know.
+ */
+export async function closeIdleInterviews(
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  try {
+    for (const s of await claimSessionsDueWarning(deps.db)) {
+      await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expiringSoon", s.language) });
+      log(structuredLog("info", "interview.expiry_warned", { session_id: s.sessionId }));
+    }
+  } catch {
+    log(structuredLog("warn", "interview.expiry_warn_failed", {}));
+  }
+
+  try {
+    for (const s of await claimExpiredSessions(deps.db)) {
+      await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expired", s.language) });
+      log(structuredLog("info", "interview.session_expired", { session_id: s.sessionId }));
+    }
+  } catch {
+    log(structuredLog("warn", "interview.expiry_close_failed", {}));
   }
 }
 
@@ -1611,6 +1676,7 @@ export function startTripBotPoller(
         await advanceRouterOwnedQuestions(deps, strings, log);
         await renderDueRouterPrompts(deps, strings, log);
         await recoverStalledInterviews(deps, strings, log);
+        await closeIdleInterviews(deps, log);
       } catch (error) {
         log(structuredLog("warn", "trip_bot.deliver_tick_failed", {
           safe_error_code: error instanceof Error ? error.name : "UNKNOWN",

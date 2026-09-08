@@ -225,9 +225,19 @@ export async function migrateChatBinding(
 
 export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<ChatRoute> {
   const live = await db.query<{ id: string; trip_id: string }>(
+    // `expired_at IS NULL` (migration 0049), and without it the expiry feature
+    // contradicts itself: a closed session still answered here, so it still
+    // counted as "already in an interview", so the fresh link the closing
+    // message tells the organizer to get would be REFUSED with
+    // `already_in_interview` — leaving them permanently locked out of the trip
+    // they were half way through setting up. Caught by a test that expected
+    // `started` and got `already_in_interview`.
+    //
+    // "Live" already meant "not confirmed"; it now also means "not closed for
+    // idleness", which is the same idea and always should have been.
     `SELECT id, trip_id
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
   );
   const [session] = live.rows;
