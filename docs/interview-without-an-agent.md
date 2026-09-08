@@ -325,18 +325,34 @@ intake path entirely.
 ## 9. Then: `extract`
 
 Document extraction follows the same shape. `extractItinerary` now runs as the
-`extract` task on the shared runner, pinned to **MiniMax on OpenRouter**
-(`minimax/minimax-m3:free`, `EXTRACT_RUNNER=openrouter`).
+`extract` task on the shared runner, pinned to **MiniMax M3 on OpenRouter**
+(`minimax/minimax-m3`, `EXTRACT_RUNNER=openrouter`). Verified against
+OpenRouter's live model list on 2026-09-08: 1,048,576-token context, $0.30/M in
+and $1.20/M out, `response_format` and `structured_outputs` both declared. The
+million-token window is the reason — extraction is the one task where long
+context earns its cost.
 
-That is the same model the `kinerary-extract` Hermes profile already names as
-its default, so the *model* doing the work does not change. What changes is
-everything around it. That profile carries seven fallbacks across four
-providers — openai-codex, anthropic, three more OpenRouter models, ollama-cloud
-— and a chain exactly like it is what let a 429 hand an interview to a
-different model mid-run on 2026-09-07. Going direct means a limit is a limit:
-retried on the same model, then surfaced as `RATE_LIMITED`, and the caller
-decides. `extractItinerary` already treats failure as `{ ok: false }` and
-proceeds, so the decision is one that path knows how to make.
+### A fallback chain hiding a broken primary
+
+The `kinerary-extract` Hermes profile names `minimax/minimax-m3:free` as its
+default. **There is no such model id.** OpenRouter publishes 16 `:free`
+variants and no MiniMax is among them.
+
+So that profile's primary has been failing on every call, and its seven
+fallbacks across four providers — openai-codex, anthropic, three more
+OpenRouter models, ollama-cloud — have been quietly absorbing it. Nobody would
+see this: extraction kept working, on a model nobody chose.
+
+That is the argument for §7's no-fallback rule stated better than the design
+stated it. A chain does not just risk swapping models under load; it removes
+the signal that would tell you your configuration is wrong. Going direct means
+a limit is a limit and a bad model id is an error: retried on the same model,
+then surfaced as `RATE_LIMITED` or `FAILED`, and the caller decides.
+`extractItinerary` already treats failure as `{ ok: false }` and proceeds, so
+that decision is one the path knows how to make.
+
+Worth fixing in the profile too — separately, since anything still on the
+Hermes path deserves a primary that resolves.
 
 Unset, `extractItinerary` still shells out to the Hermes profile exactly as it
 always has — the current acceptance path does not move until the environment

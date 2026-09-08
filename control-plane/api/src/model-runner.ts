@@ -415,16 +415,23 @@ export function openRouterKey(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * The extraction model. MiniMax on OpenRouter — the same model the
- * `kinerary-extract` Hermes profile already names as its default, so this
- * changes the path to it, not the model doing the work.
+ * The extraction model: MiniMax M3 on OpenRouter.
  *
- * What it does change is that the fallback chain goes away. That profile lists
- * seven fallbacks across four providers, and on 2026-09-07 a chain like it let
- * a 429 hand an interview to a different model mid-run. Here a limit is a
- * limit: retried on the same model, then surfaced.
+ * Verified against OpenRouter's live model list on 2026-09-08 — 1,048,576-token
+ * context, $0.30/M in and $1.20/M out, and it declares both `response_format`
+ * and `structured_outputs`. A million tokens of context is the property that
+ * matters here: extraction is the one task where a long window earns its cost.
+ *
+ * NOTE, and it is worth acting on separately: the `kinerary-extract` Hermes
+ * profile names `minimax/minimax-m3:free`, and **there is no such model id**.
+ * OpenRouter publishes 16 `:free` variants and no MiniMax is among them. So
+ * that profile's primary has been failing and falling through to its own
+ * seven-deep fallback chain — which is exactly how a fallback chain hides a
+ * broken primary, and exactly why this path does not have one.
+ *
+ * Here a limit is a limit: retried on the same model, then surfaced.
  */
-export const DEFAULT_EXTRACT_MODEL = "minimax/minimax-m3:free";
+export const DEFAULT_EXTRACT_MODEL = "minimax/minimax-m3";
 
 /**
  * Both task runners, from the environment. Undefined when nothing is
