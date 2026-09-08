@@ -781,6 +781,7 @@ async function runDocumentPath(
 
   const texts: string[] = [];
   let unreadable = 0;
+  let identity = 0;
   for (const doc of documents) {
     const read = await documentText(doc.bytes, doc.mime, doc.filename);
     if (read.ok) {
@@ -791,6 +792,12 @@ async function runDocumentPath(
         chars: read.text.length,
         truncated: read.truncated,
       }));
+    } else if (read.reason === "IDENTITY_DOCUMENT") {
+      // Not a failure and not logged as one: refusing a passport is the
+      // system working. No detail either — there is nothing about it worth
+      // recording beyond that one arrived and was left alone.
+      identity += 1;
+      log(structuredLog("info", "interview.document_identity_refused", { session_id: burst.sessionId }));
     } else {
       unreadable += 1;
       log(structuredLog("warn", "interview.document_unreadable", {
@@ -806,8 +813,13 @@ async function runDocumentPath(
     if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
   };
 
+  // Said whenever one arrived, even alongside readable files — someone who
+  // sent a passport should be told it was left unread, not have it silently
+  // disappear into a batch.
+  if (identity > 0) await say(uiString("documentIdentity", language));
+
   if (texts.length === 0) {
-    await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
+    if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
     await ask();
     return;
   }

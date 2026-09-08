@@ -321,6 +321,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // the bot look like it cannot read while quietly blaming their file.
     documentExtractFailed: "I read it, but I couldn't make sense of it just now — that's on me, not the file. I'll ask instead, and you can send it again later if you like.",
     documentUnreadable: "I couldn't read that one — it may be a scan or a photo rather than a text document. Send a different file if you have one, or we can carry on and I'll ask instead.",
+    // Said instead of reading a passport. It has to explain rather than just
+    // refuse: someone who sent it was being helpful, and being told "no" with
+    // no reason by a bot holding their other documents is unsettling.
+    documentIdentity: "That looks like a passport or ID — I've left it unread. I don't need identity documents to set up the trip, so there's no reason for me to hold one. Booking confirmations, tickets and plans are the useful ones.",
     // The three messages of an interview that can end.
     //
     // All three exist to answer the question someone actually has, which is
@@ -374,6 +378,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
+    documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
     expired: "סגרתי את השיחה בינתיים. כל מה שסיפרתם שמור ומחכה.",

@@ -26,13 +26,80 @@ export const MAX_DOCUMENT_CHARS = 200_000;
 
 export type DocumentTextResult =
   | { ok: true; text: string; pages: number; truncated: boolean }
-  | { ok: false; reason: "UNSUPPORTED_TYPE" | "TOO_LARGE" | "UNREADABLE" | "NO_TEXT"; detail?: string };
+  | {
+      ok: false;
+      reason: "UNSUPPORTED_TYPE" | "TOO_LARGE" | "UNREADABLE" | "NO_TEXT" | "IDENTITY_DOCUMENT";
+      detail?: string;
+    };
+
+/**
+ * A passport or ID, refused before its text goes anywhere.
+ *
+ * An organizer sending one is not a mistake — they are handing over "the trip
+ * documents" and a passport scan is in that pile. But it answers none of the
+ * interview's questions, so the only thing sending it to a model achieves is
+ * putting a passport number in a third party's logs. Declining costs nothing
+ * and is the correct default for a bot that has just promised the organizer
+ * their documents are safe with it.
+ *
+ * Two signals, because either alone is weak. The MRZ is decisive — the
+ * `P<ISRSURNAME<<GIVEN<<<<<` band is a format almost nothing else produces —
+ * and the filename catches a scan whose MRZ did not extract, which is common
+ * for photographs of a page.
+ *
+ * Deliberately NOT a general "sensitive document" filter. Booking
+ * confirmations carry names, ticket numbers and partial cards, and refusing
+ * those would refuse the entire feature.
+ */
+export function looksLikeIdentityDocument(text: string, filename: string | undefined): boolean {
+  const name = (filename ?? "").toLowerCase();
+  // Latin terms take a word boundary; Hebrew ones must NOT. `\b` is defined
+  // against `\w`, which is ASCII-only, so every Hebrew letter is a non-word
+  // character and `\bדרכון\b` matches nothing at all — a Hebrew-named passport
+  // would have gone straight through, which for these organizers is the likely
+  // spelling. Caught by the test, not by reading the regex.
+  if (/\b(passports?|identity card|id card)\b/.test(name)) return true;
+  if (/(דרכון|דרכונים|תעודת זהות)/.test(name)) return true;
+  if (/(^|[^a-z])pass\.(pdf|jpe?g|png)$/.test(name)) return true;
+  // THE MRZ, and the `<` is the whole signature.
+  //
+  // The first attempt was `^[PIAC][<A-Z][A-Z]{3}[A-Z<]{6,}` — a document-type
+  // letter followed by capitals — which matches the word CONFIRMATION. It
+  // refused four of the USA trip's Booking.com confirmations as passports and
+  // said nothing about it: the most valuable documents in the folder, silently
+  // discarded by a privacy check.
+  //
+  // A machine readable zone is a long line of capitals, digits and `<` filler,
+  // and the filler is what nothing else has. Requiring it costs no real
+  // detection — no passport lacks it — and gives back every document whose
+  // only crime was shouting.
+  const MRZ_LINE = /^[A-Z0-9<]{28,}$/;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.includes("<") && MRZ_LINE.test(trimmed)) return true;
+  }
+  // A filler run on its own, for a scan whose lines came out wrapped.
+  if (/<{8,}/.test(text)) return true;
+  return false;
+}
 
 /** Types worth attempting. Anything else is refused by name, not guessed at. */
-export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "text" | null {
+export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "html" | "text" | null {
   const m = (mime ?? "").toLowerCase();
   const name = (filename ?? "").toLowerCase();
   if (m.includes("pdf") || name.endsWith(".pdf")) return "pdf";
+  // HTML earns its own kind rather than falling into `text`, because
+  // `text/html` decoded raw is 90% markup and a model asked to read it spends
+  // its attention on div soup. Real case: the USA trip's ESTA applications are
+  // saved web pages, and an organizer saving a confirmation from a browser is
+  // an entirely ordinary thing to do.
+  if (m.includes("html") || /\.(html?|xhtml)$/.test(name)) return "html";
+  // TODO(images): a photographed confirmation is refused here, and people
+  // photograph confirmations constantly — the USA trip's own folder has a JPG
+  // sitting among nineteen PDFs. This needs a vision model rather than a text
+  // extractor, which is a different call with a different cost, so it is a
+  // deliberate gap and not an oversight. `UNSUPPORTED_TYPE` already gives the
+  // organizer an honest answer in the meantime.
   if (
     m.startsWith("text/") ||
     m.includes("json") ||
@@ -42,6 +109,33 @@ export function documentKindFor(mime: string | undefined, filename: string | und
     return "text";
   }
   return null;
+}
+
+/**
+ * The readable text of an HTML page.
+ *
+ * Deliberately crude — drop what can never be prose, unwrap the rest, decode
+ * the handful of entities that actually appear. A real parser would be a
+ * dependency for no gain: nothing downstream cares about structure, only about
+ * the words, and a booking confirmation's words survive this intact.
+ */
+export function htmlToText(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|head|noscript)\b[\s\S]*?<\/\1>/gi, " ")
+    // Block-level tags become newlines so lines do not run together; the rest
+    // become spaces. A table of booking details is unreadable either way if
+    // every cell collapses onto one line.
+    .replace(/<\/?(p|div|br|tr|li|h[1-6]|table|section|article)\b[^>]*>/gi, "\n")
+    .replace(/<\/(td|th)>/gi, "  ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)));
 }
 
 /**
@@ -86,6 +180,8 @@ export async function documentText(
   let pages = 1;
   if (kind === "text") {
     raw = new TextDecoder().decode(bytes);
+  } else if (kind === "html") {
+    raw = htmlToText(new TextDecoder().decode(bytes));
   } else {
     try {
       const pdf = await getDocumentProxy(bytes);
@@ -98,6 +194,13 @@ export async function documentText(
   }
 
   const tidied = tidyDocumentText(raw);
+
+  // Checked on the extracted text, before it is returned to anything that
+  // would send it onward. The filename half could have been checked earlier;
+  // both live here so there is exactly one place a passport can be refused.
+  if (looksLikeIdentityDocument(tidied, filename)) {
+    return { ok: false, reason: "IDENTITY_DOCUMENT" };
+  }
   // A scan is the common case here, and it is not a fault anyone can fix by
   // retrying — it needs its own answer to the organizer, so it gets its own
   // reason rather than being folded into UNREADABLE.

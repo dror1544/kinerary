@@ -14,6 +14,7 @@ import {
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
 import { INTAKE_QUESTIONS, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
+import { documentText, htmlToText, looksLikeIdentityDocument } from "../src/document-text.js";
 
 // A small question set standing in for INTAKE_QUESTIONS, so these tests say
 // what they mean rather than depending on the live intake's current shape.
@@ -571,5 +572,72 @@ describe("structured questions name their fields", () => {
     const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases"], language: "he" });
     assert.match(prompt, /use exactly these fields/);
     assert.ok(prompt.includes('"name": "Tokyo"'), "the field names themselves are in the prompt");
+  });
+});
+
+/**
+ * A passport is refused before its text goes anywhere.
+ *
+ * An organizer sending one is not a mistake — they are handing over "the trip
+ * documents" and a passport scan is in that pile. But it answers none of the
+ * interview's questions, so sending it to a model achieves nothing except
+ * putting a passport number in a third party's logs. Declining costs nothing,
+ * and is the right default for a bot that has just promised the organizer
+ * their documents are safe with it.
+ */
+describe("identity documents are not read", () => {
+  test("an MRZ is decisive, whatever the file is called", () => {
+    const mrz = "P<ISRELUL<<DROR<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n1234567890ISR8001011M3001019<<<<<<<<<<<<<<04";
+    assert.equal(looksLikeIdentityDocument(mrz, "scan.pdf"), true);
+  });
+
+  test("the filler run alone is enough — a photographed page often loses the first line", () => {
+    assert.equal(looksLikeIdentityDocument("ELUL<<DROR<<<<<<<<<<<<<<<<", "anything.pdf"), true);
+  });
+
+  test("the filename catches a scan whose MRZ did not extract", () => {
+    for (const name of ["pass.pdf", "Passport.pdf", "\u05d3\u05e8\u05db\u05d5\u05df.pdf", "passports scan.jpg"]) {
+      assert.equal(looksLikeIdentityDocument("(no text extracted)", name), true, name);
+    }
+  });
+
+  // The half that matters most: booking confirmations carry names, ticket
+  // numbers and partial cards. Refusing those would refuse the whole feature.
+  test("a booking confirmation is not an identity document", () => {
+    const booking = [
+      "Booking.com Confirmation",
+      "ALOUL MOSHE YOSSI MR",
+      "Confirmation number: DC6MJ6",
+      "Blue Dolphin Inn — check-in 2026-06-14",
+      "Card ending 4242",
+    ].join("\n");
+    assert.equal(looksLikeIdentityDocument(booking, "Booking.com_ Confirmation - Monterey.pdf"), false);
+    assert.equal(looksLikeIdentityDocument(booking, "IRKJJZ - ALOUL CHANA MRS _ Sabre Red Web.pdf"), false);
+  });
+
+  test("documentText refuses it by reason, not by throwing", async () => {
+    const bytes = new TextEncoder().encode("P<ISRELUL<<DROR<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+    const result = await documentText(bytes, "text/plain", "scan.txt");
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "IDENTITY_DOCUMENT");
+  });
+});
+
+describe("htmlToText", () => {
+  test("keeps the words and drops the markup", () => {
+    const html = "<html><head><style>p{color:red}</style></head><body><p>Check-in</p><p>June 14</p></body></html>";
+    const text = htmlToText(html);
+    assert.match(text, /Check-in/);
+    assert.match(text, /June 14/);
+    assert.equal(/color:red/.test(text), false, "style contents are gone");
+    assert.equal(/<[a-z]/i.test(text), false, "no tags survive");
+  });
+
+  test("block tags become line breaks so table rows do not run together", () => {
+    assert.match(htmlToText("<tr><td>Tokyo</td></tr><tr><td>Kyoto</td></tr>"), /Tokyo[\s\S]*\n[\s\S]*Kyoto/);
+  });
+
+  test("decodes the entities that actually turn up", () => {
+    assert.match(htmlToText("<p>Bed &amp; Breakfast&nbsp;&#8212; 2 nights</p>"), /Bed & Breakfast/);
   });
 });

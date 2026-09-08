@@ -26,9 +26,16 @@ if (!path) {
 // extracting each separately would produce competing `phases` proposals with
 // the last winning on nothing better than filename order.
 const info = await stat(path);
-const files = info.isDirectory()
+const entries = info.isDirectory()
   ? (await readdir(path)).filter((f) => !f.startsWith(".")).sort().map((f) => join(path, f))
   : [path];
+// Directories turn up inside a real folder (a cache, a subfolder) and readFile
+// on one throws — which would end the run rather than skip an entry.
+const files: string[] = [];
+for (const entry of entries) {
+  if ((await stat(entry)).isFile()) files.push(entry);
+  else console.log(`  SKIP ${basename(entry)}: not a file`);
+}
 
 const parts: string[] = [];
 for (const file of files) {
