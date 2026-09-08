@@ -219,6 +219,100 @@ export function normaliseExtractedItinerary(
   return { phases: out, warnings };
 }
 
+/**
+ * The same shape `buildExtractPrompt`'s last lines ask for, as a schema an
+ * adapter can enforce — the Codex CLI's `--output-schema`, OpenRouter's
+ * structured outputs.
+ *
+ * It does NOT replace `normaliseExtractedItinerary`. A schema constrains the
+ * shape; it cannot know that a date has to fall inside its phase's range, that
+ * `<` in a label is an XSS sink because the site renders config `days` text as
+ * raw HTML, or that a booking-docket URL must be dropped. Those are the
+ * invariants, they stay in reviewed code, and a provider that enforces this
+ * schema only means the normaliser has less to throw away.
+ *
+ * Kept deliberately loose on `time` (a string or null rather than a pattern):
+ * a model that cannot satisfy a regex tends to omit the field or fail the call
+ * outright, and "HH:MM or null" is something the normaliser checks anyway.
+ *
+ * Written to OpenAI's STRICT structured-output rules, because that is the
+ * validator the Codex adapter's `--output-schema` runs it through and it
+ * rejects anything else outright (observed 2026-09-08: "'required' is required
+ * to be supplied and to be an array including every key in properties"). Two
+ * consequences worth knowing before editing this:
+ *
+ *   - every key in `properties` must appear in `required`;
+ *   - so an OPTIONAL field is expressed as nullable, never as an absent one.
+ *
+ * `label`, `url` and `area` are optional in the TypeScript types above and
+ * nullable here. `normaliseExtractedItinerary` already drops a value it cannot
+ * use, so a null arrives as an omission.
+ */
+const bilingualSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["he", "en"],
+  properties: { he: { type: "string" }, en: { type: "string" } },
+};
+
+const nullableBilingual = { anyOf: [bilingualSchema, { type: "null" }] };
+
+export const EXTRACT_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["phases"],
+  properties: {
+    phases: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "days", "venues"],
+        properties: {
+          name: { type: "string" },
+          days: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["date", "label", "items"],
+              properties: {
+                date: { type: "string" },
+                label: nullableBilingual,
+                items: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["time", "text"],
+                    properties: {
+                      time: { type: ["string", "null"] },
+                      text: bilingualSchema,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          venues: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["name", "url", "area"],
+              properties: {
+                name: bilingualSchema,
+                url: { type: ["string", "null"] },
+                area: { type: ["string", "null"] },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
 export function buildExtractPrompt(args: ExtractItineraryArgs): string {
   const phaseLines = args.phases
     .map((p) => `- ${p.name}: ${p.start || "?"} to ${p.end || "?"}`)
@@ -402,6 +496,7 @@ export async function extractItinerary(
       task: "extract",
       prompt,
       parse: (raw) => (raw && typeof raw === "object" ? raw : null),
+      schema: EXTRACT_OUTPUT_SCHEMA,
       timeoutMs: EXTRACT_TIMEOUT_MS,
     });
     if (result.ok) parsed = result.value;

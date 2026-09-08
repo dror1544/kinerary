@@ -22,8 +22,11 @@
  * `normaliseExtractedItinerary`: the pure parser is the interesting half, the
  * process spawn is not.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export type RunnerFailure =
   /** No runner configured for this task — the caller proceeds without a model. */
@@ -50,6 +53,16 @@ export interface StructuredModelRequest<T> {
   prompt: string;
   /** Total: returns null for anything it does not accept. Never throws. */
   parse: (raw: unknown) => T | null;
+  /**
+   * A JSON Schema for the answer, when the caller has one.
+   *
+   * Advisory, and deliberately so: adapters that can enforce it do (the Codex
+   * CLI's `--output-schema`, OpenRouter's structured outputs), and adapters
+   * that cannot ignore it. It never replaces `parse` — a schema the provider
+   * enforces still describes what the model was ASKED for, and `parse` is what
+   * decides whether what came back is acceptable to us.
+   */
+  schema?: Record<string, unknown>;
   timeoutMs?: number;
 }
 
@@ -163,6 +176,133 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
  */
 export function worthRetrying(reason: RunnerFailure): boolean {
   return reason === "RATE_LIMITED" || reason === "TIMED_OUT" || reason === "UPSTREAM_ERROR";
+}
+
+// ── Codex CLI ────────────────────────────────────────────────────────────────
+
+/**
+ * `codex exec`, as a one-shot structuring call.
+ *
+ * Three things make it a better fit than the plain print-mode CLIs above:
+ *
+ *  - `--output-schema` is real enforcement. The model is constrained to the
+ *    shape rather than asked politely for it in a prompt, which is the single
+ *    biggest source of BAD_OUTPUT on this path.
+ *  - `-o <file>` gives the final message on its own. Codex echoes the answer
+ *    into its own transcript on stdout, so a `firstJsonObject` over stdout
+ *    would span from the echo's first brace to the copy's last one and parse
+ *    as neither.
+ *  - It authenticates through CODEX_HOME, so it needs no key of ours.
+ *
+ * Isolation matters as much as any of that: `--ephemeral --ignore-rules
+ * --skip-git-repo-check` and a neutral cwd, so a call made from inside this
+ * repository does not quietly inherit CLAUDE.md, AGENTS.md or a session.
+ * A structuring call must depend on its prompt and nothing else.
+ */
+export interface CodexSpec {
+  bin: string;
+  model: string;
+  timeoutMs: number;
+  maxAttempts: number;
+  /** Where the process runs. Neutral by default so no repo rules apply. */
+  cwd: string;
+}
+
+export function codexSpec(model: string, timeoutMs = DEFAULT_TIMEOUT_MS, over: Partial<CodexSpec> = {}): CodexSpec {
+  return { bin: "codex", model, timeoutMs, maxAttempts: 2, cwd: tmpdir(), ...over };
+}
+
+async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Record<string, unknown> }): Promise<RunOnce> {
+  const dir = await mkdtemp(join(tmpdir(), "kinerary-codex-"));
+  const answerPath = join(dir, "answer.json");
+  const args = [
+    "exec",
+    "-m", spec.model,
+    "-s", "read-only",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--ignore-rules",
+    "-o", answerPath,
+  ];
+  if (req.schema) {
+    const schemaPath = join(dir, "schema.json");
+    await writeFile(schemaPath, JSON.stringify(req.schema), "utf8");
+    args.push("--output-schema", schemaPath);
+  }
+  args.push(req.prompt);
+
+  try {
+    const exited = await new Promise<{ code: number | null; err: string }>((resolve) => {
+      // spawn, not execFile: stdin must be closed. Codex waits on it for extra
+      // instructions otherwise, and a call that hangs on an empty pipe is worse
+      // than one that fails.
+      const child = spawn(spec.bin, args, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
+      let err = "";
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        child.kill("SIGKILL");
+        resolve({ code: null, err: `timed out (${spec.timeoutMs}ms)` });
+      }, spec.timeoutMs);
+      child.stdout?.on("data", () => {});
+      child.stderr?.on("data", (d) => { err += String(d); });
+      child.on("error", (e) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code: -1, err: String(e?.message ?? e) });
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code, err });
+      });
+    });
+
+    if (exited.code === null) return { ok: false, reason: "TIMED_OUT", detail: exited.err };
+    if (exited.code === -1) return { ok: false, reason: "FAILED", detail: `${spec.bin}: ${exited.err.slice(0, 250)}` };
+
+    let answer = "";
+    try {
+      answer = await readFile(answerPath, "utf8");
+    } catch {
+      answer = "";
+    }
+    if (!answer.trim()) {
+      const tail = exited.err.trim().slice(-250);
+      if (isRateLimitText(tail)) return { ok: false, reason: "RATE_LIMITED", detail: tail };
+      return { ok: false, reason: exited.code === 0 ? "BAD_OUTPUT" : "FAILED", detail: tail || `exit ${exited.code}` };
+    }
+    return { ok: true, stdout: answer };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+export function codexRunner(specs: Record<string, CodexSpec>): StructuredModelRunner {
+  return {
+    async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
+      const started = Date.now();
+      const spec = specs[req.task];
+      if (!spec) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
+      const timeoutMs = req.timeoutMs ?? spec.timeoutMs;
+      let attempts = 0;
+      let last: { reason: RunnerFailure; detail: string } = { reason: "FAILED", detail: "" };
+      while (attempts < spec.maxAttempts) {
+        attempts += 1;
+        const out = await runCodexOnce({ ...spec, timeoutMs }, req);
+        if (out.ok) {
+          const parsed = req.parse(firstJsonObject(out.stdout));
+          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started };
+          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started };
+        }
+        last = { reason: out.reason, detail: out.detail };
+        if (!worthRetrying(out.reason)) break;
+      }
+      return { ok: false, reason: last.reason, detail: last.detail, attempts, ms: Date.now() - started };
+    },
+  };
 }
 
 // ── OpenRouter ───────────────────────────────────────────────────────────────
@@ -447,6 +587,21 @@ export const DEFAULT_EXTRACT_MODEL = "minimax/minimax-m3";
 export const DEFAULT_INTERPRET_MODEL = "minimax/minimax-m3";
 
 /**
+ * Codex Luna — the model the first real run uses, and the one to fall back to
+ * when a candidate is not good enough.
+ *
+ * Reached through the Codex CLI rather than OpenRouter, which is why it works
+ * with no credential of ours: `codex` authenticates through CODEX_HOME. It is
+ * also the only candidate here that can be given an enforced output schema.
+ *
+ * Falling back to it is a DEPLOYMENT decision — change the config and restart —
+ * not something the runner does mid-call. That distinction is the whole of §7:
+ * choosing a different model between runs is judgement, swapping one in during
+ * a run is the 2026-09-07 failure.
+ */
+export const CODEX_LUNA_MODEL = "gpt-5.6-luna";
+
+/**
  * Never route through `openrouter/auto`. It picks a model per request, which
  * is the fallback problem wearing a different hat: two runs of the same
  * interview could be served by two different models with no signal that
@@ -484,6 +639,7 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
       if (!key) return undefined;
       return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
     }
+    if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
     if (kind === "claude") return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude") });
     if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
     return undefined;
@@ -492,7 +648,8 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
   const interpretKind = (env.INTERPRET_RUNNER || "").trim().toLowerCase();
   if (interpretKind) {
     const interpretModel =
-      (env.INTERPRET_MODEL || "").trim() || (interpretKind === "openrouter" ? DEFAULT_INTERPRET_MODEL : "");
+      (env.INTERPRET_MODEL || "").trim() ||
+      (interpretKind === "openrouter" ? DEFAULT_INTERPRET_MODEL : interpretKind === "codex" ? CODEX_LUNA_MODEL : "");
     if (interpretModel) {
       const runner = build(interpretKind, interpretModel, Number(env.INTERPRET_TIMEOUT_MS || DEFAULT_TIMEOUT_MS), "interpret");
       if (runner) byTask.interpret = runner;
@@ -501,7 +658,9 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
 
   const extractKind = (env.EXTRACT_RUNNER || "").trim().toLowerCase();
   if (extractKind) {
-    const extractModel = (env.EXTRACT_MODEL || "").trim() || (extractKind === "openrouter" ? DEFAULT_EXTRACT_MODEL : "");
+    const extractModel =
+      (env.EXTRACT_MODEL || "").trim() ||
+      (extractKind === "openrouter" ? DEFAULT_EXTRACT_MODEL : extractKind === "codex" ? CODEX_LUNA_MODEL : "");
     if (extractModel) {
       const runner = build(extractKind, extractModel, Number(env.EXTRACT_TIMEOUT_MS || 90_000), "extract");
       if (runner) byTask.extract = runner;
