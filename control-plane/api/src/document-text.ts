@@ -85,7 +85,7 @@ export function looksLikeIdentityDocument(text: string, filename: string | undef
 }
 
 /** Types worth attempting. Anything else is refused by name, not guessed at. */
-export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "docx" | "html" | "text" | null {
+export function documentKindFor(mime: string | undefined, filename: string | undefined): "pdf" | "docx" | "xlsx" | "html" | "text" | null {
   const m = (mime ?? "").toLowerCase();
   const name = (filename ?? "").toLowerCase();
   if (m.includes("pdf") || name.endsWith(".pdf")) return "pdf";
@@ -94,6 +94,10 @@ export function documentKindFor(mime: string | undefined, filename: string | und
   // `.doc` is deliberately NOT here: it is a binary OLE format needing a real
   // parser, and almost nobody produces one by accident any more.
   if (m.includes("wordprocessingml") || name.endsWith(".docx")) return "docx";
+  // A budget is a spreadsheet more often than anything else, and the USA
+  // trip's folder has תכנון תקציב.xlsx beside the plan. Legacy `.xls` is left
+  // out for the same reason as `.doc`.
+  if (m.includes("spreadsheetml") || name.endsWith(".xlsx")) return "xlsx";
   // HTML earns its own kind rather than falling into `text`, because
   // `text/html` decoded raw is 90% markup and a model asked to read it spends
   // its attention on div soup. Real case: the USA trip's ESTA applications are
@@ -199,6 +203,72 @@ export function docxToText(bytes: Uint8Array): string | null {
     .replace(/&apos;/g, "'");
 }
 
+/** Every `<t>` run inside one XML element, joined — a cell's text can be split
+ *  across several runs by formatting nobody cares about here. */
+function xmlText(fragment: string): string {
+  const runs = fragment.match(/<t\b[^>]*>([\s\S]*?)<\/t>/g) ?? [];
+  return runs
+    .map((r) => r.replace(/<[^>]+>/g, ""))
+    .join("")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+/**
+ * The readable text of a spreadsheet.
+ *
+ * A budget is a spreadsheet more often than it is anything else — the USA
+ * trip's planning folder has תכנון תקציב.xlsx sitting beside the Word plan —
+ * and `budget_detail` is a question the interview asks.
+ *
+ * Rows become lines and cells become tabs, because that is the shape a model
+ * reads a table in. `t="s"` cells are indexes into the shared string table,
+ * which is the one piece of xlsx that cannot be skipped: without resolving it
+ * every text cell reads as a small integer.
+ *
+ * KNOWN LOSS: dates are serial numbers in xlsx and come out as numbers, since
+ * telling a date from a quantity needs the cell's format record. A budget's
+ * amounts survive, which is what `budget_detail` is actually after; a
+ * spreadsheet used as an itinerary would not fare as well.
+ */
+export function xlsxToText(bytes: Uint8Array, maxSheets = 12): string | null {
+  const sharedXml = readZipEntry(bytes, "xl/sharedStrings.xml")?.toString("utf8") ?? "";
+  const shared = (sharedXml.match(/<si\b[^>]*>[\s\S]*?<\/si>/g) ?? []).map(xmlText);
+
+  const lines: string[] = [];
+  let found = 0;
+  for (let n = 1; n <= maxSheets; n += 1) {
+    const sheet = readZipEntry(bytes, `xl/worksheets/sheet${n}.xml`)?.toString("utf8");
+    if (!sheet) {
+      // Sheets are numbered from 1 and contiguous in every writer worth
+      // supporting; stop at the first gap once something has been found.
+      if (found > 0) break;
+      continue;
+    }
+    found += 1;
+    for (const row of sheet.match(/<row\b[^>]*>[\s\S]*?<\/row>/g) ?? []) {
+      const cells: string[] = [];
+      for (const cell of row.match(/<c\b[^>]*(?:\/>|>[\s\S]*?<\/c>)/g) ?? []) {
+        const type = cell.match(/\st="([^"]+)"/)?.[1];
+        if (type === "s") {
+          const index = Number(cell.match(/<v>(\d+)<\/v>/)?.[1]);
+          cells.push(Number.isInteger(index) ? shared[index] ?? "" : "");
+        } else if (type === "inlineStr") {
+          cells.push(xmlText(cell));
+        } else {
+          cells.push(cell.match(/<v>([\s\S]*?)<\/v>/)?.[1] ?? "");
+        }
+      }
+      const line = cells.join("\t").trimEnd();
+      if (line.trim()) lines.push(line);
+    }
+  }
+  return found > 0 ? lines.join("\n") : null;
+}
+
 /**
  * The readable text of an HTML page.
  *
@@ -271,6 +341,10 @@ export async function documentText(
   } else if (kind === "docx") {
     const extracted = docxToText(bytes);
     if (extracted === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .docx" };
+    raw = extracted;
+  } else if (kind === "xlsx") {
+    const extracted = xlsxToText(bytes);
+    if (extracted === null) return { ok: false, reason: "UNREADABLE", detail: "not a readable .xlsx" };
     raw = extracted;
   } else if (kind === "html") {
     raw = htmlToText(new TextDecoder().decode(bytes));
