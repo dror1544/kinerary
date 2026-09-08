@@ -662,6 +662,22 @@ function canonicalIntakePayload(tripId: string, answers: AnswerStore): string {
  * about — one message settling several questions at once ("just the four of us,
  * Japan, Sept 19th to Oct 3rd"). Retired ids are in neither list.
  */
+/**
+ * Whether a NEW session starts on the interpret path.
+ *
+ * Off unless `INTERPRET_PATH_DEFAULT` says otherwise, so nothing changes for
+ * anyone who has not asked for it. It exists because flipping the flag by hand
+ * after a session starts is a race the organizer wins: they tap the deep link,
+ * the router asks its first question, and if they answer before the flip the
+ * agent takes that turn — which is precisely the two-writers state the flag is
+ * there to make impossible. The decision has to be made when the session is
+ * created, or it is not really a decision.
+ */
+export function interpretPathDefault(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.INTERPRET_PATH_DEFAULT || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
 export function partitionQuestions(
   answers: AnswerStore,
   questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
@@ -1315,9 +1331,9 @@ export async function startSession(
 
     await client.query(
       `INSERT INTO control_plane.intake_sessions
-         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language)
-       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7)`,
-      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language],
+         (id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, language, interpret_path)
+       VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7, $8)`,
+      [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault()],
     );
 
     await client.query("COMMIT");
