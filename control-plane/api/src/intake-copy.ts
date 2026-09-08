@@ -323,7 +323,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // The organizer has to be able to correct it: an answer they did not give
     // and cannot see is the one thing worse than being asked again.
     documentRead: "Here's what I took from it:",
-    documentCorrect: "If any of that is wrong, just tell me and I'll fix it. Otherwise we'll carry on.",
+    // Bridges INTO the next question instead of stopping in front of it.
+    // "Check this" followed immediately by a new question reads as two
+    // competing demands; saying we are carrying on makes the question that
+    // follows the intended next step rather than an interruption of the review.
+    documentCorrect: "If any of that is wrong just tell me and I'll fix it — no rush, later is fine too. Meanwhile, carrying on:",
+    /** Places the document means to visit but has not booked. */
+    documentPlanned: "Places from the document",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
     // NOT the same as finding nothing, and it took a live run to see why that
     // matters: the organizer sent a booking PDF full of dates and hotels and
@@ -387,7 +393,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     gotItMore: "יופי — הנה מה שרשמתי:",
     documentReading: "קיבלתי — אני קורא את זה עכשיו. זה לוקח דקה; אחר כך אספר לכם מה מצאתי ואשאל רק על מה שחסר.",
     documentRead: "הנה מה שלקחתי מהמסמך:",
-    documentCorrect: "אם משהו מזה לא נכון, פשוט תגידו לי ואתקן. אחרת נמשיך.",
+    documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
+    documentPlanned: "מקומות מהמסמך",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",

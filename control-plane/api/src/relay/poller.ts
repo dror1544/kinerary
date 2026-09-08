@@ -59,7 +59,7 @@ import {
   expiredSessionLanguage,
   touchSessionDeadline,
   answersForChat,
-  hasPendingDocument,
+  hasPendingInbound,
   deferQuestionForChat,
   deferredRequired,
   undeferAllForChat,
@@ -924,6 +924,27 @@ async function runDocumentPath(
     const lines = buildRecap(answers?.answers ?? {}, INTAKE_QUESTIONS, language)
       .filter((entry) => recorded.includes(entry.questionId))
       .map((entry) => `• ${entry.prompt}: ${entry.answerLabel}`);
+    // THE PLANNED PLACES, shown explicitly.
+    //
+    // They live inside `phases[].planned`, and the recap renders a phase by its
+    // NAME — so "Tokyo, Hakone, Kyoto" appeared and TeamLab, Skytree and the
+    // rest were invisible. They had been extracted correctly; the organizer
+    // reasonably read their absence as the document not having been understood,
+    // which is the one thing this message exists to prevent.
+    const planned: string[] = [];
+    for (const entry of (answers?.answers.phases as { data?: unknown } | undefined)?.data as
+      | { planned?: unknown }[]
+      | undefined ?? []) {
+      for (const place of Array.isArray(entry?.planned) ? entry.planned : []) {
+        if (typeof place === "string" && place.trim()) planned.push(place.trim());
+      }
+    }
+    const unique = [...new Set(planned)];
+    if (unique.length > 0) {
+      const shown = unique.slice(0, 12).join(", ");
+      lines.push(`• ${uiString("documentPlanned", language)}: ${shown}${unique.length > 12 ? ` +${unique.length - 12}` : ""}`);
+    }
+
     if (lines.length > 0) {
       await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
     }
@@ -1662,8 +1683,8 @@ async function sendNextStep(
   // the two work in parallel and the test calls it "the original motivating
   // case". It is only wrong here, where the extraction about to run is what
   // answers those same questions.
-  if ((await isInterpretPath(deps.db, chatId)) && (await hasPendingDocument(deps.db, chatId))) {
-    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_document", {
+  if ((await isInterpretPath(deps.db, chatId)) && (await hasPendingInbound(deps.db, chatId))) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_inbound", {
       session_id: view.sessionId,
     }));
     return;
@@ -1802,6 +1823,39 @@ async function sendNextStep(
       });
       return;
     }
+    // NOBODY NOMINATES OPTIONAL QUESTIONS HERE, so the router walks them.
+    //
+    // On the agent path an optional question is only asked when the agent
+    // nominates it, and the branch below hands the conversation back for
+    // exactly that. Skipping the handback on the interpret path — correct,
+    // since there is no agent — turned "hand back" into "do nothing" while
+    // still holding the floor, which is the stall Dror hit over and over:
+    // "I always need to tell him to move on, like it is waiting for something
+    // from me without telling me it does."
+    //
+    // Walking them in order is deterministic and it terminates: each is
+    // offered once, and `interview.optional_passed_over` steps past any the
+    // organizer does not answer. When they run out, `nextPhase` moves to the
+    // recap.
+    if (await isInterpretPath(deps.db, chatId)) {
+      const next = view.optionalRemaining[0];
+      if (!next) return;
+      if (`q:${next.id}` === view.lastPrompt) return;
+      if (!(await claimFloor(deps.db, chatId))) return;
+      const rendered = renderQuestion(next, selectedOptionIds(view, next.id), view.language);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      await recordLastPromptForChat(deps.db, chatId, `q:${next.id}`);
+      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.optional_walked", {
+        session_id: view.sessionId,
+        question_id: next.id,
+      }));
+      return;
+    }
+
     // After that it is the interviewer's conversation to carry. Saying
     // something anyway is how the router ended up talking over it.
     await handBackToInterviewer(view, chatId, deps);

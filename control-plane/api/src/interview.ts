@@ -752,12 +752,20 @@ export async function touchSessionDeadline(
  * seventh caller cannot forget it. Once the burst is claimed `pending_inbound`
  * is empty again and the document path owns the turn synchronously.
  */
-export async function hasPendingDocument(db: pg.Pool, chatId: string): Promise<boolean> {
+export async function hasPendingInbound(db: pg.Pool, chatId: string): Promise<boolean> {
+  // ANY pending message, not only a document.
+  //
+  // It started as a document check, because reading a file takes a minute and
+  // the router was asking for things the file was about to answer. The same
+  // race is there for TEXT, just narrower: interpreting a typed answer takes
+  // seven to fourteen seconds and the burst settles in two, so the router
+  // asked the next question in between. Live: "I answered, and immediately it
+  // moved to the next question and after reacted."
+  //
+  // Whatever is waiting to be interpreted may answer what is about to be
+  // asked. That is the rule, and the file was only its loudest case.
   const rows = await db.query<{ pending: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM jsonb_array_elements(pending_inbound) AS e
-        WHERE jsonb_array_length(COALESCE(e->'media_urls', '[]'::jsonb)) > 0
-     ) AS pending
+    `SELECT jsonb_array_length(pending_inbound) > 0 AS pending
        FROM control_plane.intake_sessions
       WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
