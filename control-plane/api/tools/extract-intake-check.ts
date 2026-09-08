@@ -8,8 +8,8 @@
  * it produces proposals, and `validateAnswer` decides, exactly as it does for
  * something typed.
  */
-import { readFile } from "node:fs/promises";
-import { basename } from "node:path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { documentText } from "../src/document-text.js";
 import { extractIntakeFromDocument, applyProposals } from "../src/interpret.js";
 import { INTAKE_QUESTIONS, partitionQuestions } from "../src/interview.js";
@@ -17,17 +17,36 @@ import { codexRunner, codexSpec, CODEX_LUNA_MODEL } from "../src/model-runner.js
 
 const path = process.argv[2];
 if (!path) {
-  console.error("usage: extract-intake-check.ts <file>");
+  console.error("usage: extract-intake-check.ts <file-or-folder>");
   process.exit(2);
 }
 
-const bytes = new Uint8Array(await readFile(path));
-const doc = await documentText(bytes, undefined, basename(path));
-if (!doc.ok) {
-  console.error(`could not read: ${doc.reason} ${doc.detail ?? ""}`);
+// A FOLDER is read as ONE document, exactly as the relay reads a burst of
+// uploads: several confirmations describing one trip are one trip, and
+// extracting each separately would produce competing `phases` proposals with
+// the last winning on nothing better than filename order.
+const info = await stat(path);
+const files = info.isDirectory()
+  ? (await readdir(path)).filter((f) => !f.startsWith(".")).sort().map((f) => join(path, f))
+  : [path];
+
+const parts: string[] = [];
+for (const file of files) {
+  const bytes = new Uint8Array(await readFile(file));
+  const one = await documentText(bytes, undefined, basename(file));
+  if (one.ok) {
+    parts.push(one.text);
+    console.log(`  read ${basename(file)}: ${one.pages}p ${one.text.length}ch${one.truncated ? " (truncated)" : ""}`);
+  } else {
+    console.log(`  SKIP ${basename(file)}: ${one.reason}${one.detail ? ` — ${one.detail}` : ""}`);
+  }
+}
+if (parts.length === 0) {
+  console.error("nothing readable");
   process.exit(1);
 }
-console.log(`read ${basename(path)}: ${doc.pages} pages, ${doc.text.length} chars${doc.truncated ? " (truncated)" : ""}\n`);
+const doc = { ok: true as const, text: parts.join("\n\n"), pages: 0, truncated: false };
+console.log(`\n${parts.length}/${files.length} readable, ${doc.text.length} chars combined\n`);
 
 const { outstanding } = partitionQuestions({}, INTAKE_QUESTIONS);
 const runner = codexRunner({ extract: codexSpec(CODEX_LUNA_MODEL, 240_000) });
