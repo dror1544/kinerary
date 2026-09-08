@@ -263,6 +263,14 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // to wonder whether their answers survived. It reads as one person
     // gathering the thread again, because from their side it is.
     resumed: "Let's pick this back up.",
+    // Said when the organizer wrote something that did not answer the question
+    // still on screen. It has to exist because "never send the same message
+    // twice" would otherwise make the router silent at exactly the moment the
+    // organizer is waiting for it — they spoke, and got nothing back. Like
+    // `resumed`, it says nothing about fault: not answering a question is a
+    // normal thing to do in a conversation, usually because you were asking
+    // about something else.
+    stillNeed: "Still need this one:",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -282,6 +290,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
     resumed: "נמשיך מכאן.",
+    stillNeed: "עוד צריך את זה:",
   },
 };
 

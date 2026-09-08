@@ -22,7 +22,16 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { openAgentTurn, questionStateForChat, submitAnswerForChat } from "../src/interview.js";
+import {
+  INTAKE_QUESTIONS,
+  getSessionForChat,
+  openAgentTurn,
+  questionStateForChat,
+  queueInboundMessage,
+  submitAnswerForChat,
+} from "../src/interview.js";
+import { flushSettledInboundBursts } from "../src/relay/poller.js";
+import { uiString } from "../src/intake-copy.js";
 import {
   claimInterpretation,
   findInterpretation,
@@ -335,6 +344,117 @@ describe("one writer per session", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABAS
       const after = await questionStateForChat(pool, a.chatId);
       assert.ok(after?.answered.includes("trip_type"));
       assert.equal(after?.outstanding.includes("trip_type"), false);
+    });
+  });
+});
+
+/**
+ * The silence, and the two rules that combine to produce it.
+ *
+ * A reply that answers nothing leaves the router wanting the question it just
+ * asked, and "never send the same message twice" then sends nothing at all.
+ * Found live on 2026-09-08 on the first real run: three answers recorded
+ * perfectly, a message about a document, then `prompt_deduped q:departure_date`
+ * as the last line in the log. The organizer spoke and got nothing back.
+ *
+ * The runner here proposes nothing, because "the model found no answer" IS the
+ * condition — reproducing it needs no live model.
+ */
+describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  const emptyRunner = {
+    async run() {
+      return { ok: true as const, value: { proposals: [], unclear: [], malformed: 0 }, attempts: 1, ms: 1 };
+    },
+  };
+
+  class Recorder {
+    readonly sent: { text: string; buttons: number }[] = [];
+    async sendMessage(p: { text: string; replyMarkup?: { inline_keyboard: unknown[][] } }) {
+      this.sent.push({ text: p.text, buttons: (p.replyMarkup?.inline_keyboard ?? []).flat().length });
+      return { ok: true as const, messageId: String(this.sent.length) };
+    }
+    async editMessageText() { return { ok: true as const }; }
+    async sendChatAction() {}
+    async answerCallbackQuery() {}
+    async getChatInfo() { return null; }
+    async getMe() { return { id: "7000000001", username: "T" }; }
+    async getUpdates() { return []; }
+    async deleteWebhookIfPresent() {}
+  }
+
+  let seq = 0;
+  async function say(pool: pg.Pool, chatId: string, text: string, telegram: Recorder) {
+    seq += 1;
+    await queueInboundMessage(pool, chatId, { text, message_id: `m${seq}` } as never);
+    await flushSettledInboundBursts(
+      { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never,
+      () => {},
+      0,
+    );
+  }
+
+  test("a REQUIRED question is re-asked in different words, with its buttons", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      // Hebrew, because "some of the bot's messages came in English" is a real
+      // past failure and a new string is exactly where it would come back.
+      await pool.query("UPDATE control_plane.intake_sessions SET language = 'he' WHERE telegram_chat_id = $1", [a.chatId]);
+      const telegram = new Recorder();
+
+      await say(pool, a.chatId, "היי", telegram);
+      const opening = telegram.sent.length;
+      assert.ok(opening > 0, "the router says something to begin with");
+
+      // Answer nothing. Before the fix this sent NOTHING at all.
+      await say(pool, a.chatId, "תסתכל במסמך שהעלתי", telegram);
+      assert.ok(telegram.sent.length > opening, "the organizer spoke and got a reply");
+
+      const last = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(last.text.startsWith(uiString("stillNeed", "he")), "a distinct opening, not the bare question again");
+      assert.equal(/[A-Za-z]{4,}/.test(last.text), false, `still Hebrew: ${last.text}`);
+      assert.ok(last.buttons > 0, "the question keeps its keyboard");
+    });
+  });
+
+  test("re-asking records nothing — it is the same question, not a new answer", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      const telegram = new Recorder();
+      await say(pool, a.chatId, "היי", telegram);
+      const before = await questionStateForChat(pool, a.chatId);
+      await say(pool, a.chatId, "לא קשור", telegram);
+      const after = await questionStateForChat(pool, a.chatId);
+      assert.deepEqual(after?.answered, before?.answered);
+    });
+  });
+
+  // The other half of the pacing rule, which the offline run proved first: an
+  // OPTIONAL question is passed over rather than re-asked, so nothing loops.
+  test("an OPTIONAL question is passed over instead of re-asked", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      const telegram = new Recorder();
+      for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+        await pool.query(
+          `UPDATE control_plane.intake_sessions
+              SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+            WHERE telegram_chat_id = $1`,
+          [a.chatId, q.id, JSON.stringify({ kind: "text", schema_version: 3, text: "x" })],
+        );
+      }
+      await say(pool, a.chatId, "היי", telegram);
+      const first = await getSessionForChat(pool, a.chatId);
+      const asked = first.ok ? first.view.lastPrompt : null;
+      if (!asked?.startsWith("q:")) return;
+
+      const optionalId = asked.slice(2);
+      await say(pool, a.chatId, "לא משנה", telegram);
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.equal(
+        after.ok && after.view.optionalRemaining.some((q) => q.id === optionalId),
+        false,
+        "the optional question is behind us, not offered again",
+      );
     });
   });
 });

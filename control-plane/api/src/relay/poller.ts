@@ -879,14 +879,52 @@ async function runInterpretPath(
   //
   // Required questions are deliberately NOT skipped — the interview cannot
   // proceed without them, so it re-asks, which is the behaviour it already had.
-  if (onScreen && !decisions.accepted.some((a) => a.questionId === onScreen)) {
-    const question = INTAKE_QUESTIONS.find((q) => q.id === onScreen);
-    if (question && !question.required && !state.answered.includes(onScreen)) {
-      await skipQuestionForChat(deps.db, burst.chatId, onScreen);
-      log(structuredLog("info", "interview.optional_passed_over", {
-        session_id: burst.sessionId,
-        question_id: onScreen,
-      }));
+  const unanswered = onScreen && !decisions.accepted.some((a) => a.questionId === onScreen);
+  const onScreenQuestion = onScreen ? INTAKE_QUESTIONS.find((q) => q.id === onScreen) : undefined;
+
+  if (unanswered && onScreenQuestion && !onScreenQuestion.required && !state.answered.includes(onScreen)) {
+    await skipQuestionForChat(deps.db, burst.chatId, onScreen);
+    log(structuredLog("info", "interview.optional_passed_over", {
+      session_id: burst.sessionId,
+      question_id: onScreen,
+    }));
+  }
+
+  // THE SILENCE. A REQUIRED question cannot be skipped, so when the organizer
+  // writes something that does not answer it the router still wants the same
+  // question — and `sendNextStep`'s "never send the same message twice" then
+  // suppresses it and sends nothing at all.
+  //
+  // Found live on 2026-09-08, first real run: three answers recorded perfectly,
+  // then a message about a document, then silence with `prompt_deduped
+  // q:departure_date` as the last thing in the log. The organizer spoke and got
+  // nothing back.
+  //
+  // The dedupe is right and stays — repeating a question verbatim is what runs
+  // 5 and 6 paid to stop. What was missing is the agent's other job: saying the
+  // same question a DIFFERENT way when a reply did not answer it. The stall
+  // watchdog already does exactly this for the agent path (distinct opening
+  // line, same question, buttons intact) and deliberately suppresses itself
+  // when the question is already on screen, because there nobody has spoken
+  // since. Here somebody has — which is precisely what makes re-asking an
+  // answer rather than noise.
+  if (unanswered && onScreenQuestion?.required && !state.answered.includes(onScreen)) {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (after.ok && after.view.awaiting === "machine" && after.view.lastPrompt === `q:${onScreen}`) {
+      const rendered = renderQuestion(onScreenQuestion, selectedOptionIds(after.view, onScreen), after.view.language);
+      if (await claimFloor(deps.db, burst.chatId)) {
+        await deps.telegram.sendMessage({
+          chatId: burst.chatId,
+          text: `${uiString("stillNeed", after.view.language)}\n\n${rendered.text}`,
+          replyMarkup: rendered.replyMarkup ?? undefined,
+        });
+        await recordLastPromptForChat(deps.db, burst.chatId, `q:${onScreen}`);
+        log(structuredLog("info", "interview.required_reasked", {
+          session_id: burst.sessionId,
+          question_id: onScreen,
+        }));
+      }
+      return;
     }
   }
 
