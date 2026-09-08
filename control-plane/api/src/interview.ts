@@ -86,6 +86,26 @@ export interface IntakeQuestion {
   // not a full schema — the interviewer is a capable LLM assembling this
   // from conversation, not a form validating untrusted input.
   dataShape?: "array" | "object";
+  /**
+   * The FIELD NAMES a structured answer must use, as a compact example.
+   *
+   * `dataShape` only says array-or-object, which is all `validateAnswer` can
+   * check — and that is not enough for anything writing this answer without a
+   * person in the loop. The worker's transformer reads specific keys
+   * (`transformer.py`'s module docstring is the contract), and an extraction
+   * that invents its own passes every check here and produces a broken site:
+   * live on 2026-09-08 a booking PDF yielded `phases: [{place, start, end}]`
+   * where the transformer wants `name`, so every phase would have arrived
+   * nameless.
+   *
+   * A person answering in conversation never had this problem, because the
+   * agent shaped their words. Nothing shapes a document.
+   *
+   * Kept here rather than in the prompt so the prompt and the transformer read
+   * from one place. If this drifts from `transformer.py`, that is a bug in
+   * this line, not in the model.
+   */
+  dataExample?: string;
   required: boolean;
   /**
    * Works this question's answer out from what is already recorded, or returns
@@ -319,6 +339,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // correction arriving later is a plain re-submit of this question.
     prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
     dataShape: "array",
+    dataExample: "[{\"name\": \"דנה אלול\", \"name_en\": \"Dana Elul\", \"age\": 12, \"family\": \"Elul\"}]",
     required: true,
     checkComplete: (data) =>
       hasNamedTraveler(data)
@@ -331,6 +352,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
+    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}}]",
     required: true,
   },
   {
@@ -338,6 +360,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
     dataShape: "array",
+    dataExample: "[{\"type\": \"flight|hotel|car\", \"name\": \"LY075 TLV-HND\", \"date\": \"2026-09-19\", \"confirmation\": \"ABC123\"}]",
     required: false,
   },
   {
@@ -345,6 +368,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Anything the group needs to know about — mobility needs, budget expectations, or family dynamics?",
     dataShape: "object",
+    dataExample: "{\"mobility\": \"...\", \"budget\": \"...\", \"family\": \"...\"}",
     required: false,
   },
 
@@ -391,6 +415,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "For each thing ticked above: everyone, or specific people? Keys are the option ids, values are \"everyone\" or a list of traveler names.",
     dataShape: "object",
+    dataExample: "{\"kosher_style\": \"everyone\", \"lactose_free\": [\"Dana\"]}",
     required: false,
   },
   {
@@ -470,6 +495,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Anything it should keep in mind about these people, or stay away from? One entry per thing, each as {he, en}.",
     dataShape: "array",
+    dataExample: "[\"never mention the surprise party\", \"Noam is shy about photos\"]",
     required: false,
   },
   // Additive-optional, like phases[].days — no INTAKE_SCHEMA_VERSION bump. A v2
@@ -500,6 +526,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "A rough budget, if you want it on the site: an overall currency and party size, plus one line per known cost — { currency, party_size?, items: [{ phase?, category, description, amount, estimate? }] }. category is one of flight/hotel/car/attraction/food/insurance/other. Use amount 0 with estimate true for a cost you know matters but not the figure. (optional)",
     dataShape: "object",
+    dataExample: "{\"currency\": \"JPY\", \"items\": [{\"label\": \"hotels\", \"amount\": 300105}]}",
     required: false,
   },
 ] as const;

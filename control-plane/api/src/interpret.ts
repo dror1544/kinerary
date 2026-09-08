@@ -487,7 +487,13 @@ function describeQuestion(q: IntakeQuestion): string {
     lines.push(`  options: ${q.options.map((o) => `${o.id} = ${o.label}`).join(" | ")}`);
     if (q.allowsOther) lines.push(`  may also be answered freely: use kind "choice_other"`);
   }
-  if (q.type === "structured") lines.push(`  shape: ${q.dataShape === "array" ? "array" : "object"}`);
+  if (q.type === "structured") {
+    lines.push(`  shape: ${q.dataShape === "array" ? "array" : "object"}`);
+    // The FIELD NAMES, not just array-or-object. Without them a model invents
+    // its own and the answer passes every check here before breaking the site
+    // downstream — `phases: [{place, …}]` where the transformer reads `name`.
+    if (q.dataExample) lines.push(`  use exactly these fields: ${q.dataExample}`);
+  }
   return lines.join("\n");
 }
 

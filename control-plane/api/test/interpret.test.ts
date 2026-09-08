@@ -9,10 +9,11 @@ import {
   interpretBurst,
   parseInterpretPayload,
   submitArgsFor,
+  buildExtractIntakePrompt,
   type ProposedAnswer,
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
-import { partitionQuestions, type IntakeQuestion } from "../src/interview.js";
+import { INTAKE_QUESTIONS, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
 
 // A small question set standing in for INTAKE_QUESTIONS, so these tests say
 // what they mean rather than depending on the live intake's current shape.
@@ -516,5 +517,59 @@ describe("partitionQuestions", () => {
   test("outstanding holds every unanswered question, not just the next one", () => {
     const { outstanding } = partitionQuestions({}, QUESTIONS);
     assert.equal(outstanding.length, QUESTIONS.length);
+  });
+});
+
+/**
+ * The field names a structured answer must use.
+ *
+ * `dataShape` only says array-or-object, which is all `validateAnswer` can
+ * check — and is not enough for anything writing an answer without a person in
+ * the loop. The worker's transformer reads specific keys, and an extraction
+ * that invents its own passes every check on this side and produces a broken
+ * site. Live on 2026-09-08 a booking PDF yielded `phases: [{place, start,
+ * end}]` where `transformer.py` reads `name`, so every phase would have
+ * arrived nameless.
+ */
+describe("structured questions name their fields", () => {
+  const structured = INTAKE_QUESTIONS.filter((q) => q.type === "structured");
+
+  test("there are some, so this suite is not vacuously passing", () => {
+    assert.ok(structured.length >= 5, `${structured.length} structured questions`);
+  });
+
+  test("every one carries an example of the fields it expects", () => {
+    const missing = structured.filter((q) => !q.dataExample).map((q) => q.id);
+    assert.deepEqual(missing, [], "a structured question with no field example is one a model will invent keys for");
+  });
+
+  test("each example parses, and matches the question's own array/object shape", () => {
+    for (const q of structured) {
+      const parsed = JSON.parse(q.dataExample!);
+      assert.equal(
+        Array.isArray(parsed),
+        q.dataShape === "array",
+        `${q.id}: dataExample is ${Array.isArray(parsed) ? "an array" : "an object"} but dataShape says ${q.dataShape}`,
+      );
+    }
+  });
+
+  // The two the transformer actually projects into trip.config.json. Their key
+  // names are a contract with transformer.py's module docstring, and this is
+  // the test that fails if either side drifts.
+  test("travelers and phases use the keys the transformer reads", () => {
+    const travelers = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "travelers")!.dataExample!);
+    assert.deepEqual(Object.keys(travelers[0]).sort(), ["age", "family", "name", "name_en"]);
+
+    const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
+    assert.deepEqual(Object.keys(phases[0]).sort(), ["accommodation", "end", "name", "name_en", "start"]);
+    assert.equal(typeof phases[0].accommodation, "object", "accommodation is an object, not a string");
+    assert.ok("name" in phases[0].accommodation);
+  });
+
+  test("the example reaches the extraction prompt", () => {
+    const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases"], language: "he" });
+    assert.match(prompt, /use exactly these fields/);
+    assert.ok(prompt.includes('"name": "Tokyo"'), "the field names themselves are in the prompt");
   });
 });
