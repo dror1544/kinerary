@@ -25,7 +25,7 @@
  */
 import { loadArchitectureProfile } from "../config.js";
 import { createDatabasePool } from "../database.js";
-import { interpretRunnerFromEnv } from "../model-runner.js";
+import { modelRunnerFromEnv } from "../model-runner.js";
 import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
@@ -268,7 +268,7 @@ async function main(): Promise<void> {
       // Undefined unless INTERPRET_RUNNER is set. A session flagged onto the
       // interpret path without one still works: the router asks its own
       // questions from intake-copy.ts, which is slower, not broken.
-      modelRunner: interpretRunnerFromEnv(),
+      modelRunner: modelRunnerFromEnv(),
       log,
     });
   }

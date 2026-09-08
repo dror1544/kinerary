@@ -277,10 +277,21 @@ export interface StructuredModelRunner {
 }
 ```
 
-Adapters behind it: Claude CLI, Codex CLI, and a fake for tests. Model pinning
-is per `task`, in configuration, not in the interview's code — `interpret`
-wants precise and cheap, `extract` wants long-context, and those move
-independently.
+Adapters behind it: the Claude and Hermes CLIs, **OpenRouter over HTTP**, and a
+fake for tests. The interface is transport-agnostic on purpose — only
+`cliRunner` spawns a process — so adding OpenRouter needed no change to any
+caller. Model pinning is per `task`, in configuration, not in the interview's
+code: `interpret` wants precise and cheap, `extract` wants long-context, and
+those move independently. `composeRunners` routes a task to its own runner, so
+the two can live on different transports at once.
+
+**One rule the OpenRouter adapter enforces by omission:** the request never
+carries a `models: [...]` fallback array. OpenRouter will silently substitute
+another model for one that is unavailable, which is the exact shape of the
+2026-09-07 failure — and from the caller it is indistinguishable from success.
+Provider routing *within* one model is fine (same weights, different host); a
+different model is not. There is a test asserting the key is absent from the
+request body, because an omission nothing checks is an omission that comes back.
 
 Two reasons this abstraction earns its keep rather than being ceremony:
 
@@ -313,14 +324,28 @@ intake path entirely.
 
 ## 9. Then: `extract`
 
-Document extraction follows the same shape, extended rather than replaced: the
-same call should answer travellers, phases, dates and anchors, not only the
-day-by-day. It moves behind `StructuredModelRunner` with its own pinned model.
+Document extraction follows the same shape. `extractItinerary` now runs as the
+`extract` task on the shared runner, pinned to **MiniMax on OpenRouter**
+(`minimax/minimax-m3:free`, `EXTRACT_RUNNER=openrouter`).
 
-Runs 14–15 leaned on this path hard — a multi-file USA upload responded to one
-file and stopped — so it is the next-largest source of real failures after
-`interpret`, and it is deliberately second: it is a bigger surface, and the
-first slice's benchmark should not be entangled with it.
+That is the same model the `kinerary-extract` Hermes profile already names as
+its default, so the *model* doing the work does not change. What changes is
+everything around it. That profile carries seven fallbacks across four
+providers — openai-codex, anthropic, three more OpenRouter models, ollama-cloud
+— and a chain exactly like it is what let a 429 hand an interview to a
+different model mid-run on 2026-09-07. Going direct means a limit is a limit:
+retried on the same model, then surfaced as `RATE_LIMITED`, and the caller
+decides. `extractItinerary` already treats failure as `{ ok: false }` and
+proceeds, so the decision is one that path knows how to make.
+
+Unset, `extractItinerary` still shells out to the Hermes profile exactly as it
+always has — the current acceptance path does not move until the environment
+says so.
+
+Still to do here: the call should answer travellers, phases, dates and anchors,
+not only the day-by-day. Runs 14–15 leaned on this path hard — a multi-file USA
+upload responded to one file and stopped — and none of that is fixed by
+changing which model is called.
 
 ## 10. Deferred: `phrase`
 
@@ -378,7 +403,9 @@ reasonable end state, not a smell.
    what this meant" from "the answers are written".
 6. **Benchmark** accuracy, p50/p95 latency, retries and failure rate against
    runs 14–15 (§8). Not started, and nothing below should start before it.
-7. Extend document extraction (§9).
+7. Extend document extraction (§9). **Transport BUILT** — `extract` runs on
+   MiniMax over OpenRouter when configured, Hermes otherwise. The extraction
+   *scope* (travellers, phases, dates, anchors) is not started.
 8. Decide afterwards whether `phrase` is needed at all (§10).
 
 Steps 1–5 are one slice; the flag is per session, and the agent path stays

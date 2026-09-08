@@ -17,6 +17,7 @@
  * `{ ok: false }` — the interviewer proceeds without `days[]`, never blocked.
  */
 import { execFile } from "node:child_process";
+import { modelRunnerFromEnv, type StructuredModelRunner } from "./model-runner.js";
 
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || "";
@@ -373,18 +374,53 @@ async function resolveVenueLinks(phases: ExtractedPhase[], destination: string):
   return { deferred: [] };
 }
 
-export async function extractItinerary(args: ExtractItineraryArgs): Promise<ExtractItineraryResult> {
-  if (!HERMES_EXTRACT_PROFILE) return { ok: false, reason: "EXTRACT_NOT_CONFIGURED" };
+/**
+ * `extract`, as one task on the shared runner.
+ *
+ * When a runner is configured for it (MiniMax on OpenRouter by default —
+ * `EXTRACT_RUNNER=openrouter`), extraction goes straight to the model and the
+ * Hermes profile's seven-deep fallback chain goes away with it. Unset, this is
+ * exactly the CLI path that has always run, so nothing about the current
+ * acceptance path moves until the environment says so.
+ */
+export async function extractItinerary(
+  args: ExtractItineraryArgs,
+  runner: StructuredModelRunner | undefined = modelRunnerFromEnv(),
+): Promise<ExtractItineraryResult> {
   if (!args.documentText || !args.documentText.trim()) {
     return { ok: false, reason: "EXTRACTION_FAILED", detail: "no document text" };
   }
-  let stdout: string;
-  try {
-    stdout = await runExtract(buildExtractPrompt(args));
-  } catch (e) {
-    return { ok: false, reason: "EXTRACTION_FAILED", detail: String((e as Error)?.message ?? e).slice(0, 200) };
+
+  const prompt = buildExtractPrompt(args);
+  let parsed: unknown = null;
+
+  if (runner) {
+    // `parse` is identity here rather than a validator: `normaliseExtractedItinerary`
+    // below is the real gate, and it is the one the tests exercise. Splitting
+    // the checking across both would give the invariants two homes.
+    const result = await runner.run<unknown>({
+      task: "extract",
+      prompt,
+      parse: (raw) => (raw && typeof raw === "object" ? raw : null),
+      timeoutMs: EXTRACT_TIMEOUT_MS,
+    });
+    if (result.ok) parsed = result.value;
+    else if (result.reason !== "NOT_CONFIGURED") {
+      return { ok: false, reason: "EXTRACTION_FAILED", detail: `${result.reason}${result.detail ? `: ${result.detail}` : ""}`.slice(0, 200) };
+    }
   }
-  const parsed = firstJsonObject(stdout);
+
+  if (parsed === null) {
+    if (!HERMES_EXTRACT_PROFILE) return { ok: false, reason: "EXTRACT_NOT_CONFIGURED" };
+    let stdout: string;
+    try {
+      stdout = await runExtract(prompt);
+    } catch (e) {
+      return { ok: false, reason: "EXTRACTION_FAILED", detail: String((e as Error)?.message ?? e).slice(0, 200) };
+    }
+    parsed = firstJsonObject(stdout);
+  }
+
   if (!parsed) return { ok: false, reason: "EXTRACTION_FAILED", detail: "no JSON object in model output" };
   const { phases, warnings } = normaliseExtractedItinerary(parsed, args.phases);
   // A venue's official/ticket link comes from the document when it prints one;
