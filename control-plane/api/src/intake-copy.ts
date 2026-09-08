@@ -302,6 +302,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // finish without — not every time a message misses it. The difference
     // between this and nagging is entirely about when it is said.
     beforeWeFinish: "Before I can put your trip together, there's one thing I still need:",
+    // Said after an OPEN answer — something typed, not tapped. A button press
+    // is its own confirmation: the keyboard disappears and the next question
+    // arrives, so acknowledging it as well is noise. Typing a list of names
+    // into a chat window and getting only the next question back is the part
+    // that feels unheard.
+    //
+    // Deliberately small. It exists to show the answer was understood, which
+    // is why the understood VALUE is echoed with it — warmth without the value
+    // would be flattery, and the value without warmth is a receipt.
+    gotIt: "Got it",
+    gotItMore: "Got it — here's what I have:",
     // Said the moment a file lands, and it sets an expectation this code now
     // has to keep: it says reading takes a moment, and reading really does
     // take about a minute and a half. Shipping this line before anything read
@@ -372,6 +383,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
+    gotIt: "יופי, רשמתי",
+    gotItMore: "יופי — הנה מה שרשמתי:",
     documentReading: "קיבלתי — אני קורא את זה עכשיו. זה לוקח דקה; אחר כך אספר לכם מה מצאתי ואשאל רק על מה שחסר.",
     documentRead: "הנה מה שלקחתי מהמסמך:",
     documentCorrect: "אם משהו מזה לא נכון, פשוט תגידו לי ואתקן. אחרת נמשיך.",

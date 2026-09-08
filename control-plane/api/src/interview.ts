@@ -352,7 +352,15 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally.",
     dataShape: "array",
-    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}}]",
+    // `planned` holds places the trip means to visit on this leg but has NOT
+    // booked. The distinction from `travel_anchors` is EVIDENCE OF BOOKING —
+    // a confirmation number, a ticket reference — not the kind of place: a
+    // museum with an e-ticket is an anchor, the same museum named in an
+    // itinerary is planned, and it becomes an anchor the day a booking for it
+    // arrives. Recorded per phase because that is where a planned place
+    // belongs; the transformer ignores the key today, and the enrichment pass
+    // that builds day-by-day itineraries is exactly what wants it.
+    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}, \"planned\": [\"Tokyo Skytree\", \"TeamLab Planets\"]}]",
     required: true,
   },
   {
@@ -729,6 +737,32 @@ export async function touchSessionDeadline(
       WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId, ttlSeconds],
   );
+}
+
+/**
+ * Is a document sitting in this chat's burst, waiting to be read?
+ *
+ * The router must not speak while one is. Clearing `router_prompt_due_at` was
+ * not enough: `advanceRouterOwnedQuestions` scans for chats merely AWAITING
+ * THE MACHINE, which an upload sets, so it asked the trip type in the two
+ * seconds between the file landing and the burst settling — live on
+ * 2026-09-09, in between the two acknowledgements.
+ *
+ * Checked at `sendNextStep`, which every router message goes through, so a
+ * seventh caller cannot forget it. Once the burst is claimed `pending_inbound`
+ * is empty again and the document path owns the turn synchronously.
+ */
+export async function hasPendingDocument(db: pg.Pool, chatId: string): Promise<boolean> {
+  const rows = await db.query<{ pending: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM jsonb_array_elements(pending_inbound) AS e
+        WHERE jsonb_array_length(COALESCE(e->'media_urls', '[]'::jsonb)) > 0
+     ) AS pending
+       FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+    [chatId],
+  );
+  return rows.rows[0]?.pending === true;
 }
 
 export interface ExpiringSession {

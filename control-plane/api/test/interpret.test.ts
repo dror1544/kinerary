@@ -563,9 +563,41 @@ describe("structured questions name their fields", () => {
     assert.deepEqual(Object.keys(travelers[0]).sort(), ["age", "family", "name", "name_en"]);
 
     const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
-    assert.deepEqual(Object.keys(phases[0]).sort(), ["accommodation", "end", "name", "name_en", "start"]);
+    // `planned` is deliberately NOT one the transformer reads — see below.
+    assert.deepEqual(
+      Object.keys(phases[0]).sort(),
+      ["accommodation", "end", "name", "name_en", "planned", "start"],
+    );
     assert.equal(typeof phases[0].accommodation, "object", "accommodation is an object, not a string");
     assert.ok("name" in phases[0].accommodation);
+  });
+
+  /**
+   * PLANNED is not ANCHORED, and the difference is evidence of booking.
+   *
+   * A museum with an e-ticket is an anchor; the same museum named in an
+   * itinerary is planned, and it becomes an anchor the day a booking for it
+   * arrives. Before this the extractor had nowhere to put a planned place and
+   * filed them under "interests" — which is what the organizer actually
+   * objected to: they are places to visit, not preferences.
+   *
+   * The transformer ignores `planned` today. That is on purpose and is why it
+   * is asserted here: `intake_versions.data` keeps it losslessly, and the
+   * enrichment pass that builds day-by-day itineraries is what wants it.
+   */
+  test("a phase can carry planned places, distinct from booked anchors", () => {
+    const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
+    assert.ok(Array.isArray(phases[0].planned), "planned is a list of place names");
+    assert.ok(phases[0].planned.every((p: unknown) => typeof p === "string"));
+
+    const anchors = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "travel_anchors")!.dataExample!);
+    assert.ok("confirmation" in anchors[0], "an anchor carries its booking evidence; a planned place does not");
+  });
+
+  test("the prompt states the planned-versus-anchored rule", () => {
+    const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases", "travel_anchors"], language: "he" });
+    assert.match(prompt, /EVIDENCE OF BOOKING/);
+    assert.match(prompt, /A price beside a name is not a booking/);
   });
 
   test("the example reaches the extraction prompt", () => {

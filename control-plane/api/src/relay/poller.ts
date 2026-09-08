@@ -59,6 +59,7 @@ import {
   expiredSessionLanguage,
   touchSessionDeadline,
   answersForChat,
+  hasPendingDocument,
   deferQuestionForChat,
   deferredRequired,
   undeferAllForChat,
@@ -309,9 +310,25 @@ export async function applyDecision(
       // lands, burst or not.
       if ((decision.event.media_urls?.length ?? 0) > 0) {
         const view = await getSessionForChat(deps.db, decision.chatId);
+        const language = view.ok ? view.view.language : DEFAULT_LANGUAGE;
+        // ONE acknowledgement, and this is it.
+        //
+        // The interpret path used to add a second from `runDocumentPath` after
+        // the burst settled, so the organizer got "קיבלתי — קורא את זה עכשיו…"
+        // and then, seconds later, "קיבלתי — אני קורא את זה עכשיו. זה לוקח
+        // דקה…" — the same sentence twice, with a question wedged between them.
+        //
+        // Said HERE rather than there because here is instant: the burst has a
+        // settle window and reading takes a minute, and the acknowledgement is
+        // the one message whose entire job is to arrive immediately. The
+        // interpret path's wording is the better one — it sets the
+        // expectation — so it is used when that path will do the reading.
         await deps.telegram.sendMessage({
           chatId: decision.chatId,
-          text: uiString("fileReceived", view.ok ? view.view.language : DEFAULT_LANGUAGE),
+          text: uiString(
+            (await isInterpretPath(deps.db, decision.chatId)) ? "documentReading" : "fileReceived",
+            language,
+          ),
         });
       }
       // Queued, not forwarded. Run 9: five rapid messages used to mean five
@@ -777,7 +794,9 @@ async function runDocumentPath(
     await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => {});
   };
 
-  await say(uiString("documentReading", language));
+  // The acknowledgement was already sent, the instant the file landed — see
+  // `interview_to_gateway` in `applyDecision`. Sending it again here is what
+  // produced the same sentence twice on 2026-09-09.
 
   const texts: string[] = [];
   let unreadable = 0;
@@ -1102,6 +1121,43 @@ async function runInterpretPath(
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
   }));
+
+  // ACKNOWLEDGE AN OPEN ANSWER, and only an open one.
+  //
+  // Typing a list of names into a chat window and getting nothing back but the
+  // next question is the part that feels unheard. A BUTTON does not need this:
+  // the keyboard disappears and the next question arrives, which is already
+  // confirmation, and a message on top of it is noise.
+  //
+  // The understood VALUE goes with it, because that is the whole point — the
+  // organizer needs to see that it landed the way they meant, while correcting
+  // it is still cheap. Warmth without the value would be flattery; the value
+  // without warmth is a receipt.
+  const open = decisions.accepted.filter((a) => {
+    const q = INTAKE_QUESTIONS.find((x) => x.id === a.questionId);
+    return q?.type === "text" || q?.type === "structured";
+  });
+  if (open.length > 0) {
+    const said = await getSessionForChat(deps.db, burst.chatId);
+    const store = await answersForChat(deps.db, burst.chatId);
+    if (said.ok && store) {
+      const lines = buildRecap(store.answers, INTAKE_QUESTIONS, said.view.language)
+        .filter((entry) => open.some((a) => a.questionId === entry.questionId))
+        .map((entry) => `${entry.prompt}: ${entry.answerLabel}`);
+      if (lines.length === 1) {
+        await deps.telegram
+          .sendMessage({ chatId: burst.chatId, text: `${uiString("gotIt", said.view.language)} — ${lines[0]}` })
+          .catch(() => {});
+      } else if (lines.length > 1) {
+        await deps.telegram
+          .sendMessage({
+            chatId: burst.chatId,
+            text: `${uiString("gotItMore", said.view.language)}\n\n${lines.map((l) => `• ${l}`).join("\n")}`,
+          })
+          .catch(() => {});
+      }
+    }
+  }
   await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
 
   // PACING. An OPTIONAL question that was on screen and did not get answered
@@ -1507,6 +1563,27 @@ async function handBackToInterviewer(
 ): Promise<void> {
   if (!deps.interviewerProfile) return;
   const log = deps.log ?? (() => {});
+
+  // NEVER ON THE INTERPRET PATH. There is no agent to hand back TO.
+  //
+  // Live on 2026-09-09, and one cause produced four symptoms: a button tap
+  // with nothing queued opened an agent turn and pushed to the gateway. The
+  // turn was never closed, because nothing on this path closes one. The
+  // trip-intake agent woke, found its sidecar down, and wrote "the MCP server
+  // is not reachable". Thirty seconds later the stall watchdog reclaimed the
+  // floor with "נמשיך מכאן" and repeated the question the organizer had just
+  // answered. And in between, the floor was held by a machine that could not
+  // act, so the organizer had to type "מה עכשיו" to shake it loose.
+  //
+  // The interpret path's own `sendNextStep` already covers the case this
+  // exists for: it asks the next question, or the boundary message, itself.
+  if (await isInterpretPath(deps.db, chatId)) {
+    log(structuredLog("info", "trip_bot.handback_skipped", {
+      session_id: view.sessionId,
+      reason: "INTERPRET_PATH",
+    }));
+    return;
+  }
   // Already talking to it. Handing a second turn to an agent that is mid-turn
   // is how run 5 turned into a bombardment: the handback opened a turn, the
   // agent's next write scheduled another router prompt, that found nothing to
@@ -1566,6 +1643,27 @@ async function sendNextStep(
   // that something was owed; this is the single fact that arbitrates them.
   if (view.awaiting === "person") {
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_held_by_person", {
+      session_id: view.sessionId,
+    }));
+    return;
+  }
+
+  // A DOCUMENT IS WAITING TO BE READ. Say nothing until it has been.
+  //
+  // The answer may be in the file, and asking for it first is the thing this
+  // whole feature exists to stop. Checked here because every router message
+  // comes through this function — `advanceRouterOwnedQuestions` reaches it by
+  // scanning for chats awaiting the machine, which an upload sets, and it
+  // asked the trip type in the two seconds between the file landing and the
+  // burst settling.
+  //
+  // INTERPRET PATH ONLY, and Track 8 is why: on the AGENT path asking a
+  // router-owned question while the agent reads a document is deliberate —
+  // the two work in parallel and the test calls it "the original motivating
+  // case". It is only wrong here, where the extraction about to run is what
+  // answers those same questions.
+  if ((await isInterpretPath(deps.db, chatId)) && (await hasPendingDocument(deps.db, chatId))) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_document", {
       session_id: view.sessionId,
     }));
     return;

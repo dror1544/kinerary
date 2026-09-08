@@ -34,7 +34,7 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import { getSessionForChat, queueInboundMessage, questionStateForChat } from "../src/interview.js";
 import { setInterpretPath } from "../src/interpret.js";
-import { flushSettledInboundBursts } from "../src/relay/poller.js";
+import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
 import { modelRunnerFromEnv } from "../src/model-runner.js";
 
 const path = process.argv[2];
@@ -137,7 +137,22 @@ console.log(`\nsession ${started.sessionId} | runner ${runner ? "configured" : "
 // ── The upload, exactly as a settled burst ───────────────────────────────────
 
 const before = await questionStateForChat(pool, CHAT);
-await queueInboundMessage(pool, CHAT, { text: "", message_id: "9001", media_urls: mediaUrls } as never);
+
+// Through `applyDecision`, not straight to the queue: the acknowledgement is
+// sent there, the document floor is taken there, and the burst is queued there.
+// Calling the queue directly skipped all three — which is how the harness
+// missed a DUPLICATE acknowledgement that a person spotted on the first live
+// upload after it.
+await applyDecision(
+  {
+    kind: "interview_to_gateway",
+    chatId: CHAT,
+    sessionId: started.sessionId,
+    hadAttachment: true,
+    event: { text: "", message_id: "9001", media_urls: mediaUrls, message_type: "document", source: { chat_id: CHAT } },
+  } as never,
+  deps,
+);
 
 const started_at = Date.now();
 await flushSettledInboundBursts(deps, deps.log, 0);
