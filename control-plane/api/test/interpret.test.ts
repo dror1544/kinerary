@@ -715,8 +715,12 @@ describe("buildRecap never shows [object Object]", () => {
     return buildRecap(answers, INTAKE_QUESTIONS, "he").find((e) => e.questionId === questionId)?.answerLabel ?? "";
   }
 
+  // `constraints` rather than `budget_detail`: the latter was retired on
+  // 2026-09-09 as a question about the organizer rather than the trip. The
+  // SHAPE is what matters here — an object whose value is an array of objects,
+  // which is ordinary and is what produced "[object Object]" live.
   test("an object holding an array of objects reads as words", () => {
-    const label = labelFor("budget_detail", {
+    const label = labelFor("constraints", {
       currency: "JPY",
       party_size: 5,
       items: [{ label: "hotels", amount: 300105 }, { label: "flights", amount: 22000 }],

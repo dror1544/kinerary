@@ -66,6 +66,18 @@ export const INTAKE_SCHEMA_VERSION = 3;
 export const RETIRED_QUESTION_IDS: ReadonlySet<string> = new Set([
   "group_size",
   "trip_duration",
+  // Retired 2026-09-09. Both are facts ABOUT THE ORGANIZER rather than about
+  // the trip, and an interview turn is the most expensive place to learn
+  // something the signup already implies. `home_country` is derivable from the
+  // account and the phone; `budget_detail` belongs on the landing page where
+  // someone is already filling in a form, not in a conversation.
+  //
+  // Consequence, stated rather than discovered later: until signup supplies
+  // them, a new intake has neither. The site degrades rather than breaks —
+  // consular contacts fall back to generic emergency numbers, and the budget
+  // section is simply absent.
+  "home_country",
+  "budget_detail",
 ]);
 
 export interface ChoiceOption {
@@ -520,21 +532,6 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "text",
     prompt: "Is there anything you'd like help planning once the trip assistant is up — days you haven't worked out, places you're unsure about, bookings still to make? It won't hold up setup.",
     maxLength: 500,
-    required: false,
-  },
-  {
-    id: "home_country",
-    type: "text",
-    prompt: "Which country are you (the organizer) from? This only sets which embassy the site lists for emergencies — optional; we default to your own country.",
-    maxLength: 80,
-    required: false,
-  },
-  {
-    id: "budget_detail",
-    type: "structured",
-    prompt: "A rough budget, if you want it on the site: an overall currency and party size, plus one line per known cost — { currency, party_size?, items: [{ phase?, category, description, amount, estimate? }] }. category is one of flight/hotel/car/attraction/food/insurance/other. Use amount 0 with estimate true for a cost you know matters but not the figure. (optional)",
-    dataShape: "object",
-    dataExample: "{\"currency\": \"JPY\", \"items\": [{\"label\": \"hotels\", \"amount\": 300105}]}",
     required: false,
   },
 ] as const;
@@ -1336,7 +1333,17 @@ function unansweredOptionalQuestions(
   questions: readonly IntakeQuestion[],
   ui: InterviewUiState = {},
 ): IntakeQuestion[] {
-  return questions.filter((q) => !q.required && answers[q.id] === undefined && !isSkipped(ui, q.id));
+  // `!RETIRED` is load-bearing and was missing. The set was consulted by the
+  // recap, by corrections and by the proposal gate — but not here, so retiring
+  // an OPTIONAL question left the router still asking it. It only ever worked
+  // because the two existing entries had been deleted from the list outright.
+  return questions.filter(
+    (q) =>
+      !q.required &&
+      !RETIRED_QUESTION_IDS.has(q.id) &&
+      answers[q.id] === undefined &&
+      !isSkipped(ui, q.id),
+  );
 }
 
 // ── The floor ─────────────────────────────────────────────────────────────────

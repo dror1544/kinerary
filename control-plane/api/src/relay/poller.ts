@@ -1512,7 +1512,22 @@ export async function advanceRouterOwnedQuestions(
     try {
       const result = await getSessionForChat(deps.db, chatId);
       if (!result.ok || result.view.state !== "interviewing") continue;
-      if (!nextRouterOwnedQuestion(result.view)) continue;
+      // ROUTER-OWNED, or anything at all on the interpret path.
+      //
+      // This scan is what moves an interview forward on a tick, and it only
+      // ever proceeded for a ROUTER-OWNED question, because every other
+      // question belonged to the agent. On the interpret path nothing belongs
+      // to the agent, so an interview whose only remaining questions are
+      // ordinary optional ones was never handed to `sendNextStep` at all — it
+      // sat awaiting the machine with nobody scheduled to speak.
+      //
+      // That is the last of today's stalls: the walk was fixed, and then never
+      // called.
+      const onInterpret = await isInterpretPath(deps.db, chatId);
+      const somethingToAsk = onInterpret
+        ? Boolean(nextRouterOwnedQuestion(result.view) ?? result.view.nextQuestion ?? result.view.pendingAsk ?? result.view.optionalRemaining[0])
+        : Boolean(nextRouterOwnedQuestion(result.view));
+      if (!somethingToAsk) continue;
       if (!isAsyncWork && (await hasOpenAgentTurn(deps.db, chatId))) {
         log(structuredLog("info", "trip_bot.router_owned_yielded", {
           session_id: result.view.sessionId,
@@ -1683,7 +1698,8 @@ async function sendNextStep(
   // the two work in parallel and the test calls it "the original motivating
   // case". It is only wrong here, where the extraction about to run is what
   // answers those same questions.
-  if ((await isInterpretPath(deps.db, chatId)) && (await hasPendingInbound(deps.db, chatId))) {
+  const onInterpretPath = await isInterpretPath(deps.db, chatId);
+  if (onInterpretPath && (await hasPendingInbound(deps.db, chatId))) {
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_inbound", {
       session_id: view.sessionId,
     }));
@@ -1692,7 +1708,22 @@ async function sendNextStep(
 
   // What there is to ask, worked out BEFORE the say is handled — because
   // whether the say goes out alone depends on it. See the fold below.
-  const autoWalkOptional = !deps.interviewerProfile;
+  // WHO WALKS THE OPTIONAL QUESTIONS.
+  //
+  // `!deps.interviewerProfile` is the agent-era rule: if an interviewer exists,
+  // it nominates which optional question is worth asking and the router must
+  // not walk them itself. Correct then, and silently wrong now — the relay
+  // still has `relay.interviewer_profile` configured, so on the interpret path
+  // this evaluated false and the built-in walk was OFF. That is why a skip
+  // recorded the answer and said nothing: `question` came out null and there
+  // was nothing left to send.
+  //
+  // On the interpret path there is no agent to nominate, so the router walks
+  // them — through THIS path, which already has the dedupe, the prompt key,
+  // the flood guard and the logging. An earlier fix added a second walk of its
+  // own further down; a second implementation of a thing that already exists
+  // is how the two disagree, and it has been removed.
+  const autoWalkOptional = !deps.interviewerProfile || onInterpretPath;
   const question =
     view.nextQuestion
     ?? view.pendingAsk
@@ -1797,6 +1828,17 @@ async function sendNextStep(
       session_id: view.sessionId,
       prompt: promptKey,
     }));
+    // THE QUESTION IS ALREADY ON THEIR SCREEN, so the turn is theirs.
+    //
+    // Returning while still holding the floor left the session `awaiting =
+    // machine` with nothing to say, and the tick scan — which looks for exactly
+    // that — picked it up again every couple of seconds and deduped again,
+    // forever. A busy loop that logs, on the interpret path only, because that
+    // scan does not reach these sessions on the agent path.
+    //
+    // Handing the floor back is also just true: we asked, they have not
+    // answered, we are waiting on them.
+    if (onInterpretPath) await claimFloor(deps.db, chatId);
     return;
   }
 
@@ -1823,53 +1865,6 @@ async function sendNextStep(
       });
       return;
     }
-    // NOBODY NOMINATES OPTIONAL QUESTIONS HERE, so the router walks them.
-    //
-    // On the agent path an optional question is only asked when the agent
-    // nominates it, and the branch below hands the conversation back for
-    // exactly that. Skipping the handback on the interpret path — correct,
-    // since there is no agent — turned "hand back" into "do nothing" while
-    // still holding the floor, which is the stall Dror hit over and over:
-    // "I always need to tell him to move on, like it is waiting for something
-    // from me without telling me it does."
-    //
-    // Walking them in order is deterministic and it terminates: each is
-    // offered once, and `interview.optional_passed_over` steps past any the
-    // organizer does not answer. When they run out, `nextPhase` moves to the
-    // recap.
-    if (await isInterpretPath(deps.db, chatId)) {
-      // FRESH state, not the view we were handed.
-      //
-      // On the tap path `sendNextStep` receives the view as it was around the
-      // write, which can still list the just-answered question first in
-      // `optionalRemaining`. The dedupe below then matched it against
-      // `lastPrompt` and returned silently — so a tap recorded the answer and
-      // said nothing, and the organizer had to type to move on. Live on
-      // 2026-09-09 after tapping "מאוזן" for trip_pace.
-      //
-      // The dedupe is right and stays; it just has to compare against what is
-      // true now.
-      const now = await getSessionForChat(deps.db, chatId);
-      if (!now.ok) return;
-      const fresh = now.view;
-      const next = fresh.optionalRemaining[0];
-      if (!next) return;
-      if (`q:${next.id}` === fresh.lastPrompt) return;
-      if (!(await claimFloor(deps.db, chatId))) return;
-      const rendered = renderQuestion(next, selectedOptionIds(fresh, next.id), fresh.language);
-      await deps.telegram.sendMessage({
-        chatId,
-        text: rendered.text,
-        replyMarkup: rendered.replyMarkup ?? undefined,
-      });
-      await recordLastPromptForChat(deps.db, chatId, `q:${next.id}`);
-      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.optional_walked", {
-        session_id: fresh.sessionId,
-        question_id: next.id,
-      }));
-      return;
-    }
-
     // After that it is the interviewer's conversation to carry. Saying
     // something anyway is how the router ended up talking over it.
     await handBackToInterviewer(view, chatId, deps);

@@ -216,11 +216,22 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
     recap: { en: "Assistant limits", he: "גבולות לעוזר" },
   },
   planning_help: {
+    // "Anything you'd like help planning" reads as handing out work, and the
+    // old text then undercut itself with "it won't hold up setup" — a question
+    // that announces it does not matter invites skipping, and Dror called it
+    // redundant on that basis.
+    //
+    // It is not redundant: the answer becomes a standing instruction for the
+    // companion on the live site ("the organizer asked for help with this after
+    // setup: …"), which makes it the one question that shapes what the
+    // assistant volunteers later. So the fix is the framing. Asking someone to
+    // FLAG something for later is a small, natural thing to say yes to; asking
+    // them to delegate planning is not.
     ask: {
-      en: "Anything you'd like help planning once the assistant is up — days you haven't worked out, places you're unsure about, bookings still to make? It won't hold up setup.",
-      he: "יש משהו שתרצו עזרה לתכנן אחרי שהעוזר יעלה — ימים שעוד לא סגורים, מקומות שאתם מתלבטים לגביהם, הזמנות שנשארו? זה לא מעכב את ההקמה.",
+      en: "Anything you'd like me to note for later — something to come back to once the trip is set up? An open day, a place you're still deciding on, a booking you haven't made.",
+      he: "יש משהו שתרצו שאסמן לעצמי להמשך — משהו שנחזור אליו אחרי שהטיול יוקם? יום שעוד פתוח, מקום שאתם מתלבטים לגביו, הזמנה שטרם נסגרה.",
     },
-    recap: { en: "Wants help with", he: "עזרה בתכנון" },
+    recap: { en: "Noted for later", he: "לסמן להמשך" },
   },
   home_country: {
     ask: {
