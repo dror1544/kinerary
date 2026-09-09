@@ -33,7 +33,9 @@ import { RelayConnector } from "./connector.js";
 import { resolveChatRoute } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
+  getSessionForChat,
 } from "../interview.js";
+import { agentTextIsInLanguage } from "./internal-leak.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
@@ -242,6 +244,23 @@ async function main(): Promise<void> {
             // "waiting for your answer" to a question the router never sent
             // (2026-09-07, live). Migration 0047 lets the two be told apart.
             if (await agentAlreadySpokeThisTurn(runtime.db!, chatId)) return false;
+            // ...and prose BEFORE it speaks, in the wrong language, is the same
+            // thinking-out-loud arriving through the one door that guard leaves
+            // open. Run 2026-09-09 got both halves of one thought: "I'll read
+            // the document and check the interview state simultaneously",
+            // in English, immediately followed by the real Hebrew reply saying
+            // the same thing. `agentTextIsInLanguage` already existed for this
+            // and its own docstring claims `say` — it was only ever wired to
+            // the phrasing on a nominated question. This is the other half.
+            const session = await getSessionForChat(runtime.db!, chatId);
+            if (session.ok && !agentTextIsInLanguage(text, session.view.language)) {
+              log(structuredLog("warn", "relay.agent_wrong_language_suppressed", {
+                chat_id: chatId,
+                language: session.view.language,
+                length: text.length,
+              }));
+              return false;
+            }
             const said = await sayForChat(runtime.db!, chatId, text);
             return said.ok;
           },
