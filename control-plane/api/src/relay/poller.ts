@@ -84,6 +84,7 @@ import {
 } from "../interpret.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { documentText } from "../document-text.js";
+import { provisionOnConfirm } from "../planner.js";
 
 /**
  * Reading a booking PDF and turning it into answers took ~94 seconds on the
@@ -639,6 +640,35 @@ async function applyInterviewCallback(
         ? uiString("intakeConfirmed", confirmedLanguage).replace("{name}", botName)
         : uiString("intakeConfirmedNoName", confirmedLanguage),
     });
+
+    // CONFIRMING IS THE APPROVAL, so provisioning starts here.
+    //
+    // A finished interview used to sit with no plan and no job, waiting for the
+    // organizer to approve — in a SPA — the thing they had just approved in the
+    // conversation. That is a second decision about the first one, and the
+    // button for it is not deployed.
+    //
+    // Best-effort by design: the intake is already confirmed and immutable, and
+    // the organizer has just been told their site is being built. A failure here
+    // is an operational problem to be retried, not something to take back.
+    if (confirmedView.ok) {
+      // The trip's owner, read from the membership rather than carried on the
+      // confirm result: `issueApproval` records WHO approved, and that has to
+      // be the organizer, not whichever session happened to be open.
+      const owner = await deps.db.query<{ user_id: string }>(
+        `SELECT user_id FROM control_plane.trip_memberships
+          WHERE trip_id = $1 AND role = 'owner' AND status = 'active' LIMIT 1`,
+        [confirmedView.view.tripId],
+      );
+      const ownerId = owner.rows[0]?.user_id ?? "";
+      const provisioned = await provisionOnConfirm(deps.db, confirmedView.view.tripId, ownerId)
+        .catch((error: unknown) => ({ ok: false as const, stage: "plan" as const, reason: String((error as Error)?.message ?? error) }));
+      log(structuredLog(provisioned.ok ? "info" : "warn", "interview.provisioning_started", {
+        session_id: confirmedView.view.sessionId,
+        trip_id: confirmedView.view.tripId,
+        ...(provisioned.ok ? { plan_id: provisioned.planId } : { stage: provisioned.stage, safe_error_code: provisioned.reason }),
+      }));
+    }
     return;
   }
 

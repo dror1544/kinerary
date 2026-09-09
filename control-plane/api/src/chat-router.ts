@@ -603,7 +603,10 @@ export function renderConfirmPrompt(
   language: Language = DEFAULT_LANGUAGE,
 ): RenderedQuestion {
   return {
-    text,
+    // What confirming DOES, said before they do it. The button now starts the
+    // build — site and assistant — so the organizer should know that when they
+    // press it, not afterwards from a message announcing it.
+    text: `${text}\n\n${uiString("confirmMeans", language)}`,
     replyMarkup: {
       inline_keyboard: [
         [

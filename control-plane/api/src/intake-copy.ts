@@ -330,6 +330,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // What they actually want to know is what happens next and who will be in
     // touch, so it says both — and names the assistant they just named, which
     // is the moment that choice first means something.
+    // On the recap, so "confirm" is an informed decision rather than a button.
+    confirmMeans: "Confirming starts the build: your trip site, and your assistant.",
     intakeConfirmed: "That's everything — thank you. I'm building your trip site now, which takes a little while. When it's ready, {name} will message you right here with the link.",
     /** When they never gave the assistant a name. */
     intakeConfirmedNoName: "That's everything — thank you. I'm building your trip site now, which takes a little while. I'll message you right here with the link when it's ready.",
@@ -416,6 +418,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
+    confirmMeans: "אישור מתחיל את ההקמה: אתר הטיול שלכם, והעוזר.",
     intakeConfirmed: "זהו, יש לי הכול — תודה. אני מקים לכם עכשיו את אתר הטיול, וזה לוקח קצת זמן. כשיהיה מוכן, {name} יכתוב לכם לכאן עם הקישור.",
     intakeConfirmedNoName: "זהו, יש לי הכול — תודה. אני מקים לכם עכשיו את אתר הטיול, וזה לוקח קצת זמן. כשיהיה מוכן אשלח לכם לכאן את הקישור.",
     gotIt: "יופי, רשמתי",
