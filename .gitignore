@@ -35,7 +35,11 @@ telegram_manager/__pycache__/
 control-plane/api/dist/
 control-plane/api/releases/
 control-plane/worker/**/__pycache__/
-control-plane/deployment/.local-secrets/
+control-plane/worker/.venv/
+# No trailing slash on purpose: with one this matches only a real directory, so
+# in a worktree — where the secrets live in the main checkout and this is a
+# SYMLINK to them — it fell through and showed up as stageable.
+control-plane/deployment/.local-secrets
 profile-templates/**/__pycache__/
 .hermes-pr3-architecture-review.md
 
