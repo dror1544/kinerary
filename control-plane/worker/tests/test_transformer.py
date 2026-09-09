@@ -1093,6 +1093,19 @@ class PhaseVenuesTests(unittest.TestCase):
         p = self._phase([])
         self.assertNotIn("venues", p)
 
+    def test_a_venue_named_with_a_plain_string_survives(self) -> None:
+        """What the document extractor actually emits, from run 2026-09-09:
+        `{"name": "Tokyo Skytree", "time": "..."}` — a plain string, not a
+        {he,en} pair. `_bilingual_text` returns None for that, so every venue
+        the interview captured was dropped at the last step. Six captured,
+        zero survived."""
+        p = self._phase([
+            {"name": "Tokyo Skytree", "time": "2026-09-20T10:00"},
+            {"name": "TeamLab Planets", "time": "2026-09-20T18:00"},
+        ])
+        self.assertEqual([v["id"] for v in p["venues"]], ["tokyo-skytree", "teamlab-planets"])
+        self.assertEqual(p["venues"][0]["name"], {"he": "Tokyo Skytree", "en": "Tokyo Skytree"})
+
     def test_planned_places_become_venues_without_a_url(self) -> None:
         """A document-derived `phases[].planned` entry (never booked, so it
         has no url) must still reach the site as a venue — this is the

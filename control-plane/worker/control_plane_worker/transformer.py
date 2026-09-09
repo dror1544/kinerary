@@ -894,7 +894,17 @@ def _plain(value: Any) -> str:
 
 def _bilingual_text(obj: Any) -> dict[str, str] | None:
     """Normalise a {he,en} pair: strip markup, mirror the present side onto the
-    missing one, and return None when both sides are empty."""
+    missing one, and return None when both sides are empty.
+
+    A PLAIN STRING is accepted and mirrored onto both sides. The document
+    extractor emits venue names that way (`{"name": "Tokyo Skytree"}`), and
+    requiring the pair meant every such venue was read as nameless and dropped
+    — on the 2026-09-09 run, all six of them. One language is not a reason to
+    discard a place; it is a reason to show the same name on both sides.
+    """
+    if isinstance(obj, str):
+        text = _plain(obj)
+        return {"he": text, "en": text} if text else None
     if not isinstance(obj, Mapping):
         return None
     he, en = _plain(obj.get("he")), _plain(obj.get("en"))
