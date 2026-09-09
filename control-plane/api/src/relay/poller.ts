@@ -1838,11 +1838,25 @@ async function sendNextStep(
     // organizer does not answer. When they run out, `nextPhase` moves to the
     // recap.
     if (await isInterpretPath(deps.db, chatId)) {
-      const next = view.optionalRemaining[0];
+      // FRESH state, not the view we were handed.
+      //
+      // On the tap path `sendNextStep` receives the view as it was around the
+      // write, which can still list the just-answered question first in
+      // `optionalRemaining`. The dedupe below then matched it against
+      // `lastPrompt` and returned silently — so a tap recorded the answer and
+      // said nothing, and the organizer had to type to move on. Live on
+      // 2026-09-09 after tapping "מאוזן" for trip_pace.
+      //
+      // The dedupe is right and stays; it just has to compare against what is
+      // true now.
+      const now = await getSessionForChat(deps.db, chatId);
+      if (!now.ok) return;
+      const fresh = now.view;
+      const next = fresh.optionalRemaining[0];
       if (!next) return;
-      if (`q:${next.id}` === view.lastPrompt) return;
+      if (`q:${next.id}` === fresh.lastPrompt) return;
       if (!(await claimFloor(deps.db, chatId))) return;
-      const rendered = renderQuestion(next, selectedOptionIds(view, next.id), view.language);
+      const rendered = renderQuestion(next, selectedOptionIds(fresh, next.id), fresh.language);
       await deps.telegram.sendMessage({
         chatId,
         text: rendered.text,
@@ -1850,7 +1864,7 @@ async function sendNextStep(
       });
       await recordLastPromptForChat(deps.db, chatId, `q:${next.id}`);
       (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.optional_walked", {
-        session_id: view.sessionId,
+        session_id: fresh.sessionId,
         question_id: next.id,
       }));
       return;
