@@ -606,6 +606,14 @@ async function applyInterviewCallback(
   }
 
   if (parsed.kind === "confirm") {
+    // READ THE SESSION FIRST. `getSessionForChat` filters on
+    // `state <> 'confirmed'`, and confirming sets exactly that state — so once
+    // the confirm below succeeds this view can never be fetched again. Reading
+    // it afterwards returned NOT_FOUND every single time, which silently cost
+    // two things: the confirmation message fell back to English on a Hebrew
+    // interview, and `provisionOnConfirm` sat inside an `if (view.ok)` that was
+    // never true, so confirming built nothing and did not even log why.
+    const sessionBeforeConfirm = await getSessionForChat(deps.db, decision.chatId);
     const result = await confirmIntakeForChat(deps.db, decision.chatId, log);
     if (!result.ok) {
       log(structuredLog("warn", "trip_bot.confirm_rejected", {
@@ -624,7 +632,7 @@ async function applyInterviewCallback(
     }
     await ack("Confirmed");
     // In the interview's own language, and naming the assistant they chose.
-    const confirmedView = await getSessionForChat(deps.db, decision.chatId);
+    const confirmedView = sessionBeforeConfirm;
     const confirmedLanguage = confirmedView.ok ? confirmedView.view.language : DEFAULT_LANGUAGE;
     const named = await answersForChat(deps.db, decision.chatId);
     const botName = (() => {
