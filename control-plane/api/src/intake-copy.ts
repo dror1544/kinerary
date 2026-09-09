@@ -349,8 +349,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // three say no, in the first or second line, before anything else.
     expiringSoon:
       "I'll close this conversation in about 10 minutes if I don't hear from you — nothing is lost, everything you've told me is saved. Send anything to keep going.",
+    // "Saved and waiting" was a promise the system does not keep: the answers
+    // ARE saved, but coming back needs a fresh interview link, and "waiting"
+    // reads as "just write when you're ready". Someone who believed it would
+    // return, write, and be told to go and find a link — the worst moment to
+    // learn it.
     expired:
-      "I've closed our conversation for now. Everything you told me is saved and waiting.",
+      "I've closed our conversation for now — everything you told me is saved, nothing is lost. To pick it back up you'll need a fresh interview link; ask whoever set the trip up and we'll carry on from where we stopped.",
     // Said when someone writes into a closed interview. It has to point at the
     // one thing that can reopen it, and name it the way they met it: this
     // conversation began by opening a link, so that is what "start again"
@@ -401,7 +406,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
-    expired: "סגרתי את השיחה בינתיים. כל מה שסיפרתם שמור ומחכה.",
+    expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
   },

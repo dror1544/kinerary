@@ -322,6 +322,53 @@ same organizer messages:
 If the numbers hold, that is sufficient evidence to remove Hermes from the
 intake path entirely.
 
+## 8b. Unfinished interviews — an open measurement
+
+**Requirement (Dror, 2026-09-09): interviews that do not finish must be
+measured.** What data to collect is deliberately not settled here; this records
+the requirement and what already exists to answer it, so the discussion starts
+from facts rather than from scratch.
+
+An abandoned interview is the failure mode nobody sees. A wrong answer gets
+corrected on the recap and a stall gets reported within minutes, but somebody
+who stops at question nine and never comes back leaves no complaint — and by
+the numbers above they look identical to somebody still typing.
+
+### What is already recorded, without adding anything
+
+- `intake_sessions` — `created_at`, `expired_at`, the `answers` object, and
+  `ui_state.last_prompt`. Together those give **how far they got and what was
+  on their screen when they stopped**, which is the single most useful pair.
+- `interview_interpretations` — one row per settled burst, with `duration_ms`,
+  `attempts`, `failure_reason` and the gate's `outcomes`. So **what the model
+  did on the turn before they left** is already there.
+- `ui_state.skipped` and `ui_state.deferred` — what they passed over.
+
+That is enough to answer "where do people stop" today, by query, with no schema
+change. It is not enough to answer "why".
+
+### The questions worth deciding before building anything
+
+- Is stopping at the LAST question of a phase different from stopping mid-phase?
+- Does a stall (`held_for_inbound`, a silent return) precede abandonment more
+  often than chance? Today's runs suggest yes, and that is the whole reason
+  this matters.
+- Does a document upload make finishing more or less likely? The hypothesis is
+  more — fewer questions — but a two-minute wait might do the opposite.
+- Is an EXPIRED session abandoned, or merely interrupted? They are different
+  outcomes and the current schema cannot tell them apart: `expired_at` says
+  the clock ran out, not whether the person had already given up.
+
+### A product question this exposes
+
+An expired interview currently needs a NEW LINK to resume. That is friction
+placed on someone whose only mistake was going to dinner, and it turns a pause
+into a restart. The chat is already bound to the trip and identity was
+established at `/start`, so resuming on the organizer's next message is
+technically available — the question is whether expiry should end a session or
+merely park it. Worth deciding before measuring abandonment, because the answer
+changes what "unfinished" means.
+
 ## 9. Then: `extract`
 
 Document extraction follows the same shape. `extractItinerary` now runs as the
