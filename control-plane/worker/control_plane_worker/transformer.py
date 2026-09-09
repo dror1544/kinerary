@@ -951,6 +951,22 @@ def _normalise_days(
 _HTTP_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 
+def _planned_as_venues(raw_planned: Any) -> list[dict[str, Any]]:
+    """Turn a phases[].planned intake payload — plain place-name strings the
+    interview proposed from a document but that were never booked — into the
+    same shape `_normalise_venues` expects, so a place like "Tokyo Skytree"
+    reaches the site's phase page the same way a `venues[]` entry from
+    `extract_itinerary` does, just without a url/area."""
+    if not isinstance(raw_planned, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in raw_planned:
+        name = _plain(raw)
+        if name:
+            out.append({"name": {"he": name, "en": name}})
+    return out
+
+
 def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
     """Turn a phases[].venues intake payload into the site's config shape:
     [{id, name:{he,en}, url?, area?}]. Deduped by english name, capped, `url`
@@ -1013,7 +1029,8 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             "end": _parse_iso_date(raw.get("end")),
             "accommodation": raw.get("accommodation"),
             "days": raw.get("days") if isinstance(raw.get("days"), list) else [],
-            "venues": raw.get("venues") if isinstance(raw.get("venues"), list) else [],
+            "venues": (raw.get("venues") if isinstance(raw.get("venues"), list) else [])
+            + _planned_as_venues(raw.get("planned")),
         })
 
     merged: list[dict[str, Any]] = []

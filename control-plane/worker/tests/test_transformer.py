@@ -1093,6 +1093,33 @@ class PhaseVenuesTests(unittest.TestCase):
         p = self._phase([])
         self.assertNotIn("venues", p)
 
+    def test_planned_places_become_venues_without_a_url(self) -> None:
+        """A document-derived `phases[].planned` entry (never booked, so it
+        has no url) must still reach the site as a venue — this is the
+        Skytree-not-on-the-phase-page gap: `_derive_phases` used to drop the
+        key entirely."""
+        intake = {**JAPAN_INTAKE, "phases": _structured([
+            {
+                "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                "planned": ["Tokyo Skytree", "TeamLab Planets"],
+            },
+        ])}
+        p = transform_intake(intake)["phases"][0]
+        self.assertEqual([v["id"] for v in p["venues"]], ["tokyo-skytree", "teamlab-planets"])
+        self.assertNotIn("url", p["venues"][0])
+
+    def test_a_venue_with_a_url_wins_over_a_planned_duplicate(self) -> None:
+        intake = {**JAPAN_INTAKE, "phases": _structured([
+            {
+                "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                "venues": [{"name": {"en": "Tokyo Skytree"}, "url": "https://www.tokyo-skytree.jp/en/"}],
+                "planned": ["Tokyo Skytree"],
+            },
+        ])}
+        p = transform_intake(intake)["phases"][0]
+        self.assertEqual(len(p["venues"]), 1)
+        self.assertEqual(p["venues"][0]["url"], "https://www.tokyo-skytree.jp/en/")
+
 
 class HomeCountryTests(unittest.TestCase):
     def test_answer_is_written_to_meta_home_country(self) -> None:

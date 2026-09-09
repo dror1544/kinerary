@@ -370,8 +370,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // museum with an e-ticket is an anchor, the same museum named in an
     // itinerary is planned, and it becomes an anchor the day a booking for it
     // arrives. Recorded per phase because that is where a planned place
-    // belongs; the transformer ignores the key today, and the enrichment pass
-    // that builds day-by-day itineraries is exactly what wants it.
+    // belongs; `_derive_phases` folds it into that phase's `venues[]`
+    // (`_planned_as_venues`, transformer.py) so enrichment geocodes it the
+    // same as a venue `extract_itinerary` found, just without a url.
     dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}, \"planned\": [\"Tokyo Skytree\", \"TeamLab Planets\"]}]",
     required: true,
   },
