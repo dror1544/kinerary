@@ -156,6 +156,8 @@ async function proxy(req, res, tripId, suffix, session) {
     upstreamResponse.pipe(res);
   });
   upstream.on("error", () => { if (!res.headersSent) json(res, 502, { error: "RUNTIME_UNAVAILABLE" }); else res.destroy(); });
+  // A closed browser must also release its long-lived upstream SSE stream.
+  res.on("close", () => upstream.destroy());
   req.pipe(upstream);
 }
 

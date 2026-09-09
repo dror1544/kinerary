@@ -244,6 +244,30 @@ and where it stopped. Output, per interview and aggregated across a window:
 
 It runs on **abandoned interviews too** — those are where the material is.
 
+### The same loop localises the questions (#41)
+
+The interview's 23 prompts and every option label are literal English strings.
+Localising them needs per-language files, reused across interviews, and — the
+part that makes this belong here — **an agent that realigns the other languages
+when the English source changes.**
+
+That is the judge loop with a different input. A strong model proposes a change
+to a versioned artifact, an eval checks it, a human promotes it. Building a
+second alignment mechanism for translations, separate from the one that
+proposes template improvements, would mean two things to trust, two ways to
+drift, and two promotion gates to get right.
+
+So the orchestrator should treat "the English prompt changed" as one more
+trigger for a proposed diff, and a stale language file as one more thing the
+gate refuses to promote silently. **A language file whose source has moved is
+worse than a missing one, because nothing looks wrong** — the organizer is
+simply asked last month's question.
+
+One constraint carries over from the interim and must survive into this design:
+`option_id` is NEVER translated. Ids land in the immutable intake and are what
+the transformer reads; only labels vary. Getting that wrong writes records
+nothing can consume, into a file that by design cannot be edited afterwards.
+
 ### The template loop must be gated, not automatic
 
 **A judge that edits the live template unattended will drift, and drift here is
@@ -325,7 +349,15 @@ build.
    coupling interview lifecycle to trip provisioning. Recommendation: reuse,
    since the adapter, its validation and its forbidden-key scan already exist.
 
-7. **Is the un-namespaced session id worth fixing upstream anyway?** The
+7. **Does the judge own translation alignment, or is that a separate lane?**
+   (#41) They are the same shape — propose a diff to a versioned artifact,
+   gate it, promote it — and sharing one mechanism avoids two things to trust.
+   But translation alignment is mechanical where template improvement is
+   editorial, and a gate tuned for one may be wrong for the other. Decide
+   before building either, because retrofitting a shared gate is harder than
+   starting with one.
+
+8. **Is the un-namespaced session id worth fixing upstream anyway?** The
    ephemeral design routes around it rather than fixing it, and every other
    profile on the machine still shares the defect. If any long-lived profile
    remains — the companions do — this is still live for them.

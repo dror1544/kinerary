@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 from control_plane_worker.companion_profile import (
@@ -159,3 +161,105 @@ class RenderProfileAdapterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SshCompanionProfileAdapterTests(unittest.TestCase):
+    """The transport, and the properties that keep it a bridge rather than a
+    foundation."""
+
+    def _adapter(self, **kw):
+        from control_plane_worker.companion_profile import SshCompanionProfileAdapter
+        return SshCompanionProfileAdapter(
+            host="host.example", user="deploy", key_path="/keys/companion", **kw
+        )
+
+    def test_it_passes_no_remote_command_at_all(self) -> None:
+        # The single most important property. The key's forced command decides
+        # what runs; if this argv ever grew a trailing command, a compromised
+        # worker would have general host execution instead of one wrapper.
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["input"] = kwargs.get("input")
+            return SimpleNamespace(returncode=0, stdout="INSTALLED trip-japan-2026\n", stderr="")
+
+        with mock.patch("control_plane_worker.companion_profile.subprocess.run", fake_run):
+            self._adapter().install({"profile": {"name": "trip-japan-2026"}})
+
+        argv = captured["argv"]
+        self.assertEqual(argv[0], "ssh")
+        self.assertEqual(argv[-1], "deploy@host.example",
+                         "the destination must be the LAST argument — nothing after it to execute")
+
+    def test_the_handoff_travels_on_stdin_not_in_the_command_line(self) -> None:
+        # Content on argv would be visible in `ps` on the host and would invite
+        # quoting bugs; the wrapper reads stdin precisely so it never has to
+        # trust an argument.
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["input"] = kwargs.get("input")
+            return SimpleNamespace(returncode=0, stdout="INSTALLED trip-x\n", stderr="")
+
+        handoff = {"profile": {"name": "trip-x"}, "organizer": {"display_name": "ניר"}}
+        with mock.patch("control_plane_worker.companion_profile.subprocess.run", fake_run):
+            self._adapter().install(handoff)
+
+        self.assertIn("ניר", captured["input"])
+        self.assertFalse(any("ניר" in part for part in captured["argv"]))
+
+    def test_an_already_present_profile_is_a_success_not_a_failure(self) -> None:
+        # A retried job after a partial success must not fail the run: the
+        # profile from the earlier attempt is there and is correct.
+        def fake_run(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="ALREADY_PRESENT trip-y\n", stderr="")
+
+        with mock.patch("control_plane_worker.companion_profile.subprocess.run", fake_run):
+            self.assertEqual(self._adapter().install({"profile": {"name": "trip-y"}}), "trip-y")
+
+    def test_a_failing_remote_raises_a_plain_error(self) -> None:
+        # Nothing above the adapter should learn that SSH was involved — the
+        # provisioner records COMPANION_INSTALL_FAILED either way, and under
+        # K3s this same failure will arrive from an orchestrator.
+        def fake_run(argv, **kwargs):
+            return SimpleNamespace(returncode=255, stdout="", stderr="Permission denied (publickey).")
+
+        with mock.patch("control_plane_worker.companion_profile.subprocess.run", fake_run):
+            with self.assertRaises(RuntimeError):
+                self._adapter().install({"profile": {"name": "trip-z"}})
+
+    def test_unrecognized_output_is_refused_rather_than_guessed(self) -> None:
+        for stdout in ("", "ok\n", "INSTALLED\n", "SOMETHING_ELSE trip-a\n"):
+            def fake_run(argv, _stdout=stdout, **kwargs):
+                return SimpleNamespace(returncode=0, stdout=_stdout, stderr="")
+            with self.subTest(stdout=stdout):
+                with mock.patch("control_plane_worker.companion_profile.subprocess.run", fake_run):
+                    with self.assertRaises(RuntimeError):
+                        self._adapter().install({"profile": {"name": "trip-a"}})
+
+    def test_preflight_fails_at_startup_when_the_key_is_absent(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self._adapter().preflight()
+
+    def test_it_satisfies_the_same_contract_as_the_other_adapters(self) -> None:
+        # The abstraction is the durable part. If this stops being substitutable
+        # for RenderProfileAdapter / NullCompanionProfileAdapter, the K3s
+        # implementation cannot simply replace it either.
+        import inspect
+        from control_plane_worker.companion_profile import (
+            CompanionProfileAdapter, NullCompanionProfileAdapter, RenderProfileAdapter,
+        )
+        # `CompanionProfileAdapter` is a plain Protocol (not runtime_checkable),
+        # so substitutability is checked structurally: same method, same
+        # call shape.
+        expected = inspect.signature(CompanionProfileAdapter.install)
+        for cls in (NullCompanionProfileAdapter, RenderProfileAdapter, type(self._adapter())):
+            with self.subTest(cls=cls.__name__):
+                self.assertTrue(callable(getattr(cls, "install", None)))
+                self.assertEqual(
+                    list(inspect.signature(cls.install).parameters),
+                    list(expected.parameters),
+                    "adapters must stay interchangeable — the K3s implementation replaces this one",
+                )

@@ -29,6 +29,10 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
+import { resolveChatRoute } from "../chat-router.js";
+import { sayForChat,
+  agentAlreadySpokeThisTurn,
+} from "../interview.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
@@ -81,6 +85,12 @@ interface Runtime {
   botIdentity?: BotIdentity;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
+  /**
+   * From `relay.multiplex_gateway_id`. Absent means routing is exact and a
+   * trip with no gateway of its own is reported unreachable rather than
+   * served by somebody else's process.
+   */
+  multiplexGatewayId?: string;
   /**
    * Present only when this relay's bot IS the signup bot. Telegram gives each
    * update to exactly one getUpdates caller, so in that topology this loop has
@@ -168,6 +178,7 @@ async function serveRuntime(path: string): Promise<Runtime> {
     db,
     botIdentity: identity ? { username: identity.username, id: identity.id } : undefined,
     interviewerProfile: relay.interviewer_profile,
+    multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
   };
 }
@@ -205,6 +216,36 @@ async function main(): Promise<void> {
     host: runtime.host,
     mediaStore,
     log,
+    ...(runtime.multiplexGatewayId ? { fallbackGatewayId: runtime.multiplexGatewayId } : {}),
+    // Track 4: on an interview chat the agent's words reach the organizer only
+    // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
+    // keyboard, the record and the order. Resolved from the binding, never from
+    // anything the gateway says about itself — same rule as inbound routing.
+    ...(runtime.db
+      ? {
+          interviewChat: async (chatId: string) => {
+            const route = await resolveChatRoute(runtime.db!, chatId);
+            return route.kind === "interview";
+          },
+          // Anything the agent writes to an organizer mid-interview is routed
+          // through `say`, not dropped. The router still delivers it, so it
+          // keeps the keyboard, the record and the order — and a turn that
+          // spoke is no longer mistaken for a stall by the watchdog.
+          interviewSay: async (chatId: string, text: string) => {
+            // Prose INSTEAD of speaking is a message worth rescuing — that is
+            // why this conversion exists, and dropping it once cost an
+            // organizer 17 lost sends and a watchdog re-asking the same
+            // question. Prose AFTER the agent has already used a real speaking
+            // tool is a different thing: it is the agent thinking out loud,
+            // and delivering it is how an organizer gets told the assistant is
+            // "waiting for your answer" to a question the router never sent
+            // (2026-09-07, live). Migration 0047 lets the two be told apart.
+            if (await agentAlreadySpokeThisTurn(runtime.db!, chatId)) return false;
+            const said = await sayForChat(runtime.db!, chatId, text);
+            return said.ok;
+          },
+        }
+      : {}),
   });
 
   // Listen BEFORE polling. The gateway reconnects on its own every 30s, so a
@@ -222,7 +263,7 @@ async function main(): Promise<void> {
       botIdentity: runtime.botIdentity,
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
-      media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl },
+      media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
       log,
     });
   }
@@ -231,6 +272,9 @@ async function main(): Promise<void> {
     port: runtime.port,
     host: runtime.host,
     polling: Boolean(runtime.db),
+    // Says out loud which routing regime this process is in. "Exact" is the
+    // destination state; a named multiplex gateway is the transition.
+    routing: runtime.multiplexGatewayId ? "fallback" : "exact",
   }));
 
   for (const signal of ["SIGINT", "SIGTERM"] as const) {

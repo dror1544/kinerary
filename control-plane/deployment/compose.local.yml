@@ -145,6 +145,20 @@ services:
       # neither needs a value set. Set PROVISIONER_COMPANION_PROFILE_ENABLED=0
       # or PROVISIONER_MCP_BRIDGE_ENABLED=0 to opt back out.
       PROVISIONER_COMPANION_TEMPLATES_DIR: ${PROVISIONER_COMPANION_TEMPLATES_DIR:-}
+      # Host-side companion materialization (A3). The Hermes install a profile
+      # must be created in is macOS-native and its gateway serves those
+      # profiles from the host, so the worker cannot render one locally. The
+      # key is forced-command restricted on the host side: it can pipe a
+      # handoff into scripts/companion-install-host.sh and do nothing else.
+      #
+      # PROVISIONING/INSTALL TIME ONLY. No part of a live trip — its routing,
+      # its chat binding, the Hermes runtime — goes through here. Expected to
+      # be replaced by the K3s orchestrator, at which point these three vars
+      # and the mount below go away and the adapter contract is unchanged.
+      PROVISIONER_COMPANION_SSH_HOST: ${PROVISIONER_COMPANION_SSH_HOST:-}
+      PROVISIONER_COMPANION_SSH_USER: ${PROVISIONER_COMPANION_SSH_USER:-}
+      PROVISIONER_COMPANION_SSH_KEY: ${PROVISIONER_COMPANION_SSH_KEY:-}
+      PROVISIONER_COMPANION_SSH_KNOWN_HOSTS: ${PROVISIONER_COMPANION_SSH_KNOWN_HOSTS:-}
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-}
       # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
@@ -176,6 +190,12 @@ services:
       # SSO is ruled out and Google is unconfigured. Stopgap until a real
       # member/organizer signup flow exists.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      # Operator's Telegram chat id for the provisioning-outcome DM. The API
+      # sends the matching approval DM to the same chat, resolved from the
+      # profile's signup.super_admin_chat_id_secret_ref. Empty simply enqueues
+      # no operator rows — this is observability, never a gate: no part of
+      # provisioning waits on, retries for, or branches on these notifications.
+      CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
       PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
       NPM_URL: ${NPM_URL:-}
       NPM_API_TOKEN: ${NPM_API_TOKEN:-}
@@ -207,6 +227,10 @@ services:
       # directory (which also holds unrelated personal/other-project keys).
       - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
       - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_rpi4_hermes:/root/.ssh/id_ed25519_rpi4_hermes:ro
+      # Companion materialization key (A3). Restricted to a single forced
+      # command on the host, so this mount grants exactly "install a companion
+      # profile", not host shell access.
+      - ${WORKER_SSH_DIR_HOST:-/Users/elul/.ssh}/id_ed25519_kinerary_companion:/root/.ssh/id_ed25519_kinerary_companion:ro
     secrets: [control_plane_database_url]
     healthcheck:
       test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]

@@ -3,12 +3,22 @@ import { z } from "zod";
 export const runtimeUrl = (window as unknown as { runtimePath?: (path: string) => string }).runtimePath || ((path: string) => path);
 
 export const tokenStore = {
-  get: () => localStorage.getItem("tripToken") || localStorage.getItem("trip-token") || localStorage.getItem("token"),
-  set: (token: string) => localStorage.setItem("tripToken", token),
+  get: () => {
+    const token = localStorage.getItem("tripToken") || localStorage.getItem("trip-token") || localStorage.getItem("token");
+    if (token && !localStorage.getItem("trip-token")) localStorage.setItem("trip-token", token);
+    return token;
+  },
+  set: (token: string) => {
+    localStorage.setItem("tripToken", token);
+    // Classic and Modern share an origin. Mirroring the session lets a traveler
+    // open a legacy-only utility without being asked to sign in a second time.
+    localStorage.setItem("trip-token", token);
+  },
   clear: () => {
     localStorage.removeItem("tripToken");
     localStorage.removeItem("trip-token");
     localStorage.removeItem("token");
+    localStorage.removeItem("trip-user");
   },
 };
 
@@ -182,6 +192,50 @@ export type ExtractedBooking = Partial<BookingInput> & {
   cost?: number | string | null;
 };
 
+const budgetItemSchema = z.object({
+  id: z.number(),
+  phase: z.string(),
+  category: z.string(),
+  description: z.string(),
+  amount: z.number(),
+  is_estimate: z.union([z.boolean(), z.number()]).transform(Boolean),
+});
+
+export type BudgetItem = z.infer<typeof budgetItemSchema>;
+export type BudgetItemInput = Omit<BudgetItem, "id">;
+
+const photoUserSchema = z.object({
+  username: z.string(),
+  name: z.string().nullable().optional(),
+  name_en: z.string().nullable().optional(),
+  color: z.string().nullable().optional(),
+}).passthrough();
+
+const photoSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  originalName: z.string().optional(),
+  phase: z.string(),
+  caption: z.string(),
+  username: z.string(),
+  uploadedAt: z.string(),
+  user: photoUserSchema,
+});
+
+const photoCommentSchema = z.object({
+  id: z.number(),
+  photo_id: z.string(),
+  username: z.string(),
+  body: z.string(),
+  created_at: z.string(),
+  user: photoUserSchema,
+});
+
+export type TripPhoto = z.infer<typeof photoSchema>;
+export type PhotoComment = z.infer<typeof photoCommentSchema>;
+export type PhotoReactions = Record<string, Record<string, string[]>>;
+export type PhotoComments = Record<string, PhotoComment[]>;
+
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
     method: "POST",
@@ -228,6 +282,24 @@ export const uploadBookingAppleWallet = (id: number, file: File) => {
   body.set("file", file);
   return api<{ ok: true; pkpass_file: string }>(`/api/bookings/${id}/wallet-apple`, { method: "POST", body });
 };
+export const getBudget = () => api<unknown>("/api/budget").then((value) => z.array(budgetItemSchema).parse(value));
+export const createBudgetItem = (input: BudgetItemInput) => api<{ ok: true; id: number }>("/api/budget", { method: "POST", body: JSON.stringify(input) });
+export const updateBudgetItem = (id: number, input: Partial<Pick<BudgetItem, "amount" | "description">>) => api<{ ok: true }>(`/api/budget/${id}`, { method: "PATCH", body: JSON.stringify(input) });
+export const deleteBudgetItem = (id: number) => api<{ ok: true }>(`/api/budget/${id}`, { method: "DELETE" });
+export const getPhotos = (phase?: string) => api<unknown>(`/api/photos${phase ? `?phase=${encodeURIComponent(phase)}` : ""}`).then((value) => z.array(photoSchema).parse(value));
+export const getPhotoReactions = () => api<PhotoReactions>("/api/reactions");
+export const getPhotoComments = () => api<unknown>("/api/comments/photo").then((value) => z.record(z.string(), z.array(photoCommentSchema)).parse(value));
+export const uploadPhoto = (file: File, fields: { phase?: string; caption?: string } = {}) => {
+  const body = new FormData();
+  body.set("photo", file);
+  if (fields.phase) body.set("phase", fields.phase);
+  if (fields.caption) body.set("caption", fields.caption);
+  return api<{ ok: true; photo: TripPhoto }>("/api/photos/upload", { method: "POST", body });
+};
+export const deletePhoto = (id: string) => api<{ ok: true }>(`/api/photos/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const togglePhotoReaction = (photoId: string, emoji: string) => api<{ ok: true; action: "added" | "removed" }>(`/api/reactions/${encodeURIComponent(photoId)}`, { method: "POST", body: JSON.stringify({ emoji }) });
+export const postPhotoComment = (photoId: string, body: string) => api<PhotoComment>(`/api/comments/photo/${encodeURIComponent(photoId)}`, { method: "POST", body: JSON.stringify({ body }) });
+export const deletePhotoComment = (id: number) => api<{ ok: true }>(`/api/comments/photo/${id}`, { method: "DELETE" });
 export const getMoments = () => api<Array<{ id: string; caption: string; body?: string | null; date?: string | null; visibility: string; author: string }>>("/api/moments");
 export const createMoment = (input: { caption: string; body?: string; date?: string; visibility?: "draft" | "published" }) => api("/api/moments", { method: "POST", body: JSON.stringify(input) });
 export const getHermes = () => api<{ identity: { name: string }; available: boolean; ask_in_telegram: boolean; telegram_username: string | null; verification_freshness: { open_issues: number; checked_at: string } }>("/api/hermes/status");

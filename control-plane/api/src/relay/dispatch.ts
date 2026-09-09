@@ -28,13 +28,32 @@ import type pg from "pg";
 import {
   parseCallbackData,
   parseInbound,
+  renderDocumentOffer,
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
   type InlineKeyboard,
+  migrateChatBinding,
+  companionIntroFacts,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { normalizeUpdate, toWireEvent, type MediaDeps, type TelegramUpdate } from "./normalize.js";
+import { groupBindingCommand, groupIntroText } from "../companion-intro.js";
+import {
+  extractGroupBindingToken,
+  issueGroupBindingToken,
+  redeemGroupBindingToken,
+} from "../group-binding.js";
+import { structuredLog } from "../redaction.js";
+import {
+  botJoinedGroup,
+  describeAttachment,
+  migrationOf,
+  normalizeUpdate,
+  toWireEventWithMedia,
+  type MediaDeps,
+  type TelegramUpdate,
+} from "./normalize.js";
+import { setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -49,8 +68,40 @@ export type DispatchDecision =
   | { kind: "to_gateway"; event: WireMessageEvent }
   /** The connector answers this one itself. */
   | { kind: "reply"; reply: DirectReply }
+  | {
+      /**
+       * The bot has just been added to a group bound to a trip: send the
+       * arrival message, then pin it if the group made us an admin.
+       *
+       * Separate from `reply` because pinning needs the sent message's id back,
+       * and `reply` deliberately discards it.
+       */
+      kind: "group_intro";
+      chatId: string;
+      text: string;
+      /**
+       * A second message sent right after, carrying only a line to copy.
+       *
+       * Its own message on purpose: a token inside a paragraph has to be
+       * drag-selected on a phone, and a slightly wrong selection produces a
+       * token that does not work with nothing to say why.
+       */
+      followUp?: string;
+      /** Whether to attempt pinning. False for a DM, where there is nothing to pin for. */
+      pin?: boolean;
+    }
+  /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
+  | { kind: "show_summary"; chatId: string; view: SessionView }
   /** A tapped inline button that belongs to the interview flow. */
-  | { kind: "interview_callback"; chatId: string; callbackQueryId: string; data: string; sessionId: string }
+  | {
+      kind: "interview_callback";
+      chatId: string;
+      callbackQueryId: string;
+      data: string;
+      sessionId: string;
+      /** The message the button belongs to, so a multi-select can be redrawn in place. */
+      messageId?: string;
+    }
   /**
    * A WRITTEN message from a chat that is mid-interview.
    *
@@ -75,7 +126,23 @@ export type DispatchDecision =
    * Carries the session the router resolved for the chat, so the caller can
    * open the turn that gates the agent's write path before the event goes out.
    */
-  | { kind: "interview_to_gateway"; chatId: string; sessionId: string; event: WireMessageEvent }
+  | {
+      kind: "interview_to_gateway";
+      chatId: string;
+      sessionId: string;
+      event: WireMessageEvent;
+      /**
+       * The organizer attached a file to this message.
+       *
+       * Distinct from `event.media_urls` being non-empty, which additionally
+       * requires the re-host to have SUCCEEDED. The two were conflated until
+       * run 14: a failed re-host silently downgraded a document turn to the
+       * ordinary agent floor, so the agent got less time exactly when it had
+       * more to do. What the agent can DO depends on the bytes arriving; how
+       * long it may take depends on the organizer having sent a file at all.
+       */
+      hadAttachment: boolean;
+    }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
@@ -99,6 +166,7 @@ export interface BotIdentity {
 export interface DispatchStrings {
   /** Shown when someone messages the bot with no trip and no valid link. */
   unbound: string;
+  companionPending: string;
   /** Shown for a bare `/start` with no deep-link payload. */
   noPayload: string;
   /** Shown when a deep link is expired, already used, or unknown. */
@@ -113,6 +181,25 @@ export interface DispatchStrings {
   writtenAnswerUnsupported: string;
   /** Shown when a turn could not be handed to the gateway, so no answer is coming. */
   gatewayUnavailable: string;
+  /**
+   * The organizer's group-binding token, with what to do with it.
+   *
+   * A function rather than a template string because the token is the whole
+   * message: everything around it exists to get it posted in the right place,
+   * after the right step.
+   */
+  groupTokenIssued: (token: string) => string;
+  /** Asked for a token somewhere it cannot be issued — not a DM, or no trip. */
+  groupTokenUnavailable: string;
+  /**
+   * ONE message for every reason a token was refused.
+   *
+   * Distinguishing "no such token" from "that token is not yours" would confirm
+   * a guess to whoever is guessing, in a room the organizer does not control.
+   */
+  groupTokenRefused: string;
+  /** Bound, but the trip has no introduction facts stored to greet with. */
+  groupBoundNoIntro: string;
 }
 
 /**
@@ -122,8 +209,32 @@ export interface DispatchStrings {
  * on differently, and guessing would be worse than a single honest sentence.
  */
 export const DEFAULT_STRINGS: DispatchStrings = {
+  groupTokenIssued: (token: string) =>
+    [
+      "To connect me to your family group:",
+      "",
+      "1. Add me to the group",
+      "2. Make me an admin — I need that to pin the welcome message",
+      "3. Post this line in the group:",
+      "",
+      token,
+      "",
+      "If you post it before making me an admin, that's fine — just post it again afterwards and I'll set things up properly.",
+    ].join("\n"),
+  groupTokenUnavailable:
+    "I can only set up a group from your own chat with me, once your trip site is ready.",
+  groupTokenRefused:
+    "That code didn't work here. Ask the trip organizer to send you a fresh one.",
+  groupBoundNoIntro: "This group is connected to the trip.",
   unbound:
     "I don't have a trip for this chat yet. Open the link from your Kinerary signup to get started.",
+  // Bound, but the assistant behind it is not ready. Says what is true — the
+  // trip exists, the site is up — without claiming an assistant that cannot
+  // answer. The alternative, `unbound`'s "I don't have a trip for this chat",
+  // is what a real organizer was told on 2026-09-06 about a trip that had
+  // provisioned perfectly.
+  companionPending:
+    "Your trip is set up and the site is ready — I'm still finishing your assistant. Try me again shortly.",
   noPayload:
     "Welcome to Kinerary. To start planning, open the link from your signup email or message — it carries the code I need.",
   badLink: "That link isn't valid any more. Ask for a fresh one and I'll pick up from there.",
@@ -156,6 +267,29 @@ export interface DispatchOptions {
   interviewerProfile?: string;
   /** Present when the connector runs a media plane; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * Whether a trip's companion gateway is connected right now.
+   *
+   * Injected rather than looked up so the router keeps its property of
+   * performing no I/O of its own. Absent means "assume reachable", which is
+   * what every caller did before per-trip gateway processes existed.
+   */
+  canReachProfile?: (profile: string) => boolean;
+  /**
+   * Whether the group's arrival message carries the shared site password.
+   *
+   * The trip login IS shared by design, and the arrival message is pinned so a
+   * member who joins later can scroll back to it — that is the argument for.
+   * Against: a password in a group is durable, searchable, and visible to
+   * everyone ever added to that group, including after the trip. Both are true,
+   * the choice is the deployment's, and turning it off changes nothing else
+   * about the message (the group is told who to ask instead).
+   *
+   * Defaults to true, matching the organizer's stated intent on 2026-09-07.
+   */
+  groupIntroIncludesPassword?: boolean;
+  /** How long a group-binding token stays valid. Defaults to a week. */
+  groupBindingTtlSeconds?: number;
 }
 
 export async function dispatchUpdate(
@@ -167,6 +301,53 @@ export async function dispatchUpdate(
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
   if (update.callback_query) return dispatchCallback(db, update);
+
+  // Added to a group. If that group is already bound to a trip, this is the
+  // companion's arrival and it introduces itself; if it is not, saying so is
+  // better than sitting silent in a room people just invited it into.
+  const joined = botJoinedGroup(update, botIdentity.id);
+  if (joined) {
+    const route = await resolveChatRoute(db, joined.chatId);
+    if (route.kind !== "companion") {
+      return { kind: "reply", reply: { chatId: joined.chatId, text: strings.unbound } };
+    }
+    const facts = await companionIntroFacts(db, route.tripId);
+    const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
+    // No stored facts means a trip provisioned before migration 0044, or one
+    // that never finished. Nothing to introduce, and inventing a name here is
+    // exactly what this module refuses to do.
+    if (!facts || !assistantName) return { kind: "ignore", reason: "NO_INTRO_FACTS" };
+    return {
+      kind: "group_intro",
+      chatId: joined.chatId,
+      text: groupIntroText(
+        {
+          assistantName,
+          tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
+          siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
+          language: facts.language === "he" ? "he" : "en",
+          loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
+          proactive: (facts.proactive as never) ?? null,
+        },
+        { includePassword: options.groupIntroIncludesPassword ?? true },
+      ),
+    };
+  }
+
+  // A supergroup migration is repaired BEFORE anything is routed. Telegram
+  // delivers it as an ordinary message with no text, so the branches below
+  // would drop it on NO_TEXT and the binding would quietly go stale — the
+  // companion falling silent in a live family group with nothing in the
+  // conversation to explain it.
+  const migration = migrationOf(update.message ?? update.edited_message);
+  if (migration) {
+    const moved = await migrateChatBinding(db, migration.from, migration.to);
+    log(structuredLog("info", "trip_bot.chat_migrated", { moved }));
+    // Nothing to say to anyone: from the family's side the group simply kept
+    // working, which is the whole point.
+    return { kind: "ignore", reason: moved ? "CHAT_MIGRATED" : "CHAT_MIGRATION_NOOP" };
+  }
 
   const message = update.message ?? update.edited_message;
   const rawChatId = message?.chat?.id;
@@ -180,14 +361,20 @@ export async function dispatchUpdate(
   const parsed = parseInbound(text);
 
   if (parsed.kind === "start") {
-    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log);
+    const outcome = await startFromDeepLink(db, chatId, parsed.payload, log, message.from?.language_code);
     switch (outcome.kind) {
       case "started": {
-        // The first question rides back on the same result, so the organizer's
-        // very first tap produces a real question rather than a "hold on".
-        const question = outcome.view.nextQuestion;
-        if (!question) return { kind: "reply", reply: { chatId, text: strings.badLink } };
-        const rendered = renderQuestion(question);
+        // The opening is the document offer, not the first question. Asking
+        // for a start date before mentioning that a PDF would answer it is
+        // how run 5 began, and typing out a trip you already have written
+        // down is the single biggest waste of an organizer's patience.
+        //
+        // The first question follows the moment they answer it — by sending
+        // the document, by tapping "I don't have one", or by just typing.
+        if (!outcome.view.nextQuestion) {
+          return { kind: "reply", reply: { chatId, text: strings.badLink } };
+        }
+        const rendered = renderDocumentOffer(outcome.view.language);
         return {
           kind: "reply",
           reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
@@ -211,7 +398,108 @@ export async function dispatchUpdate(
     }
   }
 
-  const outcome = await normalizeUpdate(db, update, options.media);
+  // A way to the summary that depends on nothing else working.
+  //
+  // Reaching the recap normally means either the interviewer calling
+  // `show_summary_for_chat` or the organizer tapping the boundary message.
+  // On 2026-09-04 run 6 neither happened: the agent asked for approval in
+  // prose, the organizer said yes, and nothing occurred — only the router's
+  // Confirm button writes an intake version, and it had never been sent. A
+  // typed command is the one path that survives an agent doing anything at
+  // all, so it exists.
+  // A binding token posted in a group, normally as `/group KIN-XXXXXXXX`.
+  //
+  // Checked BEFORE routing, because the whole point is that this group is not
+  // routed yet — the ordinary path would answer UNROUTED and tell the organizer
+  // the bot has no trip for the very group they are binding. And before the
+  // `/group` ISSUANCE branch below, because in a group `/group <token>` means
+  // redeem, not "send me another token".
+  //
+  // WHY A COMMAND AND NOT A BARE TOKEN. Telegram privacy mode: a bot that is
+  // not an admin receives only commands, replies and mentions in a group. A
+  // token pasted as ordinary text would never reach us — and the case that
+  // breaks is precisely the one this flow promises to recover, "you posted it
+  // before making me an admin, post it again". Under privacy mode that second
+  // post would vanish too. A command is delivered either way.
+  //
+  // A bare token is still accepted, because it costs nothing and works once the
+  // bot IS an admin (admins see every message). The instructions teach the
+  // command, which is the form that always arrives.
+  const postedToken = message.chat?.type !== "private"
+    ? extractGroupBindingToken(text)
+    : null;
+  if (postedToken) {
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const redeemed = senderId
+      ? await redeemGroupBindingToken(db, postedToken, chatId, senderId)
+      : ({ ok: false, reason: "WRONG_SENDER" } as const);
+    if (!redeemed.ok) {
+      log(structuredLog("info", "trip_bot.group_binding_refused", { reason: redeemed.reason }));
+      // Deliberately one message for every refusal. Distinguishing "that token
+      // does not exist" from "that token is not yours" would confirm a guess to
+      // whoever is guessing, in a room the organizer does not control.
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenRefused } };
+    }
+    log(structuredLog("info", "trip_bot.group_bound", { rebound: redeemed.rebound }));
+    const facts = await companionIntroFacts(db, redeemed.tripId);
+    const assistantName = typeof facts?.assistant_name === "string" ? facts.assistant_name : null;
+    if (!facts || !assistantName) {
+      return { kind: "reply", reply: { chatId, text: strings.groupBoundNoIntro } };
+    }
+    return {
+      kind: "group_intro",
+      chatId,
+      text: groupIntroText(
+        {
+          assistantName,
+          tripTitle: typeof facts.trip_title === "string" ? facts.trip_title : null,
+          siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
+          language: facts.language === "he" ? "he" : "en",
+          loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
+          proactive: (facts.proactive as never) ?? null,
+        },
+        { includePassword: options.groupIntroIncludesPassword ?? true },
+      ),
+    };
+  }
+
+  // The organizer asking for a group-binding token, in their own DM. Router-
+  // owned rather than agent-owned for the same reason the introduction is: the
+  // token is a credential, and one the agent got slightly wrong is a token that
+  // binds nothing and an organizer who cannot tell why.
+  if (parsed.kind === "command" && (parsed.name === "group" || parsed.name === "bind")) {
+    const route = await resolveChatRoute(db, chatId);
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    if (route.kind !== "companion" || !senderId || message.chat?.type !== "private") {
+      // Asked somewhere it cannot be answered. Silence would read as broken.
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
+    }
+    const issued = await issueGroupBindingToken(db, route.tripId, senderId, {
+      ttlSeconds: options.groupBindingTtlSeconds ?? 7 * 24 * 3600,
+    });
+    if (!issued.ok) {
+      return { kind: "reply", reply: { chatId, text: strings.groupTokenUnavailable } };
+    }
+    // Two messages: the instructions, then the line to copy on its own.
+    return {
+      kind: "group_intro",
+      chatId,
+      text: strings.groupTokenIssued(issued.token),
+      followUp: groupBindingCommand(issued.token),
+      pin: false,
+    };
+  }
+
+  if (parsed.kind === "command" && (parsed.name === "done" || parsed.name === "summary")) {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "interview") {
+      const result = await setFinishRequestedForChat(db, chatId, true);
+      if (result.ok) return { kind: "show_summary", chatId, view: result.view };
+    }
+  }
+
+  const outcome = await normalizeUpdate(db, update, options.media, options.canReachProfile);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
     // has to actually address the assistant, or the shared bot answers a
@@ -249,15 +537,31 @@ export async function dispatchUpdate(
       if (!options.interviewerProfile) {
         return { kind: "interview_text", chatId, sessionId: route.sessionId, text };
       }
+      // Re-hosted the same way the companion route does it. This branch used
+      // to call the plain `toWireEvent`, so an uploaded document reached the
+      // interviewer as `text: ""` — an empty message, from the one route that
+      // asks for a document in the first place. The organizer saw a successful
+      // upload and the agent saw nothing.
+      const attachment = describeAttachment(message);
       return {
         kind: "interview_to_gateway",
         chatId,
         sessionId: route.sessionId,
-        event: toWireEvent(message, chatId, text, options.interviewerProfile),
+        hadAttachment: attachment !== null,
+        event: await toWireEventWithMedia(
+          message,
+          chatId,
+          text,
+          options.interviewerProfile,
+          attachment,
+          options.media,
+        ),
       };
     }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    case "COMPANION_PENDING":
+      return { kind: "reply", reply: { chatId, text: strings.companionPending } };
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
@@ -284,12 +588,14 @@ async function dispatchCallback(db: pg.Pool, update: TelegramUpdate): Promise<Di
   if (parsed.kind !== "unknown" && chatId !== undefined && chatId !== null) {
     const route = await resolveChatRoute(db, String(chatId));
     if (route.kind === "interview") {
+      const messageId = (callback.message as { message_id?: unknown } | undefined)?.message_id;
       return {
         kind: "interview_callback",
         chatId: String(chatId),
         callbackQueryId: callback.id,
         data: callback.data,
         sessionId: route.sessionId,
+        ...(messageId !== undefined && messageId !== null ? { messageId: String(messageId) } : {}),
       };
     }
     // An interview-shaped callback from a chat with no live interview is

@@ -201,6 +201,10 @@ class AdapterTests(unittest.TestCase):
         # container (never sent over the wire), like JWT_SECRET.
         self.assertIn("HERMES_API_KEY=${HERMES_API_KEY}", bootstrap)
         self.assertRegex(bootstrap, r"HERMES_API_KEY=\$\(head -c 32 /dev/urandom")
+        # Newly provisioned trips open the Modern SPA at `/`. The root loader
+        # still honors the stored setting, so existing hand-built trips keep
+        # their Classic front door until an organizer changes it explicitly.
+        self.assertIn("TRIP_DESIGN_VARIANT=modern", bootstrap)
 
     def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
         # Without it a provisioned site has NO way in at all: Telegram SSO is

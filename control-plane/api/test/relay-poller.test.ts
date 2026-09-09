@@ -4,6 +4,8 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
+import { askText } from "../src/intake-copy.js";
+import { INTAKE_QUESTIONS } from "../src/interview.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import {
   answerCallbackData,
@@ -13,12 +15,15 @@ import {
 } from "../src/chat-router.js";
 import { getSessionForChat } from "../src/interview.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
-import { applyDecision, startTripBotPoller } from "../src/relay/poller.js";
+import { applyDecision, startTripBotPoller,
+  combineBurst,
+} from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
@@ -162,20 +167,30 @@ async function beginInterview(fix: Fixture, chatId: string): Promise<string> {
 // ── The organizer flow ───────────────────────────────────────────────────────
 
 describe("the organizer's first taps are recorded", () => {
-  test("a deep link produces a real question with real buttons", { skip: SKIP }, async () => {
+  test("a deep link opens with the document offer, then the first question", { skip: SKIP }, async () => {
     // The whole point of the router owning /start. Hermes's gateway discards
     // every /start before an agent sees it, which is what made one-tap
     // onboarding structurally impossible.
+    //
+    // The opening message is the offer to read a document, not the first
+    // question: asking someone to type a trip they already have written down
+    // is the biggest waste of their patience the interview can commit, and
+    // run 5 did exactly that.
     await withFixture(async (fix) => {
       const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
       assert.ok(issued.ok);
       await turn(fix, msg("700100001", `/start ${issued.token}`));
 
-      const sent = fix.telegram.lastSent;
-      assert.ok(sent, "the organizer gets an immediate reply");
-      assert.ok(sent.hasButtons, "the first intake question is tap-answerable");
+      const offer = fix.telegram.lastSent;
+      assert.ok(offer, "the organizer gets an immediate reply");
+      assert.deepEqual(offer.buttonData, ["c:nodoc"], "one way past the offer, and no question yet");
+
+      // Declining it starts the questions, tap-answerable as before.
+      await turn(fix, tap("700100001", "c:nodoc"));
+      const question = fix.telegram.lastSent;
+      assert.ok(question?.hasButtons, "the first intake question is tap-answerable");
       assert.ok(
-        sent.buttonData.every((d) => d.startsWith("a:trip_type:")),
+        question!.buttonData.every((d) => d.startsWith("a:trip_type:")),
         "the buttons answer the question that was asked",
       );
     });
@@ -196,7 +211,13 @@ describe("the organizer's first taps are recorded", () => {
 
       // The tap is acknowledged — otherwise Telegram spins the button forever.
       assert.equal(fix.telegram.answered.length, 1);
-      assert.equal(fix.telegram.lastSent?.text, "Where is the trip? (city/region/country)");
+      // What the organizer reads is `ask`, never the interviewer's field spec
+      // in `prompt` — that spec carries examples and schema instructions, and
+      // it was being read out verbatim in a live interview.
+      assert.equal(
+        fix.telegram.lastSent?.text,
+        askText(INTAKE_QUESTIONS.find((q) => q.id === "destination")!),
+      );
       assert.equal(fix.telegram.lastSent?.hasButtons, false, "a text question carries no keyboard");
     });
   });
@@ -282,6 +303,9 @@ describe("the confirm button is a real confirmation", () => {
       return_date: { kind: "text", schema_version: 2, text: "2026-09-13" },
       travelers: { kind: "structured", schema_version: 2, data: [{ name: "Dror" }] },
       phases: { kind: "structured", schema_version: 2, data: [{ name: "Tokyo" }] },
+      bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+      bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+      bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
     };
     await fix.pool.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = 'awaiting_confirmation' WHERE telegram_chat_id = $2",
@@ -520,5 +544,73 @@ describe("when the trip bot IS the signup bot", () => {
       const session = await getSessionForChat(fix.pool, "700100050");
       assert.equal(session.ok && session.view.nextQuestion?.id, "destination");
     });
+  });
+});
+
+describe("combining a burst of messages into one turn", () => {
+  // The pure part of flushSettledInboundBursts: what several inbound events
+  // become when the organizer sends them in one go. Extracted so the shape can
+  // be asserted without a database, a socket or a settle window.
+  const ev = (text: string, files: string[] = []): WireMessageEvent => ({
+    text,
+    message_type: files.length ? "document" : "text",
+    source: {
+      platform: "telegram", chat_id: "391627336", chat_type: "dm", chat_name: null,
+      user_id: "77", user_name: "Dror", thread_id: null, chat_topic: null, profile: "trip-intake",
+    },
+    ...(files.length
+      ? {
+          media_urls: files.map((f) => `http://127.0.0.1:4312/relay/media/${f}`),
+          media: files.map((f) => ({ kind: "document" as const, mime: "text/markdown", size: 10, filename: `${f}.md` })),
+        }
+      : {}),
+  });
+
+  test("every uploaded file survives, in the order they were sent", () => {
+    // 2026-09-07, live: the organizer uploaded five files describing their
+    // trip. The combiner kept the media of the LAST event that had any and
+    // discarded the rest, so the agent received one document and answered about
+    // one document. From the organizer's side it read as the assistant
+    // ignoring four files it had visibly accepted.
+    const combined = combineBurst([
+      ev("here is the plan", ["aaa"]),
+      ev("", ["bbb"]),
+      ev("", ["ccc"]),
+      ev("and the flights", ["ddd"]),
+      ev("", ["eee"]),
+    ]);
+    assert.equal(combined?.media_urls?.length, 5, "all five files reach the agent");
+    assert.equal(combined?.media?.length, 5);
+    assert.match(combined!.media_urls![0]!, /aaa$/, "and in upload order");
+    assert.match(combined!.media_urls![4]!, /eee$/);
+  });
+
+  test("text from every message is kept, blank ones skipped", () => {
+    const combined = combineBurst([ev("first"), ev(""), ev("second")]);
+    assert.equal(combined?.text, "first\nsecond");
+  });
+
+  test("a burst with no files carries no media keys at all", () => {
+    const combined = combineBurst([ev("just talking"), ev("more")]);
+    assert.equal(combined?.media_urls, undefined);
+    assert.equal(combined?.media, undefined);
+  });
+
+  test("a mix of files and plain messages keeps both", () => {
+    const combined = combineBurst([ev("look at this", ["aaa"]), ev("what do you think?")]);
+    assert.equal(combined?.media_urls?.length, 1);
+    assert.equal(combined?.text, "look at this\nwhat do you think?");
+  });
+
+  test("an empty burst combines to nothing", () => {
+    assert.equal(combineBurst([]), null);
+  });
+
+  test("the combined event keeps the LAST message's identity", () => {
+    // message_id and reply context come from the most recent message: that is
+    // the one the organizer is actually looking at.
+    const combined = combineBurst([ev("older"), ev("newest", ["zzz"])]);
+    assert.equal(combined?.source.chat_id, "391627336");
+    assert.equal(combined?.message_type, "document");
   });
 });

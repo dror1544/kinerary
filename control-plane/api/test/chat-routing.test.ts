@@ -6,8 +6,9 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { buildApp, type ChatRoutingDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const API_KEY = "test-chat-routing-key";

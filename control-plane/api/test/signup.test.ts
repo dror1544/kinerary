@@ -16,8 +16,9 @@ import {
 } from "../src/signup.js";
 import { buildApp, type SignupDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

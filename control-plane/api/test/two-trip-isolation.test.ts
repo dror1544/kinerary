@@ -39,8 +39,9 @@ import { answerCallbackData, resolveChatRoute, startFromDeepLink } from "../src/
 import { getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import { normalizeUpdate, type TelegramUpdate } from "../src/relay/normalize.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const API_KEY = "test-isolation-key";

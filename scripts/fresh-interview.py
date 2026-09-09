@@ -12,11 +12,18 @@ real.
 
 What it does, in order:
 
+  0. Works out which Telegram DM to clean: the trip's own sessions if it has
+     any, else `--chat-id`. A trip from a fresh signup has no sessions, so
+     without that argument there is nothing to clean and the interviewer keeps
+     its old conversation.
   1. Deletes the trip's live interview session and any agent turns for its chat.
   2. Clears that chat's Hermes gateway conversation, so the interviewer starts
      with no inherited history. Skipping this is how the first live run ended
      up narrating a different family's trip: three profiles shared one session
      for that DM, created identical to the microsecond.
+  2b. Moves the profile's `memories/` aside. Those load into every session, and
+     this profile interviews a different organizer each time — so a memory of
+     the last one is context the next one should never see.
   3. Resets the trip to `draft` — `issueEnrollment` accepts no other state, and
      starting an interview moves it to `intake_in_progress`.
   4. Issues a new enrollment through the real HTTP endpoint (not a direct DB
@@ -38,6 +45,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -164,6 +172,37 @@ def clear_hermes_conversation(chat_id: str) -> int:
         return 0
 
 
+def reset_profile_memories() -> str:
+    """Moves the interviewer's persistent memories aside, so a run starts clean.
+
+    ``~/.hermes/profiles/<profile>/memories/`` is loaded into EVERY session.
+    On a profile that interviews a different organizer each conversation, that
+    is the wrong shape of storage twice over: it carries one organizer's
+    conversation into the next person's interview, and it accumulates
+    interview-conduct rules that belong in SOUL.md where they have history.
+    Dror's run-4 takeaway was blunt about it — "interview has to start with a
+    clean context window".
+
+    Moved, never deleted. What lands here is real insight that exists nowhere
+    else (``~/.hermes`` has no version control), and CLAUDE.md's rule is
+    capture-then-clear. The backup is where you go looking for anything that
+    turns out to have been worth keeping.
+    """
+    memories = os.path.join(HERMES_HOME, "profiles", INTERVIEWER_PROFILE, "memories")
+    if not os.path.isdir(memories):
+        return "no memories directory"
+    keep = [f for f in os.listdir(memories) if f.endswith(".md")]
+    if not keep:
+        return "memories already empty"
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{memories}.backup-{stamp}"
+    os.makedirs(backup, exist_ok=True)
+    for name in keep:
+        os.rename(os.path.join(memories, name), os.path.join(backup, name))
+    return f"moved {len(keep)} memory file(s) to {os.path.basename(backup)}"
+
+
 def bot_username() -> str:
     """Deep links need the bot's @name. Ask Telegram if a token is reachable."""
     override = os.environ.get("KINERARY_BOT_USERNAME")
@@ -219,6 +258,10 @@ def main() -> int:
     ap.add_argument("--trip", required=True, help="trip id or slug")
     ap.add_argument("--api", default=DEFAULT_API, help=f"control-plane API base (default {DEFAULT_API})")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("--chat-id", default=os.environ.get("KINERARY_INTERVIEW_CHAT_ID"),
+                    help="Telegram DM to clear the interviewer's conversation in. Needed for a "
+                         "trip from a fresh signup, which has no session to learn it from yet "
+                         "(KINERARY_INTERVIEW_CHAT_ID)")
     ap.add_argument("--email", default=os.environ.get("KINERARY_TEST_LOGIN_EMAIL"),
                     help="organizer login (KINERARY_TEST_LOGIN_EMAIL)")
     ap.add_argument("--password", default=os.environ.get("KINERARY_TEST_LOGIN_PASSWORD"),
@@ -241,10 +284,21 @@ def main() -> int:
             "SELECT coalesce(string_agg(id||' ('||state||', chat '||coalesce(telegram_chat_id,'-')||')', '; '), '') "
             f"FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'"
         )
+        # The chat to clear is normally learned from the trip's own sessions —
+        # but a trip created by a FRESH SIGNUP has none yet, and that is exactly
+        # when a reset matters most. On 2026-09-04 run 5 this skipped the wipe
+        # silently: the organizer's DM stayed bound to a session created on
+        # 2026-08-25 with 457 messages behind it, and when a rate limit forced
+        # a context reload the interviewer surfaced a previous interview.
+        #
+        # So the derived list is a default, not the only source, and an empty
+        # one is now loud rather than invisible.
         chat_ids = [c for c in psql(
             "SELECT coalesce(string_agg(DISTINCT telegram_chat_id, ','), '') "
             f"FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'"
         ).split(",") if c]
+        if args.chat_id and args.chat_id not in chat_ids:
+            chat_ids.append(args.chat_id)
 
         print(f"trip     {slug}  ({trip_id})")
         print(f"state    {state}")
@@ -256,13 +310,38 @@ def main() -> int:
                 return 1
 
         print()
+        if not chat_ids:
+            print("  ! no chat id known for this trip, so the interviewer's CONVERSATION\n"
+                  "    was not cleared — it will resume whatever it was last saying in that\n"
+                  "    DM, from an interview that may not even be this organizer's.\n"
+                  "    Pass --chat-id <telegram id> (or set KINERARY_INTERVIEW_CHAT_ID).")
         for chat in chat_ids:
             n = clear_hermes_conversation(chat)
             print(f"  cleared {n} conversation binding(s) for chat {chat} "
                   f"in profile {INTERVIEWER_PROFILE}")
+        print(f"  {reset_profile_memories()}")
+
+        # Scoped by TRIP, and separately by every CHAT this reset touches — not
+        # trip alone. A chat can carry a session left over from a DIFFERENT
+        # trip's earlier, unconfirmed round: run 7's abandoned
+        # awaiting_confirmation session was still bound to this chat when run 8
+        # reset a brand-new trip, and the router — which resolves purely by
+        # telegram_chat_id — served that stale session on the very first
+        # /start. Cleaning up only `trip_id = X` cannot see it, because X was
+        # never that session's trip.
+        chat_list_sql = ",".join(f"'{c}'" for c in chat_ids)
+        session_filter = f"trip_id = '{trip_id}'"
+        if chat_list_sql:
+            session_filter += f" OR telegram_chat_id IN ({chat_list_sql})"
+        stale = psql(
+            "SELECT coalesce(string_agg(id||' ('||state||', trip '||trip_id||')', '; '), '') "
+            f"FROM control_plane.intake_sessions WHERE ({session_filter}) AND trip_id <> '{trip_id}'"
+        )
+        if stale:
+            print(f"  ALSO clearing stale session(s) on the same chat from another trip: {stale}")
         psql(f"DELETE FROM control_plane.interview_agent_turns WHERE session_id IN "
-             f"(SELECT id FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}')")
-        psql(f"DELETE FROM control_plane.intake_sessions WHERE trip_id = '{trip_id}'")
+             f"(SELECT id FROM control_plane.intake_sessions WHERE {session_filter})")
+        psql(f"DELETE FROM control_plane.intake_sessions WHERE {session_filter}")
         print("  deleted interview session(s) and agent turns")
         psql(f"UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = '{trip_id}'")
         print("  trip reset to draft")

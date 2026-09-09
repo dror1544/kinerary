@@ -106,6 +106,32 @@ security-relevant path (anything above, or auth in general), show the actual
 request/response proving the thing is hidden or scoped correctly — not a
 description of the code.
 
+### The control-plane DB suites destroy the database they are given
+
+```bash
+CONTROL_PLANE_TEST_DATABASE_URL="postgres://postgres:test@127.0.0.1:5434/cptest" \
+  npm test --prefix control-plane/api
+```
+
+That URL is not a preference. Every DB-backed suite in `control-plane/api`
+opens with `DROP SCHEMA IF EXISTS control_plane CASCADE`, so whatever database
+it is handed is the database it wipes. On 2026-09-06 it was handed
+`.local-secrets/control_plane_database_url_host` — the dev stack's own
+database, reached through the host port instead of the compose network — and
+the running control plane lost every trip, binding and intake version. The
+tests passed. Nothing warned. The stack was found broken afterwards, by its own
+readiness probe returning 42P01.
+
+`test/support/test-database.ts` now refuses any database whose name does not
+say it is for tests, and names the right URL in the refusal. Unset still means
+"skip the DB suites" — the unit subset with no database is a normal state. A
+suite that is *set* to something unsafe fails loudly rather than skipping,
+because a skip would hide the misconfiguration for the next person.
+
+Nothing outside that file needs to know the rule, which is the point: it was
+already written down in `docs/sprint5-trip-bot-router-design.md` and being
+written down was not enough.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over
@@ -199,6 +225,18 @@ of `docs/signup-test-execution-capture (Manual).md`.
 
 `.agents/skills/live-run/` drives the 🤖 steps of `docs/setup-test-plan.md` and
 stops at every 🧍, resumable by step. It never deploys and never tears down.
+
+`.agents/skills/interview-stack-deploy/` restarts the four services the Trip
+Bot interview needs (control-plane API, interview MCP sidecar, trip-intake
+gateway, relay) with the checks a 2026-09-05 live run found missing: it reads
+the interview-agent key from `provisioning.env` itself rather than trusting
+the calling shell, confirms the key landed **inside** the API container rather
+than assuming a restart worked, and — the one that actually matters — extracts
+the expected `*_for_chat` tool names straight from `interview-mcp.ts` and
+greps the **gateway's own** post-restart log line for each one, so "the agent
+can speak" is read off the gateway rather than inferred from an upstream
+process being alive. It refuses to restart the relay under a live conversation
+(`awaiting = 'machine'`, updated recently) unless told to anyway.
 
 ## Working style
 

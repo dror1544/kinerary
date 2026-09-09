@@ -7,8 +7,9 @@ import { digestTelegramId } from "../src/identity.js";
 import { signApprovalAction } from "../src/approval-action.js";
 import { startSignup, type NotificationAdapter, type SignupConfig } from "../src/signup.js";
 import { deleteWebhookIfPresent, handleTelegramUpdate, startTelegramApprovalPoller } from "../src/telegram-poller.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const DB_URL = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

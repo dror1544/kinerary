@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { MediaStore, MEDIA_MAX_BYTES } from "../src/relay/media-store.js";
 import { toWireEventWithMedia } from "../src/relay/normalize.js";
+import { contentDispositionFor } from "../src/relay/connector.js";
 
 const BOT_TOKEN = "8463178587:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -122,5 +123,50 @@ describe("inbound attachment re-hosting", () => {
     );
     assert.equal(event.media_urls, undefined);
     assert.equal(event.text, "hello");
+  });
+});
+
+describe("a filename that is not ASCII", () => {
+  test("is encoded rather than thrown at Node", () => {
+    // 2026-09-07, live: an organizer uploaded a trip plan whose filename was in
+    // Hebrew. Node refuses non-ASCII bytes in a header value, so serving it
+    // threw ERR_INVALID_CHAR — and because the throw happened inside the HTTP
+    // request handler, it took the WHOLE RELAY PROCESS down. The bot went
+    // silent mid-interview and nothing in the interview logs explained why:
+    // the failure was in the media plane, triggered by the gateway fetching a
+    // document the organizer had successfully uploaded.
+    //
+    // RFC 6266: the plain `filename` parameter is ASCII-only, and `filename*`
+    // carries the real one as percent-encoded UTF-8. Both are sent — the
+    // fallback for anything that does not understand the extended form.
+    const header = contentDispositionFor("תוכנית הטיול.md");
+    assert.match(header, /^attachment/);
+    // Nothing outside ASCII survives into the raw header bytes.
+    // eslint-disable-next-line no-control-regex
+    assert.ok(/^[\x20-\x7e]*$/.test(header), `header must be ASCII-safe: ${header}`);
+    assert.match(header, /filename\*=UTF-8''/);
+    assert.match(header, /%D7%AA/, "the Hebrew is percent-encoded, not dropped");
+  });
+
+  test("an ASCII filename still reads naturally", () => {
+    const header = contentDispositionFor("japan.pdf");
+    assert.match(header, /filename="japan\.pdf"/);
+  });
+
+  test("quotes and newlines cannot break out of the header", () => {
+    // A filename is organizer-supplied text arriving over Telegram. A quote
+    // would end the quoted-string early; a CR/LF would inject a header.
+    //
+    // The property that matters is that neither SURVIVES — not that the words
+    // around them are scrubbed. "X-Evil: 1" left inside a quoted filename on
+    // one line is a strange filename, not a header.
+    const header = contentDispositionFor('a"b\r\nX-Evil: 1.md');
+    assert.doesNotMatch(header, /[\r\n]/, "no line break survives");
+    assert.doesNotMatch(header, /filename="[^"]*"[^;]/, "the quoted string is not escaped early");
+    assert.equal((header.match(/"/g) ?? []).length, 2, "exactly one quoted string");
+  });
+
+  test("no filename means no parameter at all", () => {
+    assert.equal(contentDispositionFor(undefined), "attachment");
   });
 });

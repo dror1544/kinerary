@@ -35,6 +35,10 @@ function answerFor(q: IntakeQuestion): Record<string, unknown> {
     case "multi_choice":
       return { questionId: q.id, optionIds: q.options!.map((o) => o.id).slice(0, 2) };
     case "structured":
+      // travelers alone has a completeness check beyond shape (checkComplete
+      // on the question itself) — the generic stand-in below satisfies every
+      // OTHER structured question's shape check, but not that one.
+      if (q.id === "travelers") return { questionId: q.id, data: [{ name: "Alex" }] };
       return { questionId: q.id, data: q.dataShape === "array" ? [{ note: "x" }] : { note: "x" } };
     case "text":
       return { questionId: q.id, otherText: "an answer" };

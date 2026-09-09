@@ -169,14 +169,14 @@ export interface PortalDependencies {
   sessionTtlSeconds: number;
   enrollmentTtlSeconds: number;
   approvalTtlSeconds: number;
-  provisioningAdminSubjectDigests: ReadonlySet<string>;
+  /** Operator's Telegram chat id for provisioning notifications. See issueApproval. */
+  operatorChatId?: string;
 }
 
 interface PortalUser {
   id: string;
   displayName: string;
   googleSubjectDigest: string | null;
-  isProvisioningAdmin: boolean;
   sessionDigest: string;
   sessionCreatedAt: Date;
 }
@@ -201,7 +201,6 @@ async function portalUser(request: FastifyRequest, deps: PortalDependencies): Pr
     id: row.id,
     displayName: row.display_name,
     googleSubjectDigest: row.provider_subject_digest,
-    isProvisioningAdmin: row.provider_subject_digest !== null && deps.provisioningAdminSubjectDigests.has(row.provider_subject_digest),
     sessionDigest: row.session_digest,
     sessionCreatedAt: row.session_created_at,
   };
@@ -273,12 +272,13 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
   return result.rows[0] ?? null;
 }
 
-function nextAction(state: string, planStatus?: string | null, jobState?: string | null): string {
+function nextAction(state: string, planStatus?: string | null, jobState?: string | null, runtimeReady = false): string {
   if (state === "draft" || state === "intake_in_progress") return "continue_interview";
   if (state === "intake_confirmed") return "request_provisioning";
-  if (planStatus === "pending_approval") return "await_operations_approval";
+  // The organizer's own next move, not a wait on someone else.
+  if (planStatus === "pending_approval") return "review_plan";
   if (["queued", "leased", "running"].includes(jobState ?? "")) return "track_provisioning";
-  if (state === "ready_private" || state === "active") return "open_trip";
+  if (state === "ready_private" || state === "active") return runtimeReady ? "open_trip" : "view_status";
   if (state === "completed" || state === "sealed") return "view_trip";
   return "view_status";
 }
@@ -297,10 +297,9 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
   const trip = tripResult.rows[0];
   if (!trip) return null;
   const [planResult, sessionResult, routeResult, invitesResult] = await Promise.all([
-    deps.db.query<{ id: string; status: string; digest: string; release_id: string | null; review_state: string | null; job_state: string | null; safe_error_code: string | null }>(
-      `SELECT p.id, p.status, p.digest, p.release_id, r.state AS review_state, j.state AS job_state, j.safe_error_code
+    deps.db.query<{ id: string; status: string; digest: string; release_id: string | null; job_state: string | null; safe_error_code: string | null }>(
+      `SELECT p.id, p.status, p.digest, p.release_id, j.state AS job_state, j.safe_error_code
        FROM control_plane.plans p
-       LEFT JOIN control_plane.plan_operations_reviews r ON r.plan_id = p.id
        LEFT JOIN control_plane.jobs j ON j.plan_id = p.id
        WHERE p.trip_id = $1 ORDER BY p.created_at DESC LIMIT 1`, [tripId]),
     deps.db.query<{ id: string; state: string }>("SELECT id, state FROM control_plane.intake_sessions WHERE trip_id = $1 ORDER BY created_at DESC LIMIT 1", [tripId]),
@@ -309,6 +308,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       "SELECT id, intended_display_name, runtime_username, state, expires_at, created_at FROM control_plane.site_invites WHERE trip_id = $1 ORDER BY created_at DESC", [tripId]),
   ]);
   const plan = planResult.rows[0];
+  const runtimeReady = routeResult.rows[0]?.state === "ready";
   return {
     id: trip.id,
     title: trip.title ?? trip.destination_label ?? "Untitled trip",
@@ -317,7 +317,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     endDate: trip.end_date,
     tripType: trip.trip_type ?? "other",
     lifecycleState: trip.lifecycle_state,
-    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state),
+    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state, runtimeReady),
     permissions: {
       role: trip.role,
       dashboard: trip.dashboard_access,
@@ -327,10 +327,10 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     },
     interview: sessionResult.rows[0] ? { sessionId: sessionResult.rows[0].id, state: sessionResult.rows[0].state } : null,
     provisioning: plan ? {
-      planId: plan.id, planStatus: plan.status, reviewState: plan.review_state, jobState: plan.job_state,
+      planId: plan.id, planStatus: plan.status, jobState: plan.job_state,
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
     } : null,
-    runtimeReady: routeResult.rows[0]?.state === "ready" || trip.lifecycle_state === "ready_private",
+    runtimeReady,
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -436,7 +436,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
   app.get("/v1/me", async (request, reply) => {
     const user = await requireUser(request, reply, deps);
     if (!user) return;
-    return { id: user.id, displayName: user.displayName, isProvisioningAdmin: user.isProvisioningAdmin };
+    return { id: user.id, displayName: user.displayName };
   });
 
   app.post("/v1/logout", async (request, reply) => {
@@ -527,70 +527,76 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     if (!member || member.role !== "owner" || !member.dashboard_access) return reply.code(404).send({ error: "NOT_FOUND" });
     const generated = await generatePlan(deps.db, tripId, opaque("corr", 12));
     if (!generated.ok) return reply.code(generated.reason === "NO_COMPATIBLE_RELEASE" ? 422 : 409).send({ error: generated.reason });
-    await deps.db.query(
-      "INSERT INTO control_plane.plan_operations_reviews(id, plan_id, requested_by, state) VALUES ($1, $2, $3, 'pending')",
-      [opaque("oprv"), generated.planId, user.id],
-    );
     await recordFunnelEvent(deps.db, "provisioning_requested", { userId: user.id, tripId });
-    return reply.code(201).send({ planId: generated.planId, digest: generated.planDigest, reviewState: "pending" });
+    return reply.code(201).send({ planId: generated.planId, digest: generated.planDigest, planStatus: "pending_approval" });
   });
 
-  app.get("/v1/ops/provisioning-requests", async (request, reply) => {
-    const user = await requireUser(request, reply, deps);
-    if (!user) return;
-    if (!user.isProvisioningAdmin) return reply.code(403).send({ error: "FORBIDDEN" });
-    const result = await deps.db.query(
-      `SELECT r.id, r.plan_id, r.state, r.created_at, p.trip_id, p.digest, p.release_id,
-              p.desired->'resource_intent' AS requested_resources,
-              t.title, t.destination_label
-       FROM control_plane.plan_operations_reviews r JOIN control_plane.plans p ON p.id = r.plan_id
-       JOIN control_plane.trips t ON t.id = p.trip_id WHERE r.state = 'pending' ORDER BY r.created_at`,
+  // The organizer reviews the plan they just created, then approves or rejects
+  // it. Twin of app.ts's POST /v1/plans/:planId/approve — same decision, same
+  // authorizer, different auth surface (this one takes the SPA's cookie+CSRF
+  // session). There is no operations-review queue: the operator is notified
+  // when an approval lands, and provisioning never waits on that DM.
+  //
+  // Both routes are trip-scoped so the owner check and the plan are read
+  // together; a plan whose trip the caller does not own is 404, not 403.
+  async function ownedPendingPlan(
+    request: FastifyRequest, reply: FastifyReply, userId: string,
+  ): Promise<{ planId: string; tripId: string } | null> {
+    const params = request.params as { id?: string; planId?: string };
+    const tripId = params.id ?? "";
+    const planId = params.planId ?? "";
+    const member = await membership(deps, tripId, userId);
+    if (!member || member.role !== "owner" || !member.dashboard_access) {
+      reply.code(404).send({ error: "NOT_FOUND" });
+      return null;
+    }
+    const plan = await deps.db.query<{ id: string }>(
+      "SELECT id FROM control_plane.plans WHERE id = $1 AND trip_id = $2",
+      [planId, tripId],
     );
-    return { requests: result.rows.map((row) => ({
-      id: row.id, planId: row.plan_id, tripId: row.trip_id, title: row.title ?? row.destination_label,
-      digest: row.digest, releaseId: row.release_id, requestedResources: row.requested_resources ?? [], state: row.state, createdAt: row.created_at,
-    })) };
-  });
+    if (!plan.rows[0]) {
+      reply.code(404).send({ error: "NOT_FOUND" });
+      return null;
+    }
+    return { planId, tripId };
+  }
 
-  app.post("/v1/ops/provisioning-requests/:planId/approve", async (request, reply) => {
+  app.post("/v1/trips/:id/plans/:planId/approve", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
-    if (!user.isProvisioningAdmin) return reply.code(403).send({ error: "FORBIDDEN" });
-    const planId = (request.params as { planId?: string }).planId ?? "";
-    const review = await deps.db.query<{ id: string; requested_by: string; trip_id: string }>(
-      `SELECT r.id, r.requested_by, p.trip_id FROM control_plane.plan_operations_reviews r
-       JOIN control_plane.plans p ON p.id = r.plan_id WHERE r.plan_id = $1 AND r.state = 'pending'`, [planId]);
-    if (!review.rows[0]) return reply.code(404).send({ error: "NOT_FOUND" });
-    if (review.rows[0].requested_by === user.id) return reply.code(403).send({ error: "SEPARATION_OF_DUTIES_REQUIRED" });
-    const result = await issueApproval(deps.db, planId, `user:${user.id}`, deps.approvalTtlSeconds);
-    if (!result.ok) return reply.code(409).send({ error: result.reason });
-    await deps.db.query("UPDATE control_plane.plan_operations_reviews SET state = 'approved', decided_by = $1, decided_at = now(), updated_at = now() WHERE plan_id = $2", [user.id, planId]);
-    await recordFunnelEvent(deps.db, "provisioning_approved", { userId: user.id, tripId: review.rows[0].trip_id });
+    const owned = await ownedPendingPlan(request, reply, user.id);
+    if (!owned) return;
+    const result = await issueApproval(deps.db, owned.planId, `user:${user.id}`, deps.approvalTtlSeconds, {
+      operatorChatId: deps.operatorChatId,
+    });
+    if (!result.ok) return reply.code(result.reason === "ALREADY_APPROVED" ? 409 : 422).send({ error: result.reason });
+    await recordFunnelEvent(deps.db, "provisioning_approved", { userId: user.id, tripId: owned.tripId });
     return { approvalId: result.approvalId, expiresAt: result.expiresAt.toISOString() };
   });
 
-  app.post("/v1/ops/provisioning-requests/:planId/reject", async (request, reply) => {
+  app.post("/v1/trips/:id/plans/:planId/reject", async (request, reply) => {
     const user = await requireMutation(request, reply, deps);
     if (!user) return;
-    if (!user.isProvisioningAdmin) return reply.code(403).send({ error: "FORBIDDEN" });
-    const planId = (request.params as { planId?: string }).planId ?? "";
-    const body = request.body as Record<string, unknown>;
-    const code = typeof body.reasonCode === "string" && /^[A-Z][A-Z0-9_]{2,63}$/.test(body.reasonCode) ? body.reasonCode : "OPERATIONS_REJECTED";
-    const review = await deps.db.query<{ requested_by: string }>("SELECT requested_by FROM control_plane.plan_operations_reviews WHERE plan_id = $1 AND state = 'pending'", [planId]);
-    if (!review.rows[0]) return reply.code(404).send({ error: "NOT_FOUND" });
-    if (review.rows[0].requested_by === user.id) return reply.code(403).send({ error: "SEPARATION_OF_DUTIES_REQUIRED" });
+    const owned = await ownedPendingPlan(request, reply, user.id);
+    if (!owned) return;
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const code = typeof body.reasonCode === "string" && /^[A-Z][A-Z0-9_]{2,63}$/.test(body.reasonCode) ? body.reasonCode : "ORGANIZER_REJECTED";
     const client = await deps.db.connect();
     try {
       await client.query("BEGIN");
-      const updated = await client.query(
-        "UPDATE control_plane.plan_operations_reviews SET state = 'rejected', decided_by = $1, safe_rejection_code = $2, decided_at = now(), updated_at = now() WHERE plan_id = $3 AND state = 'pending'",
-        [user.id, code, planId]);
-      if (!updated.rowCount) { await client.query("ROLLBACK"); return reply.code(404).send({ error: "NOT_FOUND" }); }
-      await client.query("UPDATE control_plane.plans SET status = 'superseded', updated_at = now() WHERE id = $1 AND status = 'pending_approval'", [planId]);
-      await client.query("UPDATE control_plane.jobs SET state = 'cancelled', updated_at = now() WHERE plan_id = $1 AND state = 'waiting_for_user_action'", [planId]);
-      await client.query("UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = (SELECT trip_id FROM control_plane.plans WHERE id = $1)", [planId]);
+      // Guarded on status rather than a review row: only a plan still awaiting
+      // a decision can be rejected, and the UPDATE's own rowCount is the lock.
+      const superseded = await client.query(
+        "UPDATE control_plane.plans SET status = 'superseded', updated_at = now() WHERE id = $1 AND status = 'pending_approval'",
+        [owned.planId]);
+      if (!superseded.rowCount) { await client.query("ROLLBACK"); return reply.code(409).send({ error: "PLAN_NOT_PENDING" }); }
+      await client.query("UPDATE control_plane.jobs SET state = 'cancelled', updated_at = now() WHERE plan_id = $1 AND state = 'waiting_for_user_action'", [owned.planId]);
+      await client.query("UPDATE control_plane.trips SET lifecycle_state = 'intake_confirmed', updated_at = now() WHERE id = $1", [owned.tripId]);
       await client.query("COMMIT");
       return { state: "rejected", reasonCode: code };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
     } finally { client.release(); }
   });
 

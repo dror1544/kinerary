@@ -252,6 +252,27 @@ mcp.tool('set_telegram_group',
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));
 
+mcp.tool('add_budget_item',
+  'Add a known or estimated cost to the shared trip budget. Use a phase id from get_config, "intl_flights" for international flights, or "general" for a whole-trip cost.', {
+  phase: z.string().min(1).describe('Trip phase id, "intl_flights", or "general"'),
+  category: z.string().min(1).describe('Short category such as flight, hotel, transport, food, activity, shopping, or other'),
+  description: z.string().min(1).describe('Human-readable cost description'),
+  amount: z.number().nonnegative().describe('Amount in USD; use 0 with is_estimate true when the amount is still unknown'),
+  is_estimate: z.boolean().optional().describe('True when the amount is provisional rather than confirmed'),
+}, async (args) => ok(await apiPost('/api/budget', args)));
+
+mcp.tool('update_budget_item',
+  'Update the amount and/or description of an existing trip budget item.', {
+  id: z.number().int().positive().describe('Budget item id from get_budget'),
+  amount: z.number().nonnegative().optional().describe('Replacement amount in USD'),
+  description: z.string().min(1).optional().describe('Replacement description'),
+}, async ({ id, ...fields }) => ok(await apiPatch(`/api/budget/${id}`, fields)));
+
+mcp.tool('delete_budget_item',
+  'Delete a trip budget item after the organizer has clearly asked for its removal.', {
+  id: z.number().int().positive().describe('Budget item id from get_budget'),
+}, async ({ id }) => ok(await apiDelete(`/api/budget/${id}`)));
+
 mcp.tool('get_rsvps', 'Get RSVP status for a specific activity', {
   activityId: z.string().describe('Activity id from a phase\'s rsvp_activities[] in trip.config.json'),
 }, async ({ activityId }) => ok(await apiGet(`/api/rsvps/${activityId}`)));

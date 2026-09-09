@@ -44,7 +44,6 @@ test("a web profile boots without duplicate trip routes and retires Telegram web
     sessionTtlSeconds: profile.web!.session_ttl_seconds,
     enrollmentTtlSeconds: 3600,
     approvalTtlSeconds: 3600,
-    provisioningAdminSubjectDigests: new Set<string>(),
   } satisfies PortalDependencies;
   const app = buildApp(profile, { portal });
   try {

@@ -20,6 +20,7 @@ import type pg from "pg";
 import { resolveChatRoute, type ChatRoute } from "../chat-router.js";
 import { MEDIA_MAX_BYTES, type MediaKind } from "./media-store.js";
 import type { ChatType, WireMessageEvent, WireSessionSource } from "./protocol.js";
+import { structuredLog } from "../redaction.js";
 
 /** The subset of Telegram's Update we consume. */
 export interface TelegramUser {
@@ -28,6 +29,13 @@ export interface TelegramUser {
   first_name?: string;
   last_name?: string;
   is_bot?: boolean;
+  /**
+   * The sender's Telegram client locale ("he", "en-GB"). Present on most
+   * updates, absent on some — it is a hint about which language to DRAW in,
+   * never an identity claim and never a substitute for what the organizer
+   * actually writes.
+   */
+  language_code?: string;
 }
 
 export interface TelegramChat {
@@ -51,6 +59,32 @@ export interface TelegramMessage {
   date?: number;
   message_thread_id?: number;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
+  /**
+   * Telegram's two announcements of a group becoming a supergroup. The chat id
+   * changes, so every routing key we hold for this chat is about to be stale.
+   * `migrate_to_chat_id` arrives on a message in the OLD chat, and
+   * `migrate_from_chat_id` on one in the NEW chat — both, in practice.
+   */
+  migrate_to_chat_id?: number | string;
+  migrate_from_chat_id?: number | string;
+}
+
+/**
+ * The (from, to) chat ids of a supergroup migration announced by this message,
+ * or null when it announces none.
+ *
+ * Read off either field, because Telegram sends both and whichever arrives
+ * first should be the one that repairs the routing.
+ */
+export function migrationOf(message: TelegramMessage | undefined): { from: string; to: string } | null {
+  if (!message) return null;
+  const here = message.chat?.id;
+  if (here === undefined || here === null || here === "") return null;
+  const to = message.migrate_to_chat_id;
+  if (to !== undefined && to !== null && to !== "") return { from: String(here), to: String(to) };
+  const from = message.migrate_from_chat_id;
+  if (from !== undefined && from !== null && from !== "") return { from: String(from), to: String(here) };
+  return null;
 }
 
 export interface TelegramUpdate {
@@ -63,6 +97,50 @@ export interface TelegramUpdate {
     from?: TelegramUser;
     message?: TelegramMessage;
   };
+  /**
+   * The bot's own membership in a chat changed — added to a group, removed,
+   * or promoted. Delivered only when `my_chat_member` is in `allowedUpdates`.
+   */
+  my_chat_member?: {
+    chat?: TelegramChat;
+    from?: TelegramUser;
+    new_chat_member?: { user?: TelegramUser; status?: string };
+    old_chat_member?: { user?: TelegramUser; status?: string };
+  };
+}
+
+/**
+ * Whether this update is "the bot has just been added to a group".
+ *
+ * `member` and `administrator` are both arrivals; the difference is only
+ * whether the organizer granted rights on the way in. `left` and `kicked` are
+ * departures, and `restricted` is neither — treat anything unrecognised as not
+ * an arrival, so an unfamiliar status can never trigger an introduction.
+ */
+export function botJoinedGroup(
+  update: TelegramUpdate,
+  botId: string | undefined,
+): { chatId: string; canPin: boolean } | null {
+  const event = update.my_chat_member;
+  if (!event) return null;
+  const chat = event.chat;
+  if (!chat?.id || (chat.type !== "group" && chat.type !== "supergroup")) return null;
+
+  // It has to be US. `my_chat_member` is only ever about the bot, but the id is
+  // there and checking it costs nothing — and a shared bot that introduced
+  // itself because some OTHER bot joined would be a strange thing to debug.
+  const who = event.new_chat_member?.user?.id;
+  if (botId && who !== undefined && String(who) !== botId) return null;
+
+  const status = event.new_chat_member?.status;
+  if (status !== "member" && status !== "administrator") return null;
+
+  const was = event.old_chat_member?.status;
+  // Already inside. A promote-to-admin is not an arrival, and re-introducing
+  // on every permissions change would be noise in a live family group.
+  if (was === "member" || was === "administrator") return null;
+
+  return { chatId: String(chat.id), canPin: status === "administrator" };
 }
 
 /**
@@ -100,7 +178,7 @@ export function displayName(user: TelegramUser | undefined): string | null {
 
 export type NormalizeOutcome =
   | { kind: "event"; event: WireMessageEvent; route: ChatRoute }
-  | { kind: "dropped"; reason: "NO_MESSAGE" | "NO_CHAT_ID" | "NO_TEXT" | "FROM_BOT" | "UNROUTED" | "INTERVIEW" };
+  | { kind: "dropped"; reason: "NO_MESSAGE" | "NO_CHAT_ID" | "NO_TEXT" | "FROM_BOT" | "UNROUTED" | "INTERVIEW" | "COMPANION_PENDING" };
 
 /**
  * Normalizes one Telegram update into a wire event, or explains why it will
@@ -121,9 +199,17 @@ export interface MediaDeps {
   store: { put(input: { kind: MediaKind; mime: string; size: number; filename?: string; caption?: string; bytes: Buffer }): string | null };
   /** Public base the gateway can reach this connector on, e.g. http://127.0.0.1:4312 */
   baseUrl: string;
+  /**
+   * Optional, and the reason it exists: a failed re-host used to be completely
+   * silent on this side. `fetchFile` logs its own failures, but the two
+   * degrade-and-continue returns below logged nothing, so "the organizer's
+   * document did not reach the agent" was invisible in every log we keep. Run
+   * 14 spent an hour reconstructing it from a floor value in the database.
+   */
+  log?: (line: string) => void;
 }
 
-interface Attachment {
+export interface Attachment {
   fileId: string;
   kind: MediaKind;
   mime: string;
@@ -136,7 +222,7 @@ interface Attachment {
  * Telegram sends photos as an array of sizes, largest last — the last entry is
  * the one worth re-hosting; the thumbnails are the same image again.
  */
-function describeAttachment(message: TelegramMessage): Attachment | null {
+export function describeAttachment(message: TelegramMessage): Attachment | null {
   if (message.document?.file_id) {
     return {
       fileId: message.document.file_id,
@@ -196,7 +282,17 @@ export async function toWireEventWithMedia(
   if (!attachment || !deps) return event;
 
   const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
-  if (!file) return event;
+  if (!file) {
+    // Degrade, never drop: the turn still goes over so the agent can say it
+    // could not read the file, rather than the organizer's upload vanishing.
+    // But it must not vanish from the LOGS too.
+    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+      stage: "fetch",
+      kind: attachment.kind,
+      has_filename: Boolean(attachment.filename),
+    }));
+    return event;
+  }
 
   const id = deps.store.put({
     kind: attachment.kind,
@@ -206,7 +302,14 @@ export async function toWireEventWithMedia(
     ...(message.caption ? { caption: message.caption } : {}),
     bytes: file.bytes,
   });
-  if (!id) return event;
+  if (!id) {
+    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+      stage: "store",
+      kind: attachment.kind,
+      size: file.bytes.length,
+    }));
+    return event;
+  }
 
   return {
     ...event,
@@ -222,10 +325,20 @@ export async function toWireEventWithMedia(
   };
 }
 
+/**
+ * Whether a turn for this trip would reach a running companion right now.
+ *
+ * Supplied by the connector, which answers from live socket state. Optional:
+ * a caller that passes nothing keeps the pre-per-trip behaviour, where a
+ * binding was taken to imply a destination.
+ */
+export type ReachabilityCheck = (profile: string) => boolean;
+
 export async function normalizeUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
   deps?: MediaDeps,
+  canReach?: ReachabilityCheck,
 ): Promise<NormalizeOutcome> {
   const message = update.message ?? update.edited_message;
   if (!message) return { kind: "dropped", reason: "NO_MESSAGE" };
@@ -253,7 +366,35 @@ export async function normalizeUpdate(
   // Fail closed. On a shared bot, "no trip resolved" can never mean "use the
   // default" — the default would be somebody else's trip.
   if (route.kind === "unbound") return { kind: "dropped", reason: "UNROUTED" };
+  // Dropped here, rebuilt by dispatch.ts — which is why `describeAttachment`
+  // and `toWireEventWithMedia` are exported rather than private to this
+  // module. The interview route is the one that ASKS for a document, and it
+  // spent 2026-09-04's run handing the agent an empty message because this
+  // branch returned before the re-host and dispatch rebuilt the event without
+  // it. Whatever this branch skips, that one has to do itself.
   if (route.kind === "interview") return { kind: "dropped", reason: "INTERVIEW" };
+
+  // Bound to a trip, but no assistant installed behind it yet (migration
+  // 0043). Distinct from UNROUTED on purpose: "I don't have a trip for this
+  // chat" would be a lie — we know exactly which trip this is, and the
+  // organizer's site is already up. Answering honestly is the difference
+  // between a system that looks broken and one that says what it is doing.
+  if (!route.hermesProfile) return { kind: "dropped", reason: "COMPANION_PENDING" };
+
+  // Installed is not running. Under one gateway process per trip
+  // (`docs/per-trip-gateway-architecture.md`) a stopped companion is an
+  // ordinary, recoverable state — `gateway start`, no re-provision — and the
+  // organizer is owed the same honest answer as for a trip whose companion was
+  // never installed: same reason code, same reply, no new vocabulary.
+  //
+  // Deliberately NOT its own reason: from the organizer's side "my assistant
+  // isn't answering yet" is one situation, and splitting it would leak our
+  // process model into their chat. The distinction that matters operationally
+  // is already recorded — as reachability (migration 0042), where it can be
+  // acted on.
+  if (canReach && !canReach(route.hermesProfile)) {
+    return { kind: "dropped", reason: "COMPANION_PENDING" };
+  }
 
   return {
     kind: "event",

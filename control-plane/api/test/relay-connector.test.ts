@@ -42,9 +42,25 @@ interface Harness {
   port: number;
 }
 
-async function withConnector(fn: (h: Harness) => Promise<void>): Promise<void> {
+async function withConnector(
+  fn: (h: Harness) => Promise<void>,
+  options: {
+    interviewChats?: readonly string[];
+    interviewSay?: (chatId: string, text: string) => Promise<boolean>;
+    fallbackGatewayId?: string;
+  } = {},
+): Promise<void> {
   const telegram = new FakeTelegram();
-  const connector = new RelayConnector({ gatewaySecrets: [SECRET], telegram, port: 0 });
+  const connector = new RelayConnector({
+    gatewaySecrets: [SECRET],
+    telegram,
+    port: 0,
+    ...(options.interviewChats
+      ? { interviewChat: async (chatId: string) => options.interviewChats!.includes(chatId) }
+      : {}),
+    ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
+    ...(options.fallbackGatewayId ? { fallbackGatewayId: options.fallbackGatewayId } : {}),
+  });
   await connector.listen();
   const port = connector.address;
   assert.ok(port, "connector should have bound a port");
@@ -196,6 +212,90 @@ describe("RelayConnector — outbound actions", () => {
     });
   });
 
+  test("on an interview chat the agent cannot send at all", async () => {
+    // TRACK 4 · one voice, one writer.
+    //
+    // The agent reaches an organizer mid-interview through `say_for_chat` and
+    // `ask_question_for_chat` only, so the router keeps the keyboard, the
+    // record and the order of things. This is the same rule that lived in
+    // SOUL.md through runs 2 to 6 and failed every one of them — as
+    // chain-of-thought narration, third-person commentary about "the router",
+    // the run's own bug reports read back to the organizer, option questions
+    // degraded to numbered lists, and a prose approval request no tool could
+    // act on. Here it cannot be talked around.
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "The next question is destination — let me record that now.",
+      });
+      // Reported as delivered: the gateway blocks on a per-request future and
+      // there is nothing here it could usefully retry.
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
+    }, { interviewChats: ["900"] });
+  });
+
+  test("an interview send is routed through say, not lost", async () => {
+    // Run 7: 17 refused sends against 3 say_for_chat calls. Dropping was the
+    // wrong half of the rule — the organizer silently got less conversation,
+    // and a turn that produced nothing looked STALLED, so the watchdog fired
+    // every turn and re-asked the same question. Converting keeps the
+    // invariant (the router still delivers, still owns the keyboard and the
+    // order) without losing a word.
+    const routed: Array<{ chatId: string; text: string }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "רשמתי — נשאר רק תאריך החזרה.",
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "not sent directly — the router delivers it");
+      assert.deepEqual(routed, [{ chatId: "900", text: "רשמתי — נשאר רק תאריך החזרה." }]);
+    }, {
+      interviewChats: ["900"],
+      interviewSay: async (chatId: string, text: string) => {
+        routed.push({ chatId, text });
+        return true;
+      },
+    });
+  });
+
+  test("a leaking message is dropped even on the converting path", async () => {
+    // Conversion must not become a way for internal vocabulary to reach an
+    // organizer. A message naming field ids is one they must not read,
+    // whichever door it arrives through.
+    const routed: string[] = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "`bot_gender` עדיין ב-optionalRemaining — ואת השאר ישאל הראוטר.",
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(h.telegram.sent, [], "nothing reached the organizer");
+      assert.deepEqual(routed, [], "and it was not laundered through say either");
+    }, {
+      interviewChats: ["900"],
+      interviewSay: async (_chatId: string, text: string) => {
+        routed.push(text);
+        return true;
+      },
+    });
+  });
+
+  test("a companion chat is untouched by the interview rule", async () => {
+    // The restriction is about the interview, where a deterministic router owns
+    // the conversation. A trip companion has no router drawing its questions,
+    // so silencing it there would silence the product.
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "hello" });
+      assert.equal(result.success, true);
+      assert.equal(h.telegram.sent.length, 1, "the companion still speaks");
+    }, { interviewChats: ["900"] });
+  });
+
   test("edit and typing are performed", async () => {
     await withConnector(async (h) => {
       const edit = await roundTrip(h, {
@@ -287,8 +387,11 @@ describe("RelayConnector — inbound push", () => {
   };
 
   test("an event reaches a connected gateway with its profile intact", async () => {
+    // The gateway dials as the profile it serves: under one process per trip
+    // the authenticated id IS the destination, so `gw_1` — an id that serves
+    // no trip — would now be addressed by nothing. See the routing suite below.
     await withConnector(async ({ port, connector }) => {
-      const { ws, frames } = await dial(port, makeUpgradeToken("gw_1", SECRET, 300));
+      const { ws, frames } = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
       await waitFor(() => (connector.connectedGateways === 1 ? true : undefined));
 
       assert.equal(connector.pushInbound(event), true);
@@ -301,10 +404,186 @@ describe("RelayConnector — inbound push", () => {
   });
 
   test("with no gateway connected the push reports failure rather than pretending", async () => {
+    // Unchanged by per-trip routing: no socket at all is still the case where
+    // a silent `true` would be the damaging answer.
     // Nothing here queues, so a silent true would strand the organizer waiting
     // on an answer that is never coming.
     await withConnector(async ({ connector }) => {
       assert.equal(connector.pushInbound(event), false);
     });
+  });
+});
+
+describe("RelayConnector — per-trip gateway routing", () => {
+  /** One event, addressed at the trip whose companion should answer it. */
+  function eventFor(profile: string, chatId = "900"): WireMessageEvent {
+    return {
+      text: "when do we land?",
+      message_type: "text",
+      source: {
+        platform: "telegram",
+        chat_id: chatId,
+        chat_type: "dm",
+        chat_name: null,
+        user_id: "777",
+        user_name: "Dror",
+        thread_id: null,
+        chat_topic: null,
+        profile,
+      },
+    };
+  }
+
+  const inboundEvents = (frames: Record<string, unknown>[]): WireMessageEvent[] =>
+    frames.filter((f) => f.type === "inbound").map((f) => f.event as WireMessageEvent);
+
+  test("an event reaches only the gateway serving its trip", async () => {
+    // The property the whole per-trip architecture rests on. With one process
+    // per trip, delivering to the wrong socket is not a routing inefficiency —
+    // it is one family's companion answering with another family's data.
+    await withConnector(async ({ port, connector }) => {
+      const japan = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      const usa = await dial(port, makeUpgradeToken("companion-usa", SECRET, 300));
+      await waitFor(() => (connector.connectedGateways === 2 ? true : undefined));
+
+      assert.equal(connector.pushInbound(eventFor("companion-japan")), true);
+
+      const delivered = await waitFor(() => inboundEvents(japan.frames)[0]);
+      assert.equal(delivered.source.profile, "companion-japan");
+      assert.deepEqual(inboundEvents(usa.frames), []);
+
+      japan.ws.close();
+      usa.ws.close();
+    });
+  });
+
+  test("an event for a trip with no gateway reaches nobody, and says so", async () => {
+    // Not delivered anywhere is the only safe answer: nothing here queues, so
+    // a `true` would strand the organizer, and a fan-out would leak the turn.
+    await withConnector(async ({ port, connector }) => {
+      const japan = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      const usa = await dial(port, makeUpgradeToken("companion-usa", SECRET, 300));
+      await waitFor(() => (connector.connectedGateways === 2 ? true : undefined));
+
+      assert.equal(connector.pushInbound(eventFor("companion-greece")), false);
+      assert.deepEqual(inboundEvents(japan.frames), []);
+      assert.deepEqual(inboundEvents(usa.frames), []);
+
+      japan.ws.close();
+      usa.ws.close();
+    });
+  });
+
+  test("the declared fallback gateway takes turns no per-trip gateway serves", async () => {
+    // The multiplexing gateway, named explicitly rather than inferred from a
+    // socket count. This is what keeps the interview path working while trips
+    // move to their own processes one at a time.
+    await withConnector(
+      async ({ port, connector }) => {
+        const shared = await dial(port, makeUpgradeToken("kinerary-trip-intake", SECRET, 300));
+        await waitFor(() => (connector.connectedGateways === 1 ? true : undefined));
+
+        assert.equal(connector.pushInbound(eventFor("trip-intake")), true);
+        const delivered = await waitFor(() => inboundEvents(shared.frames)[0]);
+        assert.equal(delivered.source.profile, "trip-intake");
+
+        shared.ws.close();
+      },
+      { fallbackGatewayId: "kinerary-trip-intake" },
+    );
+  });
+
+  test("a trip's own gateway wins over the fallback", async () => {
+    // The cutover moment: the first per-trip gateway connects alongside the
+    // multiplexing one, and must take its trip's traffic away from it.
+    await withConnector(
+      async ({ port, connector }) => {
+        const shared = await dial(port, makeUpgradeToken("kinerary-trip-intake", SECRET, 300));
+        const japan = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+        await waitFor(() => (connector.connectedGateways === 2 ? true : undefined));
+
+        assert.equal(connector.pushInbound(eventFor("companion-japan")), true);
+        await waitFor(() => inboundEvents(japan.frames)[0]);
+        assert.deepEqual(inboundEvents(shared.frames), []);
+
+        // ...and the fallback still gets what nobody else serves.
+        assert.equal(connector.pushInbound(eventFor("trip-intake")), true);
+        await waitFor(() => inboundEvents(shared.frames)[0]);
+        assert.equal(inboundEvents(japan.frames).length, 1);
+
+        shared.ws.close();
+        japan.ws.close();
+      },
+      { fallbackGatewayId: "kinerary-trip-intake" },
+    );
+  });
+
+  test("an event with no profile stamp is undeliverable without a fallback", async () => {
+    // `normalize.ts` always stamps one. A frame that reached here without one
+    // has lost its trip context, and guessing a destination for it is the
+    // failure mode the stamp exists to prevent.
+    await withConnector(async ({ port, connector }) => {
+      const { ws } = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      await waitFor(() => (connector.connectedGateways === 1 ? true : undefined));
+
+      const orphan = eventFor("companion-japan");
+      delete (orphan.source as { profile?: string }).profile;
+      assert.equal(connector.pushInbound(orphan), false);
+
+      ws.close();
+    });
+  });
+
+  test("a disconnect stops the trip being reachable, and a reconnect restores it", async () => {
+    // Reachability has to track the socket, not a row: `gateway stop` must
+    // make the trip honestly unreachable rather than silently undelivered.
+    await withConnector(async ({ port, connector }) => {
+      const first = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      await waitFor(() => (connector.canReachProfile("companion-japan") ? true : undefined));
+
+      first.ws.close();
+      await waitFor(() => (connector.canReachProfile("companion-japan") ? undefined : true));
+      assert.equal(connector.pushInbound(eventFor("companion-japan")), false);
+
+      const second = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      await waitFor(() => (connector.canReachProfile("companion-japan") ? true : undefined));
+      assert.equal(connector.pushInbound(eventFor("companion-japan")), true);
+
+      second.ws.close();
+    });
+  });
+});
+
+describe("RelayConnector — canReachProfile", () => {
+  test("reports the trip whose gateway is connected, and only that one", async () => {
+    await withConnector(async ({ port, connector }) => {
+      assert.equal(connector.canReachProfile("companion-japan"), false);
+
+      const { ws } = await dial(port, makeUpgradeToken("companion-japan", SECRET, 300));
+      await waitFor(() => (connector.connectedGateways === 1 ? true : undefined));
+
+      assert.equal(connector.canReachProfile("companion-japan"), true);
+      assert.equal(connector.canReachProfile("companion-usa"), false);
+
+      ws.close();
+    });
+  });
+
+  test("a connected fallback makes every trip reachable", async () => {
+    // True, and deliberately so: while one gateway multiplexes every profile,
+    // every profile really is reachable through it. This answer becomes strict
+    // on its own when the fallback is withdrawn.
+    await withConnector(
+      async ({ port, connector }) => {
+        const { ws } = await dial(port, makeUpgradeToken("kinerary-trip-intake", SECRET, 300));
+        await waitFor(() => (connector.connectedGateways === 1 ? true : undefined));
+
+        assert.equal(connector.canReachProfile("companion-japan"), true);
+        assert.equal(connector.canReachProfile("anything-at-all"), true);
+
+        ws.close();
+      },
+      { fallbackGatewayId: "kinerary-trip-intake" },
+    );
   });
 });

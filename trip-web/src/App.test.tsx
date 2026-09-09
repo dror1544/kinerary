@@ -3,18 +3,25 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createBooking,
+  createBudgetItem,
   deleteBooking,
+  deleteBudgetItem,
+  deletePhoto,
   extractBookingDetails,
   getAuthenticatedDocument,
   createItineraryItem,
   deleteItineraryItem,
+  postPhotoComment,
   tokenStore,
+  togglePhotoReaction,
   updateItineraryItem,
   updateBooking,
+  updateBudgetItem,
+  uploadPhoto,
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
 } from "./api";
-import App, { avatarUrl, BookingCreatePanel, BookingEditPanel, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, MoreView, safeExternalUrl, wrappedMapIndex } from "./App";
+import App, { avatarUrl, BookingCreatePanel, BookingEditPanel, BudgetView, classicHrefForLocation, coordinatesFromLocationUrl, dailyMapStops, mapPins, MoreView, PhotosView, safeExternalUrl, wrappedMapIndex } from "./App";
 
 afterEach(() => {
   cleanup();
@@ -37,6 +44,23 @@ describe("Modern trip SPA", () => {
     localStorage.clear();
     localStorage.setItem("trip-token", "runtime-gateway-session");
     expect(tokenStore.get()).toBe("runtime-gateway-session");
+  });
+
+  it("migrates an existing Modern session when opening Classic", () => {
+    localStorage.clear();
+    localStorage.setItem("tripToken", "existing-modern-session");
+    expect(tokenStore.get()).toBe("existing-modern-session");
+    expect(localStorage.getItem("trip-token")).toBe("existing-modern-session");
+  });
+
+  it("shares a Modern login with Classic legacy utilities", () => {
+    localStorage.clear();
+    tokenStore.set("shared-session");
+    expect(localStorage.getItem("tripToken")).toBe("shared-session");
+    expect(localStorage.getItem("trip-token")).toBe("shared-session");
+    localStorage.setItem("trip-user", JSON.stringify({ username: "alice" }));
+    tokenStore.clear();
+    expect(localStorage.getItem("trip-user")).toBeNull();
   });
 
   it("points Classic fallback at the API server during local Vite preview", () => {
@@ -137,6 +161,7 @@ describe("Modern trip SPA", () => {
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.getByText("Ben")).toBeInTheDocument();
     expect(screen.getByText("You")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /tasks and packing/i })).toHaveAttribute("href", expect.stringContaining("classic.html"));
   });
 
   it("fetches protected booking documents with the stored bearer token", async () => {
@@ -181,6 +206,128 @@ describe("Modern trip SPA", () => {
     expect(fetchMock.mock.calls[2][1]?.body).toBeInstanceOf(FormData);
     expect(fetchMock.mock.calls[3][1]?.body).toBeInstanceOf(FormData);
     vi.unstubAllGlobals();
+  });
+
+  it("uses authenticated budget CRUD endpoints", async () => {
+    localStorage.clear();
+    tokenStore.set("member-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, id: 21 }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createBudgetItem({ phase: "tokyo", category: "food", description: "Dinner", amount: 80, is_estimate: true });
+    await updateBudgetItem(21, { amount: 95, description: "Team dinner" });
+    await deleteBudgetItem(21);
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["/api/budget", "POST"],
+      ["/api/budget/21", "PATCH"],
+      ["/api/budget/21", "DELETE"],
+    ]);
+    const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("Authorization")).toBe("Bearer member-token");
+    vi.unstubAllGlobals();
+  });
+
+  it("renders budget totals and adds an expense without leaving Modern", async () => {
+    localStorage.clear();
+    tokenStore.set("member-token");
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/budget" && !init?.method) return {
+        ok: true,
+        status: 200,
+        json: async () => [
+          { id: 1, phase: "tokyo", category: "hotel", description: "Hotel", amount: 600, is_estimate: 0 },
+          { id: 2, phase: "tokyo", category: "food", description: "Meals", amount: 200, is_estimate: 1 },
+        ],
+      };
+      return { ok: true, status: 200, json: async () => ({ ok: true, id: 3 }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BudgetView lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }], participants: [{ username: "alice" }, { username: "bob" }] }} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: /trip budget/i })).toBeInTheDocument();
+    expect(await screen.findByText("$800")).toBeInTheDocument();
+    expect(screen.getByText(/\$400 per traveler/i)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/description/i), { target: { value: "Museum tickets" } });
+    fireEvent.change(screen.getByLabelText(/^amount/i), { target: { value: "50" } });
+    fireEvent.click(screen.getByRole("button", { name: /add expense/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/budget", expect.objectContaining({ method: "POST" })));
+    const createCall = fetchMock.mock.calls.find(([url, init]) => url === "/api/budget" && init?.method === "POST");
+    expect(JSON.parse(createCall?.[1]?.body as string)).toMatchObject({ phase: "tokyo", description: "Museum tickets", amount: 50 });
+    vi.unstubAllGlobals();
+  });
+
+  it("uses authenticated photo upload, reaction, comment, and deletion endpoints", async () => {
+    localStorage.clear();
+    tokenStore.set("member-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, action: "added" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    const photo = new File(["image"], "memory.jpg", { type: "image/jpeg" });
+
+    await uploadPhoto(photo, { phase: "tokyo", caption: "First night" });
+    await togglePhotoReaction("photo/1", "❤️");
+    await postPhotoComment("photo/1", "Love this");
+    await deletePhoto("photo/1");
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method])).toEqual([
+      ["/api/photos/upload", "POST"],
+      ["/api/reactions/photo%2F1", "POST"],
+      ["/api/comments/photo/photo%2F1", "POST"],
+      ["/api/photos/photo%2F1", "DELETE"],
+    ]);
+    const uploadHeaders = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(uploadHeaders.get("Authorization")).toBe("Bearer member-token");
+    expect(uploadHeaders.has("Content-Type")).toBe(false);
+    expect(fetchMock.mock.calls[0][1]?.body).toBeInstanceOf(FormData);
+    vi.unstubAllGlobals();
+  });
+
+  it("renders the photo gallery with reactions and comments", async () => {
+    localStorage.clear();
+    tokenStore.set("member-token");
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/photos") return { ok: true, status: 200, json: async () => [{
+        id: "photo-1", filename: "memory.jpg", originalName: "Memory.jpg", phase: "tokyo", caption: "First night",
+        username: "alice", uploadedAt: "2026-05-01T18:00:00.000Z", user: { username: "alice", name_en: "Alice", color: "#123456" },
+      }] };
+      if (url === "/api/reactions") return { ok: true, status: 200, json: async () => ({ "photo-1": { "❤️": ["bob"] } }) };
+      if (url === "/api/comments/photo") return { ok: true, status: 200, json: async () => ({ "photo-1": [{ id: 4, photo_id: "photo-1", username: "bob", body: "Great photo", created_at: "2026-05-01", user: { username: "bob", name_en: "Bob" } }] }) };
+      if (url === "/api/reactions/photo-1" && init?.method === "POST") return { ok: true, status: 200, json: async () => ({ ok: true, action: "added" }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <PhotosView lang="en" config={{ phases: [{ id: "tokyo", title: "Tokyo" }] }} currentUser={{ username: "alice", name_en: "Alice" }} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("heading", { name: /trip photos/i })).toBeInTheDocument();
+    expect(await screen.findByText("First night")).toBeInTheDocument();
+    expect(screen.getByText("Great photo")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "First night" })).toHaveAttribute("src", "/api/photos/file/memory.jpg");
+    fireEvent.click(screen.getByRole("button", { name: /react with ❤️/i }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/reactions/photo-1", expect.objectContaining({ method: "POST" })));
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves a booking draft and focused input when refreshed booking props arrive", () => {
+    const client = new QueryClient();
+    const booking = { id: 12, phase: "tokyo", type: "flight", name: "Original flight" };
+    const props = { lang: "en" as const, config: { phases: [{ id: "tokyo", title: "Tokyo" }] }, onClose: vi.fn() };
+    const { rerender } = render(<QueryClientProvider client={client}><BookingEditPanel booking={booking} {...props} /></QueryClientProvider>);
+    const input = screen.getByLabelText(/booking name/i);
+    input.focus();
+    fireEvent.change(input, { target: { value: "Unsaved flight name" } });
+    rerender(<QueryClientProvider client={client}><BookingEditPanel booking={{ ...booking, name: "Remote update" }} {...props} /></QueryClientProvider>);
+    expect(input).toHaveValue("Unsaved flight name");
+    expect(document.activeElement).toBe(input);
   });
 
   it("lets an organizer edit a booking, replace documents, and explicitly confirm deletion", async () => {

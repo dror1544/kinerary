@@ -67,8 +67,23 @@ export interface TelegramClient {
     messageId: string;
     text: string;
     parseMode?: "MarkdownV2";
+    /** Redraws the keyboard alongside the text — a re-ticked multi-select. */
+    replyMarkup?: InlineKeyboard;
   }): Promise<SendResult>;
   sendChatAction(params: { chatId: string; action?: string }): Promise<void>;
+  /**
+   * Pins a message. Needs the `can_pin_messages` admin right.
+   *
+   * Returns whether it worked, and never throws: an unpinned introduction is a
+   * worse introduction, not a failed provisioning. Every caller so far treats
+   * `false` as "carry on".
+   */
+  pinChatMessage?(params: { chatId: string; messageId: string }): Promise<boolean>;
+  /**
+   * The group's own invite link, or null when the bot cannot read one (it needs
+   * `can_invite_users`, and the chat must not be a private one).
+   */
+  exportChatInviteLink?(chatId: string): Promise<string | null>;
   answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void>;
   getChatInfo(chatId: string): Promise<ChatInfo | null>;
   /**
@@ -179,12 +194,17 @@ export class HttpTelegramClient implements TelegramClient {
     messageId: string;
     text: string;
     parseMode?: "MarkdownV2";
+    replyMarkup?: InlineKeyboard;
   }): Promise<SendResult> {
     const body: Record<string, unknown> = {
       chat_id: params.chatId,
       message_id: Number(params.messageId),
       text: params.text,
     };
+    // Omitted rather than sent empty when there is no keyboard: Telegram reads
+    // an absent reply_markup as "leave it alone" and an empty one as "remove
+    // it", and removing a live question's buttons is not what an edit means.
+    if (params.replyMarkup) body.reply_markup = params.replyMarkup;
     if (params.parseMode) {
       body.text = toTelegramMarkdownV2(params.text);
       body.parse_mode = params.parseMode;
@@ -202,6 +222,32 @@ export class HttpTelegramClient implements TelegramClient {
 
   async sendChatAction(params: { chatId: string; action?: string }): Promise<void> {
     await this.post("sendChatAction", { chat_id: params.chatId, action: params.action ?? "typing" });
+  }
+
+  async pinChatMessage(params: { chatId: string; messageId: string }): Promise<boolean> {
+    // `disable_notification` on purpose: the introduction has already been sent
+    // to this chat as a message, and pinning it should not buzz everyone twice.
+    const res = await this.post("pinChatMessage", {
+      chat_id: params.chatId,
+      message_id: Number(params.messageId),
+      disable_notification: true,
+    });
+    if (!res.ok) {
+      // Not an error path worth escalating: the overwhelmingly common cause is
+      // simply that nobody made the bot an admin.
+      this.log(structuredLog("info", "telegram_api.pin_unavailable", {}));
+      return false;
+    }
+    return true;
+  }
+
+  async exportChatInviteLink(chatId: string): Promise<string | null> {
+    const res = await this.post("exportChatInviteLink", { chat_id: chatId });
+    if (!res.ok || typeof res.result !== "string") {
+      this.log(structuredLog("info", "telegram_api.invite_link_unavailable", {}));
+      return null;
+    }
+    return res.result;
   }
 
   async answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void> {

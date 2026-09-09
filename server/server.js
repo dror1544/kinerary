@@ -10,6 +10,7 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
+const { createTripEvents } = require('./trip-events');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
@@ -892,6 +893,17 @@ const journey = livingJourney.create({
     kickEnrichmentSoon();
     return { configured: true, queued: Boolean(result.changes) };
   },
+});
+
+// Install after livingJourney creates its tables. This runtime and its auth
+// credentials belong to exactly one trip; clients cannot select another DB.
+const tripEvents = createTripEvents(db);
+app.get('/api/events', authRequired, (req, res) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : req.query._t;
+  // authRequired already verified this token. End streams when it expires.
+  const expiry = token ? jwt.decode(token)?.exp : null;
+  tripEvents.stream(req, res, expiry ? expiry * 1000 : undefined);
 });
 
 const heroUpload = multer({

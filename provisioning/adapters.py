@@ -272,6 +272,7 @@ if [ ! -f {app_dir}/.env ]; then
 TRIP_DIR={app_dir}/trips/{trip_slug}
 DATA_DIR={spec.nfs_mount_path}/server-data
 PORT=3000
+TRIP_DESIGN_VARIANT=modern
 JWT_SECRET=${{JWT_SECRET}}
 HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF

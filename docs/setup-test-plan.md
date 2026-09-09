@@ -35,7 +35,9 @@ genuinely unbuilt, and which parts are already fully live and unmodified.
 
 ## Step 4: Plan
 
-9. 🤖 AI (stand-in for an approve-button UI that doesn't exist yet) — calls `POST /v1/trips/:id/plan` then `POST /v1/plans/:planId/approve`, authenticated with your password credential. The endpoints are real production code; the *decision* to approve is still yours — I only place the call once you say go, each time.
+9. 🤖 AI (stand-in for the SPA's approve button, which is built but not deployed on this stack) — calls `POST /v1/trips/:id/plan` then `POST /v1/plans/:planId/approve`, authenticated with your password credential. The endpoints are real production code; the *decision* to approve is still yours — I only place the call once you say go, each time.
+
+   **The organizer is the only approver.** The operations-review gate that used to sit between these two calls is gone (migration `0041`); a plan is created and approved by the trip's own owner. The same approval enqueues an operator Telegram DM — trip, organizer, plan id, digest, and `provisioning queued` — inside its own transaction. That DM is **observability, not a step**: don't wait for it, and a run where it never arrives is still a passing run. A second DM follows in step 10 with the provisioning outcome.
 
 ## Step 5: Provisioning
 

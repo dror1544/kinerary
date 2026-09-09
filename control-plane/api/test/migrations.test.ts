@@ -6,8 +6,9 @@ import pg from "pg";
 import { isCanonicalRecordSafe } from "../src/canonical.js";
 import { applyMigrations } from "../src/migrations.js";
 import { loadCanonicalFixtures } from "./canonical-fixtures.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
 async function reset(client: pg.PoolClient) {
@@ -60,6 +61,19 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0032_release_accepts_intake_schema_v3.sql",
       "0033_router_prompt_handoff.sql",
       "0034_web_portal_addenda.sql",
+      "0035_interview_ui_state.sql",
+      "0036_interview_language.sql",
+      "0037_interview_phase.sql",
+      "0038_interview_floor.sql",
+      "0039_interview_inbound_settle.sql",
+      "0040_interview_document_floor.sql",
+      "0041_drop_plan_operations_reviews.sql",
+      "0042_trip_reachability.sql",
+      "0043_binding_without_companion.sql",
+      "0044_companion_intro_facts.sql",
+      "0045_group_binding_tokens.sql",
+      "0046_intake_version_language.sql",
+      "0047_agent_spoke_on_turn.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -101,6 +115,19 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0032_release_accepts_intake_schema_v3.sql",
       "0033_router_prompt_handoff.sql",
       "0034_web_portal_addenda.sql",
+      "0035_interview_ui_state.sql",
+      "0036_interview_language.sql",
+      "0037_interview_phase.sql",
+      "0038_interview_floor.sql",
+      "0039_interview_inbound_settle.sql",
+      "0040_interview_document_floor.sql",
+      "0041_drop_plan_operations_reviews.sql",
+      "0042_trip_reachability.sql",
+      "0043_binding_without_companion.sql",
+      "0044_companion_intro_facts.sql",
+      "0045_group_binding_tokens.sql",
+      "0046_intake_version_language.sql",
+      "0047_agent_spoke_on_turn.sql",
     ]);
   } finally {
     await reset(client);

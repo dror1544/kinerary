@@ -6,6 +6,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { confirmIntake, submitAnswer, INTAKE_QUESTIONS } from "../src/interview.js";
+import { askText } from "../src/intake-copy.js";
 import {
   answerCallbackData,
   callbackDataFits,
@@ -15,10 +16,12 @@ import {
   parseCallbackData,
   parseInbound,
   renderConfirmPrompt,
+  renderDocumentOffer,
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
 } from "../src/chat-router.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Pure decision logic — no database required ───────────────────────────────
 
@@ -125,10 +128,93 @@ describe("renderQuestion", () => {
     }
   });
 
-  test("a text question renders no keyboard", () => {
-    const textQuestion = INTAKE_QUESTIONS.find((q) => q.type === "text");
-    assert.ok(textQuestion, "expected a text question in the intake set");
-    assert.deepEqual(renderQuestion(textQuestion), { text: textQuestion.prompt, replyMarkup: null });
+  test("a multi-select renders toggles, ticks what is chosen, and offers Done", () => {
+    // Before this the router refused multi_choice taps outright and left the
+    // question to the agent, whose `clarify` cannot draw a keyboard here — so
+    // dietary arrived as a numbered list with Hermes's "(Recommended)" stuck
+    // on the first option (2026-09-04 run 2).
+    const multi = INTAKE_QUESTIONS.find((q) => q.type === "multi_choice");
+    assert.ok(multi, "expected a multi_choice question in the intake set");
+    const chosen = multi.options![1]!.id;
+    const rendered = renderQuestion(multi, [chosen]);
+    assert.ok(rendered.replyMarkup);
+
+    const buttons = rendered.replyMarkup.inline_keyboard.flat();
+    const ticked = buttons.filter((b) => b.text.startsWith("✅"));
+    assert.equal(ticked.length, 1, "exactly the chosen option is ticked");
+    assert.ok(ticked[0]!.callback_data.startsWith(`t:${multi.id}:${chosen}`));
+    // A toggle must never be recorded as a whole answer: `a:` would replace
+    // the set with one option and silently drop every other selection.
+    assert.ok(
+      buttons.every((b) => !b.callback_data.startsWith(`a:${multi.id}:`)),
+      "multi-select options are toggles, not answers",
+    );
+    assert.ok(buttons.some((b) => b.callback_data === `n:${multi.id}`), "and there is a Done");
+  });
+
+  test("optional questions carry Skip and 'That's everything'; required ones do not", () => {
+    // A question with no visible way out reads as required. That is how every
+    // optional question became mandatory-looking in run 2.
+    const optional = INTAKE_QUESTIONS.find((q) => !q.required && q.type === "choice");
+    const required = INTAKE_QUESTIONS.find((q) => q.required && q.type === "choice");
+    assert.ok(optional && required);
+
+    const optionalButtons = renderQuestion(optional).replyMarkup!.inline_keyboard.flat();
+    assert.ok(optionalButtons.some((b) => b.callback_data === `k:${optional.id}`), "Skip");
+    assert.ok(optionalButtons.some((b) => b.callback_data === "c:done"), "That's everything");
+
+    const requiredButtons = renderQuestion(required).replyMarkup!.inline_keyboard.flat();
+    assert.ok(
+      requiredButtons.every((b) => !b.callback_data.startsWith("k:") && b.callback_data !== "c:done"),
+      "a required question offers no way past it",
+    );
+  });
+
+  test("a required text question renders no keyboard, and shows organizer copy", () => {
+    const textQuestion = INTAKE_QUESTIONS.find((q) => q.type === "text" && q.required);
+    assert.ok(textQuestion, "expected a required text question in the intake set");
+    const rendered = renderQuestion(textQuestion);
+    assert.equal(rendered.replyMarkup, null, "nothing to tap on a free-text question");
+    // `prompt` is the interviewer's field spec. What a person reads is `ask`.
+    assert.equal(rendered.text, askText(textQuestion));
+  });
+
+  test("the interview opens by offering to read a document, in the right language", () => {
+    // The router split took this away by accident: the router asks the
+    // required questions itself now, so it got there first and the organizer's
+    // very first message became "what date does the trip start?" — with no
+    // hint that the PDF they already have would answer it (run 5).
+    const he = renderDocumentOffer("he");
+    assert.ok(he.text.includes("מסמך") || he.text.includes("תוכנית"), he.text);
+    const buttons = he.replyMarkup!.inline_keyboard.flat();
+    assert.equal(buttons.length, 1, "one way past it, and no way to answer a question yet");
+    assert.equal(buttons[0]!.callback_data, "c:nodoc");
+    assert.equal(buttons[0]!.text, "אין לי מסמך");
+
+    const en = renderDocumentOffer();
+    assert.notEqual(en.text, he.text, "and it is a real translation, not a fallback");
+  });
+
+  test("a question is drawn in the interview's language, buttons included", () => {
+    // A Hebrew interview used to get Hebrew from the agent and English from
+    // the router, alternating, inside the same conversation.
+    const dietary = INTAKE_QUESTIONS.find((q) => q.id === "dietary")!;
+    const he = renderQuestion(dietary, [], "he");
+    assert.equal(he.text, askText(dietary, "he"));
+    assert.notEqual(he.text, askText(dietary, "en"), "the Hebrew copy is actually different");
+    const labels = he.replyMarkup!.inline_keyboard.flat().map((b) => b.text);
+    assert.ok(labels.some((l) => l.includes("צמחוני")), labels.join(" | "));
+    assert.ok(labels.some((l) => l.includes("סיימתי")), "Done is translated too");
+    assert.ok(labels.some((l) => l.includes("דלג")), "and so is Skip");
+  });
+
+  test("an untranslated language falls back to English rather than blank", () => {
+    // A missing translation must degrade to a sentence in the wrong language.
+    // A blank message is not a smaller failure than an untranslated one.
+    const dietary = INTAKE_QUESTIONS.find((q) => q.id === "dietary")!;
+    const rendered = renderQuestion(dietary, [], "fr" as never);
+    assert.equal(rendered.text, askText(dietary, "en"));
+    assert.ok(rendered.replyMarkup!.inline_keyboard.flat().every((b) => b.text.trim() !== ""));
   });
 });
 
@@ -158,7 +244,7 @@ describe("findQuestion", () => {
 
 // ── Routing and the deep link — database required ───────────────────────────
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
@@ -225,6 +311,28 @@ describe("resolveChatRoute (DB)", () => {
       const route = await resolveChatRoute(fix.pool, "555000111");
       assert.equal(route.kind, "interview");
       assert.equal(route.kind === "interview" && route.tripId, fix.tripId);
+    });
+  });
+
+  test("a chat bound with no companion yet resolves the trip, not 'unbound'", { skip: SKIP }, async () => {
+    // A4 (migration 0043). Routing and the assistant behind it are separate
+    // components. A binding with a NULL profile means "this chat belongs to
+    // this trip, and its assistant is not installed" — which must NOT collapse
+    // into `unbound`, because `unbound` makes the router answer "I don't have
+    // a trip for this chat". That sentence was told to a real organizer on
+    // 2026-09-06 about a trip that had provisioned perfectly.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, NULL)",
+        ["555000333", fix.tripId],
+      );
+      const route = await resolveChatRoute(fix.pool, "555000333");
+      assert.equal(route.kind, "companion", "the trip is known — this is not an unbound chat");
+      assert.equal(route.kind === "companion" && route.tripId, fix.tripId);
+      assert.equal(
+        route.kind === "companion" && route.hermesProfile, null,
+        "and the missing assistant is represented, not papered over",
+      );
     });
   });
 

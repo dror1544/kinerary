@@ -9,6 +9,8 @@ import {
   startSession, getSession, submitAnswer, confirmIntake, getSessionStatus,
   consularContactsFor, saveConsularContacts, saveSourceDocument,
   getSessionForAgent, submitAnswerForAgent, resolveChatFromOpenTurn,
+  nominateQuestionForChat,
+  sayForChat, setFinishRequestedForChat, setLanguageForChat, INTAKE_QUESTIONS,
 } from "./interview.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
@@ -46,6 +48,12 @@ export interface PlannerDependencies {
   db: pg.Pool;
   config: {
     approvalTtlSeconds: number;
+    /**
+     * Raw Telegram chat id the operator's provisioning notifications are sent
+     * to — the same chat as the signup super-admin DM. Optional: absent means
+     * approvals still work and simply enqueue no operator notification.
+     */
+    operatorChatId?: string;
   };
 }
 
@@ -841,8 +849,15 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     });
   });
 
-  // POST /v1/plans/:planId/approve — approve a pending plan.
-  // Header: X-Telegram-Login (trip owner only for Sprint 3)
+  // POST /v1/plans/:planId/approve — the trip owner approves a pending plan.
+  //
+  // This and the portal's POST /v1/trips/:id/plans/:planId/approve are ONE
+  // flow on two auth surfaces, not two competing paths: same decision, same
+  // authorizer (the trip owner), same effect. This one takes header auth and
+  // is what the live-run driver and docs/setup-test-plan.md call; the portal
+  // twin takes the SPA's cookie+CSRF session. There is no separate operations
+  // approval — the operator is notified, not asked.
+  // Header: X-Telegram-Login or X-Portal-Password-Login (trip owner only)
   app.post("/v1/plans/:planId/approve", async (request, reply) => {
     if (!dependencies.planner || !dependencies.signup || !dependencies.interview) {
       return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
@@ -878,7 +893,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!memberRow.rows[0]) return reply.code(403).send({ error: "NOT_OWNER" });
 
     const actorRef = `user:${identity.user_id}`;
-    const result = await issueApproval(planner.db, planId, actorRef, planner.config.approvalTtlSeconds);
+    const result = await issueApproval(planner.db, planId, actorRef, planner.config.approvalTtlSeconds, {
+      operatorChatId: planner.config.operatorChatId,
+    });
 
     if (!result.ok) {
       const status = result.reason === "PLAN_NOT_FOUND" ? 404
@@ -1030,6 +1047,184 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send(result.view);
   });
 
+  // The pacing half of the split: the agent says WHICH optional question is
+  // worth asking now, the router draws it. Without this the router either
+  // walks every optional question in order (a form) or never asks one at all
+  // — the two live-run failures of 2026-09-04.
+  app.post("/internal/interview/agent/current/ask", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const body = request.body as Record<string, unknown> | undefined;
+    const questionId = body?.questionId;
+    if (typeof questionId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+    // The agent's own phrasing, optional. Absent, the router draws the
+    // question from its copy table — correct and localised, but the flat voice
+    // that made run 3 read as a form.
+    const text = typeof body?.text === "string" ? body.text : undefined;
+
+    const result = await nominateQuestionForChat(
+      dependencies.interviewAgent.db,
+      chatId,
+      questionId,
+      text,
+    );
+    if (!result.ok) {
+      // Answered is not "not found", and the difference matters to the agent:
+      // one means it asked for something that does not exist, the other that
+      // the organizer has already told us. Saying so plainly is what stops it
+      // asking twice, where a bare 404 would read as a fault to work around.
+      if (result.reason === "ALREADY_ANSWERED") {
+        return reply.code(409).send({
+          error: "ALREADY_ANSWERED",
+          questionId,
+          detail: "The organizer has already answered this. Do not ask it again — read " +
+            "get_interview_for_chat and pick something still outstanding, or move on.",
+        });
+      }
+      if (result.reason === "ROUTER_OWNED") {
+        return reply.code(409).send({
+          error: "ROUTER_OWNED",
+          questionId,
+          detail: "The router already asks this one on its own, the moment it's next — there is nothing " +
+            "for you to nominate here. It will reach the organizer without you doing anything.",
+        });
+      }
+      return reply.code(404).send({ error: result.reason });
+    }
+    return reply.code(200).send(result.view);
+  });
+
+  // Everything a document just told us, in one call.
+  //
+  // Run 7's first report: "It started good, red the document parse it, and then
+  // asked for destination". The PDF was read into the model's context and
+  // nothing reached the RECORD, so the router — correctly — asked for a
+  // destination nobody had recorded. Extraction has to go through the same
+  // write path as any other answer, and doing that a dozen times over is
+  // friction the agent skips. So: one call, partial success reported per
+  // question, because a document that yields five good answers and one bad one
+  // should still leave five answers behind.
+  app.post("/internal/interview/agent/current/answers", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const body = request.body as { answers?: unknown } | undefined;
+    if (!Array.isArray(body?.answers) || body.answers.length === 0) {
+      return reply.code(400).send({
+        error: "ANSWERS_REQUIRED",
+        expectedArgument: "answers",
+        detail: "Pass a non-empty `answers` array of { questionId, optionId?, otherText?, optionIds?, data? }.",
+      });
+    }
+
+    const recorded: string[] = [];
+    const rejected: Array<{ questionId: string; reason: string; detail?: string }> = [];
+    for (const raw of body.answers) {
+      const entry = raw as Record<string, unknown>;
+      const questionId = typeof entry.questionId === "string" ? entry.questionId : null;
+      if (!questionId) {
+        rejected.push({ questionId: "?", reason: "QUESTION_ID_REQUIRED" });
+        continue;
+      }
+      const result = await submitAnswerForAgent(
+        dependencies.interviewAgent.db,
+        chatId,
+        questionId,
+        (entry.optionId as string | null) ?? null,
+        entry.otherText as string | undefined,
+        entry.data,
+        entry.optionIds as readonly string[] | undefined,
+      );
+      if (result.ok) recorded.push(questionId);
+      // INCOMPLETE_ANSWER's detail is the whole point of the rejection — a
+      // bare reason code would tell the agent something failed without
+      // telling it what to fix, and it would have no way to tell this apart
+      // from a shape error worth giving up on rather than correcting.
+      else rejected.push({ questionId, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) });
+    }
+
+    const view = await getSessionForAgent(dependencies.interviewAgent.db, chatId);
+    return reply.code(200).send({
+      recorded,
+      rejected,
+      ...(view.ok ? { view: view.view } : {}),
+    });
+  });
+
+  // The agent's voice. It has no other way to reach the organizer: on an
+  // interview chat the relay drops anything the agent sends directly, so a
+  // message exists for the organizer only if it was written here on purpose.
+  app.post("/internal/interview/agent/current/say", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const text = (request.body as Record<string, unknown> | undefined)?.text;
+    if (typeof text !== "string" || text.trim().length === 0) {
+      return reply.code(400).send({
+        error: "TEXT_REQUIRED",
+        expectedArgument: "text",
+        detail: "Pass the message you want the organizer to read, as `text`.",
+      });
+    }
+
+    const result = await sayForChat(dependencies.interviewAgent.db, chatId, text);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // The agent is the only side that can read what the organizer wrote, so it
+  // is the only side that can say what language the router should draw in.
+  app.post("/internal/interview/agent/current/language", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const language = (request.body as Record<string, unknown> | undefined)?.language;
+    if (typeof language !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await setLanguageForChat(dependencies.interviewAgent.db, chatId, language);
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
+  // "I have everything" — the agent asks for the recap; only the organizer's
+  // own tap on it confirms.
+  app.post("/internal/interview/agent/current/summary", async (request, reply) => {
+    if (!dependencies.interviewAgent) {
+      return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
+    }
+    if (!agentAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const chatId = await resolveCurrentChat(reply);
+    if (chatId === null) return reply;
+
+    const result = await setFinishRequestedForChat(
+      dependencies.interviewAgent.db, chatId, true, { schedulePrompt: true },
+    );
+    if (!result.ok) return reply.code(404).send({ error: result.reason });
+    return reply.code(200).send(result.view);
+  });
+
   app.post("/internal/interview/agent/current/answer", async (request, reply) => {
     if (!dependencies.interviewAgent) {
       return reply.code(503).send({ error: "INTERVIEW_AGENT_NOT_CONFIGURED" });
@@ -1067,7 +1262,23 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       const status = result.reason === "NOT_FOUND" ? 404
         : result.reason === "SESSION_CONFIRMED" ? 409
         : 400;
-      return reply.code(status).send({ error: result.reason });
+      // A bare "TEXT_REQUIRED" tells the agent something is wrong and not what
+      // to do about it, so it guesses — and on 2026-09-04 run 6 it guessed
+      // twice more, tripped Hermes's MCP breaker, and an organizer who had
+      // just uploaded their whole itinerary was asked for the destination from
+      // scratch. The reply now says which argument this particular question
+      // wants, because the question set is the only thing that knows.
+      const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+      const expected = !question ? undefined
+        : question.type === "structured" ? `data (a JSON ${question.dataShape ?? "object"})`
+        : question.type === "multi_choice" ? "optionIds (an array of option ids)"
+        : question.type === "choice" ? "optionId (one option id), or optionId 'other' with otherText"
+        : "otherText (the answer as plain text)";
+      return reply.code(status).send({
+        error: result.reason,
+        ...(question ? { questionType: question.type, expectedArgument: expected } : {}),
+        ...(question?.options ? { options: question.options.map((o) => o.id) } : {}),
+      });
     }
     return reply.code(200).send({ state: result.view.state, view: result.view });
   });
@@ -1161,7 +1372,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     // closed bindings as history, so an unfiltered read would route a group to
     // a trip it was deliberately detached from — on a shared bot, that is
     // another organizer's trip.
-    const result = await db.query<{ trip_id: string; hermes_profile: string }>(
+    const result = await db.query<{ trip_id: string; hermes_profile: string | null }>(
       `SELECT trip_id, hermes_profile
        FROM control_plane.telegram_chat_bindings
        WHERE chat_id = $1 AND closed_at IS NULL`,

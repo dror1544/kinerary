@@ -6,8 +6,9 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`;
@@ -33,7 +34,7 @@ function portalDeps(db: pg.Pool): PortalDependencies {
     runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async () => {} },
     publicOrigin: "http://portal.example.test", runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
-    enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, provisioningAdminSubjectDigests: new Set(),
+    enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, operatorChatId: "operator-chat-1",
   };
 }
 
@@ -64,7 +65,12 @@ before(async () => {
 
 after(async () => {
   if (skip) return;
+  await pool.query("DELETE FROM control_plane.notification_outbox WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.plan_approvals WHERE plan_id IN (SELECT id FROM control_plane.plans WHERE trip_id = ANY($1))", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.jobs WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.plans WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.runtime_launch_grants WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.runtime_routes WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_password_credentials WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.site_invites WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
@@ -178,5 +184,185 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
       payload: { tripId: ids.ownedTrip, runtimeUsername: "password-guest", password: "wrong-secret" },
     });
     assert.equal(badPassword.statusCode, 401);
+  } finally { await app.close(); }
+});
+
+test("a ready lifecycle stays closed until its runtime route is ready", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "route");
+  try {
+    await pool.query(
+      "UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1",
+      [ids.ownedTrip],
+    );
+
+    const withoutRoute = await app.inject({
+      method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: owner.cookie },
+    });
+    assert.equal(withoutRoute.statusCode, 200);
+    assert.equal(withoutRoute.json().runtimeReady, false);
+    assert.equal(withoutRoute.json().nextAction, "view_status");
+
+    await pool.query(
+      `INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state)
+       VALUES ($1, $2, 'ready')`,
+      [ids.ownedTrip, `route_${suffix}ready`],
+    );
+    const withRoute = await app.inject({
+      method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: owner.cookie },
+    });
+    assert.equal(withRoute.statusCode, 200);
+    assert.equal(withRoute.json().runtimeReady, true);
+    assert.equal(withRoute.json().nextAction, "open_trip");
+  } finally {
+    await pool.query("DELETE FROM control_plane.runtime_routes WHERE trip_id = $1", [ids.ownedTrip]);
+    await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [ids.ownedTrip]);
+    await app.close();
+  }
+});
+
+// ── Provisioning approval: one organizer-driven path ────────────────────────
+//
+// The ops-review gate these routes replaced is gone (migration 0041). What has
+// to hold now is that the trip's OWNER decides, that nobody else can, and that
+// the operator notification is enqueued by the approval itself rather than by
+// the route — so an approval can never happen silently, and a notification can
+// never fail an approval.
+
+async function seedPendingPlan(tripId: string, label: string) {
+  const planId = `plan_${suffix}${label}`;
+  const digest = `sha256:${label.repeat(64).slice(0, 64).replace(/[^a-f0-9]/g, "a")}`;
+  // plans_trip_active_idx (migration 0011) allows one pending_approval-or-
+  // approved plan per trip, so retire whatever a previous test left active.
+  await pool.query(
+    "UPDATE control_plane.plans SET status = 'superseded' WHERE trip_id = $1 AND status IN ('pending_approval','approved')",
+    [tripId]);
+  await pool.query(
+    `INSERT INTO control_plane.plans(id, trip_id, release_id, kind, digest, status)
+     VALUES ($1, $2, NULL, 'provision', $3, 'pending_approval')`,
+    [planId, tripId, digest]);
+  await pool.query(
+    `INSERT INTO control_plane.jobs(id, trip_id, plan_id, job_type, idempotency_key, correlation_id, state)
+     VALUES ($1, $2, $3, 'provision', $4, $5, 'waiting_for_user_action')`,
+    [`job_${suffix}${label}`, tripId, planId, `idem-${planId}`, `corr_${suffix}${label}`]);
+  await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'planned' WHERE id = $1", [tripId]);
+  return planId;
+}
+
+test("the trip owner approves their own plan, and the operator notification rides the same transaction", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  try {
+    const planId = await seedPendingPlan(ids.ownedTrip, "p1");
+    const { cookie, csrf } = await session(ids.owner, "appr1");
+
+    const approve = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.ownedTrip}/plans/${planId}/approve`,
+      headers: { cookie, "x-csrf-token": csrf },
+    });
+    assert.equal(approve.statusCode, 200);
+    assert.ok(approve.json().approvalId);
+
+    // The approval did what the worker gates on.
+    const plan = await pool.query("SELECT status FROM control_plane.plans WHERE id = $1", [planId]);
+    assert.equal(plan.rows[0].status, "approved");
+    const job = await pool.query("SELECT state FROM control_plane.jobs WHERE plan_id = $1", [planId]);
+    assert.equal(job.rows[0].state, "queued");
+    const trip = await pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [ids.ownedTrip]);
+    assert.equal(trip.rows[0].lifecycle_state, "provisioning_approved");
+
+    // ...and the operator row is there, addressed to the operator, pending for
+    // the dispatcher. Nothing in the path above waited on it.
+    const outbox = await pool.query(
+      `SELECT recipient, state, payload FROM control_plane.notification_outbox
+       WHERE trip_id = $1 AND notification_type = 'operator_provisioning_approved'`,
+      [ids.ownedTrip]);
+    assert.equal(outbox.rowCount, 1);
+    assert.equal(outbox.rows[0].recipient, "operator-chat-1");
+    assert.equal(outbox.rows[0].state, "pending");
+    assert.equal(outbox.rows[0].payload.plan_id, planId);
+    assert.equal(outbox.rows[0].payload.approved_by, `user:${ids.owner}`);
+    assert.equal(outbox.rows[0].payload.organizer, "Owner");
+  } finally { await app.close(); }
+});
+
+test("a non-owner cannot approve or reject, and the retired ops queue is gone", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  try {
+    const planId = await seedPendingPlan(ids.ownedTrip, "p2");
+    for (const [userId, label] of [[ids.member, "mem"], [ids.outsider, "out"]] as const) {
+      const { cookie, csrf } = await session(userId, `deny${label}`);
+      for (const action of ["approve", "reject"]) {
+        const response = await app.inject({
+          method: "POST", url: `/v1/trips/${ids.ownedTrip}/plans/${planId}/${action}`,
+          headers: { cookie, "x-csrf-token": csrf },
+        });
+        assert.equal(response.statusCode, 404, `${label} ${action}`);
+      }
+    }
+    // The plan is untouched by the refusals.
+    const plan = await pool.query("SELECT status FROM control_plane.plans WHERE id = $1", [planId]);
+    assert.equal(plan.rows[0].status, "pending_approval");
+
+    // The operations-review surface no longer exists at all.
+    const { cookie } = await session(ids.owner, "opsgone");
+    const queue = await app.inject({ method: "GET", url: "/v1/ops/provisioning-requests", headers: { cookie } });
+    assert.equal(queue.statusCode, 404);
+  } finally { await app.close(); }
+});
+
+test("the owner rejects a plan: superseded, job cancelled, trip back to intake_confirmed", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  try {
+    const planId = await seedPendingPlan(ids.otherTrip, "p3");
+    // otherTrip's owner is `outsider` — ownership is per trip, not global.
+    const { cookie, csrf } = await session(ids.outsider, "rej1");
+
+    const reject = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.otherTrip}/plans/${planId}/reject`,
+      headers: { cookie, "x-csrf-token": csrf }, payload: { reasonCode: "ORGANIZER_CHANGED_MIND" },
+    });
+    assert.equal(reject.statusCode, 200);
+    assert.equal(reject.json().reasonCode, "ORGANIZER_CHANGED_MIND");
+
+    const plan = await pool.query("SELECT status FROM control_plane.plans WHERE id = $1", [planId]);
+    assert.equal(plan.rows[0].status, "superseded");
+    const job = await pool.query("SELECT state FROM control_plane.jobs WHERE plan_id = $1", [planId]);
+    assert.equal(job.rows[0].state, "cancelled");
+    const trip = await pool.query("SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [ids.otherTrip]);
+    assert.equal(trip.rows[0].lifecycle_state, "intake_confirmed");
+
+    // A rejected plan cannot then be approved.
+    const approve = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.otherTrip}/plans/${planId}/approve`,
+      headers: { cookie, "x-csrf-token": csrf },
+    });
+    assert.equal(approve.statusCode, 422);
+    // Rejection is not an operator-notification event — only approval is.
+    const outbox = await pool.query(
+      `SELECT count(*)::int AS count FROM control_plane.notification_outbox
+       WHERE trip_id = $1 AND notification_type LIKE 'operator_%'`, [ids.otherTrip]);
+    assert.equal(outbox.rows[0].count, 0);
+  } finally { await app.close(); }
+});
+
+test("with no operator chat id configured, approval still succeeds and simply enqueues nothing", { skip }, async () => {
+  const app = buildApp(profile, { portal: { ...portalDeps(pool), operatorChatId: undefined } });
+  try {
+    const planId = await seedPendingPlan(ids.ownedTrip, "p4");
+    const { cookie, csrf } = await session(ids.owner, "noop1");
+    const before = await pool.query(
+      `SELECT count(*)::int AS count FROM control_plane.notification_outbox
+       WHERE notification_type = 'operator_provisioning_approved'`);
+    const approve = await app.inject({
+      method: "POST", url: `/v1/trips/${ids.ownedTrip}/plans/${planId}/approve`,
+      headers: { cookie, "x-csrf-token": csrf },
+    });
+    assert.equal(approve.statusCode, 200);
+    const job = await pool.query("SELECT state FROM control_plane.jobs WHERE plan_id = $1", [planId]);
+    assert.equal(job.rows[0].state, "queued");
+    const after = await pool.query(
+      `SELECT count(*)::int AS count FROM control_plane.notification_outbox
+       WHERE notification_type = 'operator_provisioning_approved'`);
+    assert.equal(after.rows[0].count, before.rows[0].count, "no operator row was added");
   } finally { await app.close(); }
 });

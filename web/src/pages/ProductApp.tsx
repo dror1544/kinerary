@@ -7,12 +7,12 @@ import { z } from "zod";
 import { api, getMe, getTrip, getTrips, passwordSignIn, signIn, type TripSummary } from "../api";
 import { Brand } from "../components/Brand";
 
-export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join" | "ops";
+export type ProductView = "sign-in" | "trips" | "new-trip" | "trip" | "runtime" | "join";
 
 export default function ProductApp({ view }: { view: ProductView }) {
   if (view === "sign-in") return <SignIn />;
   if (view === "join") return <Join />;
-  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup /> : view === "runtime" ? <Runtime /> : <Ops />}</Protected>;
+  return <Protected>{view === "trips" ? <Trips /> : view === "new-trip" ? <NewTrip /> : view === "trip" ? <TripSetup /> : <Runtime />}</Protected>;
 }
 
 function SignIn() {
@@ -50,14 +50,14 @@ function Protected({ children }: { children: React.ReactNode }) {
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, retry: false });
   if (me.isPending) return <div className="route-loading">Opening your personal space…</div>;
   if (me.isError) return <Navigate replace to={`/sign-in?return_to=${encodeURIComponent(location.pathname)}`} />;
-  return <div className="product-shell"><DashboardHeader name={me.data.displayName} admin={me.data.isProvisioningAdmin} />{children}</div>;
+  return <div className="product-shell"><DashboardHeader name={me.data.displayName} />{children}</div>;
 }
 
-function DashboardHeader({ name, admin }: { name: string; admin: boolean }) {
+function DashboardHeader({ name }: { name: string }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const logout = useMutation({ mutationFn: () => api("/v1/logout", { method: "POST" }), onSuccess: async () => { queryClient.clear(); navigate("/"); } });
-  return <header className="product-header"><Brand /><nav className="dashboard-nav"><Link to="/trips">My trips</Link>{admin && <Link to="/ops/provisioning">Operations</Link>}<span>{name}</span><button className="text-button" onClick={() => logout.mutate()}>Sign out</button></nav></header>;
+  return <header className="product-header"><Brand /><nav className="dashboard-nav"><Link to="/trips">My trips</Link><span>{name}</span><button className="text-button" onClick={() => logout.mutate()}>Sign out</button></nav></header>;
 }
 
 function Trips() {
@@ -66,7 +66,7 @@ function Trips() {
     const grouped: Record<string, TripSummary[]> = { Setup: [], Provisioning: [], Ready: [], Completed: [] };
     for (const trip of trips.data?.trips || []) {
       if (["completed", "sealed"].includes(trip.lifecycleState)) grouped.Completed.push(trip);
-      else if (trip.runtimeReady || ["ready_private", "active"].includes(trip.lifecycleState)) grouped.Ready.push(trip);
+      else if (trip.runtimeReady) grouped.Ready.push(trip);
       else if (trip.provisioning) grouped.Provisioning.push(trip);
       else grouped.Setup.push(trip);
     }
@@ -101,7 +101,34 @@ function TripSetup() {
   if (detail.isPending) return <main className="dashboard-main">Loading trip…</main>;
   if (detail.isError) return <main className="dashboard-main"><Notice>Trip not found or unavailable.</Notice></main>;
   const trip = detail.data;
-  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}><button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>Open Telegram interview</button></WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Request provisioning" detail={trip.provisioning ? humanize(trip.provisioning.reviewState || trip.provisioning.jobState || trip.provisioning.planStatus) : "An operations administrator reviews the immutable plan before work begins."}>{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Request provisioning</button>}</WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
+  return <main className="dashboard-main"><Link className="back-link" to="/trips">← My trips</Link><div className="page-title"><div><p className="eyebrow">Trip setup</p><h1>{trip.title}</h1><p>{trip.destination}</p></div>{trip.runtimeReady && <Link className="button" to={`/trips/${trip.id}/app`}>Open trip</Link>}</div><div className="setup-layout"><section className="workflow-card"><h2>Setup progress</h2><WorkflowStep done={Boolean(trip.interview)} title="Start your private planning interview" detail={trip.interview ? `Interview ${humanize(trip.interview.state)}` : "Continue in the shared Kinerary Telegram bot."}><button className="button button-small" onClick={() => interview.mutate()} disabled={interview.isPending}>Open Telegram interview</button></WorkflowStep><WorkflowStep done={trip.lifecycleState !== "draft" && trip.lifecycleState !== "intake_in_progress"} title="Confirm the trip outline" detail="The normalized summary becomes available here after confirmation." /><WorkflowStep done={Boolean(trip.provisioning)} title="Create the provisioning plan" detail="Kinerary pins an exact release and the resources your trip needs, for you to review before anything is built.">{trip.nextAction === "request_provisioning" && <button className="button button-small" onClick={() => provision.mutate()} disabled={provision.isPending}>Create plan</button>}</WorkflowStep><WorkflowStep done={Boolean(trip.provisioning) && trip.provisioning!.planStatus !== "pending_approval"} title="Review and approve the plan" detail={trip.provisioning ? humanize(trip.provisioning.jobState || trip.provisioning.planStatus) : "Available once the plan exists. You approve it yourself — nobody else has to sign off."}><PlanReview trip={trip} tripId={tripId} /></WorkflowStep>{trip.provisioning?.safeErrorCode && <Notice>Setup needs attention: {humanize(trip.provisioning.safeErrorCode)}</Notice>}{(interview.isError || provision.isError) && <Notice>{(interview.error || provision.error)?.message}</Notice>}</section><InvitePanel trip={trip} /></div></main>;
+}
+
+function PlanReview({ trip, tripId }: { trip: TripSummary; tripId: string }) {
+  const queryClient = useQueryClient();
+  const plan = trip.provisioning;
+  // Approve and reject are the same decision surface, so they share one
+  // mutation: whichever the organizer picks is the review's outcome.
+  const decide = useMutation({
+    mutationFn: (action: "approve" | "reject") => api(`/v1/trips/${tripId}/plans/${plan!.planId}/${action}`, { method: "POST" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trip", tripId] }),
+  });
+  if (!plan) return null;
+  return <div className="plan-review">
+    <dl className="plan-facts">
+      <div><dt>Plan</dt><dd>{plan.planId}</dd></div>
+      <div><dt>Digest</dt><dd className="plan-digest">{plan.digest}</dd></div>
+      {plan.releaseId && <div><dt>Release</dt><dd>{plan.releaseId}</dd></div>}
+    </dl>
+    {plan.planStatus === "pending_approval" && <>
+      <p className="subtle">Approving releases exactly this plan. Provisioning starts on its own once you approve — nothing else has to sign off.</p>
+      <div className="button-row">
+        <button className="button button-small" onClick={() => decide.mutate("approve")} disabled={decide.isPending}>Approve and provision</button>
+        <button className="text-button" onClick={() => decide.mutate("reject")} disabled={decide.isPending}>Reject</button>
+      </div>
+    </>}
+    {decide.isError && <Notice>{decide.error?.message}</Notice>}
+  </div>;
 }
 
 function WorkflowStep({ done, title, detail, children }: { done: boolean; title: string; detail: string; children?: React.ReactNode }) {
@@ -144,14 +171,6 @@ function Join() {
   const [password, setPassword] = useState("");
   const redeem = useMutation({ mutationFn: () => api<{ appPath: string }>("/v1/site-invites/redeem", { method: "POST", body: JSON.stringify({ token, method, ...(method === "password" ? { password } : {}) }) }), onSuccess: ({ appPath }) => navigate(appPath), onError: (error) => { if (method === "google" && error.message.includes("GOOGLE_SIGN_IN_REQUIRED")) signIn(`/join#token=${token}`); } });
   return <div className="product-shell"><header className="product-header"><Brand /></header><main className="placeholder-card"><p className="eyebrow">Private invitation</p>{!token || inspect.isError ? <><h1>This invitation is unavailable</h1><p>Ask the organizer for a fresh link.</p></> : inspect.isPending ? <p>Checking invitation…</p> : <><h1>Join {inspect.data.tripTitle}</h1><p>This invitation is intended for {inspect.data.displayName}.</p><div className="method-tabs"><button className={method === "google" ? "active" : ""} onClick={() => setMethod("google")}>Use Google</button><button className={method === "password" ? "active" : ""} onClick={() => setMethod("password")}>Use a password</button></div>{method === "password" && <label className="standalone-field">Choose a password<input type="password" minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} /></label>}<button className="button wide" onClick={() => redeem.mutate()} disabled={redeem.isPending || inspect.data.status !== "unused"}>Join this trip</button>{redeem.isError && <Notice>{redeem.error.message}</Notice>}</>}</main></div>;
-}
-
-type OpsRequest = { planId: string; tripId: string; title: string; digest: string; releaseId: string; requestedResources: Array<{ logical_type: string; isolation_tier: string }>; createdAt: string };
-function Ops() {
-  const queryClient = useQueryClient();
-  const requests = useQuery({ queryKey: ["ops"], queryFn: () => api<{ requests: OpsRequest[] }>("/v1/ops/provisioning-requests") });
-  const decide = useMutation({ mutationFn: ({ planId, action }: { planId: string; action: "approve" | "reject" }) => api(`/v1/ops/provisioning-requests/${planId}/${action}`, { method: "POST", body: action === "reject" ? JSON.stringify({ reasonCode: "OPERATIONS_REJECTED" }) : undefined }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["ops"] }) });
-  return <main className="dashboard-main"><p className="eyebrow">Operations</p><h1>Provisioning requests</h1><p className="lede">Only the exact immutable plan digest shown here can be released.</p>{requests.isError && <Notice>Administrator access is required.</Notice>}<div className="ops-list">{requests.data?.requests.map((request) => <article className="workflow-card" key={request.planId}><div><small>{request.releaseId}</small><h2>{request.title}</h2><p>{request.requestedResources.map((resource) => `${humanize(resource.logical_type)} · ${humanize(resource.isolation_tier)}`).join(", ")}</p><code>{request.digest}</code></div><div className="ops-actions"><button className="button button-small" onClick={() => decide.mutate({ planId: request.planId, action: "approve" })}>Approve and queue</button><button className="button button-small button-quiet" onClick={() => decide.mutate({ planId: request.planId, action: "reject" })}>Reject</button></div></article>)}</div>{requests.data?.requests.length === 0 && <div className="empty-state"><h2>The queue is clear.</h2></div>}</main>;
 }
 
 function Notice({ children }: { children: React.ReactNode }) { return <div className="notice" role="alert">{children}</div>; }

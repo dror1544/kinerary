@@ -27,6 +27,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
+import { MediaStore } from "../src/relay/media-store.js";
 import {
   AGENT_TURN_TTL_SECONDS,
   closeAgentTurn,
@@ -34,9 +35,12 @@ import {
   openAgentTurn,
   submitAnswerForAgent,
   submitAnswerForChat,
+  agentAlreadySpokeThisTurn,
+  sayForChat
 } from "../src/interview.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
@@ -127,6 +131,35 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
         [a.sessionId],
       );
       assert.ok(row.rows[0]!.answers[Q], "the answer is stored on A's session");
+    });
+  });
+
+  test("an incomplete structured answer is rejected and leaves the question outstanding", async () => {
+    // Run 12, 2026-09-05: `travelers` recorded as a headcount with no names,
+    // structurally valid, substantively useless. The write must not land, and
+    // the question must still read as unanswered afterward — not "answered
+    // badly", which nothing downstream would ever revisit.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const result = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ count: 5, age_group: "adults" }],
+      );
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "INCOMPLETE_ANSWER");
+      assert.ok(result.ok === false && result.detail, "the agent gets told what is actually missing");
+
+      const row = await pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [a.sessionId],
+      );
+      assert.equal(row.rows[0]!.answers.travelers, undefined, "nothing was written — still outstanding, not answered badly");
+
+      // Retrying with a real name succeeds — the rejection was a bounce, not
+      // a dead end.
+      const retry = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ name: "Ella", age: 40 }],
+      );
+      assert.equal(retry.ok, true);
     });
   });
 
@@ -260,6 +293,172 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
     });
   });
 
+  test("/done reaches the summary whatever the interviewer is doing", async () => {
+    // Run 6 ended with the agent asking for approval in prose, the organizer
+    // agreeing, and nothing happening — only the router's Confirm button
+    // writes an intake version, and it had never been sent. This is the path
+    // that does not depend on the agent, or on a button sent long ago.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/done"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "show_summary");
+      if (decision.kind !== "show_summary") return;
+      assert.equal(decision.chatId, a.chatId);
+      // With required questions still outstanding it does NOT jump to a recap
+      // — there is nothing valid to confirm yet — it asks the next one. The
+      // command's job is to be a route that always works, not a way past the
+      // questions the trip cannot be built without.
+      assert.equal(decision.view.state, "interviewing");
+      assert.ok(decision.view.nextQuestion?.required, "and the required question is what comes next");
+    });
+  });
+
+  test("an unrelated command is still forwarded, not swallowed", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/help"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.notEqual(decision.kind, "show_summary");
+    });
+  });
+
+  test("an uploaded document reaches the interviewer, re-hosted", async () => {
+    // Regression, 2026-09-04 run 2. This branch called the plain `toWireEvent`,
+    // so a caption-less PDF arrived as `text: ""` and the interviewer told the
+    // organizer an empty message had come through — on the one route whose own
+    // script asks for a trip-plan document. The companion route had carried
+    // media since 2026-09-03; only this one did not.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const pdf = Buffer.from("%PDF-1.4 itinerary");
+      const store = new MediaStore();
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 2,
+          message: {
+            message_id: 12,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            telegram: { async fetchFile() { return { bytes: pdf, mime: "application/pdf" }; } },
+            store,
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.message_type, "document");
+      assert.equal(decision.event.media?.[0]?.filename, "japan.pdf");
+      const url = decision.event.media_urls?.[0] ?? "";
+      assert.match(url, /^http:\/\/127\.0\.0\.1:4312\/relay\/media\/[0-9a-f]{32}$/);
+      // The point of re-hosting: the gateway is handed a reference it can
+      // fetch, never a Telegram URL carrying the bot token.
+      assert.ok(store.get(url.split("/").pop()!), "the bytes are readable through the store");
+    });
+  });
+
+  test("a document turn is a document turn even when re-hosting fails", async () => {
+    // 2026-09-06 run 14. `isDocumentTurn` was read off `media_urls`, which is
+    // only populated when re-hosting SUCCEEDS. A failed re-host therefore
+    // silently downgraded the turn to the ordinary 30s floor — and the agent,
+    // which now has MORE to do (notice the file is unreadable, say so, record
+    // whatever it can), got LESS time to do it. The watchdog closed the turn
+    // 28 seconds in, and every write the agent made afterwards was refused;
+    // the organizer was told "I could not save the answer".
+    //
+    // The attachment is what makes it a document turn. Whether the bytes
+    // arrived decides what the agent can DO, never how long it may take.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            // Every failure mode of fetchFile reduces to this.
+            telegram: { async fetchFile() { return null; } },
+            store: new MediaStore(),
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.deepEqual(decision.event.media_urls, undefined, "re-hosting failed, as set up");
+      assert.equal(decision.hadAttachment, true, "and the turn still knows a file was sent");
+    });
+  });
+
+  test("a plain text turn is not a document turn", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 4,
+          message: {
+            message_id: 14,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            text: "we are going to Japan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.hadAttachment, false);
+    });
+  });
+
+  test("an attachment still forwards when the connector has no media plane", async () => {
+    // Degrade, never drop: without media deps the turn is still handed over, so
+    // the agent can say it cannot read the file rather than going silent.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+            caption: "our plan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.text, "our plan");
+      assert.equal(decision.event.media_urls, undefined);
+    });
+  });
+
   test("the forwarded event is stamped from the chat, not from the message text", async () => {
     await withTwoInterviews(async ({ pool, a, b }) => {
       // The organizer's own words name the other chat and a different profile.
@@ -274,6 +473,53 @@ describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABA
       assert.equal(decision.event.source.chat_id, a.chatId);
       assert.equal(decision.event.source.profile, "trip-intake");
       assert.equal(decision.sessionId, a.sessionId);
+    });
+  });
+});
+
+describe("prose instead of speaking, versus prose after speaking", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  test("a turn starts with the agent having said nothing", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("say_for_chat counts as speaking", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const said = await sayForChat(pool, a.chatId, "כמעט סיימנו");
+      assert.equal(said.ok, true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+    });
+  });
+
+  test("a NEW turn starts silent again", async () => {
+    // Per turn, not per session. An agent that spoke properly once must not be
+    // muted for the rest of the interview.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await sayForChat(pool, a.chatId, "first");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("with no open turn, nothing is claimed to have been said", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("one chat's speaking does not silence another's", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await openAgentTurn(pool, b.chatId, b.sessionId);
+      await sayForChat(pool, a.chatId, "only a");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, b.chatId), false);
     });
   });
 });

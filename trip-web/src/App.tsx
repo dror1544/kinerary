@@ -1,3 +1,5 @@
+import { heroCandidates, useHeroPhoto } from "./hero-photo";
+import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -11,6 +13,7 @@ import {
   Clock3,
   CloudSun,
   Download,
+  DollarSign,
   Compass,
   ExternalLink,
   GalleryHorizontalEnd,
@@ -42,10 +45,14 @@ import brandMark from "./assets/brand/mark.svg";
 import {
   ActiveItinerary,
   Booking,
+  BudgetItem,
   CurrentUser,
   approveBookingDraft,
   createBooking,
+  createBudgetItem,
   deleteBooking,
+  deleteBudgetItem,
+  deletePhoto,
   createItineraryItem,
   deleteItineraryItem,
   ItineraryItem,
@@ -55,6 +62,7 @@ import {
   extractBookingDetails,
   getAuthenticatedDocument,
   getBookings,
+  getBudget,
   getConfig,
   getConfirmations,
   getFlightStatus,
@@ -62,17 +70,24 @@ import {
   getItinerary,
   getMe,
   getMoments,
+  getPhotoComments,
+  getPhotoReactions,
+  getPhotos,
   getToday,
   getUiSettings,
   getWeather,
   login,
+  postPhotoComment,
   reportIssue,
   runtimeUrl,
   tokenStore,
+  togglePhotoReaction,
   updateBooking,
+  updateBudgetItem,
   updateItineraryItem,
   uploadBookingAppleWallet,
   uploadBookingConfirmation,
+  uploadPhoto,
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
@@ -82,6 +97,7 @@ type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attra
 type ItineraryTimeMode = "exact" | "rough" | "none";
 
 const roughTimes = ["morning", "noon", "afternoon", "evening"] as const;
+const photoReactionEmojis = ["❤️", "😂", "🔥", "👏", "😮"] as const;
 
 const tabIcons = {
   today: Home,
@@ -327,7 +343,7 @@ function LoginScreen() {
   );
 }
 
-function Hero({
+export function Hero({
   config,
   settings,
   lang,
@@ -350,7 +366,7 @@ function Hero({
 }) {
   const activePhase = config?.phases?.find((phase) => phase.id === heroPhaseId);
   const activePhaseName = activePhase ? text(activePhase.title, lang) : "";
-  const fallback = activePhase?.hero?.photo || settings?.hero.url || config?.meta?.homePhoto || config?.phases?.[0]?.hero?.photo || config?.meta?.mapPhoto || "";
+  const { photo: fallback, unavailable } = useHeroPhoto(heroCandidates(config, settings?.hero.url, heroPhaseId));
   const heroLogo = tripLogoUrl(config?.meta?.logo) || brandMark;
   const heroLogoAlt = config?.meta?.logoAlt || config?.meta?.title || "Trip";
   const visiblePhoto = useRef(fallback);
@@ -367,7 +383,7 @@ function Hero({
   }, [fallback]);
   const backgroundPosition = `${(settings?.hero.focal_x ?? 0.5) * 100}% ${(settings?.hero.focal_y ?? 0.45) * 100}%`;
   return (
-    <header className={departingPhoto ? "trip-hero phase-shift" : "trip-hero"}>
+    <header className={departingPhoto ? "trip-hero phase-shift" : "trip-hero"} data-photo-state={fallback ? "ready" : unavailable ? "unavailable" : "loading"}>
       {departingPhoto ? <div className="hero-image-layer hero-image-departing" aria-hidden="true" style={{ backgroundImage: `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${departingPhoto}")`, backgroundPosition }} /> : null}
       <div key={fallback || "solid"} className="hero-image-layer hero-image-arriving" aria-hidden="true" style={{ backgroundImage: fallback ? `linear-gradient(180deg, rgba(16,38,58,.1), rgba(16,38,58,.54)), url("${fallback}")` : undefined, backgroundPosition }} />
       <nav className="topline" aria-label="Trip">
@@ -601,7 +617,7 @@ function TodayView({
   lang: Lang;
   isOrganizer?: boolean;
 }) {
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
@@ -723,6 +739,7 @@ function JourneyView({
   const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
   const daySpineRef = useRef<HTMLElement>(null);
+  const handledFocus = useRef<JourneyFocus | null>(null);
 
   useEffect(() => {
     if (!selectedPhase && phaseGroups[0]?.id) setSelectedPhase(phaseGroups[0].id);
@@ -739,7 +756,7 @@ function JourneyView({
   }, [activePhase, selected]);
 
   useEffect(() => {
-    if (!focus?.phaseId) return;
+    if (!focus?.phaseId || handledFocus.current === focus) return;
     const phase = phaseGroups.find((entry) => entry.id === focus.phaseId);
     if (!phase) return;
     setSelectedPhase(phase.id);
@@ -748,8 +765,10 @@ function JourneyView({
   }, [focus, phaseGroups]);
 
   useEffect(() => {
-    if (!focus?.phaseId || activePhase?.id !== focus.phaseId) return;
+    if (!focus?.phaseId || handledFocus.current === focus || activePhase?.id !== focus.phaseId) return;
+    if (focus.date && activePhase.days.some(day => day.date === focus.date) && activeDate !== focus.date) return;
     const frame = window.requestAnimationFrame(() => {
+      handledFocus.current = focus;
       const target = focus.itemUid ? document.getElementById(`itinerary-item-${encodeURIComponent(focus.itemUid)}`) : null;
       (target || daySpineRef.current)?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -762,6 +781,7 @@ function JourneyView({
   const [timeMode, setTimeMode] = useState<ItineraryTimeMode>("none");
   const [enrichmentNote, setEnrichmentNote] = useState("");
   const editorRef = useRef<HTMLFormElement>(null);
+  useLiveEditGuard(Boolean(editing), "itinerary");
 
   useEffect(() => {
     if (!editing) return;
@@ -1161,6 +1181,7 @@ function bookingDraft(booking: Booking) {
 export function BookingEditPanel({ booking, config, lang, onClose }: { booking: Booking; config?: TripConfig; lang: Lang; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState(() => bookingDraft(booking));
+  useLiveEditGuard(true, "bookings");
   const [confirmationFile, setConfirmationFile] = useState<File | null>(null);
   const [walletFile, setWalletFile] = useState<File | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -1665,13 +1686,326 @@ function MapView({ config, itinerary, lang, onOpenItinerary }: { config?: TripCo
   );
 }
 
-function ModulePlaceholder({ module, lang }: { module: Module; lang: Lang }) {
+const budgetCategoryMeta: Record<string, { icon: string; en: string; he: string }> = {
+  flight: { icon: "✈️", en: "Flights", he: "טיסות" },
+  transport: { icon: "🚆", en: "Transport", he: "תחבורה" },
+  car: { icon: "🚗", en: "Car", he: "רכב" },
+  hotel: { icon: "🏨", en: "Lodging", he: "לינה" },
+  lodging: { icon: "🏨", en: "Lodging", he: "לינה" },
+  food: { icon: "🍽️", en: "Food", he: "אוכל" },
+  activity: { icon: "🎟️", en: "Activities", he: "פעילויות" },
+  activities: { icon: "🎟️", en: "Activities", he: "פעילויות" },
+  shopping: { icon: "🛍️", en: "Shopping", he: "קניות" },
+  other: { icon: "📌", en: "Other", he: "אחר" },
+};
+
+function budgetMoney(value: number) {
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: value % 1 ? 2 : 0 }).format(value);
+}
+
+function budgetPhaseName(phaseId: string, config: TripConfig | undefined, lang: Lang) {
+  if (phaseId === "intl_flights") return copy(lang, "International flights", "טיסות בינלאומיות");
+  if (phaseId === "general") return copy(lang, "Whole trip", "כל הטיול");
+  const phase = config?.phases?.find((item) => item.id === phaseId);
+  return phase ? text(phase.title, lang) : phaseId.replace(/[_-]+/g, " ");
+}
+
+function BudgetRow({ item, lang, onSave, onDelete }: { item: BudgetItem; lang: Lang; onSave: (id: number, values: { amount: number; description: string }) => Promise<boolean>; onDelete: (id: number) => Promise<boolean> }) {
+  const [editing, setEditing] = useState(false);
+  useLiveEditGuard(editing, "budget");
+  const [description, setDescription] = useState(item.description);
+  const [amount, setAmount] = useState(String(item.amount));
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const meta = budgetCategoryMeta[item.category] || budgetCategoryMeta.other;
+
+  if (editing) {
+    return (
+      <div className="budget-row budget-row-editing">
+        <span className="budget-category-icon" aria-hidden="true">{meta.icon}</span>
+        <label>{copy(lang, "Description", "תיאור")}<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+        <label>{copy(lang, "Amount", "סכום")}<input type="number" min="0" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>
+        <div className="budget-row-actions">
+          <button type="button" onClick={async () => { if (await onSave(item.id, { description: description.trim(), amount: Number(amount) })) setEditing(false); }}>{copy(lang, "Save", "שמירה")}</button>
+          <button type="button" onClick={() => setEditing(false)}>{copy(lang, "Cancel", "ביטול")}</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <section className="module-layout">
+    <div className={item.is_estimate && item.amount === 0 ? "budget-row budget-row-missing" : "budget-row"}>
+      <span className="budget-category-icon" title={meta[lang]}>{meta.icon}</span>
+      <div className="budget-row-copy">
+        <strong>{item.description}</strong>
+        <small>{meta[lang]}{item.is_estimate ? ` · ${copy(lang, "estimate", "הערכה")}` : ""}</small>
+      </div>
+      <strong className={item.is_estimate ? "budget-estimate" : ""}>{item.is_estimate && item.amount === 0 ? "?" : `${item.is_estimate ? "~" : ""}${budgetMoney(item.amount)}`}</strong>
+      <div className="budget-row-actions">
+        <button type="button" onClick={() => { setDescription(item.description); setAmount(String(item.amount)); setEditing(true); }} aria-label={`${copy(lang, "Edit", "עריכה")} ${item.description}`}><Pencil size={15} /></button>
+        {confirmingDelete ? (
+          <>
+            <button className="danger-action" type="button" onClick={async () => { if (await onDelete(item.id)) setConfirmingDelete(false); }}>{copy(lang, "Confirm", "אישור")}</button>
+            <button type="button" onClick={() => setConfirmingDelete(false)}>{copy(lang, "Cancel", "ביטול")}</button>
+          </>
+        ) : <button type="button" onClick={() => setConfirmingDelete(true)} aria-label={`${copy(lang, "Delete", "מחיקה")} ${item.description}`}><Trash2 size={15} /></button>}
+      </div>
+    </div>
+  );
+}
+
+export function BudgetView({ config, lang }: { config?: TripConfig; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const budget = useQuery({ queryKey: ["budget"], queryFn: getBudget });
+  const [phase, setPhase] = useState(config?.phases?.[0]?.id || "general");
+  const [category, setCategory] = useState("other");
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [isEstimate, setIsEstimate] = useState(false);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const items = budget.data || [];
+  const total = items.reduce((sum, item) => sum + (item.amount || 0), 0);
+  const missing = items.filter((item) => item.is_estimate && item.amount === 0);
+  const travelerCount = Math.max(config?.participants?.length || 0, 1);
+  const configuredOrder = new globalThis.Map((config?.phases || []).map((item, index) => [item.id, index]));
+  const groups = Array.from(items.reduce((map, item) => {
+    if (!map.has(item.phase)) map.set(item.phase, []);
+    map.get(item.phase)!.push(item);
+    return map;
+  }, new globalThis.Map<string, BudgetItem[]>()).entries()).sort(([a], [b]) => {
+    const rank = (value: string) => value === "intl_flights" ? -1 : configuredOrder.get(value) ?? 999;
+    return rank(a) - rank(b) || a.localeCompare(b);
+  });
+
+  async function refresh() {
+    await queryClient.invalidateQueries({ queryKey: ["budget"] });
+  }
+
+  async function addItem(event: React.FormEvent) {
+    event.preventDefault();
+    const parsedAmount = Number(amount);
+    if (!description.trim() || !Number.isFinite(parsedAmount) || parsedAmount < 0) {
+      setError(copy(lang, "Add a description and a valid amount.", "יש להוסיף תיאור וסכום תקין."));
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await createBudgetItem({ phase, category, description: description.trim(), amount: parsedAmount, is_estimate: isEstimate });
+      setDescription("");
+      setAmount("");
+      setIsEstimate(false);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not add expense.", "לא ניתן להוסיף הוצאה."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveItem(id: number, values: { amount: number; description: string }) {
+    if (!values.description || !Number.isFinite(values.amount) || values.amount < 0) {
+      setError(copy(lang, "Add a description and a valid amount.", "יש להוסיף תיאור וסכום תקין."));
+      return false;
+    }
+    setError("");
+    try {
+      await updateBudgetItem(id, values);
+      await refresh();
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not update expense.", "לא ניתן לעדכן את ההוצאה."));
+      return false;
+    }
+  }
+
+  async function removeItem(id: number) {
+    setError("");
+    try {
+      await deleteBudgetItem(id);
+      await refresh();
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not delete expense.", "לא ניתן למחוק את ההוצאה."));
+      return false;
+    }
+  }
+
+  return (
+    <section className="module-layout budget-layout">
       <div className="module-header">
-        <span className="panel-label"><Sparkles size={16} /> {moduleLabel(module, lang)}</span>
-        <h2>{moduleLabel(module, lang)} is next in the Modern rebuild.</h2>
-        <p>It stays visible in navigation so we can keep the structure stable while rebuilding parity slice by slice.</p>
+        <span className="panel-label"><DollarSign size={16} /> {moduleLabel("budget", lang)}</span>
+        <h2>{copy(lang, "Trip budget", "תקציב הטיול")}</h2>
+        <p>{copy(lang, "Known costs and working estimates, grouped by the part of the trip they belong to.", "עלויות ידועות והערכות עבודה, לפי חלקי הטיול.")}</p>
+      </div>
+      <section className="budget-summary" aria-label={copy(lang, "Budget summary", "סיכום תקציב")}>
+        <div><small>{copy(lang, "Current total", "סה״כ נוכחי")}</small><strong>{budgetMoney(total)}</strong></div>
+        <div><small>{copy(lang, "Split", "חלוקה")}</small><strong>{budgetMoney(total / travelerCount)} {copy(lang, "per traveler", "למטייל")}</strong></div>
+        <div><small>{copy(lang, "Still unknown", "עדיין חסר")}</small><strong>{missing.length}</strong></div>
+      </section>
+      {missing.length ? <p className="module-alert"><AlertTriangle size={17} /> {copy(lang, `${missing.length} estimated ${missing.length === 1 ? "cost has" : "costs have"} no amount yet.`, `ל-${missing.length} הוצאות משוערות עדיין אין סכום.`)}</p> : null}
+      <div className="budget-groups">
+        {groups.map(([phaseId, phaseItems]) => (
+          <section className="budget-phase-card" key={phaseId}>
+            <header><div><small>{copy(lang, "Trip phase", "שלב בטיול")}</small><h3>{budgetPhaseName(phaseId, config, lang)}</h3></div><strong>{copy(lang, "Subtotal", "סיכום ביניים")} · {budgetMoney(phaseItems.reduce((sum, item) => sum + item.amount, 0))}</strong></header>
+            <div>{phaseItems.map((item) => <BudgetRow key={item.id} item={item} lang={lang} onSave={saveItem} onDelete={removeItem} />)}</div>
+          </section>
+        ))}
+        {!budget.isLoading && !groups.length ? <p className="empty-state">{copy(lang, "No costs have been added yet.", "עדיין לא נוספו עלויות.")}</p> : null}
+        {budget.isLoading ? <p className="empty-state">{copy(lang, "Loading budget…", "טוען תקציב…")}</p> : null}
+        {budget.isError ? <p className="form-error" role="alert">{copy(lang, "Could not load the budget.", "לא ניתן לטעון את התקציב.")}</p> : null}
+      </div>
+      <form className="budget-add-panel" onSubmit={addItem}>
+        <div><span className="panel-label"><Plus size={15} /> {copy(lang, "Add a cost", "הוספת הוצאה")}</span><h3>{copy(lang, "Keep the shared picture current", "עדכון התמונה המשותפת")}</h3></div>
+        <div className="budget-add-fields">
+          <label>{copy(lang, "Trip phase", "שלב בטיול")}<select value={phase} onChange={(event) => setPhase(event.target.value)}><option value="general">{copy(lang, "Whole trip", "כל הטיול")}</option><option value="intl_flights">{copy(lang, "International flights", "טיסות בינלאומיות")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</select></label>
+          <label>{copy(lang, "Category", "קטגוריה")}<select value={category} onChange={(event) => setCategory(event.target.value)}>{Object.entries(budgetCategoryMeta).filter(([key]) => !["lodging", "activities"].includes(key)).map(([key, meta]) => <option key={key} value={key}>{meta.icon} {meta[lang]}</option>)}</select></label>
+          <label>{copy(lang, "Description", "תיאור")}<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+          <label>{copy(lang, "Amount (USD)", "סכום (USD)")}<input type="number" min="0" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>
+          <label className="checkbox-field"><input type="checkbox" checked={isEstimate} onChange={(event) => setIsEstimate(event.target.checked)} /> {copy(lang, "This is an estimate", "זו הערכה")}</label>
+        </div>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <button className="primary-action" type="submit" disabled={saving}>{saving ? copy(lang, "Adding…", "מוסיף…") : copy(lang, "Add expense", "הוספת הוצאה")}</button>
+      </form>
+    </section>
+  );
+}
+
+export function PhotosView({ config, currentUser, lang }: { config?: TripConfig; currentUser?: CurrentUser; lang: Lang }) {
+  const queryClient = useQueryClient();
+  const photos = useQuery({ queryKey: ["photos"], queryFn: () => getPhotos() });
+  const reactions = useQuery({ queryKey: ["photo-reactions"], queryFn: getPhotoReactions });
+  const comments = useQuery({ queryKey: ["photo-comments"], queryFn: getPhotoComments });
+  const [filter, setFilter] = useState("all");
+  const [uploadPhase, setUploadPhase] = useState(config?.phases?.[0]?.id || "general");
+  const [caption, setCaption] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  useLiveEditGuard(Object.values(commentDrafts).some(Boolean), "photos");
+  const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const visiblePhotos = (photos.data || []).filter((photo) => filter === "all" || photo.phase === filter);
+
+  async function refreshPhotos() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["photos"] }),
+      queryClient.invalidateQueries({ queryKey: ["photo-reactions"] }),
+      queryClient.invalidateQueries({ queryKey: ["photo-comments"] }),
+    ]);
+  }
+
+  async function submitUpload(event: React.FormEvent) {
+    event.preventDefault();
+    if (!file) {
+      setError(copy(lang, "Choose a photo first.", "יש לבחור תמונה תחילה."));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await uploadPhoto(file, { phase: uploadPhase, caption: caption.trim() });
+      setFile(null);
+      setCaption("");
+      await refreshPhotos();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not upload photo.", "לא ניתן להעלות תמונה."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function react(photoId: string, emoji: string) {
+    setError("");
+    try {
+      await togglePhotoReaction(photoId, emoji);
+      await queryClient.invalidateQueries({ queryKey: ["photo-reactions"] });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not save reaction.", "לא ניתן לשמור את התגובה."));
+    }
+  }
+
+  async function submitComment(photoId: string) {
+    const body = commentDrafts[photoId]?.trim();
+    if (!body) return;
+    setError("");
+    try {
+      await postPhotoComment(photoId, body);
+      setCommentDrafts((drafts) => ({ ...drafts, [photoId]: "" }));
+      await queryClient.invalidateQueries({ queryKey: ["photo-comments"] });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not save comment.", "לא ניתן לשמור את התגובה."));
+    }
+  }
+
+  async function removePhoto(photoId: string) {
+    setError("");
+    try {
+      await deletePhoto(photoId);
+      setConfirmingDelete(null);
+      await refreshPhotos();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : copy(lang, "Could not delete photo.", "לא ניתן למחוק את התמונה."));
+    }
+  }
+
+  return (
+    <section className="module-layout photos-layout">
+      <div className="module-header">
+        <span className="panel-label"><Camera size={16} /> {moduleLabel("photos", lang)}</span>
+        <h2>{copy(lang, "Trip photos", "תמונות מהטיול")}</h2>
+        <p>{copy(lang, "A shared gallery for the moments everyone wants to keep, with reactions and conversation together.", "גלריה משותפת לרגעים שרוצים לשמור, יחד עם תגובות ושיחה.")}</p>
+      </div>
+      <form className="photo-upload-panel" onSubmit={submitUpload}>
+        <label className="upload-control"><Upload size={18} /><span>{file?.name || copy(lang, "Choose photo", "בחירת תמונה")}</span><input type="file" accept="image/*" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
+        <label>{copy(lang, "Album", "אלבום")}<select value={uploadPhase} onChange={(event) => setUploadPhase(event.target.value)}><option value="general">{copy(lang, "General", "כללי")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</select></label>
+        <label className="photo-caption-field">{copy(lang, "Caption", "כיתוב")}<input value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={copy(lang, "What was happening?", "מה קרה כאן?")} /></label>
+        <button className="primary-action" type="submit" disabled={busy}>{busy ? copy(lang, "Uploading…", "מעלה…") : copy(lang, "Add to gallery", "הוספה לגלריה")}</button>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+      </form>
+      <div className="photo-filter" role="group" aria-label={copy(lang, "Photo album", "אלבום תמונות")}>
+        <button className={filter === "all" ? "active" : ""} type="button" onClick={() => setFilter("all")}>{copy(lang, "All", "הכול")}</button>
+        <button className={filter === "general" ? "active" : ""} type="button" onClick={() => setFilter("general")}>{copy(lang, "General", "כללי")}</button>
+        {config?.phases?.map((item) => <button className={filter === item.id ? "active" : ""} key={item.id} type="button" onClick={() => setFilter(item.id)}>{text(item.title, lang)}</button>)}
+      </div>
+      <div className="photo-grid">
+        {visiblePhotos.map((photo) => {
+          const photoComments = comments.data?.[photo.id] || [];
+          const photoReactions = reactions.data?.[photo.id] || {};
+          const authorName = personName(photo.user, lang);
+          const alt = photo.caption || copy(lang, `Photo by ${authorName}`, `תמונה מאת ${authorName}`);
+          return (
+            <article className="photo-card" key={photo.id}>
+              <img className="photo-image" src={safeFileUrl("/api/photos/file", photo.filename)} alt={alt} loading="lazy" />
+              <div className="photo-card-body">
+                <div className="photo-author"><PersonAvatar username={photo.username} name={authorName} color={photo.user.color} size="small" /><div><strong>{authorName}</strong><small>{new Date(photo.uploadedAt).toLocaleDateString(lang === "he" ? "he-IL" : "en-US", { month: "short", day: "numeric", year: "numeric" })} · {budgetPhaseName(photo.phase, config, lang)}</small></div></div>
+                {photo.caption ? <p className="photo-caption">{photo.caption}</p> : null}
+                <div className="photo-reactions">
+                  {photoReactionEmojis.map((emoji) => {
+                    const users = photoReactions[emoji] || [];
+                    const active = users.includes(currentUser?.username || "");
+                    return <button className={active ? "active" : ""} key={emoji} type="button" onClick={() => react(photo.id, emoji)} aria-label={`${copy(lang, "React with", "תגובה עם")} ${emoji}`}>{emoji}{users.length ? <span>{users.length}</span> : null}</button>;
+                  })}
+                </div>
+                <div className="photo-comments">
+                  {photoComments.map((comment) => {
+                    const commentName = personName(comment.user, lang);
+                    return <div className="photo-comment" key={comment.id}><PersonAvatar username={comment.username} name={commentName} color={comment.user.color} size="small" /><div><strong>{commentName}</strong><p>{comment.body}</p></div></div>;
+                  })}
+                  <div className="photo-comment-form"><input aria-label={`${copy(lang, "Comment on", "תגובה על")} ${alt}`} value={commentDrafts[photo.id] || ""} onChange={(event) => setCommentDrafts((drafts) => ({ ...drafts, [photo.id]: event.target.value }))} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); submitComment(photo.id); } }} placeholder={copy(lang, "Write a comment", "כתיבת תגובה")} /><button type="button" onClick={() => submitComment(photo.id)} aria-label={copy(lang, "Send comment", "שליחת תגובה")}><Send size={16} /></button></div>
+                </div>
+                {photo.username === currentUser?.username ? (
+                  <div className="photo-delete-actions">
+                    {confirmingDelete === photo.id ? <><span>{copy(lang, "Delete this photo?", "למחוק את התמונה?")}</span><button className="danger-action" type="button" onClick={() => removePhoto(photo.id)}>{copy(lang, "Delete", "מחיקה")}</button><button type="button" onClick={() => setConfirmingDelete(null)}>{copy(lang, "Cancel", "ביטול")}</button></> : <button type="button" onClick={() => setConfirmingDelete(photo.id)}><Trash2 size={15} /> {copy(lang, "Delete photo", "מחיקת תמונה")}</button>}
+                  </div>
+                ) : null}
+              </div>
+            </article>
+          );
+        })}
+        {!photos.isLoading && !visiblePhotos.length ? <p className="empty-state">{copy(lang, "No photos in this album yet.", "עדיין אין תמונות באלבום הזה.")}</p> : null}
+        {photos.isLoading || reactions.isLoading || comments.isLoading ? <p className="empty-state">{copy(lang, "Loading photos…", "טוען תמונות…")}</p> : null}
+        {photos.isError || reactions.isError || comments.isError ? <p className="form-error" role="alert">{copy(lang, "Could not load the gallery.", "לא ניתן לטעון את הגלריה.")}</p> : null}
       </div>
     </section>
   );
@@ -1702,22 +2036,23 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
     }
   }
 
-  const workflows: Array<{ label: string; module?: Module }> = [
+  const workflows: Array<{ label: string; module?: Module; classic?: boolean }> = [
+    { label: "Account, avatar and sign-in", classic: true },
     { label: "Bookings, PDFs and wallet", module: "bookings" },
     { label: "Maps and country info", module: "map" },
     { label: "Budget", module: "budget" },
     { label: "Photos and reactions", module: "photos" },
-    { label: "Tasks and packing" },
-    { label: "RSVP, ratings and comments" },
-    { label: "Lost and found" },
-    { label: "Trivia and leaderboard" },
+    { label: "Tasks and packing", classic: true },
+    { label: "RSVP, ratings and comments", classic: true },
+    { label: "Lost and found", classic: true },
+    { label: "Trivia and leaderboard", classic: true },
   ];
   return (
     <section className="more-layout">
       <div className="section-heading">
         <span className="panel-label"><Settings size={16} /> More</span>
-        <h2>Classic remains one tap away while Modern reaches parity.</h2>
-        <p>{config?.meta?.title || "This trip"} keeps budget and costs outside the daily itinerary.</p>
+        <h2>Modern for the trip. Classic for established group utilities.</h2>
+        <p>{config?.meta?.title || "This trip"} keeps budget and costs outside the daily itinerary. Legacy-only tools stay available to every traveler.</p>
       </div>
       <section className="participants-panel" aria-labelledby="participants-heading">
         <div className="participants-heading">
@@ -1764,7 +2099,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
           <a
             key={workflow.label}
             className="workflow-link"
-            href={workflow.module ? `#${workflow.module}` : "#more"}
+            href={workflow.module ? `#${workflow.module}` : classicHref()}
             onClick={(event) => {
               if (!workflow.module) return;
               event.preventDefault();
@@ -1772,7 +2107,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             }}
           >
             <ChevronLeft size={16} />
-            <span>{workflow.label}</span>
+            <span>{workflow.label}{workflow.classic ? <small className="workflow-legacy">Classic</small> : null}</span>
           </a>
         ))}
       </div>
@@ -1872,17 +2207,22 @@ export default function App() {
   const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const authed = Boolean(tokenStore.get());
+  useTripUpdates(authed);
   const config = useQuery({ queryKey: ["config"], queryFn: getConfig, enabled: authed });
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, enabled: authed });
   const ui = useQuery({ queryKey: ["ui"], queryFn: getUiSettings, enabled: authed });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes, enabled: authed });
-  const itinerary = useQuery({ queryKey: ["itinerary"], queryFn: getItinerary, enabled: authed, refetchInterval: 60_000 });
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday, enabled: authed, refetchInterval: 60_000 });
+  const itinerary = useQuery({ queryKey: ["itinerary"], queryFn: getItinerary, enabled: authed });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday, enabled: authed });
 
   useEffect(() => {
     document.documentElement.lang = lang;
     document.documentElement.dir = lang === "he" ? "rtl" : "ltr";
   }, [lang]);
+
+  useEffect(() => {
+    if (me.data) localStorage.setItem("trip-user", JSON.stringify(me.data));
+  }, [me.data]);
 
   useEffect(() => {
     const syncHash = () => {
@@ -1933,8 +2273,8 @@ export default function App() {
   const moduleContent = activeModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
-    budget: <ModulePlaceholder module="budget" lang={lang} />,
-    photos: <ModulePlaceholder module="photos" lang={lang} />,
+    budget: <BudgetView config={config.data} lang={lang} />,
+    photos: <PhotosView config={config.data} currentUser={me.data} lang={lang} />,
   }[activeModule] : null;
   const content = moduleContent || tabContent;
 

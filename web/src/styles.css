@@ -596,3 +596,11 @@ h1 { margin: 0; max-width: 700px; font: 800 clamp(48px, 5.1vw, 78px)/1.01 "Manro
   .ops-actions .button { width: 100%; }
   .placeholder-card { margin: 8vh 16px; padding: 30px; }
 }
+
+.plan-review { margin-top: 4px; }
+.plan-facts { display: grid; gap: 8px; margin: 0 0 14px; }
+.plan-facts div { display: flex; gap: 10px; align-items: baseline; }
+.plan-facts dt { color: #6a7a83; font-size: 13px; min-width: 62px; margin: 0; }
+.plan-facts dd { margin: 0; font-size: 13px; }
+.plan-digest { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.button-row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }

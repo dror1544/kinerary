@@ -26,6 +26,10 @@ const pool = createDatabasePool(connectionString, () => {
 });
 
 let signup: SignupDependencies | undefined;
+// Hoisted out of the signup block because the approval routes address their
+// operator notification to the same chat as the signup DM. One configured
+// operator, one chat id, resolved once.
+let operatorChatId: string | undefined;
 if (profile.signup) {
   const signupConfig = profile.signup;
   const [botToken, actionSecret, webhookSecret, superAdminChatId] = await Promise.all([
@@ -40,6 +44,7 @@ if (profile.signup) {
   // before this build's first provider construction, per the ordering
   // guarantee its own test asserts: an invalid profile must never reach a
   // constructed provider.
+  operatorChatId = superAdminChatId;
   const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
     telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`) } : undefined,
   }));
@@ -83,6 +88,7 @@ if (profile.signup) {
     db: pool,
     config: {
       approvalTtlSeconds: 86400,
+      operatorChatId,
     },
   };
 }
@@ -109,7 +115,7 @@ if (chatRoutingKey) {
 let portal: PortalDependencies | undefined;
 if (profile.web) {
   const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([resolveSecretRef(profile.web.google_client_id_secret_ref), resolveSecretRef(profile.web.google_client_secret_ref), resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)]);
-  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, provisioningAdminSubjectDigests: new Set(profile.web.provisioning_admin_subject_digests) };
+  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
 }
 
 // The interviewer agent's chat-addressed interview routes, which the MCP
@@ -152,7 +158,16 @@ if (signup) {
   const timer = setInterval(() => {
     if (dispatching) return;
     dispatching = true;
-    dispatchPendingTripNotifications(pool, notification, (line) => process.stderr.write(`${line}\n`))
+    dispatchPendingTripNotifications(
+      pool,
+      notification,
+      (line) => process.stderr.write(`${line}\n`),
+      // For the add-to-group link in a companion introduction. Read from the
+      // profile rather than stored per outbox row: it belongs to the
+      // deployment, and a row written before a bot rename would otherwise hand
+      // an organizer a link to a handle that no longer resolves.
+      { botUsername: profile.web?.telegram_bot_username ?? null },
+    )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
           safe_error_code: error instanceof Error ? error.name : "UNKNOWN",

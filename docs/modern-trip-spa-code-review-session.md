@@ -173,3 +173,38 @@ failure; falsy-zero skipping a map stop on the equator/prime meridian;
 - A pre-existing staged change to
   `control-plane/worker/control_plane_worker/provisioner.py` was left untouched
   and out of every commit above.
+
+## Hero reliability follow-up — 2026-09-09
+
+Modern previously put the chosen URL directly into a CSS background. Uploaded
+heroes live behind `authRequired`, so direct browser requests lacked the bearer
+token; gateway-relative CSS URLs also bypassed `runtimePath`. The `||` chain
+selected the first nonempty URL without checking whether it loaded, and the
+transition removed the old image after 900 ms regardless of replacement readiness.
+
+`trip-web/src/hero-photo.ts` now authenticates same-origin image requests, uses
+the runtime prefix, validates image MIME and decoding, and only then swaps the
+visible photo. External image requests never receive the trip bearer token.
+Failed candidates fall through to other configured photos; failed/slow changes
+retain the last decoded photo. Retries are bounded and restart on reconnect;
+obsolete loads cannot replace the current selection. Decoded-image memory is
+bounded and private object URLs are released on unmount, not stored persistently.
+
+The SPA regression suite now includes nonempty hero fixtures, authenticated
+loading, gateway routing, invalid responses, timeouts, fallback ordering, and
+stale-load races. `tests/hero-http.test.js` checks the actual protected upload/read
+contract. Verification completed on 2026-09-09 after the temporary test-server
+restriction cleared: 36 SPA tests, TypeScript, and the isolated HTTP test pass.
+The HTTP test sees 401 without authentication and matching PNG bytes with it.
+Chrome rendered a real configured Japan photograph after uploading a temporary
+copy into the fixture trip's protected media storage, and loaded it again after
+refresh. An intentionally corrupt replacement then left the same decoded image
+visible (same blob URL); screenshots confirmed the photograph remained on screen.
+The browser check used the direct local runtime; gateway path mapping is covered
+by the loader regression test. No deployment or live-trip photo replacement was
+performed.
+
+Third-party image URLs remain an external dependency. To remove that source of
+outages, selected originals must be copied into durable trip-owned media storage
+(with source/credit retained), then checked during deployment. The loader fixes
+do not claim that an external provider will keep serving a URL indefinitely.

@@ -30,8 +30,9 @@ Hermes-agent runtime, and Telegram as the first messaging adapter. Those are
 The first release deliberately supports one happy-path organizer and one demo
 trip at a time, but it must use durable IDs, membership scoping, idempotency,
 and per-trip records from the beginning. For the local MVP, a super-admin
-approval is required before a verified signup becomes a usable draft. Manual
-approval is also expected at the later provision and public-activation gates.
+approval is required before a verified signup becomes a usable draft. The
+provision gate is the **organizer's own** — superseded 2026-09-05, see below.
+The public-activation gate is unscoped; see `docs/activation-scope.md`.
 
 ### MVP signup-approval gate
 
@@ -332,6 +333,42 @@ approved intake into a running private trip, with a working URL delivered to
 the organizer and basic family access. No JSON editing, no repository access,
 no deployment commands required from the organizer or family.
 
+> **Exit gate REACHED 2026-09-06 — the first successful provisioning run in
+> this project's history.** `control_plane.jobs` had been 0 for the whole
+> project; seven trips had reached `intake_confirmed` and not one had ever been
+> planned. Run 13's trip went the whole way: plan → organizer approval → job →
+> transform → slug promotion (`draft-sreq-b5293…` → `japan-2026-2`, deduped
+> against the existing `japan-2026`) → real LXC `trip-japan-2026-2` (vmid 104,
+> 192.168.0.61) → NPM → Cloudflare. Both `http://192.168.0.61:8080` and
+> `https://japan-2026-2.ara-united.store` answer **HTTP 200**. Job succeeded on
+> attempt 1; trip is `ready_private`.
+>
+> **But the trip is unroutable, and not for the reason predicted.**
+> `activation-scope.md`'s B1 (no `hermes`/`node` in the worker) never got a
+> chance to fire, because a defect one step upstream skipped the companion
+> first: `_resolve_organizers` (`transformer.py:649-656`) matches
+> `organizer_identity` only against `{name, name_en, username}` — **never
+> `name + family`**. The organizer answered "ניר סולומון" against a participant
+> named "ניר"/"Nir"/`nir`, so nothing matched, `agent.organizers` was unset,
+> `build_companion_handoff` returned `None`, and the companion was skipped.
+> `assistant_names` is empty and `telegram_chat_bindings` is 0 — the organizer
+> messages the bot and gets "I don't have a trip for this chat."
+>
+> It is also **silent**: the skip logs at `info`, the worker configures no
+> logging, so the root logger sits at `WARNING` and the entire successful run
+> emitted one line. Nothing anywhere says the trip has no companion. B1 is
+> still real and fires next once this is fixed — see
+> `docs/companion-install-plan.md`.
+>
+> **Deploy gap found the same day:** `interview-stack-deploy` recreates only
+> `api`. The worker's code arrives via a bind mount defaulting to a different
+> checkout, so the first attempt failed three times with `intake is missing
+> required questions: ['group_size', 'trip_duration']` — API on schema v3,
+> worker on v2. The schema-version guard cannot help when the two halves come
+> from different trees. Resolved for now by consolidating onto
+> `integration/sprint-5-plus` so the default mount is correct; the deploy
+> script still does not deploy the worker.
+
 This is the sprint whose exit gate is the product-alignment acceptance test
 from the PR #10 comment (2026-08-20). Release-artifact hardening (immutable
 build pipeline, sanitation scans, sealed manifests, promotion rules) is
@@ -595,6 +632,44 @@ this sprint still **not built** — deferred as a follow-on, since the exit gate
 ("a sealed, scanned release artifact is promoted and selected by the planner")
 does not hinge on them.
 
+**Technical debt — lifecycle enforcement is declared, not enforced (recorded
+2026-09-05, deliberately NOT refactored).**
+
+`control-plane/api/src/lifecycle.ts` declares the trip state machine and
+exports `canTransitionTrip` / `assertTripTransition`. Both have **zero
+production callers** — the only importer in the tree is
+`test/lifecycle.test.ts`, which tests the table against itself.
+`tripStates`, `TripState`, `jobStates` and `JobState` have no references at
+all. Meanwhile **eight separate writers** move trips between states:
+`signup.ts:279`, `interview.ts:572` and `:832`, `planner.ts:152` and `:289`,
+`plan-approval.ts:71`, `intake-correction.ts:164`, and
+`provisioner.py`'s `_complete`. Four read the current state first; four write
+blind.
+
+The declared table is also **wrong**, not merely unenforced — so centralizing
+means correcting it, not just calling it:
+
+- `retryProvision` and `correctIntake` both perform backward edges to
+  `intake_confirmed` that `allowedTransitions` forbids outright;
+- `provisioner.py` jumps `provisioning_approved → ready_private`, skipping
+  `provisioning`, which the table requires;
+- `pending_signup_approval` has no writer at all.
+
+Half the enum is unreachable: `pending_signup_approval`, `provisioning`,
+`activation_approved`, `active`, `completed`, `sealed`.
+
+**The rule, as Dror set it:** *before adding significant new lifecycle
+transitions or writers, centralize lifecycle transition enforcement so the
+declared state machine becomes authoritative rather than documentation-only.*
+Avoid new ad-hoc writers; do not refactor the existing ones unless a concrete
+correctness issue forces it. The guarded transitions are adequate for the
+current live flow.
+
+*Honest note:* the organizer-reject route added 2026-09-05 writes
+`planned → intake_confirmed`, a backward edge this table forbids. It is a
+repointed existing transaction (the former ops-reject), not a new writer — but
+it is one more instance, and it is counted above.
+
 Build — **operational gaps found in the Phase H run** (each needed a hand DB
 edit or a destroy-and-recreate before this sprint):
 
@@ -811,6 +886,323 @@ contexts and test groups without creating a per-trip Telegram bot.
 >
 > **Track 3 (the interview UX batch below) is untouched** and is the largest
 > remaining piece of this sprint.
+>
+> **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
+> runs in one day (`docs/signup-test-run1..6-raw-notes.md`) reached a confirmed
+> intake twice, and one of those needed two manual database unblocks. The
+> analysis is `docs/interview-design-review.md`: these are not six unrelated
+> defects but four missing pieces of the contract between the router and the
+> interviewer. Track 3's remaining UX items are absorbed into Track 4 rather
+> than fixed one at a time — fixing them one at a time is what produced runs
+> 2–6.
+
+#### Live trip updates — MCP/API → Modern UI — **BUILT locally (2026-09-09); deployed acceptance pending**
+
+Added to Sprint 5 by the organizer's request, as part of wiring the trip to
+the AI companion. Implemented in this worktree; production deployment and the
+full MCP-through-runtime-gateway acceptance remain outstanding.
+
+**Local verification (2026-09-09):** authenticated `/api/events` streams
+resource revisions from SQLite triggers; rollback also rolls back the revision.
+One 250 ms reader per runtime runs only while clients are connected. No raw
+trip content, row IDs, or credentials appear in events. Modern coalesces changes,
+refetches dependent queries, reconnects with backoff, and polls every 60 seconds
+in the foreground as fallback. An open editor holds affected query refreshes
+until it closes, protecting drafts even if another client deletes the row.
+
+Two Chrome tabs against a disposable fixture trip both displayed an agent-key
+budget write without reload. With an unsaved draft open in one tab, a remote
+delete removed the row from the other tab, while the first retained its draft
+and input focus; closing that editor applied the pending deletion. HTTP tests
+cover itinerary edits, booking document attachments (without creating itinerary
+items), photos, reactions, comments, rejected writes, and reconnect snapshots.
+Gateway tests verify streaming, trip-cookie isolation, and upstream cleanup.
+These are local checks, not a claim of live deployment or human approval.
+
+**Original problem:** Today/Journey poll every 60 seconds; Bookings, Budget, Photos,
+and comments have no periodic refresh. A successful MCP/API write does not
+notify an already-open Modern page. The 30-second query freshness setting
+is not a polling timer.
+
+Build:
+
+- Add an authenticated, trip-scoped server-sent event (SSE) stream. Publish
+  resource-change notifications only after successful persistence, including
+  writes made through MCP, direct API calls, and background plan enrichment.
+- Cover itinerary, bookings and attached documents, budget, photos, reactions,
+  and comments. Events carry minimal resource/revision metadata; browsers
+  retrieve content through the existing authorized read endpoints.
+- In Modern, invalidate and refetch affected queries, including dependent
+  Today/Journey and confirmation summaries. Coalesce bursts and preserve
+  unsaved editor input, focus, and scroll position.
+- Refresh on reconnection and return to the foreground; retain bounded polling
+  as a fallback. Verify the runtime gateway/proxy delivers events without
+  buffering and that disconnected clients are cleaned up.
+- Keep document attachment and itinerary creation distinct: attaching a
+  confirmation refreshes its booking and linked cards; creating or linking a
+  daily plan item remains an explicit agent operation.
+
+Acceptance checks:
+
+- With Modern open in two browsers, add/edit a plan item and attach a booking
+  document through MCP. Both browsers show the persisted changes without a
+  reload, targeting **within two seconds** on a healthy foreground connection.
+- Repeat for budget, photos, reactions, and comments; verify background
+  enrichment also appears and failed writes publish no change notification.
+- Disconnect one browser, make changes, then reconnect: it catches up without
+  duplicates or losing unsaved edits. Exercise polling fallback separately.
+- Unauthenticated clients are rejected; a second trip receives neither the
+  first trip's events nor its data. Existing read permissions still apply.
+
+**Sprint 5 exit requirement:** demonstrate the MCP → persisted trip data →
+open Modern UI loop through the runtime gateway before calling agent wiring
+complete.
+
+#### Track 4 — one voice, one writer *(the sprint's priority as of 2026-09-04)*
+
+Build:
+
+- **The agent becomes the only voice; the router becomes the only writer.**
+  Four agent tools — `say`, `ask(question_id, text)`, `record(question_id,
+  value)`, `summarize` — and every other outbound agent message is dropped at
+  the relay boundary. The agent phrases each question in the organizer's own
+  language; the router attaches the keyboard and owns the record. Free-form
+  answers are extracted by the agent and never parsed by the router.
+- **`record` accepts questions that have not been asked yet**, so anything the
+  organizer volunteers early — in conversation or in an uploaded document —
+  shrinks the remaining list before it is ever spoken aloud. Run 6 asked for a
+  destination it had already recorded.
+- **An explicit phase column** (`opening → essentials → optional → recap →
+  confirmed`) with transitions and entry actions that fire exactly once,
+  replacing `deriveSessionState` and the three flags bolted onto it. `/done`
+  becomes an ordinary transition rather than an escape hatch.
+- **A floor token** — one writer at a time, the router by default — making
+  `interview_agent_turns` authoritative and retiring the handback guard,
+  prompt dedupe and settle window that currently approximate it.
+- **A watchdog:** if the floor is held and nothing organizer-visible has been
+  sent for **30 seconds** (Dror, 2026-09-04, against the latency he sat
+  through), the router takes it back and asks the next question from
+  `intake-copy.ts`. Robotic, but never stuck.
+  - *Future, deliberately not built:* a shorter deadline for a plain typed
+    answer than for an uploaded file, since reading a document is the one turn
+    that legitimately takes seconds. One number until there is evidence two are
+    needed.
+- **Derivable questions are never asked** — `timezone` from the destination,
+  `home_country` from the organizer, duration from the dates.
+- **The document offer becomes a phase entry action**, not a prompt
+  instruction, so the run-5 regression cannot recur by construction.
+
+Automated tests:
+
+- **A transcript harness** — the gap that let six regressions reach a person
+  rather than CI. Drive the router with a scripted organizer and a stubbed
+  agent, and assert the organizer-visible message sequence rather than units.
+  Standing assertions, each one a past run: no message sent twice; no option
+  question without a keyboard; no string outside the session's language; every
+  question asked at most once; every path reaches `confirmed` or a stated dead
+  end; no denylisted internal token reaches the chat.
+- an agent `send` that is not `say`/`ask` never reaches Telegram;
+- `record` on a question not yet asked removes it from the remaining set;
+- the watchdog fires and the interview continues after a silent agent turn.
+
+**Defect found 2026-09-06, run 13 — fixed.** The "one writer" contract had a
+hole that stalled two interviews for eleven minutes each. `sendNextStep`
+delivered a pending `say` and returned *before* working out what to ask; the
+send claims the floor, so a nomination made seconds earlier was stranded behind
+a floor that now belonged to the organizer, and nothing spoke again until they
+did. `trip_pace` was nominated, never drawn, never answered — while the agent's
+closing text had told the organizer it was asked. `nominateQuestionForChat`
+already folded a say into a nomination, but only one still pending when the
+nomination ran; here the say arrived *after* the ask, which no nomination-time
+fold can win. The fold now also happens at render time, where both values come
+from the same session row in the same pass and write order stops mattering.
+
+**Exit gate for Track 4:** two consecutive live runs reach `intake_confirmed`
+with no manual database intervention, and the transcript harness runs in CI on
+`integration/**`.
+
+**Open decisions, resolved.** The watchdog interval is 30 seconds (Dror,
+2026-09-04). Tone/language discipline being *filtered* rather than
+*impossible* is the accepted trade for a chat that reads human — confirmed by
+run 9's own organizer verdict ("I don't mind open questions instead of the
+multiple answers"), which explicitly does not want the alternative (more
+buttons, less voice).
+
+**A1–A3+B all shipped and reached a clean `intake_confirmed` on run 9
+(2026-09-05)** — the first confirmation since run 4, and the first with no
+manual database intervention. `interview-design-review.md`'s exit gate
+("two consecutive live runs... no manual database intervention") is one run
+into two.
+
+#### Track 5 — one turn per burst, not one per message
+
+Run 9's own closing line named this exactly: **"it still seems that hermes
+and gw are competing."** An organizer who answers in five separate Telegram
+messages (one line per family member, a normal way to type on a phone)
+produces **five separate agent turns**, because `openAgentTurn` closes
+whatever turn is open for a chat before opening the next one — and Hermes does
+not know or care that we closed its turn row, so it keeps its own,
+now-orphaned conversation loop running regardless. Seven distinct turn ids
+were logged for one five-message burst. The result: the same optional
+question nominated twice by two different overlapping invocations (once with
+buttons, once without), and a checkbox tap silently refused because a
+different overlapping invocation had already finalized that question —
+visible only as an easy-to-miss Telegram toast, never a chat message. Record
+integrity held throughout (`trip_pace` was checked and found written exactly
+once); this is a conversation-level defect, not a data one.
+
+Build:
+
+- A short settle window on the INBOUND side, mirroring
+  `ROUTER_PROMPT_SETTLE_SECONDS` on the outbound side: messages arriving
+  within N seconds of each other coalesce into one forward to the agent
+  instead of each tearing down and replacing the last turn.
+- `openAgentTurn`'s close-then-open behavior is correct for a genuinely new
+  turn; the fix sits upstream of it, in deciding when an inbound message
+  really starts a new turn versus continuing one still settling.
+
+Automated tests:
+
+- A transcript-harness reproduction of the exact run-9 shape: five rapid
+  messages: assert exactly one turn opens; assert no question is asked twice.
+
+**Exit gate for Track 5:** the run-9 five-message burst, replayed live,
+produces one turn and no duplicate question.
+
+**Track 5, live: two clean `intake_confirmed` runs in a row (run 9, run 10)**
+— `interview-design-review.md`'s exit gate ("two consecutive live runs... no
+manual database intervention") is now met.
+
+Two small UX fixes shipped alongside Track 5 from run 10's report, both
+low-risk and independent of the deeper issue below: a tapped keyboard now
+collapses (removes its buttons, shows what was picked) instead of sitting
+there answered but unchanged, on both single-choice and multi-select Done;
+and a Telegram typing indicator fires the instant a message is queued or a
+handback begins, masking the settle-window wait and the agent's own latency —
+Dror's own suggestion, unprompted: "the writing… signal give the feeling
+there is someone on the other side."
+
+#### Track 6 — the watchdog can close a turn out from under a still-working agent *(partially mitigated 2026-09-05; root cause open)*
+
+Run 10: a `bot_tone` question rendered by the 30-second watchdog got tapped,
+and nothing happened until the organizer typed a message. Root cause, read
+from the relay log: `claimStalledAgentTurns` closes the DB's row for
+whatever turn was open the moment 30 seconds pass with nothing sent — but the
+interviewer was not actually silent, it was still working through several
+optional questions in one long Hermes-side turn our side has no visibility
+into. Closing our OWN turn record while the real conversation is still
+running is what Track 5 fixed for RAPID bursts; this is the same family of
+mismatch on a slower timescale — our notion of "the current turn" and
+Hermes's own, actually-running one drift apart, and a handback or a tap can
+land in the gap between them (`handback_skipped: TURN_ALREADY_OPEN` fired
+three times around the same window run 10 hit this).
+
+Not scoped in detail yet, because the right fix depends on something we do
+not currently have: a signal FROM Hermes that it is still actively working,
+so the watchdog can tell "stalled" from "slow" before closing anything. Two
+candidate directions, neither committed to:
+
+- A lightweight heartbeat/progress tool call the agent can make mid-turn,
+  extending the floor deadline without saying anything to the organizer.
+- Loosen `claimStalledAgentTurns` to check for RECENT (not necessarily
+  organizer-facing) tool activity on the turn before deciding it is stalled,
+  if that activity is visible to us at all.
+
+**Exit gate for Track 6:** not yet defined — needs the mechanism decided
+first.
+
+Run 11 found a second symptom of the same family: `read_file failed —
+document extraction failed — File not found` on Hermes's own local temp
+cache of an uploaded document, in the same window as repeated
+`handback_skipped`/`agent_floor_reclaimed` events. Likely the same root cause
+as the stuck-button symptom — the delay before the agent actually gets to
+use something stretches long enough for Hermes's own side to have moved on.
+Not a timeout to lengthen (`INBOUND_SETTLE_SECONDS`/`AGENT_FLOOR_SECONDS`
+are not document-read timeouts); filed here rather than as its own track.
+
+**Direction set by Dror, 2026-09-05.** Track 6 is fixed independently of the
+provisioning-approval work. A **partial mitigation landed the same day** —
+`DOCUMENT_FLOOR_SECONDS` gives a document/photo turn 90 seconds instead of 30,
+session-scoped via migration `0040` and cleared by the next ordinary turn. Its
+own commit is explicit that this is *"a wider guess, not a fix: nothing here
+lets the control plane tell 'still working' from 'stuck', which is what Track 6
+actually needs."* The root cause is therefore still open, and two things are
+settled about the eventual fix so they are not re-derived later:
+
+- **The 30-second floor is wrong for document ingestion.** Run 12 measured a
+  real document turn taking over a minute of genuine Hermes work before its
+  first write — the 30s floor closed the turn out from under a still-working
+  agent, and Hermes's next two tool calls returned `404 NOT_FOUND`, so the
+  document's answers were never recorded and the agent could not say so. The
+  watchdog followed its own rule correctly; the rule is what is wrong for this
+  turn kind. The 90s floor widens the window; it does not close the gap.
+- **Do not solve it by raising an arbitrary timeout.** The fix is in the turn
+  semantics: make a long-running document extraction distinguishable from a
+  genuinely stalled or failed turn, and make retries idempotent from the
+  interviewer's and the organizer's point of view. Retries currently surface to
+  the user as repeated interview questions, which is the part that actually
+  damages onboarding.
+
+**Exit gate for Track 6:** a slow document turn is never closed by the
+watchdog, and a retried turn never re-asks a question the organizer already
+answered. This is an onboarding-reliability issue and should be resolved
+**before live onboarding scales**.
+
+**But not by building more watchdog machinery.**
+`docs/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
+in its *Stop* column — "this is precisely what a graph migration deletes" — and
+§2.1 reads run 12's two `404 NOT_FOUND`s as an **`ExecutionContext` failure**,
+stated exactly: `/internal/interview/agent/current/*` resolves "which interview
+am I in" by looking for an open turn, the watchdog had closed it, and the
+watchdog's only way to ask "is the agent still working?" is to guess from
+elapsed time. *"You cannot supervise a lifecycle you do not own, you can only
+guess at it, and every guess is a threshold someone will eventually exceed."*
+
+That is the same conclusion as the directive above, one layer down: "fix the
+turn semantics" **is** owning execution identity and lifecycle. So Track 6's
+remaining work should be met by the `ExecutionContext` contract — which the
+review recommends starting now, in parallel with onboarding rather than after
+it — and not by another floor, settle or watchdog threshold. The 90s document
+floor stands as the interim widening; nothing further should be added to that
+machinery.
+
+#### Track 7 — the agent can still ask a choice question in prose *(scoped, not built)*
+
+Run 11, Dror: "several duplications on the gender question... it seems like
+in the optional questions the agent precedes the router." Traced precisely,
+and it is two things stacked:
+
+1. **The structural half is fixed** (this session): `say_for_chat` and
+   `ask_question_for_chat` are independent slots, and calling both in one
+   breath used to deliver as two separate Telegram messages — the agent's
+   lead-in, then the router's buttoned render. `nominateQuestionForChat` now
+   folds an undelivered `say_for_chat` into the nomination's own text when
+   the two land close together, and leaves an already-delivered one alone.
+2. **The root cause is not fixed**: the agent asking a choice question in
+   prose at all, rather than through `ask_question_for_chat`, is still only
+   forbidden by a SOUL sentence ("never ask a question that has fixed
+   options"). That rule has now failed across at least three different
+   models in this session's own logs. The fold in (1) hides the symptom when
+   the two calls happen to land together; it does nothing when the agent
+   asks in prose and NEVER calls `ask_question_for_chat` at all for that
+   question — the router (or the watchdog) still has to notice and draw it
+   separately, on its own schedule.
+
+The honest next step is a structural detector at the relay boundary — the
+same category as `internal-leak.ts`, which already scans agent text for
+banned tokens — that recognises when agent prose is asking a KNOWN
+choice/multi-choice question and either suppresses it or redirects the
+intent into a proper nomination. Not built: content classification against
+live prompts is easy to get wrong in the false-positive direction (blocking
+legitimate conversation that happens to touch the same topic), and this
+needs the same "prove it with a test before shipping it" discipline as
+everything else in this design, not a live patch under pressure.
+
+**Exit gate for Track 7:** a choice/multi-choice question is never delivered
+without buttons, regardless of how the agent tries to ask it — proven by a
+transcript-harness test that drives the agent through `say_for_chat` with
+prose that names a known option-question's topic, not just through the
+proper tool.
 
 Build:
 
@@ -864,6 +1256,12 @@ Build:
     (Step 3 #3, #4);
   - allow multiple planned-order answers, with a flight-details option on flight
     days (Step 3 #8);
+  - **multi-select taps plus a real "other" button (#42)** — one job, not two.
+    `allowsOther` never reaches the keyboard, and `multi_choice` taps are
+    refused outright because one tap carries one option while the answer is the
+    whole set. Both need the same missing primitive: a per-chat draft that
+    accumulates taps and a Done button to commit it. Building "other" alone
+    means building that machinery again for multi-select a week later;
   - let the interviewer read a pasted link / scrape a page without prompting the
     organizer for approval (Step 3 #5, #6);
   - say plainly that day-by-day itinerary help lives on the trip bot and this
@@ -925,7 +1323,63 @@ Exit gate: private verification demonstrates one group, one logical binding,
 one organizer profile and one exact trip context/MCP identity, with a two-trip
 isolation test passing.
 
+#### Track 8 — router-owned deterministic progression, with answer-completeness validation — **BUILT (2026-09-05)**, one gap open
+
+Agreed and built on 2026-09-05, independently of the provisioning-approval
+convergence — nothing in this track is in scope for the approval branch. Both
+halves landed in `6205b2d`:
+
+- **Router-owned deterministic progression. — BUILT.** `routerOwned` marks the
+  four questions needing neither context nor interpretation — `trip_type`,
+  `bot_gender`, `bot_tone`, `bot_proactive` — and the router alone asks them:
+  `nominateQuestionForChat` refuses them outright, and a per-tick scan asks them
+  the moment they are next. That covers both the 3–5 minute gaps between
+  fixed-choice questions and the dead air during document extraction, as one
+  mechanism rather than two.
+  **Narrowed 2026-09-06 after run 13** ("it again competing with the agent on
+  the questions"). As first built the scan also fired *while an agent turn was
+  open doing something else* — but an open turn is equally the state of an
+  agent composing its next message, so a fixed-choice question could land on
+  top of the interviewer. The two are now separated by what the turn is FOR: a
+  turn carrying media is real async work (the only thing that stamps
+  `awaiting_floor_seconds`) and the scan still fills that dead air; any other
+  open turn is a conversation the interviewer owns, and the router yields
+  (`trip_bot.router_owned_yielded`). With no turn open it fires freely. Deliberately explicit that fixed-option is necessary but not
+  sufficient: `dietary` is fixed-option and stays with the agent.
+- **Lightweight answer-completeness validation. — BUILT.** `checkComplete`, an
+  opt-in per-question check rejecting with `INCOMPLETE_ANSWER` plus a detail
+  string the agent can act on. Schema validity and substantive completeness are
+  different questions — `travelers` recorded as `{count: 5, age_group: "adults"}`
+  satisfied the first while establishing nobody at all, which is why the
+  organizer was later asked about allergies with no roster to attach them to.
+  Nothing is written on rejection, so the question stays outstanding rather than
+  answered badly.
+
+**Known gap, open:** SOUL has not been told about router-owned questions, so
+the agent is blocked from *nominating* them but not from *narrating* them in
+prose. That is Track 7's problem one layer up, and it is untested live.
+
+**Exit gate for Track 8:** the four router-owned questions are never asked by
+the agent in prose, and no answer advances the interview without satisfying its
+own completeness check. Not met while the SOUL gap above stands.
+
 ### Sprint 6 — Verification, explicit activation, dashboard, and demo rehearsal
+
+> **Activation is superseded pending scoping (2026-09-05, Dror).** The separate
+> expiring activation plan and its distinct approval, described below, predate
+> `docs/activation-scope.md`. `activation_approved` and `active` are declared in
+> the schema but have no writer, and whether they survive at all is an open
+> product question. Do not build against this section's activation design until
+> that scoping lands. The rest of the sprint (verification, dashboard, demo
+> rehearsal) is unaffected.
+
+> **Verification aggregator, 2026-09-06:** `ready_private` was reached for the
+> first time on 2026-09-06 with **no** aggregator in front of it, and the run
+> demonstrates exactly what this bullet exists to prevent — the trip was marked
+> `ready_private` and reported success while having no companion profile, no
+> chat binding and no `runtime_routes` row. "Messaging binding" is already in
+> the required list below; that requirement is now evidenced rather than
+> anticipated. See Sprint 4's status box.
 
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
@@ -1168,6 +1622,15 @@ Build:
   the candidate → eval → promotion shape the release pipeline already uses. A
   judge editing the live template unattended reproduces the 2026-09-03 failure
   mode with a faster loop.
+- **Localised question catalogue on the same loop (#41).** All 23 prompts and
+  every option label are literal English strings today. Localising them needs
+  per-language files plus an agent that realigns the others when the English
+  source changes — which is the judge loop with a different input, so it shares
+  the mechanism rather than growing a second one. `option_id` is NEVER
+  translated: ids land in the immutable intake and are what the transformer
+  reads, so only labels vary. A language file whose source has moved is worse
+  than a missing one, because nothing looks wrong — the organizer is simply
+  asked last month's question, so staleness has to be a gate condition.
 
 Automated tests:
 
@@ -1187,14 +1650,15 @@ Manual tests:
 - the judge's suggestions on that interview are actionable by the super admin;
 - an organizer starting a second trip gets a genuinely fresh interviewer.
 
-**Open decision points before this can start** — all seven are stated in full
+**Open decision points before this can start** — all eight are stated in full
 in `docs/interviewer-lifecycle-design.md`, and each changes the shape of the
 build: whether the ephemeral path replaces or coexists with the shared one;
 the interview TTL and whether "abandoned" is terminal or resumable; who may
 promote a template change and against what eval; how much transcript the judge
 may see and for how long; per-interview vs batched judging; whether the render
-step reuses the provisioner's adapter; and whether the un-namespaced session id
-is worth fixing upstream for the long-lived companion profiles that keep it.
+step reuses the provisioner's adapter; whether the judge owns translation alignment or that is a
+separate lane (#41); and whether the un-namespaced session id is worth fixing
+upstream for the long-lived companion profiles that keep it.
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 

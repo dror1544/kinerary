@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink } from "../src/chat-router.js";
+import { migrateChatBinding, resolveChatRoute, startFromDeepLink } from "../src/chat-router.js";
 import {
   CONTRACT_VERSION,
   decodeFrame,
@@ -18,6 +18,7 @@ import {
   verifyUpgradeToken,
 } from "../src/relay/protocol.js";
 import { displayName, mapChatType, normalizeUpdate, type TelegramUpdate } from "../src/relay/normalize.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Upgrade-token auth: cross-language conformance ───────────────────────────
 
@@ -259,7 +260,7 @@ describe("displayName", () => {
 
 // ── Normalization + the routing stamp — database required ────────────────────
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
@@ -331,6 +332,68 @@ describe("normalizeUpdate (DB)", () => {
       assert.equal(outcome.event.source.chat_id, "600000111");
       assert.equal(outcome.event.source.chat_type, "dm");
       assert.equal(outcome.event.text, "when do we land?");
+    });
+  });
+
+  test("a bound trip whose gateway is not running is COMPANION_PENDING", { skip: SKIP }, async () => {
+    // A binding proves a companion was INSTALLED. It never proves one is
+    // SERVING, and conflating the two is what reports a healthy trip the
+    // organizer cannot actually talk to (A2/A4, migration 0042). With one
+    // gateway process per trip, "is it running" is a live socket question, so
+    // ask it here rather than let the turn vanish into an unrouted push.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000777", fix.tripId, "companion-stopped"],
+      );
+
+      const outcome = await normalizeUpdate(
+        fix.pool,
+        textUpdate("600000777", "when do we land?"),
+        undefined,
+        () => false,
+      );
+      assert.deepEqual(outcome, { kind: "dropped", reason: "COMPANION_PENDING" });
+    });
+  });
+
+  test("a bound trip whose gateway IS running produces the event", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000888", fix.tripId, "companion-running"],
+      );
+
+      const asked: string[] = [];
+      const outcome = await normalizeUpdate(
+        fix.pool,
+        textUpdate("600000888", "when do we land?"),
+        undefined,
+        (profile) => {
+          asked.push(profile);
+          return true;
+        },
+      );
+      assert.equal(outcome.kind, "event");
+      if (outcome.kind !== "event") return;
+      assert.equal(outcome.event.source.profile, "companion-running");
+      // Asked about the trip resolved from the binding, not about anything the
+      // message claimed.
+      assert.deepEqual(asked, ["companion-running"]);
+    });
+  });
+
+  test("with no reachability check supplied, a bound trip still routes", { skip: SKIP }, async () => {
+    // The parameter is optional so the check can ship inert: callers that do
+    // not pass one keep exactly today's behaviour.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["600000999", fix.tripId, "companion-unchecked"],
+      );
+
+      const outcome = await normalizeUpdate(fix.pool, textUpdate("600000999", "hi"));
+      assert.equal(outcome.kind, "event");
     });
   });
 
@@ -441,6 +504,72 @@ describe("normalizeUpdate (DB)", () => {
       if (outcome.kind !== "event") return;
       assert.equal(outcome.event.source.chat_type, "group");
       assert.equal(outcome.event.source.chat_name, "Japan Trip");
+    });
+  });
+});
+
+describe("supergroup migration", { skip: SKIP }, () => {
+  test("a binding follows the chat when Telegram upgrades a group to a supergroup", async () => {
+    // Raised before it bit us, 2026-09-07. Telegram changes the chat id when a
+    // group becomes a supergroup — and it does that on its own, when the group
+    // grows or gains a feature nobody thought of as a migration. The binding is
+    // keyed on chat id, so the companion would answer "I don't have a trip for
+    // this chat" in a room it was working in a minute earlier, and neither the
+    // organizer nor the family would have any idea why.
+    //
+    // Telegram announces it twice: `migrate_to_chat_id` on a message in the OLD
+    // chat, `migrate_from_chat_id` on one in the NEW chat. Either is enough.
+    await withFixture(async (fix) => {
+      const oldChat = "-100111";
+      const newChat = "-1002000111";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, $3)`,
+        [oldChat, fix.tripId, "companion-japan"],
+      );
+
+      assert.equal(await migrateChatBinding(fix.pool, oldChat, newChat), true);
+
+      const before = await resolveChatRoute(fix.pool, oldChat);
+      assert.equal(before.kind, "unbound", "the old id stops routing");
+
+      const after = await resolveChatRoute(fix.pool, newChat);
+      assert.equal(after.kind, "companion");
+      if (after.kind !== "companion") return;
+      assert.equal(after.tripId, fix.tripId);
+      assert.equal(after.hermesProfile, "companion-japan", "and it keeps its companion");
+    });
+  });
+
+  test("migrating a chat with no binding changes nothing and says so", async () => {
+    await withFixture(async (fix) => {
+      assert.equal(await migrateChatBinding(fix.pool, "-100999", "-1002000999"), false);
+      assert.equal((await resolveChatRoute(fix.pool, "-1002000999")).kind, "unbound");
+    });
+  });
+
+  test("it will not overwrite a binding the destination already has", async () => {
+    // Fail closed. If the new id is already bound — a replayed update, or an id
+    // that belongs to another trip — moving the old binding on top of it would
+    // silently repoint a live group at a different family's trip. That is the
+    // one outcome worse than the stale binding this function exists to fix.
+    await withFixture(async (fix) => {
+      const oldChat = "-100222";
+      const newChat = "-1002000222";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-old')`,
+        [oldChat, fix.tripId],
+      );
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-already-there')`,
+        [newChat, fix.tripId],
+      );
+
+      assert.equal(await migrateChatBinding(fix.pool, oldChat, newChat), false);
+      const after = await resolveChatRoute(fix.pool, newChat);
+      assert.equal(after.kind === "companion" && after.hermesProfile, "companion-already-there");
     });
   });
 });

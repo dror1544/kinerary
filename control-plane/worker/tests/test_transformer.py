@@ -6,6 +6,8 @@ import unittest
 from datetime import date
 
 from control_plane_worker.transformer import (
+    _resolve_organizers,
+    derive_days_from_anchors,
     derive_bookings,
     derive_trip_slug,
     transform_intake,
@@ -90,6 +92,37 @@ class DeriveTripSlugTests(unittest.TestCase):
 
 
 class TransformerTests(unittest.TestCase):
+    def test_planning_help_is_carried_to_the_companion(self) -> None:
+        # The interview collects structure; what the organizer still wants help
+        # with is work the trip companion does afterwards. Carrying it as a
+        # standing instruction is what stops the ask being lost between the two
+        # agents.
+        intake = {**JAPAN_INTAKE, "planning_help": _text("we haven't worked out Kyoto yet")}
+        config = transform_intake(intake)
+        instructions = config["agent"]["standing_instructions"]
+        carried = [i for i in instructions if "Kyoto" in i["text"]["en"]]
+        self.assertEqual(len(carried), 1, "the organizer's ask reaches the companion")
+        self.assertIn("Kyoto", carried[0]["text"]["he"], "both languages carry it")
+
+    def test_planning_help_is_organizer_only(self) -> None:
+        # It is the organizer's own words about what they have not sorted out —
+        # not something to publish to the whole family.
+        intake = {**JAPAN_INTAKE, "planning_help": _text("still need to book the ryokan")}
+        config = transform_intake(intake)
+        carried = [i for i in config["agent"]["standing_instructions"] if "ryokan" in i["text"]["en"]]
+        self.assertEqual(carried[0]["visibility"], "organizer")
+
+    def test_no_planning_help_adds_no_instruction(self) -> None:
+        # Additive-optional: an intake without it must transform exactly as before.
+        without = transform_intake(JAPAN_INTAKE)
+        blank = transform_intake({**JAPAN_INTAKE, "planning_help": _text("   ")})
+        self.assertEqual(
+            (without.get("agent") or {}).get("standing_instructions"),
+            (blank.get("agent") or {}).get("standing_instructions"),
+        )
+
+
+
     def test_non_latin_destination_falls_back_to_a_phase_name(self) -> None:
         # "trip-2026" is a URL a family cannot tell from anyone else's; a
         # phase name is one they recognise (capture ledger, General #4).
@@ -886,11 +919,110 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(len(instructions), 1)
         self.assertEqual(instructions[0]["text"], {"he": "שניהם", "en": "Both"})
 
+    # ── language ──────────────────────────────────────────────────────────────
+
+    def test_the_interview_language_becomes_the_trip_language(self) -> None:
+        """Run 14, live: the entire interview was held in Hebrew, the session
+        recorded language='he' — and the trip came out with defaultLang 'en',
+        because this value was hardcoded. The companion then greeted the
+        organizer and the family in English, with a Hebrew assistant name
+        embedded in it.
+
+        The language is not a preference to re-ask for. It was established by
+        the organizer's own first message and every message after it.
+        """
+        config = transform_intake(
+            {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language="he",
+        )
+        self.assertEqual(config["meta"]["defaultLang"], "he")
+
+    def test_no_language_still_means_english(self) -> None:
+        # Every intake version written before the language was carried has none,
+        # and must keep transforming exactly as it did.
+        config = transform_intake({**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["defaultLang"], "en")
+
+    def test_an_unrecognised_language_falls_back_rather_than_propagating(self) -> None:
+        # Fails safe, matching the shared schema rule: an unknown value resolves
+        # to the most conservative option instead of reaching the site as a
+        # language code nothing can render.
+        for bogus in ("", "  ", "klingon", "EN-GB", None):
+            with self.subTest(bogus=bogus):
+                config = transform_intake(
+                    {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language=bogus,
+                )
+                self.assertEqual(config["meta"]["defaultLang"], "en")
+
+    def test_the_language_is_case_and_space_insensitive(self) -> None:
+        for supplied in ("HE", " he ", "He"):
+            with self.subTest(supplied=supplied):
+                config = transform_intake(
+                    {**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20), language=supplied,
+                )
+                self.assertEqual(config["meta"]["defaultLang"], "he")
+
     # ── organizer ─────────────────────────────────────────────────────────────
 
     def test_organizer_identity_resolves_to_a_username(self) -> None:
         config = self._config(organizer_identity=_text("eitan"))
         self.assertEqual(config["agent"]["organizers"], ["eitan"])
+
+    def test_a_hebrew_given_name_alone_resolves(self) -> None:
+        """Run 14, live: the interview asked who the organizer is and the
+        organizer typed "ניר". The roster held name="ניר סולומון",
+        name_en="Nir", username="nir" — so the ENGLISH given name matched (it
+        is already bare in name_en) and the HEBREW one did not, purely because
+        `name` carries the full name and `name_en` carries only the first.
+
+        The trip provisioned, the site came up, and the companion was never
+        built: ORGANIZER_UNRESOLVED. Answering with your own first name, in the
+        language the whole interview was conducted in, is not an edge case.
+        """
+        config = self._config(
+            # The roster exactly as run 14 produced it: full Hebrew `name`,
+            # given-name-only `name_en`.
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון", "family_en": "Solomon"},
+            ]),
+            organizer_identity=_text("ניר"),
+        )
+        self.assertEqual(config["agent"]["organizers"], ["nir"])
+
+    def test_a_given_name_two_travelers_share_stays_unresolved(self) -> None:
+        """The reason given names were not matched in the first place, and the
+        reason adding them is still safe: ambiguity resolves to nobody, never
+        to whoever the roster happens to list first."""
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
+                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+            ]),
+            organizer_identity=_text("ניר"),
+        )
+        self.assertNotIn("agent", config)
+
+    def test_a_full_name_still_wins_over_a_shared_given_name(self) -> None:
+        # Adding given-name forms must not make a precise answer ambiguous.
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
+                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+            ]),
+            organizer_identity=_text("ניר כהן"),
+        )
+        self.assertEqual(len(config["agent"]["organizers"]), 1)
+
+    def test_the_household_label_alone_still_resolves_to_nobody(self) -> None:
+        # A family name is not a person. Unchanged by given-name matching.
+        config = self._config(
+            travelers=_structured([
+                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון"},
+                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון"},
+            ]),
+            organizer_identity=_text("סולומון"),
+        )
+        self.assertNotIn("agent", config)
 
     def test_unmatched_organizer_identity_writes_no_organizers(self) -> None:
         # driver.mjs hard-fails on an organizer absent from participants[], and
@@ -1214,3 +1346,198 @@ class DeriveBookingsLinkTests(unittest.TestCase):
         cfg["phases"][0]["venues"] = []
         hotel = next(b for b in derive_bookings(cfg, JAPAN_INTAKE) if b["type"] == "hotel")
         self.assertIsNone(hotel["location_url"])
+
+
+class ResolveOrganizersTests(unittest.TestCase):
+    """Which of the travellers is the organizer, from what they typed.
+
+    Load-bearing far past its size: no organizer means `_derive_agent` writes
+    no `agent.organizers`, which means `build_companion_handoff` returns None,
+    which means the companion profile is never installed and the provisioned
+    trip has no chat binding. The organizer messages the bot and is told "I
+    don't have a trip for this chat" — a trip that provisioned "successfully"
+    and cannot be reached.
+    """
+
+    #: Run 13's actual roster, as transformed on 2026-09-06.
+    SOLOMONS = [
+        {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "ella", "name": "אלה", "name_en": "Ella", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "maya", "name": "מאיה", "name_en": "Maya", "family": "סולומון", "family_en": "Solomon"},
+        {"username": "shai", "name": "שי", "name_en": "Shai", "family": "סולומון", "family_en": "Solomon"},
+    ]
+
+    def _resolve(self, stated: str, participants=None) -> list[str]:
+        return _resolve_organizers(
+            {"organizer_identity": _text(stated)}, participants or list(self.SOLOMONS)
+        )
+
+    def test_the_run_13_answer_that_matched_nobody(self) -> None:
+        # Verbatim. This returned [] on 2026-09-06 and cost the trip its
+        # companion; it is the whole reason this class exists.
+        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+
+    def test_full_name_in_either_script(self) -> None:
+        # Answering with your full name is the NORMAL case, not an edge one.
+        self.assertEqual(self._resolve("Nir Solomon"), ["nir"])
+        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+
+    def test_full_name_across_scripts(self) -> None:
+        # Rosters are mixed in practice — a Hebrew given name whose household
+        # label was only ever transliterated, or the reverse.
+        self.assertEqual(self._resolve("ניר Solomon"), ["nir"])
+        self.assertEqual(self._resolve("Nir סולומון"), ["nir"])
+
+    def test_the_forms_that_already_worked_still_do(self) -> None:
+        for stated in ("ניר", "Nir", "nir"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_case_and_spacing_do_not_decide_reachability(self) -> None:
+        for stated in ("  nir  solomon ", "NIR SOLOMON", "Nir  Solomon"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_a_bare_family_name_names_a_household_not_a_person(self) -> None:
+        # Five people share it. Matching would hand one of them — whichever
+        # the roster listed first — the organizer's private channel.
+        self.assertEqual(self._resolve("סולומון"), [])
+        self.assertEqual(self._resolve("Solomon"), [])
+
+    def test_an_ambiguous_answer_is_refused_rather_than_guessed(self) -> None:
+        twins = [
+            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
+            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+        ]
+        self.assertEqual(self._resolve("שי", twins), [])
+        # ...and the family name is exactly what disambiguates them.
+        self.assertEqual(self._resolve("שי כהן", twins), ["shai_a"])
+
+    def test_someone_who_is_not_on_the_trip_matches_nobody(self) -> None:
+        self.assertEqual(self._resolve("Dana Levi"), [])
+
+    def test_no_answer_is_not_a_match(self) -> None:
+        self.assertEqual(_resolve_organizers({}, list(self.SOLOMONS)), [])
+        self.assertEqual(self._resolve("   "), [])
+
+    def test_the_shape_the_transformer_actually_produces(self) -> None:
+        # The tests above hand `_resolve_organizers` a roster carrying
+        # `family: "סולומון"`. `_build_participants` does not produce that: it
+        # SLUGIFIES family to "solomon" and drops `family_en` entirely. So a
+        # fix verified only against the shape above still leaves the live path
+        # broken — which is exactly what happened on the first attempt at this
+        # fix, caught by the provisioner integration test rather than here.
+        transformed = [
+            {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"},
+            {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "solomon"},
+        ]
+        intake = {
+            "organizer_identity": _text("ניר סולומון"),
+            "travelers": {"kind": "structured", "schema_version": 3, "data": [
+                {"name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+            ]},
+        }
+        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+
+        # And the English pair, which the slug happens to resemble but which
+        # must resolve through the raw roster rather than by luck.
+        intake["organizer_identity"] = _text("Nir Solomon")
+        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+
+    def test_a_roster_with_no_raw_travelers_still_resolves_a_bare_name(self) -> None:
+        # Older intakes, and any path that hands over participants without the
+        # structured travelers answer beside them, must not regress.
+        transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
+        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])
+
+
+class DeriveDaysFromAnchorsTests(unittest.TestCase):
+    """A day-by-day built from the dated anchors, with no model involved.
+
+    `phases[].days[]` had exactly one producer — `extract_itinerary`, an LLM
+    pass over an uploaded document — which is unreachable from the chat-scoped
+    interview (no `_for_chat` twin). So no control-plane trip has ever had a
+    day-by-day, while the organizer's plan sat in `travel_anchors` already
+    dated, timed and structured. Nothing about projecting that needs a model.
+    """
+
+    PHASES = [
+        {"id": "tokyo", "dates": {"start": "2026-09-19", "end": "2026-09-23"}},
+        {"id": "kyoto", "dates": {"start": "2026-09-24", "end": "2026-09-27"}},
+    ]
+
+    def _days(self, anchors):
+        return derive_days_from_anchors(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )
+
+    def test_run_13s_anchors_land_on_the_right_days_and_phases(self) -> None:
+        out = self._days([
+            {"type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"},
+            {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"},
+            {"type": "activity", "detail": "Sagano Romantic Train, one-way — 25 Sep 2026 at 14:02"},
+        ])
+        self.assertEqual(sorted(out), ["kyoto", "tokyo"])
+        tokyo = out["tokyo"]
+        self.assertEqual([d["date"] for d in tokyo], ["2026-09-20"])
+        self.assertEqual(
+            [(i["time"], i["text"]["en"]) for i in tokyo[0]["items"]],
+            [("10:00", "Tokyo Skytree e-ticket"), ("18:00", "TeamLab Planets")],
+        )
+
+    def test_the_date_and_time_are_stripped_from_the_label(self) -> None:
+        # They are represented structurally now; printing "at 10:00" beside a
+        # 10:00 slot is the same fact twice.
+        out = self._days([{"type": "activity", "detail": "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"}])
+        text = out["tokyo"][0]["items"][0]["text"]["en"]
+        self.assertEqual(text, "Tokyo Skytree e-ticket")
+        self.assertNotIn("2026", text)
+        self.assertNotIn("10:00", text)
+
+    def test_timed_items_sort_before_untimed_ones_within_a_day(self) -> None:
+        out = self._days([
+            {"type": "activity", "detail": "Something all day — 20 Sep 2026"},
+            {"type": "activity", "detail": "Skytree — 20 Sep 2026 at 10:00"},
+        ])
+        times = [i["time"] for i in out["tokyo"][0]["items"]]
+        self.assertEqual(times, ["10:00", None], "'some time that day' belongs last, not at 00:00")
+
+    def test_hotels_and_proposals_are_not_itinerary_items(self) -> None:
+        # A hotel is the phase's accommodation; a proposal is a whole-trip
+        # quote whose dates are range endpoints, not a moment in the plan.
+        out = self._days([
+            {"type": "hotel", "detail": "OMO3 Asakusa — 19 Sep 2026 to 23 Sep 2026"},
+            {"type": "car", "detail": "Rental — 20 Sep 2026"},
+            {"type": "proposal", "detail": "Whole trip quote — 19 Sep 2026"},
+        ])
+        self.assertEqual(out, {})
+
+    def test_an_undated_anchor_stays_a_booking(self) -> None:
+        # It is still real and still shows on the Bookings tab; it just has no
+        # day to sit on, and guessing one would be worse than omitting it.
+        self.assertEqual(self._days([{"type": "activity", "detail": "Museum tickets, sometime"}]), {})
+
+    def test_an_anchor_outside_every_phase_is_not_forced_into_one(self) -> None:
+        # derive_bookings parks such a row on phase 1 because bookings.phase is
+        # NOT NULL. A day-by-day has no such constraint, and putting a
+        # 30 September event in the Tokyo tab would simply be wrong.
+        self.assertEqual(self._days([{"type": "activity", "detail": "Something — 30 Sep 2026 at 09:00"}]), {})
+
+    def test_extracted_days_win_over_derived_ones(self) -> None:
+        # The precedence written the right way round: an uploaded document's
+        # itinerary is richer than a list of bookings, so this fills empty
+        # phases rather than competing for the slot.
+        intake = dict(JAPAN_INTAKE)
+        intake["phases"] = {"kind": "structured", "schema_version": 3, "data": [{
+            "name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+            "days": [{"date": "2026-09-20", "items": [
+                {"time": "09:00", "text": {"he": "מהמסמך", "en": "From the document"}}]}],
+        }]}
+        intake["travel_anchors"] = {"kind": "structured", "schema_version": 3, "data": [
+            {"type": "activity", "detail": "Skytree — 20 Sep 2026 at 10:00"}]}
+        cfg = transform_intake(intake)
+        items = cfg["phases"][0]["days"][0]["items"]
+        self.assertEqual([i["text"]["en"] for i in items], ["From the document"])

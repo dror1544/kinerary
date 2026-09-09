@@ -9,8 +9,10 @@ import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "..
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
+import { testDatabaseUrl } from "./support/test-database.js";
+import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
@@ -79,7 +81,7 @@ function tap(chatId: string | null, data: string, fromId = 777): TelegramUpdate 
   };
 }
 
-async function bindCompanion(fix: Fixture, chatId: string, profile: string): Promise<void> {
+async function bindCompanion(fix: Fixture, chatId: string, profile: string | null): Promise<void> {
   await fix.pool.query(
     "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
     [chatId, fix.tripId, profile],
@@ -128,6 +130,29 @@ describe("dispatchUpdate — the branch table", () => {
       const decision = await dispatchUpdate(fix.pool, msg("700000444", "hello?"));
       assert.equal(decision.kind, "reply");
       assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
+    });
+  });
+
+  test("a bound chat with no assistant yet is answered honestly, not told it has no trip", { skip: SKIP }, async () => {
+    // The whole point of A4, at the only layer the organizer sees. On
+    // 2026-09-06 a trip provisioned perfectly — site up, HTTP 200 — and the
+    // organizer messaging the bot was told "I don't have a trip for this
+    // chat", because the companion install had failed and routing was gated
+    // behind it. Routing now exists independently, so the honest answer is
+    // available: we know your trip, the assistant is not ready yet.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000666", null);
+      const decision = await dispatchUpdate(fix.pool, msg("700000666", "מתי הטיסה שלנו?"));
+      assert.equal(decision.kind, "reply");
+      assert.equal(
+        decision.kind === "reply" && decision.reply.text,
+        DEFAULT_STRINGS.companionPending,
+      );
+      assert.notEqual(
+        decision.kind === "reply" && decision.reply.text,
+        DEFAULT_STRINGS.unbound,
+        "never claim the trip is unknown — it is bound, and the site is already up",
+      );
     });
   });
 
@@ -312,6 +337,14 @@ describe("chat-addressed session writes", () => {
             return_date: { kind: "text", schema_version: 2, text: "2026-09-13" },
             travelers: { kind: "structured", schema_version: 2, data: [{ name: "Dror" }] },
             phases: { kind: "structured", schema_version: 2, data: [{ name: "Tokyo" }] },
+            bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+            bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+            bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+            // The assistant's identity became required on 2026-09-07, so a
+            // session that can confirm has to carry it.
+            bot_name: { kind: "text", schema_version: 2, text: "Rio" },
+            bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
+            bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
           }),
           "700002004",
         ],
@@ -385,5 +418,161 @@ describe("chat-addressed session writes", () => {
       );
       assert.equal(result.ok && result.view.tripId, secondTripId);
     });
+  });
+});
+
+describe("the companion arriving in a group", { skip: SKIP }, () => {
+  const joinUpdate = (chatId: string, status = "member", botId = "8463178587") => ({
+    update_id: 90,
+    my_chat_member: {
+      chat: { id: chatId, type: "supergroup" },
+      from: { id: 77, is_bot: false, first_name: "Dror" },
+      old_chat_member: { user: { id: Number(botId), is_bot: true }, status: "left" },
+      new_chat_member: { user: { id: Number(botId), is_bot: true }, status },
+    },
+  }) as never;
+
+  test("introduces itself in a group that is bound to a trip", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000777";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio",
+          trip_title: "Japan 2026",
+          private_url: "https://japan-2026.example",
+          language: "en",
+          login_password: "seed-pw",
+          proactive: { morning_briefing: "07:30" },
+        })],
+      );
+
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.equal(decision.chatId, chatId);
+      assert.match(decision.text, /Rio/);
+      assert.match(decision.text, /https:\/\/japan-2026\.example/);
+      assert.match(decision.text, /seed-pw/);
+      assert.match(decision.text, /07:30/);
+      // It is already in the group; offering an add-to-group link would be absurd.
+      assert.doesNotMatch(decision.text, /startgroup/);
+    });
+  });
+
+  test("the password can be withheld from the group by one option", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000888";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio", private_url: "https://japan-2026.example",
+          language: "en", login_password: "seed-pw", organizer: "Dror",
+        })],
+      );
+
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+        { groupIntroIncludesPassword: false },
+      );
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.doesNotMatch(decision.text, /seed-pw/);
+      assert.match(decision.text, /Dror/);
+    });
+  });
+
+  test("an unbound group is told so, not left in silence", async () => {
+    // People just invited it into a room. Saying nothing reads as broken.
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate("-1002000999"), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "reply");
+    });
+  });
+
+  test("a promotion to admin is not a second arrival", async () => {
+    // Re-introducing on every permissions change would be noise in a live
+    // family group.
+    await withFixture(async (fix) => {
+      const chatId = "-1002000111";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      const promoted = {
+        update_id: 91,
+        my_chat_member: {
+          chat: { id: chatId, type: "supergroup" },
+          old_chat_member: { user: { id: 8463178587, is_bot: true }, status: "member" },
+          new_chat_member: { user: { id: 8463178587, is_bot: true }, status: "administrator" },
+        },
+      } as never;
+      const decision = await dispatchUpdate(
+        fix.pool, promoted, undefined, undefined, { id: "8463178587" },
+      );
+      assert.notEqual(decision.kind, "group_intro");
+    });
+  });
+
+  test("a trip with no stored intro facts stays quiet rather than inventing a name", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002000222";
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'companion-japan')`,
+        [chatId, fix.tripId],
+      );
+      const decision = await dispatchUpdate(
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+      );
+      assert.equal(decision.kind, "ignore");
+    });
+  });
+});
+
+describe("the agent answering in the wrong language", () => {
+  test("Hebrew interview, Hebrew agent text — kept", () => {
+    assert.equal(agentTextIsInLanguage("רשמתי, ממשיכים", "he"), true);
+  });
+
+  test("Hebrew interview, all-English agent text — rejected", () => {
+    // Run 15: "some of the messages from the bot came in English", in an
+    // interview held entirely in Hebrew, after a rate-limit swapped the model
+    // mid-conversation. The router's own copy is fully localised, so falling
+    // back to it beats passing through a sentence the organizer cannot read.
+    assert.equal(agentTextIsInLanguage("Got it — what pace suits you?", "he"), false);
+  });
+
+  test("a Hebrew sentence carrying English words is still Hebrew", () => {
+    // Place names, confirmation numbers and the odd English word are normal.
+    // The test is whether ANY Hebrew is present, not whether all of it is.
+    assert.equal(agentTextIsInLanguage("רשמתי את OMO3 Asakusa ל-19/9", "he"), true);
+  });
+
+  test("an English interview is never second-guessed", () => {
+    // The reverse direction is not checked: Hebrew inside an English interview
+    // is far more likely to be a traveller's name than a language slip.
+    assert.equal(agentTextIsInLanguage("משפחת סולומון is confirmed", "en"), true);
+    assert.equal(agentTextIsInLanguage("plain english", "en"), true);
+  });
+
+  test("empty text is not a language failure", () => {
+    assert.equal(agentTextIsInLanguage("", "he"), true);
+    assert.equal(agentTextIsInLanguage("   ", "he"), true);
   });
 });
