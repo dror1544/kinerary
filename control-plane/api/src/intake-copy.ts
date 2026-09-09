@@ -322,6 +322,17 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // Deliberately small. It exists to show the answer was understood, which
     // is why the understood VALUE is echoed with it — warmth without the value
     // would be flattery, and the value without warmth is a receipt.
+    // THE LAST THING THE ORGANIZER READS from this interview, so it should not
+    // be the only untranslated, most technical sentence in it. It was: "That's
+    // locked in — version 1 of your trip plan", in English, at the end of a
+    // Hebrew conversation. "Version 1" is our vocabulary, not theirs.
+    //
+    // What they actually want to know is what happens next and who will be in
+    // touch, so it says both — and names the assistant they just named, which
+    // is the moment that choice first means something.
+    intakeConfirmed: "That's everything — thank you. I'm building your trip site now, which takes a little while. When it's ready, {name} will message you right here with the link.",
+    /** When they never gave the assistant a name. */
+    intakeConfirmedNoName: "That's everything — thank you. I'm building your trip site now, which takes a little while. I'll message you right here with the link when it's ready.",
     gotIt: "Got it",
     gotItMore: "Got it — here's what I have:",
     // Said the moment a file lands, and it sets an expectation this code now
@@ -405,6 +416,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
+    intakeConfirmed: "זהו, יש לי הכול — תודה. אני מקים לכם עכשיו את אתר הטיול, וזה לוקח קצת זמן. כשיהיה מוכן, {name} יכתוב לכם לכאן עם הקישור.",
+    intakeConfirmedNoName: "זהו, יש לי הכול — תודה. אני מקים לכם עכשיו את אתר הטיול, וזה לוקח קצת זמן. כשיהיה מוכן אשלח לכם לכאן את הקישור.",
     gotIt: "יופי, רשמתי",
     gotItMore: "יופי — הנה מה שרשמתי:",
     documentReading: "קיבלתי — אני קורא את זה עכשיו. זה לוקח דקה; אחר כך אספר לכם מה מצאתי ואשאל רק על מה שחסר.",

@@ -622,9 +622,22 @@ async function applyInterviewCallback(
       return;
     }
     await ack("Confirmed");
+    // In the interview's own language, and naming the assistant they chose.
+    const confirmedView = await getSessionForChat(deps.db, decision.chatId);
+    const confirmedLanguage = confirmedView.ok ? confirmedView.view.language : DEFAULT_LANGUAGE;
+    const named = await answersForChat(deps.db, decision.chatId);
+    const botName = (() => {
+      const answer = named?.answers.bot_name as { text?: unknown } | undefined;
+      const raw = typeof answer?.text === "string" ? answer.text.trim() : "";
+      // A name with markup or a newline in it would arrive as a broken
+      // sentence; better to fall back than to send something mangled.
+      return raw && raw.length <= 60 && !/[<>\n]/.test(raw) ? raw : "";
+    })();
     await deps.telegram.sendMessage({
       chatId: decision.chatId,
-      text: `That's locked in — version ${result.versionNumber} of your trip plan. I'll take it from here and let you know when your trip site is ready.`,
+      text: botName
+        ? uiString("intakeConfirmed", confirmedLanguage).replace("{name}", botName)
+        : uiString("intakeConfirmedNoName", confirmedLanguage),
     });
     return;
   }

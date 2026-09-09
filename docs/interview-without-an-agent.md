@@ -410,6 +410,50 @@ not only the day-by-day. Runs 14–15 leaned on this path hard — a multi-file 
 upload responded to one file and stopped — and none of that is fixed by
 changing which model is called.
 
+## 9b. OPEN ISSUE: the recap reads like a database row
+
+Raised 2026-09-09 from a finished Hebrew interview. The recap is the last thing
+an organizer checks before committing, and it came out like this:
+
+```
+• יעד            Japan
+• נוסעים          Nir Solomon, Ela, Noa, Maya, Shai
+• אזור זמן        Asia/Tokyo
+• תאריך יציאה     2026-09-19
+• למי זה נוגע     kosher_style: everyone, lactose_free: Noa
+```
+
+Hebrew labels, English values, and one line of raw option ids. The organizer
+typed those names in Hebrew and got them back transliterated; they said "יפן"
+and got "Japan".
+
+**Two different problems, and only one of them needs a model.**
+
+*Deterministic, and a plain bug:* `kosher_style: everyone` leaks internal
+option ids into a message a person is asked to check. `optionLabel` exists and
+already renders `dietary` correctly one line above — `dietary_scope` is a
+structured answer keyed BY option id, and `describeStructured` prints keys
+verbatim. That is fixable without any model and should be.
+
+*Not deterministic:* "Japan" for יפן, ISO dates, `Asia/Tokyo`. These are
+CORRECT values — the transformer wants `Asia/Tokyo` and `2026-09-19`, and the
+Latin spelling of a traveller's name is what the site needs. The recap is
+showing the STORED form because it has no other. Rendering them the way the
+organizer would say them is a presentation layer that does not exist.
+
+**This is the first concrete argument for `phrase` (§10).** It was deferred on
+the grounds that the design should prove itself before generated prose came
+back into the user-facing path. That still holds for questions. But a recap is
+not a question: it restates what is already recorded and decided, a wrong
+phrasing is visible to the organizer next to the value it describes, and the
+fallback — today's output — is exactly what we have now. The blast radius is
+about as small as generated text gets.
+
+Not built here. Dror asked for it marked, and the deterministic half should
+land first anyway: a model asked to phrase `kosher_style: everyone` will
+happily invent something plausible rather than say "kosher-style, everyone",
+and fixing the leak removes the hardest input from the problem.
+
 ## 10. Deferred: `phrase`
 
 Earlier drafts had a third call producing one string of prose in the organizer's
