@@ -896,6 +896,76 @@ contexts and test groups without creating a per-trip Telegram bot.
 > than fixed one at a time — fixing them one at a time is what produced runs
 > 2–6.
 
+#### Live trip updates — MCP/API → Modern UI — **BUILT locally (2026-09-09); deployed acceptance pending**
+
+Added to Sprint 5 by the organizer's request, as part of wiring the trip to
+the AI companion. Implemented in this worktree; production deployment and the
+full deployed acceptance matrix remain outstanding.
+
+**Gateway verification update (2026-09-10):** the real runtime session bridge
+is implemented. A disposable browser run showed an MCP budget write in two
+Modern tabs through the gateway without reload; HTTP integration also verified
+two streams within two seconds, reconnect, and access boundaries. Grant/route
+responses used a control-plane fixture. This proves the local gateway path,
+not the complete resource matrix below or deployed acceptance. See
+[runtime-session-exchange.md](runtime-session-exchange.md).
+
+**Local verification (2026-09-09):** authenticated `/api/events` streams
+resource revisions from SQLite triggers; rollback also rolls back the revision.
+One 250 ms reader per runtime runs only while clients are connected. No raw
+trip content, row IDs, or credentials appear in events. Modern coalesces changes,
+refetches dependent queries, reconnects with backoff, and polls every 60 seconds
+in the foreground as fallback. An open editor holds affected query refreshes
+until it closes, protecting drafts even if another client deletes the row.
+
+Two Chrome tabs against a disposable fixture trip both displayed an agent-key
+budget write without reload. With an unsaved draft open in one tab, a remote
+delete removed the row from the other tab, while the first retained its draft
+and input focus; closing that editor applied the pending deletion. HTTP tests
+cover itinerary edits, booking document attachments (without creating itinerary
+items), photos, reactions, comments, rejected writes, and reconnect snapshots.
+Gateway tests verify streaming, trip-cookie isolation, and upstream cleanup.
+These are local checks, not a claim of live deployment or human approval.
+
+**Original problem:** Today/Journey poll every 60 seconds; Bookings, Budget, Photos,
+and comments have no periodic refresh. A successful MCP/API write does not
+notify an already-open Modern page. The 30-second query freshness setting
+is not a polling timer.
+
+Build:
+
+- Add an authenticated, trip-scoped server-sent event (SSE) stream. Publish
+  resource-change notifications only after successful persistence, including
+  writes made through MCP, direct API calls, and background plan enrichment.
+- Cover itinerary, bookings and attached documents, budget, photos, reactions,
+  and comments. Events carry minimal resource/revision metadata; browsers
+  retrieve content through the existing authorized read endpoints.
+- In Modern, invalidate and refetch affected queries, including dependent
+  Today/Journey and confirmation summaries. Coalesce bursts and preserve
+  unsaved editor input, focus, and scroll position.
+- Refresh on reconnection and return to the foreground; retain bounded polling
+  as a fallback. Verify the runtime gateway/proxy delivers events without
+  buffering and that disconnected clients are cleaned up.
+- Keep document attachment and itinerary creation distinct: attaching a
+  confirmation refreshes its booking and linked cards; creating or linking a
+  daily plan item remains an explicit agent operation.
+
+Acceptance checks:
+
+- With Modern open in two browsers, add/edit a plan item and attach a booking
+  document through MCP. Both browsers show the persisted changes without a
+  reload, targeting **within two seconds** on a healthy foreground connection.
+- Repeat for budget, photos, reactions, and comments; verify background
+  enrichment also appears and failed writes publish no change notification.
+- Disconnect one browser, make changes, then reconnect: it catches up without
+  duplicates or losing unsaved edits. Exercise polling fallback separately.
+- Unauthenticated clients are rejected; a second trip receives neither the
+  first trip's events nor its data. Existing read permissions still apply.
+
+**Sprint 5 exit requirement:** demonstrate the MCP → persisted trip data →
+open Modern UI loop through the runtime gateway before calling agent wiring
+complete.
+
 #### Track 4 — one voice, one writer *(the sprint's priority as of 2026-09-04)*
 
 Build:

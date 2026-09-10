@@ -190,6 +190,7 @@ services:
       # SSO is ruled out and Google is unconfigured. Stopgap until a real
       # member/organizer signup flow exists.
       PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      CONTROL_PLANE_EXCHANGE_KEY: ${CONTROL_PLANE_EXCHANGE_KEY:-}
       # Operator's Telegram chat id for the provisioning-outcome DM. The API
       # sends the matching approval DM to the same chat, resolved from the
       # profile's signup.super_admin_chat_id_secret_ref. Empty simply enqueues

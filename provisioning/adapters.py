@@ -100,7 +100,7 @@ class ProxmoxLxcAdapter:
     plain `mkdir`, not a separate TrueNAS-side provisioning step.
     """
 
-    def __init__(self, ssh: SshTransport, seed_password: str = "", reset_data: bool = False) -> None:
+    def __init__(self, ssh: SshTransport, seed_password: str = "", reset_data: bool = False, control_plane_exchange_key: str = "") -> None:
         self.ssh = ssh
         # Optional shared onboarding password for the new site's participants.
         # Deliberately NOT part of LxcSpec/Topology: those are serialized to
@@ -108,6 +108,9 @@ class ProxmoxLxcAdapter:
         # a git repository — a secret must not travel that way. Empty keeps
         # server.js's safe default (independent random per-user passwords).
         self._seed_password = seed_password
+        if "\n" in control_plane_exchange_key or "\r" in control_plane_exchange_key:
+            raise ValueError("control-plane exchange key must be one line")
+        self._control_plane_exchange_key = control_plane_exchange_key
         # When true, create() wipes the trip's NFS data dir (SQLite DB + media)
         # before anything else. The control plane sets this only for a first
         # provision — a container teardown leaves that dir intact, so a failed
@@ -236,6 +239,10 @@ class ProxmoxLxcAdapter:
             f"  printf 'SEED_PASSWORD=%s\\n' {shlex.quote(self._seed_password)} >> {app_dir}/.env\n"
             if self._seed_password else ""
         )
+        exchange_key_line = (
+            f"  printf 'CONTROL_PLANE_EXCHANGE_KEY=%s\\n' {shlex.quote(self._control_plane_exchange_key)} >> {app_dir}/.env\n"
+            if self._control_plane_exchange_key else ""
+        )
         script = f"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -272,10 +279,12 @@ if [ ! -f {app_dir}/.env ]; then
 TRIP_DIR={app_dir}/trips/{trip_slug}
 DATA_DIR={spec.nfs_mount_path}/server-data
 PORT=3000
+TRIP_DESIGN_VARIANT=modern
 JWT_SECRET=${{JWT_SECRET}}
 HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF
-{seed_password_line}fi
+{seed_password_line}{exchange_key_line}  chmod 600 {app_dir}/.env
+fi
 
 cat > /etc/systemd/system/kinerary-server.service <<'UNITEOF'
 [Unit]

@@ -78,6 +78,13 @@ tests); the companion bundle and MCP bridge scripts are complete.
 | B5 | **Per-trip MCP port collision.** `mcp_bridge.py` never passes `--port`; `setup-mcp.sh` hardcodes `3001` and kills whatever is listening there, so trip N+1 would kill trip N's bridge. | `mcp_bridge.py:100`, `setup-mcp.sh:76` |
 | B6 | **Manual allowlisting, unsupervised services.** `multiplex_profile_allowlist` holds one entry and needs a hand config edit plus a gateway restart per trip. Four long-running services (relay, interview MCP, gateway, per-trip `trip-mcp`) are unsupervised `nohup` processes outside compose. | `~/.hermes/profiles/trip-intake/config.yaml:20-22` |
 
+**B3 implementation update — 2026-09-10:** implemented and verified locally on
+`feat/modern-spa-next`, including participant identity binding and first-time
+LXC exchange-key setup. The findings table above records the original running
+stack inspection. Existing runtimes still need explicit private identity/key
+configuration and deployment. See [runtime session exchange](runtime-session-exchange.md).
+No deployed acceptance or human approval is recorded here.
+
 **Note on B3:** it is *not* required for a family to get in — the seed password
 already gives a working login. B3 buys the clean per-member path, not first
 access. Worth separating when answering question 5.

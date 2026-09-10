@@ -8,6 +8,45 @@ Companion pieces: `activation-scope.md` (what activation *is* — still open),
 `companion-install-plan.md` (B1), `onboarding-mvp-sprint-plan.md` (the sprints).
 This file is the journey, end to end, and where it actually breaks.
 
+## Verification update — 2026-09-10
+
+PR #44 contains the Modern work; the local parent integration branch was
+merged into it at `27a38bd`. The September 7 commit checkpoint below is
+historical. Map and direct-runtime MCP updates have been browser-verified;
+the detailed evidence is in `modern-trip-spa-code-review-session.md`.
+
+Activation B3 is now implemented locally: the real runtime exchanges a
+trip-scoped portal identity for its existing local user's JWT. Disposable
+browser checks covered portal → Modern → Classic, logout back to My trips,
+and an MCP budget write appearing in two Modern tabs through the real gateway.
+The control-plane grant/route responses were fixtures, so deployed acceptance
+remains pending. Existing runtimes require a private identity sidecar and a
+dedicated exchange key; see [the contract](runtime-session-exchange.md).
+
+## Update — 2026-09-07
+
+Phase B is implemented on `feat/modern-spa-next` and is waiting for the explicit
+commit/PR checkpoint:
+
+- the current Sprint 5 integration tree has been overlaid cleanly onto the
+  feature worktree;
+- fresh provisioned runtimes default to Modern at `/`, while existing runtimes
+  keep their current choice because their `.env` is not overwritten;
+- successful provisioning now creates or readies `runtime_routes`, and the
+  portal fails closed until that route exists instead of inferring readiness
+  from `ready_private`;
+- Modern now has working Budget and Photos modules, including budget CRUD,
+  photo upload/delete, albums, reactions, and comments;
+- the trip MCP now exposes budget writes as well as reads, completing the
+  Budget surface the companion will need in Sprint 5;
+- Account/avatar/sign-in management, Tasks/Packing, RSVP/Ratings/Comments,
+  Lost & Found, and Trivia remain the established Classic implementations.
+  They are labeled as such in Modern, remain available to every traveler, and
+  share the same browser session.
+
+The historical run evidence below is intentionally preserved; its `no` rows
+describe the 2026-09-06 deployment, not the feature branch after this update.
+
 ---
 
 ## 1. Where the journey stands
@@ -75,31 +114,23 @@ real answer. Not a log line — the actual reply.
 `site/modern/` already ships with every deploy and is live on the provisioned
 trip. What is missing is that it is not what the organizer's link opens.
 
-**B1 — merge `feat/modern-spa-next`.** Four commits not in the integration
-branch: the interactive itinerary map, itinerary ordering, the editor
-viewport fix, and enrichment for modern itinerary additions. The provisioned
-trip is running a modern SPA four commits stale.
+**B1 — merge `feat/modern-spa-next` (implemented; PR pending).** The feature
+branch now carries the interactive itinerary map, itinerary ordering, editor
+viewport fix, enrichment for Modern itinerary additions, complete Bookings,
+Budget and Photos modules, and its rebuilt production bundle. The current
+Sprint 5 integration tree overlays cleanly; the remaining step is the explicit
+commit/PR/merge checkpoint.
 
-**B2 — decide the front door.** `/` is the legacy site; `/modern/` is the new
-one. Options, in the order I would consider them:
-1. **Modern at `/`, legacy at `/legacy/`** — the organizer's link opens the
-   product you intend to ship. Highest impact, and the only one that makes the
-   onboarding link mean what it says.
-2. Modern at `/` for new trips only, legacy default for the two hand-built
-   trips — safer for `japan-2026` and `elul-family-usa-2026`, which people use.
-3. Leave as-is and link `/modern/` explicitly in the onboarding message —
-   cheapest, and postpones the decision without blocking anything.
+**B2 — front door (implemented).** Freshly provisioned trips set
+`TRIP_DESIGN_VARIANT=modern`, so `/` opens Modern. Existing hand-built trips
+retain their current front door because the bootstrap never overwrites an
+existing `.env`. Classic remains at `/classic.html` for established group
+utilities and as an organizer fallback.
 
-This is a product call, not a technical one. Everything else here is
-sequenced so it does not block.
-
-**B3 — `runtime_routes` (activation-scope B2).** Zero rows repo-wide; the only
-writer is a one-shot backfill in migration 0034. `GET
-/internal/runtime-routes/:tripId` 404s `RUNTIME_NOT_READY` forever for a new
-trip, which kills "Open trip", invite creation and participant lookup.
-`portal.ts` masks it in the dashboard with `|| lifecycle_state ===
-"ready_private"`. Needed for the organizer's *managed* path, not for a family
-member typing the URL.
+**B3 — `runtime_routes` (implemented).** The successful provisioning
+transaction now creates or readies the route while keeping its stable
+`route_ref` on reprovision. The portal and web dashboard require that ready
+route; `ready_private` alone no longer masks a missing runtime.
 
 **Acceptance:** the link delivered after provisioning opens the modern SPA,
 signed in, showing that trip's itinerary.

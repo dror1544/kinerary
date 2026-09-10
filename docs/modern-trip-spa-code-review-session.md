@@ -173,3 +173,145 @@ failure; falsy-zero skipping a map stop on the equator/prime meridian;
 - A pre-existing staged change to
   `control-plane/worker/control_plane_worker/provisioner.py` was left untouched
   and out of every commit above.
+
+## Hero reliability follow-up — 2026-09-09
+
+Modern previously put the chosen URL directly into a CSS background. Uploaded
+heroes live behind `authRequired`, so direct browser requests lacked the bearer
+token; gateway-relative CSS URLs also bypassed `runtimePath`. The `||` chain
+selected the first nonempty URL without checking whether it loaded, and the
+transition removed the old image after 900 ms regardless of replacement readiness.
+
+`trip-web/src/hero-photo.ts` now authenticates same-origin image requests, uses
+the runtime prefix, validates image MIME and decoding, and only then swaps the
+visible photo. External image requests never receive the trip bearer token.
+Failed candidates fall through to other configured photos; failed/slow changes
+retain the last decoded photo. Retries are bounded and restart on reconnect;
+obsolete loads cannot replace the current selection. Decoded-image memory is
+bounded and private object URLs are released on unmount, not stored persistently.
+
+The SPA regression suite now includes nonempty hero fixtures, authenticated
+loading, gateway routing, invalid responses, timeouts, fallback ordering, and
+stale-load races. `tests/hero-http.test.js` checks the actual protected upload/read
+contract. Verification completed on 2026-09-09 after the temporary test-server
+restriction cleared: 36 SPA tests, TypeScript, and the isolated HTTP test pass.
+The HTTP test sees 401 without authentication and matching PNG bytes with it.
+Chrome rendered a real configured Japan photograph after uploading a temporary
+copy into the fixture trip's protected media storage, and loaded it again after
+refresh. An intentionally corrupt replacement then left the same decoded image
+visible (same blob URL); screenshots confirmed the photograph remained on screen.
+The browser check used the direct local runtime; gateway path mapping is covered
+by the loader regression test. No deployment or live-trip photo replacement was
+performed.
+
+Third-party image URLs remain an external dependency. To remove that source of
+outages, selected originals must be copied into durable trip-owned media storage
+(with source/credit retained), then checked during deployment. The loader fixes
+do not claim that an external provider will keep serving a URL indefinitely.
+
+## 3D map and parent integration — 2026-09-10
+
+Merged `integration/sprint-5-plus` into `feat/modern-spa-next` at `27a38bd`
+without conflicts, including the companion-scope template update.
+
+The map now offers explicit 2D/3D switching. The opt-in 3D view loads
+OpenFreeMap building extrusions; satellite imagery remains build-configured.
+MapLibre's worker is emitted through Vite's worker pipeline so the production
+bundle can load it. Trip markers and camera positioning no longer wait for a
+third-party style or tiles, and a stalled 3D load offers a return to 2D.
+Mode changes retain the selected stop and release the previous map and markers.
+Camera animations respect the browser's reduced-motion preference.
+
+Validation on the merged tree:
+
+- 39 Modern SPA tests pass, including worker setup, markers before style load,
+  selected-stop preservation, 3D readiness, timeout recovery, and cleanup.
+- TypeScript and the production build pass.
+- Repository preflight passes: trip-site tests, API build/unit subset, Python
+  worker/provisioning, and organizer web tests/typecheck/build.
+- Full API suite against the dedicated `cptest` database on port 5434:
+  743 passed, 0 failed, 6 skipped.
+- All 5 runtime-gateway tests pass, including SSE streaming, cookie isolation,
+  and upstream cleanup.
+- Chrome rendered 3D buildings from the production bundle against a disposable
+  fixture runtime and switched back to 2D; no browser map errors were recorded.
+- A real `add_budget_item` MCP call appeared in two open Modern Chrome tabs
+  without reload. With an unsaved editor draft in the first tab,
+  `delete_budget_item` removed the second tab's row while retaining the first
+  tab's draft. Cancelling the editor applied the pending deletion.
+
+**Gateway acceptance remains blocked, not passed.** A real POST to
+`/api/internal/control-plane/session` on the fixture trip server returns
+HTTP 404 (`Cannot POST /api/internal/control-plane/session`). The gateway
+requires this endpoint for launch, while its isolated test supplies a stub.
+This is the existing activation B3 gap in `docs/activation-scope.md`, not a
+regression introduced by the map. The two-browser MCP check above used the
+direct runtime, so it does not establish the full managed gateway login path,
+the two-second gateway target, or deployed acceptance. No live deployment or
+PR approval is recorded by this verification.
+
+
+## Runtime session bridge — 2026-09-10
+
+The B3 gap observed above is implemented in the working tree. The runtime now
+binds control-plane identities to existing local accounts using a private
+trip/owner manifest and a dedicated exchange key. Member invitations preserve
+Classic passwords and cannot claim organizer accounts. Both interfaces share
+the same identity, permissions, gateway cookie, and logout helper.
+
+Real HTTP integration results against disposable runtime data:
+
+- Missing, incorrect, traveler, and companion credentials cannot exchange a
+  session (401). A correctly mapped owner receives a token (200).
+- Wrong trip, identity, username, or role fails (403); conflicting invitation
+  bindings fail (409); members cannot read the organizer brief (403).
+- Gateway proxy access to internal routes fails (404). Removed participants'
+  existing managed JWTs fail (401), and new exchanges fail (403).
+- Two real gateway SSE streams receive an MCP write within the two-second
+  test timeout; reconnect retrieves current state.
+
+Chrome also verified the built portal → Modern → Classic path without a second
+login, Classic and Modern logout returning to My trips, and a real MCP budget
+write appearing in two Modern tabs through the gateway without reload. Only the
+control-plane grant/route APIs were fixture responses; these checks do not
+establish live-stack deployment acceptance.
+
+Validation: runtime integration 8/8; gateway 5/5; portal DB 6/6; worker 76/76;
+provisioning 34/34; organizer web 10/10; Modern 39/39; shared logout 3/3.
+Repository preflight passed; final framing/logout refinements passed their
+affected tests and production builds. DB tests used only `cptest` on port 5434.
+Configuration and migration requirements are in
+[runtime-session-exchange.md](runtime-session-exchange.md). No deployment or
+PR approval was performed.
+
+## PR #44 review fixes — 2026-09-11
+
+Addressed the three findings on review 5172086172:
+
+- Enrichment now creates a revision changing only the matching item's generated
+  fields. Item types, durations, confirmation state, other items, and day context
+  survive; the full Classic compatibility projection is no longer used here.
+- Title edits reset the enrichment queue and discard only companion values that
+  still match recorded generated output. Authored translations and links remain.
+  The editor preserves its existing translation instead of submitting null on
+  every save. Generation checks reject results from an older in-flight title.
+  Existing values created before output tracking are conservatively retained:
+  their authorship cannot be recovered from the old database schema.
+- Booking creation retains the persisted ID and successful attachment uploads.
+  Retrying a failed attachment reuses that ID, applies any intervening form edits,
+  and skips completed uploads. The error explains that the booking already exists.
+
+The three new HTTP regressions failed against the reviewed implementation and
+pass with these changes. They use a disposable real trip server and stub model
+service, including a delayed response across a title edit. Two UI regressions
+cover failed confirmation upload, failed wallet upload after successful PDF
+upload, edited fields on retry, and starting the next booking.
+
+Validation: 168/168 related server tests (server, living journey, enrichment,
+schedule review, trip events, and protected hero HTTP), 41/41 Modern SPA tests,
+TypeScript, production build, and `git diff --check` pass. The HTTP suites retain
+401 responses for unauthenticated/foreign-trip event reads and 403 responses
+for family-member organizer-only writes. Production assets were regenerated.
+The review fixes are isolated from the separate login/runtime-activation work.
+The deployment target authorized for these fixes is the local Modern preview
+at localhost:8081; live trip deployments remain outside this change.

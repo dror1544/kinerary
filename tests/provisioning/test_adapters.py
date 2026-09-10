@@ -201,6 +201,10 @@ class AdapterTests(unittest.TestCase):
         # container (never sent over the wire), like JWT_SECRET.
         self.assertIn("HERMES_API_KEY=${HERMES_API_KEY}", bootstrap)
         self.assertRegex(bootstrap, r"HERMES_API_KEY=\$\(head -c 32 /dev/urandom")
+        # Newly provisioned trips open the Modern SPA at `/`. The root loader
+        # still honors the stored setting, so existing hand-built trips keep
+        # their Classic front door until an organizer changes it explicitly.
+        self.assertIn("TRIP_DESIGN_VARIANT=modern", bootstrap)
 
     def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
         # Without it a provisioned site has NO way in at all: Telegram SSO is
@@ -219,6 +223,17 @@ class AdapterTests(unittest.TestCase):
         # password containing a dollar sign.
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
+
+    def test_exchange_key_is_private_and_shell_quoted(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        adapter = ProxmoxLxcAdapter(ssh, control_plane_exchange_key="exchange $key")
+        adapter.create(LXC_SPEC)
+        bootstrap = ssh.commands[3]
+        self.assertIn("'exchange $key'", bootstrap)
+        self.assertIn("CONTROL_PLANE_EXCHANGE_KEY=%s", bootstrap)
+        self.assertIn("chmod 600 /opt/kinerary/.env", bootstrap)
+        with self.assertRaises(ValueError):
+            ProxmoxLxcAdapter(ssh, control_plane_exchange_key="key\nJWT_SECRET=oops")
 
     def test_connect_timeout_and_command_timeout_are_independent(self) -> None:
         # Regression: one `timeout` served as BOTH the ssh ConnectTimeout and
