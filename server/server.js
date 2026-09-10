@@ -431,6 +431,8 @@ for (const [col, decl] of [
   ['enrichment_status', "TEXT DEFAULT 'none'"],
   ['enriched_at',       'TEXT'],
   ['enrich_attempts',   'INTEGER DEFAULT 0'],
+  ['enrichment_values', "TEXT DEFAULT '{}'"],
+  ['enrichment_generation', 'INTEGER DEFAULT 0'],
   // Minutes-since-midnight, derived from `time` on write. `time` may hold a
   // rough token ("morning"), which would otherwise sort lexically — "afternoon"
   // before "morning" before "noon" — so ordering uses this instead.
@@ -881,10 +883,15 @@ const journey = livingJourney.create({
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
-  requestItemEnrichment: (itemUid) => {
+  requestItemEnrichment: (itemUid, { titleChanged = false } = {}) => {
     // A Modern edit projects into the Classic compatibility table. Queue just
     // that projected row rather than re-running enrichment for the entire trip.
     // The background worker owns model calls, so the save request remains fast.
+    if (titleChanged) {
+      db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none', enrich_attempts = 0, " +
+        "enrichment_values = '{}', enrichment_generation = enrichment_generation + 1, " +
+        "needs_tickets = NULL, advance_booking = NULL WHERE itinerary_item_uid = ?").run(itemUid);
+    }
     if (!HERMES_URL) return { configured: false, queued: false };
     const result = db.prepare(
       "UPDATE phase_plan_items SET enrichment_status = 'pending', enrich_attempts = 0 " +
@@ -2678,32 +2685,46 @@ async function runEnrichmentPass() {
       db.prepare('UPDATE phase_plan_items SET enrich_attempts = enrich_attempts + 1 WHERE id = ?').run(item.id);
       try {
         const out = await enrichOne(item);
+        const current = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(item.id);
+        // The organizer may edit or delete an item while the provider is busy.
+        // Leave the newer generation pending instead of applying stale output.
+        if (!current || current.enrichment_generation !== item.enrichment_generation ||
+            current.text_he !== item.text_he || current.text_en !== item.text_en ||
+            current.date !== item.date || current.phase_id !== item.phase_id) continue;
         // The organizer enters one title. The enrichment service supplies the
         // companion language without overwriting Hebrew an organizer authored.
         // If the primary field was entered in English, replace that temporary
         // storage value with the Hebrew translation once it is available.
-        const primaryLooksHebrew = /[\u0590-\u05FF]/.test(item.text_he || '');
-        const translatedHe = !item.text_en && !primaryLooksHebrew ? cleanEnrichedText(out.text_he) : null;
-        const translatedEn = !item.text_en ? cleanEnrichedText(out.text_en) : null;
+        const primaryLooksHebrew = /[\u0590-\u05FF]/.test(current.text_he || '');
+        const translatedHe = !current.text_en && !primaryLooksHebrew ? cleanEnrichedText(out.text_he) : null;
+        const translatedEn = !current.text_en ? cleanEnrichedText(out.text_en) : null;
         // Link a real booking if one plainly matches, but never overwrite a
         // link an organizer or agent already set by hand.
-        const bookingId = item.booking_id || findMatchingBooking(item);
-        db.prepare(
-          "UPDATE phase_plan_items SET text_he = COALESCE(?, text_he), text_en = COALESCE(?, text_en), " +
-          "location_url = COALESCE(?, location_url), waze_url = ?, " +
-          'website_url = ?, ticket_url = ?, needs_tickets = ?, advance_booking = ?, ' +
-          "booking_id = COALESCE(?, booking_id), enrichment_status = 'done', " +
-          "enriched_at = datetime('now') WHERE id = ?"
-        ).run(translatedHe, translatedEn, cleanLink(out.maps_url), cleanLink(out.waze_url),
-              cleanLink(out.website_url), cleanLink(out.ticket_url),
-              cleanBool(out.needs_tickets), cleanBool(out.advance_booking),
-              bookingId, item.id);
-        // The Modern UI reads the immutable active revision, not the Classic
-        // compatibility row the worker enriches. Synchronize each completed
-        // pass so the translated title and links appear there without a manual
-        // Classic reload.
-        journey.syncFromLegacy('enrichment');
+        const fields = {};
+        if (translatedHe) fields.text_he = translatedHe;
+        if (translatedEn) fields.text_en = translatedEn;
+        for (const [key, value] of Object.entries({
+          location_url: cleanLink(out.maps_url), waze_url: cleanLink(out.waze_url),
+          website_url: cleanLink(out.website_url), ticket_url: cleanLink(out.ticket_url),
+          needs_tickets: cleanBool(out.needs_tickets), advance_booking: cleanBool(out.advance_booking),
+          booking_id: current.booking_id ? null : findMatchingBooking(current),
+        })) {
+          if (current[key] == null || current[key] === '') {
+            if (value != null) fields[key] = value;
+          }
+        }
+        let generated;
+        try { generated = JSON.parse(current.enrichment_values || '{}'); } catch { generated = {}; }
+        db.transaction(() => {
+          const assignments = Object.keys(fields).map(key => `${key} = ?`);
+          db.prepare(`UPDATE phase_plan_items SET ${assignments.length ? assignments.join(', ') + ', ' : ''}
+            enrichment_values = ?, enrichment_status = 'done', enriched_at = datetime('now') WHERE id = ?`)
+            .run(...Object.values(fields), JSON.stringify({ ...generated, ...fields }), item.id);
+          journey.applyItemEnrichment(current, fields);
+        })();
       } catch (e) {
+        const current = db.prepare('SELECT enrichment_generation FROM phase_plan_items WHERE id = ?').get(item.id);
+        if (!current || current.enrichment_generation !== item.enrichment_generation) continue;
         const attempts = db.prepare('SELECT enrich_attempts a FROM phase_plan_items WHERE id = ?').get(item.id)?.a || 0;
         if (attempts >= ENRICH_MAX_ATTEMPTS) {
           db.prepare("UPDATE phase_plan_items SET enrichment_status = 'failed' WHERE id = ?").run(item.id);

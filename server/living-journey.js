@@ -640,6 +640,19 @@ function updateLegacyFromActive(db) {
   })();
 }
 
+// Enrichment changes only a few fields on one item. The compatibility table
+// cannot round-trip Modern types, durations or day context.
+function applyItemEnrichment(db, legacy, fields) {
+  const uid = legacy.itinerary_item_uid || (legacy.config_ref ? `cfg_${digest(legacy.config_ref).slice(0, 16)}` : `legacy_${legacy.id}`);
+  if (!activeRows(db)?.items.some(item => item.item_uid === uid)) return;
+  const allowed = ['text_he', 'text_en', 'location_url', 'waze_url', 'website_url', 'ticket_url', 'booking_id'];
+  const patch = Object.fromEntries(allowed.filter(key => Object.hasOwn(fields, key)).map(key => [key, fields[key]]));
+  if (!Object.keys(patch).length) return;
+  return cloneWith(db, 'enrichment', 'Enriched itinerary item', rows => {
+    rows.items = rows.items.map(item => item.item_uid === uid ? { ...item, ...patch } : item);
+  });
+}
+
 function syncFromLegacy(db, raw, author = 'legacy-api') {
   const state = getState(db);
   if (!state) return null;
@@ -1007,6 +1020,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     }
     if (body.date !== undefined && !ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
     let touched = false;
+    let titleChanged = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer edited itinerary item', (rows) => {
       rows.items = rows.items.map((item) => {
         if (item.item_uid !== uid) return item;
@@ -1022,13 +1036,23 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
         if (body.item_type !== undefined) next.item_type = normalizeType(body.item_type);
         if (body.confirmation_state !== undefined) next.confirmation_state = normalizeConfirmation(body.confirmation_state);
         if (body.duration_minutes !== undefined) next.duration_minutes = Number.isFinite(Number(body.duration_minutes)) ? Number(body.duration_minutes) : null;
+        titleChanged = body.text_he !== undefined && next.text_he !== item.text_he;
+        if (titleChanged) {
+          const legacy = db.prepare('SELECT enrichment_values FROM phase_plan_items WHERE itinerary_item_uid = ?').get(uid);
+          const generated = readJson(legacy?.enrichment_values, {});
+          // The form submits unchanged companion fields too. Clear only values
+          // still equal to our generated output; preserve deliberate edits.
+          for (const key of ['text_en', 'location_url', 'waze_url', 'website_url', 'ticket_url', 'booking_id']) {
+            if (Object.hasOwn(generated, key) && next[key] === generated[key]) next[key] = null;
+          }
+        }
         return next;
       });
     });
     if (!touched) return res.status(404).json({ error: 'not found' });
     updateLegacyFromActive(db);
     const enrichment = body.text_he !== undefined
-      ? requestItemEnrichment?.(uid) || { configured: false, queued: false }
+      ? requestItemEnrichment?.(uid, { titleChanged }) || { configured: false, queued: false }
       : undefined;
     res.json({ revision: nextId, item_uid: uid, ...(enrichment ? { enrichment } : {}) });
   });
@@ -1186,6 +1210,7 @@ function create(options) {
   return {
     registerRoutes: (app, middlewares) => registerRoutes({ ...options, app, ...middlewares }),
     syncFromLegacy: (author) => syncFromLegacy(db, raw, author),
+    applyItemEnrichment: (legacy, fields) => applyItemEnrichment(db, legacy, fields),
     updateLegacyFromActive: () => updateLegacyFromActive(db),
     uiSettings: () => uiSettings(db),
   };

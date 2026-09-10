@@ -793,12 +793,12 @@ function JourneyView({
     mutationFn: ({ itemUid, input }: { itemUid?: string; input: ItineraryItemInput }) => itemUid ? updateItineraryItem(itemUid, input) : createItineraryItem(input),
     onSuccess: (result) => {
       setEditing(null);
-      setEnrichmentNote(result.enrichment?.configured
+      setEnrichmentNote(result.enrichment?.queued
         ? copy(lang, "Saved. Kinerary is now adding the other language, location, and useful links. It can take a minute.", "נשמר. קינררי מוסיף עכשיו את השפה השנייה, מיקום וקישורים שימושיים. זה עשוי לקחת כדקה.")
-        : copy(lang, "Saved. The other language and location links will be added automatically when the trip assistant is online.", "נשמר. השפה השנייה וקישורי המיקום יתווספו אוטומטית כשהעוזר של הטיול יהיה זמין."));
+        : copy(lang, "Saved.", "נשמר."));
       void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
       void queryClient.invalidateQueries({ queryKey: ["today"] });
-      if (result.enrichment?.configured) {
+      if (result.enrichment?.queued) {
         [4_000, 12_000, 30_000].forEach((delay) => window.setTimeout(() => {
           void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
           void queryClient.invalidateQueries({ queryKey: ["today"] });
@@ -888,7 +888,7 @@ function JourneyView({
               event.preventDefault();
               if (!draft.phase_id || !draft.date || !draft.text_he.trim()) return;
               const time = timeMode === "none" ? null : draft.time?.trim() || null;
-              saveMutation.mutate({ itemUid: editing === "new" ? undefined : editing.item_uid, input: { ...draft, text_he: draft.text_he.trim(), text_en: null, time, location_url: draft.location_url?.trim() || null } });
+              saveMutation.mutate({ itemUid: editing === "new" ? undefined : editing.item_uid, input: { ...draft, text_he: draft.text_he.trim(), time, location_url: draft.location_url?.trim() || null } });
             }}
           >
             <div className="editor-heading">
@@ -1069,6 +1069,8 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
   const [isOpen, setIsOpen] = useState(false);
   const [extractionError, setExtractionError] = useState("");
   const formGeneration = useRef(0);
+  const savedBooking = useRef<{ id: number; input: string; confirmation: File | null; wallet: File | null } | null>(null);
+  const [partiallySaved, setPartiallySaved] = useState(false);
   const queryClient = useQueryClient();
   const extractMutation = useMutation({
     mutationFn: async (generation: number) => {
@@ -1100,12 +1102,33 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
   });
   const mutation = useMutation({
     mutationFn: async () => {
-      const created = await createBooking({ ...draft, phase: draft.phase || defaultPhase });
-      if (confirmationFile) await uploadBookingConfirmation(created.id, confirmationFile);
-      if (walletFile) await uploadBookingAppleWallet(created.id, walletFile);
-      return created;
+      const input = { ...draft, phase: draft.phase || defaultPhase };
+      const serialized = JSON.stringify(input);
+      if (!savedBooking.current) {
+        const created = await createBooking(input);
+        savedBooking.current = { id: created.id, input: serialized, confirmation: null, wallet: null };
+        setPartiallySaved(true);
+        formGeneration.current += 1;
+        void queryClient.invalidateQueries({ queryKey: ["bookings"] });
+      }
+      const saved = savedBooking.current;
+      if (saved.input !== serialized) {
+        await updateBooking(saved.id, input);
+        saved.input = serialized;
+      }
+      if (confirmationFile && saved.confirmation !== confirmationFile) {
+        await uploadBookingConfirmation(saved.id, confirmationFile);
+        saved.confirmation = confirmationFile;
+      }
+      if (walletFile && saved.wallet !== walletFile) {
+        await uploadBookingAppleWallet(saved.id, walletFile);
+        saved.wallet = walletFile;
+      }
+      return { id: saved.id };
     },
     onSuccess: () => {
+      savedBooking.current = null;
+      setPartiallySaved(false);
       formGeneration.current += 1;
       setDraft({ phase: defaultPhase, type: "flight", name: "", date_from: "", date_to: "", passengers: "", confirmation: "", location_url: "", google_wallet_url: "", apple_wallet_url: "" });
       setConfirmationFile(null);
@@ -1115,6 +1138,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       setIsOpen(false);
       queryClient.invalidateQueries({ queryKey: ["bookings"] });
     },
+    onError: () => { void queryClient.invalidateQueries({ queryKey: ["bookings"] }); },
   });
 
   if (!isOrganizer) return null;
@@ -1156,7 +1180,7 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
         </div>
       </details>
       <button className="primary-action" type="submit" disabled={mutation.isPending || !(draft.phase || defaultPhase) || !draft.name.trim()}>{mutation.isPending ? (lang === "he" ? "שומר…" : "Saving…") : (lang === "he" ? "שמירת הזמנה" : "Save booking")}</button>
-      {mutation.isError ? <p className="form-error">{mutation.error instanceof Error ? mutation.error.message : (lang === "he" ? "לא ניתן לשמור את ההזמנה" : "Could not save the booking")}</p> : null}
+      {mutation.isError ? <p className="form-error" role="alert">{partiallySaved ? copy(lang, "The booking is saved. Save again to retry the remaining changes and attachments. ", "ההזמנה נשמרה. יש לשמור שוב כדי לנסות להשלים את השינויים והקבצים שנותרו. ") : ""}{mutation.error instanceof Error ? mutation.error.message : (lang === "he" ? "לא ניתן לשמור את ההזמנה" : "Could not save the booking")}</p> : null}
       {mutation.isSuccess ? <p className="saved-note">{lang === "he" ? "ההזמנה נשמרה ומוכנה לחברי הטיול." : "Booking saved and ready for trip members."}</p> : null}
     </form>
   );

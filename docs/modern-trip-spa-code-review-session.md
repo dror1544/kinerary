@@ -249,3 +249,35 @@ regression introduced by the map. The two-browser MCP check above used the
 direct runtime, so it does not establish the full managed gateway login path,
 the two-second gateway target, or deployed acceptance. No live deployment or
 PR approval is recorded by this verification.
+
+## PR #44 review fixes — 2026-09-11
+
+Addressed the three findings on review 5172086172:
+
+- Enrichment now creates a revision changing only the matching item's generated
+  fields. Item types, durations, confirmation state, other items, and day context
+  survive; the full Classic compatibility projection is no longer used here.
+- Title edits reset the enrichment queue and discard only companion values that
+  still match recorded generated output. Authored translations and links remain.
+  The editor preserves its existing translation instead of submitting null on
+  every save. Generation checks reject results from an older in-flight title.
+  Existing values created before output tracking are conservatively retained:
+  their authorship cannot be recovered from the old database schema.
+- Booking creation retains the persisted ID and successful attachment uploads.
+  Retrying a failed attachment reuses that ID, applies any intervening form edits,
+  and skips completed uploads. The error explains that the booking already exists.
+
+The three new HTTP regressions failed against the reviewed implementation and
+pass with these changes. They use a disposable real trip server and stub model
+service, including a delayed response across a title edit. Two UI regressions
+cover failed confirmation upload, failed wallet upload after successful PDF
+upload, edited fields on retry, and starting the next booking.
+
+Validation: 168/168 related server tests (server, living journey, enrichment,
+schedule review, trip events, and protected hero HTTP), 41/41 Modern SPA tests,
+TypeScript, production build, and `git diff --check` pass. The HTTP suites retain
+401 responses for unauthenticated/foreign-trip event reads and 403 responses
+for family-member organizer-only writes. Production assets were regenerated.
+The review fixes are isolated from the separate login/runtime-activation work.
+The deployment target authorized for these fixes is the local Modern preview
+at localhost:8081; live trip deployments remain outside this change.
