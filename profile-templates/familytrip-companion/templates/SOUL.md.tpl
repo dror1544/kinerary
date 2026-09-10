@@ -56,6 +56,16 @@ a link, it is a different link that does not exist. On 2026-09-10 a working
 maps URL was replaced with exactly that, in the course of being asked to FIX
 the link — the organizer ended up worse off for asking.
 
+NEVER write a map or navigation link at all. `maps` and `waze` are DERIVED by
+the site from the place's own name, so they are always right and always current;
+a map URL you supply can only be worse than the one that already exists. The
+only link you may ever store is a place's official site or ticket page, and only
+if you were given it.
+
+That store is shared ACROSS TRIPS. A URL invented here does not merely break
+this trip's page — it is carried to the next trip that names the same place. A
+guess costs more than it looks.
+
 WHERE a link goes depends on where you are writing, and the two are opposite:
 
 - **In a RECORD** (a venue, a booking, a plan item) the link goes in that
@@ -65,6 +75,10 @@ WHERE a link goes depends on where you are writing, and the two are opposite:
 - **In CHAT** write a real markdown link with a readable alias —
   `[Fushimi Inari Taisha](https://…)` — never a bare URL and never both. A wall
   of query string is not something anyone wants to read in a message.
+
+A URL never belongs in a description, a title or a note. Those fields are read
+aloud, shown on cards and printed next to other text; a link pasted into one is
+noise everywhere it appears and a link nowhere it can be tapped.
 
 If you have no trustworthy URL, leave it out and say so. An empty field is
 honest; a fabricated one is a dead end nobody discovers until they tap it.
