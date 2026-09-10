@@ -13,7 +13,7 @@ import { basename, join } from "node:path";
 import { documentText } from "../src/document-text.js";
 import { extractIntakeFromDocument, applyProposals } from "../src/interpret.js";
 import { INTAKE_QUESTIONS, partitionQuestions } from "../src/interview.js";
-import { codexRunner, codexSpec, CODEX_LUNA_MODEL } from "../src/model-runner.js";
+import { codexRunner, codexSpec, CODEX_LUNA_MODEL, modelRunnerFromEnv } from "../src/model-runner.js";
 
 const path = process.argv[2];
 if (!path) {
@@ -56,7 +56,13 @@ const doc = { ok: true as const, text: parts.join("\n\n"), pages: 0, truncated: 
 console.log(`\n${parts.length}/${files.length} readable, ${doc.text.length} chars combined\n`);
 
 const { outstanding } = partitionQuestions({}, INTAKE_QUESTIONS);
-const runner = codexRunner({ extract: codexSpec(CODEX_LUNA_MODEL, 240_000) });
+// The CONFIGURED runner first, so this reproduces what the relay actually
+// does. It hardcoded codex, which meant it could not reproduce a live
+// extraction at all once EXTRACT_RUNNER moved to claude — and a document that
+// came back empty on 2026-09-10 had to be chased with a throwaway script.
+// Falls back to codex so an invocation with no environment still works.
+const runner = modelRunnerFromEnv() ?? codexRunner({ extract: codexSpec(CODEX_LUNA_MODEL, 240_000) });
+console.log(`runner: ${process.env.EXTRACT_RUNNER || "codex (fallback)"} ${process.env.EXTRACT_MODEL || ""}`);
 
 const started = Date.now();
 const result = await extractIntakeFromDocument(runner, {
