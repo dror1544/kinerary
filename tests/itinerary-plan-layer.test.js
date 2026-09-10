@@ -19,6 +19,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { mkdtempSync, rmSync, cpSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
@@ -149,7 +150,7 @@ function renderFor(plan, days, { isOrganizer }) {
 // is exactly the race helpers/server.js warns about.
 before(async () => {
   tripDir = makeTripDir();
-  await startTestServer({ PORT: '3107', TRIP_DIR: tripDir });
+  await startTestServer({ PORT: String(PORTS.itineraryPlanLayerServer), TRIP_DIR: tripDir });
 });
 after(() => {
   stopTestServer();
@@ -164,7 +165,7 @@ describe('A. Itinerary-change routing guidance (MCP tool contract)', () => {
   let tools;
 
   before(async () => {
-    await startTestMcp({ MCP_PORT: '3108' });
+    await startTestMcp({ MCP_PORT: String(PORTS.itineraryPlanLayerMcp) });
     tools = await mcpListTools();
   });
   after(() => stopTestMcp());
