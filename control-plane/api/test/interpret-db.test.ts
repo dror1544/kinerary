@@ -494,6 +494,57 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
     );
   }
 
+  test("answering the boundary in words gets an answer, not silence", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      // Everything required answered AND every optional one skipped — the only
+      // way `nextQuestion` is genuinely null, which is what makes this the
+      // boundary rather than a question still waiting.
+      for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+        await pool.query(
+          `UPDATE control_plane.intake_sessions
+              SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+            WHERE telegram_chat_id = $1`,
+          [a.chatId, q.id, JSON.stringify({ kind: "text", schema_version: 3, text: "x" })],
+        );
+      }
+      const optionalIds = INTAKE_QUESTIONS.filter((x) => !x.required).map((x) => x.id);
+      // The exact shape read off the stalled live session on 2026-09-10: the
+      // boundary offer already shown, nothing left on screen, router holding
+      // the turn.
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET language = 'he', state = 'awaiting_confirmation', awaiting = 'machine',
+                phase = 'optional',
+                ui_state = jsonb_build_object(
+                  'offered_more', true,
+                  'last_prompt', 'q:planning_help',
+                  'skipped', $2::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [a.chatId, JSON.stringify(optionalIds)],
+      );
+      const telegram = new Recorder();
+
+      // "לא" — no, don't add more. It answers the OFFER, not any question in
+      // the schema, so interpret proposes nothing and nothing is owed by the
+      // ordinary rules. Live, that produced total silence until the session
+      // expired.
+      await say(pool, a.chatId, "לא", telegram);
+
+      assert.ok(telegram.sent.length > 0, "the interview must not go silent on a person");
+      const reply = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(
+        reply.text.includes(uiString("didNotFollow", "he")),
+        "it says it did not follow, in the interview's own language",
+      );
+      assert.ok(
+        reply.text.includes(uiString("essentialsDone", "he")),
+        "and restates what it is actually waiting for",
+      );
+      assert.ok(reply.buttons >= 2, "with both exits tappable for someone whose words it cannot parse");
+    });
+  });
+
   test("a REQUIRED question steps aside instead of being repeated", async () => {
     await withTwoInterviews(async ({ pool, a }) => {
       await setInterpretPath(pool, a.chatId, true);

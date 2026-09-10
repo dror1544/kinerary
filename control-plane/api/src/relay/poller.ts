@@ -26,6 +26,7 @@ import {
   renderEssentialsDone,
   renderQuestion,
   type InlineKeyboard,
+  type RenderedQuestion,
 } from "../chat-router.js";
 import {
   closeAgentTurn,
@@ -1045,9 +1046,33 @@ async function runInterpretPath(
     await markAwaitingMachine(deps.db, burst.chatId, AGENT_FLOOR_SECONDS);
   }
 
+  /**
+   * THE ORGANIZER SPOKE, SO SOMETHING IS OWED BACK.
+   *
+   * `sendNextStep` legitimately says nothing in several situations — the floor
+   * is not ours, the next thing is already on screen and the dedupe refuses to
+   * repeat it, the state is one it does not speak for. Every one of those is
+   * correct when NOBODY has spoken. After an organizer's message it is a
+   * dead end: they typed, and the interview went quiet.
+   *
+   * Live on 2026-09-10. The boundary offer — "add more details, or shall I
+   * show you a summary?" — carries both buttons, and the organizer answered it
+   * in words instead: "לא". `interpret` did its job and proposed nothing,
+   * because "no" answers the offer rather than any question in the schema.
+   * Nothing was owed by the ordinary rules, the dedupe held the line, and the
+   * session sat on `awaiting = 'machine'` until it expired. From the outside
+   * that is indistinguishable from a broken bot.
+   *
+   * So: if we said nothing, say we did not follow, and put back exactly what
+   * we are waiting for — with its buttons, so there is always a tap available
+   * to someone whose words we cannot parse. Never a bare "I didn't
+   * understand": that is the message that makes a person guess.
+   */
   const ask = async () => {
     const after = await getSessionForChat(deps.db, burst.chatId);
-    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
+    if (!after.ok) return;
+    if (await sendNextStep(after.view, burst.chatId, deps, strings)) return;
+    await restateExpectation(after.view, burst.chatId, deps, "NOT_UNDERSTOOD");
   };
 
   // Idempotency (§6). A redelivered burst, or a retry after the relay died
@@ -1405,8 +1430,18 @@ export async function closeIdleInterviews(
 ): Promise<void> {
   try {
     for (const s of await claimSessionsDueWarning(deps.db)) {
-      await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expiringSoon", s.language) });
-      log(structuredLog("info", "interview.expiry_warned", { session_id: s.sessionId }));
+      // "Send anything to keep going" is true and not enough: someone who
+      // stopped because they did not know what was wanted is told, again, to
+      // send something. Restating the outstanding question — with its buttons
+      // — answers the question they actually have, and a tap is a cheaper way
+      // back in than composing a sentence. Falls back to the bare notice when
+      // there is genuinely nothing outstanding to show.
+      const view = await getSessionForChat(deps.db, s.chatId);
+      const restated = view.ok && await restateExpectation(view.view, s.chatId, deps, "EXPIRING");
+      if (!restated) {
+        await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expiringSoon", s.language) });
+      }
+      log(structuredLog("info", "interview.expiry_warned", { session_id: s.sessionId, restated: Boolean(restated) }));
     }
   } catch {
     log(structuredLog("warn", "interview.expiry_warn_failed", {}));
@@ -1715,12 +1750,74 @@ async function handBackToInterviewer(
  * optional question to raise is its call; without one there is nobody else to
  * ask, so the walk stays as the fallback.
  */
+/**
+ * Say what the interview is waiting for, in the organizer's language, with
+ * whatever buttons that thing carries.
+ *
+ * The rule this serves: the interview never goes quiet on a person. Whatever
+ * the reason we have nothing new to say — a reply we could not parse, a
+ * session about to expire — the way out is the same, and it is never a bare
+ * "I didn't understand". That sentence tells someone they failed without
+ * telling them what would succeed, which is the stall-with-extra-steps.
+ *
+ * Deliberately re-sends something already on screen. `sendNextStep`'s dedupe
+ * is right that repeating a question unprompted is noise; this only runs when
+ * the alternative is silence, and then the same question with a line saying
+ * why it is back is the most useful thing there is.
+ *
+ * It re-renders rather than quoting the last message, so the buttons come
+ * back live — a keyboard from an older message still works in Telegram, but a
+ * person who has typed once and been misunderstood should not have to scroll
+ * up to find out that tapping was an option.
+ */
+async function restateExpectation(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+  reason: "NOT_UNDERSTOOD" | "EXPIRING",
+): Promise<boolean> {
+  const lead = uiString(reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : "didNotFollow", view.language);
+
+  // What is outstanding, most specific first. The BOUNDARY is the case that
+  // needed this: `state` is still `interviewing` there — everything required
+  // answered, every optional one skipped, `nextQuestion` null — so keying off
+  // the state would miss precisely the session that stalled.
+  const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
+  let rendered: RenderedQuestion;
+  if (question) {
+    rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+  } else if (view.state === "awaiting_confirmation") {
+    rendered = renderConfirmPrompt(
+      `${uiString("recapHeader", view.language)}\n\n`
+      + (view.recap ?? []).map((e) => `• ${e.prompt}\n  ${e.answerLabel}`).join("\n")
+      + `\n\n${uiString("recapFooter", view.language)}`,
+      view.language,
+    );
+  } else if (view.offeredMore) {
+    rendered = renderEssentialsDone(view.language);
+  } else {
+    return false;
+  }
+
+  if (!(await claimFloor(deps.db, chatId))) return false;
+  (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.expectation_restated", {
+    session_id: view.sessionId,
+    reason,
+  }));
+  await deps.telegram.sendMessage({
+    chatId,
+    text: `${lead}\n\n${rendered.text}`,
+    replyMarkup: rendered.replyMarkup ?? undefined,
+  });
+  return true;
+}
+
 async function sendNextStep(
   view: SessionView,
   chatId: string,
   deps: TripBotPollerDeps,
   _strings: DispatchStrings,
-): Promise<void> {
+): Promise<boolean> {
   let text: string;
   let replyMarkup: InlineKeyboard | undefined;
 
@@ -1732,7 +1829,7 @@ async function sendNextStep(
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_held_by_person", {
       session_id: view.sessionId,
     }));
-    return;
+    return false;
   }
 
   // A DOCUMENT IS WAITING TO BE READ. Say nothing until it has been.
@@ -1754,7 +1851,7 @@ async function sendNextStep(
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_inbound", {
       session_id: view.sessionId,
     }));
-    return;
+    return false;
   }
 
   // What there is to ask, worked out BEFORE the say is handled — because
@@ -1857,7 +1954,7 @@ async function sendNextStep(
       // if the router got here first this returns false and the message waits
       // for the organizer's next turn rather than landing on top of what was
       // just said.
-      if (!(await claimFloor(deps.db, chatId))) return;
+      if (!(await claimFloor(deps.db, chatId))) return false;
       await clearPendingSayForChat(deps.db, chatId);
       await deps.telegram.sendMessage({
         chatId,
@@ -1870,7 +1967,7 @@ async function sendNextStep(
         // parse mode.
         parseMode: "MarkdownV2",
       });
-      return;
+      return true;
     }
   }
 
@@ -1890,7 +1987,7 @@ async function sendNextStep(
     // Handing the floor back is also just true: we asked, they have not
     // answered, we are waiting on them.
     if (onInterpretPath) await claimFloor(deps.db, chatId);
-    return;
+    return false;
   }
 
   if (!question && view.state !== "awaiting_confirmation") {
@@ -1905,7 +2002,7 @@ async function sendNextStep(
     // there is nothing to remember to set. `offeredMore` is still read for
     // sessions that predate the phase column and have not transitioned since.
     if (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore)) {
-      if (!(await claimFloor(deps.db, chatId))) return;
+      if (!(await claimFloor(deps.db, chatId))) return false;
       const rendered = renderEssentialsDone(view.language);
       await clearPendingEntryForChat(deps.db, chatId);
       await markOfferedMoreForChat(deps.db, chatId);
@@ -1914,12 +2011,12 @@ async function sendNextStep(
         text: rendered.text,
         replyMarkup: rendered.replyMarkup ?? undefined,
       });
-      return;
+      return true;
     }
     // After that it is the interviewer's conversation to carry. Saying
     // something anyway is how the router ended up talking over it.
     await handBackToInterviewer(view, chatId, deps);
-    return;
+    return false;
   }
 
   if (view.state === "awaiting_confirmation") {
@@ -1979,9 +2076,10 @@ async function sendNextStep(
 
   // The question or the recap. Claimed last, immediately before it goes out,
   // so a slow render cannot leave the floor held by a message nobody sent.
-  if (!(await claimFloor(deps.db, chatId))) return;
+  if (!(await claimFloor(deps.db, chatId))) return false;
   await deps.telegram.sendMessage({ chatId, text, replyMarkup });
   if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
+  return true;
 }
 
 // ── The loop ─────────────────────────────────────────────────────────────────

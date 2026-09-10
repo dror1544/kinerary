@@ -373,6 +373,13 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // three say no, in the first or second line, before anything else.
     expiringSoon:
       "I'll close this conversation in about 10 minutes if I don't hear from you — nothing is lost, everything you've told me is saved. Send anything to keep going.",
+    // Never on its own: both of these are a LEAD, and what the interview is
+    // actually waiting for is re-sent underneath, buttons and all. "I didn't
+    // understand" by itself tells someone they failed without telling them
+    // what would succeed.
+    didNotFollow: "Sorry — I didn't quite follow that. Here's what I'm waiting for:",
+    stillWaitingBeforeExpiry:
+      "I'll close this conversation in about 10 minutes if I don't hear from you — nothing is lost, everything you've told me is saved. This is what I'm still waiting for:",
     // "Saved and waiting" was a promise the system does not keep: the answers
     // ARE saved, but coming back needs a fresh interview link, and "waiting"
     // reads as "just write when you're ready". Someone who believed it would
@@ -433,6 +440,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
+    didNotFollow: "סליחה — לא הבנתי בדיוק. הנה מה שאני מחכה לו:",
+    stillWaitingBeforeExpiry:
+      "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. זה מה שאני עדיין מחכה לו:",
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
