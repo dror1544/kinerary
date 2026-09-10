@@ -35,6 +35,7 @@ telegram_manager/__pycache__/
 control-plane/api/dist/
 control-plane/api/releases/
 control-plane/worker/**/__pycache__/
+control-plane/api/**/__pycache__/
 control-plane/worker/.venv/
 # No trailing slash on purpose: with one this matches only a real directory, so
 # in a worktree — where the secrets live in the main checkout and this is a
