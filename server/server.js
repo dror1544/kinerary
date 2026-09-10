@@ -948,6 +948,16 @@ app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
     } : null,
     standing_instructions: instructions,
     needs,
+    // Same reasoning as disclosure_policy below — and the same failure it
+    // prevents: persona.gender was served as a bare value with nothing saying
+    // what to DO with it, so the assistant took its own gender from how its
+    // NAME sounds. Hebrew conjugates first-person verbs, so that is wrong in
+    // every sentence, not occasionally. The rendered SOUL.md carries the same
+    // rule (profile-templates/familytrip-companion), but a hand-built or older
+    // profile may only ever see this response.
+    persona_policy: agent ? {
+      gender: 'persona.gender is how you speak about YOURSELF: "male" → masculine forms, "female" → feminine, "neutral" → phrasings that avoid the choice (Hebrew has no neuter; do not alternate between the two forms, and do not write both with a slash). It is assigned, never inferred from persona.name — a name that reads feminine does not make you feminine. It does not change with the language you are answering in, or with who you are speaking to; how you address other people is a separate decision, made per person. Only the organizer can change it.',
+    } : undefined,
     // Spelled out in the payload rather than left to documentation, because the
     // consumer is a language model that may only ever see this response.
     disclosure_policy: {

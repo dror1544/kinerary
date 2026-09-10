@@ -275,6 +275,17 @@ describe('GET /api/agent/brief', () => {
     }
     assert.ok(brief.disclosure_policy?.organizer, 'the payload should state the disclosure rule, not assume the reader knows it');
   });
+
+  test('states what persona.gender is FOR, not just its value', async () => {
+    // The value alone was served for months and the assistant still gendered
+    // itself off its own name — masculine config, feminine Hebrew. A bare
+    // enum is data; the reader is a language model that needs the rule.
+    const res = await api('/api/agent/brief', { apiKey: 'test-hermes-key' });
+    const brief = await res.json();
+    assert.equal(brief.persona.gender, 'male');
+    assert.match(brief.persona_policy?.gender || '', /YOURSELF/);
+    assert.match(brief.persona_policy?.gender || '', /never inferred from persona\.name/);
+  });
 });
 
 // ── /api/config/warnings ────────────────────────────────────────────────────────
