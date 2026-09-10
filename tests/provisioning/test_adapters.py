@@ -224,6 +224,17 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
 
+    def test_exchange_key_is_private_and_shell_quoted(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        adapter = ProxmoxLxcAdapter(ssh, control_plane_exchange_key="exchange $key")
+        adapter.create(LXC_SPEC)
+        bootstrap = ssh.commands[3]
+        self.assertIn("'exchange $key'", bootstrap)
+        self.assertIn("CONTROL_PLANE_EXCHANGE_KEY=%s", bootstrap)
+        self.assertIn("chmod 600 /opt/kinerary/.env", bootstrap)
+        with self.assertRaises(ValueError):
+            ProxmoxLxcAdapter(ssh, control_plane_exchange_key="key\nJWT_SECRET=oops")
+
     def test_connect_timeout_and_command_timeout_are_independent(self) -> None:
         # Regression: one `timeout` served as BOTH the ssh ConnectTimeout and
         # the whole subprocess deadline (timeout + 15 = 35s). The bootstrap

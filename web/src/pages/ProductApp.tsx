@@ -146,6 +146,7 @@ function InvitePanel({ trip }: { trip: TripSummary }) {
 }
 
 function Runtime() {
+  const navigate = useNavigate();
   const { tripId = "" } = useParams();
   const iframe = useRef<HTMLIFrameElement>(null);
   const [launch, setLaunch] = useState<{ runtimeOrigin: string; framePath: string; launchToken: string }>();
@@ -154,12 +155,17 @@ function Runtime() {
   useEffect(() => {
     if (!launch) return;
     const onMessage = (event: MessageEvent) => {
-      if (event.origin !== launch.runtimeOrigin || event.source !== iframe.current?.contentWindow || event.data?.type !== "kinerary:runtime-ready") return;
+      if (event.origin !== launch.runtimeOrigin || event.source !== iframe.current?.contentWindow) return;
+      if (event.data?.type === "kinerary:runtime-logout") {
+        navigate("/trips", { replace: true });
+        return;
+      }
+      if (event.data?.type !== "kinerary:runtime-ready") return;
       iframe.current.contentWindow?.postMessage({ type: "kinerary:launch", token: launch.launchToken }, launch.runtimeOrigin);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [launch]);
+  }, [launch, navigate]);
   return <main className="runtime-shell"><div className="runtime-bar"><Link to={`/trips/${tripId}/setup`}>← Trip setup</Link><strong>Kinerary trip</strong><span /></div>{grant.isPending && <div className="route-loading">Opening your trip…</div>}{grant.isError && <div className="route-loading">This trip is not ready to open.</div>}{launch && <iframe ref={iframe} title="Kinerary trip" src={`${launch.runtimeOrigin}${launch.framePath}`} sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts allow-downloads" allow="clipboard-write" />}</main>;
 }
 

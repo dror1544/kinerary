@@ -18,6 +18,8 @@ const ids = {
 };
 let pool: pg.Pool;
 let passwordInviteeId: string | undefined;
+const runtimeEnrollments: Record<string, unknown>[] = [];
+let failNextEnrollment = false;
 
 const profile = validateArchitectureProfile({
   version: 1, environment: "test", public_api: { bind_host: "127.0.0.1", port: 4310 },
@@ -31,7 +33,10 @@ function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
     google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused" }) },
-    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async () => {} },
+    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async (input) => {
+      runtimeEnrollments.push(input);
+      if (failNextEnrollment) { failNextEnrollment = false; throw new Error("simulated runtime reply lost"); }
+    } },
     publicOrigin: "http://portal.example.test", runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, operatorChatId: "operator-chat-1",
@@ -124,6 +129,12 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     });
     assert.equal(createdInvite.statusCode, 201);
     const inviteToken = new URL(createdInvite.json().joinUrl).hash.slice("#token=".length);
+    failNextEnrollment = true;
+    const failedRedemption = await app.inject({
+      method: "POST", url: "/v1/site-invites/redeem",
+      payload: { token: inviteToken, method: "password", password: "password-guest-secret" },
+    });
+    assert.equal(failedRedemption.statusCode, 500);
     const redeemed = await app.inject({
       method: "POST", url: "/v1/site-invites/redeem",
       payload: { token: inviteToken, method: "password", password: "password-guest-secret" },
@@ -133,6 +144,12 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
       "SELECT redeemed_by FROM control_plane.site_invites WHERE id = $1", [createdInvite.json().id]);
     passwordInviteeId = inviteRow.rows[0]?.redeemed_by;
     assert.ok(passwordInviteeId);
+    const attempts = runtimeEnrollments.filter(item => item.inviteId === createdInvite.json().id);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].userId, passwordInviteeId);
+    assert.deepEqual(attempts[0], attempts[1], "runtime binding retries use the same identity");
+    assert.deepEqual(Object.keys(attempts[0]).sort(), ["displayName", "inviteId", "runtimeUsername", "tripId", "userId"]);
+
 
     const duplicateInvite = await app.inject({
       method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`,

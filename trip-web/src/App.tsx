@@ -2249,7 +2249,13 @@ function AppMenu({
           <button
             type="button"
             className="danger-menu"
-            onClick={() => {
+            onClick={async () => {
+              const logout = (window as unknown as { runtimeLogout?: () => Promise<void> }).runtimeLogout;
+              if (logout) {
+                try { await logout(); }
+                catch { window.alert("Sign out failed. Please try again."); }
+                return;
+              }
               tokenStore.clear();
               window.location.reload();
             }}

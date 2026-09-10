@@ -35,6 +35,8 @@ before(async () => {
       return;
     }
     proxiedAuthorization = req.headers.authorization;
+    res.setHeader("x-frame-options", "DENY");
+    res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ path: req.url }));
   });
@@ -88,6 +90,8 @@ test("consumes a trip-bound grant once and proxies with the runtime session", as
   assert.equal(response.status, 200);
   assert.equal(proxiedAuthorization, "Bearer runtime-jwt");
   assert.deepEqual(await response.json(), { path: "/api/config?upstream=http://attacker.invalid" });
+  assert.equal(response.headers.get("x-frame-options"), null);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'; frame-ancestors https://app.example.test");
 });
 
 test("rejects trip paths without a valid gateway session", async () => {

@@ -193,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                     # member/organizer signup flow is the actual fix; this is a
                     # stopgap so a provisioned trip is reachable.
                     seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
+                    control_plane_exchange_key=os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                 )

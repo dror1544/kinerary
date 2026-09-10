@@ -11,6 +11,7 @@ const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
+const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
@@ -673,7 +674,9 @@ async function initData() {
   } catch (e) { console.error('Bookings seed failed:', e.message); }
 }
 
-initData().catch(console.error);
+const dataReady = initData();
+dataReady.catch(console.error);
+const controlPlaneAuth = createControlPlaneAuth({ app, db, tripDir: TRIP_DIR, config: () => TRIP_CONFIG, ready: dataReady, jwtSecret: JWT_SECRET });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 function getUser(username) {
@@ -699,6 +702,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
     req.user = { username: payload.username };
     next();
   } catch {
@@ -867,6 +871,7 @@ function organizerOrAgentRequired(req, res, next) {
   let payload;
   try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
 
+  if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   // No configured organizer means nobody qualifies. Failing closed here matters
   // more than convenience: the alternative — treating "unset" as "everyone" —

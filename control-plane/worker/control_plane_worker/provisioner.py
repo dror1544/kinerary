@@ -605,6 +605,23 @@ class ProvisionerWorker:
             # bookings.json carries the phase hotels and the travel_anchors
             # the interview captured, which the config itself drops.
             sidecars: dict[str, Any] = {"trivia_questions.json": []}
+            # Private identity sidecar: never part of the public trip config.
+            # The transformer resolves organizer_identity to exactly one local
+            # participant. Ambiguity disables portal handoff, never guesses.
+            organizers = (config.get("agent") or {}).get("organizers", [])
+            with conn.cursor(row_factory=dict_row) as identity_cur:
+                identity_cur.execute(
+                    "SELECT user_id FROM control_plane.trip_memberships "
+                    "WHERE trip_id = %s AND role = 'owner' AND status = 'active'",
+                    (trip_id,),
+                )
+                owners = identity_cur.fetchall()
+            owner = ({"userId": owners[0]["user_id"], "username": organizers[0]}
+                     if len(owners) == 1 and len(organizers) == 1 else None)
+            sidecars["control-plane.identity.json"] = {
+                "version": 1, "tripId": trip_id, "owner": owner,
+            }
+
             bookings = derive_bookings(config, answers)
             if bookings:
                 sidecars["bookings.json"] = bookings

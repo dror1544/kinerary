@@ -1435,3 +1435,13 @@ describe('PUT /api/auth/password', () => {
     assert.equal(newLogin.status, 200);
   });
 });
+
+
+test('an unmanaged Classic runtime does not expose a session minting path', async () => {
+  const response = await api('/api/internal/control-plane/session', {
+    method: 'POST', apiKey: 'test-hermes-key', token,
+    body: { tripId: 'trip_testtest', userId: 'user_testtest', role: 'owner', runtimeUsername: 'alice' },
+  });
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: 'AUTHENTICATION_REQUIRED' });
+});

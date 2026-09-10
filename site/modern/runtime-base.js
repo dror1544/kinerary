@@ -14,6 +14,21 @@
   localStorage.setItem('trip-token', 'runtime-gateway-session');
 
   const nativeFetch = window.fetch.bind(window);
+  window.runtimeLogout = async function () {
+    const response = await nativeFetch(base + '/__logout', {
+      method: 'POST', headers: { 'X-Kinerary-Logout': '1' },
+    });
+    if (!response.ok) throw new Error('Sign out failed');
+    const { portalUrl } = await response.json();
+    ['trip-token', 'tripToken', 'token', 'trip-user'].forEach(key => localStorage.removeItem(key));
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: 'kinerary:runtime-logout' }, portalUrl);
+      location.replace(base + '/__signed_out');
+    } else {
+      location.assign(portalUrl);
+    }
+  };
+
   window.fetch = function (input, init) {
     if (typeof input === 'string') input = window.runtimePath(input);
     else if (input instanceof URL && input.origin === location.origin) input = new URL(window.runtimePath(input.pathname) + input.search + input.hash, input.origin);

@@ -340,6 +340,24 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.worker.run_once()
         sidecars = self.fake_deploy.deployed[0]["sidecars"]
         self.assertEqual([], sidecars["trivia_questions.json"])
+        identity = sidecars["control-plane.identity.json"]
+        self.assertEqual(self.fix["trip_id"], identity["tripId"])
+        self.assertIsNone(identity["owner"], "an unresolved organizer must not be guessed")
+
+    def test_owner_identity_is_bound_to_the_resolved_local_organizer(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "travelers": {"kind": "structured", "schema_version": 2,
+                          "data": [{"name": "Alice", "name_en": "Alice", "age": 35}]},
+            "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Alice"},
+        })
+        self.worker.run_once()
+        deployed = self.fake_deploy.deployed[0]
+        identity = deployed["sidecars"]["control-plane.identity.json"]
+        self.assertEqual(self.fix["user_id"], identity["owner"]["userId"])
+        self.assertIn(identity["owner"]["username"], deployed["config"]["agent"]["organizers"])
+        self.assertNotIn("control_plane_user_id", json.dumps(deployed["config"]))
 
     def test_bookings_sidecar_is_derived_from_phases_and_anchors(self) -> None:
         teardown_fixture(self.conn, self.fix)
@@ -1866,7 +1884,7 @@ class OrphanBindingAdoptionTests(unittest.TestCase):
         self._bind("-100888", self.trip_id, None)
         with self.conn.cursor() as cur:
             cur.execute(
-                "UPDATE control_plane.telegram_chat_bindings SET closed_at = now() WHERE chat_id = %s",
+                "UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'test_closed' WHERE chat_id = %s",
                 ("-100888",),
             )
         self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 0)

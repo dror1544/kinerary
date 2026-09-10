@@ -900,7 +900,15 @@ contexts and test groups without creating a per-trip Telegram bot.
 
 Added to Sprint 5 by the organizer's request, as part of wiring the trip to
 the AI companion. Implemented in this worktree; production deployment and the
-full MCP-through-runtime-gateway acceptance remain outstanding.
+full deployed acceptance matrix remain outstanding.
+
+**Gateway verification update (2026-09-10):** the real runtime session bridge
+is implemented. A disposable browser run showed an MCP budget write in two
+Modern tabs through the gateway without reload; HTTP integration also verified
+two streams within two seconds, reconnect, and access boundaries. Grant/route
+responses used a control-plane fixture. This proves the local gateway path,
+not the complete resource matrix below or deployed acceptance. See
+[runtime-session-exchange.md](runtime-session-exchange.md).
 
 **Local verification (2026-09-09):** authenticated `/api/events` streams
 resource revisions from SQLite triggers; rollback also rolls back the revision.

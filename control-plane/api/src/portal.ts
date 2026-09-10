@@ -126,11 +126,9 @@ export interface RuntimeAccountAdapter {
   provisionParticipant(input: {
     tripId: string;
     inviteId: string;
+    userId: string;
     runtimeUsername: string;
     displayName: string;
-    method: "google" | "password";
-    googleSubjectDigest?: string;
-    password?: string;
   }): Promise<void>;
 }
 
@@ -666,7 +664,6 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     let signedIn = await portalUser(request, deps);
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
-    const runtimeCredential: { googleSubjectDigest?: string; password?: string } = {};
     if (method === "google") {
       // Google redemption acts through an existing browser session, so it is
       // a state-changing request and must prove the session's CSRF secret.
@@ -674,9 +671,6 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       if (!csrfUser) return;
       signedIn = csrfUser;
       if (!signedIn?.googleSubjectDigest) return reply.code(401).send({ error: "GOOGLE_SIGN_IN_REQUIRED" });
-      runtimeCredential.googleSubjectDigest = signedIn.googleSubjectDigest;
-    } else {
-      runtimeCredential.password = password;
     }
     const invites = await deps.db.query<{
       id: string; trip_id: string; intended_display_name: string; runtime_username: string; state: string; expires_at: Date;
@@ -687,7 +681,9 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1", [invite.id]);
       return reply.code(410).send({ error: "INVITE_EXPIRED" });
     }
-    const userId = signedIn?.id ?? opaque("user");
+    // Stable across a rolled-back redemption: the runtime may already have
+    // recorded this invite when the control-plane transaction retries.
+    const userId = signedIn?.id ?? `user_${sha256(invite.id).slice(7, 39)}`;
     const portalPasswordHash = method === "password" && password ? await hashPortalPassword(password) : null;
     let passwordSession: { sessionToken: string; csrf: string } | null = null;
     const client = await deps.db.connect();
@@ -700,8 +696,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       // lock prevents concurrent redemption; if the database transaction later
       // aborts, the same raw invite may safely retry the runtime enrollment.
       await deps.runtimeAccounts.provisionParticipant({
-        tripId: invite.trip_id, inviteId: invite.id, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
-        method, ...runtimeCredential,
+        tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
       });
       if (portalPasswordHash) {
         await client.query(

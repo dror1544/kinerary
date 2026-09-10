@@ -250,6 +250,40 @@ direct runtime, so it does not establish the full managed gateway login path,
 the two-second gateway target, or deployed acceptance. No live deployment or
 PR approval is recorded by this verification.
 
+
+## Runtime session bridge — 2026-09-10
+
+The B3 gap observed above is implemented in the working tree. The runtime now
+binds control-plane identities to existing local accounts using a private
+trip/owner manifest and a dedicated exchange key. Member invitations preserve
+Classic passwords and cannot claim organizer accounts. Both interfaces share
+the same identity, permissions, gateway cookie, and logout helper.
+
+Real HTTP integration results against disposable runtime data:
+
+- Missing, incorrect, traveler, and companion credentials cannot exchange a
+  session (401). A correctly mapped owner receives a token (200).
+- Wrong trip, identity, username, or role fails (403); conflicting invitation
+  bindings fail (409); members cannot read the organizer brief (403).
+- Gateway proxy access to internal routes fails (404). Removed participants'
+  existing managed JWTs fail (401), and new exchanges fail (403).
+- Two real gateway SSE streams receive an MCP write within the two-second
+  test timeout; reconnect retrieves current state.
+
+Chrome also verified the built portal → Modern → Classic path without a second
+login, Classic and Modern logout returning to My trips, and a real MCP budget
+write appearing in two Modern tabs through the gateway without reload. Only the
+control-plane grant/route APIs were fixture responses; these checks do not
+establish live-stack deployment acceptance.
+
+Validation: runtime integration 8/8; gateway 5/5; portal DB 6/6; worker 76/76;
+provisioning 34/34; organizer web 10/10; Modern 39/39; shared logout 3/3.
+Repository preflight passed; final framing/logout refinements passed their
+affected tests and production builds. DB tests used only `cptest` on port 5434.
+Configuration and migration requirements are in
+[runtime-session-exchange.md](runtime-session-exchange.md). No deployment or
+PR approval was performed.
+
 ## PR #44 review fixes — 2026-09-11
 
 Addressed the three findings on review 5172086172:

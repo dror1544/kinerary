@@ -15,10 +15,13 @@ merged into it at `27a38bd`. The September 7 commit checkpoint below is
 historical. Map and direct-runtime MCP updates have been browser-verified;
 the detailed evidence is in `modern-trip-spa-code-review-session.md`.
 
-The complete gateway handoff is still blocked by activation B3: the real
-trip server returns HTTP 404 for `POST /api/internal/control-plane/session`.
-Passing gateway tests use a stub for that endpoint. Do not treat route
-registration or a passing Modern build as proof that portal launch works.
+Activation B3 is now implemented locally: the real runtime exchanges a
+trip-scoped portal identity for its existing local user's JWT. Disposable
+browser checks covered portal → Modern → Classic, logout back to My trips,
+and an MCP budget write appearing in two Modern tabs through the real gateway.
+The control-plane grant/route responses were fixtures, so deployed acceptance
+remains pending. Existing runtimes require a private identity sidecar and a
+dedicated exchange key; see [the contract](runtime-session-exchange.md).
 
 ## Update — 2026-09-07
 
