@@ -1,3 +1,4 @@
+import { PORTS } from './helpers/ports.js';
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -21,9 +22,9 @@ before(async () => {
   temp = mkdtempSync(join(tmpdir(), 'runtime-identity-test-'));
   const manifest = join(temp, 'identity.json');
   writeFileSync(manifest, JSON.stringify({ version: 1, tripId, owner: { userId: ownerId, username: 'alice' } }));
-  await startTestServer({ PORT: 3296, CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
+  await startTestServer({ PORT: PORTS.controlPlaneSession, CONTROL_PLANE_EXCHANGE_KEY: key, CONTROL_PLANE_IDENTITY_FILE: manifest, SITE_DIR: fileURLToPath(new URL('../site', import.meta.url)) });
   await loginAsAlice();
-  await startTestMcp({ MCP_PORT: '3295', API_BASE_URL: 'http://127.0.0.1:3296', TRIP_API_KEY: 'test-hermes-key' });
+  await startTestMcp({ MCP_PORT: String(PORTS.controlPlaneSessionMcp), API_BASE_URL: `http://127.0.0.1:${PORTS.controlPlaneSession}`, TRIP_API_KEY: 'test-hermes-key' });
   controlPlane = http.createServer(async (req, res) => {
     assert.equal(req.headers['x-api-key'], key);
     res.setHeader('content-type', 'application/json');
@@ -33,7 +34,7 @@ before(async () => {
       if (token !== 'owner-grant' && token !== 'member-grant') { res.writeHead(401); return res.end('{}'); }
       return res.end(JSON.stringify({ ...sessionBody(token === 'member-grant' ? { userId: memberId, role: 'member', runtimeUsername: 'bob' } : {}), audience: 'runtime_gateway' }));
     }
-    if (req.url === `/internal/runtime-routes/${tripId}`) return res.end(JSON.stringify({ routeRef: 'fixture', upstreamOrigin: 'http://127.0.0.1:3296', upstreamBasePath: '' }));
+    if (req.url === `/internal/runtime-routes/${tripId}`) return res.end(JSON.stringify({ routeRef: 'fixture', upstreamOrigin: `http://127.0.0.1:${PORTS.controlPlaneSession}`, upstreamBasePath: '' }));
     res.writeHead(404); res.end('{}');
   });
   Object.assign(process.env, { NODE_ENV: 'test', CONTROL_PLANE_INTERNAL_ORIGIN: await listen(controlPlane),

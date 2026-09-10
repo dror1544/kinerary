@@ -10,6 +10,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -20,7 +21,7 @@ import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/se
 let token;
 
 before(async () => {
-  await startTestServer({ PORT: '3107' }); // 3095-3106 already claimed by other test files
+  await startTestServer({ PORT: String(PORTS.currencyRates) });
   token = await loginAsAlice();
 });
 after(() => stopTestServer());
@@ -103,7 +104,7 @@ async function stopPatchedServer({ proc, dataDir, tripDir }) {
 // thing as leaving it unset — both are "the organizer's home currency is
 // the dollar".
 describe('GET /api/currency-rates — explicit homeCurrency: "USD"', () => {
-  const PORT = 3111; // 3095-3110 already claimed by other test files
+  const PORT = PORTS.currencyRatesUsdHome;
   let server;
 
   before(async () => {
@@ -127,7 +128,7 @@ describe('GET /api/currency-rates — explicit homeCurrency: "USD"', () => {
 // on every single view, never able to populate its cache. USD must be
 // filtered out before the request goes out, not just handled in the error path.
 describe('GET /api/currency-rates — USD-only destination, no home currency', () => {
-  const PORT = 3112; // 3095-3111 already claimed by other test files
+  const PORT = PORTS.currencyRatesUsdOnly;
   let server;
 
   before(async () => {

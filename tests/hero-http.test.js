@@ -1,8 +1,9 @@
+import { PORTS } from './helpers/ports.js';
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
 let token;
-before(async () => { await startTestServer({ HOST: '127.0.0.1', PORT: 3196 }); token = await loginAsAlice(); });
+before(async () => { await startTestServer({ HOST: '127.0.0.1', PORT: PORTS.heroHttp }); token = await loginAsAlice(); });
 after(stopTestServer);
 
 test('uploaded hero URLs require authentication and return image bytes to an authorized loader', async () => {

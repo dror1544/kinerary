@@ -1,3 +1,4 @@
+import { PORTS } from './helpers/ports.js';
 import assert from 'node:assert/strict';
 import { before, after, test } from 'node:test';
 import { createRequire } from 'node:module';
@@ -5,7 +6,7 @@ import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/se
 const require = createRequire(import.meta.url);
 const jwt = require('../server/node_modules/jsonwebtoken');
 let token;
-before(async () => { await startTestServer({ PORT: 3198 }); token = await loginAsAlice(); });
+before(async () => { await startTestServer({ PORT: PORTS.tripEventsHttp }); token = await loginAsAlice(); });
 after(stopTestServer);
 
 async function stream() {

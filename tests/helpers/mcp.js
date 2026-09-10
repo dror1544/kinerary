@@ -1,11 +1,12 @@
 import { spawn } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { PORTS } from './ports.js';
 
 const HERE     = dirname(fileURLToPath(import.meta.url));
 const MCP_JS   = join(HERE, '..', '..', 'mcp', 'mcp.js');
 const MCP_DIR  = join(HERE, '..', '..', 'mcp');
-const DEFAULT_TEST_PORT = 3098;
+const DEFAULT_TEST_PORT = PORTS.mcpDefault;
 
 export const MCP_API_KEY  = 'test-mcp-key';
 export const TRIP_API_KEY = 'test-trip-key';

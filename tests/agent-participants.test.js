@@ -8,6 +8,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, cpSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -18,7 +19,7 @@ const HERE         = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, 'fixtures');
 const SERVER_JS    = join(HERE, '..', 'server', 'server.js');
 const SERVER_DIR   = join(HERE, '..', 'server');
-const PORT         = 3101; // 3095-3100 already claimed by other test files
+const PORT         = PORTS.agentParticipants;
 
 function waitForServer(proc) {
   return new Promise((resolve, reject) => {

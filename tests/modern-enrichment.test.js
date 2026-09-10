@@ -1,3 +1,4 @@
+import { PORTS } from './helpers/ports.js';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { before, after, test } from 'node:test';
@@ -18,7 +19,7 @@ before(async () => {
     else respond();
   });
   await new Promise(resolve => service.listen(0, '127.0.0.1', resolve));
-  await startTestServer({ PORT: 3194, HERMES_URL: `http://127.0.0.1:${service.address().port}` });
+  await startTestServer({ PORT: PORTS.modernEnrichment, HERMES_URL: `http://127.0.0.1:${service.address().port}` });
   await loginAsAlice();
 });
 after(() => { heldResponse?.(); stopTestServer(); service?.closeAllConnections(); service?.close(); });

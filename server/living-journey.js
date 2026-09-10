@@ -3,6 +3,9 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// "<phase>|<YYYY-MM-DD>|<index>" — the identity a config-imported item keeps
+// across revisions, and the key the compatibility tables adopt it by.
+const CONFIG_REF_RE = /^[^|]+\|\d{4}-\d{2}-\d{2}\|\d+$/;
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const ROUGH_TIMES = { morning: 9 * 60, noon: 12 * 60, afternoon: 15 * 60, evening: 19 * 60 };
 const VALID_ITEM_TYPES = new Set(['travel', 'activity', 'meal', 'lodging', 'free_time', 'booking', 'task', 'note']);
@@ -232,6 +235,9 @@ function schema(db) {
       BEFORE DELETE ON itinerary_plan_items
       BEGIN SELECT RAISE(ABORT, 'itinerary plan items are immutable'); END;
   `);
+  // Set once the compatibility tables actually carry the config items, and
+  // never cleared. See legacyOwnsConfig().
+  try { db.exec('ALTER TABLE trip_itinerary_state ADD COLUMN legacy_owns_config INTEGER NOT NULL DEFAULT 0'); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
 }
 
@@ -601,7 +607,7 @@ function updateLegacyFromActive(db) {
     const adoptByConfigRef = db.prepare('UPDATE phase_plan_items SET itinerary_item_uid = ? WHERE itinerary_item_uid IS NULL AND config_ref = ?');
     const adoptByLegacyId = db.prepare('UPDATE phase_plan_items SET itinerary_item_uid = ? WHERE itinerary_item_uid IS NULL AND id = ?');
     for (const item of rows.items) {
-      if (typeof item.source_ref === 'string' && /^[^|]+\|\d{4}-\d{2}-\d{2}\|\d+$/.test(item.source_ref)) adoptByConfigRef.run(item.item_uid, item.source_ref);
+      if (typeof item.source_ref === 'string' && CONFIG_REF_RE.test(item.source_ref)) adoptByConfigRef.run(item.item_uid, item.source_ref);
       const legacyId = /^legacy_(\d+)$/.exec(item.item_uid || '')?.[1];
       if (legacyId) adoptByLegacyId.run(item.item_uid, Number(legacyId));
     }
@@ -623,7 +629,7 @@ function updateLegacyFromActive(db) {
          extra_links=excluded.extra_links`
     );
     for (const item of rows.items) {
-      const configRef = typeof item.source_ref === 'string' && /^[^|]+\|\d{4}-\d{2}-\d{2}\|\d+$/.test(item.source_ref) ? item.source_ref : null;
+      const configRef = typeof item.source_ref === 'string' && CONFIG_REF_RE.test(item.source_ref) ? item.source_ref : null;
       itemInsert.run(
         item.phase_id, item.date, item.time, item.time_sort, item.text_he, item.text_en,
         item.location_url, item.waze_url, item.website_url, item.ticket_url, item.booking_id,
@@ -653,12 +659,62 @@ function applyItemEnrichment(db, legacy, fields) {
   });
 }
 
+// Classic treats phase_plan_* as an overlay that supersedes the config
+// schedule as soon as it is non-empty (see renderDays() in site/app.js), so a
+// single added item is indistinguishable from a complete plan by row count
+// alone. What actually moves the config schedule INTO those tables is either
+// promote-config-days or a Modern write projecting back through
+// updateLegacyFromActive() — both of which stamp config_ref. Once that has
+// happened the overlay really is the whole plan, so this is sticky and is
+// recorded rather than re-derived: a promoted item the organizer later deletes
+// must stay deleted, and after the fact that looks exactly like an item that
+// was never promoted. Same reason phase_plan_import_log exists.
+function legacyOwnsConfig(db) {
+  if (getState(db)?.legacy_owns_config) return true;
+  const carries = db.prepare(
+    "SELECT 1 FROM phase_plan_items WHERE config_ref IS NOT NULL AND config_ref <> '' LIMIT 1"
+  ).get();
+  if (!carries) return false;
+  db.prepare('UPDATE trip_itinerary_state SET legacy_owns_config = 1 WHERE id = 1').run();
+  return true;
+}
+
+// Keeps the config-imported schedule the itinerary already holds while the
+// overlay only carries the organizer's additions, so a first Classic edit adds
+// to the plan instead of replacing it.
+function carryConfigRowsForward(current, rows) {
+  if (!current) return;
+  const haveItem = new Set(rows.items.map((item) => item.item_uid));
+  const haveDay = new Set(rows.days.map((day) => `${day.phase_id}|${day.date}`));
+  for (const item of current.items) {
+    if (haveItem.has(item.item_uid)) continue;
+    if (!CONFIG_REF_RE.test(String(item.source_ref || ''))) continue;
+    rows.items.push({ ...item, extra_links: writeJson(item.extra_links) });
+    haveItem.add(item.item_uid);
+  }
+  for (const day of current.days) {
+    const key = `${day.phase_id}|${day.date}`;
+    if (haveDay.has(key)) continue;
+    // Only days a carried item still lands on — a day left empty must not
+    // come back with it.
+    if (!rows.items.some((item) => item.phase_id === day.phase_id && item.date === day.date)) continue;
+    rows.days.push({
+      ...day,
+      lodging_context: writeJson(day.lodging_context),
+      pickup_context: writeJson(day.pickup_context),
+      sort_order: rows.days.length,
+    });
+    haveDay.add(key);
+  }
+}
+
 function syncFromLegacy(db, raw, author = 'legacy-api') {
   const state = getState(db);
   if (!state) return null;
   const rows = rowsFromLegacyPlan(db);
-  if (!rows.items.length && !rows.days.length) return state.active_version_id;
   const current = getVersionRows(db, state.active_version_id);
+  if (!legacyOwnsConfig(db)) carryConfigRowsForward(current, rows);
+  if (!rows.items.length && !rows.days.length) return state.active_version_id;
   const comparable = (value) => ({
     days: value.days.map(({ phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order }) => ({
       phase_id, date, label_he, label_en, lodging_context: writeJson(lodging_context), pickup_context: writeJson(pickup_context), sort_order,
@@ -1022,6 +1078,10 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     let touched = false;
     let titleChanged = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer edited itinerary item', (rows) => {
+      // A move needs somewhere to land. rows.days is what drives Modern's day
+      // picker, so changing an item's date or phase without creating the
+      // destination day returned 200 and then hid the item entirely.
+      const landed = [];
       rows.items = rows.items.map((item) => {
         if (item.item_uid !== uid) return item;
         touched = true;
@@ -1046,8 +1106,13 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
             if (Object.hasOwn(generated, key) && next[key] === generated[key]) next[key] = null;
           }
         }
+        if (next.phase_id !== item.phase_id || next.date !== item.date) landed.push(next);
         return next;
       });
+      for (const item of landed) {
+        if (!item.date || rows.days.some((day) => day.phase_id === item.phase_id && day.date === item.date)) continue;
+        rows.days.push({ phase_id: item.phase_id, date: item.date, label_he: null, label_en: null, lodging_context: null, pickup_context: null, sort_order: rows.days.length });
+      }
     });
     if (!touched) return res.status(404).json({ error: 'not found' });
     updateLegacyFromActive(db);

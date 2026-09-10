@@ -10,6 +10,7 @@ on:
       - "docs/trip-fleet-control-plane-plan"
   pull_request:
     branches:
+      - "integration/**"
       - main
       - "docs/trip-fleet-control-plane-plan"
 
@@ -194,3 +195,33 @@ jobs:
       - name: Test
         run: npm test
         working-directory: tests
+
+  modern:
+    name: Modern trip SPA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: trip-web/package-lock.json
+      - run: npm ci
+        working-directory: trip-web
+      - run: npm test
+        working-directory: trip-web
+      - run: npm run build
+        working-directory: trip-web
+
+  runtime-gateway:
+    name: Runtime gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm test
+        working-directory: control-plane/runtime-gateway
