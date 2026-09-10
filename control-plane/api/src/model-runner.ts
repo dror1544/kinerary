@@ -109,6 +109,8 @@ export interface CliSpec {
   timeoutMs: number;
   /** Attempts in total, including the first. Never a different model. */
   maxAttempts: number;
+  /** Where to run it. Defaults to a neutral directory — see `hermeticEnv`. */
+  cwd?: string;
 }
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
@@ -147,12 +149,44 @@ export function hermesSpec(profile: string, timeoutMs = DEFAULT_TIMEOUT_MS, bin 
 
 type RunOnce = { ok: true; stdout: string } | { ok: false; reason: RunnerFailure; detail: string };
 
+/**
+ * A bounded model call must not depend on WHERE it was spawned from.
+ *
+ * `execFile` inherits the parent's cwd and environment, and the parent here is
+ * the relay — a long-running process living inside the kinerary checkout. So
+ * `claude -p` was being started in a directory containing CLAUDE.md, a
+ * `.claude/settings.json` full of hooks, and a repo it will happily read; and
+ * with the environment of whatever shell launched the relay, which on this
+ * machine includes an ambient Claude Code session's own `CLAUDE_CODE_*`
+ * variables.
+ *
+ * That is not a theoretical tidiness argument. On 2026-09-10 the SAME document,
+ * model, prompt and timeout produced four accepted proposals in 188s through
+ * `tools/extract-intake-check.ts` and `proposed: 0, malformed: 0` in 25s
+ * through the relay — well-formed output containing nothing, twice, from a
+ * booking PDF full of trip details.
+ *
+ * `codexSpec` already ran in `tmpdir()` for its own reasons; the CLI path never
+ * did. Now both are hermetic: a neutral directory, and the caller's session
+ * variables stripped so a nested CLI cannot mistake this for a conversation it
+ * is part of. PATH and HOME stay — the binary has to be findable and has to
+ * reach its own credentials.
+ */
+function hermeticEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PID" || k === "CLAUDE_EFFORT") continue;
+    env[k] = v;
+  }
+  return env;
+}
+
 function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
   return new Promise((resolve) => {
     execFile(
       spec.bin,
       spec.args(prompt, spec.model),
-      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: hermeticEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve({ ok: true, stdout: String(stdout) });
         const tail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-250);
