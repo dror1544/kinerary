@@ -85,6 +85,27 @@ const GATEWAY_STATUS_PHRASES: readonly string[] = [
   "queued for the next turn",
   "subagent working",
   "compressing context",
+  // The harness announcing its own INFRASTRUCTURE, reported live on
+  // 2026-09-10 from a family trip companion:
+  //
+  //     🔄 Switched to fallback model: gpt-5.4-mini via openai-codex →
+  //        claude-haiku-4-5-20251001 via anthropic
+  //
+  // A provider failed over. That is a fact about our billing and our vendors,
+  // narrated to someone asking about their holiday — and it names the models
+  // behind the assistant, which is the one thing the persona is not supposed
+  // to be. Matching is on the fixed English stems the gateway emits; no
+  // organizer discussing a trip writes "switched to fallback model".
+  "switched to fallback model",
+  "falling back to model",
+  "switching to model",
+  "retrying with model",
+  // The gateway's own setup chatter on a fresh chat — a home channel being
+  // registered is plumbing, and it arrives as the FIRST thing a family sees.
+  "sethome",
+  "/sethome",
+  "home channel set",
+  "set as home channel",
 ];
 
 /**

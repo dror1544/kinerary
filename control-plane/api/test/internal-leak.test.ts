@@ -31,6 +31,20 @@ describe("internal leak detection", () => {
     }
   });
 
+  test("catches the harness narrating its own infrastructure", () => {
+    // Reported live on 2026-09-10 from a family companion. A provider failover
+    // is a fact about our vendors and our billing, and it names the models
+    // behind the persona — to someone asking about their holiday.
+    for (const text of [
+      "🔄 Switched to fallback model: gpt-5.4-mini via openai-codex → claude-haiku-4-5-20251001 via anthropic",
+      "Falling back to model claude-haiku-4-5",
+      "/sethome registered this chat",
+      "This chat is now set as home channel",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, true, text);
+    }
+  });
+
   test("leaves ordinary interview conversation alone", () => {
     // The cost of a false positive is a silent bot, so these matter more than
     // the catches. Every one is a sentence the interviewer SHOULD send.
