@@ -1,145 +1,103 @@
 /**
- * CommonMark → Telegram MarkdownV2.
+ * Agent markdown → Telegram MarkdownV2, without losing the message.
  *
- * Our capability descriptor advertises `markdown_dialect: "markdown_v2"`, but
- * what actually arrives from the agent is ordinary CommonMark — `**bold**`,
- * unescaped punctuation, the usual. Those are not the same language, and the
- * difference is not cosmetic:
+ * THE PROBLEM. MarkdownV2 requires `_ * [ ] ( ) ~ \` > # + - = | { } . !` to be
+ * backslash-escaped everywhere they are not part of an entity. Ordinary prose
+ * is full of them: a full stop, a hyphen, "(FCO)". So the agent writes a
+ * perfectly good `[Fushimi Inari](https://…)`, Telegram rejects the whole
+ * message with "can't parse entities", and `telegram-api.ts` re-sends it with
+ * `parse_mode` deleted — a designed fallback that delivers the text and loses
+ * every link in it. The organizer sees literal brackets and concludes the bot
+ * cannot make links.
  *
- *   - MarkdownV2 bold is *one* asterisk. `**bold**` is not "bold with extra
- *     asterisks"; it is an empty entity followed by stray text.
- *   - MarkdownV2 reserves `_ * [ ] ( ) ~ \` > # + - = | { } . !` EVERYWHERE.
- *     One unescaped `.` or `-` in ordinary prose rejects the entire message
- *     with 400 "can't parse entities" — which is exactly what we were seeing.
+ * Escaping everything would fix the rejection and break the links too, which is
+ * the same outcome by a different route. So this escapes the PROSE and leaves
+ * the entities alone: links, inline code and code fences are recognised first,
+ * their inner text escaped by their own rules, and everything between them
+ * escaped wholesale.
  *
- * So sending CommonMark as MarkdownV2 fails outright, and sending it as plain
- * text shows the asterisks. Converting is the only option that renders.
- *
- * The strategy is conservative: recognise the handful of constructs Telegram
- * actually supports, and escape absolutely everything else. A construct we do
- * not recognise degrades to visible literal text, never to a parse error —
- * and the caller still has a plain-text retry underneath as a last resort.
+ * Deliberately supports a small set — links, code, bold, italic. An agent
+ * writing a table or a blockquote gets it escaped into visible punctuation,
+ * which is legible and safe. The alternative, a full CommonMark translator,
+ * is a large surface for a chat message and would still not cover everything
+ * Telegram means by "entity".
  */
 
-/** Reserved in MarkdownV2 body text. Telegram rejects any of these unescaped. */
-const RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
+/** Every character MarkdownV2 reserves outside an entity. */
+const SPECIALS = "_*[]()~`>#+-=|{}.!\\";
 
-function escapeAll(text: string): string {
-  return text.replace(RESERVED, (ch) => `\\${ch}`);
-}
-
-/** Inside a code span only the backslash and backtick need escaping. */
-function escapeCode(text: string): string {
-  return text.replace(/([`\\])/g, "\\$1");
-}
-
-/** Inside a link target, only `)` and `\` terminate it. */
-function escapeUrl(text: string): string {
-  return text.replace(/([)\\])/g, "\\$1");
-}
-
-interface Token {
-  kind: "text" | "code" | "pre" | "bold" | "italic" | "strike" | "link" | "heading";
-  value: string;
-  /** link only */
-  url?: string;
+/** Escape a run of plain text so Telegram treats every character literally. */
+export function escapeMarkdownV2(text: string): string {
+  let out = "";
+  for (const ch of text) out += SPECIALS.includes(ch) ? `\\${ch}` : ch;
+  return out;
 }
 
 /**
- * Splits CommonMark into the tokens Telegram can express.
- *
- * Order matters. Code fences are taken before inline code, inline code before
- * emphasis, and `**` before `*` — otherwise the shorter marker eats the longer
- * one's opening delimiter and the rest of the message parses as garbage.
+ * Inside `(...)` of a link, only `)` and `\` may be escaped — escaping a dot
+ * or dash there would put a backslash into the URL itself and break it. This
+ * is the rule that makes "escape everything" wrong rather than merely ugly.
  */
-export function tokenizeCommonMark(input: string): Token[] {
-  const tokens: Token[] = [];
-  let rest = input;
+function escapeUrl(url: string): string {
+  return url.replace(/([\\)])/g, "\\$1");
+}
 
-  // Each pattern captures its content; the union is scanned left to right so
-  // the earliest match in the string wins regardless of which pattern it is.
-  const patterns: { kind: Token["kind"]; re: RegExp }[] = [
-    { kind: "pre", re: /```(?:[a-zA-Z0-9_+-]*\n)?([\s\S]*?)```/ },
-    // Telegram has NO heading syntax, so `## Title` would otherwise escape to a
-    // literal "\#\# Title". Bold is the conventional stand-in, and it keeps the
-    // document's structure legible instead of turning it into visible hashes.
-    //
-    // Matched at line start only, and AFTER the code-fence pattern in earliest-
-    // match order — so a `# comment` inside a fenced block belongs to the fence
-    // (which starts earlier) and is left alone.
-    { kind: "heading", re: /(?:^|\n)[ \t]*#{1,6}[ \t]+([^\n]+)/ },
-    { kind: "code", re: /`([^`\n]+)`/ },
-    { kind: "link", re: /\[([^\]\n]*)\]\(([^)\s]+)\)/ },
-    { kind: "bold", re: /\*\*([^\n]+?)\*\*/ },
-    { kind: "strike", re: /~~([^\n]+?)~~/ },
-    // Single-marker emphasis last, and it must not match the `**` it is part
-    // of — the bold pattern above has already consumed those.
-    { kind: "italic", re: /(?<![*\w])\*([^*\n]+?)\*(?![*\w])/ },
-    { kind: "italic", re: /(?<![_\w])_([^_\n]+?)_(?![_\w])/ },
+/** Inside code, only the backtick and backslash are special. */
+function escapeCode(code: string): string {
+  return code.replace(/([\\`])/g, "\\$1");
+}
+
+// Ordered: a fenced block must win over inline code, and a link over emphasis,
+// or a URL containing an underscore would be read as italic.
+const FENCE = /```([\s\S]*?)```/;
+const INLINE_CODE = /`([^`\n]+)`/;
+const LINK = /\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)/;
+const BOLD = /\*\*([^*\n]+)\*\*/;
+const ITALIC = /(?<![*\w])\*([^*\n]+)\*(?!\w)/;
+
+/**
+ * Convert one message. Never throws and never returns something Telegram will
+ * reject: anything unrecognised ends up escaped, which renders as itself.
+ */
+export function toTelegramMarkdownV2(text: string): string {
+  if (!text) return "";
+
+  const patterns: { re: RegExp; render: (m: RegExpExecArray) => string }[] = [
+    { re: FENCE, render: (m) => "```" + escapeCode(m[1] ?? "") + "```" },
+    { re: INLINE_CODE, render: (m) => "`" + escapeCode(m[1] ?? "") + "`" },
+    // A link's LABEL is prose and escapes as prose; its URL escapes by the
+    // narrower rule above. An empty label would render as a bare `[](url)`,
+    // so it falls back to showing the URL.
+    {
+      re: LINK,
+      render: (m) => {
+        const label = (m[1] ?? "").trim();
+        const url = m[2] ?? "";
+        return label
+          ? `[${escapeMarkdownV2(label)}](${escapeUrl(url)})`
+          : `[${escapeMarkdownV2(url)}](${escapeUrl(url)})`;
+      },
+    },
+    { re: BOLD, render: (m) => `*${escapeMarkdownV2(m[1] ?? "")}*` },
+    { re: ITALIC, render: (m) => `_${escapeMarkdownV2(m[1] ?? "")}_` },
   ];
 
-  while (rest.length > 0) {
-    let best: { kind: Token["kind"]; index: number; match: RegExpExecArray } | null = null;
-    for (const { kind, re } of patterns) {
-      const m = re.exec(rest);
-      if (m && (best === null || m.index < best.index)) {
-        best = { kind, index: m.index, match: m };
-      }
+  // Find the earliest entity, escape everything before it, render it, recurse
+  // on the rest. Linear, and it cannot nest an entity inside another entity's
+  // escaped text — which is what keeps a URL out of the emphasis parser.
+  let earliest: { index: number; length: number; rendered: string } | null = null;
+  for (const { re, render } of patterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    if (earliest === null || m.index < earliest.index) {
+      earliest = { index: m.index, length: m[0].length, rendered: render(m) };
     }
-    if (!best) {
-      tokens.push({ kind: "text", value: rest });
-      break;
-    }
-    if (best.index > 0) tokens.push({ kind: "text", value: rest.slice(0, best.index) });
-    if (best.kind === "link") {
-      tokens.push({ kind: "link", value: best.match[1] ?? "", url: best.match[2] ?? "" });
-    } else {
-      tokens.push({ kind: best.kind, value: best.match[1] ?? "" });
-    }
-    rest = rest.slice(best.index + best.match[0].length);
   }
-  return tokens;
-}
 
-/**
- * Renders CommonMark as MarkdownV2 that Telegram will accept.
- *
- * Emphasis content is escaped too — a bold run containing a full stop is still
- * a parse error without it, which is the subtle version of the same bug.
- */
-export function toTelegramMarkdownV2(input: string): string {
-  let out = "";
-  for (const token of tokenizeCommonMark(input)) {
-    switch (token.kind) {
-      case "text":
-        out += escapeAll(token.value);
-        break;
-      case "pre":
-        out += "```\n" + escapeCode(token.value.replace(/\n$/, "")) + "\n```";
-        break;
-      case "code":
-        out += "`" + escapeCode(token.value) + "`";
-        break;
-      case "heading":
-        // Keep the line break the pattern consumed, so the heading still starts
-        // its own line.
-        out += "\n*" + escapeAll(token.value) + "*";
-        break;
-      case "bold":
-        // One asterisk, not two. This is the whole reason `**bold**` rendered
-        // as literal asterisks rather than as bold.
-        out += "*" + escapeAll(token.value) + "*";
-        break;
-      case "italic":
-        out += "_" + escapeAll(token.value) + "_";
-        break;
-      case "strike":
-        out += "~" + escapeAll(token.value) + "~";
-        break;
-      case "link":
-        out += "[" + escapeAll(token.value) + "](" + escapeUrl(token.url ?? "") + ")";
-        break;
-    }
-  }
-  return out;
+  if (!earliest) return escapeMarkdownV2(text);
+  return (
+    escapeMarkdownV2(text.slice(0, earliest.index))
+    + earliest.rendered
+    + toTelegramMarkdownV2(text.slice(earliest.index + earliest.length))
+  );
 }

@@ -35,6 +35,7 @@ import {
   type WireMessageEvent,
 } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
+import { toTelegramMarkdownV2 } from "./markdown.js";
 
 /**
  * A `Content-Disposition` value that Node will actually accept.
@@ -427,12 +428,20 @@ export class RelayConnector {
         }
         const sent = await telegram.sendMessage({
           chatId: action.chat_id,
-          text: action.content,
-          replyTo: action.reply_to,
           // Agent-authored, so it is written in the dialect TELEGRAM_DESCRIPTOR
           // advertises. Sending it unparsed was why formatting arrived as
           // literal asterisks: we were announcing markdown_v2 and then not
           // honouring it.
+          //
+          // ...and announcing it while sending RAW was the other half. MarkdownV2
+          // reserves the punctuation ordinary prose is made of, so a message with
+          // a full stop in it is rejected whole, and telegram-api.ts's fallback
+          // re-sends it with no parse_mode at all — words delivered, every link
+          // dropped. Reported as "the link is not identified, it looks like plain
+          // text". Escaping the prose and leaving the entities alone is what
+          // makes the dialect we advertise true.
+          text: toTelegramMarkdownV2(action.content),
+          replyTo: action.reply_to,
           parseMode: "MarkdownV2",
         });
         return sent.ok
@@ -443,7 +452,10 @@ export class RelayConnector {
         const edited = await telegram.editMessageText({
           chatId: action.chat_id,
           messageId: action.message_id,
-          text: action.content,
+          // Same reason as `send`: an edit is agent prose too, and an edit that
+          // fails to parse leaves the ORIGINAL message on screen, so the loss
+          // is even quieter.
+          text: toTelegramMarkdownV2(action.content),
           parseMode: "MarkdownV2",
         });
         return edited.ok ? { success: true } : { success: false, error: edited.error ?? "EDIT_FAILED" };
