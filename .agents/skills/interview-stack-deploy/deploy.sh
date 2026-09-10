@@ -219,7 +219,7 @@ OLD_RELAY="$(lsof -nP -iTCP:4312 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
 sleep 2
 ( cd "$API_DIR"
   env -u RELAY_GATEWAY_SECRET CONTROL_PLANE_ARCHITECTURE_PROFILE="$RELAY_ARCH_PROFILE" \
-    nohup npx tsx src/relay/server.ts > "$RELAY_LOG" 2>&1 &
+    nohup npx tsx src/relay/server.ts >> "$RELAY_LOG" 2>&1 &
 )
 for _ in $(seq 1 15); do lsof -nP -iTCP:4312 -sTCP:LISTEN -t >/dev/null 2>&1 && break; sleep 1; done
 NEW_RELAY="$(lsof -nP -iTCP:4312 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
