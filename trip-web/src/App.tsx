@@ -1386,7 +1386,7 @@ const satelliteMapStyle = satelliteTileUrl && satelliteAttribution
  * required attribution must be supplied explicitly; trip coordinates are not
  * sent to an unreviewed third party merely because a map screen is opened.
  */
-const mapModes = satelliteMapStyle ? (["raster", "satellite"] as const) : (["raster"] as const);
+const mapModes = satelliteMapStyle ? (["raster", "3d", "satellite"] as const) : (["raster", "3d"] as const);
 
 function validCoordinates(lat: number, lng: number) {
   return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
@@ -1454,7 +1454,7 @@ export function wrappedMapIndex(index: number, count: number) {
   return count > 0 ? ((index % count) + count) % count : 0;
 }
 
-function InteractiveMap({
+export function InteractiveMap({
   pins,
   lang,
   onOpenItinerary,
@@ -1471,6 +1471,7 @@ function InteractiveMap({
   const markerElementRefs = useRef(new globalThis.Map<string, HTMLButtonElement>());
   const [activeIndex, setActiveIndex] = useState(0);
   const [mapMode, setMapMode] = useState<(typeof mapModes)[number]>("raster");
+  const [buildingStatus, setBuildingStatus] = useState<"loading" | "ready" | "unavailable">("loading");
   const activePin = pins[activeIndex] || pins[0];
 
   function syncActiveMarkerLabel(pinId: string | undefined) {
@@ -1486,54 +1487,92 @@ function InteractiveMap({
     const container = containerRef.current;
     if (!container || !pins.length) return;
     let disposed = false;
+    let buildingTimeout: ReturnType<typeof setTimeout> | undefined;
     let map: import("maplibre-gl").Map | undefined;
-    void Promise.all([import("maplibre-gl"), import("maplibre-gl/dist/maplibre-gl.css")]).then(([maplibregl]) => {
+    void Promise.all([import("maplibre-gl"), import("maplibre-gl/dist/maplibre-gl.css"), import("maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url")]).then(([maplibregl, , worker]) => {
       if (disposed) return;
+      // v6's worker must go through Vite's worker pipeline, including its
+      // shared imports. Auto-detection points at a missing file after bundling.
+      maplibregl.setWorkerUrl(worker.default);
       const instance = new maplibregl.Map({
         container,
-        style: mapMode === "satellite" && satelliteMapStyle ? satelliteMapStyle : freeMapStyle,
+        style: mapMode === "3d" ? "https://tiles.openfreemap.org/styles/bright" : mapMode === "satellite" && satelliteMapStyle ? satelliteMapStyle : freeMapStyle,
         center: [pins[0].lng, pins[0].lat],
         zoom: pins.length === 1 ? 12 : 5,
+        pitch: mapMode === "3d" ? 50 : 0,
+        bearing: mapMode === "3d" ? -20 : 0,
+        canvasContextAttributes: { antialias: true },
       });
       map = instance;
       mapRef.current = instance;
-      instance.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
-      // `load` waits for every vector tile. A slow/offline tile provider would
-      // leave the controls visible but never add the authoritative pins. The
-      // style is enough to render markers and fit the camera; tiles can finish
-      // loading independently afterward.
+      if (mapMode === "3d") {
+        setBuildingStatus("loading");
+        buildingTimeout = setTimeout(() => setBuildingStatus("unavailable"), 15000);
+      }
+      instance.addControl(new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }), "top-right");
+      // Install the building layer once the style is ready; trip markers
+      // below do not wait for any third-party style or tiles.
       instance.on("style.load", () => {
-        pins.forEach((pin) => {
-          const markerButton = document.createElement("button");
-          markerButton.type = "button";
-          markerButton.className = "map-pin-marker";
-          markerButton.setAttribute("aria-label", `${pin.title} — ${pin.subtitle}`);
-          markerButton.title = pin.title;
-          const dot = document.createElement("span");
-          dot.className = `map-pin-dot ${pin.kind === "stay" ? "stay" : "stop"}`;
-          dot.setAttribute("aria-hidden", "true");
-          const label = document.createElement("span");
-          label.className = "map-pin-label";
-          label.textContent = pin.title;
-          markerButton.append(dot, label);
-          markerButton.addEventListener("click", () => {
-            const nextIndex = pins.findIndex((candidate) => candidate.id === pin.id);
-            if (nextIndex >= 0) setActiveIndex(nextIndex);
-            onOpenItinerary(pin);
+        // Load the vector map and building data only in the opt-in 3D view.
+        if (mapMode === "3d") {
+          instance.on("sourcedata", (event) => {
+            if (event.sourceId === "buildings" && event.isSourceLoaded) {
+              clearTimeout(buildingTimeout);
+              setBuildingStatus("ready");
+            }
           });
-          markerElementRefs.current.set(pin.id, markerButton);
-          const marker = new maplibregl.Marker({ element: markerButton, anchor: "bottom" })
-            .setLngLat([pin.lng, pin.lat])
-            .addTo(instance);
-          markerRefs.current.push(marker);
-        });
-        syncActiveMarkerLabel(activePin?.id);
-        if (activePin) instance.jumpTo({ center: [activePin.lng, activePin.lat], zoom: 16 });
-        instance.resize();
+          instance.addSource("buildings", { type: "vector", url: "https://tiles.openfreemap.org/planet" });
+          const firstLabel = instance.getStyle().layers.find((layer) => layer.type === "symbol")?.id;
+          instance.addLayer({
+            id: "trip-3d-buildings",
+            type: "fill-extrusion",
+            source: "buildings",
+            "source-layer": "building",
+            minzoom: 14,
+            filter: ["!=", ["get", "hide_3d"], true],
+            paint: {
+              "fill-extrusion-color": "#a3bcb7",
+              "fill-extrusion-height": ["coalesce", ["get", "render_height"], 3],
+              "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+              "fill-extrusion-opacity": 0.85,
+            },
+          }, firstLabel);
+        }
       });
+      // Trip markers remain usable even when the basemap provider is offline.
+      pins.forEach((pin) => {
+        const markerButton = document.createElement("button");
+        markerButton.type = "button";
+        markerButton.className = "map-pin-marker";
+        markerButton.setAttribute("aria-label", `${pin.title} — ${pin.subtitle}`);
+        markerButton.title = pin.title;
+        const dot = document.createElement("span");
+        dot.className = `map-pin-dot ${pin.kind === "stay" ? "stay" : "stop"}`;
+        dot.setAttribute("aria-hidden", "true");
+        const label = document.createElement("span");
+        label.className = "map-pin-label";
+        label.textContent = pin.title;
+        markerButton.append(dot, label);
+        markerButton.addEventListener("click", () => {
+          const nextIndex = pins.findIndex((candidate) => candidate.id === pin.id);
+          if (nextIndex >= 0) setActiveIndex(nextIndex);
+          onOpenItinerary(pin);
+        });
+        markerElementRefs.current.set(pin.id, markerButton);
+        const marker = new maplibregl.Marker({ element: markerButton, anchor: "bottom" })
+          .setLngLat([pin.lng, pin.lat])
+          .addTo(instance);
+        markerRefs.current.push(marker);
+      });
+      syncActiveMarkerLabel(activePin?.id);
+      if (activePin) instance.jumpTo({ center: [activePin.lng, activePin.lat], zoom: 16 });
+      instance.resize();
+    }).catch(() => {
+      if (!disposed) setBuildingStatus("unavailable");
     });
     return () => {
       disposed = true;
+      clearTimeout(buildingTimeout);
       markerRefs.current.forEach((marker) => marker.remove());
       markerRefs.current = [];
       markerElementRefs.current.clear();
@@ -1546,7 +1585,7 @@ function InteractiveMap({
     const map = mapRef.current;
     if (!map || !activePin) return;
     syncActiveMarkerLabel(activePin.id);
-    map.flyTo({ center: [activePin.lng, activePin.lat], zoom: 16, duration: 1100, essential: true });
+    map.flyTo({ center: [activePin.lng, activePin.lat], zoom: 16, pitch: mapMode === "3d" ? 50 : 0, duration: 1100 });
   }, [activeIndex, activePin]);
 
   useEffect(() => {
@@ -1561,7 +1600,7 @@ function InteractiveMap({
     const pin = pins[nextIndex];
     if (!map || !pin) return;
     syncActiveMarkerLabel(pin.id);
-    map.flyTo({ center: [pin.lng, pin.lat], zoom: 16, duration: 1100, essential: true });
+    map.flyTo({ center: [pin.lng, pin.lat], zoom: 16, pitch: mapMode === "3d" ? 50 : 0, duration: 1100 });
   }, [focusRequest, pins]);
 
   function moveTo(index: number) {
@@ -1572,14 +1611,14 @@ function InteractiveMap({
     const map = mapRef.current;
     if (!map || !pins.length) return;
     if (pins.length === 1) {
-      map.flyTo({ center: [pins[0].lng, pins[0].lat], zoom: 16, duration: 1100, essential: true });
+      map.flyTo({ center: [pins[0].lng, pins[0].lat], zoom: 16, pitch: mapMode === "3d" ? 50 : 0, duration: 1100 });
       return;
     }
     const west = Math.min(...pins.map((pin) => pin.lng));
     const east = Math.max(...pins.map((pin) => pin.lng));
     const south = Math.min(...pins.map((pin) => pin.lat));
     const north = Math.max(...pins.map((pin) => pin.lat));
-    map.fitBounds([[west, south], [east, north]], { padding: 54, maxZoom: 5, duration: 1100 });
+    map.fitBounds([[west, south], [east, north]], { padding: 54, maxZoom: 5, pitch: 0, bearing: 0, duration: 1100 });
   }
 
   return (
@@ -1597,11 +1636,12 @@ function InteractiveMap({
         </button>
         {mapModes.length > 1 ? (
           <div className="map-mode-switch" role="group" aria-label={lang === "he" ? "סגנון מפה" : "Map style"}>
-            {mapModes.map((mode) => <button key={mode} className={mapMode === mode ? "active" : ""} type="button" onClick={() => setMapMode(mode)}>{mode === "satellite" ? (lang === "he" ? "לוויין" : "Satellite") : (lang === "he" ? "מפה" : "Raster")}</button>)}
+            {mapModes.map((mode) => <button key={mode} className={mapMode === mode ? "active" : ""} aria-pressed={mapMode === mode} type="button" onClick={() => setMapMode(mode)}>{mode === "satellite" ? (lang === "he" ? "לוויין" : "Satellite") : mode === "3d" ? "3D" : "2D"}</button>)}
           </div>
         ) : null}
       </div>
       <div ref={containerRef} className="interactive-map" aria-label={lang === "he" ? "מפת הטיול" : "Trip map"} />
+      {mapMode === "3d" && buildingStatus !== "ready" ? <p role="status">{buildingStatus === "loading" ? (lang === "he" ? "טוען מבנים בתלת־ממד…" : "Loading 3D buildings…") : (lang === "he" ? "מפת התלת־ממד מתעכבת. אפשר לעבור ל־2D ולהמשיך לצפות בנקודות הטיול." : "The 3D map is taking longer to load. Switch to 2D to keep exploring your trip stops.")}</p> : null}
     </>
   );
 }

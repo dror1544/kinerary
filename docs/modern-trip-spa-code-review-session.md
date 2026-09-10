@@ -208,3 +208,44 @@ Third-party image URLs remain an external dependency. To remove that source of
 outages, selected originals must be copied into durable trip-owned media storage
 (with source/credit retained), then checked during deployment. The loader fixes
 do not claim that an external provider will keep serving a URL indefinitely.
+
+## 3D map and parent integration — 2026-09-10
+
+Merged `integration/sprint-5-plus` into `feat/modern-spa-next` at `27a38bd`
+without conflicts, including the companion-scope template update.
+
+The map now offers explicit 2D/3D switching. The opt-in 3D view loads
+OpenFreeMap building extrusions; satellite imagery remains build-configured.
+MapLibre's worker is emitted through Vite's worker pipeline so the production
+bundle can load it. Trip markers and camera positioning no longer wait for a
+third-party style or tiles, and a stalled 3D load offers a return to 2D.
+Mode changes retain the selected stop and release the previous map and markers.
+Camera animations respect the browser's reduced-motion preference.
+
+Validation on the merged tree:
+
+- 39 Modern SPA tests pass, including worker setup, markers before style load,
+  selected-stop preservation, 3D readiness, timeout recovery, and cleanup.
+- TypeScript and the production build pass.
+- Repository preflight passes: trip-site tests, API build/unit subset, Python
+  worker/provisioning, and organizer web tests/typecheck/build.
+- Full API suite against the dedicated `cptest` database on port 5434:
+  743 passed, 0 failed, 6 skipped.
+- All 5 runtime-gateway tests pass, including SSE streaming, cookie isolation,
+  and upstream cleanup.
+- Chrome rendered 3D buildings from the production bundle against a disposable
+  fixture runtime and switched back to 2D; no browser map errors were recorded.
+- A real `add_budget_item` MCP call appeared in two open Modern Chrome tabs
+  without reload. With an unsaved editor draft in the first tab,
+  `delete_budget_item` removed the second tab's row while retaining the first
+  tab's draft. Cancelling the editor applied the pending deletion.
+
+**Gateway acceptance remains blocked, not passed.** A real POST to
+`/api/internal/control-plane/session` on the fixture trip server returns
+HTTP 404 (`Cannot POST /api/internal/control-plane/session`). The gateway
+requires this endpoint for launch, while its isolated test supplies a stub.
+This is the existing activation B3 gap in `docs/activation-scope.md`, not a
+regression introduced by the map. The two-browser MCP check above used the
+direct runtime, so it does not establish the full managed gateway login path,
+the two-second gateway target, or deployed acceptance. No live deployment or
+PR approval is recorded by this verification.

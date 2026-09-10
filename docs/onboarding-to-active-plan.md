@@ -8,6 +8,18 @@ Companion pieces: `activation-scope.md` (what activation *is* — still open),
 `companion-install-plan.md` (B1), `onboarding-mvp-sprint-plan.md` (the sprints).
 This file is the journey, end to end, and where it actually breaks.
 
+## Verification update — 2026-09-10
+
+PR #44 contains the Modern work; the local parent integration branch was
+merged into it at `27a38bd`. The September 7 commit checkpoint below is
+historical. Map and direct-runtime MCP updates have been browser-verified;
+the detailed evidence is in `modern-trip-spa-code-review-session.md`.
+
+The complete gateway handoff is still blocked by activation B3: the real
+trip server returns HTTP 404 for `POST /api/internal/control-plane/session`.
+Passing gateway tests use a stub for that endpoint. Do not treat route
+registration or a passing Modern build as proof that portal launch works.
+
 ## Update — 2026-09-07
 
 Phase B is implemented on `feat/modern-spa-next` and is waiting for the explicit
