@@ -253,7 +253,7 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
 export const UI_STRINGS: Record<Language, Record<string, string>> = {
   en: {
     skip: "⤼ Skip this one",
-    finish: "🏁 No more questions",
+    finish: "🏁 Finished",
     multiDone: "✔️ Done",
     confirm: "✅ Confirm",
     keepPlanning: "✏️ Keep planning",
@@ -264,7 +264,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     none: "(none)",
     skipped: "(skipped)",
     otherPrefix: "Other",
-    essentialsDone: "That's everything I need. Want to add a few more details, or shall I show you the summary?",
+    essentialsDone: "That's everything I actually need — the rest is optional. A few more questions let me tailor your assistant to the group: how you like to travel, what people eat, who to keep an eye on. Answer as many or as few as you like, and press Finished whenever you've had enough.",
     askMore: "➕ A few more questions",
     documentOffer: "Before we start on details — if you already have a plan, a booking confirmation, tickets or a spreadsheet for this trip, send it here and I'll read it instead of making you type it all out.",
     noDocument: "I don't have one",
@@ -397,7 +397,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
   },
   he: {
     skip: "⤼ דלג על זו",
-    finish: "🏁 מספיק שאלות",
+    finish: "🏁 סיים",
     multiDone: "✔️ סיימתי",
     confirm: "✅ אישור",
     keepPlanning: "✏️ עוד לא סיימתי",
@@ -408,7 +408,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     none: "(אין)",
     skipped: "(דילגו)",
     otherPrefix: "אחר",
-    essentialsDone: "זה כל מה שצריך. רוצים להוסיף עוד כמה פרטים, או שאראה לכם סיכום?",
+    essentialsDone: "זה כל מה שבאמת צריך — מכאן זה רשות. עוד כמה שאלות יעזרו לי להתאים את העוזר לקבוצה: איך אתם אוהבים לטייל, מה אוכלים, על מי לשים לב. תענו על כמה שבא לכם, ותלחצו סיים מתי שתרצו.",
     askMore: "➕ עוד כמה שאלות",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
