@@ -141,10 +141,37 @@ describe('POST /api/bookings/extract-draft', () => {
     const confirmations = await (await api('/api/confirmations/summary', { token: bobToken })).json();
     assert.equal(confirmations.items.some(item => item.id === booking.id), false, 'draft confirmation leaked through Modern summary');
 
+    // Classic's plan projection is the other half of the same boundary. It
+    // attaches the booking to the plan item by id, and joinBooking() looked it
+    // up without the visibility rule — so the member's booking list correctly
+    // excluded the draft while GET /api/phases/ny/plan handed over its name
+    // and confirmation code.
+    const classicWrite = await api('/api/phases/ny/plan', {
+      method: 'POST', token,
+      body: { date: '2027-03-11', text_he: 'טיוטה מצורפת', text_en: 'Draft attached', booking_id: booking.id },
+    });
+    assert.equal(classicWrite.status, 201);
+    const memberPlan = await (await api('/api/phases/ny/plan', { token: bobToken })).json();
+    const memberRow = memberPlan.find(row => row.booking_id === booking.id);
+    assert.ok(memberRow, 'the plan item itself is not the secret — only the booking behind it');
+    assert.equal(memberRow.booking, null, 'draft booking leaked through the Classic plan projection');
+    assert.equal(
+      JSON.stringify(memberPlan).includes(booking.confirmation), false,
+      `confirmation ${booking.confirmation} reached a member through /api/phases/ny/plan`,
+    );
+
+    // The organizer who attached it still sees what they attached.
+    const organizerPlan = await (await api('/api/phases/ny/plan', { token })).json();
+    assert.equal(organizerPlan.find(row => row.booking_id === booking.id)?.booking?.confirmation, booking.confirmation,
+      'an organizer reviewing drafts must still see the booking on the plan item');
+
     const approved = await api(`/api/bookings/${booking.id}/approve`, { method: 'POST', token });
     assert.equal(approved.status, 200);
     const visibleRows = await (await api('/api/bookings', { token: bobToken })).json();
     assert.equal(visibleRows.some(row => row.id === booking.id), true, 'approved draft should be visible to members');
+    const approvedPlan = await (await api('/api/phases/ny/plan', { token: bobToken })).json();
+    assert.equal(approvedPlan.find(row => row.booking_id === booking.id)?.booking?.confirmation, booking.confirmation,
+      'once approved, the booking should reach the member through the plan too');
   });
 
   test('rejects a member attempting to create a draft', async () => {

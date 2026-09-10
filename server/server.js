@@ -1868,8 +1868,7 @@ app.get('/api/bookings', authRequired, (req, res) => {
   const wheres = [];
   // Drafts are a private organizer workflow. Members only ever receive
   // approved bookings, even if they guess the status query parameter.
-  const canReviewDrafts = req.user?.isAgent || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
-  if (!canReviewDrafts) wheres.push("review_status = 'approved'");
+  if (!canReviewDrafts(req)) wheres.push("COALESCE(review_status, 'approved') = 'approved'");
   if (phase) { wheres.push('phase = ?'); params.push(phase); }
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
@@ -2031,10 +2030,27 @@ function withCorrection(row) {
   };
 }
 
-function joinBooking(item) {
+// Drafts are a private organizer workflow, so every route that resolves a
+// booking has to say whose eyes the answer is for. Kept as one predicate
+// rather than repeated inline: GET /api/bookings had the only copy, and the
+// Classic plan projection below silently didn't.
+function canReviewDrafts(req) {
+  return Boolean(req?.user?.isAgent)
+      || normalizeOrganizers(TRIP_CONFIG.agent).includes(req?.user?.username);
+}
+
+// Classic's half of the same boundary living-journey.js's serializeItinerary()
+// enforces for Modern: a booking still in organizer review must not reach a
+// member through an attached plan-item card, only through /api/bookings.
+// Fails safe — a caller that forgets to pass the viewer's capability gets the
+// member-visible projection, never the draft.
+function joinBooking(item, { includeDrafts = false } = {}) {
   const withCorr = withCorrection(item);
   if (!item.booking_id) return withCorr;
-  const bk = db.prepare('SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?').get(item.booking_id);
+  const bk = db.prepare(
+    'SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?' +
+    (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
+  ).get(item.booking_id);
   return { ...withCorr, booking: bk || null };
 }
 
@@ -2130,7 +2146,8 @@ app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
     'SELECT * FROM phase_plan_items WHERE phase_id = ? ' +
     'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
   ).all(req.params.phase_id);
-  res.json(rows.map(joinBooking));
+  const includeDrafts = canReviewDrafts(req);
+  res.json(rows.map((row) => joinBooking(row, { includeDrafts })));
 });
 
 // Day headlines for a phase. Separate from the item list so /plan keeps its
@@ -2232,7 +2249,7 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   ensurePlanDay(req.params.phase_id, date || null);
   journey.syncFromLegacy('legacy-plan-create');
   kickEnrichmentSoon();
-  res.status(201).json(joinBooking(created));
+  res.status(201).json(joinBooking(created, { includeDrafts: true }));
 });
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
@@ -2289,7 +2306,7 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
     .get(req.params.id, req.params.phase_id);
   journey.syncFromLegacy('legacy-plan-update');
-  res.json({ ...joinBooking(updated), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
+  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
 });
 
 app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
@@ -2448,7 +2465,7 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
   kickEnrichmentSoon();
   res.json({
     ok: true, phase_id: phaseId, swapped: [date_a, date_b], days,
-    items: items.map(joinBooking),
+    items: items.map((item) => joinBooking(item, { includeDrafts: true })),
     // The caller has to come back for this. get_phase_plan returns whatever
     // the reviewer has written by then, and an agent that made this change is
     // expected to relay those corrections to the organizer.
@@ -3207,7 +3224,7 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
     ).run(bk.phase, date, text, text, bk.location_url || null, bk.id, 'needs_review', 'migration');
     db.prepare('INSERT INTO phase_plan_import_log (booking_id) VALUES (?)').run(bk.id);
     const item = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
-    created.push(joinBooking(item));
+    created.push(joinBooking(item, { includeDrafts: true }));
   }
   journey.syncFromLegacy('legacy-import-from-bookings');
   res.json({ created, skipped });
