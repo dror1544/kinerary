@@ -56,6 +56,12 @@ def port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def relay_pid() -> str:
+    out = subprocess.run(["lsof", "-nP", "-iTCP:4312", "-sTCP:LISTEN", "-t"],
+                         capture_output=True, text=True).stdout.strip()
+    return out.splitlines()[0] if out else ""
+
+
 def api_ready(api: str) -> tuple[bool, str]:
     try:
         with urllib.request.urlopen(f"{api}/readyz", timeout=5) as resp:
@@ -118,6 +124,39 @@ def check_running_code() -> None:
     print("  code       api + worker carry the interview work")
 
 
+def check_interview_path(relay_pid: str) -> None:
+    """The interview must run WITHOUT an agent, and the flag that decides it
+    lives in the relay's environment — so it is lost on any restart from a
+    shell that did not source provisioning.env.
+
+    Unset is not an error, it is a downgrade: new sessions are created on the
+    agent path, which is supported, so nothing warns. On 2026-09-09 that cost a
+    whole run — English narration inside a Hebrew interview, and a turn that
+    opened and never closed. Read it off the process rather than off the file
+    that was supposed to have been sourced.
+    """
+    out = subprocess.run(["ps", "eww", relay_pid], capture_output=True, text=True).stdout
+    env = dict(
+        part.split("=", 1) for part in out.split() if "=" in part and part.split("=", 1)[0].isupper()
+    )
+    problems = []
+    if env.get("INTERPRET_PATH_DEFAULT", "").lower() not in ("1", "true", "yes"):
+        problems.append("INTERPRET_PATH_DEFAULT is not set — new sessions would run WITH the Hermes agent")
+    for var in ("INTERPRET_RUNNER", "EXTRACT_RUNNER"):
+        if not env.get(var):
+            problems.append(f"{var} is unset — that task returns NOT_CONFIGURED and the router silently does less")
+    if problems:
+        raise Stop(
+            "the relay is running without the interview's own configuration:\n    - "
+            + "\n    - ".join(problems)
+            + "\n  These live in ~/kinerary-deploy/provisioning.env. Restart the relay from a shell"
+              "\n  that sourced it:\n"
+              "    set -a && . ~/kinerary-deploy/provisioning.env && set +a\n"
+              "    .agents/skills/interview-stack-deploy/deploy.sh"
+        )
+    print(f"  interview  agentless, {env.get('INTERPRET_RUNNER')}/{env.get('INTERPRET_MODEL', '?')}")
+
+
 def preflight(api: str, want_relay: bool) -> None:
     print("== preflight ==")
     ready, detail = api_ready(api)
@@ -142,6 +181,7 @@ def preflight(api: str, want_relay: bool) -> None:
 
     if port_open(4312):
         print("  relay      :4312 up")
+        check_interview_path(relay_pid())
         return
     if not want_relay:
         raise Stop(
@@ -151,6 +191,7 @@ def preflight(api: str, want_relay: bool) -> None:
         )
     print("  relay      :4312 down — starting it (live action)")
     start_relay()
+    check_interview_path(relay_pid())
 
 
 # ── signup ───────────────────────────────────────────────────────────────────
@@ -213,6 +254,11 @@ def main() -> int:
     ap.add_argument("--api", default=DEFAULT_API)
     ap.add_argument("--start-relay", action="store_true", help="start the relay if down (live action)")
     ap.add_argument("--wait-minutes", type=int, default=10, help="how long to wait for your approval tap")
+    # Added after checking the preflight by running the whole thing, which
+    # signed a real account up and put an approval prompt on someone's phone.
+    # The preflight is the part worth running on its own; the signup is not.
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="check the stack and exit, without signing anything up")
     args = ap.parse_args()
 
     stamp = datetime.now().strftime("%m%d%H%M")
@@ -221,6 +267,9 @@ def main() -> int:
 
     try:
         preflight(args.api, args.start_relay)
+        if args.preflight_only:
+            print("\npreflight only — nothing was signed up.")
+            return 0
 
         print("\n== signup ==")
         print(f"  email    {email}")
