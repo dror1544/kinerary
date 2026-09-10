@@ -132,6 +132,72 @@ Nothing outside that file needs to know the rule, which is the point: it was
 already written down in `docs/sprint5-trip-bot-router-design.md` and being
 written down was not enough.
 
+### The interview has no agent — and silently grows one back
+
+The interview is a **deterministic router calling bounded LLM functions**, not
+an agent (`docs/interview-without-an-agent.md`). Per session that is
+`intake_sessions.interpret_path`, set at creation from `INTERPRET_PATH_DEFAULT`.
+
+These live in `~/kinerary-deploy/provisioning.env` and must reach the **relay
+process**, which is where the interview's model calls are made:
+
+```
+INTERPRET_PATH_DEFAULT=1
+INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5
+EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5
+```
+
+**Unset is not an error, it is a downgrade.** With no flag, new sessions are
+created on the agent path — which is a supported path, so nothing warns. With
+no runner, `interpret`/`extract` return `NOT_CONFIGURED` and the router simply
+does less. Both failures are invisible from the conversation and both were paid
+for on 2026-09-09: a stack rebuilt from a shell without the flag put the Hermes
+agent back into a live interview, which produced English narration mid-Hebrew
+and a turn that opened and never closed.
+
+Two reasons that hurts more than it looks:
+
+- **Hermes cannot reach Claude on this host.** Its profiles ask for
+  `provider: anthropic`, get "no Anthropic credentials found" every time, and
+  fall down their chain to `openai-codex`, which is metered. Editing a profile's
+  model to a `claude-*` id does not fix it. The `claude` CLI *is* authenticated
+  here, which is why `*_RUNNER=claude` is the configured path — it needs no key.
+- **The two paths write different shapes.** Agentless emits
+  `phases[].planned: ["Tokyo Skytree"]`; the agent emits
+  `phases[].venues: [{name, time}]`. `transformer.py` handles both now, but a
+  shape appearing where you did not expect it is a reliable signal of which
+  path actually ran.
+
+When an interview misbehaves, read `interpret_path` off the session first:
+
+```bash
+docker exec kinerary-control-plane-local-postgres-1 psql -U kinerary_control_plane \
+  -d kinerary_control_plane -c "SELECT id, interpret_path, language FROM control_plane.intake_sessions ORDER BY created_at DESC LIMIT 3;"
+# and: rows in interview_agent_turns mean the agent was in the loop at all.
+# An open turn with closed_at NULL means it took the turn and failed silently.
+```
+
+### The containers mount a checkout, so the directory decides the branch
+
+`compose.local.yml` bind-mounts `control-plane/api/dist` and the worker package
+from the **host**, and `WORKER_REPO_ROOT_HOST` defaults to `/Users/elul/kinerary`.
+So `docker compose up` from the wrong directory runs the wrong branch with no
+error at all, and `interview-stack-deploy/deploy.sh` does not set that variable
+itself. Bring the stack up from the checkout you mean, and pass it explicitly:
+
+```bash
+cd <the worktree you mean>
+(cd control-plane/api && npm run build)     # the API mount is dist/, not src/
+set -a && . ~/kinerary-deploy/provisioning.env && set +a
+WORKER_REPO_ROOT_HOST=$PWD BUILDX_CONFIG=~/.docker/buildx-local \
+  docker compose -f control-plane/deployment/compose.local.yml up -d --build --wait
+KINERARY_REPO=$PWD ~/kinerary-deploy/bring-up.sh   # sidecar from the same tree
+```
+
+Verify by reading the running containers rather than trusting the directory —
+`scripts/new-trip-run.py`'s preflight does exactly this and refuses to mint an
+interview link when a marker is missing.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over

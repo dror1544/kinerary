@@ -86,9 +86,30 @@ even when a `text` key is supplied. The only reliable path for text-type
 questions (`destination`, `departure_date`, `return_date`, etc.) is individual
 `submit_answer_for_chat` calls with `otherText`.
 
-**Pattern:** use `record_answers_for_chat` for structured/multi-choice answers
-from a document; follow with individual `submit_answer_for_chat(otherText=...)`
-calls for every `text`-type question.
+**Confirmed in session (2026-09-09) — the `structured` row above is not
+reliable either.** Batching `travelers` as `structured`, exactly as the table
+describes, came back `DATA_REQUIRED` or was rejected outright. See
+`references/pitfalls-2026-09-09b.md`. Two things were true at once, and only
+the second is a rule worth carrying:
+
+- the batch path does not dependably accept `structured` answers;
+- on the individual call the argument is **`data`**, not `structured` —
+  `{"questionId": "travelers", "structured": [...]}` returns
+  `{"error": "DATA_REQUIRED", "expectedArgument": "data (a JSON array)"}`.
+  Pass the actual JSON value, never a JSON-encoded string.
+
+**Pattern, revised:** use `submit_answer_for_chat(data=...)` individually for
+every `structured` question, and `submit_answer_for_chat(otherText=...)`
+individually for every `text` question. Reserve `record_answers_for_chat` for
+`choice` / `multi_choice` batches, which are the only types it has actually
+been observed to take.
+
+> Both notes above describe the AGENT path. Since 2026-09-09 the interview
+> normally runs without an agent (`docs/interview-without-an-agent.md`), where
+> the router writes every answer through `submitAnswerForChat` itself and none
+> of these tools are called. If you are reading this because a tool call is
+> failing, check `intake_sessions.interpret_path` first — an agent in the loop
+> at all may be the actual surprise.
 
 ## Document-first workflow
 

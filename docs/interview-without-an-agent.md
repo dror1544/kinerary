@@ -1,10 +1,28 @@
 # A deterministic interview with bounded LLM functions
 
-**Status: approved 2026-09-07 with adjustments. Steps 1–5 built, unmeasured.**
-Frozen comparison point: the tag `pre-interview-rewrite`. The slice is behind
-`intake_sessions.interpret_path`, off by default, and no session has been
-switched onto it — §8's benchmark is the next thing, and until it has run this
-is a path that passes its tests rather than a path that is known to work.
+**Status: approved 2026-09-07. Steps 1–5 built. LIVE BY DEFAULT since
+2026-09-09, and still unmeasured — §8's benchmark has not run.**
+Frozen comparison point: the tag `pre-interview-rewrite`.
+
+`intake_sessions.interpret_path` is per session and is set at creation from
+**`INTERPRET_PATH_DEFAULT`**, which is now `1` in
+`~/kinerary-deploy/provisioning.env`. Two sessions have run on the path
+(2026-09-08 and everything after 2026-09-09), the first with **zero**
+`interview_agent_turns` rows.
+
+> **THE FLAG LIVES IN AN ENVIRONMENT, AND AN ENVIRONMENT IS LOST ON RESTART.**
+> On 2026-09-09 the stack was rebuilt from a shell where
+> `INTERPRET_PATH_DEFAULT` was unset. New sessions were created with
+> `interpret_path = false`, the Hermes agent came back, and the run produced
+> four agent turns, chain-of-thought narration in English inside a Hebrew
+> interview, and one turn that opened and never closed. Nothing announced the
+> change: the agent path is a supported path, so returning to it is silent by
+> construction. If an interview starts behaving like an agent again, read
+> `interpret_path` off the session before reading anything else.
+
+Everything below describes the path as designed. What is *known* is narrower:
+it passes its tests, and it has held a real interview. Whether it is better
+than the agent path is what §8 exists to answer, and §8 has not run.
 
 The one-line statement of intent, which the rest of this document exists to
 serve:
@@ -371,13 +389,27 @@ changes what "unfinished" means.
 
 ## 9. Then: `extract`
 
-Document extraction follows the same shape. `extractItinerary` now runs as the
-`extract` task on the shared runner, pinned to **MiniMax M3 on OpenRouter**
-(`minimax/minimax-m3`, `EXTRACT_RUNNER=openrouter`). Verified against
-OpenRouter's live model list on 2026-09-08: 1,048,576-token context, $0.30/M in
-and $1.20/M out, `response_format` and `structured_outputs` both declared. The
-million-token window is the reason — extraction is the one task where long
-context earns its cost.
+Document extraction follows the same shape, as the `extract` task on the shared
+runner.
+
+**As deployed 2026-09-09: `EXTRACT_RUNNER=claude`,
+`EXTRACT_MODEL=claude-sonnet-5`** (and the same pair for `INTERPRET_`). Not a
+judgment that Claude extracts better than the alternative below — a
+consequence of what this machine can actually authenticate. `claudeSpec` shells
+`claude -p <prompt> --model <model>`, which uses the CLI's own auth and needs no
+key of ours; Hermes, by contrast, has **no Anthropic credentials on this host**
+and every `provider: anthropic` request in its profiles fails with "no
+Anthropic credentials found" and falls down the chain to `openai-codex`, which
+is metered. Reaching Claude through the CLI is the path that costs nothing per
+run here.
+
+The prior pinning was **MiniMax M3 on OpenRouter** (`minimax/minimax-m3`,
+`EXTRACT_RUNNER=openrouter`) — verified against OpenRouter's live model list on
+2026-09-08: 1,048,576-token context, $0.30/M in and $1.20/M out,
+`response_format` and `structured_outputs` both declared. That million-token
+window is still the strongest argument for it, since extraction is the one task
+where long context earns its cost. Revisit if a document ever exceeds what the
+CLI path will take.
 
 ### A fallback chain hiding a broken primary
 
@@ -516,13 +548,16 @@ reasonable end state, not a smell.
 8. Decide afterwards whether `phrase` is needed at all (§10).
 
 Steps 1–5 are one slice; the flag is per session, and the agent path stays
-intact and untouched for sessions not on it.
+intact and untouched for sessions not on it. That the old path stays intact is
+a deliberate property and also the reason a regression onto it is invisible —
+see the warning at the top.
 
-What steps 1–5 do **not** establish: that any of it is better. No session has
-run on the path, no model has been called outside a fake, and the process-spawn
-cost §8 exists to measure has not been paid once. The tests show the gate
-refuses what it should refuse; they say nothing about whether a real model
-proposes the right things in Hebrew.
+What steps 1–5 do **not** establish: that any of it is better. The path has now
+held a real interview, but the process-spawn cost §8 exists to measure has not
+been paid deliberately or recorded once, and no A/B against runs 14–15 exists.
+The tests show the gate refuses what it should refuse; they say nothing about
+whether a real model proposes the right things in Hebrew. Treat §8 as
+outstanding, not as overtaken by the path having shipped.
 
 ## 13. What must not regress
 
