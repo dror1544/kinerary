@@ -8,6 +8,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -63,7 +64,7 @@ async function login(port) {
 
 // ── GET /api/config/versions & /api/config/versions/:version ──────────────────
 describe('GET /api/config/versions', () => {
-  const PORT = 3097;
+  const PORT = PORTS.configVersionsRestart;
   let dataDir, proc, token;
 
   before(async () => {
@@ -122,7 +123,7 @@ describe('GET /api/config/versions', () => {
 
 // ── Boot-time snapshot behavior across restarts ────────────────────────────────
 describe('boot-time snapshot behavior', () => {
-  const PORT = 3098;
+  const PORT = PORTS.configVersionsBoot;
   let dataDir, tripDir;
 
   async function fetchVersions() {

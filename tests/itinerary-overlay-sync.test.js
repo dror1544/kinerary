@@ -22,6 +22,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { startTestServer, stopTestServer, api } from './helpers/server.js';
 
 // Matches HERMES_API_KEY in startTestServer() — the service-account path, so
@@ -32,7 +33,7 @@ const CONFIG_DAY = '2027-03-11';
 
 const active = async () => (await api('/api/itinerary/active', { apiKey: AGENT_KEY })).json();
 
-before(async () => { await startTestServer({ PORT: '3113' }); }); // 3095-3112 already claimed by other test files
+before(async () => { await startTestServer({ PORT: String(PORTS.itineraryOverlaySync) }); });
 after(() => stopTestServer());
 
 describe('A. A Classic edit adds to the itinerary instead of replacing it', () => {

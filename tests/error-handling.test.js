@@ -12,14 +12,15 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { startTestServer, stopTestServer, api } from './helpers/server.js';
 
-before(async () => { await startTestServer({ PORT: '3105' }); }); // 3095-3104 already claimed by other test files
+before(async () => { await startTestServer({ PORT: String(PORTS.errorHandling) }); });
 after(() => stopTestServer());
 
 describe('app-wide error-handling middleware', () => {
   test('a malformed JSON body gets a fixed generic message, not the raw parser error', async () => {
-    const res = await fetch('http://localhost:3105/api/auth/login', {
+    const res = await fetch(`http://localhost:${PORTS.errorHandling}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{not valid json',

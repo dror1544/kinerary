@@ -19,13 +19,14 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import http from 'http';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
 
 let token;
 let mockHermes;
 let lastMockRequest;
-const MOCK_PORT = 3103; // 3095-3102 already claimed by other test files
+const MOCK_PORT = PORTS.bookingExtractMockHermes;
 
 before(async () => {
   mockHermes = http.createServer((req, res) => {
@@ -41,7 +42,7 @@ before(async () => {
 
   // Dedicated port — every other test file shares one hardcoded default,
   // and node:test runs files concurrently by default (see helpers/server.js).
-  await startTestServer({ HERMES_URL: `http://127.0.0.1:${MOCK_PORT}`, PORT: '3104' });
+  await startTestServer({ HERMES_URL: `http://127.0.0.1:${MOCK_PORT}`, PORT: String(PORTS.bookingExtractServer) });
   token = await loginAsAlice();
 });
 

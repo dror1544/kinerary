@@ -18,6 +18,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, cpSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -126,7 +127,7 @@ describe('B. promote-config-days lifts the carried links into the plan layer', (
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
     cfg.phases = [...(cfg.phases || []), TOKYO_PHASE];
     writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-    await startTestServer({ PORT: '3110', TRIP_DIR: tripDir });
+    await startTestServer({ PORT: String(PORTS.configDayLinksServer), TRIP_DIR: tripDir });
   });
   after(() => {
     stopTestServer();
@@ -217,7 +218,7 @@ const KYOTO_PHASE = {
 };
 
 describe('C. links reach a DB that was seeded / promoted before they existed', () => {
-  const PORT = 3111;
+  const PORT = PORTS.configDayLinksSeeded;
   let dataDir, tripDir;
 
   before(() => {

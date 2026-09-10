@@ -17,6 +17,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import http from 'http';
 import { mkdtempSync, rmSync, cpSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -30,7 +31,7 @@ const AGENT_KEY = 'test-hermes-key';
 const PHASE     = 'honolulu';
 const DAY_13    = '2026-08-13';
 const DAY_14    = '2026-08-14';
-const MOCK_PORT = 3110;
+const MOCK_PORT = PORTS.scheduleReviewMockHermes;
 
 // What the reviewer will be told to "find". Keyed by the text it replaces, so
 // the mock can answer against whatever the schedule actually looks like when
@@ -123,7 +124,7 @@ before(async () => {
   });
   await new Promise(r => mockHermes.listen(MOCK_PORT, r));
   tripDir = makeTripDir();
-  await startTestServer({ PORT: '3109', TRIP_DIR: tripDir, HERMES_URL: `http://127.0.0.1:${MOCK_PORT}` });
+  await startTestServer({ PORT: String(PORTS.scheduleReviewServer), TRIP_DIR: tripDir, HERMES_URL: `http://127.0.0.1:${MOCK_PORT}` });
 });
 
 after(() => {

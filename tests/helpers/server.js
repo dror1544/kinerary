@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { PORTS } from './ports.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, '..', 'fixtures');
 const SERVER_JS    = join(HERE, '..', '..', 'server', 'server.js');
-const DEFAULT_TEST_PORT = 3099;
+const DEFAULT_TEST_PORT = PORTS.serverDefault;
 
 let serverProcess = null;
 let dataDir = null;
@@ -17,7 +18,7 @@ let tripDir = null;
 // share one hardcoded port — harmless while few files raced for it, but
 // adding one more contender (booking-extract-proxy.test.js) turned that
 // latent risk into an actual EADDRINUSE-driven startup failure. Each file
-// can now pass its own PORT via extraEnv to get a dedicated one.
+// passes its own PORT via extraEnv, named in helpers/ports.js.
 let BASE_URL = `http://localhost:${DEFAULT_TEST_PORT}`;
 
 export async function startTestServer(extraEnv = {}) {
