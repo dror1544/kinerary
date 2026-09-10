@@ -24,10 +24,36 @@ genuinely unbuilt, and which parts are already fully live and unmodified.
 
 ## Step 1–2: Signup + approval
 
-4. 🤖 AI (stand-in for landing-spa's signup form, doesn't exist yet) — calls `POST /v1/signup` with your email/password + trip name. Creates the account and a pending approval request. This is real production signup code (`signup.ts`) — only the caller is missing.
+4. 🤖 AI (stand-in for landing-spa's signup form, doesn't exist yet) — calls `POST /v1/signup` with your email/password + trip name. This is real production signup code (`signup.ts`) — only the caller is missing.
+
+**Steps 5–7 no longer happen on this stack (2026-09-10).** `signup.auto_approve`
+is `true` in `control-plane/config/architecture.local.example.json`, so the trip
+and its owner membership are created in the same transaction as the request and
+`POST /v1/signup` returns `approved` with a `tripId` directly. There is no
+pending state to tap, no outbox row, and no DM.
+
+The steps are kept below because the operator path is still the **default** —
+`auto_approve` defaults to `false`, and any profile omitting it behaves exactly
+as written here. That is deliberate: this is the front-door admission gate, and
+with it open anything that can reach `POST /v1/signup` owns a trip. It is safe
+here only because the API binds to `127.0.0.1`.
+
+<details><summary>The operator approval path, as it still runs by default</summary>
+
 5. 🏭 PRODUCTION 🚀 — the outbox dispatcher (already running, unmodified background loop in the API process) sends a real Telegram DM to your phone (chat 391627336) via the Kinerary Bot, with Approve/Reject buttons.
 6. 🧍 HUMAN — taps Approve on your phone, for real.
-7. 🏭 PRODUCTION — **RESOLVED, was the open question in the last revision.** Telegram delivers your tap as a `callback_query`. The API process has been running a long-polling loop (`startTelegramApprovalPoller`, `telegram-poller.ts`) since it started up in step 1 — it calls Telegram's `getUpdates` every 3 seconds, exactly like Hermes and the RPi bot already do, and picks your tap up on the next poll. **No public URL, no subdomain, no manual DB read** — the fix built earlier today closes this for real, and it's about to get its first live Telegram round-trip. (The webhook route, `POST /v1/signup/callback`, stays in the codebase for later — see the poller's module doc — but isn't what fires here.)
+7. 🏭 PRODUCTION — Telegram delivers your tap as a `callback_query`. The API process runs a long-polling loop (`startTelegramApprovalPoller`, `telegram-poller.ts`) — it calls Telegram's `getUpdates` every 3 seconds, exactly like Hermes and the RPi bot already do, and picks your tap up on the next poll. **No public URL, no subdomain, no manual DB read.** (The webhook route, `POST /v1/signup/callback`, stays in the codebase for later — see the poller's module doc — but isn't what fires here.)
+
+Worth keeping straight, because it confuses everyone once: **the approver was
+never the person signing up.** A Telegram bot cannot open a conversation with
+someone who has never messaged it, so the DM goes to one fixed operator chat
+(`super_admin_chat_id`, a secret) that has. The new organizer is reached the
+other way round — by a `t.me/<bot>?start=<token>` deep link they tap, which
+starts the conversation from their side and carries the enrollment token. On
+this dev stack both roles are the same person, which is what makes it look like
+the bot cold-messaged a new user.
+
+</details>
 
 ## Step 3: Interview
 

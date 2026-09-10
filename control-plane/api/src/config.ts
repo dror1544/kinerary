@@ -64,6 +64,14 @@ export const architectureProfileSchema = z.object({
     action_secret_ref: secretReference,
     action_ttl_seconds: z.number().int().min(60).max(86400).default(3600),
     signup_rate_limit_cooldown_seconds: z.number().int().min(0).max(86400).default(3600),
+    /**
+     * Grant the trip at signup rather than waiting for the super-admin's
+     * approve tap. This is the front-door admission gate, so it defaults to
+     * FALSE and a profile that omits it keeps the operator in the loop.
+     * Intended for a local stack whose API binds to 127.0.0.1; on anything
+     * reachable it means whoever can POST /v1/signup gets a trip.
+     */
+    auto_approve: z.boolean().default(false),
     /** Seconds until an issued enrollment link expires. Default 24 hours. */
     enrollment_ttl_seconds: z.number().int().min(60).max(604800).default(86400),
     // Registered with Telegram via setWebhook's secret_token param. The

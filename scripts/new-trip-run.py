@@ -281,30 +281,33 @@ def main() -> int:
         })
         print(f"  -> {result.get('status')} ({result.get('requestId', '')})")
 
-        if result.get("status") == "approved":
-            raise Stop(
-                "this account was ALREADY approved and points at an existing trip "
-                f"({result.get('tripId')}). Re-run with a different --email for a clean trip."
-            )
+        # With signup.auto_approve on, the trip is granted in the same
+        # transaction as the request, so this is the NORMAL result and there is
+        # nothing to tap. A fresh email cannot have an older approved row (that
+        # is the whole reason the default email is unique per run), so an
+        # approval here means auto-approve, not a reused account.
+        trip_id = result.get("tripId")
+        if result.get("status") == "approved" and trip_id:
+            print(f"  auto-approved -> {trip_id} (no operator tap needed)")
 
-        print("\n== approval ==")
-        print("  🧍 Tap APPROVE on the Telegram message that just arrived.")
-        deadline = time.time() + args.wait_minutes * 60
-        trip_id = None
-        while time.time() < deadline:
-            time.sleep(5)
-            status = signup_status(args.api, email, password)
-            if status.get("status") == "approved":
-                trip_id = status.get("tripId")
-                print(f"  approved -> {trip_id}")
-                break
-            if status.get("status") == "rejected":
-                raise Stop("the signup was REJECTED.")
         if not trip_id:
-            raise Stop(
-                f"no approval within {args.wait_minutes} minutes. The request is still pending — "
-                "tap Approve, then re-run with the SAME --email and --password to pick it up."
-            )
+            print("\n== approval ==")
+            print("  🧍 Tap APPROVE on the Telegram message that just arrived.")
+            deadline = time.time() + args.wait_minutes * 60
+            while time.time() < deadline:
+                time.sleep(5)
+                status = signup_status(args.api, email, password)
+                if status.get("status") == "approved":
+                    trip_id = status.get("tripId")
+                    print(f"  approved -> {trip_id}")
+                    break
+                if status.get("status") == "rejected":
+                    raise Stop("the signup was REJECTED.")
+            if not trip_id:
+                raise Stop(
+                    f"no approval within {args.wait_minutes} minutes. The request is still pending — "
+                    "tap Approve, then re-run with the SAME --email and --password to pick it up."
+                )
 
         print("\n== interview link ==")
         enrollment = post(f"{args.api}/v1/trips/{trip_id}/enrollment", {},

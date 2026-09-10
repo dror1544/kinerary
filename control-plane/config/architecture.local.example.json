@@ -30,6 +30,7 @@
     "action_secret_ref": "file:///run/secrets/approval_signing_key",
     "action_ttl_seconds": 3600,
     "signup_rate_limit_cooldown_seconds": 3600,
+    "auto_approve": true,
     "webhook_secret_ref": "file:///run/secrets/telegram_webhook_secret"
   },
   "relay": {

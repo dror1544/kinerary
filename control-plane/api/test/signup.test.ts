@@ -116,6 +116,86 @@ after(() => {
 
 // ── Service-layer tests ─────────────────────────────────────────────────────
 
+test("autoApprove grants the trip at signup, with no operator and no outbox row", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const identity = makeIdentity("200000900");
+    const result = await startSignup(
+      pool, identity, "Japan 2026", { ...testConfig, autoApprove: true }, notification,
+    );
+
+    // Approved outright — the caller never sees 'awaiting_approval'.
+    assert.equal(result.status, "approved");
+    assert.ok(result.tripId);
+
+    // Nobody was asked. An outbox row exists to be delivered and retried, and
+    // a decision already made is not a message.
+    assert.equal(notification.calls.length, 0);
+    const outbox = await pool.query("SELECT count(*)::int AS c FROM control_plane.notification_outbox");
+    assert.equal(outbox.rows[0].c, 0);
+
+    // Indistinguishable from a tapped approval, which is the property that
+    // matters: everything downstream reads these rows and nothing else.
+    const req = await pool.query(
+      "SELECT state, trip_id FROM control_plane.signup_approval_requests WHERE user_id IS NOT NULL",
+    );
+    assert.equal(req.rows[0].state, "approved");
+    assert.equal(req.rows[0].trip_id, result.tripId);
+
+    const trip = await pool.query(
+      "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [result.tripId],
+    );
+    assert.equal(trip.rows[0].lifecycle_state, "draft");
+
+    const owner = await pool.query(
+      "SELECT role, status FROM control_plane.trip_memberships WHERE trip_id = $1", [result.tripId],
+    );
+    assert.equal(owner.rows[0].role, "owner");
+    assert.equal(owner.rows[0].status, "active");
+
+    // And the status endpoint agrees, so enrollment's owner check will too.
+    const status = await getSignupStatus(pool, identity.provider, identity.providerSubjectDigest);
+    assert.equal(status.status, "approved");
+    assert.equal(status.tripId, result.tripId);
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
+test("without autoApprove the operator is still asked", { skip }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await resetDb(client);
+    await applyMigrations(client, migrationsDir);
+    client.release();
+
+    const notification = new CapturingNotification();
+    const result = await startSignup(
+      pool, makeIdentity("200000901"), "Japan 2026", testConfig, notification,
+    );
+
+    assert.equal(result.status, "awaiting_approval");
+    assert.equal(notification.calls.length, 1);
+    const trips = await pool.query("SELECT count(*)::int AS c FROM control_plane.trips");
+    assert.equal(trips.rows[0].c, 0, "no trip exists until someone approves");
+  } finally {
+    const c2 = await pool.connect();
+    await resetDb(c2);
+    c2.release();
+    await pool.end();
+  }
+});
+
 test("verified signup creates one pending request and one outbox notification", { skip }, async () => {
   const pool = new pg.Pool({ connectionString: databaseUrl });
   const client = await pool.connect();

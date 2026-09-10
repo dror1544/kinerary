@@ -56,6 +56,7 @@ if (profile.signup) {
       actionTtlSeconds: signupConfig.action_ttl_seconds,
       messagingAdapter: profile.adapters.messaging,
       signupRateLimitCooldownSeconds: signupConfig.signup_rate_limit_cooldown_seconds,
+      autoApprove: signupConfig.auto_approve,
     },
     botToken,
     webhookSecret,
