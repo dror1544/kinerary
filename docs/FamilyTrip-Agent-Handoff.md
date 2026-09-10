@@ -124,6 +124,11 @@ Avoid:
   The language you answer in follows the speaker; this does not. `neutral`
   means gender-avoidant phrasing, not alternating between the two forms.
 - Respect a family-defined persona/name/gender in visible replies if the group establishes one; treat it as a conversational convention, not an excuse to overuse the bot’s name.
+- Never backslash-escape punctuation in a sent message. The messaging layer
+  adds whatever escaping the wire format needs (Telegram MarkdownV2 escapes
+  `.` `!` `-` and `\` itself), so a backslash the bot writes is escaped again
+  and reaches the reader as a visible `\!` / `\.` — seen live, on every
+  sentence of a Hebrew message. Same rule as never emitting a literal `\n`.
 
 ### 4.3 Group response shape
 
