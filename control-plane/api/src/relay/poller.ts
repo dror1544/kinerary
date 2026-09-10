@@ -956,6 +956,16 @@ async function runDocumentPath(
 
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
+    // PROPOSED vs ACCEPTED, and MALFORMED alongside both — the interpret log
+    // has carried all three from the start and this one carried neither.
+    // 2026-09-10: a real booking PDF read cleanly (4 pages, 4708 chars) and
+    // committed `accepted: 0, rejected: 0`. Those two numbers cannot tell you
+    // whether the model proposed nothing, or proposed things that never
+    // survived parsing — and the same document through
+    // `tools/extract-intake-check.ts` proposed four and had all four accepted.
+    // A whole session went into distinguishing two cases one field separates.
+    proposed: result.payload.proposals.length,
+    malformed: result.payload.malformed ?? 0,
     accepted: decisions.accepted.length,
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
