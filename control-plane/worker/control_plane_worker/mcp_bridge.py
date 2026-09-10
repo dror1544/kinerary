@@ -75,7 +75,14 @@ class ShellMcpBridgeAdapter:
         self,
         deploy_root: str,
         vmid_map: Mapping[str, str],
-        timeout: int = 180,
+        # setup-mcp.sh does not just write config: it starts the bridge,
+        # registers it, patches the transport and then RUNS `hermes mcp test`,
+        # which enumerates every tool over a live connection. Timed end to end
+        # on 2026-09-10 that is ~6 minutes. At 180s it was killed every single
+        # run — `setup-mcp.sh exited -15`, SIGTERM, reported as a bridge
+        # failure when nothing had failed except the clock. Four provisions in
+        # a row lost their MCP wiring to it.
+        timeout: int = 900,
     ) -> None:
         self._deploy_root = deploy_root
         self._vmid_map = vmid_map
