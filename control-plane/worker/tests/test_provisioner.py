@@ -1854,8 +1854,14 @@ class OrphanBindingAdoptionTests(unittest.TestCase):
     def test_a_closed_binding_is_not_revived(self) -> None:
         self._bind("-100888", self.trip_id, None)
         with self.conn.cursor() as cur:
+            # closed_reason travels with closed_at — "closed" is a single fact,
+            # and telegram_chat_bindings_closed_reason_ck enforces it (see
+            # test_closed_at_and_closed_reason_cannot_disagree, which asserts
+            # that a bare closed_at is rejected). Closing the row illegally here
+            # raised CheckViolation before this test could assert anything.
             cur.execute(
-                "UPDATE control_plane.telegram_chat_bindings SET closed_at = now() WHERE chat_id = %s",
+                "UPDATE control_plane.telegram_chat_bindings "
+                "SET closed_at = now(), closed_reason = 'profile_rebound' WHERE chat_id = %s",
                 ("-100888",),
             )
         self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 0)
