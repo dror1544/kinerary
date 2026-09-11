@@ -453,6 +453,30 @@ export function uiString(key: string, language: Language = DEFAULT_LANGUAGE): st
   return UI_STRINGS[language]?.[key] ?? UI_STRINGS[DEFAULT_LANGUAGE][key] ?? key;
 }
 
+const MONTHS: Record<Language, readonly string[]> = {
+  en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+  he: ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"],
+};
+
+/**
+ * A stored YYYY-MM-DD as the organizer would say it: "19 בספטמבר 2026",
+ * "September 19, 2026". Null for anything that is not exactly a real calendar
+ * day, so the caller shows the text as written rather than a date it invented.
+ *
+ * Why not `Intl.DateTimeFormat`: the relay runs on whatever Node the host has,
+ * and a build without full ICU renders Hebrew months as English, silently. A
+ * twelve-word table cannot drift with the runtime.
+ */
+export function readableDate(iso: string, language: Language = DEFAULT_LANGUAGE): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso.trim());
+  if (!m) return null;
+  const [year, month, day] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  if (probe.getUTCFullYear() !== year || probe.getUTCMonth() !== month - 1 || probe.getUTCDate() !== day) return null;
+  const name = (MONTHS[language] ?? MONTHS[DEFAULT_LANGUAGE])[month - 1];
+  return language === "he" ? `${day} ב${name} ${year}` : `${name} ${day}, ${year}`;
+}
+
 function pick(localised: Localised | undefined, language: Language): string | null {
   if (!localised) return null;
   return localised[language] ?? localised[DEFAULT_LANGUAGE] ?? null;

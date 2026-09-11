@@ -32,6 +32,7 @@ import {
   getSessionStatus,
   ianaZoneFor,
 } from "../src/interview.js";
+import { readableDate } from "../src/intake-copy.js";
 import { applyMigrations } from "../src/migrations.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
@@ -432,6 +433,53 @@ describe("buildRecap: structured answers (unit)", () => {
       constraints: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: {} },
     } as never);
     assert.equal(recap.find((e) => e.questionId === "constraints")!.answerLabel, "(none)");
+  });
+});
+
+// A date is stored as YYYY-MM-DD because the transformer needs it that way,
+// and it was shown that way too — in the acknowledgement after a typed date, in
+// the summary of what a document said, and on the confirmation recap. The
+// standing decision (trip-creation-interview/references/QUESTIONS.md) is that
+// an organizer never sees a format: dates are read back in plain language, in
+// the organizer's own language, because that is what catches "06/09".
+describe("buildRecap: a date reads as a date (unit)", () => {
+  const dates = {
+    departure_date: { kind: "text" as const, schema_version: INTAKE_SCHEMA_VERSION, text: "2026-09-19" },
+    return_date: { kind: "text" as const, schema_version: INTAKE_SCHEMA_VERSION, text: "2026-10-03" },
+  };
+  const label = (answers: Parameters<typeof buildRecap>[0], id: string, language: "he" | "en") =>
+    buildRecap(answers, INTAKE_QUESTIONS, language).find((e) => e.questionId === id)!.answerLabel;
+
+  test("in Hebrew", () => {
+    assert.equal(label(dates, "departure_date", "he"), "19 בספטמבר 2026");
+    assert.equal(label(dates, "return_date", "he"), "3 באוקטובר 2026");
+  });
+
+  test("in English", () => {
+    assert.equal(label(dates, "departure_date", "en"), "September 19, 2026");
+    assert.equal(label(dates, "return_date", "en"), "October 3, 2026");
+  });
+
+  test("never as YYYY-MM-DD, in any language the interview speaks", () => {
+    for (const language of ["he", "en"] as const) {
+      for (const entry of buildRecap(dates, INTAKE_QUESTIONS, language)) {
+        assert.doesNotMatch(entry.answerLabel, /\d{4}-\d{2}-\d{2}/, `${language}: ${entry.answerLabel}`);
+      }
+    }
+  });
+
+  test("what is not exactly a real calendar date is shown as the organizer wrote it", () => {
+    const vague = { departure_date: { kind: "text" as const, schema_version: INTAKE_SCHEMA_VERSION, text: "early September" } };
+    assert.equal(label(vague, "departure_date", "he"), "early September");
+    const impossible = { departure_date: { kind: "text" as const, schema_version: INTAKE_SCHEMA_VERSION, text: "2026-02-30" } };
+    assert.equal(label(impossible, "departure_date", "en"), "2026-02-30",
+      "an impossible date is not silently rolled into March");
+  });
+
+  test("readableDate is the one place the wording lives", () => {
+    assert.equal(readableDate("2026-01-01", "he"), "1 בינואר 2026");
+    assert.equal(readableDate("2026-12-31", "en"), "December 31, 2026");
+    assert.equal(readableDate("19/09/2026", "en"), null);
   });
 });
 

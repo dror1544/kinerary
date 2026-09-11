@@ -6,6 +6,7 @@ import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
   optionLabel,
+  readableDate,
   recapLabel,
   uiString,
   type Language,
@@ -1020,7 +1021,9 @@ export function buildRecap(
       } else if (ans.kind === "structured") {
         answerLabel = describeStructured(ans.data);
       } else {
-        answerLabel = ans.text || uiString("skipped", language);
+        // A date is stored as YYYY-MM-DD for the transformer and read back in
+        // words: an organizer never sees a format (QUESTIONS.md, dates).
+        answerLabel = (ans.text && readableDate(ans.text, language)) || ans.text || uiString("skipped", language);
       }
       // `prompt` is the AGENT's field spec — it carries examples and schema
       // instructions no organizer should read, and reading them back on the
