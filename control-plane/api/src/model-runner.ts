@@ -171,10 +171,22 @@ type RunOnce = { ok: true; stdout: string } | { ok: false; reason: RunnerFailure
  * variables stripped so a nested CLI cannot mistake this for a conversation it
  * is part of. PATH and HOME stay — the binary has to be findable and has to
  * reach its own credentials.
+ *
+ * CLAUDE_CODE_OAUTH_TOKEN is the one CLAUDE_CODE_ variable that is a
+ * credential, not session state, and it stays. On a Mac the CLI finds its login
+ * in the keychain, so stripping it cost nothing; on the Proxmox VM the relay
+ * runs in a container with no keychain, the token from `claude setup-token` is
+ * the CLI's only credential, and stripping it made every interpret call exit
+ * non-zero — FAILED — until the interview stalled on its first typed answer
+ * (2026-09-11).
  */
-function hermeticEnv(): NodeJS.ProcessEnv {
+export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
+  for (const [k, v] of Object.entries(source)) {
+    if (k === "CLAUDE_CODE_OAUTH_TOKEN") {
+      env[k] = v;
+      continue;
+    }
     if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PID" || k === "CLAUDE_EFFORT") continue;
     env[k] = v;
   }
