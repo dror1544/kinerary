@@ -544,9 +544,10 @@ def main() -> int:
     if not MAC_STACK and args.auto and not os.environ.get("KINERARY_RELAY_RESTART"):
         ap.error(f"--auto on {PROJECT} needs KINERARY_RELAY_RESTART: the default, scripts/relay-restart.sh, "
                  "restarts the Mac's live relay")
-    if not MAC_STACK and args.teardown:
-        ap.error(f"--teardown on {PROJECT}: scripts/teardown-trip.py tears down through the Mac "
-                 "(launchctl, ~/kinerary-deploy) and has no path for this stack yet")
+    if not MAC_STACK and args.teardown and not os.environ.get("KINERARY_TEARDOWN"):
+        ap.error(f"--teardown on {PROJECT} needs KINERARY_TEARDOWN: scripts/teardown-trip.py's defaults "
+                 "are the Mac's (~/kinerary-deploy, ~/.hermes); on the VM use "
+                 "control-plane/deployment/vm-teardown-trip.sh")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
@@ -632,7 +633,10 @@ def stage_teardown(ctx: dict) -> int:
     if not ctx.get("trip_id"):
         note("no trip was created — nothing to tear down")
         return 0
-    result = subprocess.run([str(REPO / "scripts/teardown-trip.py"), "--trip", ctx["trip_id"], "--execute"])
+    # KINERARY_TEARDOWN names a twin with the same arguments for a non-Mac stack
+    # (the VM: control-plane/deployment/vm-teardown-trip.sh).
+    script = os.environ.get("KINERARY_TEARDOWN") or str(REPO / "scripts/teardown-trip.py")
+    result = subprocess.run([script, "--trip", ctx["trip_id"], "--execute"])
     if result.returncode == 0:
         ok(f"{ctx['trip_id']} torn down")
     else:

@@ -51,11 +51,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 HOME = Path.home()
-DEPLOY_ROOT = HOME / "kinerary-deploy"
-PROFILES = HOME / ".hermes/profiles"
+# Where this stack keeps its state: the Mac's home directory by default. On the
+# Proxmox VM the deploy root and the Hermes volume live under /opt and this runs
+# as root — control-plane/deployment/vm-teardown-trip.sh sets these.
+DEPLOY_ROOT = Path(os.environ.get("KINERARY_DEPLOY_ROOT") or HOME / "kinerary-deploy")
+PROFILES = Path(os.environ.get("KINERARY_HERMES_HOME") or HOME / ".hermes") / "profiles"
 INTERVIEWER_CONFIG = PROFILES / "trip-intake/config.yaml"
 LAUNCH_AGENTS = HOME / "Library/LaunchAgents"
-PG = "kinerary-control-plane-local-postgres-1"
+PG = f"{os.environ.get('KINERARY_COMPOSE_PROJECT', 'kinerary-control-plane-local')}-postgres-1"
+# macOS runs each companion gateway as a launchd agent. The VM runs Hermes in a
+# container whose gateways are s6 slots (compose.vm.yml, container `hermes`).
+MACOS = sys.platform == "darwin"
+HERMES_CONTAINER = os.environ.get("KINERARY_HERMES_CONTAINER", "hermes")
 
 TRIP_ID = re.compile(r"^trip_[A-Za-z0-9]{8,64}$")
 SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -120,12 +127,17 @@ def original_slug(slug: str) -> str:
 
 
 def load_provisioning_env() -> None:
-    """The same `set -a; . provisioning.env` the worker's compose up relies on."""
-    env_file = DEPLOY_ROOT / "provisioning.env"
-    for line in env_file.read_text().splitlines():
-        m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
-        if m:
-            os.environ.setdefault(m.group(1), m.group(2).strip().strip('"').strip("'"))
+    """The env the worker's compose up is given: provisioning.env, and on the VM
+    vm.env over it. Compose's later --env-file wins; here setdefault keeps the
+    first value seen, so the override is read first."""
+    for name in ("vm.env", "provisioning.env"):
+        env_file = DEPLOY_ROOT / name
+        if not env_file.is_file():
+            continue
+        for line in env_file.read_text().splitlines():
+            m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
+            if m:
+                os.environ.setdefault(m.group(1), m.group(2).strip().strip('"').strip("'"))
 
 
 # ── what is there ────────────────────────────────────────────────────────────
@@ -175,8 +187,47 @@ def interviewer_allows(profile: str) -> bool:
 
 
 def gateway_loaded(profile: str) -> bool:
-    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
-    return f"ai.hermes.gateway-{profile}" in out
+    if MACOS:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+        return f"ai.hermes.gateway-{profile}" in out
+    # The gateway process itself, in the Hermes container. Anchored so
+    # japan2026 never matches japan20262.
+    return bool(re.search(rf"-p {re.escape(profile)} gateway run\b", _container_ps()))
+
+
+def s6_slot(profile: str) -> bool:
+    """The profile's s6 supervisor. It legitimately outlives a stopped gateway
+    and goes only once the profile is deleted AND s6 rescans — so it is the last
+    thing checked, not what the gateway step waits on."""
+    return not MACOS and bool(re.search(rf"gateway-{re.escape(profile)}(?![A-Za-z0-9-])", _container_ps()))
+
+
+def _container_ps() -> str:
+    return subprocess.run(["docker", "exec", HERMES_CONTAINER, "ps", "-eo", "args"],
+                          capture_output=True, text=True).stdout
+
+
+def gateway_installed(profile: str) -> bool:
+    return gateway_loaded(profile) or s6_slot(profile) or (
+        MACOS and (LAUNCH_AGENTS / f"ai.hermes.gateway-{profile}.plist").exists())
+
+
+def s6_rescan() -> None:
+    """Stop the supervisors of slots whose service directory is gone. Hermes's
+    own delete does not, so they would otherwise linger (and pile up across
+    test runs) until the container restarts."""
+    if not MACOS:
+        subprocess.run(["docker", "exec", HERMES_CONTAINER, "/command/s6-svscanctl", "-an", "/run/service"],
+                       capture_output=True)
+
+
+def listeners(port: str) -> list[str]:
+    """Pids listening on a TCP port. lsof on the Mac; the Debian VM ships ss."""
+    if shutil.which("lsof"):
+        return subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                              capture_output=True, text=True).stdout.split()
+    out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True).stdout
+    return re.findall(r"pid=(\d+)", out)
 
 
 def bridge(trip_dir: Path) -> tuple[str, str] | None:
@@ -349,8 +400,7 @@ def main() -> int:
     b = bridge(trip_dir)
     plan = [
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
-        ("gateway", gateway_loaded(profile) or (LAUNCH_AGENTS / f"ai.hermes.gateway-{profile}.plist").exists(),
-         f"uninstall ai.hermes.gateway-{profile}"),
+        ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
         ("bridge", b is not None, f"stop trip-mcp pid {b[0]} on :{b[1]}" if b else "no bridge"),
         ("infra", topo is not None, f"Cloudflare + NPM + LXC for {orig}" if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or not trip["slug"].startswith("retired-"),
@@ -385,22 +435,27 @@ def main() -> int:
         narrow_allowlist(profile)
         say(f"{GREEN}✓{RESET}", "allowlist  narrowed, interviewer restarted")
 
-    if gateway_loaded(profile) or (LAUNCH_AGENTS / f"ai.hermes.gateway-{profile}.plist").exists():
-        subprocess.run([hermes(), "-p", profile, "gateway", "uninstall"], capture_output=True, text=True)
+    if gateway_installed(profile):
+        subprocess.run([hermes(), "-p", profile, "gateway", "uninstall"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
         for _ in range(20):
             if not gateway_loaded(profile):
                 break
             time.sleep(1)
-        if gateway_loaded(profile):  # the uninstall's own bootout can lag
+        if gateway_loaded(profile) and MACOS:  # the uninstall's own bootout can lag
             subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.gateway-{profile}"],
                            capture_output=True)
+            time.sleep(3)
+        elif gateway_loaded(profile):  # s6: stop the slot, then let svscan drop it
+            subprocess.run([hermes(), "-p", profile, "gateway", "stop"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+            s6_rescan()
             time.sleep(3)
         say(f"{GREEN}✓{RESET}" if not gateway_loaded(profile) else f"{RED}✗{RESET}", "gateway    uninstalled")
 
     if b:
         pid, port = b
-        listener = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-                                  capture_output=True, text=True).stdout.split()
+        listener = listeners(port)
         cmd = subprocess.run(["ps", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout
         if pid in listener and "mcp.js" in cmd:
             subprocess.run(["kill", pid])
@@ -429,7 +484,9 @@ def main() -> int:
 
     home = PROFILES / profile
     if home.is_dir():
-        subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True)
+        subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL)
+        s6_rescan()
         if args.settle_seconds > 0:
             print(f"    {DIM}watching {args.settle_seconds}s for the profile coming back…{RESET}")
             time.sleep(args.settle_seconds)
@@ -438,6 +495,14 @@ def main() -> int:
             say(f"{RED}✗{RESET}", f"profile    {home} CAME BACK — something still ticks it; nothing removed it again")
         else:
             say(f"{GREEN}✓{RESET}", "profile    deleted, and stayed gone")
+        if not MACOS:
+            s6_rescan()
+            time.sleep(2)
+            if s6_slot(profile) or gateway_loaded(profile):
+                failed = True
+                say(f"{RED}✗{RESET}", f"s6         a {profile} supervisor is still running after a rescan")
+            else:
+                say(f"{GREEN}✓{RESET}", "s6         no supervisor left for it")
 
     print(f"\n{RED}✗ something remains{RESET}" if failed else f"\n{GREEN}✓ {orig} torn down{RESET}")
     return 1 if failed else 0

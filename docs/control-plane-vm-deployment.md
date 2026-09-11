@@ -204,8 +204,8 @@ Green on 2026-09-11: `--scenario manual` (every answer typed, 13 turns) and
 and no job created, Proxmox untouched. `multi` not yet run. `--stop-after confirm`
 ends the run at the confirmed intake; on this VM the build could not start
 anyway, because unsealed releases are off and `provisionOnConfirm` answers
-`NO_COMPATIBLE_RELEASE`. `--teardown` is refused here — `teardown-trip.py`
-tears down through the Mac. The automated organizer needs the api package's
+`NO_COMPATIBLE_RELEASE`. `--teardown` needs `KINERARY_TEARDOWN` pointing at
+`control-plane/deployment/vm-teardown-trip.sh`. The automated organizer needs the api package's
 dev dependencies (`npm ci` in `control-plane/api`) for `tsx`.
 
 ## Hermes
@@ -244,9 +244,45 @@ Mac — only the host changed. On the VM:
 on non-Darwin hosts (stop, then start — the s6 twin of launchd's
 bootout-then-bootstrap). `setup-mcp.sh` needed no change.
 
-Known gaps on Linux: after `hermes profile delete`, s6 supervisors linger
-until `/command/s6-svscanctl -an /run/service`; and `teardown-trip.py`'s
-gateway step reads `launchctl` only.
+### Tearing a trip down from the VM
+
+```bash
+control-plane/deployment/vm-teardown-trip.sh --trip <slug|trip_id>            # the plan
+control-plane/deployment/vm-teardown-trip.sh --trip <slug|trip_id> --execute  # do it
+```
+
+The same `scripts/teardown-trip.py`, run as root with the VM's locations
+(`KINERARY_DEPLOY_ROOT`, `KINERARY_HERMES_HOME`, `KINERARY_COMPOSE_PROJECT`,
+`KINERARY_HERMES_CONTAINER`). On Linux it finds a companion's gateway as an s6
+slot in the Hermes container rather than a launchd agent, confirms the bridge's
+listener with `ss` where there is no `lsof`, reads `vm.env` over
+`provisioning.env` the way compose does, and after deleting the profile runs
+`/command/s6-svscanctl -an /run/service` — Hermes's own delete leaves the
+supervisor behind — then fails the run if one survives. The e2e runner uses it
+with `KINERARY_TEARDOWN=…/vm-teardown-trip.sh`.
+
+Proven 2026-09-11 on a throwaway trip with a companion installed through the
+forced command: backup, gateway uninstalled, bindings closed and slug retired,
+profile deleted and stayed gone through the 70 s cron watch, no supervisor left.
+The Cloudflare/NPM/LXC and bridge steps run the same provisioner code as on the
+Mac; they are proven by the first VM provisioning run (A6).
+
+## Later: model and effort per task (parked by Dror, 2026-09-11)
+
+Today both interview tasks — **interpret** (reading a typed answer) and
+**extract** (reading an uploaded document) — run `claude-sonnet-5` through the
+Claude Code CLI at effort `xhigh`: explicit on this VM, inherited from a
+personal setting on the Mac. `model-runner.ts` can already route each task to
+`codex` (`gpt-5.6-luna`), `openrouter` (default `minimax/minimax-m3`) or a
+`hermes` profile.
+
+Choosing deliberately is future optimisation, and it needs testing, not
+opinion. This VM is the bench for it: the automated organizer runs here without
+touching the Mac, and `interview_interpretations` already records every call's
+outcome and duration. Measure per task, per candidate model and effort:
+question-mapping accuracy (the two misreads above are the regression cases),
+latency, and cost. Make effort an explicit per-task setting at the same time,
+so the Mac stops depending on a coding-session preference.
 
 ## Cutover (Phase B)
 
