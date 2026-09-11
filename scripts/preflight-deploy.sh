@@ -41,8 +41,13 @@
 # script whatever the flags, and a human typing it is the approval.
 set -uo pipefail
 
-REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-cd "$REPO_ROOT" || exit 1
+# NOT `REPO_ROOT`: --deploy sources provisioning.env, which sets REPO_ROOT=/repo
+# (the worker's path inside its container) and silently replaced this one — the
+# first real --deploy asked Docker to mount a host path `/repo` and left the
+# worker Created, not running. tests/scripts/test_preflight_script.py keeps
+# every name compose reads from the environment out of this script.
+CHECKOUT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+cd "$CHECKOUT" || exit 1
 
 DEPLOY=0; CLEANUP=0; SCENARIO=japan
 while [ $# -gt 0 ]; do
@@ -225,20 +230,21 @@ busy="$(live_sql "SELECT count(*) FROM control_plane.jobs WHERE state IN ('lease
 
 run "api build"                control-plane/api            npm run build
 [ "$FAILED" = 0 ] || exit 1
+[ -d "$CHECKOUT/control-plane/worker" ] || die "$CHECKOUT is not a checkout — refusing to hand it to compose"
 if ( set -a; . "$HOME/kinerary-deploy/provisioning.env"; set +a
-     WORKER_REPO_ROOT_HOST="$REPO_ROOT" BUILDX_CONFIG="$HOME/.docker/buildx-local" \
+     WORKER_REPO_ROOT_HOST="$CHECKOUT" BUILDX_CONFIG="$HOME/.docker/buildx-local" \
        docker compose -f control-plane/deployment/compose.local.yml up -d --build --wait ) >"$LOGS/compose.log" 2>&1; then
-  pass "compose stack up (worker mounts $REPO_ROOT)"
+  pass "compose stack up (worker mounts $CHECKOUT)"
 else die "compose up failed (log: $LOGS/compose.log)"; fi
 
 # The directory decides the branch (CLAUDE.md). Read it off the containers.
 mount_of() { docker inspect "$1" --format "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Source}}{{end}}{{end}}"; }
-[ "$(mount_of kinerary-control-plane-local-api-1 /app/dist)" = "$REPO_ROOT/control-plane/api/dist" ] \
+[ "$(mount_of kinerary-control-plane-local-api-1 /app/dist)" = "$CHECKOUT/control-plane/api/dist" ] \
   && pass "API serves this checkout's dist" || die "the API container mounts another checkout's dist"
-[ "$(mount_of kinerary-control-plane-local-worker-1 /repo)" = "$REPO_ROOT" ] \
+[ "$(mount_of kinerary-control-plane-local-worker-1 /repo)" = "$CHECKOUT" ] \
   && pass "worker reads this checkout" || die "the worker container mounts another checkout"
 
-if ( set -a; . "$HOME/kinerary-deploy/provisioning.env"; set +a; export WORKER_REPO_ROOT_HOST="$REPO_ROOT"
+if ( set -a; . "$HOME/kinerary-deploy/provisioning.env"; set +a; export WORKER_REPO_ROOT_HOST="$CHECKOUT"
      .agents/skills/interview-stack-deploy/deploy.sh ) >"$LOGS/interview-stack.log" 2>&1; then
   pass "API, interview sidecar, interviewer gateway and relay restarted and verified"
 else fail "interview-stack-deploy failed (log: $LOGS/interview-stack.log)"; tail -15 "$LOGS/interview-stack.log" | sed 's/^/       /'; exit 1; fi
@@ -247,7 +253,7 @@ else fail "interview-stack-deploy failed (log: $LOGS/interview-stack.log)"; tail
 # names — not by the containers. Say so when it is not this one; changing a
 # trust boundary is not a preflight's decision.
 forced="$(grep -o 'command="[^"]*companion-install-host.sh"' "$HOME/.ssh/authorized_keys" 2>/dev/null | sed 's/command="//; s/"$//')"
-if [ "$forced" = "$REPO_ROOT/scripts/companion-install-host.sh" ]; then pass "companions render from this checkout"
+if [ "$forced" = "$CHECKOUT/scripts/companion-install-host.sh" ]; then pass "companions render from this checkout"
 else note "companions render from ${forced:-<no forced command>}, not this checkout"; fi
 
 step "Post-deploy checks — the running stack, then the model-backed harnesses"
