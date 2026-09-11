@@ -1260,6 +1260,56 @@ class DeriveBookingsTests(unittest.TestCase):
         self.assertEqual("Tokyo Skytree E-ticket — 20 Sep 2026 10:00", anchor["notes"])
         self.assertIsNone(anchor["confirmation"])
 
+    def test_a_structured_anchor_keeps_its_name_its_date_and_its_phase(self) -> None:
+        # The automated full cycle, 2026-09-11: four ticketed Italy attractions
+        # in the {type, name, date, confirmation} shape all became "Activity",
+        # undated, parked on the FIRST phase — the Uffizi and the Doge's Palace
+        # included, which are not in Rome.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "activity", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
+                {"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "TK-2"},
+            ]),
+        }
+        rows = {b["name"]: b for b in self._bookings(intake) if b["type"] == "attraction"}
+        self.assertEqual(sorted(rows), ["Kinkaku-ji", "Tokyo Skytree"])
+        self.assertEqual((rows["Tokyo Skytree"]["date_from"], rows["Tokyo Skytree"]["phase"]), ("2026-09-20", "tokyo"))
+        self.assertEqual((rows["Kinkaku-ji"]["date_from"], rows["Kinkaku-ji"]["phase"]), ("2026-09-25", "kyoto"))
+        self.assertEqual(rows["Kinkaku-ji"]["confirmation"], "TK-2")
+        # Two rows, two keys: hashing the bare type gave both "activity" the
+        # same seed_key and the site's INSERT OR IGNORE kept only one.
+        self.assertEqual(len({r["seed_key"] for r in rows.values()}), 2)
+
+    def test_a_hotel_anchor_for_the_phases_own_hotel_is_one_row_not_two(self) -> None:
+        # Same run: the organizer's documents gave each hotel twice — as the
+        # phase's accommodation and as a dated anchor carrying the booking
+        # number. The Bookings tab listed every hotel twice, one of them
+        # without its confirmation.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "hotel", "name": "OMO3 Asakusa, Tokyo", "date": "2026-09-19", "confirmation": "HTL-1"},
+                {"type": "hotel", "name": "Cross Hotel Kyoto", "date": "2026-09-24", "confirmation": "OTHER"},
+            ]),
+        }
+        hotels = [b for b in self._bookings(intake) if b["type"] == "hotel"]
+        self.assertEqual([(h["phase"], h["name"], h["confirmation"]) for h in hotels],
+                         [("tokyo", "OMO3 Asakusa", "HTL-1"),
+                          # A confirmation the phase already had is not overwritten.
+                          ("kyoto", "Cross Hotel Kyoto", "CH-88")])
+
+    def test_a_second_hotel_in_the_same_phase_keeps_its_own_row(self) -> None:
+        # A split stay is two bookings; folding only works on the same hotel.
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": "hotel", "name": "Park Hyatt Tokyo", "date": "2026-09-21", "confirmation": "PH-7"},
+            ]),
+        }
+        hotels = [(b["phase"], b["name"]) for b in self._bookings(intake) if b["type"] == "hotel"]
+        self.assertEqual(hotels, [("tokyo", "OMO3 Asakusa"), ("kyoto", "Cross Hotel Kyoto"), ("tokyo", "Park Hyatt Tokyo")])
+
     def test_iso_dates_in_anchor_text_are_recognised(self) -> None:
         intake = {
             **self.PHASED_INTAKE,
@@ -1589,6 +1639,35 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         # It is still real and still shows on the Bookings tab; it just has no
         # day to sit on, and guessing one would be worse than omitting it.
         self.assertEqual(self._days([{"type": "activity", "detail": "Museum tickets, sometime"}]), {})
+
+    # 2026-09-11, the automated full cycle: the interpret path files a ticketed
+    # attraction in the travel_anchors question's OWN example shape —
+    # {type, name, date, confirmation} — with no free-text `detail`. This read
+    # only `detail`, so four ticketed Italy attractions reached no day and no
+    # phase: the site showed none of them.
+    def test_a_structured_anchor_lands_on_its_day(self) -> None:
+        out = self._days([
+            {"type": "activity", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
+            {"type": "activity", "name": "Fushimi Inari night walk", "date": "2026-09-25", "time": "19:30"},
+        ])
+        self.assertEqual([(d["date"], [(i["time"], i["text"]["en"]) for i in d["items"]]) for d in out["tokyo"]],
+                         [("2026-09-20", [(None, "Tokyo Skytree")])])
+        self.assertEqual(out["kyoto"][0]["items"][0], {"time": "19:30", "text": {"he": "Fushimi Inari night walk",
+                                                                               "en": "Fushimi Inari night walk"}})
+
+    def test_the_questions_own_example_shape_is_understood(self) -> None:
+        # interview.ts travel_anchors dataExample, verbatim in shape.
+        out = self._days([{"type": "flight", "name": "LY075 TLV-HND", "date": "2026-09-19", "confirmation": "ABC123"}])
+        self.assertEqual(out["tokyo"][0]["date"], "2026-09-19")
+        self.assertEqual(out["tokyo"][0]["items"][0]["text"]["en"], "LY075 TLV-HND")
+
+    def test_structured_hotels_stay_out_of_the_day_plan(self) -> None:
+        self.assertEqual(self._days([{"type": "hotel", "name": "OMO3 Asakusa", "date": "2026-09-19"}]), {})
+
+    def test_a_structured_anchor_needs_a_real_date(self) -> None:
+        for bad in ("next week", "2026-02-30", ""):
+            with self.subTest(date=bad):
+                self.assertEqual(self._days([{"type": "activity", "name": "Museum", "date": bad}]), {})
 
     def test_an_anchor_outside_every_phase_is_not_forced_into_one(self) -> None:
         # derive_bookings parks such a row on phase 1 because bookings.phase is

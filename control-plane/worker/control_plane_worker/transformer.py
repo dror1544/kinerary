@@ -1537,6 +1537,44 @@ def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
 
 
 _ANCHOR_TIME_RE = re.compile(r"\bat\s+([0-2]?\d:[0-5]\d)\b", re.IGNORECASE)
+_CLOCK_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """One reading of a `travel_anchors` entry, whichever shape it arrived in.
+
+    Two shapes reach here. The agent path writes free text —
+    ``{type, detail: "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"}`` — and
+    the interpret path writes the question's own example shape (interview.ts
+    `travel_anchors.dataExample`) — ``{type, name, date: "2026-09-20",
+    confirmation}``, optionally ``time``. Reading only ``detail`` turned every
+    anchor of the second shape into an undated "Activity" on the first phase,
+    which is how four ticketed Italy attractions reached no day on 2026-09-11.
+
+    Structured fields win where present; the free text fills what they leave
+    out. Both callers read through here so they cannot disagree about what an
+    anchor says.
+    """
+    anchor_type = str(raw.get("type") or "").strip().lower()
+    detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
+    name = str(raw.get("name") or raw.get("title") or "").strip()
+    stated_date = str(raw.get("date") or raw.get("date_from") or raw.get("start") or "").strip()
+    when = (
+        _parse_iso_date(stated_date)
+        or _extract_anchor_date(stated_date)
+        or _extract_anchor_date(detail)
+        or _extract_anchor_date(name)
+    )
+    stated_time = str(raw.get("time") or "").strip()
+    time_match = _ANCHOR_TIME_RE.search(f"{name} {detail}")
+    clock = stated_time if _CLOCK_RE.match(stated_time) else (time_match.group(1) if time_match else None)
+    # The date and time are represented structurally, so strip them from the
+    # label rather than printing "at 10:00" beside a 10:00 slot.
+    label = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", name or detail))
+    label = label.strip(" \u2014-—,;:").strip()
+    return {"type": anchor_type, "detail": detail, "name": name, "when": when,
+            "time": clock, "label": label}
+
 
 #: Anchor types that describe WHERE you sleep or WHAT a quote costs, not
 #: something that happens at a time on a day. Hotels already own the phase's
@@ -1579,32 +1617,20 @@ def derive_days_from_anchors(
     for raw in _structured_list(data, "travel_anchors"):
         if not isinstance(raw, dict):
             continue
-        anchor_type = str(raw.get("type") or "").strip().lower()
-        if anchor_type in _NON_ITINERARY_ANCHORS:
+        anchor = _read_anchor(raw)
+        if anchor["type"] in _NON_ITINERARY_ANCHORS:
             continue
-        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
-        if not detail:
-            continue
-        when = _extract_anchor_date(detail)
+        when = anchor["when"]
         if not when:
             continue  # undated: it is a booking, not a moment in the plan
         phase_id = _phase_id_for_date(phases, when)
         if not phase_id:
             continue  # outside every phase — the Bookings tab still shows it
-        time_match = _ANCHOR_TIME_RE.search(detail)
-        # The date and time are now represented structurally, so strip them
-        # from the label rather than printing "at 10:00" beside a 10:00 slot.
-        label = _ANCHOR_DATE_RE.sub("", detail)
-        label = _ANCHOR_TIME_RE.sub("", label)
-        label = label.strip(" \u2014-—,;:").strip()
+        label = anchor["label"]
         if not label:
             continue
-        text = {"he": label, "en": label}
         day = by_phase.setdefault(phase_id, {}).setdefault(when.isoformat(), [])
-        day.append({
-            "time": time_match.group(1) if time_match else None,
-            "text": text,
-        })
+        day.append({"time": anchor["time"], "text": {"he": label, "en": label}})
 
     out: dict[str, list[dict[str, Any]]] = {}
     for phase_id, days in by_phase.items():
@@ -1616,6 +1642,15 @@ def derive_days_from_anchors(
             rendered.append({"date": iso, "items": items})
         out[phase_id] = rendered
     return out
+
+
+def _same_place(a: str, b: str) -> bool:
+    """Whether two booking names name the same place: "Hotel Artemide" and
+    "Hotel Artemide, Rome" do; "OMO3 Asakusa" and "Park Hyatt Tokyo" do not."""
+    def norm(text: str) -> str:
+        return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
+    x, y = norm(a), norm(b)
+    return bool(x and y) and (x in y or y in x)
 
 
 def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1641,6 +1676,7 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
     phases = list(config.get("phases") or [])
     fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
     bookings: list[dict[str, Any]] = []
+    hotel_row: dict[str, dict[str, Any]] = {}
 
     for phase in phases:
         accommodation = phase.get("accommodation")
@@ -1667,19 +1703,35 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             ),
             "seed_key": f"hotel_{phase.get('id')}",
         })
+        hotel_row[str(phase.get("id"))] = bookings[-1]
 
     for raw in _structured_list(data, "travel_anchors"):
         if not isinstance(raw, dict):
             continue
-        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
-        anchor_type = str(raw.get("type") or "").strip().lower()
-        if not detail and not anchor_type:
+        anchor = _read_anchor(raw)
+        detail, anchor_type = anchor["detail"], anchor["type"]
+        if not detail and not anchor_type and not anchor["name"]:
             continue
         # A "proposal" is a whole-trip quote, not a dated item — any date inside
         # it is a range endpoint, so don't pin it to a single day or phase.
-        when = None if anchor_type == "proposal" else _extract_anchor_date(detail)
-        name = _shorten_phase_name(detail, max_length=60) if detail else ""
+        when = None if anchor_type == "proposal" else anchor["when"]
+        name = _shorten_phase_name(anchor["name"] or detail, max_length=60) if (anchor["name"] or detail) else ""
         phase_id = _phase_id_for_date(phases, when) if when else None
+        # The same hotel often arrives twice — as the phase's accommodation and
+        # as a dated anchor holding the booking number. One row, carrying the
+        # number; a different hotel in the same phase is a split stay and keeps
+        # its own.
+        own = hotel_row.get(phase_id or "")
+        if own and _ANCHOR_TYPE_MAP.get(anchor_type) == "hotel" and _same_place(own["name"], name):
+            own["confirmation"] = own["confirmation"] or raw.get("confirmation")
+            continue
+        # A free-text anchor keeps the key it has always had, so re-provisioning
+        # an existing trip stays idempotent. A structured one has no `detail`;
+        # hashing the type alone gave every "activity" the SAME key, and the
+        # site's INSERT OR IGNORE kept one of them.
+        identity = detail or "|".join(
+            str(part) for part in (anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "")
+        )
         bookings.append({
             "phase": phase_id or fallback_phase,
             "type": _ANCHOR_TYPE_MAP.get(anchor_type, "other"),
@@ -1693,9 +1745,7 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             # If the anchor names a venue the itinerary already links, reuse
             # that link rather than leaving the row with a bare 📍.
             "location_url": _config_venue_link(f"{name} {detail}", phases),
-            "seed_key": "anchor_" + hashlib.sha1(
-                (detail or anchor_type).encode("utf-8")
-            ).hexdigest()[:10],
+            "seed_key": "anchor_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10],
         })
 
     return bookings
