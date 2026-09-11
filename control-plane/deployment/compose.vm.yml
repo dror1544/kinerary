@@ -215,8 +215,14 @@ services:
       # (2026-09-11: at default effort the VM mapped answers to the wrong question).
       # Explicit here so this VM matches the Mac on purpose, not by inheritance.
       CLAUDE_CONFIG_DIR: /home/node/.claude-config
-    # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; root-only file.
-    env_file: [/opt/agent-auth/claude.env]
+    # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
+    # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
+    # rotating state (codex and anthropic OAuth are each logged into separately:
+    # two holders of one refresh token lock each other out). Root-only files.
+    env_file:
+      - path: /opt/agent-auth/claude.env
+      - path: /opt/agent-auth/openrouter.env
+        required: false
     volumes:
       - /opt/agent-auth/codex:/codex
       - /opt/agent-auth/claude-config:/home/node/.claude-config
@@ -268,7 +274,10 @@ services:
       EXTRACT_MODEL: ${EXTRACT_MODEL:-}
       CODEX_HOME: /codex
       CLAUDE_CONFIG_DIR: /home/node/.claude-config
-    env_file: [/opt/agent-auth/claude.env]
+    env_file:
+      - path: /opt/agent-auth/claude.env
+      - path: /opt/agent-auth/openrouter.env
+        required: false
     volumes:
       - /opt/agent-auth/codex:/codex
       - /opt/agent-auth/claude-config:/home/node/.claude-config

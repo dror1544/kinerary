@@ -140,7 +140,8 @@ Values never go in this file or in logs. Where each lives:
 | Relay↔gateway secret | `.local-secrets/relay_gateway_secret` | same value in `trip-intake/.env` |
 | Chat-routing key, interview MCP key, interview agent key | `vm.env` | **VM-only**, generated on the VM, not shared with the Mac |
 | Claude | `/opt/agent-auth/claude.env` | `claude setup-token` (subscription), long-lived |
-| Codex (CLI) | `/opt/agent-auth/codex/` | `codex login --device-auth` inside the agent-runtime image |
+| OpenRouter (the interview) | `/opt/agent-auth/openrouter.env` | the same API key Hermes holds — safe to share, unlike OAuth |
+| Codex (CLI, the interview) | `/opt/agent-auth/codex/` | its own device login: `vm-interview-runner.sh login codex` |
 | Hermes providers | `/opt/hermes-data/auth.json` | `hermes auth add` inside the container: `openai-codex` and `anthropic` as OAuth (subscription logins), `openrouter` and `ollama-cloud` as API keys |
 | Proxmox, NPM, Cloudflare | `provisioning.env` | unchanged from the Mac |
 
@@ -328,6 +329,44 @@ gives you a booking PDF to send.
 Don't finish an interview on the Mac stack during the test, and don't answer
 with a destination a live Mac trip already has — the slug comes from your
 answers, and the two stacks share Proxmox, NPM, Cloudflare and the RPi4.
+
+## Interview models — default and fallback
+
+The interview's two model tasks run through `model-runner.ts`: **interpret** in
+the relay, **extract** in the sidecar. The default is Claude Code
+(`claude-sonnet-5`); two fallbacks are wired, each with its own credential:
+
+| Runner | Credential on the VM | Default model |
+|---|---|---|
+| `claude` | `CLAUDE_CODE_OAUTH_TOKEN` — `claude setup-token`, in `/opt/agent-auth/claude.env` | `claude-sonnet-5` |
+| `codex` | its own device login in `/opt/agent-auth/codex` (`CODEX_HOME`) | `gpt-5.6-luna` |
+| `openrouter` | `OPENROUTER_API_KEY` — the same key Hermes holds, `/opt/agent-auth/openrouter.env` | model-runner's per-task default |
+
+**There is no automatic fallback, on purpose.** model-runner retries the same
+pinned model and then gives up: on 2026-09-07 a fallback chain swapped models
+mid-interview and it finished in the wrong language. Falling back is a
+deployment decision, and it is one command:
+
+```bash
+control-plane/deployment/vm-interview-runner.sh status
+control-plane/deployment/vm-interview-runner.sh login codex   # once — the interview's own codex login
+control-plane/deployment/vm-interview-runner.sh probe codex   # one real call; changes nothing
+control-plane/deployment/vm-interview-runner.sh codex         # switch both tasks
+control-plane/deployment/vm-interview-runner.sh claude        # back to the default
+```
+
+A switch sets runner **and** model for both tasks (a codex runner asked for
+`claude-sonnet-5` would fail), refuses a runner with no credential or one that
+fails a real call through `runner-probe.mjs`, and restarts the relay through
+`vm-relay-restart.sh`, which refuses while an interview is mid-turn. Proven on
+2026-09-12 with a claude → openrouter → claude round trip read back from inside
+the restarted relay.
+
+Only the OpenRouter key is shared with Hermes: an API key has no rotating state.
+Codex and Anthropic OAuth refresh tokens are single-use, so the interview and
+Hermes each log in separately — two holders of one would lock each other out.
+The explicit `xhigh` effort (`CLAUDE_CONFIG_DIR`) applies to the claude runner
+only; effort for the others is part of the parked model optimisation below.
 
 ## Later: model and effort per task (parked by Dror, 2026-09-11)
 
