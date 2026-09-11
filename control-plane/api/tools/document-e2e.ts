@@ -40,9 +40,14 @@ import { modelRunnerFromEnv } from "../src/model-runner.js";
 const path = process.argv[2];
 const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
 if (!path || !databaseUrl) {
-  console.error("usage: CONTROL_PLANE_TEST_DATABASE_URL=... document-e2e.ts <file-or-folder>");
+  console.error("usage: CONTROL_PLANE_TEST_DATABASE_URL=... document-e2e.ts <file-or-folder> [--expect Rome,Colosseum]");
   process.exit(2);
 }
+// Words that must be somewhere in what the documents answered — a stop, a
+// place, a booking. Where they land (`planned` or `travel_anchors`) is the
+// model's call under the schema; that they land at all is the test.
+const expectArg = process.argv.slice(3).join("=").split("--expect=")[1] ?? "";
+const expected = expectArg.split(",").map((s) => s.trim()).filter(Boolean);
 
 const CHAT = "870000001";
 const id = (p: string) => `${p}_${randomBytes(16).toString("hex")}`;
@@ -173,6 +178,17 @@ console.log(`phase: ${view.ok ? view.view.phase : "?"} | awaiting: ${view.ok ? v
 
 const interesting = logs.filter((l) => /document_|interpret_|required_/.test(l));
 console.log(`\n=== events ===`);
-for (const line of interesting) console.log(`  ${line.slice(0, 200)}`);
+for (const line of interesting) console.log(`  ${line.slice(0, 400)}`);
+
+// A VERDICT, so a preflight can run this unattended.
+const stored = (await pool.query("SELECT answers FROM control_plane.intake_sessions WHERE telegram_chat_id = $1", [CHAT]))
+  .rows[0]?.answers ?? {};
+const haystack = JSON.stringify(stored).toLowerCase();
+const problems: string[] = [];
+if (learned.length === 0) problems.push("the documents answered nothing");
+const missing = expected.filter((word) => !haystack.includes(word.toLowerCase()));
+if (missing.length > 0) problems.push(`never reached the answers: ${missing.join(", ")}`);
+console.log(problems.length ? `\nVERDICT: FAIL — ${problems.join("; ")}` : "\nVERDICT: PASS");
+process.exitCode = problems.length ? 1 : 0;
 
 await pool.end();

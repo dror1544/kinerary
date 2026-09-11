@@ -18,13 +18,15 @@ built. Four separate faults hid in that gap for a whole day:
 Every one is invisible from the job's own status and obvious from outside. So
 this checks from outside, and each stage FAILS LOUDLY rather than warning.
 
-    scripts/e2e-full-cycle.py --scenario multi
-    scripts/e2e-full-cycle.py --scenario manual --keep      # leave it running
+    scripts/e2e-full-cycle.py --scenario multi               # leave it running
+    scripts/e2e-full-cycle.py --scenario japan --teardown    # remove it afterwards
 
-`--keep` skips teardown, which is the default for a trip someone wants to poke
-at afterwards. Teardown is opt-in precisely because destroying a trip leaves
-references behind — allowlist entries, chat bindings, DB rows — and that
-cleanup is not yet automated (see the teardown gaps in the run report).
+Leaving the trip running is the default, for a trip someone wants to poke at
+afterwards. `--teardown` removes exactly the trip this run created — by the id
+signup returned, never by name — through scripts/teardown-trip.py, which undoes
+every reference provisioning left: container, DNS, proxy host, profile,
+gateway, bridge, allowlist entry, chat bindings, slug. It runs whether the
+cycle passed or failed, because a failed run leaves the most behind.
 """
 from __future__ import annotations
 
@@ -308,11 +310,21 @@ def stage_content(ctx: dict, scenario: str) -> None:
 
     # The regression that started all of this: a place named in a document must
     # survive to the phase page, not be dropped by the transformer.
+    #
+    # As a venue OR as a day-plan item. The schema files a place by evidence of
+    # booking: named in an itinerary it is `planned` and becomes a venue; with a
+    # ticket reference it is a `travel_anchor`, and a dated anchor becomes a day
+    # item (derive_days_from_anchors). Either is the place reaching the page —
+    # the only failure is it reaching neither.
     venues = [v for p in phases for v in (p.get("venues") or [])]
+    day_items = [i for p in phases for d in (p.get("days") or []) for i in (d.get("items") or [])]
     for expected in spec.get("expect_planned", []):
-        hit = any(expected.lower() in json.dumps(v, ensure_ascii=False).lower() for v in venues)
-        check(hit, f"venue survived to the site: {expected}",
-              f"{expected!r} was in the document and is NOT on any phase")
+        needle = expected.lower()
+        in_venues = any(needle in json.dumps(v, ensure_ascii=False).lower() for v in venues)
+        in_days = any(needle in json.dumps(i, ensure_ascii=False).lower() for i in day_items)
+        check(in_venues or in_days,
+              f"place survived to the site: {expected} ({'venue' if in_venues else 'day plan'})",
+              f"{expected!r} was in the document and is on no phase — neither a venue nor a day item")
 
     # Every venue link the site renders must be a real http(s) URL. `maps` and
     # `waze` are derived from the place name, so they are the ones that must
@@ -396,12 +408,16 @@ def main() -> int:
     ap.add_argument("--trip-name", default=None)
     ap.add_argument("--wait-minutes", type=int, default=30,
                     help="how long to wait for the human half of the interview")
-    ap.add_argument("--keep", action="store_true", default=True,
-                    help="leave the trip running afterwards (default)")
+    ap.add_argument("--keep", action="store_true",
+                    help="leave the trip running afterwards — the default; kept for old invocations")
+    ap.add_argument("--teardown", action="store_true",
+                    help="afterwards, tear down the trip THIS run created (scripts/teardown-trip.py), "
+                         "whether the run passed or failed")
     args = ap.parse_args()
 
     trip_name = args.trip_name or {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026"}[args.scenario]
     ctx: dict = {}
+    code = 0
     try:
         stage_preflight()
         ctx.update(stage_signup(trip_name))
@@ -411,21 +427,39 @@ def main() -> int:
         stage_content(ctx, args.scenario)
         stage_companion(ctx)
         stage_mcp(ctx)
+        print(f"\n{GREEN}✓ full cycle green{RESET}: site, content, companion and MCP all verified.")
+        print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
+        print(f"  login: {ctx['email']} / {ctx['password']}")
     except Failed as exc:
         print(f"\n{RED}✗ FAILED{RESET}: {exc}\n")
         if ctx.get("trip_id"):
             print(f"  trip:  {ctx['trip_id']}  ({ctx.get('slug', 'no slug yet')})")
             print(f"  login: {ctx.get('email')} / {ctx.get('password')}")
-        return 1
+        code = 1
     except KeyboardInterrupt:
         print(f"\n{YELLOW}interrupted{RESET} — nothing torn down.")
         return 130
 
-    print(f"\n{GREEN}✓ full cycle green{RESET}: site, content, companion and MCP all verified.")
-    print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
-    print(f"  login: {ctx['email']} / {ctx['password']}")
-    print(f"  {DIM}left running (--keep is the default){RESET}")
-    return 0
+    if not args.teardown:
+        if ctx.get("trip_id"):
+            print(f"  {DIM}left running — `scripts/teardown-trip.py --trip {ctx['trip_id']} --execute` removes it{RESET}")
+        return code
+    return stage_teardown(ctx) or code
+
+
+def stage_teardown(ctx: dict) -> int:
+    """Only ever the trip this run signed up — its id came back from /v1/signup
+    above. Anything that existed before the run is not this function's to touch."""
+    stage("Teardown — remove what this run created")
+    if not ctx.get("trip_id"):
+        note("no trip was created — nothing to tear down")
+        return 0
+    result = subprocess.run([str(REPO / "scripts/teardown-trip.py"), "--trip", ctx["trip_id"], "--execute"])
+    if result.returncode == 0:
+        ok(f"{ctx['trip_id']} torn down")
+    else:
+        print(f"  {RED}✗{RESET} teardown exited {result.returncode} — see above; the trip may be half-removed")
+    return result.returncode
 
 
 if __name__ == "__main__":

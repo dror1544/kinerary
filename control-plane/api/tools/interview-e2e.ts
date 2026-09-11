@@ -162,7 +162,19 @@ console.log(`accepted total ${turns.reduce((n, t) => n + t.accepted, 0)} | model
 console.log(`\nanswered (${state?.answered.length}): ${state?.answered.join(", ")}`);
 console.log(`outstanding (${state?.outstanding.length}): ${state?.outstanding.join(", ")}`);
 console.log(`state: ${final.ok ? final.view.state : "?"} | phase: ${final.ok ? final.view.phase : "?"}`);
-console.log(`agent turns opened: ${(await pool.query("SELECT count(*)::int c FROM control_plane.interview_agent_turns")).rows[0].c}`);
+const agentTurns: number = (await pool.query("SELECT count(*)::int c FROM control_plane.interview_agent_turns")).rows[0].c;
+console.log(`agent turns opened: ${agentTurns}`);
 console.log(`pushed to gateway: ${connector.pushed.length}`);
+
+// A VERDICT, so a preflight can run this unattended. The interpret path works
+// when the interview reaches the recap, the model never failed a turn, and the
+// agent was never in the loop — the third is the one that silently regresses.
+const problems: string[] = [];
+if (!final.ok || final.view.state !== "awaiting_confirmation") problems.push("did not reach the recap");
+const failures = turns.filter((t) => t.reason).length;
+if (failures > 0) problems.push(`${failures} model failure(s)`);
+if (agentTurns > 0) problems.push(`${agentTurns} agent turn(s) opened`);
+console.log(problems.length ? `\nVERDICT: FAIL — ${problems.join("; ")}` : "\nVERDICT: PASS");
+process.exitCode = problems.length ? 1 : 0;
 
 await pool.end();

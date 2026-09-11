@@ -95,16 +95,53 @@ Details: `mcp/README.md`, `mcp/PROVISIONING.md`.
 ## Testing
 
 ```bash
-cd tests && npm test        # 405 tests / 81 suites as of 2026-09-04 — all pass
-scripts/preflight-deploy.sh # every suite at once, plus the hard rules below
+cd tests && npm test                           # the trip-site suite alone
+scripts/preflight-deploy.sh                    # every suite, with its real deps — deploys nothing
+scripts/preflight-deploy.sh --deploy           # + deploy THIS checkout, verify it, walk one trip (you do the interview)
+scripts/preflight-deploy.sh --deploy --cleanup # + tear down the trip this run created
+#   --scenario japan|multi|manual|none         # which trip; none = deploy + automated checks only
 ```
-Run before claiming something works, not after. `preflight-deploy.sh` skips a
-suite whose interpreter deps are missing rather than failing it, and says so —
-a check that is permanently red is a check nobody reads. It proves the build is
-deployable; it does **not** deploy. If you touch a
+Run before claiming something works, not after. The default mode runs what CI
+runs and what CI does not (trip-web, runtime-gateway, `tests/scripts`), and it
+**provides** dependencies rather than skipping without them: a Python 3.12 venv
+with the worker's requirements (cached in `~/.cache/kinerary-preflight`), `npm
+ci` where a package has none. It used to report the worker and provisioning
+suites as "skipped" on a Mac whose `python3` lacks PyYAML — a clean preflight
+that had not run 340 tests.
+
+Every mode cleans up after itself on every exit, Ctrl-C included: its private
+test database is dropped, a test Postgres it started is stopped, the tracked
+`site/modern` is restored if the trip-web build changed it, and the temp dir
+goes (kept, and named, when the run failed).
+
+`--deploy` **is** a deploy — hard rule 2 applies, and the hook prompts on this
+script whatever its flags. It refuses uncommitted tracked changes (a deploy has
+to be a commit you can name) and a provisioning job that is mid-build.
+`--cleanup` removes only the trip whose id this run's signup returned, through
+`scripts/teardown-trip.py` — see below. If you touch a
 security-relevant path (anything above, or auth in general), show the actual
 request/response proving the thing is hidden or scoped correctly — not a
 description of the code.
+
+### Tearing down a test trip
+
+```bash
+scripts/teardown-trip.py --trip <slug|trip_id>            # the plan — read-only
+scripts/teardown-trip.py --trip <slug|trip_id> --execute  # do it
+```
+
+The inverse of provisioning: backs everything up first, then the interviewer's
+allowlist entry, the companion's gateway and trip-mcp bridge, the Cloudflare
+record and ingress rule, the NPM host and the LXC (through the worker's own
+provisioner), the chat bindings and slug (`retired-<slug>-<yyyymmdd>`, which
+frees the name), the deploy directory, and the profile. **Order matters in one
+place**: the allowlist entry goes, and the interviewer restarts, *before* the
+profile is deleted — the interviewer runs a cron ticker per allowlisted profile,
+and on 2026-09-11 that ticker recreated a deleted profile's directory, which is
+enough to make the next trip of that name install without a companion.
+
+It refuses a trip past `ready_private` (real people have used it) and a profile
+another trip's open binding still names. There is no `--force`.
 
 ### The control-plane DB suites destroy the database they are given
 
