@@ -163,11 +163,202 @@ print(f"merged overlay -> {config_path} (model={merged.get('model', {}).get('def
 PYMERGE
 }
 
+# Everything the relay half needs is derived HERE, host-side, from the same
+# architecture profile the relay itself reads. Nothing about it comes from the
+# handoff — that is the untrusted side of this boundary, and a caller that
+# could name the relay could point a trip's companion at one it controls.
+ARCH_PROFILE="${KINERARY_ARCHITECTURE_PROFILE:-$REPO_ROOT/control-plane/deployment/.local-secrets/architecture.relay-host.json}"
+
+# ENROLL, not just activate.
+#
+# A companion with a rendered profile, a merged config and a working trip-mcp
+# still does not speak as itself. The relay routes by gateway IDENTITY, and a
+# gateway carrying no identity falls through to `multiplex_gateway_id` — which
+# is the INTERVIEWER. That failure is not silence, which is exactly why it
+# survived so long: on 2026-09-10 japan-2026's organizer was answered in the
+# interviewer's voice, out of the interviewer's profile, about their own trip.
+# It was fixed by hand with an `echo` into the profile's .env, and nothing
+# wrote it down — so italy-2026, provisioned hours later, shipped unenrolled
+# too.
+#
+# Enrollment against THIS relay is three env stamps, not `hermes gateway
+# enroll`: that subcommand redeems a single-use token against the hosted Nous
+# connector and needs a portal login. Ours authenticates a gateway with a
+# shared secret and takes its identity from the id, so per-trip enrollment is
+# "same secret, distinct id" — and the id is the profile name, which is the
+# rule docs/per-trip-gateway-architecture.md already states.
+enroll_relay() {
+  local name="$1"
+  local env_file="$HOME/.hermes/profiles/$name/.env"
+
+  if [ ! -f "$ARCH_PROFILE" ]; then
+    printf 'companion-install-host: no architecture profile at %s; %s left UNENROLLED (it would answer as the interviewer)\n' \
+      "$ARCH_PROFILE" "$name" >&2
+    return 0
+  fi
+
+  local relay_url secret_file
+  relay_url="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+host, port = r.get("bind_host"), r.get("port")
+print(f"http://{host}:{port}" if host and port else "")
+PY
+  )" || relay_url=""
+  secret_file="$(/usr/bin/python3 - "$ARCH_PROFILE" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("relay") or {}
+refs = r.get("gateway_secret_refs") or []
+ref = refs[0] if refs else ""
+print(ref[len("file://"):] if ref.startswith("file://") else "")
+PY
+  )" || secret_file=""
+
+  if [ -z "$relay_url" ] || [ -z "$secret_file" ] || [ ! -r "$secret_file" ]; then
+    printf 'companion-install-host: relay url/secret not resolvable from %s; %s left UNENROLLED\n' \
+      "$ARCH_PROFILE" "$name" >&2
+    return 0
+  fi
+
+  local secret
+  secret="$(cat "$secret_file")"
+  [ -n "$secret" ] || {
+    printf 'companion-install-host: relay secret file is empty; %s left UNENROLLED\n' "$name" >&2
+    return 0
+  }
+
+  # Rewritten in place, not appended: this runs again on every retry, and three
+  # copies of GATEWAY_RELAY_ID with different values is a worse state than none.
+  umask 077
+  touch "$env_file"
+  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" <<'PY'
+import sys
+env_path, url, gid, secret = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+managed = {
+    "GATEWAY_RELAY_URL": url,
+    "GATEWAY_RELAY_ID": gid,
+    "GATEWAY_RELAY_SECRET": secret,
+}
+with open(env_path) as fh:
+    lines = fh.read().splitlines()
+kept = [ln for ln in lines if ln.split("=", 1)[0].strip() not in managed]
+while kept and not kept[-1].strip():
+    kept.pop()
+kept.append("")
+kept.append("# Relay identity for this trip's gateway, written by companion-install-host.sh.")
+kept.append("# The id IS the profile name: the relay routes to a gateway by it, and a")
+kept.append("# gateway without one is served the interviewer's traffic instead of its own.")
+kept += [f"{k}={v}" for k, v in managed.items()]
+with open(env_path, "w") as fh:
+    fh.write("\n".join(kept) + "\n")
+PY
+  chmod 600 "$env_file"
+  printf 'companion-install-host: enrolled %s with the relay at %s\n' "$name" "$relay_url" >&2
+}
+
+# START it. A gateway that exists and is enrolled but is not running is still
+# a companion that never answers.
+#
+# launchd rather than a bare background process because this outlives the SSH
+# session that created it and has to come back after a reboot — the 2026-09-02
+# power-cut evening was spent on a bridge that had simply died and nothing
+# brought back. KeepAlive/ThrottleInterval/ExitTimeOut mirror the plist that
+# was written by hand for japan2026, which is the only per-trip gateway that
+# has actually run.
+#
+# This is the one thing here that leaves a process behind, so it is also the
+# one thing that must be safe to repeat: `bootout` before `bootstrap` makes a
+# retry a restart rather than a second copy fighting for the same socket.
+start_gateway() {
+  local name="$1"
+  local home="$HOME/.hermes/profiles/$name"
+  local label="ai.hermes.gateway-${name}"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local py="$HOME/.hermes/hermes-agent/venv/bin/python"
+
+  if [ ! -x "$py" ]; then
+    printf 'companion-install-host: no Hermes venv python; %s installed but NOT RUNNING\n' "$name" >&2
+    return 0
+  fi
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$home/logs"
+  cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${py}</string>
+        <string>-m</string>
+        <string>hermes_cli.stderr_timestamp</string>
+        <string>--error-log</string>
+        <string>${home}/logs/gateway.error.log</string>
+        <string>--</string>
+        <string>${py}</string>
+        <string>-m</string>
+        <string>hermes_cli.main</string>
+        <string>--profile</string>
+        <string>${name}</string>
+        <string>gateway</string>
+        <string>run</string>
+        <string>--replace</string>
+        <string>--external-supervisor</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${home}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${HOME}/.hermes/hermes-agent/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.hermes/node/bin:${HOME}/.local/bin</string>
+        <key>VIRTUAL_ENV</key>
+        <string>${HOME}/.hermes/hermes-agent/venv</string>
+        <key>HERMES_HOME</key>
+        <string>${home}</string>
+    </dict>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ExitTimeOut</key>
+    <integer>25</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${home}/logs/gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>${home}/logs/gateway.error.log</string>
+</dict>
+</plist>
+PLIST
+
+  launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+    printf 'companion-install-host: gateway %s started\n' "$name" >&2
+  else
+    printf 'companion-install-host: launchctl bootstrap failed for %s; plist written but NOT RUNNING\n' "$name" >&2
+  fi
+}
+
 if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then
   # Idempotent, and it repairs: a profile installed before the merge existed
   # is still missing its provider, and a retry should fix that rather than
   # report success and change nothing.
   merge_overlay "$PROFILE_NAME"
+  enroll_relay "$PROFILE_NAME"
+  start_gateway "$PROFILE_NAME"
   printf 'ALREADY_PRESENT %s\n' "$PROFILE_NAME"
   exit 0
 fi
@@ -178,5 +369,7 @@ fi
   --install-profile "$PROFILE_NAME" >/dev/null
 
 merge_overlay "$PROFILE_NAME"
+enroll_relay "$PROFILE_NAME"
+start_gateway "$PROFILE_NAME"
 
 printf 'INSTALLED %s\n' "$PROFILE_NAME"
