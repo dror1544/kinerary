@@ -39,12 +39,18 @@ export const PORTS = {
   itineraryPlanLayerServer: 3118,  // moved off 3107 (currencyRates)
   configDayLinksServer:     3114,  // moved off 3110 (scheduleReviewMockHermes)
 
+  modernEnrichment:        3194,
+  heroHttp:                3196,
+  tripEventsHttp:          3198,
+  controlPlaneSession:     3296,
+
   // Servers a single describe() spawns with a patched config of its own.
   currencyRatesUsdHome:     3111,
   currencyRatesUsdOnly:     3112,
   configDayLinksSeeded:     3115,  // moved off 3111 (currencyRatesUsdHome)
 
   // ── MCP servers ────────────────────────────────────────────────────────
+  controlPlaneSessionMcp:  3295,
   mcpExtract:               3106,
   itineraryPlanLayerMcp:    3108,
   mcpDefault:               3117,  // moved off 3098 (configVersionsBoot)

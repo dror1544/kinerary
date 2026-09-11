@@ -126,11 +126,9 @@ export interface RuntimeAccountAdapter {
   provisionParticipant(input: {
     tripId: string;
     inviteId: string;
+    userId: string;
     runtimeUsername: string;
     displayName: string;
-    method: "google" | "password";
-    googleSubjectDigest?: string;
-    password?: string;
   }): Promise<void>;
 }
 
@@ -272,13 +270,13 @@ async function membership(deps: PortalDependencies, tripId: string, userId: stri
   return result.rows[0] ?? null;
 }
 
-function nextAction(state: string, planStatus?: string | null, jobState?: string | null): string {
+function nextAction(state: string, planStatus?: string | null, jobState?: string | null, runtimeReady = false): string {
   if (state === "draft" || state === "intake_in_progress") return "continue_interview";
   if (state === "intake_confirmed") return "request_provisioning";
   // The organizer's own next move, not a wait on someone else.
   if (planStatus === "pending_approval") return "review_plan";
   if (["queued", "leased", "running"].includes(jobState ?? "")) return "track_provisioning";
-  if (state === "ready_private" || state === "active") return "open_trip";
+  if (state === "ready_private" || state === "active") return runtimeReady ? "open_trip" : "view_status";
   if (state === "completed" || state === "sealed") return "view_trip";
   return "view_status";
 }
@@ -308,6 +306,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       "SELECT id, intended_display_name, runtime_username, state, expires_at, created_at FROM control_plane.site_invites WHERE trip_id = $1 ORDER BY created_at DESC", [tripId]),
   ]);
   const plan = planResult.rows[0];
+  const runtimeReady = routeResult.rows[0]?.state === "ready";
   return {
     id: trip.id,
     title: trip.title ?? trip.destination_label ?? "Untitled trip",
@@ -316,7 +315,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
     endDate: trip.end_date,
     tripType: trip.trip_type ?? "other",
     lifecycleState: trip.lifecycle_state,
-    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state),
+    nextAction: nextAction(trip.lifecycle_state, plan?.status, plan?.job_state, runtimeReady),
     permissions: {
       role: trip.role,
       dashboard: trip.dashboard_access,
@@ -329,7 +328,7 @@ async function tripDetail(deps: PortalDependencies, tripId: string, userId: stri
       planId: plan.id, planStatus: plan.status, jobState: plan.job_state,
       releaseId: plan.release_id, digest: plan.digest, safeErrorCode: plan.safe_error_code,
     } : null,
-    runtimeReady: routeResult.rows[0]?.state === "ready" || trip.lifecycle_state === "ready_private",
+    runtimeReady,
     invites: invitesResult.rows.map((invite) => ({
       id: invite.id, displayName: invite.intended_display_name, runtimeUsername: invite.runtime_username,
       status: invite.state === "unused" && invite.expires_at.getTime() < Date.now() ? "expired" : invite.state,
@@ -665,7 +664,6 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     let signedIn = await portalUser(request, deps);
     const password = method === "password" && typeof body.password === "string" ? body.password : undefined;
     if (method === "password" && (!password || password.length < 8 || password.length > 128)) return reply.code(400).send({ error: "PASSWORD_INVALID" });
-    const runtimeCredential: { googleSubjectDigest?: string; password?: string } = {};
     if (method === "google") {
       // Google redemption acts through an existing browser session, so it is
       // a state-changing request and must prove the session's CSRF secret.
@@ -673,9 +671,6 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       if (!csrfUser) return;
       signedIn = csrfUser;
       if (!signedIn?.googleSubjectDigest) return reply.code(401).send({ error: "GOOGLE_SIGN_IN_REQUIRED" });
-      runtimeCredential.googleSubjectDigest = signedIn.googleSubjectDigest;
-    } else {
-      runtimeCredential.password = password;
     }
     const invites = await deps.db.query<{
       id: string; trip_id: string; intended_display_name: string; runtime_username: string; state: string; expires_at: Date;
@@ -686,7 +681,9 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       await deps.db.query("UPDATE control_plane.site_invites SET state = 'expired', updated_at = now() WHERE id = $1", [invite.id]);
       return reply.code(410).send({ error: "INVITE_EXPIRED" });
     }
-    const userId = signedIn?.id ?? opaque("user");
+    // Stable across a rolled-back redemption: the runtime may already have
+    // recorded this invite when the control-plane transaction retries.
+    const userId = signedIn?.id ?? `user_${sha256(invite.id).slice(7, 39)}`;
     const portalPasswordHash = method === "password" && password ? await hashPortalPassword(password) : null;
     let passwordSession: { sessionToken: string; csrf: string } | null = null;
     const client = await deps.db.connect();
@@ -699,8 +696,7 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
       // lock prevents concurrent redemption; if the database transaction later
       // aborts, the same raw invite may safely retry the runtime enrollment.
       await deps.runtimeAccounts.provisionParticipant({
-        tripId: invite.trip_id, inviteId: invite.id, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
-        method, ...runtimeCredential,
+        tripId: invite.trip_id, inviteId: invite.id, userId, runtimeUsername: invite.runtime_username, displayName: invite.intended_display_name,
       });
       if (portalPasswordHash) {
         await client.query(

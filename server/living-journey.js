@@ -327,7 +327,9 @@ function rowsFromLegacyPlan(db) {
     sort_order: index,
   }));
   const items = db.prepare(
-    'SELECT * FROM phase_plan_items ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
+    // Time is the primary schedule order. sort_order is only the stable
+    // tie-breaker for entries with the same clock position or no time.
+    'SELECT * FROM phase_plan_items ORDER BY date ASC, COALESCE(time_sort, 99999) ASC, sort_order ASC, id ASC'
   ).all().map((row, index) => ({
     item_uid: row.itinerary_item_uid || (row.config_ref ? `cfg_${digest(row.config_ref).slice(0, 16)}` : `legacy_${row.id}`),
     phase_id: row.phase_id,
@@ -345,7 +347,7 @@ function rowsFromLegacyPlan(db) {
     confirmation_state: row.status === 'confirmed' ? 'verified' : 'needs_review',
     duration_minutes: null,
     sort_order: Number.isFinite(Number(row.sort_order)) ? Number(row.sort_order) : index,
-    source_ref: row.config_ref || `legacy:${row.id}`,
+    source_ref: row.itinerary_item_uid ? `modern:${row.itinerary_item_uid}` : row.config_ref || `legacy:${row.id}`,
     created_by: row.created_by || 'legacy',
     extra_links: row.extra_links || null,
   })).filter((row) => row.text_he);
@@ -439,7 +441,9 @@ function getVersionRows(db, revisionIdValue) {
     pickup_context: readJson(day.pickup_context, null),
   }));
   const items = db.prepare(
-    'SELECT * FROM itinerary_plan_items WHERE revision_id = ? ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, item_uid ASC'
+    // Exact and rough times share time_sort, so they must sort ahead of the
+    // manual insertion order. Untimed entries intentionally fall to the end.
+    'SELECT * FROM itinerary_plan_items WHERE revision_id = ? ORDER BY date ASC, COALESCE(time_sort, 99999) ASC, sort_order ASC, item_uid ASC'
   ).all(revisionIdValue).map((item) => ({
     ...item,
     extra_links: readJson(item.extra_links, []),
@@ -640,6 +644,19 @@ function updateLegacyFromActive(db) {
     if (itemUids.length) db.prepare(`DELETE FROM phase_plan_items WHERE itinerary_item_uid IS NOT NULL AND itinerary_item_uid NOT IN (${itemUids.map(() => '?').join(',')})`).run(...itemUids);
     else db.prepare('DELETE FROM phase_plan_items WHERE itinerary_item_uid IS NOT NULL').run();
   })();
+}
+
+// Enrichment changes only a few fields on one item. The compatibility table
+// cannot round-trip Modern types, durations or day context.
+function applyItemEnrichment(db, legacy, fields) {
+  const uid = legacy.itinerary_item_uid || (legacy.config_ref ? `cfg_${digest(legacy.config_ref).slice(0, 16)}` : `legacy_${legacy.id}`);
+  if (!activeRows(db)?.items.some(item => item.item_uid === uid)) return;
+  const allowed = ['text_he', 'text_en', 'location_url', 'waze_url', 'website_url', 'ticket_url', 'booking_id'];
+  const patch = Object.fromEntries(allowed.filter(key => Object.hasOwn(fields, key)).map(key => [key, fields[key]]));
+  if (!Object.keys(patch).length) return;
+  return cloneWith(db, 'enrichment', 'Enriched itinerary item', rows => {
+    rows.items = rows.items.map(item => item.item_uid === uid ? { ...item, ...patch } : item);
+  });
 }
 
 // Classic treats phase_plan_* as an overlay that supersedes the config
@@ -929,7 +946,7 @@ function confirmationSummary(db) {
   });
 }
 
-function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired }) {
+function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequired, organizerOrAgentRequired, requestItemEnrichment }) {
   app.get('/api/ui-bootstrap', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json({
@@ -1045,7 +1062,8 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
       });
     });
     updateLegacyFromActive(db);
-    res.status(201).json({ revision: nextId, item_uid: uid });
+    const enrichment = requestItemEnrichment?.(uid) || { configured: false, queued: false };
+    res.status(201).json({ revision: nextId, item_uid: uid, enrichment });
   });
 
   app.patch('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
@@ -1058,6 +1076,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     }
     if (body.date !== undefined && !ISO_DATE_RE.test(body.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
     let touched = false;
+    let titleChanged = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer edited itinerary item', (rows) => {
       // A move needs somewhere to land. rows.days is what drives Modern's day
       // picker, so changing an item's date or phase without creating the
@@ -1077,6 +1096,16 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
         if (body.item_type !== undefined) next.item_type = normalizeType(body.item_type);
         if (body.confirmation_state !== undefined) next.confirmation_state = normalizeConfirmation(body.confirmation_state);
         if (body.duration_minutes !== undefined) next.duration_minutes = Number.isFinite(Number(body.duration_minutes)) ? Number(body.duration_minutes) : null;
+        titleChanged = body.text_he !== undefined && next.text_he !== item.text_he;
+        if (titleChanged) {
+          const legacy = db.prepare('SELECT enrichment_values FROM phase_plan_items WHERE itinerary_item_uid = ?').get(uid);
+          const generated = readJson(legacy?.enrichment_values, {});
+          // The form submits unchanged companion fields too. Clear only values
+          // still equal to our generated output; preserve deliberate edits.
+          for (const key of ['text_en', 'location_url', 'waze_url', 'website_url', 'ticket_url', 'booking_id']) {
+            if (Object.hasOwn(generated, key) && next[key] === generated[key]) next[key] = null;
+          }
+        }
         if (next.phase_id !== item.phase_id || next.date !== item.date) landed.push(next);
         return next;
       });
@@ -1087,7 +1116,10 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     });
     if (!touched) return res.status(404).json({ error: 'not found' });
     updateLegacyFromActive(db);
-    res.json({ revision: nextId, item_uid: uid });
+    const enrichment = body.text_he !== undefined
+      ? requestItemEnrichment?.(uid, { titleChanged }) || { configured: false, queued: false }
+      : undefined;
+    res.json({ revision: nextId, item_uid: uid, ...(enrichment ? { enrichment } : {}) });
   });
 
   app.delete('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
@@ -1243,6 +1275,7 @@ function create(options) {
   return {
     registerRoutes: (app, middlewares) => registerRoutes({ ...options, app, ...middlewares }),
     syncFromLegacy: (author) => syncFromLegacy(db, raw, author),
+    applyItemEnrichment: (legacy, fields) => applyItemEnrichment(db, legacy, fields),
     updateLegacyFromActive: () => updateLegacyFromActive(db),
     uiSettings: () => uiSettings(db),
   };

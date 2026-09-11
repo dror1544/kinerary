@@ -5,6 +5,7 @@ import http from "node:http";
 let upstream, controlPlane, gateway;
 let upstreamOrigin, gatewayOrigin;
 let proxiedAuthorization;
+let eventStreamClosed = false;
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${server.address().port}`)));
@@ -24,7 +25,18 @@ before(async () => {
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ ok: true, username: "bob" }));
     }
+    if (req.url === "/api/events") {
+      assert.equal(req.headers.authorization, "Bearer runtime-jwt");
+      eventStreamClosed = false;
+      res.writeHead(200, { "content-type": "text/event-stream", "x-accel-buffering": "no" });
+      res.write('event: ready\ndata: {"revisions":{"bookings":0}}\n\n');
+      const timer = setTimeout(() => res.write('event: change\ndata: {"revisions":{"bookings":1}}\n\n'), 30);
+      res.on("close", () => { clearTimeout(timer); eventStreamClosed = true; });
+      return;
+    }
     proxiedAuthorization = req.headers.authorization;
+    res.setHeader("x-frame-options", "DENY");
+    res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ path: req.url }));
   });
@@ -78,6 +90,8 @@ test("consumes a trip-bound grant once and proxies with the runtime session", as
   assert.equal(response.status, 200);
   assert.equal(proxiedAuthorization, "Bearer runtime-jwt");
   assert.deepEqual(await response.json(), { path: "/api/config?upstream=http://attacker.invalid" });
+  assert.equal(response.headers.get("x-frame-options"), null);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'; frame-ancestors https://app.example.test");
 });
 
 test("rejects trip paths without a valid gateway session", async () => {
@@ -89,4 +103,32 @@ test("forwards internal participant existence checks", async () => {
   const response = await fetch(`${gatewayOrigin}/internal/t/trip_abcdefgh/participants/bob`, { headers: { "x-api-key": "exchange-key" } });
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true, username: "bob" });
+});
+
+
+test("streams authenticated events without buffering, scopes the cookie, and closes the upstream", async () => {
+  const launched = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/__launch`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: "valid-grant" }),
+  });
+  const cookie = launched.headers.get("set-cookie").split(";")[0];
+  const foreign = await fetch(`${gatewayOrigin}/t/trip_other123/api/events`, { headers: { cookie } });
+  assert.equal(foreign.status, 401);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+  try {
+    const response = await fetch(`${gatewayOrigin}/t/trip_abcdefgh/api/events`, { headers: { cookie }, signal: controller.signal });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-accel-buffering"), "no");
+    const reader = response.body.getReader();
+    let frames = "";
+    while (!frames.includes("event: change")) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      frames += new TextDecoder().decode(chunk.value);
+    }
+    assert.match(frames, /event: ready/);
+    controller.abort();
+    for (let attempt = 0; attempt < 100 && !eventStreamClosed; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(eventStreamClosed, true);
+  } finally { clearTimeout(timeout); controller.abort(); }
 });

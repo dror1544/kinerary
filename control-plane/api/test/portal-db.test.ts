@@ -18,6 +18,8 @@ const ids = {
 };
 let pool: pg.Pool;
 let passwordInviteeId: string | undefined;
+const runtimeEnrollments: Record<string, unknown>[] = [];
+let failNextEnrollment = false;
 
 const profile = validateArchitectureProfile({
   version: 1, environment: "test", public_api: { bind_host: "127.0.0.1", port: 4310 },
@@ -31,7 +33,10 @@ function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
     google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused" }) },
-    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async () => {} },
+    runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async (input) => {
+      runtimeEnrollments.push(input);
+      if (failNextEnrollment) { failNextEnrollment = false; throw new Error("simulated runtime reply lost"); }
+    } },
     publicOrigin: "http://portal.example.test", runtimeOrigin: "http://runtime.example.test", runtimeExchangeKey: "exchange-key",
     runtimeUpstreamHostSuffixes: ["internal"], telegramBotUsername: "kinerary_bot", sessionTtlSeconds: 3600,
     enrollmentTtlSeconds: 3600, approvalTtlSeconds: 3600, operatorChatId: "operator-chat-1",
@@ -70,6 +75,7 @@ after(async () => {
   await pool.query("DELETE FROM control_plane.jobs WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.plans WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.runtime_launch_grants WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.runtime_routes WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_password_credentials WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.site_invites WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
@@ -123,6 +129,12 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     });
     assert.equal(createdInvite.statusCode, 201);
     const inviteToken = new URL(createdInvite.json().joinUrl).hash.slice("#token=".length);
+    failNextEnrollment = true;
+    const failedRedemption = await app.inject({
+      method: "POST", url: "/v1/site-invites/redeem",
+      payload: { token: inviteToken, method: "password", password: "password-guest-secret" },
+    });
+    assert.equal(failedRedemption.statusCode, 500);
     const redeemed = await app.inject({
       method: "POST", url: "/v1/site-invites/redeem",
       payload: { token: inviteToken, method: "password", password: "password-guest-secret" },
@@ -132,6 +144,12 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
       "SELECT redeemed_by FROM control_plane.site_invites WHERE id = $1", [createdInvite.json().id]);
     passwordInviteeId = inviteRow.rows[0]?.redeemed_by;
     assert.ok(passwordInviteeId);
+    const attempts = runtimeEnrollments.filter(item => item.inviteId === createdInvite.json().id);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].userId, passwordInviteeId);
+    assert.deepEqual(attempts[0], attempts[1], "runtime binding retries use the same identity");
+    assert.deepEqual(Object.keys(attempts[0]).sort(), ["displayName", "inviteId", "runtimeUsername", "tripId", "userId"]);
+
 
     const duplicateInvite = await app.inject({
       method: "POST", url: `/v1/trips/${ids.ownedTrip}/site-invites`,
@@ -184,6 +202,40 @@ test("portal HTTP authorization separates dashboard, tenant and runtime access",
     });
     assert.equal(badPassword.statusCode, 401);
   } finally { await app.close(); }
+});
+
+test("a ready lifecycle stays closed until its runtime route is ready", { skip }, async () => {
+  const app = buildApp(profile, { portal: portalDeps(pool) });
+  const owner = await session(ids.owner, "route");
+  try {
+    await pool.query(
+      "UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1",
+      [ids.ownedTrip],
+    );
+
+    const withoutRoute = await app.inject({
+      method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: owner.cookie },
+    });
+    assert.equal(withoutRoute.statusCode, 200);
+    assert.equal(withoutRoute.json().runtimeReady, false);
+    assert.equal(withoutRoute.json().nextAction, "view_status");
+
+    await pool.query(
+      `INSERT INTO control_plane.runtime_routes(trip_id, route_ref, state)
+       VALUES ($1, $2, 'ready')`,
+      [ids.ownedTrip, `route_${suffix}ready`],
+    );
+    const withRoute = await app.inject({
+      method: "GET", url: `/v1/trips/${ids.ownedTrip}`, headers: { cookie: owner.cookie },
+    });
+    assert.equal(withRoute.statusCode, 200);
+    assert.equal(withRoute.json().runtimeReady, true);
+    assert.equal(withRoute.json().nextAction, "open_trip");
+  } finally {
+    await pool.query("DELETE FROM control_plane.runtime_routes WHERE trip_id = $1", [ids.ownedTrip]);
+    await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [ids.ownedTrip]);
+    await app.close();
+  }
 });
 
 // ── Provisioning approval: one organizer-driven path ────────────────────────

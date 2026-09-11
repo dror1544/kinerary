@@ -10,6 +10,8 @@ const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
 const livingJourney = require('./living-journey');
+const { createTripEvents } = require('./trip-events');
+const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
@@ -430,6 +432,8 @@ for (const [col, decl] of [
   ['enrichment_status', "TEXT DEFAULT 'none'"],
   ['enriched_at',       'TEXT'],
   ['enrich_attempts',   'INTEGER DEFAULT 0'],
+  ['enrichment_values', "TEXT DEFAULT '{}'"],
+  ['enrichment_generation', 'INTEGER DEFAULT 0'],
   // Minutes-since-midnight, derived from `time` on write. `time` may hold a
   // rough token ("morning"), which would otherwise sort lexically — "afternoon"
   // before "morning" before "noon" — so ordering uses this instead.
@@ -670,7 +674,9 @@ async function initData() {
   } catch (e) { console.error('Bookings seed failed:', e.message); }
 }
 
-initData().catch(console.error);
+const dataReady = initData();
+dataReady.catch(console.error);
+const controlPlaneAuth = createControlPlaneAuth({ app, db, tripDir: TRIP_DIR, config: () => TRIP_CONFIG, ready: dataReady, jwtSecret: JWT_SECRET });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 function getUser(username) {
@@ -696,6 +702,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
     req.user = { username: payload.username };
     next();
   } catch {
@@ -864,6 +871,7 @@ function organizerOrAgentRequired(req, res, next) {
   let payload;
   try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
 
+  if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   // No configured organizer means nobody qualifies. Failing closed here matters
   // more than convenience: the alternative — treating "unset" as "everyone" —
@@ -880,6 +888,34 @@ const journey = livingJourney.create({
   raw: TRIP_CONFIG_RAW,
   fetchImpl: fetch,
   mediaDir: MEDIA_DIR,
+  requestItemEnrichment: (itemUid, { titleChanged = false } = {}) => {
+    // A Modern edit projects into the Classic compatibility table. Queue just
+    // that projected row rather than re-running enrichment for the entire trip.
+    // The background worker owns model calls, so the save request remains fast.
+    if (titleChanged) {
+      db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none', enrich_attempts = 0, " +
+        "enrichment_values = '{}', enrichment_generation = enrichment_generation + 1, " +
+        "needs_tickets = NULL, advance_booking = NULL WHERE itinerary_item_uid = ?").run(itemUid);
+    }
+    if (!HERMES_URL) return { configured: false, queued: false };
+    const result = db.prepare(
+      "UPDATE phase_plan_items SET enrichment_status = 'pending', enrich_attempts = 0 " +
+      "WHERE itinerary_item_uid = ? AND (enrichment_status IS NULL OR enrichment_status IN ('none', 'failed'))"
+    ).run(itemUid);
+    kickEnrichmentSoon();
+    return { configured: true, queued: Boolean(result.changes) };
+  },
+});
+
+// Install after livingJourney creates its tables. This runtime and its auth
+// credentials belong to exactly one trip; clients cannot select another DB.
+const tripEvents = createTripEvents(db);
+app.get('/api/events', authRequired, (req, res) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : req.query._t;
+  // authRequired already verified this token. End streams when it expires.
+  const expiry = token ? jwt.decode(token)?.exp : null;
+  tripEvents.stream(req, res, expiry ? expiry * 1000 : undefined);
 });
 
 const heroUpload = multer({
@@ -1802,6 +1838,10 @@ app.delete('/api/budget/:id', authRequired, (req, res) => {
 // ── BOOKINGS ──────────────────────────────────────────────────────────────────
 
 const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
+// Booking extraction is provider-agnostic. The legacy variables remain as a
+// compatibility fallback while deployments move to the neutral names.
+const EXTRACTION_SERVICE_URL = (process.env.EXTRACTION_SERVICE_URL || HERMES_URL || '').replace(/\/$/, '');
+const EXTRACTION_SERVICE_KEY = process.env.EXTRACTION_SERVICE_API_KEY || HERMES_KEY;
 
 // With no enrichment worker, a row left 'pending' shows a permanent
 // "Finding links…" spinner. On a control-plane-provisioned trip the links
@@ -1816,7 +1856,7 @@ if (!HERMES_URL) {
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 async function extractBookingDetails(req) {
-  if (!HERMES_URL) throw Object.assign(new Error('HERMES_URL not configured'), { status: 503 });
+  if (!EXTRACTION_SERVICE_URL) throw Object.assign(new Error('Booking extraction is not available right now'), { status: 503 });
   const url = req.body?.url;
   // The site's own "Extract Details with AI" upload (site/app.js) sends
   // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
@@ -1829,17 +1869,16 @@ async function extractBookingDetails(req) {
     ? JSON.stringify({ url })
     : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
 
-  const r = await fetch(`${HERMES_URL}/extract`, {
+  const r = await fetch(`${EXTRACTION_SERVICE_URL}/extract`, {
     method: 'POST',
-    headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
+    headers: { 'X-API-Key': EXTRACTION_SERVICE_KEY, 'Content-Type': 'application/json' },
     body,
-    // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
-    // call (mcp/mcp.js) — this used to be shorter (30s), so this call
-    // could time out and error here while trip-mcp's own call was still
-    // legitimately running, producing a confusing failure under load.
+    // Longer than the extraction service's CLI bridge timeout — this call
+    // must not fail while the provider still has a legitimate request in
+    // progress, which would otherwise look like a failed upload.
     timeout: 50000,
   });
-  if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
+  if (!r.ok) throw Object.assign(new Error(`Booking extraction service returned an error (status ${r.status})`), { status: 502 });
   return r.json();
 }
 
@@ -1904,7 +1943,7 @@ app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings', authRequired, (req, res) => {
+app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
   if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
   const result = db.prepare(
@@ -1915,7 +1954,7 @@ app.post('/api/bookings', authRequired, (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
-app.patch('/api/bookings/:id', authRequired, (req, res) => {
+app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
   const updates = [];
   const params = [];
@@ -1928,7 +1967,7 @@ app.patch('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/bookings/:id', authRequired, (req, res) => {
+app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const row = db.prepare('SELECT seed_key FROM bookings WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (row.seed_key) return res.status(403).json({ error: 'seed bookings cannot be deleted' });
@@ -1936,7 +1975,7 @@ app.delete('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, confUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pdf file required' });
   db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, conf_file: req.file.filename });
@@ -1993,7 +2032,7 @@ const pkpassUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/wallet-apple', organizerOrAgentRequired, pkpassUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pkpass file required' });
   db.prepare('UPDATE bookings SET pkpass_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, pkpass_file: req.file.filename });
@@ -2536,6 +2575,13 @@ function cleanLink(u) {
   return typeof u === 'string' && /^https?:\/\//i.test(u.trim()) ? u.trim() : null;
 }
 
+// Model-written itinerary text reaches every trip member. Strip markup before
+// persisting it, just as we do for generated day labels, and keep the model
+// bounded to a single itinerary-line-sized value.
+function cleanEnrichedText(value) {
+  return typeof value === 'string' && value.trim() ? stripTags(value).slice(0, 2000) : null;
+}
+
 function cleanBool(v) {
   if (v === true || v === 1 || v === 'true') return 1;
   if (v === false || v === 0 || v === 'false') return 0;
@@ -2671,19 +2717,46 @@ async function runEnrichmentPass() {
       db.prepare('UPDATE phase_plan_items SET enrich_attempts = enrich_attempts + 1 WHERE id = ?').run(item.id);
       try {
         const out = await enrichOne(item);
+        const current = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(item.id);
+        // The organizer may edit or delete an item while the provider is busy.
+        // Leave the newer generation pending instead of applying stale output.
+        if (!current || current.enrichment_generation !== item.enrichment_generation ||
+            current.text_he !== item.text_he || current.text_en !== item.text_en ||
+            current.date !== item.date || current.phase_id !== item.phase_id) continue;
+        // The organizer enters one title. The enrichment service supplies the
+        // companion language without overwriting Hebrew an organizer authored.
+        // If the primary field was entered in English, replace that temporary
+        // storage value with the Hebrew translation once it is available.
+        const primaryLooksHebrew = /[\u0590-\u05FF]/.test(current.text_he || '');
+        const translatedHe = !current.text_en && !primaryLooksHebrew ? cleanEnrichedText(out.text_he) : null;
+        const translatedEn = !current.text_en ? cleanEnrichedText(out.text_en) : null;
         // Link a real booking if one plainly matches, but never overwrite a
         // link an organizer or agent already set by hand.
-        const bookingId = item.booking_id || findMatchingBooking(item);
-        db.prepare(
-          "UPDATE phase_plan_items SET location_url = COALESCE(?, location_url), waze_url = ?, " +
-          'website_url = ?, ticket_url = ?, needs_tickets = ?, advance_booking = ?, ' +
-          "booking_id = COALESCE(?, booking_id), enrichment_status = 'done', " +
-          "enriched_at = datetime('now') WHERE id = ?"
-        ).run(cleanLink(out.maps_url), cleanLink(out.waze_url),
-              cleanLink(out.website_url), cleanLink(out.ticket_url),
-              cleanBool(out.needs_tickets), cleanBool(out.advance_booking),
-              bookingId, item.id);
+        const fields = {};
+        if (translatedHe) fields.text_he = translatedHe;
+        if (translatedEn) fields.text_en = translatedEn;
+        for (const [key, value] of Object.entries({
+          location_url: cleanLink(out.maps_url), waze_url: cleanLink(out.waze_url),
+          website_url: cleanLink(out.website_url), ticket_url: cleanLink(out.ticket_url),
+          needs_tickets: cleanBool(out.needs_tickets), advance_booking: cleanBool(out.advance_booking),
+          booking_id: current.booking_id ? null : findMatchingBooking(current),
+        })) {
+          if (current[key] == null || current[key] === '') {
+            if (value != null) fields[key] = value;
+          }
+        }
+        let generated;
+        try { generated = JSON.parse(current.enrichment_values || '{}'); } catch { generated = {}; }
+        db.transaction(() => {
+          const assignments = Object.keys(fields).map(key => `${key} = ?`);
+          db.prepare(`UPDATE phase_plan_items SET ${assignments.length ? assignments.join(', ') + ', ' : ''}
+            enrichment_values = ?, enrichment_status = 'done', enriched_at = datetime('now') WHERE id = ?`)
+            .run(...Object.values(fields), JSON.stringify({ ...generated, ...fields }), item.id);
+          journey.applyItemEnrichment(current, fields);
+        })();
       } catch (e) {
+        const current = db.prepare('SELECT enrichment_generation FROM phase_plan_items WHERE id = ?').get(item.id);
+        if (!current || current.enrichment_generation !== item.enrichment_generation) continue;
         const attempts = db.prepare('SELECT enrich_attempts a FROM phase_plan_items WHERE id = ?').get(item.id)?.a || 0;
         if (attempts >= ENRICH_MAX_ATTEMPTS) {
           db.prepare("UPDATE phase_plan_items SET enrichment_status = 'failed' WHERE id = ?").run(item.id);

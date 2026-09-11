@@ -101,9 +101,9 @@ async function launch(req, res, tripId) {
   const route = await routeFor(tripId);
   const sessionResponse = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/session`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": EXCHANGE_KEY },
-    body: JSON.stringify({ userId: grant.userId, role: grant.role, runtimeUsername: grant.runtimeUsername }),
+    body: JSON.stringify({ tripId, userId: grant.userId, role: grant.role, runtimeUsername: grant.runtimeUsername }),
   });
-  if (!sessionResponse.ok) return json(res, 503, { error: "RUNTIME_SESSION_FAILED" });
+  if (!sessionResponse.ok) return json(res, [400, 401, 403].includes(sessionResponse.status) ? 401 : 503, { error: "RUNTIME_SESSION_FAILED" });
   const runtime = await sessionResponse.json();
   if (typeof runtime.token !== "string") return json(res, 503, { error: "RUNTIME_SESSION_FAILED" });
   const value = encodeSession({ tripId, token: runtime.token, exp: Date.now() + 12 * 60 * 60 * 1000 });
@@ -133,7 +133,7 @@ async function participantExists(req, res, tripId, runtimeUsername) {
   if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(runtimeUsername)) return json(res, 400, { error: "INVALID_REQUEST" });
   const route = await routeFor(tripId);
   const response = await fetch(`${route.upstreamOrigin}${route.upstreamBasePath}/api/internal/control-plane/participants/${encodeURIComponent(runtimeUsername)}`, {
-    method: "GET", headers: { "x-api-key": EXCHANGE_KEY },
+    method: "GET", headers: { "x-api-key": EXCHANGE_KEY, "x-control-plane-trip-id": tripId },
   });
   const payload = await response.text();
   res.writeHead(response.status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -151,11 +151,21 @@ async function proxy(req, res, tripId, suffix, session) {
   const upstream = transport.request({ protocol: origin.protocol, hostname: origin.hostname, port: origin.port || undefined, method: req.method, path: targetPath, headers }, (upstreamResponse) => {
     const responseHeaders = { ...upstreamResponse.headers };
     delete responseHeaders["set-cookie"];
+    // Trip nginx serves direct sites with X-Frame-Options: DENY. The managed
+    // portal deliberately frames them, so replace that policy with a CSP
+    // restricted to the configured portal, preserving other CSP directives.
+    delete responseHeaders["x-frame-options"];
+    const upstreamCsp = String(responseHeaders["content-security-policy"] || "");
+    const csp = upstreamCsp.split(";").map(part => part.trim()).filter(part => part && !/^frame-ancestors(?:\s|$)/i.test(part));
+    responseHeaders["content-security-policy"] = [...csp, `frame-ancestors ${PORTAL_ORIGIN}`].join("; ");
+
     if (typeof responseHeaders.location === "string" && responseHeaders.location.startsWith("/")) responseHeaders.location = `/t/${tripId}${responseHeaders.location}`;
     res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
     upstreamResponse.pipe(res);
   });
   upstream.on("error", () => { if (!res.headersSent) json(res, 502, { error: "RUNTIME_UNAVAILABLE" }); else res.destroy(); });
+  // A closed browser must also release its long-lived upstream SSE stream.
+  res.on("close", () => upstream.destroy());
   req.pipe(upstream);
 }
 
@@ -174,6 +184,20 @@ export function createRuntimeGateway() {
       if (!/^trip_[A-Za-z0-9]{8,64}$/.test(tripId)) return json(res, 404, { error: "NOT_FOUND" });
       const suffix = match[2] || "/";
       if (suffix === "/__launch" && req.method === "POST") return await launch(req, res, tripId);
+      if (suffix === "/__signed_out" && req.method === "GET") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": `default-src 'none'; frame-ancestors ${PORTAL_ORIGIN}` });
+        return res.end("<!doctype html><title>Signed out</title><p>You have signed out of this trip. Return to your personal space to open it again.</p>");
+      }
+      if (suffix === "/__logout" && req.method === "POST") {
+        if (req.headers["x-kinerary-logout"] !== "1" || (req.headers.origin && req.headers.origin !== RUNTIME_ORIGIN)) {
+          return json(res, 403, { error: "ORIGIN_REJECTED" });
+        }
+        res.setHeader("set-cookie", `kit_runtime=; Path=/t/${tripId}/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie ? "; Secure" : ""}`);
+        return json(res, 200, { portalUrl: PORTAL_ORIGIN });
+      }
+      // Internal identity endpoints are exclusively server-to-server.
+      if (suffix.startsWith("/api/internal/")) return json(res, 404, { error: "NOT_FOUND" });
+
       const session = decodeSession(cookieValue(req, "kit_runtime"));
       if (!session || session.tripId !== tripId) {
         if (req.method !== "GET" || suffix !== "/") return json(res, 401, { error: "AUTHENTICATION_REQUIRED" });

@@ -186,6 +186,7 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
             cur.execute("DELETE FROM control_plane.jobs WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.plans WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.intake_versions WHERE trip_id = %s", (trip_id,))
+            cur.execute("DELETE FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.releases WHERE id = %s", (fix["release_id"],))
@@ -264,6 +265,16 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["lifecycle_state"], "ready_private")
 
+    def test_happy_path_registers_a_ready_runtime_route(self) -> None:
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT route_ref, state FROM control_plane.runtime_routes WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertRegex(row["route_ref"], r"^route_[A-Za-z0-9]{8,64}$")
+        self.assertEqual(row["state"], "ready")
+
     def test_happy_path_consumes_approval(self) -> None:
         self.worker.run_once()
         row = self.conn.execute(
@@ -329,6 +340,24 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.worker.run_once()
         sidecars = self.fake_deploy.deployed[0]["sidecars"]
         self.assertEqual([], sidecars["trivia_questions.json"])
+        identity = sidecars["control-plane.identity.json"]
+        self.assertEqual(self.fix["trip_id"], identity["tripId"])
+        self.assertIsNone(identity["owner"], "an unresolved organizer must not be guessed")
+
+    def test_owner_identity_is_bound_to_the_resolved_local_organizer(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "travelers": {"kind": "structured", "schema_version": 2,
+                          "data": [{"name": "Alice", "name_en": "Alice", "age": 35}]},
+            "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Alice"},
+        })
+        self.worker.run_once()
+        deployed = self.fake_deploy.deployed[0]
+        identity = deployed["sidecars"]["control-plane.identity.json"]
+        self.assertEqual(self.fix["user_id"], identity["owner"]["userId"])
+        self.assertIn(identity["owner"]["username"], deployed["config"]["agent"]["organizers"])
+        self.assertNotIn("control_plane_user_id", json.dumps(deployed["config"]))
 
     def test_bookings_sidecar_is_derived_from_phases_and_anchors(self) -> None:
         teardown_fixture(self.conn, self.fix)

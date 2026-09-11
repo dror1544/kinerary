@@ -976,9 +976,13 @@ async function checkAuth() {
   return false;
 }
 
-function doLogout() {
-  localStorage.removeItem('trip-token');
-  localStorage.removeItem('trip-user');
+async function doLogout() {
+  if (window.runtimeLogout) {
+    try { await window.runtimeLogout(); }
+    catch { alert('Sign out failed. Please try again.'); }
+    return;
+  }
+  ['trip-token', 'tripToken', 'token', 'trip-user'].forEach(key => localStorage.removeItem(key));
   currentUser = null;
   const smUser = document.getElementById('sm-user');
   if (smUser) smUser.style.display = 'none';

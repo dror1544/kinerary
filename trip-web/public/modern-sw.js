@@ -1,4 +1,4 @@
-const CACHE = "kinerary-modern-v2";
+const CACHE = "kinerary-modern-v3";
 const SHELL = ["./", "./index.html"];
 
 self.addEventListener("install", (event) => {

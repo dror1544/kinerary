@@ -139,10 +139,28 @@ token and logs it (`connector.ts:164-166`), then discards it.
 
 **The gateway id is the profile name.** One address, derived from the binding
 already stored in `trip_chat_bindings.hermes_profile`, with no second registry
-to keep in sync. `hermes gateway enroll` persists `GATEWAY_RELAY_ID` /
-`GATEWAY_RELAY_SECRET` / `GATEWAY_RELAY_URL` into the profile's `.env`
-(`hermes_cli/gateway_enroll.py:234`), so the identity a gateway presents is
-provisioned, not asserted.
+to keep in sync.
+
+`scripts/companion-install-host.sh` writes `GATEWAY_RELAY_URL` /
+`GATEWAY_RELAY_ID` / `GATEWAY_RELAY_SECRET` into the profile's `.env` as part
+of installing the companion, and starts the gateway under a launchd label of
+its own — so the identity a gateway presents is provisioned, not asserted.
+Both values are derived host-side from the same architecture profile the relay
+itself reads; neither comes from the handoff.
+
+**Not** `hermes gateway enroll`, despite the name. That subcommand redeems a
+single-use token against the hosted Nous connector and requires a portal
+login. This relay authenticates a gateway with a shared secret and takes its
+identity from the id, so per-trip enrollment here is "same secret, distinct
+id" — three env stamps, no round trip.
+
+Until 2026-09-10 nothing performed that step at all, and this section
+described the wrong command as though it did. Two trips shipped unenrolled.
+The failure is not silence: with no identity of its own, a gateway is served
+the fallback's traffic, so japan-2026's organizer was answered *in the
+interviewer's voice, out of the interviewer's profile*, about their own trip.
+It was repaired by hand and not written down, so italy-2026 shipped the same
+way hours later.
 
 ### The one declared exception
 
