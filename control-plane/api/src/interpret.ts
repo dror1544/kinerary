@@ -354,6 +354,9 @@ export interface AcceptedProposal {
   questionId: string;
   answer: IntakeAnswer;
   proposal: ProposedAnswer;
+  /** Set when the answer was assembled from several structured proposals for
+   *  the same question — see `mergeStructuredParts`. Absent for a single one. */
+  mergedFrom?: number;
 }
 
 export interface RejectedProposal {
@@ -386,6 +389,133 @@ export interface ApplyProposalsContext {
 }
 
 export const DEFAULT_MIN_CONFIDENCE = 0.7;
+
+// ── Merging a structured answer the model split ──────────────────────────────
+//
+// Several documents are read as one source (runDocumentPath), so one call sees
+// the hotels and the tickets together — and still, sometimes, answers `phases`
+// twice: the stays in one proposal, the attractions in another. Winner-takes-all
+// then kept whichever was more confident and discarded the rest, which on
+// 2026-09-11 dropped every ticketed attraction from a four-document Italy trip.
+//
+// For a structured answer the parts are not rivals, they are slices. Each part
+// that passes the gate on its own merits is combined here, entry by entry.
+// Text and choices are still winner-takes-all: two destinations cannot be
+// merged, only chosen between.
+
+function isBlank(v: unknown): boolean {
+  return v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Key order must not make two identical entries look different. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (isRecord(v)) {
+    return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v) ?? "null";
+}
+
+/**
+ * What makes two entries the same thing: a stop, a traveler and a booking are
+ * each identified by their name (a booking also by its type — a hotel and a
+ * flight can share a name, two flights on one reference cannot). Anything
+ * without a name is only the same as an identical copy of itself.
+ */
+function entryKey(entry: unknown): string {
+  if (typeof entry === "string") return `s:${fold(entry)}`;
+  if (isRecord(entry)) {
+    const name = [entry.name_en, entry.name].find((n) => typeof n === "string" && n.trim() !== "");
+    if (typeof name === "string") {
+      const type = typeof entry.type === "string" ? fold(entry.type) : "";
+      return `n:${type}|${fold(name)}`;
+    }
+  }
+  return `j:${canonical(entry)}`;
+}
+
+/** `primary` wins every field both set; `secondary` only fills what is missing. */
+function mergeRecords(primary: Record<string, unknown>, secondary: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...primary };
+  for (const [key, value] of Object.entries(secondary)) {
+    const held = out[key];
+    if (isBlank(held)) out[key] = value;
+    else if (Array.isArray(held) && Array.isArray(value)) out[key] = mergeLists(held, value);
+    else if (isRecord(held) && isRecord(value)) out[key] = mergeRecords(held, value);
+  }
+  return out;
+}
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+function isoOf(v: unknown): string | null {
+  return typeof v === "string" && ISO_DAY.test(v) ? v : null;
+}
+
+/**
+ * Same name, but the same visit? A trip can return to a city, and a hotel can
+ * be booked twice — so the dates decide when both sides have them: the same
+ * start, or one starting inside the other's range. An undated side has nothing
+ * to contradict it and joins.
+ */
+function sameVisit(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const aStart = isoOf(a.start) ?? isoOf(a.date);
+  const bStart = isoOf(b.start) ?? isoOf(b.date);
+  if (!aStart || !bStart || aStart === bStart) return true;
+  const aEnd = isoOf(a.end), bEnd = isoOf(b.end);
+  return (aEnd !== null && bStart > aStart && bStart < aEnd) || (bEnd !== null && aStart > bStart && aStart < bEnd);
+}
+
+/**
+ * `secondary` folded into `primary`. Entries of ONE list are never merged with
+ * each other — the model listed them separately, and two Tokyo legs are two
+ * legs. An entry only ever joins one that came from an earlier proposal.
+ */
+function mergeLists(primary: readonly unknown[], secondary: readonly unknown[]): unknown[] {
+  const out: unknown[] = [...primary];
+  const earlier = out.length;
+  for (const entry of secondary) {
+    const key = entryKey(entry);
+    if (!isRecord(entry)) {
+      if (!out.some((e) => entryKey(e) === key)) out.push(entry);
+      continue;
+    }
+    let match = -1;
+    for (let i = 0; i < earlier && match === -1; i += 1) {
+      const held = out[i];
+      if (isRecord(held) && entryKey(held) === key && sameVisit(held, entry)) match = i;
+    }
+    if (match === -1) out.push(entry);
+    else out[match] = mergeRecords(out[match] as Record<string, unknown>, entry);
+  }
+  return out;
+}
+
+/**
+ * Combines the data of several structured proposals for one question, given
+ * in precedence order (most confident first). A list merges entry by entry; an
+ * object key by key. A list whose every entry carries an ISO `start` — which is
+ * what a stop is — comes back in date order, because the parts arrive in the
+ * order the documents happened to be read, not the order of the trip.
+ */
+export function mergeStructuredParts(parts: readonly unknown[]): unknown {
+  const [first, ...rest] = parts;
+  if (Array.isArray(first)) {
+    const merged = rest.reduce<unknown[]>((acc, p) => (Array.isArray(p) ? mergeLists(acc, p) : acc), first);
+    const dated = merged.every((e) => isRecord(e) && typeof e.start === "string" && ISO_DAY.test(e.start));
+    return dated
+      ? [...merged].sort((a, b) => String((a as { start: string }).start).localeCompare(String((b as { start: string }).start)))
+      : merged;
+  }
+  if (isRecord(first)) {
+    return rest.reduce<Record<string, unknown>>((acc, p) => (isRecord(p) ? mergeRecords(acc, p) : acc), first);
+  }
+  return first;
+}
 
 /** The one-for-one mapping onto `validateAnswer`'s parameter list. */
 function validateProposed(
@@ -423,31 +553,95 @@ export function applyProposals(
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
 
+  const accepted: AcceptedProposal[] = [];
+  const rejected: RejectedProposal[] = [];
+  const reject = (proposal: ProposedAnswer, reason: RejectReason, detail?: string) =>
+    rejected.push({ questionId: proposal.questionId, reason, detail, proposal });
+
+  const isStructured = (p: ProposedAnswer) => p.value.kind === "structured";
+
   // Highest confidence wins a contested question; ties go to the earlier
   // proposal. The model's ordering carries no meaning, but its confidence does.
+  // Only for answers that cannot be merged — structured ones are grouped below.
   const winner = new Map<string, number>();
   proposals.forEach((p, i) => {
+    if (isStructured(p)) return;
     const held = winner.get(p.questionId);
     const holder = held === undefined ? undefined : proposals[held];
     if (!holder || p.confidence > holder.confidence) winner.set(p.questionId, i);
   });
 
-  const accepted: AcceptedProposal[] = [];
-  const rejected: RejectedProposal[] = [];
+  const groups = new Map<string, number[]>();
+  proposals.forEach((p, i) => {
+    if (isStructured(p)) groups.set(p.questionId, [...(groups.get(p.questionId) ?? []), i]);
+  });
+
+  // What a proposal must pass on its own merits, before anything is combined.
+  const ownMerits = (p: ProposedAnswer): { reason: RejectReason; detail?: string } | null => {
+    if (RETIRED_QUESTION_IDS.has(p.questionId)) return { reason: "NOT_OUTSTANDING", detail: "retired question" };
+    if (answered.has(p.questionId)) return { reason: "ALREADY_ANSWERED" };
+    if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
+    if (p.confidence < minConfidence) return { reason: "LOW_CONFIDENCE" };
+    if (!evidenceAppears(p.evidence, ctx.sourceText)) return { reason: "EVIDENCE_NOT_IN_SOURCE" };
+    return null;
+  };
+
+  const decideStructured = (parts: ProposedAnswer[]) => {
+    const passing: ProposedAnswer[] = [];
+    for (const p of parts) {
+      const refused = ownMerits(p);
+      if (refused) reject(p, refused.reason, refused.detail);
+      else passing.push(p);
+    }
+    if (passing.length === 0) return;
+    // Stable, so a tie keeps document order — the same rule as `winner`.
+    const ordered = [...passing].sort((a, b) => b.confidence - a.confidence);
+    const primary = ordered[0]!;
+
+    if (ordered.length > 1) {
+      const merged: ProposedAnswer = {
+        questionId: primary.questionId,
+        value: { kind: "structured", data: mergeStructuredParts(ordered.map((p) => (p.value as { data: unknown }).data)) },
+        // As sure as its least sure part: every part was checked on its own,
+        // and the answer is only as good as the weakest slice of it.
+        confidence: Math.min(...ordered.map((p) => p.confidence)),
+        evidence: [...new Set(ordered.flatMap((p) => p.evidence.split("\n")))].join("\n"),
+        sourceMessageId: primary.sourceMessageId,
+      };
+      const validated = validateProposed(merged, questions);
+      if (validated.ok) {
+        accepted.push({ questionId: primary.questionId, answer: validated.answer, proposal: merged, mergedFrom: ordered.length });
+        return;
+      }
+      // Refused as a whole: fall back to exactly what the gate did before
+      // merging existed, and say why the others were left out.
+      const why = `merge refused: ${validated.reason}${validated.detail ? ` — ${validated.detail}` : ""}`;
+      for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
+    }
+
+    const validated = validateProposed(primary, questions);
+    if (!validated.ok) return reject(primary, validated.reason, validated.detail);
+    accepted.push({ questionId: primary.questionId, answer: validated.answer, proposal: primary });
+  };
 
   proposals.forEach((proposal, i) => {
-    const reject = (reason: RejectReason, detail?: string) =>
-      rejected.push({ questionId: proposal.questionId, reason, detail, proposal });
+    if (isStructured(proposal)) {
+      // Decided once per question, at its first proposal, so `accepted` keeps
+      // the order the model answered in.
+      const group = groups.get(proposal.questionId)!;
+      if (group[0] === i) decideStructured(group.map((j) => proposals[j]!));
+      return;
+    }
 
-    if (RETIRED_QUESTION_IDS.has(proposal.questionId)) return reject("NOT_OUTSTANDING", "retired question");
-    if (answered.has(proposal.questionId)) return reject("ALREADY_ANSWERED");
-    if (!outstanding.has(proposal.questionId)) return reject("NOT_OUTSTANDING");
-    if (winner.get(proposal.questionId) !== i) return reject("DUPLICATE_PROPOSAL");
-    if (proposal.confidence < minConfidence) return reject("LOW_CONFIDENCE");
-    if (!evidenceAppears(proposal.evidence, ctx.sourceText)) return reject("EVIDENCE_NOT_IN_SOURCE");
+    if (RETIRED_QUESTION_IDS.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING", "retired question");
+    if (answered.has(proposal.questionId)) return reject(proposal, "ALREADY_ANSWERED");
+    if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
+    if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
+    if (proposal.confidence < minConfidence) return reject(proposal, "LOW_CONFIDENCE");
+    if (!evidenceAppears(proposal.evidence, ctx.sourceText)) return reject(proposal, "EVIDENCE_NOT_IN_SOURCE");
 
     const validated = validateProposed(proposal, questions);
-    if (!validated.ok) return reject(validated.reason, validated.detail);
+    if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
     accepted.push({ questionId: proposal.questionId, answer: validated.answer, proposal });
   });
 
@@ -792,7 +986,7 @@ export interface InterpretationRow {
 /** The gate's verdict, flattened for storage. Reasons are kept per question so
  *  a later run can be compared against this one without re-inferring why. */
 export interface StoredOutcomes {
-  accepted?: { questionId: string; confidence: number }[];
+  accepted?: { questionId: string; confidence: number; mergedFrom?: number }[];
   rejected?: { questionId: string; reason: RejectReason; detail?: string }[];
   askAnyway?: string[];
   malformed?: number;
@@ -895,7 +1089,11 @@ export async function markInterpretationCommitted(
 /** Flattens the gate's verdict for storage. */
 export function storedOutcomes(decisions: ProposalDecisions, malformed: number): StoredOutcomes {
   return {
-    accepted: decisions.accepted.map((a) => ({ questionId: a.questionId, confidence: a.proposal.confidence })),
+    accepted: decisions.accepted.map((a) => ({
+      questionId: a.questionId,
+      confidence: a.proposal.confidence,
+      ...(a.mergedFrom ? { mergedFrom: a.mergedFrom } : {}),
+    })),
     rejected: decisions.rejected.map((r) => ({ questionId: r.questionId, reason: r.reason, detail: r.detail })),
     askAnyway: decisions.askAnyway,
     malformed,

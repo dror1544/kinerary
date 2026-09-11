@@ -8,6 +8,7 @@ import {
   evidenceAppears,
   interpretBurst,
   parseInterpretPayload,
+  storedOutcomes,
   submitArgsFor,
   buildExtractIntakePrompt,
   type ProposedAnswer,
@@ -356,6 +357,242 @@ describe("applyProposals — the gate", () => {
   test("no proposals is a valid, quiet outcome", () => {
     const { accepted, rejected, askAnyway } = applyProposals([], CTX);
     assert.deepEqual([accepted.length, rejected.length, askAnyway.length], [0, 0, 0]);
+  });
+});
+
+// Four Italy documents, read as one source. On 2026-09-11 the extractor split
+// `phases` into two proposals over exactly this shape — the hotels in one, the
+// ticketed attractions in the other — and winner-takes-all kept the hotels and
+// threw the attractions away. The organizer's summary then showed no places at
+// all, which reads as the tickets never having been understood.
+describe("applyProposals — a structured answer split across proposals", () => {
+  const MERGE_QUESTIONS: IntakeQuestion[] = [
+    ...QUESTIONS,
+    { id: "phases", type: "structured", prompt: "Stops?", required: true, dataShape: "array" },
+    { id: "travel_anchors", type: "structured", prompt: "Bookings?", required: false, dataShape: "array" },
+    { id: "constraints", type: "structured", prompt: "Constraints?", required: false, dataShape: "object" },
+  ];
+  const SOURCE = [
+    "Rome: Hotel Artemide, check-in 02 May 2026, check-out 06 May 2026",
+    "Florence: Hotel Davanzati, check-in 06 May 2026, check-out 09 May 2026",
+    "Colosseum Underground, Rome, 2026-05-03",
+    "Uffizi Gallery, Florence, 2026-05-07",
+    "Vatican Museums, Rome, 2026-05-04",
+    "Outbound LY381 02 May 2026, Return LY382 12 May 2026, booking XR7T2Q",
+    "Dana Levi, Omri Levi (12), Yael Levi",
+    "Omri uses a wheelchair. Budget is moderate.",
+  ].join("\n");
+  const MCTX = {
+    sourceText: SOURCE,
+    outstanding: ["phases", "travel_anchors", "travelers", "constraints", "destination"],
+    answered: [] as string[],
+    questions: MERGE_QUESTIONS,
+  };
+  const hotels = [
+    { name: "Rome", start: "2026-05-02", end: "2026-05-06", accommodation: { name: "Hotel Artemide" } },
+    { name: "Florence", start: "2026-05-06", end: "2026-05-09", accommodation: { name: "Hotel Davanzati" } },
+  ];
+  const tickets = [
+    { name: "Rome", planned: ["Colosseum Underground"] },
+    { name: "Florence", planned: ["Uffizi Gallery"] },
+  ];
+  const part = (questionId: string, data: unknown, evidence: string, confidence = 0.9) =>
+    proposal({ questionId, value: { kind: "structured", data }, evidence, confidence });
+
+  test("hotels in one proposal and planned places in another become one answer carrying both", () => {
+    const { accepted, rejected } = applyProposals(
+      [
+        part("phases", hotels, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati", 0.92),
+        part("phases", tickets, "Colosseum Underground\nUffizi Gallery", 0.88),
+      ],
+      MCTX,
+    );
+    assert.equal(rejected.length, 0);
+    assert.equal(accepted.length, 1);
+    assert.equal(accepted[0]?.mergedFrom, 2);
+    const answer = accepted[0]?.answer as { data: unknown };
+    assert.deepEqual(answer.data, [
+      { name: "Rome", start: "2026-05-02", end: "2026-05-06", accommodation: { name: "Hotel Artemide" }, planned: ["Colosseum Underground"] },
+      { name: "Florence", start: "2026-05-06", end: "2026-05-09", accommodation: { name: "Hotel Davanzati" }, planned: ["Uffizi Gallery"] },
+    ]);
+  });
+
+  test("a stop only one proposal names is kept, and stops come back in date order", () => {
+    const { accepted } = applyProposals(
+      [
+        part("phases", [hotels[1]], "Florence: Hotel Davanzati"),
+        part("phases", [hotels[0]], "Rome: Hotel Artemide"),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { name: string }[] }).data;
+    assert.deepEqual(data.map((p) => p.name), ["Rome", "Florence"]);
+  });
+
+  test("where both set the same field differently, the more confident proposal wins that field", () => {
+    const { accepted } = applyProposals(
+      [
+        part("phases", [{ name: "Rome", start: "2026-05-02", end: "2026-05-05" }], "Rome: Hotel Artemide", 0.75),
+        part("phases", [{ name: "rome", start: "2026-05-02", end: "2026-05-06" }], "check-out 06 May 2026", 0.95),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { end: string }[] }).data;
+    assert.equal(data.length, 1, "the same stop spelled in another case is one stop");
+    assert.equal(data[0]?.end, "2026-05-06");
+  });
+
+  // A trip that ends where it began: the Hebrew interview harness's own answer
+  // was "Tokyo 19-23, Hakone, Kyoto, Osaka, then back to Tokyo until the 3rd".
+  // Matching stops by name alone would fold the two Tokyo legs into one.
+  test("the same city visited twice stays two stops", () => {
+    const itinerary = [
+      { name: "Rome", start: "2026-05-02", end: "2026-05-06" },
+      { name: "Florence", start: "2026-05-06", end: "2026-05-09" },
+      { name: "Rome", start: "2026-05-09", end: "2026-05-12" },
+    ];
+    const { accepted } = applyProposals(
+      [
+        part("phases", itinerary, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati", 0.92),
+        part("phases", [{ name: "Rome", start: "2026-05-10", planned: ["Vatican Museums"] }], "Vatican Museums", 0.85),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { name: string; start: string; planned?: string[] }[] }).data;
+    assert.deepEqual(data.map((p) => `${p.name} ${p.start}`), ["Rome 2026-05-02", "Florence 2026-05-06", "Rome 2026-05-09"]);
+    assert.deepEqual(data[2]?.planned, ["Vatican Museums"], "a dated place lands on the visit its date falls in");
+    assert.equal(data[0]?.planned, undefined);
+  });
+
+  test("an undated slice joins the first stop of that name, and adds no stop", () => {
+    const { accepted } = applyProposals(
+      [
+        part("phases", [{ name: "Rome", start: "2026-05-02", end: "2026-05-06" }, { name: "Rome", start: "2026-05-09", end: "2026-05-12" }],
+          "Rome: Hotel Artemide"),
+        part("phases", [{ name: "Rome", planned: ["Colosseum Underground"] }], "Colosseum Underground"),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { planned?: string[] }[] }).data;
+    assert.equal(data.length, 2);
+    assert.deepEqual(data[0]?.planned, ["Colosseum Underground"]);
+  });
+
+  test("two stays at one hotel on different dates are two bookings", () => {
+    const { accepted } = applyProposals(
+      [
+        part("travel_anchors", [{ type: "hotel", name: "Hotel Artemide", date: "2026-05-02" }], "Rome: Hotel Artemide"),
+        part("travel_anchors", [{ type: "hotel", name: "Hotel Artemide", date: "2026-05-09" }], "Rome: Hotel Artemide"),
+      ],
+      MCTX,
+    );
+    assert.equal((accepted[0]?.answer as { data: unknown[] }).data.length, 2);
+  });
+
+  test("planned places are unioned, without the same place twice", () => {
+    const { accepted } = applyProposals(
+      [
+        part("phases", [{ name: "Rome", planned: ["Colosseum Underground", "Vatican Museums"] }], "Colosseum Underground\nVatican Museums"),
+        part("phases", [{ name: "Rome", planned: ["colosseum underground"] }], "Colosseum Underground"),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { planned: string[] }[] }).data;
+    assert.deepEqual(data[0]?.planned, ["Colosseum Underground", "Vatican Museums"]);
+  });
+
+  test("bookings from two documents are unioned; the same booking named twice is kept once", () => {
+    const flights = [
+      { type: "flight", name: "LY381", confirmation: "XR7T2Q" },
+      { type: "flight", name: "LY382", confirmation: "XR7T2Q" },
+    ];
+    const { accepted } = applyProposals(
+      [
+        part("travel_anchors", flights, "Outbound LY381 02 May 2026, Return LY382 12 May 2026, booking XR7T2Q"),
+        part("travel_anchors", [flights[0], { type: "hotel", name: "Hotel Artemide" }], "Rome: Hotel Artemide"),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: { name: string }[] }).data;
+    assert.deepEqual(data.map((a) => a.name), ["LY381", "LY382", "Hotel Artemide"],
+      "two flights on one booking reference are two bookings, not one");
+  });
+
+  test("travelers merge by name, each filling the other's gaps", () => {
+    const { accepted } = applyProposals(
+      [
+        part("travelers", [{ name: "Dana Levi" }, { name: "Omri Levi" }], "Dana Levi, Omri Levi"),
+        part("travelers", [{ name: "Omri Levi", age: 12 }, { name: "Yael Levi" }], "Omri Levi (12), Yael Levi"),
+      ],
+      MCTX,
+    );
+    const data = (accepted[0]?.answer as { data: unknown }).data;
+    assert.deepEqual(data, [{ name: "Dana Levi" }, { name: "Omri Levi", age: 12 }, { name: "Yael Levi" }]);
+  });
+
+  test("an object answer merges key by key", () => {
+    const { accepted } = applyProposals(
+      [
+        part("constraints", { mobility: "Omri uses a wheelchair" }, "Omri uses a wheelchair"),
+        part("constraints", { budget: "moderate" }, "Budget is moderate"),
+      ],
+      MCTX,
+    );
+    assert.deepEqual((accepted[0]?.answer as { data: unknown }).data,
+      { mobility: "Omri uses a wheelchair", budget: "moderate" });
+  });
+
+  // A merge only combines proposals that were each acceptable on their own. It
+  // is not a way for a weak or invented part to ride in on a strong one.
+  test("a part that fails confidence contributes nothing, and says why", () => {
+    const { accepted, rejected } = applyProposals(
+      [
+        part("phases", hotels, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati", 0.9),
+        part("phases", tickets, "Colosseum Underground\nUffizi Gallery", 0.4),
+      ],
+      MCTX,
+    );
+    assert.equal(accepted[0]?.mergedFrom, undefined);
+    assert.deepEqual((accepted[0]?.answer as { data: unknown }).data, hotels);
+    assert.deepEqual(rejected.map((r) => r.reason), ["LOW_CONFIDENCE"]);
+  });
+
+  test("a part whose evidence is not in the source contributes nothing", () => {
+    const { accepted, rejected } = applyProposals(
+      [
+        part("phases", hotels, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati"),
+        part("phases", [{ name: "Venice", planned: ["Doge's Palace"] }], "Doge's Palace, Venice"),
+      ],
+      MCTX,
+    );
+    assert.deepEqual((accepted[0]?.answer as { data: { name: string }[] }).data.map((p) => p.name), ["Rome", "Florence"]);
+    assert.deepEqual(rejected.map((r) => r.reason), ["EVIDENCE_NOT_IN_SOURCE"]);
+  });
+
+  test("a merged answer the question refuses falls back to the most confident part, as before", () => {
+    const atMostTwo: IntakeQuestion[] = MERGE_QUESTIONS.map((q) =>
+      q.id === "phases" ? { ...q, checkComplete: (d: unknown) => (Array.isArray(d) && d.length <= 2 ? null : "too many") } : q);
+    const { accepted, rejected } = applyProposals(
+      [
+        part("phases", hotels, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati", 0.95),
+        part("phases", [{ name: "Venice" }], "Uffizi Gallery", 0.8),
+      ],
+      { ...MCTX, questions: atMostTwo },
+    );
+    assert.deepEqual((accepted[0]?.answer as { data: unknown }).data, hotels);
+    assert.equal(rejected[0]?.reason, "DUPLICATE_PROPOSAL");
+    assert.match(rejected[0]?.detail ?? "", /INCOMPLETE_ANSWER/);
+  });
+
+  test("the stored outcome says an answer was merged, and from how many", () => {
+    const decisions = applyProposals(
+      [
+        part("phases", hotels, "Rome: Hotel Artemide\nFlorence: Hotel Davanzati", 0.92),
+        part("phases", tickets, "Colosseum Underground\nUffizi Gallery", 0.88),
+      ],
+      MCTX,
+    );
+    assert.deepEqual(storedOutcomes(decisions, 0).accepted, [{ questionId: "phases", confidence: 0.88, mergedFrom: 2 }]);
   });
 });
 

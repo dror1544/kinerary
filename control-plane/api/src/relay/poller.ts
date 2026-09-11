@@ -967,6 +967,9 @@ async function runDocumentPath(
     proposed: result.payload.proposals.length,
     malformed: result.payload.malformed ?? 0,
     accepted: decisions.accepted.length,
+    // An answer assembled from several proposals for one question — the case
+    // that, before merging, silently dropped a document's attractions.
+    merged: decisions.accepted.filter((a) => a.mergedFrom).length,
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
     ms: result.ms,
@@ -1225,6 +1228,7 @@ async function runInterpretPath(
   log(structuredLog("info", "interview.interpret_committed", {
     session_id: burst.sessionId,
     accepted: decisions.accepted.length,
+    merged: decisions.accepted.filter((a) => a.mergedFrom).length,
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
   }));
