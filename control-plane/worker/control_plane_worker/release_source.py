@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -31,9 +32,21 @@ class ReleaseSourceError(RuntimeError):
         self.safe_error_code = safe_error_code
 
 
+def _safe_directory(repo_root: str) -> list[str]:
+    """`-c safe.directory=` for exactly this repository.
+
+    The worker runs as root against a repository it did not create. On the
+    Proxmox VM /repo is a bind mount owned by the operator's uid, and git
+    refuses that ("detected dubious ownership"), which failed every release
+    verification. Only the repository the worker was handed is trusted — the
+    path as given and, if different, its real path — never a wildcard."""
+    paths = {os.path.abspath(repo_root), os.path.realpath(repo_root)}
+    return [arg for path in sorted(paths) for arg in ("-c", f"safe.directory={path}")]
+
+
 def _git(repo_root: str, *args: str, binary: bool = False):
     result = subprocess.run(
-        ["git", "-C", repo_root, *args],
+        ["git", *_safe_directory(repo_root), "-C", repo_root, *args],
         capture_output=True,
         check=False,
     )
