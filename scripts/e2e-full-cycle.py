@@ -47,7 +47,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 API = os.environ.get("KINERARY_API", "http://127.0.0.1:4310")
-PG = "kinerary-control-plane-local-postgres-1"
+# Which stack this run inspects. The Mac's local compose project by default;
+# `kinerary-cp` on the Proxmox VM (control-plane/deployment/compose.vm.yml),
+# where the runner runs ON the VM so loopback addresses mean the VM's own.
+PROJECT = os.environ.get("KINERARY_COMPOSE_PROJECT", "kinerary-control-plane-local")
+MAC_STACK = PROJECT == "kinerary-control-plane-local"
+PG = f"{PROJECT}-postgres-1"
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -140,10 +145,10 @@ def stage_preflight() -> None:
     # so `docker compose up` in the wrong directory runs the wrong branch in
     # silence. Read the markers off the RUNNING containers.
     markers = [
-        ("kinerary-control-plane-local-api-1", ["ls", "/app/dist/interpret.js"], "document reading"),
-        ("kinerary-control-plane-local-api-1",
+        (f"{PROJECT}-api-1", ["ls", "/app/dist/interpret.js"], "document reading"),
+        (f"{PROJECT}-api-1",
          ["grep", "-l", "provisionOnConfirm", "/app/dist/relay/poller.js"], "confirm starts the build"),
-        ("kinerary-control-plane-local-worker-1",
+        (f"{PROJECT}-worker-1",
          ["grep", "-l", "_planned_as_venues", "/app/control_plane_worker/transformer.py"],
          "planned places reach the site"),
     ]
@@ -151,12 +156,22 @@ def stage_preflight() -> None:
         rc = subprocess.run(["docker", "exec", container, *cmd], capture_output=True).returncode
         check(rc == 0, f"deployed code carries: {what}", f"the running stack is missing: {what}")
 
-    relay_pid = subprocess.run(
-        ["lsof", "-nP", "-iTCP:4312", "-sTCP:LISTEN", "-t"], capture_output=True, text=True
-    ).stdout.split("\n")[0].strip()
-    check(bool(relay_pid), "relay listening on :4312", "the relay is down — nothing will answer")
-
-    env = subprocess.run(["ps", "eww", relay_pid], capture_output=True, text=True).stdout
+    relay_container = os.environ.get("KINERARY_RELAY_CONTAINER")
+    if relay_container:
+        # The relay as a compose service (the VM): its environment is read inside
+        # the container. Space-joined so the checks below read it like `ps eww`.
+        running = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", relay_container],
+                                 capture_output=True, text=True).stdout.strip()
+        check(running == "true", f"relay container {relay_container} running",
+              "the relay is down — nothing will answer")
+        env = " ".join(subprocess.run(["docker", "exec", relay_container, "env"],
+                                      capture_output=True, text=True).stdout.splitlines()) + " "
+    else:
+        relay_pid = subprocess.run(
+            ["lsof", "-nP", "-iTCP:4312", "-sTCP:LISTEN", "-t"], capture_output=True, text=True
+        ).stdout.split("\n")[0].strip()
+        check(bool(relay_pid), "relay listening on :4312", "the relay is down — nothing will answer")
+        env = subprocess.run(["ps", "eww", relay_pid], capture_output=True, text=True).stdout
     check("INTERPRET_PATH_DEFAULT=1" in env,
           "interview is agentless (INTERPRET_PATH_DEFAULT=1)",
           "INTERPRET_PATH_DEFAULT is unset — new sessions would run WITH the Hermes agent")
@@ -288,7 +303,12 @@ def finish_workdir(work: Path, passed: bool) -> None:
 
 
 def relay_restart(telegram_root: str | None) -> None:
-    cmd = [str(REPO / "scripts/relay-restart.sh")] + (["--telegram-root", telegram_root] if telegram_root else [])
+    # scripts/relay-restart.sh restarts the MAC's host relay. Any other stack names
+    # a twin with the same interface (the VM: control-plane/deployment/
+    # vm-relay-restart.sh); main() refuses --auto on a non-Mac stack without one,
+    # because the default would bounce the Mac's live relay onto a stand-in.
+    script = os.environ.get("KINERARY_RELAY_RESTART") or str(REPO / "scripts/relay-restart.sh")
+    cmd = [script] + (["--telegram-root", telegram_root] if telegram_root else [])
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Failed(f"relay restart failed: {(result.stderr or result.stdout).strip()[-400:]}")
@@ -321,13 +341,15 @@ def bot_username() -> str:
     return "<your-bot>"
 
 
-def stage_confirm_and_build(ctx: dict, wait_minutes: int) -> None:
-    stage("Confirm → build (provisionOnConfirm)")
+def stage_confirm_and_build(ctx: dict, wait_minutes: int, build: bool = True) -> None:
+    stage("Confirm → build (provisionOnConfirm)" if build else "Confirm")
     trip = ctx["trip_id"]
     wait_for("the intake to be confirmed",
              lambda: psql(f"SELECT 1 FROM control_plane.intake_versions WHERE trip_id='{trip}' LIMIT 1") == "1",
              timeout=wait_minutes * 60, interval=15)
     ok("intake version written (immutable)")
+    if not build:
+        return
 
     # Confirming SHOULD start the build on its own. If it did not, say so and
     # drive it by hand — a green run must not hide that the hook failed.
@@ -515,7 +537,16 @@ def main() -> int:
                          "whether the run passed or failed")
     ap.add_argument("--auto", action="store_true",
                     help="play the organizer automatically through a Telegram stand-in instead of a person")
+    ap.add_argument("--stop-after", choices=["confirm"], default=None,
+                    help="stop once the intake is confirmed, before the build — for a stack that must "
+                         "not provision (the Proxmox VM while the Mac stack is live)")
     args = ap.parse_args()
+    if not MAC_STACK and args.auto and not os.environ.get("KINERARY_RELAY_RESTART"):
+        ap.error(f"--auto on {PROJECT} needs KINERARY_RELAY_RESTART: the default, scripts/relay-restart.sh, "
+                 "restarts the Mac's live relay")
+    if not MAC_STACK and args.teardown:
+        ap.error(f"--teardown on {PROJECT}: scripts/teardown-trip.py tears down through the Mac "
+                 "(launchctl, ~/kinerary-deploy) and has no path for this stack yet")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
@@ -572,7 +603,12 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
     try:
         ctx.update(stage_signup(trip_name))
         stage_interview(ctx, scenario, work, auto)
-        stage_confirm_and_build(ctx, args.wait_minutes)
+        stage_confirm_and_build(ctx, args.wait_minutes, build=args.stop_after != "confirm")
+        if args.stop_after == "confirm":
+            print(f"\n{GREEN}✓ interview green ({scenario}){RESET}: signup, interview and confirm verified; "
+                  "stopped before the build as asked.")
+            print(f"  trip:  {ctx['trip_id']}")
+            return 0
         stage_site(ctx)
         stage_content(ctx, scenario)
         stage_companion(ctx)
