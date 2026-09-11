@@ -217,7 +217,10 @@ Two reasons that hurts more than it looks:
   `phases[].planned: ["Tokyo Skytree"]`; the agent emits
   `phases[].venues: [{name, time}]`. `transformer.py` handles both now, but a
   shape appearing where you did not expect it is a reliable signal of which
-  path actually ran.
+  path actually ran. One exception: agentless may instead leave `planned`
+  empty and file a ticketed attraction as a dated `travel_anchors` entry
+  (`{type, name, date, confirmation}`) — it chose that on one run in three
+  on 2026-09-11. That is the same path, not the agent; both reach the site.
 
 When an interview misbehaves, read `interpret_path` off the session first:
 
