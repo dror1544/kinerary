@@ -50,6 +50,36 @@ import subprocess
 from typing import Mapping, Protocol
 
 
+#: Ports below this belong to hand-provisioned trips and the legacy shared
+#: bridge (3001, 3011, 3013). Auto-provisioned trips start above all of them.
+MCP_PORT_BASE = 3000
+
+
+def mcp_port_for_vmid(vmid: str) -> int | None:
+    """The port this trip's bridge listens on — a function of its container,
+    so it is the same on every re-provision and different for every trip.
+
+    Until 2026-09-10 nothing passed `--port` at all, so setup-mcp.sh took its
+    3001 default for EVERY trip. Each new trip's bridge therefore killed the
+    previous trip's and took its port, and the profile config left behind
+    still named it — which is the shape of a companion answering confidently
+    out of another family's data. It never actually landed because the kill
+    that would have done it was itself broken (BusyBox lsof, same script), so
+    this closes a live hole rather than a theoretical one.
+
+    Derived from the vmid because it is already unique per trip, already in
+    topology.yaml, and needs no new registry to drift out of sync. Returns
+    None for anything that would not produce a sane port, so the caller skips
+    the bridge rather than guessing a number that might belong to someone.
+    """
+    if not vmid or not vmid.isdigit():
+        return None
+    port = MCP_PORT_BASE + int(vmid)
+    if not (3100 <= port <= 3999):
+        return None
+    return port
+
+
 class McpBridgeAdapter(Protocol):
     """Wires trip-mcp to a companion Hermes profile. Returns True if wired,
     False if skipped (e.g. no vmid/topology yet available for this slug)."""
@@ -102,9 +132,16 @@ class ShellMcpBridgeAdapter:
         if not vmid:
             return False
 
+        port = mcp_port_for_vmid(vmid)
+        if port is None:
+            return False
+
         setup_mcp_sh = os.path.join(self._deploy_root, "setup-mcp.sh")
         result = subprocess.run(
-            [setup_mcp_sh, profile_name, local_url, "--vmid", vmid, "--trip-dir", trip_dir],
+            [
+                setup_mcp_sh, profile_name, local_url,
+                "--vmid", vmid, "--trip-dir", trip_dir, "--port", str(port),
+            ],
             capture_output=True,
             text=True,
             timeout=self._timeout,
