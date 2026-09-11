@@ -178,8 +178,10 @@ async function confirmed(): Promise<boolean> {
 
 function fingerprint(v: SessionView | null): string {
   if (!v) return "none";
+  // `lastPrompt` is what the router last put on screen — the surest sign the
+  // screen changed, even when no answer did (declining the document offer).
   return JSON.stringify([v.state, v.phase, v.awaiting, v.nextQuestion?.id, v.pendingAsk?.id,
-    v.optionalRemaining.length, v.offeredMore, v.selections, v.recap?.length ?? 0]);
+    v.optionalRemaining.length, v.offeredMore, v.selections, v.recap?.length ?? 0, v.lastPrompt]);
 }
 
 class Stalled extends Error {}
@@ -227,33 +229,52 @@ const MIME: Record<string, string> = {
 // ── The organizer ────────────────────────────────────────────────────────────
 
 const asked = new Set<string>();
+/** How many times each question was found on screen without its buttons yet. */
+const waitedFor = new Map<string, number>();
+const BUTTON_PATIENCE = 30; // × ~2s: a rendered question has its buttons long before this
 
+/**
+ * Answers the question on screen. `false` means "not answerable YET" — its
+ * message and buttons have not arrived — and the caller waits and asks again.
+ * The 2026-09-11 run treated a button that had simply not been sent yet as a
+ * missing answer and stalled the manual scenario at its very first question.
+ */
 async function answer(q: IntakeQuestion, s: Scenario): Promise<boolean> {
-  asked.add(q.id);
+  const notYet = () => {
+    const n = (waitedFor.get(q.id) ?? 0) + 1;
+    waitedFor.set(q.id, n);
+    if (n > BUTTON_PATIENCE) throw new Stalled(`${q.id} is the next question but its buttons never arrived`);
+    return false;
+  };
   if (q.type === "choice") {
     const option = s.choice[q.id] ?? q.options?.[0]?.id;
-    if (option && (await tap(`a:${q.id}:${option}`))) return true;
+    if (!option) throw new Stalled(`${q.id} has no options to choose from`);
+    if (!(await tap(`a:${q.id}:${option}`))) return notYet();
   } else if (q.type === "multi_choice") {
     const picks = s.multi[q.id];
-    if (picks) {
-      for (const option of picks) {
-        if (!(await tap(`t:${q.id}:${option}`))) return false;
-        await sleep(2500);
-        await drain();
-      }
-      return tap(`n:${q.id}`);
+    if (!picks) {
+      if (q.required) throw new Stalled(`the scenario has no answer for required question ${q.id}`);
+      return (await tap(`k:${q.id}`)) || notYet();
     }
+    if (!(await messageWith(`n:${q.id}`))) return notYet();
+    for (const option of picks) {
+      await tap(`t:${q.id}:${option}`);
+      await sleep(2500);
+      await drain();
+    }
+    await tap(`n:${q.id}`);
   } else {
     const text = s.text[q.id];
-    if (text) {
-      await type(text, s.language);
-      return true;
+    if (!text) {
+      // Nothing scripted: an optional question is skipped the way a person
+      // would; a required one is a gap in this script, reported, not guessed.
+      if (q.required) throw new Stalled(`the scenario has no answer for required question ${q.id} (${q.type})`);
+      return (await tap(`k:${q.id}`)) || notYet();
     }
+    await type(text, s.language);
   }
-  // Nothing scripted: an optional question is skipped the way a person would;
-  // a required one is a gap in this script, reported rather than guessed at.
-  if (!q.required) return tap(`k:${q.id}`);
-  throw new Stalled(`the scenario has no answer for required question ${q.id} (${q.type})`);
+  asked.add(q.id);
+  return true;
 }
 
 async function main(): Promise<number> {
@@ -280,8 +301,12 @@ async function main(): Promise<number> {
       });
     }
     v = await settle(before, `${files.length} document(s)`);
-  } else if (!(await tap("c:nodoc"))) {
-    throw new Stalled("no document offer to decline");
+  } else {
+    const before = fingerprint(v);
+    if (!(await tap("c:nodoc"))) throw new Stalled("no document offer to decline");
+    // Wait for the first question to arrive, as a person would, before reading
+    // the screen — the manual scenario tapped for trip_type before it was sent.
+    v = await settle(before, "declining the document offer");
   }
 
   for (let turn = 0; Date.now() < deadline; turn += 1) {
