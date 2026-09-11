@@ -301,6 +301,34 @@ scenario produced `portugal-lisbon-and-porto-2026` — the same slug the Mac's
 run of that scenario produces. A VM run and a Mac run of the same scenario
 would fight over one hostname, NPM host and ingress rule: never overlap them.
 
+## Manual test
+
+A person's end-to-end run on the VM — the gate for declaring Sprint 5 done.
+
+**Step 0, once:** give Hermes on the VM its provider logins (see Credentials).
+A companion answers through `openai-codex` first, falling back to Anthropic,
+OpenRouter and Ollama; with no credential it cannot answer at all.
+
+```bash
+ssh -i ~/.ssh/id_ed25519_kinerary_cp debian@192.168.0.45
+/opt/kinerary/control-plane/deployment/vm-manual-test.sh --check   # preconditions; changes nothing
+/opt/kinerary/control-plane/deployment/vm-manual-test.sh           # the test
+```
+
+It refuses unless the control plane is ready, the relay is on
+`@Tripinterviewer_bot`, Hermes has a credential, no job is in flight and a
+sealed release is available. Then it switches provisioning on — and back off on
+every exit, Ctrl-C included — signs a new organizer up, prints a `t.me` link,
+waits while you do the interview and confirm, and verifies the build, the site
+and its content, the companion and its trip-mcp. The trip is left running: open
+the printed site URL, talk to the companion from the same chat, and remove it
+with the printed `vm-teardown-trip.sh` command when done. `--scenario japan`
+gives you a booking PDF to send.
+
+Don't finish an interview on the Mac stack during the test, and don't answer
+with a destination a live Mac trip already has — the slug comes from your
+answers, and the two stacks share Proxmox, NPM, Cloudflare and the RPi4.
+
 ## Later: model and effort per task (parked by Dror, 2026-09-11)
 
 Today both interview tasks — **interpret** (reading a typed answer) and
