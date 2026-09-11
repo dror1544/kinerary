@@ -87,9 +87,30 @@ sudo sed -i "s/^KINERARY_REV=.*/KINERARY_REV=$REV/" /opt/kinerary-deploy/vm.env
 $C up -d --wait
 ```
 
-`agent-runtime` is the api image plus the pinned `claude` and `codex` CLIs;
-the relay (interpret) and sidecar (extract) shell out to them through
-`model-runner.ts`.
+`agent-runtime` is the api image plus the `claude` and `codex` CLIs the relay
+(interpret) and sidecar (extract) shell out to through `model-runner.ts`,
+**pinned to the versions the Mac runs** (npm's `stable` tag for claude). Bump
+them together with the Mac, never one side alone: on 2026-09-11 an older CLI
+with the same model id returned no proposal for a one-word answer the Mac read
+correctly 4 times out of 4, and the interview stalled.
+
+**Effort is explicit here, and inherited on the Mac.** Every `claude -p` on the
+Mac loads Dror's personal `~/.claude/settings.json`, which sets
+`effortLevel: xhigh` — so the Mac's interpretation runs at extra-high effort by
+accident of a coding-session preference. At the default effort the VM mapped
+answers to the wrong question (a one-word assistant name to nothing; "Dror, the
+family's dad" to `travelers` instead of `organizer_identity`), and the
+interview stalled. The relay and sidecar therefore get
+`CLAUDE_CONFIG_DIR=/home/node/.claude-config` holding only
+`{"effortLevel": "xhigh"}` (`/opt/agent-auth/claude-config/`). Measured: 7.8 s
+per interpret call at default effort, 15.2 s with it (Mac: 13.1 s), and the
+mapping matched the Mac's.
+
+The relay's credential is `CLAUDE_CODE_OAUTH_TOKEN`. `model-runner.ts`'s
+`hermeticEnv` strips a calling Claude Code session's `CLAUDE_CODE_*` variables
+from the nested CLI but keeps that one — on the Mac the CLI uses the keychain,
+here the token is its only credential, and losing it made every interpret call
+`FAILED`.
 
 ### Checks that actually answer the question
 
@@ -142,16 +163,50 @@ the RPi4:
    creates; both workers edit the same RPi4 `cloudflared` config. A VM
    provisioning run needs a unique slug, the `.95–.99` pool (already in
    `vm.env`; the Mac allocates lowest-first from `.60`), and an agreed window.
-3. **Only Kinerary profiles in `/opt/hermes-data`.** The container auto-starts
+3. **`PROVISIONER_VMID_MAP={}` in `vm.env`.** `provisioning.env` maps Mac trips
+   onto real containers (201, 202), and with compute off the worker deploys
+   straight to a mapped container — an inherited map is a path from this VM
+   onto the Mac's trips. `{}`, not blank: the worker rejects blank at start.
+4. **Only Kinerary profiles in `/opt/hermes-data`.** The container auto-starts
    any profile whose last recorded state was `running`, and the Mac's other
    profiles poll other live bots directly. Never copy `~/.hermes` wholesale;
    strip `TELEGRAM_BOT_TOKEN` from anything staged.
-4. **Never run `scripts/e2e-full-cycle.py` against the VM unmodified.** Its
+5. **Never run `scripts/e2e-full-cycle.py` against the VM without its VM switches.** Its
    automated-organizer mode repoints the relay by calling the **Mac's**
-   `scripts/relay-restart.sh`.
-5. **Hermes gets no Docker socket.** It would give the AI runtime root over
+   `scripts/relay-restart.sh` unless told otherwise; it now refuses `--auto`
+   on a non-Mac stack without `KINERARY_RELAY_RESTART` (see below).
+6. **Hermes gets no Docker socket.** It would give the AI runtime root over
    every container here, the control plane included. The terminal toolset
    (k3s ledger C12) stays off for Kinerary profiles.
+
+## End-to-end test on the VM
+
+`scripts/e2e-full-cycle.py`'s automated organizer runs here, on the VM, so
+every loopback address is the VM's own. Three switches point it at this stack
+and one stops it before anything could provision:
+
+```bash
+cd /opt/kinerary
+KINERARY_COMPOSE_PROJECT=kinerary-cp \
+KINERARY_RELAY_CONTAINER=kinerary-cp-relay-1 \
+KINERARY_RELAY_RESTART=/opt/kinerary/control-plane/deployment/vm-relay-restart.sh \
+python3 scripts/e2e-full-cycle.py --scenario manual --auto --stop-after confirm
+```
+
+`vm-relay-restart.sh` is the VM twin of `scripts/relay-restart.sh`: same
+interface, same refusals, checks read off the container. It recreates the relay
+to change its environment, which deletes the old container's log — so it
+appends the outgoing log to `/var/log/kinerary/relay.log` first. Read that file,
+not `docker compose logs`, for anything that happened before the last restart.
+
+Green on 2026-09-11: `--scenario manual` (every answer typed, 13 turns) and
+`--scenario japan` (a booking PDF, 10 turns) — intake version written, no plan
+and no job created, Proxmox untouched. `multi` not yet run. `--stop-after confirm`
+ends the run at the confirmed intake; on this VM the build could not start
+anyway, because unsealed releases are off and `provisionOnConfirm` answers
+`NO_COMPATIBLE_RELEASE`. `--teardown` is refused here — `teardown-trip.py`
+tears down through the Mac. The automated organizer needs the api package's
+dev dependencies (`npm ci` in `control-plane/api`) for `tsx`.
 
 ## Hermes
 

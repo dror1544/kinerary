@@ -252,6 +252,17 @@ Verify by reading the running containers rather than trusting the directory —
 `scripts/new-trip-run.py`'s preflight does exactly this and refuses to mint an
 interview link when a marker is missing.
 
+### The control plane on the Proxmox VM
+
+VM 110 `kinerary-cp` runs the whole stack under Compose, Hermes included —
+runbook: `docs/control-plane-vm-deployment.md`. While the Mac stack is live it
+runs on `@Tripinterviewer_bot`, never `@Kinerary_bot`, with provisioning off and
+`PROVISIONER_VMID_MAP={}`. On the VM restart the relay with
+`control-plane/deployment/vm-relay-restart.sh`, not `scripts/relay-restart.sh`
+(that one restarts the Mac's), and point `scripts/e2e-full-cycle.py` at it with
+`KINERARY_COMPOSE_PROJECT` / `KINERARY_RELAY_CONTAINER` / `KINERARY_RELAY_RESTART`
+— it refuses `--auto` on a non-Mac stack without them.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over

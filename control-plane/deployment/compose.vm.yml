@@ -205,10 +205,21 @@ services:
       EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
       EXTRACT_MODEL: ${EXTRACT_MODEL:-}
       CODEX_HOME: /codex
+      # Empty = api.telegram.org. The e2e runner's automated organizer points it
+      # at a loopback Telegram stand-in through vm-relay-restart.sh, and puts it
+      # back in a `finally`; the relay accepts https, or http to loopback only.
+      TELEGRAM_API_ROOT: ${TELEGRAM_API_ROOT:-}
+      # The CLI's own config dir, holding ONLY {"effortLevel": "xhigh"}. On the Mac
+      # every `claude -p` loads ~/.claude/settings.json — Dror's personal
+      # effortLevel: xhigh — and interpretation quality turned out to depend on it
+      # (2026-09-11: at default effort the VM mapped answers to the wrong question).
+      # Explicit here so this VM matches the Mac on purpose, not by inheritance.
+      CLAUDE_CONFIG_DIR: /home/node/.claude-config
     # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; root-only file.
     env_file: [/opt/agent-auth/claude.env]
     volumes:
       - /opt/agent-auth/codex:/codex
+      - /opt/agent-auth/claude-config:/home/node/.claude-config
     secrets:
       - source: control_plane_database_url_host
         target: control_plane_database_url
@@ -256,9 +267,11 @@ services:
       EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
       EXTRACT_MODEL: ${EXTRACT_MODEL:-}
       CODEX_HOME: /codex
+      CLAUDE_CONFIG_DIR: /home/node/.claude-config
     env_file: [/opt/agent-auth/claude.env]
     volumes:
       - /opt/agent-auth/codex:/codex
+      - /opt/agent-auth/claude-config:/home/node/.claude-config
     depends_on:
       api:
         condition: service_healthy
