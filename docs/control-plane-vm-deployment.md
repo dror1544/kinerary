@@ -323,8 +323,23 @@ every exit, Ctrl-C included — signs a new organizer up, prints a `t.me` link,
 waits while you do the interview and confirm, and verifies the build, the site
 and its content, the companion and its trip-mcp. The trip is left running: open
 the printed site URL, talk to the companion from the same chat, and remove it
-with the printed `vm-teardown-trip.sh` command when done. `--scenario japan`
-gives you a booking PDF to send.
+with the printed `vm-teardown-trip.sh` command when done.
+
+**The trip is yours to choose.** The default scenario is `own`: answer about a
+trip you actually mean to take, in any language. Nothing in the runner knows the
+destination, so the content check reads the intake you confirmed back out of
+`intake_versions` and asserts against the config the container is serving — your
+destination is on the site, your dates are its dates, every stop you named has a
+phase. Passing lines say only that something matched, never what it was; a
+failure prints the values, because a mismatch cannot be diagnosed without them.
+`--trip-name "Greece 2026"` sets the name the signup form would have carried
+(the default placeholder is `My trip`).
+
+The named scenarios are the other case — `japan`, `multi` and `manual` are
+fixtures in `control-plane/api/test/fixtures/make_documents.py`, with answers
+and documents written down so runs can be compared and so a place named in a
+PDF can be asserted by name on the phase page. Pick one only if you intend to
+answer as it says; `--scenario japan` gives you a booking PDF to send.
 
 Don't finish an interview on the Mac stack during the test, and don't answer
 with a destination a live Mac trip already has — the slug comes from your

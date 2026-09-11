@@ -20,6 +20,15 @@ this checks from outside, and each stage FAILS LOUDLY rather than warning.
 
     scripts/e2e-full-cycle.py --scenario multi               # leave it running
     scripts/e2e-full-cycle.py --scenario japan --teardown    # remove it afterwards
+    scripts/e2e-full-cycle.py --scenario own                 # a person's OWN trip
+
+The scenarios are fixtures: `japan`, `multi` and `manual` each have documents
+and answers written down in control-plane/api/test/fixtures/make_documents.py,
+so the run can assert that a place named in a document reached the phase page.
+`own` is the other case — a person answering about a trip they actually mean to
+take. Nothing about it is scripted and nothing here knows the destination, so
+what the site is checked against is the intake THEY confirmed, read back from
+control_plane.intake_versions after the fact.
 
 Leaving the trip running is the default, for a trip someone wants to poke at
 afterwards. `--teardown` removes exactly the trip this run created — by the id
@@ -66,6 +75,11 @@ def hermes_cli() -> list[str]:
     return [exe] if exe else [os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python"), "-m", "hermes_cli.main"]
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+
+
+# The scenario that is not a fixture: a person's own trip. Named once so the
+# places that must treat it differently cannot drift apart.
+OWN = "own"
 
 
 class Failed(Exception):
@@ -210,18 +224,12 @@ def stage_signup(trip_name: str) -> dict:
 
 def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = None) -> None:
     stage(f"Interview — scenario '{scenario}'" + (" (automated organizer)" if auto else ""))
-    sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
-    from make_documents import SCENARIOS, build  # noqa: E402
-
-    spec = SCENARIOS[scenario]
-    docs = None
-    if spec["documents"]:
-        docs = work / scenario
-        files = build(scenario, docs)
-        ok(f"generated {len(files)} document(s): {', '.join(f.name for f in files)}")
+    if scenario == OWN:
+        docs = None
+        ok("your own trip — nothing is scripted; answer about a trip you mean to take")
+        note("the checks afterwards come from the intake you confirm, not from a fixture")
     else:
-        ok("no documents — every answer typed, which is the control case")
-
+        docs = _fixture_documents(scenario, work)
     enrollment = api("POST", f"/v1/trips/{ctx['trip_id']}/enrollment", {},
                      auth_header(ctx["email"], ctx["password"]))
     ctx["enrollment"] = enrollment
@@ -233,6 +241,21 @@ def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = 
     print(f"     https://t.me/{bot_username()}?start={enrollment['token']}\n")
     if docs:
         print(f"     send the scenario's document(s) when the bot asks: {docs}\n")
+
+
+def _fixture_documents(scenario: str, work: Path) -> "Path | None":
+    sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
+    from make_documents import SCENARIOS, build  # noqa: E402
+
+    spec = SCENARIOS[scenario]
+    docs = None
+    if spec["documents"]:
+        docs = work / scenario
+        files = build(scenario, docs)
+        ok(f"generated {len(files)} document(s): {', '.join(f.name for f in files)}")
+    else:
+        ok("no documents — every answer typed, which is the control case")
+    return docs
 
 
 class Auto:
@@ -469,6 +492,95 @@ def stage_content(ctx: dict, scenario: str) -> None:
         ok(f"{len(venues)} venue(s), links well-formed")
 
 
+def stage_own_content(ctx: dict) -> None:
+    """The other half of stage_content, for a trip nobody here scripted.
+
+    A fixture run knows what the answers were, so it asserts on them by name.
+    A person's run cannot: the destination is theirs and this script is told
+    nothing about it. So the expectation is READ BACK from the intake version
+    they confirmed — immutable, written at confirm — and checked against the
+    config the container is actually serving. That is the same property the
+    fixture scenarios test (what was answered reached the site), asserted
+    without anyone here having to know the trip.
+
+    Their answers are their own: the passing lines say THAT a thing matched,
+    never what it was. A failure prints the values, because a mismatch cannot
+    be diagnosed without them.
+    """
+    stage("Content — what YOU confirmed reached the site")
+    data = json.loads(psql(
+        f"SELECT data FROM control_plane.intake_versions "
+        f"WHERE trip_id='{ctx['trip_id']}' ORDER BY version DESC LIMIT 1") or "{}")
+    check(bool(data), "the confirmed intake was read back", "no intake version to check the site against")
+
+    config = ctx["config"]
+    meta = config.get("meta") or {}
+    phases = config.get("phases") or []
+    blob = json.dumps(config, ensure_ascii=False).lower()
+
+    destination = _answer_text(data.get("destination")).strip()
+    check(bool(destination), "you answered a destination", "the intake has no destination answer")
+    check(destination.lower() in blob, "your destination is on the site",
+          f"the destination you confirmed ({destination!r}) appears nowhere in the site's config")
+
+    # Both date questions are required now, so absent means an older intake —
+    # skipped rather than failed, since the transformer then legitimately
+    # derives dates instead of carrying them.
+    departure = _answer_text(data.get("departure_date")).strip()
+    returning = _answer_text(data.get("return_date")).strip()
+    if departure and returning:
+        check(str(meta.get("departure", "")).startswith(departure),
+              "your departure date is the site's departure date",
+              f"you confirmed {departure} and the site departs {meta.get('departure')!r}")
+        check(meta.get("returnDate") == returning,
+              "your return date is the site's return date",
+              f"you confirmed {returning} and the site returns {meta.get('returnDate')!r}")
+    else:
+        note("no explicit dates in the intake — the site's dates are derived, nothing to compare")
+
+    # Every stop named in the interview has to be findable on some phase. Phases
+    # with the same name collapse into one (_derive_phases), so this asks for
+    # presence, never for a count.
+    named = [n for n in (_phase_name(raw) for raw in _structured_items(data, "phases")) if n]
+    check(bool(phases), f"{len(phases)} phase(s) on the site", "the site has no phases")
+    missing = [n for n in named if n.lower() not in json.dumps(phases, ensure_ascii=False).lower()]
+    if named:
+        check(not missing, f"every stop you named has a phase ({len(named)})",
+              f"named in the interview and on no phase: {missing}")
+    else:
+        note("you named no separate stops — the single phase above is the whole trip")
+
+
+def _answer_text(answer: object) -> str:
+    """The display value of one intake answer — transformer._text_value, which
+    lives in the worker image and is not importable from here."""
+    if not isinstance(answer, dict):
+        return ""
+    kind = answer.get("kind")
+    if kind == "choice":
+        return str(answer.get("option_id") or "")
+    if kind == "choice_other":
+        return str(answer.get("other_text") or "")
+    if kind == "text":
+        return str(answer.get("text") or "")
+    return ""
+
+
+def _structured_items(data: dict, question_id: str) -> list:
+    """A structured answer's array payload — transformer._structured_list."""
+    answer = data.get(question_id)
+    if not isinstance(answer, dict) or answer.get("kind") != "structured":
+        return []
+    payload = answer.get("data")
+    return payload if isinstance(payload, list) else []
+
+
+def _phase_name(raw: object) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    return str(raw.get("name") or raw.get("name_en") or "").strip()
+
+
 def stage_companion(ctx: dict) -> None:
     stage("The companion — installed, rendered, running, routable")
     slug = ctx["slug"]
@@ -533,12 +645,18 @@ def stage_mcp(ctx: dict) -> None:
           f"`hermes mcp test trip-mcp` did not list trip tools:\n{blob[-400:]}")
 
 
-TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026"}
+TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026",
+              # A placeholder the organizer would have typed on the signup form,
+              # deliberately not a destination: naming it would be this script
+              # deciding what an `own` run is about. --trip-name replaces it.
+              OWN: "My trip"}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "all"])
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", OWN, "all"],
+                    help="a fixture (japan, multi, manual), or 'own' — a person's real trip, "
+                         "checked against the intake they confirm")
     ap.add_argument("--trip-name", default=None)
     ap.add_argument("--wait-minutes", type=int, default=30,
                     help="how long to wait for the human half of the interview")
@@ -560,6 +678,9 @@ def main() -> int:
         ap.error(f"--teardown on {PROJECT} needs KINERARY_TEARDOWN: scripts/teardown-trip.py's defaults "
                  "are the Mac's (~/kinerary-deploy, ~/.hermes); on the VM use "
                  "control-plane/deployment/vm-teardown-trip.sh")
+    if args.scenario == OWN and args.auto:
+        ap.error("--scenario own is a person answering about their own trip; the automated "
+                 "organizer can only play a fixture (japan, multi, manual)")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
@@ -623,7 +744,7 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
             print(f"  trip:  {ctx['trip_id']}")
             return 0
         stage_site(ctx)
-        stage_content(ctx, scenario)
+        stage_own_content(ctx) if scenario == OWN else stage_content(ctx, scenario)
         stage_companion(ctx)
         stage_mcp(ctx)
         print(f"\n{GREEN}✓ full cycle green ({scenario}){RESET}: site, content, companion and MCP all verified.")

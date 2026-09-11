@@ -4,13 +4,22 @@
 #   ssh -i ~/.ssh/id_ed25519_kinerary_cp debian@192.168.0.45
 #   /opt/kinerary/control-plane/deployment/vm-manual-test.sh --check     # preconditions only
 #   /opt/kinerary/control-plane/deployment/vm-manual-test.sh             # the test
-#   /opt/kinerary/control-plane/deployment/vm-manual-test.sh --scenario japan   # with a document to send
+#   /opt/kinerary/control-plane/deployment/vm-manual-test.sh --trip-name "Greece 2026"
+#   /opt/kinerary/control-plane/deployment/vm-manual-test.sh --scenario japan   # a fixture, with documents
 #
 # The same runner the automated cycle uses, minus the automated organizer: it
 # signs a new organizer up, prints a t.me link to @Tripinterviewer_bot, and waits
 # while YOU do the interview and confirm. Then it verifies what confirming built —
 # the provisioning job, the site and its content, the companion, its trip-mcp —
 # and leaves the trip running so you can open the site and talk to the companion.
+#
+# THE TRIP IS YOURS. The default scenario is `own`: answer about a trip you
+# actually mean to take, in whatever language you like. Nothing here knows the
+# destination, and the content check afterwards is read back from the intake you
+# confirmed rather than from a fixture, so any real trip passes it and none of
+# your answers are echoed into the log. The named scenarios (japan, multi,
+# manual) are the opposite case — a written-down trip, for comparing runs — and
+# they expect you to answer as that fixture says.
 #
 # Provisioning is switched on for the run only, and back off on every exit,
 # Ctrl-C included: both stacks share Proxmox, NPM, Cloudflare and the RPi4, and
@@ -22,15 +31,17 @@ VM_ENV=/opt/kinerary-deploy/vm.env
 C=(sudo docker compose -f "$DIR/compose.vm.yml" --env-file /opt/kinerary-deploy/provisioning.env --env-file "$VM_ENV")
 PSQL=(sudo docker exec kinerary-cp-postgres-1 psql -U kinerary_control_plane -d kinerary_control_plane -At -c)
 
-SCENARIO=manual
+SCENARIO=own
 WAIT=45
 CHECK_ONLY=0
+TRIP_NAME=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --scenario) SCENARIO="${2:?}"; shift ;;
+    --trip-name) TRIP_NAME=(--trip-name "${2:?}"); shift ;;
     --wait-minutes) WAIT="${2:?}"; shift ;;
     --check) CHECK_ONLY=1 ;;
-    *) echo "usage: $0 [--check] [--scenario manual|japan|multi] [--wait-minutes N]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--check] [--scenario own|manual|japan|multi] [--trip-name NAME] [--wait-minutes N]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -59,6 +70,9 @@ sealed="$("${PSQL[@]}" "SELECT count(*) FROM control_plane.releases WHERE status
 
 note "confirm the MAC is not provisioning right now: don't finish an interview on the Mac stack during this test"
 note "the trip's slug comes from your answers — don't reuse a destination a live Mac trip already has"
+[ "$SCENARIO" = own ] \
+  && note "scenario 'own': answer about a trip YOU mean to take — the site is checked against what you confirm" \
+  || note "scenario '$SCENARIO' is a fixture: answer as control-plane/api/test/fixtures/make_documents.py writes it down"
 
 if [ "$PROBLEMS" -gt 0 ]; then
   echo; echo "$PROBLEMS precondition(s) not met — nothing was changed"; exit 1
@@ -85,7 +99,7 @@ provisioning 1 1
 ok "worker: compute=$(sudo docker exec kinerary-cp-worker-1 printenv PROVISIONER_COMPUTE_ENABLED), companion + trip-mcp on"
 
 echo
-"$DIR/vm-e2e.sh" --scenario "$SCENARIO" --wait-minutes "$WAIT" || true
+"$DIR/vm-e2e.sh" --scenario "$SCENARIO" "${TRIP_NAME[@]}" --wait-minutes "$WAIT" || true
 
 trip="$("${PSQL[@]}" "SELECT id || '  ' || slug FROM control_plane.trips ORDER BY created_at DESC LIMIT 1")"
 echo
