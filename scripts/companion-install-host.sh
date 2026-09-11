@@ -289,6 +289,10 @@ PY
 # retry a restart rather than a second copy fighting for the same socket.
 start_gateway() {
   local name="$1"
+  if [ "$(uname -s)" != Darwin ]; then
+    start_gateway_supervised "$name"
+    return 0
+  fi
   local home="$HOME/.hermes/profiles/$name"
   local label="ai.hermes.gateway-${name}"
   local plist="$HOME/Library/LaunchAgents/${label}.plist"
@@ -367,6 +371,29 @@ PLIST
     printf 'companion-install-host: gateway %s started\n' "$name" >&2
   else
     printf 'companion-install-host: launchctl bootstrap failed for %s; plist written but NOT RUNNING\n' "$name" >&2
+  fi
+}
+
+# Linux (the Proxmox VM, compose.vm.yml): Hermes runs in a container whose
+# per-profile gateways are s6 services, and `hermes` on PATH is a wrapper that
+# execs into it. There, Hermes's own lifecycle command IS the supervisor: the
+# gateway outlives this SSH session, the run intent it records is what the
+# container reads on the next boot (hermes_cli/container_boot.py), and
+# stop-then-start is the s6 twin of bootout-then-bootstrap above — a retry
+# restarts the gateway rather than starting a second copy on the same socket.
+# stdin is closed explicitly: the wrapper's `docker exec -i` would otherwise
+# forward whatever this script's stdin still holds.
+start_gateway_supervised() {
+  local name="$1"
+  if ! command -v hermes >/dev/null 2>&1; then
+    printf 'companion-install-host: no hermes on PATH; %s installed but NOT RUNNING\n' "$name" >&2
+    return 0
+  fi
+  hermes -p "$name" gateway stop </dev/null >/dev/null 2>&1 || true
+  if hermes -p "$name" gateway start </dev/null >/dev/null 2>&1; then
+    printf 'companion-install-host: gateway %s started\n' "$name" >&2
+  else
+    printf 'companion-install-host: hermes gateway start failed for %s; profile installed but NOT RUNNING\n' "$name" >&2
   fi
 }
 
