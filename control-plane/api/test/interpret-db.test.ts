@@ -573,6 +573,86 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
     });
   });
 
+  // 2026-09-11, the automated full cycle, verbatim: the stops were read with
+  // LOW_CONFIDENCE, so `phases` stepped aside. The last required question was
+  // then answered with a TAP (the assistant's tone), and the set-aside question
+  // never came back — the router walked on to the optional ones, and "Finished"
+  // did nothing at all. The return at the boundary lived only on the typed path.
+  async function requiredSetAside(pool: pg.Pool, chatId: string, lastPrompt: string, remaining: string[]) {
+    for (const q of INTAKE_QUESTIONS.filter((x) => x.required && !remaining.includes(x.id) && x.id !== "phases")) {
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [chatId, q.id, JSON.stringify(q.type === "choice"
+          ? { kind: "choice", option_id: q.options![0]!.id, schema_version: 3, other_text: null }
+          : { kind: "text", schema_version: 3, text: "x" })],
+      );
+    }
+    await pool.query(
+      `UPDATE control_plane.intake_sessions
+          SET language = 'en', awaiting = 'machine', phase = 'essentials',
+              ui_state = jsonb_build_object('deferred', '["phases"]'::jsonb, 'last_prompt', $2::text)
+        WHERE telegram_chat_id = $1`,
+      [chatId, lastPrompt],
+    );
+  }
+
+  /**
+   * Taps a button the way production handles one: the callback, then a delivery
+   * tick — a tap hands the floor to the organizer, and what the router says next
+   * comes from the tick (see interview-transcript.test.ts `turn`). Returns what
+   * the router logged, which is the reason for any silence.
+   */
+  async function tap(pool: pg.Pool, chat: Chat, data: string, telegram: Recorder): Promise<string> {
+    const { applyDecision, renderDueRouterPrompts, advanceRouterOwnedQuestions } = await import("../src/relay/poller.js");
+    const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+    const logs: string[] = [];
+    const log = (l: string) => logs.push(l);
+    const deps = { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner, log } as never;
+    await applyDecision(
+      { kind: "interview_callback", chatId: chat.chatId, callbackQueryId: `cq${++seq}`, data, sessionId: chat.sessionId } as never,
+      deps,
+    );
+    await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, log);
+    await renderDueRouterPrompts(deps, DEFAULT_STRINGS, log, 0);
+    return logs.map((l) => (JSON.parse(l) as { event?: string }).event).join(", ");
+  }
+
+  test("a required answer set aside comes back when the last one is answered with a tap", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await requiredSetAside(pool, a.chatId, "q:bot_tone", ["bot_tone"]);
+      const telegram = new Recorder();
+
+      const events = await tap(pool, a, "a:bot_tone:warm", telegram);
+
+      const last = telegram.sent[telegram.sent.length - 1];
+      assert.ok(last, `the router says something after the tap (router logged: ${events})`);
+      assert.ok(last.text.includes(uiString("beforeWeFinish", "en")),
+        `the set-aside question comes back, said as the blocker it is — got: ${last.text}`);
+      const view = await getSessionForChat(pool, a.chatId);
+      assert.equal(view.ok && view.view.nextQuestion?.id, "phases");
+    });
+  });
+
+  test("\"Finished\" with a required answer still set aside brings it back — never silence", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      // Every required question answered but the one set aside, and an optional
+      // one on screen with its Finished button — the live stall's exact state.
+      await requiredSetAside(pool, a.chatId, "q:trip_interests", []);
+      const telegram = new Recorder();
+
+      const events = await tap(pool, a, "c:done", telegram);
+
+      assert.ok(telegram.sent.length > 0, `Finished must never be met with silence (router logged: ${events})`);
+      const last = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(last.text.includes(uiString("beforeWeFinish", "en")),
+        `it says what is still needed — got: ${last.text}`);
+    });
+  });
+
   test("re-asking records nothing — it is the same question, not a new answer", async () => {
     await withTwoInterviews(async ({ pool, a }) => {
       await setInterpretPath(pool, a.chatId, true);

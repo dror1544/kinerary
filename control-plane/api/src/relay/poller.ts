@@ -1326,41 +1326,14 @@ async function runInterpretPath(
     }));
   }
 
-  // THE BOUNDARY. Nothing left to ask, but a required answer is still missing:
-  // bring the deferred questions back, once, and say why they are back.
+  // The floor was taken when the burst arrived; the router speaks now. If the
+  // interview is at the boundary with an answer still set aside, that is
+  // `sendNextStep`'s to handle — for every path, not only this one.
   //
-  // This is where the earlier fix belongs. Re-asking the instant a reply missed
-  // fixed the silence and created nagging — "עוד צריך את זה: מתי הטיול מתחיל?"
-  // after every message about something else. Deferring costs nothing, because
-  // `confirmIntake` refuses without a required answer regardless, so the only
-  // question was ever WHEN to come back for it: immediately, which pesters, or
-  // at the point it actually blocks something, which informs.
-  const afterCommit = await getSessionForChat(deps.db, burst.chatId);
-  if (afterCommit.ok && !afterCommit.view.nextQuestion) {
-    const store = await answersForChat(deps.db, burst.chatId);
-    const missing = store ? deferredRequired(store.answers) : [];
-    if (missing.length > 0) {
-      await undeferAllForChat(deps.db, burst.chatId);
-      log(structuredLog("info", "interview.required_raised_at_boundary", {
-        session_id: burst.sessionId,
-        missing: missing.map((q) => q.id),
-      }));
-      const view = await getSessionForChat(deps.db, burst.chatId);
-      if (view.ok && await claimFloor(deps.db, burst.chatId)) {
-        const question = view.view.nextQuestion ?? missing[0]!;
-        const rendered = renderQuestion(question, selectedOptionIds(view.view, question.id), view.view.language);
-        await deps.telegram.sendMessage({
-          chatId: burst.chatId,
-          text: `${uiString("beforeWeFinish", view.view.language)}\n\n${rendered.text}`,
-          replyMarkup: rendered.replyMarkup ?? undefined,
-        });
-        await recordLastPromptForChat(deps.db, burst.chatId, `q:${question.id}`);
-      }
-      return;
-    }
-  }
-
-  // The floor was taken when the burst arrived; the router speaks now.
+  // Deferring costs nothing because `confirmIntake` refuses without a required
+  // answer regardless; the only question was ever WHEN to come back for it:
+  // immediately, which pesters ("עוד צריך את זה: מתי הטיול מתחיל?" after every
+  // message about something else), or at the point it blocks something.
   await ask();
 }
 
@@ -1866,6 +1839,43 @@ async function sendNextStep(
       session_id: view.sessionId,
     }));
     return false;
+  }
+
+  // THE BOUNDARY. Nothing required left to ask, but a required answer is still
+  // missing — one that stepped aside after a reply did not answer it. Bring the
+  // set-aside questions back, and say why they are back, BEFORE anything
+  // optional and before the summary: this is the point where it actually
+  // blocks something, so "I still need this" informs rather than pesters.
+  //
+  // HERE, and not on the typed-message path where it used to live, because
+  // every router message comes through this function. On 2026-09-11 the
+  // automated full cycle's stops were read with LOW_CONFIDENCE and stepped
+  // aside; the last required question was then answered with a TAP, which
+  // never passed the typed path's check — so the router walked on to the
+  // optional questions, and "Finished" produced nothing at all, because the
+  // summary cannot open with a required answer missing. A person would have
+  // been stuck in front of a button that did nothing.
+  if (view.state === "interviewing" && !view.nextQuestion) {
+    const store = await answersForChat(deps.db, chatId);
+    const missing = store ? deferredRequired(store.answers) : [];
+    if (missing.length > 0) {
+      await undeferAllForChat(deps.db, chatId);
+      (deps.log ?? (() => {}))(structuredLog("info", "interview.required_raised_at_boundary", {
+        session_id: view.sessionId,
+        missing: missing.map((q) => q.id),
+      }));
+      const back = await getSessionForChat(deps.db, chatId);
+      const question = (back.ok ? back.view.nextQuestion : null) ?? missing[0]!;
+      if (!(await claimFloor(deps.db, chatId))) return false;
+      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: `${uiString("beforeWeFinish", view.language)}\n\n${rendered.text}`,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
+      return true;
+    }
   }
 
   // What there is to ask, worked out BEFORE the say is handled — because
