@@ -11,6 +11,7 @@ from unittest.mock import patch
 from control_plane_worker.mcp_bridge import (
     NullMcpBridgeAdapter,
     ShellMcpBridgeAdapter,
+    mcp_port_for_vmid,
 )
 
 TOPOLOGY_YAML = """\
@@ -43,6 +44,32 @@ npm:
   forward_host: trip-osaka-2026
   forward_port: 8080
 """
+
+
+class McpPortForVmidTests(unittest.TestCase):
+    """One trip, one port. Before 2026-09-10 nothing passed --port at all, so
+    every auto-provisioned trip took setup-mcp.sh's 3001 default and the next
+    trip's bridge inherited the previous trip's port with the previous trip's
+    profile still pointing at it."""
+
+    def test_every_vmid_gets_its_own_port(self) -> None:
+        ports = {mcp_port_for_vmid(str(v)) for v in range(100, 400)}
+        self.assertEqual(len(ports), 300, "two containers would share a bridge port")
+
+    def test_the_port_is_stable_across_reprovisions(self) -> None:
+        self.assertEqual(mcp_port_for_vmid("104"), mcp_port_for_vmid("104"))
+
+    def test_it_stays_clear_of_the_hand_provisioned_bridges(self) -> None:
+        # 3001 (legacy shared), 3011 (japan-2025), 3013 (japan-2026) are live
+        # and were set by hand. An auto-provisioned trip must never land on one.
+        for taken in (3001, 3011, 3013):
+            self.assertNotIn(taken, {mcp_port_for_vmid(str(v)) for v in range(100, 1000)})
+
+    def test_a_vmid_that_cannot_produce_a_sane_port_is_refused(self) -> None:
+        # Skipping the bridge is recoverable by hand. Guessing a port is not:
+        # it points a companion at whatever else happens to be listening.
+        for bad in ("", "abc", "99", "1000", "999999", "-5", "10.4", None):
+            self.assertIsNone(mcp_port_for_vmid(bad), bad)  # type: ignore[arg-type]
 
 
 class NullMcpBridgeAdapterTests(unittest.TestCase):
@@ -113,6 +140,29 @@ class ShellMcpBridgeAdapterTests(unittest.TestCase):
             self.assertIn("210", args)
             self.assertIn("--trip-dir", args)
             self.assertIn(os.path.join(deploy_root, "trips", "tokyo-2026"), args)
+            # Without this the script takes its own 3001 default, which is
+            # every other trip's default too.
+            self.assertIn("--port", args)
+            self.assertIn(str(mcp_port_for_vmid("210")), args)
+
+    def test_two_trips_never_get_the_same_port(self) -> None:
+        with tempfile.TemporaryDirectory() as deploy_root:
+            self._write_topology(deploy_root, "tokyo-2026")
+            self._write_topology(deploy_root, "osaka-2026", TOPOLOGY_YAML_WITH_VMID)
+            ports = []
+            for slug, profile, vmid in (
+                ("tokyo-2026", "tokyo2026", "211"),
+                ("osaka-2026", "osaka2026", "210"),
+            ):
+                adapter = ShellMcpBridgeAdapter(deploy_root=deploy_root, vmid_map={slug: vmid})
+                with patch("control_plane_worker.mcp_bridge.subprocess.run") as mock_run:
+                    mock_run.return_value.returncode = 0
+                    mock_run.return_value.stderr = ""
+                    mock_run.return_value.stdout = ""
+                    adapter.setup(slug, profile)
+                args = mock_run.call_args.args[0]
+                ports.append(args[args.index("--port") + 1])
+            self.assertEqual(len(set(ports)), 2, f"both trips got {ports}")
 
     def test_setup_raises_on_a_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as deploy_root:
