@@ -53,6 +53,17 @@ API = os.environ.get("KINERARY_API", "http://127.0.0.1:4310")
 PROJECT = os.environ.get("KINERARY_COMPOSE_PROJECT", "kinerary-control-plane-local")
 MAC_STACK = PROJECT == "kinerary-control-plane-local"
 PG = f"{PROJECT}-postgres-1"
+# Where that stack keeps trips and companions, and how to reach its Hermes.
+# The Mac's home directory and venv by default; on the VM these are root-only
+# paths under /opt and a `hermes` wrapper into the container — which is why the
+# VM runs this through control-plane/deployment/vm-e2e.sh, as root.
+DEPLOY_ROOT = Path(os.environ.get("KINERARY_DEPLOY_ROOT") or Path.home() / "kinerary-deploy")
+HERMES_HOME = Path(os.environ.get("KINERARY_HERMES_HOME") or Path.home() / ".hermes")
+
+
+def hermes_cli() -> list[str]:
+    exe = os.environ.get("KINERARY_HERMES_BIN")
+    return [exe] if exe else [os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python"), "-m", "hermes_cli.main"]
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 
@@ -382,7 +393,7 @@ def stage_confirm_and_build(ctx: dict, wait_minutes: int, build: bool = True) ->
 def stage_site(ctx: dict) -> None:
     stage("The site — up, and serving THIS trip")
     slug = ctx["slug"]
-    topology = Path.home() / "kinerary-deploy/trips" / slug / "topology.yaml"
+    topology = DEPLOY_ROOT / "trips" / slug / "topology.yaml"
     check(topology.exists(), f"topology written ({topology})", f"no topology.yaml for {slug}")
     ip = next((l.split("ipv4:")[1].strip().split("/")[0]
                for l in topology.read_text().splitlines() if "ipv4:" in l), "")
@@ -462,7 +473,7 @@ def stage_companion(ctx: dict) -> None:
     stage("The companion — installed, rendered, running, routable")
     slug = ctx["slug"]
     profile = "".join(ch for ch in slug if ch.isalnum())
-    home = Path.home() / ".hermes/profiles" / profile
+    home = HERMES_HOME / "profiles" / profile
     check(home.is_dir(), f"profile directory exists ({profile})", f"no profile at {home}")
 
     # A BARE `hermes profile create` skeleton is a directory too. The installer
@@ -475,7 +486,9 @@ def stage_companion(ctx: dict) -> None:
     check("trip companion for" in soul, "SOUL is this trip's, not stock Hermes boilerplate",
           "SOUL.md is the default Hermes persona — the profile was never rendered")
 
-    running = subprocess.run(["pgrep", "-f", f"profile {profile} gateway run"],
+    # launchd runs `--profile X gateway run`; an s6 slot in the VM's Hermes
+    # container runs `-p X gateway run`, visible to the host's pgrep.
+    running = subprocess.run(["pgrep", "-f", f"(-p|--profile) {profile} gateway run"],
                              capture_output=True).returncode == 0
     check(running, "companion gateway is running", "the companion's gateway is not running")
 
@@ -499,7 +512,7 @@ def stage_mcp(ctx: dict) -> None:
     stage("MCP — the companion can actually read the trip")
     slug = ctx["slug"]
     profile = "".join(ch for ch in slug if ch.isalnum())
-    home = Path.home() / ".hermes/profiles" / profile
+    home = HERMES_HOME / "profiles" / profile
     cfg = (home / "config.yaml").read_text() if (home / "config.yaml").is_file() else ""
     check("trip-mcp" in cfg, "trip-mcp registered in the profile",
           "no trip-mcp entry — setup-mcp.sh never completed")
@@ -511,8 +524,7 @@ def stage_mcp(ctx: dict) -> None:
           "trip-mcp is present but DISABLED — the SSE transport patch did not run")
 
     out = subprocess.run(
-        [os.path.expanduser("~/.hermes/hermes-agent/venv/bin/python"), "-m", "hermes_cli.main",
-         "--profile", profile, "mcp", "test", "trip-mcp"],
+        [*hermes_cli(), "--profile", profile, "mcp", "test", "trip-mcp"],
         capture_output=True, text=True, timeout=300,
     )
     blob = out.stdout + out.stderr

@@ -264,8 +264,42 @@ with `KINERARY_TEARDOWN=…/vm-teardown-trip.sh`.
 Proven 2026-09-11 on a throwaway trip with a companion installed through the
 forced command: backup, gateway uninstalled, bindings closed and slug retired,
 profile deleted and stayed gone through the 70 s cron watch, no supervisor left.
-The Cloudflare/NPM/LXC and bridge steps run the same provisioner code as on the
-Mac; they are proven by the first VM provisioning run (A6).
+The Cloudflare/NPM/LXC and bridge steps were then proven by the first VM
+provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
+the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
+byte-identical to before the run.
+
+## Provisioning from the VM
+
+Off by default while the Mac stack is live. Three `vm.env` flags switch it on
+for a run, and back off afterwards:
+
+```bash
+sudo sed -i -e 's/^PROVISIONER_COMPUTE_ENABLED=.*/PROVISIONER_COMPUTE_ENABLED=1/' \
+            -e 's/^PROVISIONER_COMPANION_PROFILE_ENABLED=.*/PROVISIONER_COMPANION_PROFILE_ENABLED=1/' \
+            -e 's/^PROVISIONER_MCP_BRIDGE_ENABLED=.*/PROVISIONER_MCP_BRIDGE_ENABLED=1/' /opt/kinerary-deploy/vm.env
+$C up -d --wait worker     # and the reverse (compute blank, the other two 0) when done
+```
+
+The planner here selects only a **sealed** release (`manifest.files` present;
+unsealed is off), so build and promote one from a committed revision first —
+`npm run release -- build`, then `promote <id> --to verified` and
+`--to available`, with `CONTROL_PLANE_DATABASE_URL_FILE` pointing at
+`.local-secrets/control_plane_database_url_host`. The worker re-verifies that
+release's tree with git as root against `/repo`, which the operator owns;
+`release_source._git` therefore passes `safe.directory` for exactly that path
+(git refuses it otherwise — "detected dubious ownership").
+
+First full cycle, 2026-09-11 (A6): `vm-e2e.sh --scenario manual --auto
+--teardown` — interview, confirm, provisioning job succeeded from sealed
+`release_8b41451f…`, site up, both phases on it, companion rendered and running
+under exact relay routing, trip-mcp enabled and answering, then torn down from
+the VM with every step green and the infrastructure back to its baseline.
+
+**The slug comes from the interview, not `--trip-name`.** The `manual`
+scenario produced `portugal-lisbon-and-porto-2026` — the same slug the Mac's
+run of that scenario produces. A VM run and a Mac run of the same scenario
+would fight over one hostname, NPM host and ingress rule: never overlap them.
 
 ## Later: model and effort per task (parked by Dror, 2026-09-11)
 
@@ -298,5 +332,8 @@ Not done. Gates, in order:
 5. Swap the VM's `telegram_creds` to `@Kinerary_bot`, restart the relay.
 6. `/opt/kinerary-deploy` becomes the single copy of per-trip state: give it a
    backup target first.
+7. Retire the Mac worker's `PROVISIONER_LXC_IP_POOL` (or make the two pools
+   disjoint) before both stacks can provision in parallel: each allocator only
+   scans its own deploy root's topology files, so neither sees the other's IPs.
 
 The Mac's compose volume and Hermes profiles stay intact as the rollback.
