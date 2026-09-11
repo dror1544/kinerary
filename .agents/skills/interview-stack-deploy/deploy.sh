@@ -193,39 +193,16 @@ fi
 
 # ── 6. The relay — never restarted under a live conversation without asking ─
 step "Relay"
-LIVE_SESSIONS="$(docker exec kinerary-control-plane-local-postgres-1 psql -U kinerary_control_plane -d kinerary_control_plane -At -c \
-  "SELECT telegram_chat_id FROM control_plane.intake_sessions WHERE state <> 'confirmed' AND awaiting = 'machine' AND awaiting_since > now() - interval '5 minutes';" 2>/dev/null || true)"
-
-if [ -n "$LIVE_SESSIONS" ] && [ "$FORCE_RESTART_RELAY" -eq 0 ]; then
-  cat <<EOF
-    STOPPING before the relay restart.
-
-    At least one interview looks mid-turn right now (awaiting = machine,
-    updated in the last 5 minutes): $LIVE_SESSIONS
-
-    Restarting the relay here drops whatever Telegram update is in flight —
-    it is fetched by the dying process and never handled, and Telegram
-    considers it delivered. This happened live on 2026-09-05 and ate an
-    organizer's message mid-interview.
-
-    Ask the person on that chat for a pause, or re-run with
-    --force-restart-relay if you have already confirmed it is safe.
-EOF
-  exit 2
+# One implementation (scripts/relay-restart.sh): it refuses under a mid-turn
+# interview (restarting drops the Telegram update in flight — 2026-09-05), and
+# it sources provisioning.env ITSELF and reads INTERPRET_* back off the running
+# process. This step used to rely on the calling shell for that environment,
+# which is exactly how a relay came back running the interview WITH the agent.
+if [ "$FORCE_RESTART_RELAY" -eq 1 ]; then
+  "$REPO_ROOT/scripts/relay-restart.sh" --force-live | sed 's/^/    /' || die "relay restart failed — see above"
+else
+  "$REPO_ROOT/scripts/relay-restart.sh" | sed 's/^/    /' || die "relay restart failed — see above (mid-turn interview? re-run with --force-restart-relay once it is safe)"
 fi
-
-OLD_RELAY="$(lsof -nP -iTCP:4312 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
-[ -n "$OLD_RELAY" ] && kill "$OLD_RELAY" 2>/dev/null
-sleep 2
-( cd "$API_DIR"
-  env -u RELAY_GATEWAY_SECRET CONTROL_PLANE_ARCHITECTURE_PROFILE="$RELAY_ARCH_PROFILE" \
-    nohup npx tsx src/relay/server.ts >> "$RELAY_LOG" 2>&1 &
-)
-for _ in $(seq 1 15); do lsof -nP -iTCP:4312 -sTCP:LISTEN -t >/dev/null 2>&1 && break; sleep 1; done
-NEW_RELAY="$(lsof -nP -iTCP:4312 -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
-[ -n "$NEW_RELAY" ] || die "relay did not come up on :4312 — check $RELAY_LOG"
-grep -q '"event":"relay.gateway_connected"' "$RELAY_LOG" || info "WARNING: relay is up but no gateway has connected yet — check $RELAY_LOG"
-info "relay up: pid $NEW_RELAY"
 
 echo
 echo "All four services confirmed on the new build. Nothing here reset a trip or minted a link — use fresh-interview.py for that."

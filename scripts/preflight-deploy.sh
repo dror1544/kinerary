@@ -18,8 +18,16 @@
 #       returned, never by name (scripts/teardown-trip.py). Nothing that existed
 #       before the run is touched.
 #
-#   --scenario japan|multi|manual|none   the trip to walk (default japan);
+#   --scenario japan|multi|manual|all|none   the trip to walk (default japan);
 #                                        none = deploy + automated checks only
+#   --auto                               an automated organizer plays the person
+#                                        (tools/auto-organizer.ts) through a
+#                                        Telegram stand-in; needed for `all`.
+#                                        The relay goes back to real Telegram
+#                                        afterwards, pass or fail.
+#
+#   scripts/preflight-deploy.sh --deploy --auto --scenario all --cleanup
+#       every scenario, end to end, nobody's hands on anything, nothing left behind
 #
 # WHY IT GREW. The old version skipped trip-web and runtime-gateway entirely,
 # and on a Mac whose python3 lacks PyYAML/psycopg it reported the worker and
@@ -49,18 +57,23 @@ set -uo pipefail
 CHECKOUT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 cd "$CHECKOUT" || exit 1
 
-DEPLOY=0; CLEANUP=0; SCENARIO=japan
+DEPLOY=0; CLEANUP=0; AUTO=0; SCENARIO=japan
 while [ $# -gt 0 ]; do
   case "$1" in
     --deploy) DEPLOY=1 ;;
     --cleanup) CLEANUP=1 ;;
-    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|none}"; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    --auto) AUTO=1 ;;
+    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|all|none}"; shift ;;
+    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
-case "$SCENARIO" in japan|multi|manual|none) ;; *) echo "--scenario must be japan|multi|manual|none" >&2; exit 2 ;; esac
+case "$SCENARIO" in japan|multi|manual|all|none) ;; *) echo "--scenario must be japan|multi|manual|all|none" >&2; exit 2 ;; esac
+if [ "$SCENARIO" = all ] && [ "$AUTO" = 0 ]; then
+  echo "--scenario all needs --auto: three interviews back to back are not a thing to ask a person for" >&2
+  exit 2
+fi
 if [ "$CLEANUP" = 1 ] && [ "$DEPLOY" = 0 ]; then
   echo "--cleanup tears down the trip a --deploy run creates; without --deploy there is nothing to clean up" >&2
   exit 2
@@ -284,9 +297,11 @@ if [ "$SCENARIO" = none ]; then
   printf '\n%s[ ok ]%s deployed and verified. No trip walked (--scenario none).\n' "$C_G" "$C_X"; exit 0
 fi
 
-step "One trip, signup to working companion ($SCENARIO)$([ "$CLEANUP" = 1 ] && echo ', then torn down')"
-if [ "$CLEANUP" = 1 ]; then python3 scripts/e2e-full-cycle.py --scenario "$SCENARIO" --teardown
-else python3 scripts/e2e-full-cycle.py --scenario "$SCENARIO"; fi
+step "Signup to working companion ($SCENARIO)$([ "$AUTO" = 1 ] && echo ', automated organizer')$([ "$CLEANUP" = 1 ] && echo ', then torn down')"
+E2E_ARGS=(--scenario "$SCENARIO")
+[ "$AUTO" = 1 ] && E2E_ARGS+=(--auto)
+[ "$CLEANUP" = 1 ] && E2E_ARGS+=(--teardown)
+python3 scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
 printf '\n%s[ ok ]%s deployed, verified, and one trip walked end to end.\n' "$C_G" "$C_X"

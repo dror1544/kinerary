@@ -282,10 +282,19 @@ def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
         os.chmod(f, 0o600)
 
 
+# An interview left open on a torn-down trip is still a session the relay
+# works: it would warn it "about to close" and then close it, messaging the
+# organizer's chat about a trip that no longer exists. Marking it expired is
+# what the relay's own expiry does, without the message.
+CLOSE_SESSIONS = ("UPDATE control_plane.intake_sessions SET expired_at = now() "
+                  "WHERE trip_id = '{id}' AND expired_at IS NULL AND state <> 'confirmed'")
+
+
 def retire_in_db(trip: dict) -> str:
     if trip["slug"].startswith("retired-"):
         psql(f"UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' "
              f"WHERE trip_id = '{trip['id']}' AND closed_at IS NULL")
+        psql(CLOSE_SESSIONS.format(id=trip["id"]))
         return trip["slug"]
     base = f"retired-{trip['orig']}-{datetime.now():%Y%m%d}"
     new = base
@@ -298,6 +307,7 @@ UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';
+{CLOSE_SESSIONS.format(id=trip['id'])};
 COMMIT;""")
     return new
 

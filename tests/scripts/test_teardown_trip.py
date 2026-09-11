@@ -84,6 +84,20 @@ class NarrowAllowlist(unittest.TestCase):
         self.assertEqual(argv[1:], ["--profile", "trip-intake", "gateway", "restart"])
 
 
+class RetireInDb(unittest.TestCase):
+    def test_an_open_interview_is_closed_with_the_trip(self):
+        # Left open, the relay would later message the organizer's chat that an
+        # interview for a trip that no longer exists is about to close.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"})
+        tx = seen[-1]
+        self.assertIn("UPDATE control_plane.intake_sessions SET expired_at = now()", tx)
+        self.assertIn("state <> 'confirmed'", tx)
+        self.assertLess(tx.index("BEGIN"), tx.index("intake_sessions"))
+        self.assertLess(tx.index("intake_sessions"), tx.index("COMMIT"))
+
+
 class OriginalSlug(unittest.TestCase):
     def test_a_retired_slug_still_names_its_old_resources(self):
         self.assertEqual(teardown.original_slug("retired-japan-2026-20260911"), "japan-2026")

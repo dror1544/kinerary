@@ -99,8 +99,22 @@ cd tests && npm test                           # the trip-site suite alone
 scripts/preflight-deploy.sh                    # every suite, with its real deps — deploys nothing
 scripts/preflight-deploy.sh --deploy           # + deploy THIS checkout, verify it, walk one trip (you do the interview)
 scripts/preflight-deploy.sh --deploy --cleanup # + tear down the trip this run created
-#   --scenario japan|multi|manual|none         # which trip; none = deploy + automated checks only
+#   --scenario japan|multi|manual|all|none     # which trip; none = deploy + automated checks only
+#   --auto                                     # an automated organizer plays the person (needed for `all`)
+scripts/preflight-deploy.sh --deploy --auto --scenario all --cleanup   # everything, hands off, nothing left behind
 ```
+
+`--auto` replaces exactly one thing: a person on Telegram. The relay is pointed
+at a local Bot API stand-in (`control-plane/api/tools/fake-telegram.ts`, via
+`TELEGRAM_API_ROOT`, which only accepts https or loopback because it receives the
+bot token), and `tools/auto-organizer.ts` sends `/start`, uploads the
+scenario's documents, types and taps through it — reading its own session over a
+**read-only** connection to know which question is on screen. Everything else is
+production code doing production work. The relay goes back to real Telegram in
+a `finally`, so a failed run cannot leave @Kinerary_bot answering a stand-in;
+while a run is going, real messages to the bot wait at Telegram. Restart the
+relay only with `scripts/relay-restart.sh` — it sources `provisioning.env`
+itself and reads `INTERPRET_*` back off the running process.
 Run before claiming something works, not after. The default mode runs what CI
 runs and what CI does not (trip-web, runtime-gateway, `tests/scripts`), and it
 **provides** dependencies rather than skipping without them: a Python 3.12 venv

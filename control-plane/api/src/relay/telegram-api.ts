@@ -13,9 +13,33 @@ import { structuredLog } from "../redaction.js";
 import type { InlineKeyboard } from "../chat-router.js";
 import { toTelegramMarkdownV2 } from "./markdown.js";
 
-const TELEGRAM_API_ROOT = "https://api.telegram.org";
-/** File downloads hang off a different path root than the method API. */
-const TELEGRAM_FILE_ROOT = "https://api.telegram.org/file";
+export const TELEGRAM_API_ROOT = "https://api.telegram.org";
+
+/**
+ * Where the Bot API lives. Telegram's own, unless the operator points it
+ * elsewhere — a self-hosted telegram-bot-api server, or the end-to-end
+ * harness's stand-in (tools/fake-telegram.ts), which is what lets a whole
+ * signup-to-companion cycle run with no human thumbs on a phone.
+ *
+ * Every request to this root carries the BOT TOKEN in its path, so the root is
+ * refused unless it is https, or plain http to this machine. Anything else
+ * would put the token on the wire, readable, to another host.
+ */
+export function telegramApiRoot(configured: string | undefined): string {
+  const value = (configured ?? "").trim();
+  if (!value) return TELEGRAM_API_ROOT;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("TELEGRAM_API_ROOT is not a URL");
+  }
+  const loopback = url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("TELEGRAM_API_ROOT must be https, or http to 127.0.0.1 — it receives the bot token");
+  }
+  return value.replace(/\/+$/, "");
+}
 
 export interface SendResult {
   ok: boolean;
@@ -97,13 +121,18 @@ export interface TelegramClient {
 }
 
 export class HttpTelegramClient implements TelegramClient {
+  private readonly apiRoot: string;
+
   constructor(
     private readonly botToken: string,
     private readonly log: (line: string) => void = () => {},
-  ) {}
+    apiRoot: string = TELEGRAM_API_ROOT,
+  ) {
+    this.apiRoot = telegramApiRoot(apiRoot);
+  }
 
   private url(method: string): string {
-    return `${TELEGRAM_API_ROOT}/bot${this.botToken}/${method}`;
+    return `${this.apiRoot}/bot${this.botToken}/${method}`;
   }
 
   private async post(method: string, body: unknown): Promise<{ ok: boolean; result?: unknown; error?: string }> {
@@ -288,7 +317,8 @@ export class HttpTelegramClient implements TelegramClient {
         this.log(structuredLog("warn", "telegram_api.file_too_large", { size: meta.file_size }));
         return null;
       }
-      const response = await fetch(`${TELEGRAM_FILE_ROOT}/bot${this.botToken}/${filePath}`);
+      // File downloads hang off a different path root than the method API.
+      const response = await fetch(`${this.apiRoot}/file/bot${this.botToken}/${filePath}`);
       if (!response.ok) {
         this.log(structuredLog("warn", "telegram_api.file_download_failed", { status: response.status }));
         return null;

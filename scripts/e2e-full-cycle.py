@@ -180,30 +180,115 @@ def stage_signup(trip_name: str) -> dict:
     return {"trip_id": result["tripId"], "email": email, "password": password}
 
 
-def stage_interview(ctx: dict, scenario: str) -> None:
-    stage(f"Interview — scenario '{scenario}'")
+def stage_interview(ctx: dict, scenario: str, auto: "Auto | None" = None) -> None:
+    stage(f"Interview — scenario '{scenario}'" + (" (automated organizer)" if auto else ""))
     sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
     from make_documents import SCENARIOS, build  # noqa: E402
 
     spec = SCENARIOS[scenario]
+    docs = None
     if spec["documents"]:
-        out = Path("/tmp") / f"kinerary-e2e-{scenario}"
-        files = build(scenario, out)
+        docs = Path("/tmp") / f"kinerary-e2e-{scenario}"
+        files = build(scenario, docs)
         ok(f"generated {len(files)} document(s): {', '.join(f.name for f in files)}")
-        note("extraction is exercised by tools/extract-intake-check.ts against this folder")
     else:
         ok("no documents — every answer typed, which is the control case")
 
-    # The interview itself is a conversation. Driving it here would be driving
-    # the ROUTER, not the interview, so this stage stops at the link: it is the
-    # one step a person genuinely has to do, and pretending otherwise would
-    # make a green run that proves nothing about the interview.
     enrollment = api("POST", f"/v1/trips/{ctx['trip_id']}/enrollment", {},
                      auth_header(ctx["email"], ctx["password"]))
     ctx["enrollment"] = enrollment
     ok(f"enrollment issued ({enrollment['enrollmentId']})")
+    if auto:
+        auto.interview(ctx, scenario, enrollment["token"], docs)
+        return
     print(f"\n  {YELLOW}🧍 HUMAN{RESET} open this, answer the interview, and CONFIRM:\n")
     print(f"     https://t.me/{bot_username()}?start={enrollment['token']}\n")
+    if docs:
+        print(f"     send the scenario's document(s) when the bot asks: {docs}\n")
+
+
+class Auto:
+    """The person on Telegram, automated — see tools/auto-organizer.ts.
+
+    For the length of the run the relay is pointed at a Telegram stand-in
+    (tools/fake-telegram.ts) instead of api.telegram.org, and the organizer
+    types, uploads and taps through it. That is the ONLY substitution: the
+    relay, router, model calls, API, worker, provisioning, companion and MCP are
+    the production code, doing production work. `end()` puts the relay back on
+    real Telegram, and it is called from a `finally` — a failed run must not
+    leave the bot answering a stand-in nobody is watching.
+    """
+
+    def __init__(self) -> None:
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        self.root = f"http://127.0.0.1:{self.port}"
+        self.proc: subprocess.Popen | None = None
+        self.log = Path("/tmp") / f"kinerary-e2e-fake-telegram-{self.port}.log"
+
+    def begin(self) -> None:
+        stage("Automated organizer — relay pointed at the Telegram stand-in")
+        self.proc = subprocess.Popen(
+            ["node", "--import", "tsx", "tools/fake-telegram.ts", "--port", str(self.port)],
+            cwd=REPO / "control-plane/api", stdout=self.log.open("w"), stderr=subprocess.STDOUT,
+        )
+
+        def healthy() -> bool:
+            try:
+                with urllib.request.urlopen(f"{self.root}/_control/health", timeout=2) as r:
+                    return r.status == 200
+            except Exception:  # noqa: BLE001
+                return False
+        wait_for("the Telegram stand-in", healthy, timeout=30, interval=1)
+        ok(f"Telegram stand-in on {self.root}")
+        relay_restart(self.root)
+        ok("relay restarted against the stand-in (agentless, runners set, gateways reconnected)")
+
+    def interview(self, ctx: dict, scenario: str, token: str, docs: Path | None) -> None:
+        # A private-chat id no real Telegram user has (real ids are ~10 digits),
+        # fresh per run so no earlier session or binding is inherited.
+        chat = str(9_000_000_000_000 + secrets.randbelow(10**9))
+        ctx["chat"] = chat
+        env = {**os.environ, "CONTROL_PLANE_DATABASE_URL": live_database_url(),
+               "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"}
+        cmd = ["node", "--import", "tsx", "tools/auto-organizer.ts", "--scenario", scenario,
+               "--token", token, "--chat", chat, "--telegram", self.root]
+        if docs:
+            cmd += ["--docs", str(docs)]
+        result = subprocess.run(cmd, cwd=REPO / "control-plane/api", env=env)
+        check(result.returncode == 0, "the organizer answered every question and confirmed",
+              "the automated organizer stalled — its transcript is above")
+
+    def end(self) -> None:
+        stage("Automated organizer — relay back on real Telegram")
+        try:
+            relay_restart(None)
+            ok("relay restarted against api.telegram.org")
+        finally:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+
+
+def relay_restart(telegram_root: str | None) -> None:
+    cmd = [str(REPO / "scripts/relay-restart.sh")] + (["--telegram-root", telegram_root] if telegram_root else [])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Failed(f"relay restart failed: {(result.stderr or result.stdout).strip()[-400:]}")
+
+
+def live_database_url() -> str:
+    """The live control-plane DB, reached from the host — for the organizer's
+    READ-ONLY view of its own session (it opens the connection read-only)."""
+    path = REPO / "control-plane/deployment/.local-secrets/control_plane_database_url_host"
+    if not path.is_file():
+        raise Failed(f"no {path} — the organizer needs the host URL of the live control-plane DB")
+    return path.read_text().strip()
 
 
 def bot_username() -> str:
@@ -402,9 +487,12 @@ def stage_mcp(ctx: dict) -> None:
           f"`hermes mcp test trip-mcp` did not list trip tools:\n{blob[-400:]}")
 
 
+TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026"}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual"])
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "all"])
     ap.add_argument("--trip-name", default=None)
     ap.add_argument("--wait-minutes", type=int, default=30,
                     help="how long to wait for the human half of the interview")
@@ -413,38 +501,73 @@ def main() -> int:
     ap.add_argument("--teardown", action="store_true",
                     help="afterwards, tear down the trip THIS run created (scripts/teardown-trip.py), "
                          "whether the run passed or failed")
+    ap.add_argument("--auto", action="store_true",
+                    help="play the organizer automatically through a Telegram stand-in instead of a person")
     args = ap.parse_args()
+    if args.scenario == "all" and not args.auto:
+        ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
-    trip_name = args.trip_name or {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026"}[args.scenario]
-    ctx: dict = {}
-    code = 0
+    scenarios = ["japan", "multi", "manual"] if args.scenario == "all" else [args.scenario]
+    results: list[tuple[str, int, dict]] = []
     try:
         stage_preflight()
-        ctx.update(stage_signup(trip_name))
-        stage_interview(ctx, args.scenario)
-        stage_confirm_and_build(ctx, args.wait_minutes)
-        stage_site(ctx)
-        stage_content(ctx, args.scenario)
-        stage_companion(ctx)
-        stage_mcp(ctx)
-        print(f"\n{GREEN}✓ full cycle green{RESET}: site, content, companion and MCP all verified.")
-        print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
-        print(f"  login: {ctx['email']} / {ctx['password']}")
     except Failed as exc:
         print(f"\n{RED}✗ FAILED{RESET}: {exc}\n")
-        if ctx.get("trip_id"):
-            print(f"  trip:  {ctx['trip_id']}  ({ctx.get('slug', 'no slug yet')})")
-            print(f"  login: {ctx.get('email')} / {ctx.get('password')}")
-        code = 1
+        return 1
+    auto = Auto() if args.auto else None
+    try:
+        if auto:
+            auto.begin()
+        for scenario in scenarios:
+            ctx: dict = {}
+            code = run_scenario(scenario, args, auto, ctx)
+            if args.teardown:
+                code = stage_teardown(ctx) or code
+            elif ctx.get("trip_id"):
+                print(f"  {DIM}left running — `scripts/teardown-trip.py --trip {ctx['trip_id']} --execute` removes it{RESET}")
+            results.append((scenario, code, ctx))
     except KeyboardInterrupt:
         print(f"\n{YELLOW}interrupted{RESET} — nothing torn down.")
         return 130
+    except Failed as exc:
+        print(f"\n{RED}✗ FAILED{RESET}: {exc}\n")
+        results.append(("setup", 1, {}))
+    finally:
+        if auto:
+            try:
+                auto.end()
+            except Failed as exc:
+                print(f"\n{RED}✗ THE RELAY IS NOT BACK ON REAL TELEGRAM{RESET}: {exc}\n")
+                results.append(("restore", 1, {}))
 
-    if not args.teardown:
+    if len(results) > 1 or args.scenario == "all":
+        print(f"\n{'scenario':<10} result")
+        for name, code, ctx in results:
+            print(f"{name:<10} {GREEN + 'green' + RESET if code == 0 else RED + 'FAILED' + RESET}  "
+                  f"{ctx.get('trip_id', '')} {ctx.get('slug', '')}")
+    return 0 if results and all(code == 0 for _, code, _ in results) else 1
+
+
+def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", ctx: dict) -> int:
+    trip_name = args.trip_name if (args.trip_name and args.scenario != "all") else TRIP_NAMES[scenario]
+    try:
+        ctx.update(stage_signup(trip_name))
+        stage_interview(ctx, scenario, auto)
+        stage_confirm_and_build(ctx, args.wait_minutes)
+        stage_site(ctx)
+        stage_content(ctx, scenario)
+        stage_companion(ctx)
+        stage_mcp(ctx)
+        print(f"\n{GREEN}✓ full cycle green ({scenario}){RESET}: site, content, companion and MCP all verified.")
+        print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
+        print(f"  login: {ctx['email']} / {ctx['password']}")
+        return 0
+    except Failed as exc:
+        print(f"\n{RED}✗ FAILED ({scenario}){RESET}: {exc}\n")
         if ctx.get("trip_id"):
-            print(f"  {DIM}left running — `scripts/teardown-trip.py --trip {ctx['trip_id']} --execute` removes it{RESET}")
-        return code
-    return stage_teardown(ctx) or code
+            print(f"  trip:  {ctx['trip_id']}  ({ctx.get('slug', 'no slug yet')})")
+            print(f"  login: {ctx.get('email')} / {ctx.get('password')}")
+        return 1
 
 
 def stage_teardown(ctx: dict) -> int:

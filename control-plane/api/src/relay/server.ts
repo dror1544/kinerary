@@ -39,7 +39,7 @@ import { agentTextIsInLanguage } from "./internal-leak.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { startTripBotPoller } from "./poller.js";
-import { HttpTelegramClient, type TelegramClient } from "./telegram-api.js";
+import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -132,7 +132,13 @@ async function serveRuntime(path: string): Promise<Runtime> {
     }));
   });
 
-  const telegram = new HttpTelegramClient(botToken, log);
+  // Said loudly when it is not Telegram's own: a relay left pointed at the
+  // e2e stand-in answers nobody real, and the log is where that shows first.
+  const telegramRoot = telegramApiRoot(process.env.TELEGRAM_API_ROOT);
+  if (telegramRoot !== TELEGRAM_API_ROOT) {
+    log(structuredLog("warn", "relay.telegram_api_root_overridden", { root: telegramRoot }));
+  }
+  const telegram = new HttpTelegramClient(botToken, log, telegramRoot);
 
   // Ask Telegram who we are rather than configuring it. The username and id
   // drive the group relevance gate (@mention detection, and telling a reply to
