@@ -443,6 +443,8 @@ async function answerEverythingRequired(fix: Fixture): Promise<void> {
     // Required as of 2026-09-07. bot_gender and bot_tone are choice questions
     // and go through the tap path above; only the name is typed.
     bot_name: "Rio",
+    // Required as of 2026-09-11: without it no companion is built.
+    organizer_identity: "Dror",
   };
 
   for (let guard = 0; guard < 40; guard += 1) {

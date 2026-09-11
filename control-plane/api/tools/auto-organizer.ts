@@ -90,7 +90,10 @@ const SCENARIOS: Record<string, Scenario> = {
       destination: "Portugal — Lisbon and Porto",
       departure_date: "June 10, 2026",
       return_date: "June 18, 2026",
-      travelers: "Noa Cohen, Avi Cohen, and our kids Tamar and Eitan",
+      // First person on purpose: "me" next to a name is how organizer_identity
+      // should be learned without being asked. The japan script lists the
+      // family in the third person, so between them both paths run.
+      travelers: "Me — Noa Cohen, 45 — my husband Avi Cohen, 47, and our kids Tamar, 12, and Eitan, 9",
       phases: "Lisbon from June 10 to June 14, then Porto from June 14 to June 18",
       bot_name: "Sol",
       trip_interests: "food, tiles and old neighbourhoods, one beach day",
@@ -153,9 +156,24 @@ const pool = new pg.Pool({
   max: 2,
 });
 
+let sessionId: string | null = null;
+
 async function view(): Promise<SessionView | null> {
   const r = await getSessionForChat(pool, chatId);
+  if (r.ok) sessionId = r.view.sessionId;
   return r.ok ? r.view : null;
+}
+
+/**
+ * A CONFIRMED session is no longer the chat's active one, so `view()` returns
+ * nothing once confirm lands — which the first automated run read as "the
+ * session vanished" and reported a stall on a run that had in fact built the
+ * trip. The session's own row says what happened.
+ */
+async function confirmed(): Promise<boolean> {
+  if (!sessionId) return false;
+  const r = await pool.query("SELECT state FROM control_plane.intake_sessions WHERE id = $1", [sessionId]);
+  return r.rows[0]?.state === "confirmed";
 }
 
 function fingerprint(v: SessionView | null): string {
@@ -175,6 +193,7 @@ async function settle(before: string, what: string): Promise<SessionView | null>
     await drain();
     const queued = Number((await control("health")).updatesQueued ?? 0);
     v = await view();
+    if (queued === 0 && !v && (await confirmed())) return null;
     if (queued === 0 && v && v.awaiting !== "machine" && fingerprint(v) !== before) {
       await sleep(1000); // let a follow-up message land before reading the screen
       await drain();
@@ -207,7 +226,10 @@ const MIME: Record<string, string> = {
 
 // ── The organizer ────────────────────────────────────────────────────────────
 
+const asked = new Set<string>();
+
 async function answer(q: IntakeQuestion, s: Scenario): Promise<boolean> {
+  asked.add(q.id);
   if (q.type === "choice") {
     const option = s.choice[q.id] ?? q.options?.[0]?.id;
     if (option && (await tap(`a:${q.id}:${option}`))) return true;
@@ -264,7 +286,10 @@ async function main(): Promise<number> {
 
   for (let turn = 0; Date.now() < deadline; turn += 1) {
     v = await view();
-    if (!v) throw new Stalled("the session disappeared");
+    if (!v) {
+      if (await confirmed()) break;
+      throw new Stalled("the session disappeared without being confirmed");
+    }
     if (v.state === "confirmed") break;
     const before = fingerprint(v);
 
@@ -288,12 +313,15 @@ async function main(): Promise<number> {
     await drain();
   }
 
-  v = await view();
   await drain();
-  if (v?.state !== "confirmed") throw new Stalled(`out of time in state ${v?.state}`);
+  if (!(await confirmed())) throw new Stalled(`out of time before the intake was confirmed`);
   const unknown = (await control(`sent?chatId=${chatId}`)).unknownMethods as string[];
-  console.log(JSON.stringify({ event: "organizer.confirmed", scenario: scenarioName, sessionId: v.sessionId,
-    tripId: v.tripId, unknownTelegramMethods: unknown }));
+  // Which questions a person would actually have been asked — the rest came
+  // from their documents or from something they had already said.
+  say(`  asked: ${[...asked].join(", ")}`);
+  if (!asked.has("organizer_identity")) say("  organizer_identity: inferred, not asked");
+  console.log(JSON.stringify({ event: "organizer.confirmed", scenario: scenarioName, sessionId,
+    asked: [...asked], unknownTelegramMethods: unknown }));
   return 0;
 }
 

@@ -52,6 +52,7 @@ const JAPAN_ANSWERS = {
   bot_name: { kind: "text", schema_version: 2, text: "Rio" },
   bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
   bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+  organizer_identity: { kind: "text", schema_version: 2, text: "Eitan" },
 };
 
 const CORRECTED_ANSWERS = {

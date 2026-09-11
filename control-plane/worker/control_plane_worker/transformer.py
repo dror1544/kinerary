@@ -690,6 +690,44 @@ def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any])
     return forms
 
 
+#: A self-reference someone puts in front of their own name: "I'm Nir", "אני
+#: ניר", "it's me, Nir". Only ever stripped from the START of the answer.
+_SELF_REFERENCE = re.compile(
+    r"^(?:it'?s\s+me|i\s+am|i'?m|me|myself|זה\s+אני|זאת\s+אני|אני)(?=[\s,:(]|$)[\s,:]*",
+    re.IGNORECASE,
+)
+#: What separates a name from what someone says about themselves after it:
+#: "ניר, אבא של המשפחה", "Nir - the dad", "Nir (the dad)". A hyphen counts
+#: only with spaces around it, so "Anne-Marie" stays one name.
+_AFTER_NAME = re.compile(r"\s*[,;(—–]\s*|\s+-\s+")
+
+
+def _stated_name_candidates(answer: str) -> list[str]:
+    """The answer as typed, then the NAME at the front of it.
+
+    2026-09-11, the first automated full cycle: "which of the travellers are
+    you?" is answered in a sentence — "ניר, אבא של המשפחה", "I'm Nir", "me
+    (Nir)" — and matching the whole sentence found nobody, so the trip
+    provisioned with no companion. This reads the leading name out of such an
+    answer and NOTHING else: never a name buried later ("Nir's wife" is not
+    Nir), and never a word from the description. The candidate still has to
+    match exactly one traveller; see `_resolve_organizers`.
+    """
+    full = _normalize_identity(answer)
+    if not full:
+        return []
+    candidates = [full]
+    rest = _SELF_REFERENCE.sub("", full, count=1)
+    parts = _AFTER_NAME.split(rest, maxsplit=1)
+    head = parts[0].strip(" )")
+    if head:
+        candidates.append(head)
+    elif len(parts) > 1:
+        # "me (Nir)": the self-reference WAS the head, so the name is next.
+        candidates.append(_AFTER_NAME.split(parts[1], maxsplit=1)[0].strip(" )"))
+    return list(dict.fromkeys(c for c in candidates if c))
+
+
 def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, Any]]) -> list[str]:
     """Matches the organizer_identity answer to a participant username.
 
@@ -705,8 +743,8 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     with extra steps.
     """
     answer = data.get("organizer_identity")
-    needle = _normalize_identity(_text_value(answer)) if isinstance(answer, Mapping) else ""
-    if not needle:
+    candidates = _stated_name_candidates(_text_value(answer)) if isinstance(answer, Mapping) else []
+    if not candidates:
         return []
 
     # The raw roster, keyed by every given-name form it carries, so a
@@ -723,7 +761,7 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
             if form:
                 raw_by_name.setdefault(form, entry)
 
-    matched: list[str] = []
+    forms_by_username: dict[str, set[str]] = {}
     for participant in participants:
         username = participant.get("username")
         if not username:
@@ -734,11 +772,19 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
                 raw_by_name.get(_normalize_identity(participant.get("name_en"))),
             ) if raw is not None
         ]
-        if needle in _identity_forms(participant, *aliases):
-            matched.append(username)
+        forms_by_username.setdefault(username, set()).update(_identity_forms(participant, *aliases))
 
-    unique = list(dict.fromkeys(matched))
-    return unique if len(unique) == 1 else []
+    # The answer as typed first, then the name at the front of it. The first
+    # reading that names exactly ONE traveller wins; a reading that names two
+    # ends the search — a looser read must never break a tie a stricter one
+    # could not.
+    for needle in candidates:
+        matched = [u for u, forms in forms_by_username.items() if needle in forms]
+        if len(matched) == 1:
+            return matched
+        if len(matched) > 1:
+            return []
+    return []
 
 
 def _derive_agent(

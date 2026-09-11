@@ -1486,6 +1486,36 @@ class ResolveOrganizersTests(unittest.TestCase):
         intake["organizer_identity"] = _text("Nir Solomon")
         self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
 
+    # 2026-09-11, the first automated full cycle: a natural answer to "which of
+    # the travellers are you?" is a name WITH something around it, and every
+    # one of these matched nobody — so the trip provisioned with no companion.
+    def test_a_name_followed_by_a_description(self) -> None:
+        for stated in ("ניר, אבא של המשפחה", "Nir - the dad", "Nir — organizing this", "Nir (the dad)"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_a_self_reference_in_front_of_the_name(self) -> None:
+        for stated in ("אני ניר", "זה אני, ניר", "I'm Nir", "I am Nir Solomon", "me (Nir)", "it's me, Nir"):
+            with self.subTest(stated=stated):
+                self.assertEqual(self._resolve(stated), ["nir"])
+
+    def test_the_tolerant_read_takes_the_leading_name_never_any_word(self) -> None:
+        # "Nir's wife" is NOT Nir. Only the name the sentence starts with — after
+        # an optional "I'm"/"אני" — is read; a name buried later is not.
+        self.assertEqual(self._resolve("אשתו של ניר"), [])
+        self.assertEqual(self._resolve("Nir's wife"), [])
+        self.assertEqual(self._resolve("the dad"), [])
+        self.assertEqual(self._resolve("Noa, Nir's wife"), ["noa"])
+
+    def test_the_tolerant_read_still_refuses_to_guess(self) -> None:
+        twins = [
+            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
+            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+        ]
+        self.assertEqual(self._resolve("אני שי", twins), [])
+        self.assertEqual(self._resolve("Shai, the older one", twins), [])
+        self.assertEqual(self._resolve("אני שי כהן", twins), ["shai_a"])
+
     def test_a_roster_with_no_raw_travelers_still_resolves_a_bare_name(self) -> None:
         # Older intakes, and any path that hands over participants without the
         # structured travelers answer beside them, must not regress.

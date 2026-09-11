@@ -441,11 +441,24 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     required: false,
   },
   {
+    // REQUIRED as of 2026-09-11. Optional, it was the one skippable question
+    // whose absence costs the whole assistant: `build_companion_handoff` will
+    // not guess who gets the organizer's private channel, so an organizer who
+    // tapped "finish" before reaching it got a site with no companion and a
+    // build reported as a success — found by the first automated full cycle.
+    //
+    // Required does not mean always ASKED. The travelers answer, or a
+    // document, often already says who is speaking ("me — Dror, 52, and Noa,
+    // 45"; "Three of us: me (Dana), Omri, Yael"), and the interpreter records
+    // it from there, so the router only asks when nobody has said.
     id: "organizer_identity",
     type: "text",
-    prompt: "Which of the travelers are you? (this sets up your private organizer channel with the trip assistant)",
+    prompt:
+      "Which of the travelers is the person you are talking to? Record ONLY that traveler's own name, exactly as the travelers list has it — \"Dror\" or \"Dror Elul\", never \"Dror, the dad\" or \"I am Dror\". " +
+      "Answer it WITHOUT asking whenever they have already said which traveler they are: \"me\", \"I\", \"myself\", \"אני\" next to a name in the travelers answer, or a document written in the first person (\"me (Dana)\"). " +
+      "Never infer it from anything else — not from who signed up, not from who is listed first.",
     maxLength: 80,
-    required: false,
+    required: true,
   },
   {
     // The assistant's name, voice and tone are REQUIRED as of 2026-09-07, at the

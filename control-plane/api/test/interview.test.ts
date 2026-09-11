@@ -312,14 +312,24 @@ describe("validateAnswer (unit)", () => {
     // optional, and the reason still holds for them: proactive scheduling and
     // standing limits are refinements, and an organizer who skips them still
     // gets a working assistant.
+    //
+    // CHANGED 2026-09-11: organizer_identity left this list. "Still gets a
+    // working assistant" was false for it — `build_companion_handoff` will not
+    // guess who owns the organizer's private channel, so skipping it cost the
+    // whole companion (ORGANIZER_UNRESOLVED), under a build reported as a
+    // success. The first automated full cycle did exactly what the UI invites:
+    // tapped "finish" at the first optional question.
     for (const id of [
-      "trip_pace", "dietary", "dietary_scope", "organizer_identity",
+      "trip_pace", "dietary", "dietary_scope",
       "bot_proactive", "bot_limits",
     ]) {
       const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
       assert.ok(q, `${id} must exist`);
       assert.equal(q.required, false, `${id} must be optional`);
     }
+    // Required — though only ASKED when the travelers answer or a document has
+    // not already said who is speaking (see its prompt).
+    assert.equal(INTAKE_QUESTIONS.find((q) => q.id === "organizer_identity")?.required, true);
   });
 });
 
@@ -575,6 +585,8 @@ async function answerAllRequiredQuestions(pool: pg.Pool, sessionToken: string): 
   await submitAnswer(pool, sessionToken, "bot_name", "Rio");
   await submitAnswer(pool, sessionToken, "bot_gender", "neutral");
   await submitAnswer(pool, sessionToken, "bot_tone", "warm");
+  // Required as of 2026-09-11 — without it no companion can be built.
+  await submitAnswer(pool, sessionToken, "organizer_identity", "Test Traveler");
   await submitAnswer(pool, sessionToken, "phases", null, undefined, undefined, [
     { name: "Test City", start: "2026-09-06", end: "2026-09-20" },
   ]);
@@ -1328,6 +1340,8 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       // "all required questions" and one of these is now the last.
       await submitAnswer(fix.pool, sessionToken, "bot_name", "Rio");
       await submitAnswer(fix.pool, sessionToken, "bot_gender", "neutral");
+      // organizer_identity is required as of 2026-09-11 too.
+      await submitAnswer(fix.pool, sessionToken, "organizer_identity", "Test");
       const last = await submitAnswer(fix.pool, sessionToken, "bot_tone", "warm");
 
       assert.equal(last.ok, true);

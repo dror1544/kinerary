@@ -306,6 +306,7 @@ describe("the confirm button is a real confirmation", () => {
       bot_name: { kind: "text", schema_version: 2, text: "Rio" },
       bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
       bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+      organizer_identity: { kind: "text", schema_version: 2, text: "Dror" },
     };
     await fix.pool.query(
       "UPDATE control_plane.intake_sessions SET answers = $1, state = 'awaiting_confirmation' WHERE telegram_chat_id = $2",

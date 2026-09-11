@@ -340,11 +340,15 @@ describe("chat-addressed session writes", () => {
             bot_name: { kind: "text", schema_version: 2, text: "Rio" },
             bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
             bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+            // Required as of 2026-09-11: without it no companion is built.
+            organizer_identity: { kind: "text", schema_version: 2, text: "Dror" },
             // The assistant's identity became required on 2026-09-07, so a
             // session that can confirm has to carry it.
             bot_name: { kind: "text", schema_version: 2, text: "Rio" },
             bot_gender: { kind: "choice", option_id: "neutral", schema_version: 2, other_text: null },
             bot_tone: { kind: "choice", option_id: "warm", schema_version: 2, other_text: null },
+            // Required as of 2026-09-11: without it no companion is built.
+            organizer_identity: { kind: "text", schema_version: 2, text: "Dror" },
           }),
           "700002004",
         ],
