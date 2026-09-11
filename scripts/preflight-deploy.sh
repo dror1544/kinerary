@@ -307,4 +307,5 @@ E2E_ARGS=(--scenario "$SCENARIO")
 python3 -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
-printf '\n%s[ ok ]%s deployed, verified, and one trip walked end to end.\n' "$C_G" "$C_X"
+if [ "$SCENARIO" = all ]; then walked="every scenario walked"; else walked="the $SCENARIO trip walked"; fi
+printf '\n%s[ ok ]%s deployed, verified, and %s end to end.\n' "$C_G" "$C_X" "$walked"
