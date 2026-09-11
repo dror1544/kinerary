@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--vmid-map must be a JSON object of slug→vmid")
             from .companion_profile import NullCompanionProfileAdapter, RenderProfileAdapter
             from .compute import LxcProvisionAdapter, NullComputeAdapter
-            from .mcp_bridge import NullMcpBridgeAdapter, ShellMcpBridgeAdapter
+            from .mcp_bridge import NullMcpBridgeAdapter, ShellMcpBridgeAdapter, SshMcpBridgeAdapter
             from .provisioner import ProvisionerWorker, ShellDeployAdapter
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
@@ -247,8 +247,16 @@ def main(argv: list[str] | None = None) -> int:
                     " (provisioning only; forced-command key)",
                     flush=True,
                 )
+                # The bridge goes where the companion went: node and Hermes are
+                # on that host, not in this container (setup-mcp.sh here died
+                # on "can't execute 'node'" every provision until 2026-09-11).
                 mcp_bridge_adapter = (
-                    ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
+                    SshMcpBridgeAdapter(
+                        host=args.companion_ssh_host,
+                        user=args.companion_ssh_user,
+                        key_path=args.companion_ssh_key,
+                        known_hosts=args.companion_ssh_known_hosts,
+                    )
                     if args.enable_mcp_bridge else NullMcpBridgeAdapter()
                 )
             elif args.companion_templates_dir:

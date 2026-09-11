@@ -170,6 +170,32 @@ class NullCompanionProfileAdapter:
         return None
 
 
+def forced_command_argv(
+    host: str, user: str, key_path: str, port: int = 22, known_hosts: str | None = None,
+) -> list[str]:
+    """The ssh invocation for the host's forced-command key.
+
+    No remote command: the key's forced command decides what runs. Even if this
+    list gained an attacker-controlled entry it could not choose the program —
+    but there is nothing to append to in the first place. Shared by every
+    request that goes over this key, so they cannot drift in how they reach it.
+    """
+    return [
+        "ssh",
+        "-i", key_path,
+        "-p", str(port),
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "IdentitiesOnly=yes",
+        # Host-key policy is explicit either way rather than left to the
+        # ambient ~/.ssh/known_hosts of whatever user the worker runs as.
+        *(("-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes")
+          if known_hosts else
+          ("-o", "StrictHostKeyChecking=accept-new")),
+        f"{user}@{host}",
+    ]
+
+
 class SshCompanionProfileAdapter:
     """Materializes a companion on a host reachable over SSH.
 
@@ -239,25 +265,9 @@ class SshCompanionProfileAdapter:
 
     def install(self, handoff: Mapping[str, Any]) -> Optional[str]:
         payload = json.dumps(dict(handoff), ensure_ascii=False)
-        # No remote command: the key's forced command decides what runs. Even
-        # if this list gained an attacker-controlled entry it could not choose
-        # the program — but there is nothing to append to in the first place.
-        argv = [
-            "ssh",
-            "-i", self._key_path,
-            "-p", str(self._port),
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "IdentitiesOnly=yes",
-            # Host-key policy is explicit either way rather than left to the
-            # ambient ~/.ssh/known_hosts of whatever user the worker runs as.
-            *(("-o", f"UserKnownHostsFile={self._known_hosts}", "-o", "StrictHostKeyChecking=yes")
-              if self._known_hosts else
-              ("-o", "StrictHostKeyChecking=accept-new")),
-            f"{self._user}@{self._host}",
-        ]
         result = subprocess.run(
-            argv, input=payload, capture_output=True, text=True, timeout=self._timeout,
+            forced_command_argv(self._host, self._user, self._key_path, self._port, self._known_hosts),
+            input=payload, capture_output=True, text=True, timeout=self._timeout,
         )
         if result.returncode != 0:
             raise RuntimeError(

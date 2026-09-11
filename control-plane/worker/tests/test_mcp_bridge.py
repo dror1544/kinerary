@@ -8,11 +8,55 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import json
+import subprocess
+
 from control_plane_worker.mcp_bridge import (
     NullMcpBridgeAdapter,
     ShellMcpBridgeAdapter,
+    SshMcpBridgeAdapter,
     mcp_port_for_vmid,
 )
+
+
+class SshMcpBridgeAdapterTests(unittest.TestCase):
+    """The bridge is wired on the host that runs the companion, because node
+    and Hermes are there and not in the worker's container — setup-mcp.sh run
+    in the container failed with "can't execute 'node'" on every provision."""
+
+    def adapter(self) -> SshMcpBridgeAdapter:
+        return SshMcpBridgeAdapter(host="host.docker.internal", user="elul", key_path="/keys/companion")
+
+    def run_with(self, stdout: str = "WIRED japan2026\n", returncode: int = 0):
+        return patch("control_plane_worker.mcp_bridge.subprocess.run",
+                     return_value=subprocess.CompletedProcess([], returncode, stdout, "boom"))
+
+    def test_the_request_carries_only_the_slug_and_the_profile(self) -> None:
+        with self.run_with() as run:
+            self.assertTrue(self.adapter().setup("japan-2026", "japan2026"))
+        payload = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(payload, {"record_type": "trip_mcp_bridge_request", "schema_version": 1,
+                                   "slug": "japan-2026", "profile": {"name": "japan2026"}})
+
+    def test_no_remote_command_the_forced_command_decides(self) -> None:
+        with self.run_with() as run:
+            self.adapter().setup("japan-2026", "japan2026")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "ssh")
+        self.assertEqual(argv[-1], "elul@host.docker.internal", "nothing may follow the destination")
+
+    def test_unsafe_names_are_refused_before_anything_is_sent(self) -> None:
+        with self.run_with() as run:
+            for slug, profile in (("../etc", "japan2026"), ("japan-2026", "Japan 2026"), ("japan-2026;rm", "x")):
+                with self.subTest(slug=slug, profile=profile), self.assertRaises(RuntimeError):
+                    self.adapter().setup(slug, profile)
+            run.assert_not_called()
+
+    def test_only_an_exact_wired_reply_counts(self) -> None:
+        with self.run_with(stdout="WIRED someone-else\n"), self.assertRaises(RuntimeError):
+            self.adapter().setup("japan-2026", "japan2026")
+        with self.run_with(returncode=2), self.assertRaises(RuntimeError):
+            self.adapter().setup("japan-2026", "japan2026")
 
 TOPOLOGY_YAML = """\
 version: 1

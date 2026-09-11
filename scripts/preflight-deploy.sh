@@ -301,7 +301,10 @@ step "Signup to working companion ($SCENARIO)$([ "$AUTO" = 1 ] && echo ', automa
 E2E_ARGS=(--scenario "$SCENARIO")
 [ "$AUTO" = 1 ] && E2E_ARGS+=(--auto)
 [ "$CLEANUP" = 1 ] && E2E_ARGS+=(--teardown)
-python3 scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
+# -u: unbuffered. The stages print through Python while the organizer and the
+# teardown write straight to the same stream; buffered, a scenario's failure
+# line surfaced after the NEXT scenario's output, detached from its cause.
+python3 -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
 printf '\n%s[ ok ]%s deployed, verified, and one trip walked end to end.\n' "$C_G" "$C_X"

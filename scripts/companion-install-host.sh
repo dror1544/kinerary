@@ -58,23 +58,41 @@ cat > "$HANDOFF"
 [ -s "$HANDOFF" ] || die "empty handoff on stdin"
 
 # Validate before use. `render_profile.py` does its own strict schema check and
-# forbidden-key scan; this is the narrower question of whether the one value
-# that becomes a filesystem path is safe to treat as one.
-PROFILE_NAME="$(
+# forbidden-key scan; this is the narrower question of whether the values that
+# become filesystem paths are safe to treat as ones.
+#
+# Two requests arrive on this key: a companion handoff (the default), and —
+# since 2026-09-11 — a `trip_mcp_bridge_request`, which carries NOTHING but a
+# trip slug and a profile name. Everything the bridge needs beyond those two
+# (the site's address, the container, the port) is read from this host's own
+# kinerary-deploy files below, never from the request.
+VALIDATED="$(
   /usr/bin/python3 - "$HANDOFF" <<'PY'
 import json, re, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception as e:
     print(f"handoff is not valid JSON: {e}", file=sys.stderr); raise SystemExit(2)
+kind = d.get("record_type") or "trip_assistant_profile_input"
+if kind not in ("trip_assistant_profile_input", "trip_mcp_bridge_request"):
+    print(f"refusing unknown request type: {kind!r}", file=sys.stderr); raise SystemExit(2)
 name = ((d.get("profile") or {}).get("name") or "")
 # Conservative on purpose: this becomes ~/.hermes/profiles/<name>. No dots (no
 # traversal), no separators, no spaces, bounded length.
 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", name):
     print(f"refusing unsafe profile name: {name!r}", file=sys.stderr); raise SystemExit(2)
-print(name)
+slug = ""
+if kind == "trip_mcp_bridge_request":
+    slug = d.get("slug") or ""
+    # Becomes ~/kinerary-deploy/trips/<slug>: the trip-slug grammar, no more.
+    if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug) or len(slug) > 80:
+        print(f"refusing unsafe trip slug: {slug!r}", file=sys.stderr); raise SystemExit(2)
+print(f"{kind}\t{name}\t{slug}")
 PY
 )" || die "handoff validation failed"
+REQUEST_KIND="$(printf '%s' "$VALIDATED" | cut -f1)"
+PROFILE_NAME="$(printf '%s' "$VALIDATED" | cut -f2)"
+TRIP_SLUG="$(printf '%s' "$VALIDATED" | cut -f3)"
 
 # render_profile.py refuses to overwrite an existing profile, so a retried job
 # after a partial success is a safe error rather than a silent clobber. Report
@@ -351,6 +369,60 @@ PLIST
     printf 'companion-install-host: launchctl bootstrap failed for %s; plist written but NOT RUNNING\n' "$name" >&2
   fi
 }
+
+# ── The trip-mcp bridge, wired on THIS host ──────────────────────────────────
+#
+# The bridge is `node mcp.js` plus a `hermes mcp add` into the companion's
+# profile, so it can only be set up where node and Hermes are — here. The
+# worker used to run setup-mcp.sh inside its own container, which has neither:
+# "env: can't execute 'node'", every provision, found by the first automated
+# full cycle (2026-09-11). Every companion shipped blind unless someone started
+# its bridge by hand.
+#
+# The request names a slug and a profile. The site's address, the container
+# and the port come from this host's own topology.yaml for that slug, and the
+# profile must already be one this key installed.
+if [ "$REQUEST_KIND" = "trip_mcp_bridge_request" ]; then
+  DEPLOY_ROOT="${KINERARY_DEPLOY_ROOT:-$HOME/kinerary-deploy}"
+  TRIP_DIR="$DEPLOY_ROOT/trips/$TRIP_SLUG"
+  [ -f "$TRIP_DIR/topology.yaml" ] || die "no topology for $TRIP_SLUG on this host"
+  [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ] || die "no companion profile $PROFILE_NAME to wire"
+  [ -x "$DEPLOY_ROOT/setup-mcp.sh" ] || die "no setup-mcp.sh in $DEPLOY_ROOT"
+  py="$(find_yaml_python)" || die "no python with PyYAML to read the topology"
+  # Into a file, not "$( ... <<HEREDOC )": macOS /bin/bash 3.2 — which is what
+  # sshd runs a forced command with — mis-parses quotes inside a here-document
+  # inside a command substitution, and one apostrophe in a comment made this
+  # whole script unparseable.
+  "$py" - "$TRIP_DIR/topology.yaml" "$TRIP_SLUG" > "$WORK/wiring" <<'PYTOPO' || die "could not read $TRIP_SLUG's topology"
+import sys, yaml
+topo = yaml.safe_load(open(sys.argv[1])) or {}
+slug = sys.argv[2]
+lxc = ((topo.get("proxmox") or {}).get("lxc") or {})
+if topo.get("name") != slug or lxc.get("name") != f"trip-{slug}":
+    print(f"topology does not describe {slug}", file=sys.stderr); raise SystemExit(2)
+vmid = str((topo.get("proxmox") or {}).get("vmid") or "")
+ip = str(lxc.get("ipv4") or "").split("/")[0]
+fport = str((topo.get("npm") or {}).get("forward_port") or "")
+# The port rule is mcp_bridge.mcp_port_for_vmid's: 3000 + vmid, inside
+# 3100-3999, clear of the hand-provisioned bridges below 3100.
+if not vmid.isdigit() or not (3100 <= 3000 + int(vmid) <= 3999) or not ip or not fport.isdigit():
+    print(f"topology for {slug} lacks a usable vmid/ip/port", file=sys.stderr); raise SystemExit(2)
+print(f"{vmid}\t{ip}\t{fport}\t{3000 + int(vmid)}")
+PYTOPO
+  WIRING="$(cat "$WORK/wiring")"
+  VMID="$(printf '%s' "$WIRING" | cut -f1)"; SITE_IP="$(printf '%s' "$WIRING" | cut -f2)"
+  SITE_PORT="$(printf '%s' "$WIRING" | cut -f3)"; MCP_PORT="$(printf '%s' "$WIRING" | cut -f4)"
+  # REPO_ROOT: the bridge runs this checkout's mcp.js, the same checkout whose
+  # templates rendered the companion. stdin from /dev/null so the backgrounded
+  # bridge does not hold this SSH session open after the script returns.
+  if REPO_ROOT="$REPO_ROOT" "$DEPLOY_ROOT/setup-mcp.sh" "$PROFILE_NAME" "http://$SITE_IP:$SITE_PORT" \
+       --vmid "$VMID" --trip-dir "$TRIP_DIR" --port "$MCP_PORT" < /dev/null > "$WORK/setup-mcp.log" 2>&1; then
+    printf 'WIRED %s\n' "$PROFILE_NAME"
+    exit 0
+  fi
+  tail -20 "$WORK/setup-mcp.log" >&2
+  die "setup-mcp.sh failed for $TRIP_SLUG"
+fi
 
 if [ -d "$HOME/.hermes/profiles/$PROFILE_NAME" ]; then
   # Idempotent, and it repairs: a profile installed before the merge existed

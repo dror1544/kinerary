@@ -45,9 +45,13 @@ trip's trip.env instead of minting one.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from typing import Mapping, Protocol
+
+from .companion_profile import forced_command_argv
 
 
 #: Ports below this belong to hand-provisioned trips and the legacy shared
@@ -95,6 +99,66 @@ class NullMcpBridgeAdapter:
 
     def setup(self, slug: str, profile_name: str) -> bool:
         return False
+
+
+class SshMcpBridgeAdapter:
+    """Wires a trip's trip-mcp bridge on the host that runs its companion.
+
+    The bridge is `node mcp.js` plus a `hermes mcp add` into the companion's
+    profile, so it can only be set up where node and Hermes are. With companions
+    installed over SSH (SshCompanionProfileAdapter), that is NOT the worker's
+    container: `ShellMcpBridgeAdapter` ran setup-mcp.sh in there, which failed
+    with "env: can't execute 'node'" on every provision and shipped every
+    companion without its trip tools — found by the first automated full cycle,
+    2026-09-11.
+
+    Same key, same forced command as the companion install. The request carries
+    only the slug and the profile name; the host derives the site address,
+    container and port from its own topology.yaml (scripts/companion-install-host.sh).
+    """
+
+    _SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+    _PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key_path: str,
+        *,
+        port: int = 22,
+        known_hosts: str | None = None,
+        # setup-mcp.sh starts the bridge, registers it and runs `hermes mcp
+        # test` over a live connection: ~6 minutes end to end (see
+        # ShellMcpBridgeAdapter's note on the 180s that killed it every run).
+        timeout: int = 900,
+    ) -> None:
+        self._host, self._user, self._key_path = host, user, key_path
+        self._port, self._known_hosts, self._timeout = port, known_hosts, timeout
+
+    def setup(self, slug: str, profile_name: str) -> bool:
+        # Checked here too so a bad value fails in the worker's own log, not as
+        # an opaque refusal from the other side of an SSH connection.
+        if not self._SLUG.fullmatch(slug or "") or not self._PROFILE.fullmatch(profile_name or ""):
+            raise RuntimeError(f"refusing to request a bridge for {slug!r}/{profile_name!r}")
+        payload = json.dumps({
+            "record_type": "trip_mcp_bridge_request",
+            "schema_version": 1,
+            "slug": slug,
+            "profile": {"name": profile_name},
+        })
+        result = subprocess.run(
+            forced_command_argv(self._host, self._user, self._key_path, self._port, self._known_hosts),
+            input=payload, capture_output=True, text=True, timeout=self._timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"trip-mcp bridge over ssh exited {result.returncode}: {(result.stderr or result.stdout)[-500:]}"
+            )
+        line = (result.stdout or "").strip().splitlines()[-1] if (result.stdout or "").strip() else ""
+        if line != f"WIRED {profile_name}":
+            raise RuntimeError(f"unrecognized bridge result: {line[:200]!r}")
+        return True
 
 
 class ShellMcpBridgeAdapter:
