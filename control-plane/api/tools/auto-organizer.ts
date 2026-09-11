@@ -3,7 +3,7 @@
  * cycle that used to need a person on Telegram.
  *
  *   node --import tsx tools/auto-organizer.ts --scenario japan --token <enrollment token> \
- *     --chat 9000000000001 --telegram http://127.0.0.1:4399 [--docs /tmp/kinerary-e2e-japan]
+ *     --chat 9000000000001 --telegram http://127.0.0.1:4399 [--docs <dir of the scenario's documents>]
  *
  * It talks to the relay exactly as a person does — through Telegram, here the
  * stand-in in tools/fake-telegram.ts: it sends /start with the deep-link token,

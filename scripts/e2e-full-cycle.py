@@ -35,8 +35,10 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -180,7 +182,7 @@ def stage_signup(trip_name: str) -> dict:
     return {"trip_id": result["tripId"], "email": email, "password": password}
 
 
-def stage_interview(ctx: dict, scenario: str, auto: "Auto | None" = None) -> None:
+def stage_interview(ctx: dict, scenario: str, work: Path, auto: "Auto | None" = None) -> None:
     stage(f"Interview — scenario '{scenario}'" + (" (automated organizer)" if auto else ""))
     sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
     from make_documents import SCENARIOS, build  # noqa: E402
@@ -188,7 +190,7 @@ def stage_interview(ctx: dict, scenario: str, auto: "Auto | None" = None) -> Non
     spec = SCENARIOS[scenario]
     docs = None
     if spec["documents"]:
-        docs = Path("/tmp") / f"kinerary-e2e-{scenario}"
+        docs = work / scenario
         files = build(scenario, docs)
         ok(f"generated {len(files)} document(s): {', '.join(f.name for f in files)}")
     else:
@@ -219,14 +221,14 @@ class Auto:
     leave the bot answering a stand-in nobody is watching.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, work: Path) -> None:
         import socket
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
         self.root = f"http://127.0.0.1:{self.port}"
         self.proc: subprocess.Popen | None = None
-        self.log = Path("/tmp") / f"kinerary-e2e-fake-telegram-{self.port}.log"
+        self.log = work / "fake-telegram.log"
 
     def begin(self) -> None:
         stage("Automated organizer — relay pointed at the Telegram stand-in")
@@ -273,6 +275,16 @@ class Auto:
                     self.proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
+
+
+def finish_workdir(work: Path, passed: bool) -> None:
+    """This run's documents and stand-in log: gone when every scenario passed,
+    kept and named when one did not — the rule preflight-deploy.sh's
+    housekeeping applies to its own logs."""
+    if passed:
+        shutil.rmtree(work, ignore_errors=True)
+    else:
+        print(f"  {DIM}kept this run's documents and logs: {work}{RESET}")
 
 
 def relay_restart(telegram_root: str | None) -> None:
@@ -514,13 +526,17 @@ def main() -> int:
     except Failed as exc:
         print(f"\n{RED}✗ FAILED{RESET}: {exc}\n")
         return 1
-    auto = Auto() if args.auto else None
+    # The scenario documents and the stand-in's log, in one place that goes
+    # away with a passing run. /tmp, not $TMPDIR: a person running a manual
+    # scenario has to find the documents in Telegram's file picker.
+    work = Path(tempfile.mkdtemp(prefix="kinerary-e2e-", dir="/tmp"))
+    auto = Auto(work) if args.auto else None
     try:
         if auto:
             auto.begin()
         for scenario in scenarios:
             ctx: dict = {}
-            code = run_scenario(scenario, args, auto, ctx)
+            code = run_scenario(scenario, args, auto, ctx, work)
             if args.teardown:
                 code = stage_teardown(ctx) or code
             elif ctx.get("trip_id"):
@@ -528,6 +544,7 @@ def main() -> int:
             results.append((scenario, code, ctx))
     except KeyboardInterrupt:
         print(f"\n{YELLOW}interrupted{RESET} — nothing torn down.")
+        finish_workdir(work, passed=False)
         return 130
     except Failed as exc:
         print(f"\n{RED}✗ FAILED{RESET}: {exc}\n")
@@ -545,14 +562,16 @@ def main() -> int:
         for name, code, ctx in results:
             print(f"{name:<10} {GREEN + 'green' + RESET if code == 0 else RED + 'FAILED' + RESET}  "
                   f"{ctx.get('trip_id', '')} {ctx.get('slug', '')}")
-    return 0 if results and all(code == 0 for _, code, _ in results) else 1
+    passed = bool(results) and all(code == 0 for _, code, _ in results)
+    finish_workdir(work, passed)
+    return 0 if passed else 1
 
 
-def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", ctx: dict) -> int:
+def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", ctx: dict, work: Path) -> int:
     trip_name = args.trip_name if (args.trip_name and args.scenario != "all") else TRIP_NAMES[scenario]
     try:
         ctx.update(stage_signup(trip_name))
-        stage_interview(ctx, scenario, auto)
+        stage_interview(ctx, scenario, work, auto)
         stage_confirm_and_build(ctx, args.wait_minutes)
         stage_site(ctx)
         stage_content(ctx, scenario)
