@@ -889,6 +889,7 @@ async function weatherObservation(db, fetchImpl, query) {
     const normalized = {
       source: 'open-meteo',
       date,
+      forecast_dates: (raw?.daily?.time || []).filter((day) => ISO_DATE_RE.test(day)),
       temperature_max: index >= 0 ? raw.daily.temperature_2m_max?.[index] ?? null : null,
       temperature_min: index >= 0 ? raw.daily.temperature_2m_min?.[index] ?? null : null,
       precipitation_probability: index >= 0 ? raw.daily.precipitation_probability_max?.[index] ?? null : null,

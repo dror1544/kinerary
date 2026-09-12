@@ -1,3 +1,4 @@
+import { TodayWeather } from "./TodayWeather";
 import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { datesInPhase } from "./phase-calendar";
@@ -22,7 +23,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
-  CloudSun,
   Download,
   DollarSign,
   Compass,
@@ -87,7 +87,6 @@ import {
   getPhotos,
   getToday,
   getUiSettings,
-  getWeather,
   getLoginRoster,
   resetParticipantPassword,
   login,
@@ -707,12 +706,6 @@ function TodayView({
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
-  const firstStop = config?.phases?.find((phase) => Number.isFinite(phase.mapStop?.lat) && Number.isFinite(phase.mapStop?.lng))?.mapStop;
-  const weather = useQuery({
-    queryKey: ["weather", firstStop?.lat, firstStop?.lng, today.data?.today],
-    queryFn: () => getWeather(firstStop!.lat!, firstStop!.lng!, today.data!.today),
-    enabled: Boolean(Number.isFinite(firstStop?.lat) && Number.isFinite(firstStop?.lng) && today.data?.today),
-  });
   const missing = confirmations.data?.items.filter((item) => item.state !== "verified").slice(0, 3) || [];
   const next = today.data?.next || itinerary?.items[0] || null;
   const companionName = botDisplayName(config, hermes.data?.identity.name, lang);
@@ -732,16 +725,7 @@ function TodayView({
       </div>
 
       <aside className="ops-strip">
-        <section className="mini-panel">
-          <CloudSun size={20} />
-          <h3>{copy(lang,"Weather","מזג אוויר")}</h3>
-          <p>
-            {weather.data?.temperature_max != null
-              ? `${Math.round(weather.data.temperature_min || 0)}-${Math.round(weather.data.temperature_max)} C`
-              : "Last known weather appears here when available."}
-          </p>
-          {weather.data?.stale ? <small>Stale: {weather.data.fetched_at || "not refreshed yet"}</small> : null}
-        </section>
+        {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
         <section className="mini-panel">
           <Plane size={20} />
           <h3>{copy(lang,"Flights","טיסות")}</h3>

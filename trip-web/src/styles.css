@@ -1042,3 +1042,8 @@ textarea { min-height: 132px; resize: vertical; }
 .mobile-select-options button { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 56px; padding: 14px 16px; border: 1px solid var(--kit-line); border-radius: 10px; background: var(--kit-paper); color: var(--kit-ink); text-align: start; font-size: 20px; line-height: 1.4; cursor: pointer; }
 .mobile-select-options button[aria-pressed=true] { background: #dff3ef; border-color: var(--kit-teal); font-weight: 700; }
 .mobile-select-options button:disabled { opacity: .5; cursor: default; }
+
+.weather-date { margin-top: 8px; font-size: 13px; }
+.weather-navigation { display: flex; gap: 8px; margin: 12px 0 8px; }
+.weather-navigation button { flex: 1; justify-content: center; }
+.weather-navigation button:disabled { opacity: .45; cursor: default; }

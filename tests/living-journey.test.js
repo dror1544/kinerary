@@ -15,7 +15,7 @@ function fixtureConfig() {
   return JSON.parse(readFileSync(join(HERE, 'fixtures', 'trip.config.json'), 'utf8'));
 }
 
-test('living journey seeds immutable original and active itinerary versions once', () => {
+test('living journey seeds immutable original and active itinerary versions once', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'living-journey-'));
   try {
     const db = new Database(':memory:');
@@ -34,6 +34,30 @@ test('living journey seeds immutable original and active itinerary versions once
     const raw = JSON.stringify(config);
     create({ db, config, raw, mediaDir: dir, fetchImpl: fetch });
     create({ db, config, raw, mediaDir: dir, fetchImpl: fetch });
+
+    // Exercise the weather response and its cached provider horizon.
+    let fetches = 0;
+    const journey = create({ db, config, raw, mediaDir: dir, fetchImpl: async () => {
+      fetches++;
+      return { ok: true, json: async () => ({ daily: {
+        time: ['2026-09-12', '2026-09-13'],
+        temperature_2m_max: [28, 22], temperature_2m_min: [18, 12],
+        precipitation_probability_max: [0, 30],
+      } }) };
+    } });
+    const routes = new Map();
+    const app = Object.fromEntries(['get', 'post', 'put', 'patch', 'delete'].map((method) =>
+      [method, (path, ...handlers) => routes.set(`${method} ${path}`, handlers.at(-1))]));
+    journey.registerRoutes(app, { authRequired() {}, organizerOrAgentRequired() {} });
+    let result;
+    const weather = routes.get('get /api/operations/weather');
+    const request = { query: { lat: 35, lon: 139, date: '2026-09-13' } };
+    await weather(request, { json(value) { result = value; } });
+    assert.deepEqual(result.forecast_dates, ['2026-09-12', '2026-09-13']);
+    assert.equal(result.temperature_max, 22);
+    await weather(request, { json(value) { result = value; } });
+    assert.equal(fetches, 1);
+    assert.deepEqual(result.forecast_dates, ['2026-09-12', '2026-09-13']);
 
     const state = db.prepare('SELECT * FROM trip_itinerary_state').all();
     const versions = db.prepare('SELECT * FROM itinerary_plan_versions ORDER BY created_at ASC').all();
