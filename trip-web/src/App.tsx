@@ -1,8 +1,9 @@
+import { rsvpForItem } from "./activity-rsvp";
 import { datesInPhase } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
 import { ImmichAlbum } from "./immich";
 import { Readiness, CurrencyConverter } from "./readiness";
-import { GroupActivities, LostFound } from "./group-utilities";
+import { GroupActivities, LostFound, ActivityRsvp } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
 import { Trivia } from "./trivia";
@@ -497,16 +498,19 @@ export function Hero({
 function TimelineItem({
   item,
   compact = false,
+  rsvpId,
   lang = "en",
   botName,
   telegramUsername,
 }: {
   item: ItineraryItem;
   compact?: boolean;
+  rsvpId?: string;
   lang?: Lang;
   botName?: string;
   telegramUsername?: string | null;
 }) {
+  const [rsvpOpen, setRsvpOpen] = useState(false);
   const Icon = item.item_type === "travel" || item.booking?.type === "flight" ? Plane : item.item_type === "meal" ? TicketCheck : MapPin;
   const title = itemTitle(item, lang);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
@@ -544,6 +548,7 @@ function TimelineItem({
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
         <div className="item-actions" aria-label={`Actions for ${title}`}>
+          {rsvpId && <button className="item-action" type="button" aria-expanded={rsvpOpen} aria-controls={`rsvp-${item.item_uid}`} onClick={() => setRsvpOpen(open => !open)}><CheckCircle2 size={15} />{copy(lang, "RSVP", "אישור השתתפות")}</button>}
           {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking?.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</>} /> : null}
           {ticketUrl ? <a className="item-action" href={ticketUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
           {websiteUrl ? <a className="item-action" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={15} /> {copy(lang, "Site", "אתר")}</a> : null}
@@ -552,6 +557,7 @@ function TimelineItem({
           {extraLinks.map((link) => <a key={`${link.label}-${link.url}`} className="item-action" href={link.url} target="_blank" rel="noreferrer"><ExternalLink size={15} /> {link.label}</a>)}
           {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {copy(lang, "Ask", "שאלו")}</a> : null}
         </div>
+        {rsvpId && rsvpOpen && <section className="parity-panel activity-rsvp-panel" id={`rsvp-${item.item_uid}`} aria-label={copy(lang, "Activity RSVP", "השתתפות בפעילות")}><ActivityRsvp key={rsvpId} id={rsvpId} lang={lang} /></section>}
       </div>
     </article>
   );
@@ -1005,7 +1011,6 @@ export function JourneyView({
         <div className="day-heading">
           <span className="panel-label">{activePhase?.title || "Journey"}</span>
           <div className="journey-tools">
-          <a href="#activities">{copy(lang,"Activity RSVPs and venue feedback","השתתפות בפעילויות ודירוג מקומות")}</a>
           {isOrganizer&&<a href="#plan-tools">{copy(lang,"Day titles, swaps and original plan","כותרות ימים, החלפות והמסלול המקורי")}</a>}
           </div>
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
@@ -1106,7 +1111,7 @@ export function JourneyView({
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
-              <TimelineItem item={item} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              <TimelineItem item={item} rsvpId={rsvpForItem(item, config, itinerary)?.id} lang={lang} botName={botName} telegramUsername={telegramUsername} />
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>

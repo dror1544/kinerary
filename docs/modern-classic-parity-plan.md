@@ -228,3 +228,15 @@ Verified in a 390×844 browser: selecting March 12 changes Journey to the empty
 selected day; the 1195px menu content scrolls within an 844px panel, reaching
 Sign out at the bottom while page scroll stays at zero. All 90 SPA tests and
 the production build pass. No server changes.
+
+## RSVP on Journey activity cards — 2026-09-12
+
+Removed the separate Journey activity/RSVP link. Marked activities expose an
+RSVP button alongside their existing card actions; it expands Going/Maybe/Not
+going and the optional note inside the card, using the existing RSVP API.
+A phase's `rsvp_activities` entry can set `item_uid` to explicitly link the
+itinerary item. Existing entries can match a unique item by phase, exact ISO
+date, and exact title in either language. Ambiguous or unmarked items receive
+no RSVP action; stable links survive day/title edits. Group participation
+remains available under More for entries without a matching itinerary card.
+Build and all 93 SPA tests pass, including inline submission and matching rules.
