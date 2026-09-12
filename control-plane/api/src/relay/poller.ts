@@ -1296,6 +1296,10 @@ async function runInterpretPath(
     outstanding: state.outstanding,
     answered: state.answered,
     unclear: [],
+    // The reply to the question we just asked is not a volunteered guess, and
+    // the confidence floor must not send the router round again to ask it a
+    // second time. See ApplyProposalsContext.pendingQuestionId.
+    pendingQuestionId: onScreen,
   });
 
   for (const accepted of decisions.accepted) {

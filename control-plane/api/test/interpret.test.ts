@@ -217,6 +217,52 @@ describe("parseInterpretPayload — the schema is this function", () => {
   });
 });
 
+describe("the answer to the question on screen is not refused for confidence", () => {
+  // 2026-09-12, `--scenario japan`: the router asked "מי מהנוסעים זה אתה?",
+  // the organizer answered "דרור, אבא של המשפחה", and the model read it as
+  // `Dror` at 0.4 — then, asked again, at 0.55. Both below the floor, both
+  // refused, the same question asked a third time. There is no exit from that
+  // by answering: the same words produce the same reading. The run gave up
+  // after four minutes; a person gives up sooner.
+  const base = (questionId: string, confidence: number) => ([{
+    questionId, confidence,
+    value: { kind: "text", text: "Dror" },
+    evidence: "\u05d3\u05e8\u05d5\u05e8, \u05d0\u05d1\u05d0 \u05e9\u05dc \u05d4\u05de\u05e9\u05e4\u05d7\u05d4",
+  }] as never);
+
+  const ctx = (pending: string | null) => ({
+    sourceText: "\u05d3\u05e8\u05d5\u05e8, \u05d0\u05d1\u05d0 \u05e9\u05dc \u05d4\u05de\u05e9\u05e4\u05d7\u05d4",
+    outstanding: ["organizer_identity", "bot_name"],
+    answered: [],
+    pendingQuestionId: pending,
+  });
+
+  test("a low-confidence reply to the pending question is accepted", () => {
+    const decided = applyProposals(base("organizer_identity", 0.4), ctx("organizer_identity"));
+    assert.equal(decided.accepted.length, 1);
+    assert.equal(decided.accepted[0]?.questionId, "organizer_identity");
+    assert.deepEqual(decided.askAnyway, [], "nothing to re-ask: it was just answered");
+  });
+
+  test("the same read for a question nobody asked is still refused", () => {
+    // The floor's actual job: a side-extraction the model volunteered.
+    const decided = applyProposals(base("organizer_identity", 0.4), ctx("bot_name"));
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "LOW_CONFIDENCE");
+  });
+
+  test("the exemption is only the floor — evidence is still required", () => {
+    const decided = applyProposals(
+      [{ questionId: "organizer_identity", confidence: 0.4,
+         value: { kind: "text", text: "Dror" },
+         evidence: "something the organizer never wrote" }] as never,
+      ctx("organizer_identity"),
+    );
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "EVIDENCE_NOT_IN_SOURCE");
+  });
+});
+
 describe("exampleEchoes — a value that came from the prompt, not the person", () => {
   // 2026-09-12. An organizer's confirmed intake recorded their planned places
   // as exactly "Tokyo Skytree" and "TeamLab Planets" — the two values in the
