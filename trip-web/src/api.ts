@@ -253,6 +253,21 @@ export async function getLoginRoster(): Promise<{ username: string; name?: strin
   return (payload.participants ?? []).flatMap((p) => (p.username ? [{ ...p, username: p.username }] : []));
 }
 
+/**
+ * Put a traveller back into their own trip.
+ *
+ * Two ways, and the organizer picks: `trip_password` restores the shared
+ * password the whole group was already given — for someone who forgot theirs
+ * and needs in now — and the default mints a one-time link they open to choose
+ * their own. The password is never in the response either way.
+ */
+export async function resetParticipantPassword(username: string, to?: "trip_password") {
+  return api<{ ok: true; username: string; restored?: string; enrollment_token?: string }>(
+    `/api/agent/participants/${encodeURIComponent(username)}/reset-password`,
+    { method: "POST", body: JSON.stringify(to ? { to } : {}) },
+  );
+}
+
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
     method: "POST",

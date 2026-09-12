@@ -882,3 +882,32 @@ textarea { min-height: 132px; resize: vertical; }
   .readiness-row { grid-template-columns: auto 1fr; padding: 10px 0; }
   .readiness-row small { grid-column: 2; text-align: start; }
 }
+
+.member-logins { margin-top: 18px; }
+.member-logins h3 { margin: 0 0 4px; font: 800 20px/1.2 var(--kit-font-display); }
+.member-logins p { margin: 0 0 12px; color: var(--kit-ink-soft); line-height: 1.6; }
+.member-logins ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.member-logins li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+  border-top: 1px solid var(--kit-line);
+  padding-top: 10px;
+}
+.member-logins small { color: var(--kit-ink-soft); font-weight: 600; }
+.member-login-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.member-login-actions button {
+  border: 1px solid var(--kit-line);
+  border-radius: 999px;
+  padding: 7px 13px;
+  color: white;
+  background: var(--kit-teal);
+  font-weight: 700;
+  cursor: pointer;
+}
+.member-login-actions button.ghost { color: var(--kit-ink); background: white; }
+.member-login-actions button:disabled { opacity: .55; cursor: not-allowed; }
+.member-login-result { flex-basis: 100%; color: var(--kit-ink-soft); line-height: 1.6; }
+.member-login-result code { display: block; overflow-wrap: anywhere; margin-top: 6px; color: var(--kit-ink); }

@@ -77,6 +77,7 @@ import {
   getUiSettings,
   getWeather,
   getLoginRoster,
+  resetParticipantPassword,
   login,
   postPhotoComment,
   reportIssue,
@@ -2177,6 +2178,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             <span>{busy ? "Uploading..." : "Change hero picture"}</span>
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
+          <MemberLogins config={config} lang={lang} />
         </section>
       ) : null}
       <div className="workflow-grid">
@@ -2203,6 +2205,87 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
         ))}
       </div>
     </section>
+  );
+}
+
+/**
+ * Getting a traveller back into the site.
+ *
+ * Their username is derived from their name and the password was shared with
+ * the whole group, so the only person who can be stuck is someone who set their
+ * own and forgot it — and until now the only way back was the organizer asking
+ * the assistant. This is the same two options, where the organizer already is.
+ *
+ * Organizer-only by the caller (`isOrganizer`), and organizer-only at the
+ * server too — `organizerOrAgentRequired` refuses anyone else, which is the
+ * boundary that actually matters. Hiding the panel is courtesy, not security.
+ */
+function MemberLogins({ config, lang }: { config?: TripConfig; lang: Lang }) {
+  const [pending, setPending] = useState("");
+  const [result, setResult] = useState<{ username: string; text: string; link?: string } | null>(null);
+
+  async function reset(username: string, to?: "trip_password") {
+    setPending(username);
+    setResult(null);
+    try {
+      const payload = await resetParticipantPassword(username, to);
+      setResult(payload.enrollment_token
+        ? {
+            username,
+            text: copy(lang,
+              "Send them this link — it works once, and it is not for the family group.",
+              "שלחו להם את הקישור הזה — הוא חד-פעמי, ולא מיועד לקבוצה המשפחתית."),
+            link: `${window.location.origin}${runtimeUrl("/")}#enroll=${payload.enrollment_token}`,
+          }
+        : {
+            username,
+            text: copy(lang, "Done — they can use the trip password again.", "בוצע — הם יכולים להשתמש שוב בסיסמת הטיול."),
+          });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      setResult({
+        username,
+        text: message === "no_trip_password"
+          ? copy(lang,
+              "This trip has no shared password — send a one-time link instead.",
+              "לטיול הזה אין סיסמה משותפת — שלחו קישור חד-פעמי במקום.")
+          : copy(lang, "That did not go through. Try again.", "זה לא עבר. נסו שוב."),
+      });
+    } finally {
+      setPending("");
+    }
+  }
+
+  return (
+    <div className="member-logins">
+      <h3>{copy(lang, "Signing in", "כניסה לאתר")}</h3>
+      <p>{copy(lang,
+        "Everyone signs in with their own name and the trip password. If someone set their own and forgot it, put it back here.",
+        "כל אחד נכנס עם השם שלו וסיסמת הטיול. אם מישהו הגדיר סיסמה משלו ושכח אותה, אפשר להחזיר אותה כאן.")}</p>
+      <ul>
+        {config?.participants?.map((participant) => (
+          <li key={participant.username}>
+            <span><strong>{personName(participant, lang)}</strong> <small>@{participant.username}</small></span>
+            <span className="member-login-actions">
+              <button type="button" disabled={pending === participant.username}
+                onClick={() => reset(participant.username, "trip_password")}>
+                {copy(lang, "Back to the trip password", "חזרה לסיסמת הטיול")}
+              </button>
+              <button type="button" className="ghost" disabled={pending === participant.username}
+                onClick={() => reset(participant.username)}>
+                {copy(lang, "One-time link", "קישור חד-פעמי")}
+              </button>
+            </span>
+            {result?.username === participant.username ? (
+              <span className="member-login-result">
+                {result.text}
+                {result.link ? <code>{result.link}</code> : null}
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
