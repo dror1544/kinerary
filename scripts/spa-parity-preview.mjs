@@ -55,9 +55,9 @@ config.phases[1].venues = [{ name: { en: "Mountain museum", he: "מוזיאון 
 config.phases[1].days = [];
 config.phases[0].rsvp_activities = [
   {
-    id: "fixture-walk",
-    title: { en: "Group walk", he: "הליכה קבוצתית" },
-    date: "2026-09-11",
+    id: "fixture-breakfast",
+    title: config.phases[0].days[0].items[0].text,
+    date: config.phases[0].days[0].date,
     price: { en: "Free", he: "חינם" },
   },
 ];
