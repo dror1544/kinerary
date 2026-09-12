@@ -4233,6 +4233,28 @@ function renderDays(phase) {
     }
   }
 
+  // ── Places, when there is no schedule at all ──
+  // An interview-built trip arrives with the places a leg is planned around
+  // and no dated days: nothing yet turns `venues[]` into `days[]`. Until
+  // 2026-09-12 those places reached only the ratings block, so a phase read as
+  // empty while the trip config listed Tokyo Skytree and TeamLab Planets on it.
+  // Shown only when there is no plan and no schedule — once either exists, it
+  // IS the schedule and this would duplicate it.
+  if (!html && phase.venues?.length) {
+    const rows = phase.venues.map(v => {
+      const nav = [['🗺️', v.maps], ['🔵', v.waze], ['🎫', v.tickets || v.url]]
+        .map(([icon, u]) => {
+          const safe = safeUrl(u);
+          return safe ? `<a class="poi-btn day-item-link" href="${esc(safe)}" target="_blank" rel="noopener">${icon}</a>` : '';
+        }).join('');
+      return `<li>${_biSpan(v.name)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
+    }).join('');
+    html += `<div class="day-block phase-places-block">
+      <div class="day-label"><span class="lang-he">מקומות שתוכננו — עוד אין תוכנית יומית</span><span class="lang-en">Planned places — no day-by-day yet</span></div>
+      <ul>${rows}</ul>
+    </div>`;
+  }
+
   el.innerHTML = html;
 }
 

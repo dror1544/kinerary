@@ -58,6 +58,18 @@ export const configSchema = z.object({
     end: z.string().optional(),
     hero: z.object({ photo: z.string().optional() }).optional(),
     mapStop: z.object({ lat: z.number().optional(), lng: z.number().optional(), name: bilingualSchema }).optional(),
+    dates: z.object({ start: z.string().optional(), end: z.string().optional() }).optional(),
+    // The places a phase means to visit, with the map links the transformer
+    // derives for each. Parsed since 2026-09-12: they were dropped here, so a
+    // trip whose itinerary is places-without-days had nothing to render at all.
+    venues: z.array(z.object({
+      id: z.string().optional(),
+      name: bilingualSchema,
+      maps: z.string().optional(),
+      waze: z.string().optional(),
+      url: z.string().optional(),
+      tickets: z.string().optional(),
+    })).optional(),
     accommodation: z.object({
       name: bilingualSchema,
       name_en: z.string().optional(),

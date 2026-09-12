@@ -55,6 +55,7 @@ import {
   deletePhoto,
   createItineraryItem,
   deleteItineraryItem,
+  ItineraryDay,
   ItineraryItem,
   ItineraryItemInput,
   TripConfig,
@@ -726,6 +727,49 @@ function TodayView({
   );
 }
 
+/**
+ * The phases the itinerary shows, and what each one has to show.
+ *
+ * Pure and exported, because the defect it carried was one word: phases with
+ * no days were filtered out, so an interview-built trip — five phases with
+ * their dates, their hotels and their places, and no day-by-day because
+ * nothing yet writes one — rendered as an empty itinerary. Reported
+ * 2026-09-12: "no phases, no locations, no data". A phase is a phase whether
+ * or not its days exist.
+ */
+export function buildPhaseGroups(
+  configPhases: TripConfig["phases"],
+  days: ItineraryDay[],
+  lang: Lang,
+) {
+  const config = { phases: configPhases };
+
+    // EVERY CONFIGURED PHASE, days or not.
+    //
+    // Filtering on `days.length` made a trip with no day-by-day render as no
+    // trip at all: five phases with dates, hotels and places, and an itinerary
+    // tab showing nothing. Reported 2026-09-12 on the first organizer-run trip
+    // built from an interview — "no phases, no locations, no data" — where the
+    // day plan is exactly what the interview cannot produce yet. A phase with
+    // places and no schedule is a real state of a real trip, not an empty one.
+    const configured = (config?.phases || []).map((phase) => ({
+      id: phase.id,
+      title: text(phase.title, lang) || phase.id,
+      days: days.filter((day) => day.phase_id === phase.id),
+      venues: phase.venues || [],
+      dates: phase.dates,
+    }));
+    const configuredIds = new Set(configured.map((phase) => phase.id));
+    const orphanGroups = Array.from(new Set(days.map((day) => day.phase_id).filter((id) => !configuredIds.has(id)))).map((id) => ({
+      id,
+      title: id,
+      days: days.filter((day) => day.phase_id === id),
+      venues: [] as NonNullable<NonNullable<TripConfig["phases"]>[number]["venues"]>,
+      dates: undefined,
+    }));
+    return [...configured, ...orphanGroups];
+}
+
 function JourneyView({
   itinerary,
   config,
@@ -746,20 +790,7 @@ function JourneyView({
   focus?: JourneyFocus | null;
 }) {
   const days = itinerary?.days || [];
-  const phaseGroups = useMemo(() => {
-    const configured = (config?.phases || []).map((phase) => ({
-      id: phase.id,
-      title: text(phase.title, lang) || phase.id,
-      days: days.filter((day) => day.phase_id === phase.id),
-    })).filter((phase) => phase.days.length);
-    const configuredIds = new Set(configured.map((phase) => phase.id));
-    const orphanGroups = Array.from(new Set(days.map((day) => day.phase_id).filter((id) => !configuredIds.has(id)))).map((id) => ({
-      id,
-      title: id,
-      days: days.filter((day) => day.phase_id === id),
-    }));
-    return [...configured, ...orphanGroups];
-  }, [config?.phases, days, lang]);
+  const phaseGroups = useMemo(() => buildPhaseGroups(config?.phases, days, lang), [config?.phases, days, lang]);
   const [selectedPhase, setSelectedPhase] = useState(phaseGroups[0]?.id || "");
   const activePhase = phaseGroups.find((phase) => phase.id === selectedPhase) || phaseGroups[0];
   const [selected, setSelected] = useState(activePhase?.days[0]?.date || "");
@@ -889,7 +920,11 @@ function JourneyView({
           >
             <i>{index + 1}</i>
             <span>{phase.title}</span>
-            <small>{phase.days.length} {phase.days.length === 1 ? "day" : "days"}</small>
+            <small>{phase.days.length
+              ? `${phase.days.length} ${phase.days.length === 1 ? "day" : "days"}`
+              : phase.venues.length
+                ? copy(lang, `${phase.venues.length} ${phase.venues.length === 1 ? "place" : "places"}`, `${phase.venues.length} מקומות`)
+                : copy(lang, "no plan yet", "אין עדיין תוכנית")}</small>
           </button>
         ))}
       </aside>
@@ -976,10 +1011,52 @@ function JourneyView({
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
               </div> : null}
             </div>
-          )) : <p className="empty-state">No structured items for this phase day yet.</p>}
+          )) : activePhase && !activePhase.days.length ? (
+            <PhasePlaces venues={activePhase.venues} lang={lang} />
+          ) : <p className="empty-state">{copy(lang, "No structured items for this phase day yet.", "אין עדיין פריטים מתוזמנים ליום הזה.")}</p>}
         </div>
       </section>
     </section>
+  );
+}
+
+/**
+ * What a phase has before it has a day-by-day: the places.
+ *
+ * The interview captures where a leg is going — "Tokyo Skytree", "TeamLab
+ * Planets" — but nothing yet turns those into dated days, so an
+ * interview-built trip arrives as phases full of places and no schedule. Until
+ * 2026-09-12 that rendered as nothing whatsoever. Showing the places says what
+ * is actually known, and says plainly that the schedule is still open, rather
+ * than implying the trip is empty.
+ */
+export function PhasePlaces({ venues, lang }: {
+  venues: NonNullable<NonNullable<TripConfig["phases"]>[number]["venues"]>;
+  lang: Lang;
+}) {
+  if (!venues.length) {
+    return <p className="empty-state">{copy(lang, "Nothing planned for this phase yet.", "עוד לא תוכנן דבר לשלב הזה.")}</p>;
+  }
+  return (
+    <div className="phase-places">
+      <p className="empty-state">{copy(lang,
+        "No day-by-day for this phase yet — here is what it is planned around.",
+        "עוד אין תוכנית יומית לשלב הזה — אלה המקומות שתוכננו בו.")}</p>
+      <ul>
+        {venues.map((venue, index) => (
+          <li key={venue.id || index}>
+            <strong>{text(venue.name, lang) || venue.id}</strong>
+            <span className="phase-place-links">
+              {venue.maps ? <a href={venue.maps} target="_blank" rel="noreferrer">{copy(lang, "Maps", "מפות")}</a> : null}
+              {venue.waze ? <a href={venue.waze} target="_blank" rel="noreferrer">Waze</a> : null}
+              {venue.tickets || venue.url
+                ? <a href={venue.tickets || venue.url} target="_blank" rel="noreferrer">{copy(lang, "Tickets", "כרטיסים")}</a>
+                : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
