@@ -941,3 +941,14 @@ textarea { min-height: 132px; resize: vertical; }
 }
 .hero-identity span { max-width: 12ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 620px) { .hero-identity span { display: none; } }
+
+.editor-warning {
+  grid-column: 1 / -1;
+  margin: 0;
+  border-radius: var(--kit-radius);
+  padding: 10px 12px;
+  color: var(--kit-ink);
+  background: rgba(240, 173, 78, .18);
+  line-height: 1.5;
+}
+.day-selector button small { opacity: .8; }

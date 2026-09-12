@@ -757,6 +757,32 @@ function TodayView({
  * 2026-09-12: "no phases, no locations, no data". A phase is a phase whether
  * or not its days exist.
  */
+/**
+ * Every date a phase covers, from its own date range.
+ *
+ * The interview establishes the SHAPE of a trip — three days in Tokyo, one in
+ * Hakone, two in Kyoto — well before anyone writes what happens in them. Those
+ * days exist; they are just empty. Showing them is what turns the journey page
+ * from "nothing here" into a plan waiting to be filled, and gives an organizer
+ * somewhere to put the first activity. Asked for 2026-09-12.
+ *
+ * Derived on the page, never written down: the day is real, but "empty day" is
+ * not a fact worth recording in an immutable intake or a trip config.
+ */
+export function datesInPhase(dates?: { start?: string; end?: string }): string[] {
+  const start = dates?.start;
+  const end = dates?.end || start;
+  if (!start || !/^\d{4}-\d{2}-\d{2}$/.test(start) || !end || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return [];
+  const out: string[] = [];
+  // UTC throughout: these are calendar dates, and a local-midnight Date shifts
+  // them by a day for anyone east or west of the machine that renders it.
+  for (let day = new Date(`${start}T00:00:00Z`); day <= new Date(`${end}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) {
+    out.push(day.toISOString().slice(0, 10));
+    if (out.length > 400) break;  // a trip, not a century
+  }
+  return out;
+}
+
 export function buildPhaseGroups(
   configPhases: TripConfig["phases"],
   days: ItineraryDay[],
@@ -778,6 +804,7 @@ export function buildPhaseGroups(
       days: days.filter((day) => day.phase_id === phase.id),
       venues: phase.venues || [],
       dates: phase.dates,
+      calendar: datesInPhase(phase.dates),
     }));
     const configuredIds = new Set(configured.map((phase) => phase.id));
     const orphanGroups = Array.from(new Set(days.map((day) => day.phase_id).filter((id) => !configuredIds.has(id)))).map((id) => ({
@@ -786,11 +813,12 @@ export function buildPhaseGroups(
       days: days.filter((day) => day.phase_id === id),
       venues: [] as NonNullable<NonNullable<TripConfig["phases"]>[number]["venues"]>,
       dates: undefined,
+      calendar: [] as string[],
     }));
     return [...configured, ...orphanGroups];
 }
 
-function JourneyView({
+export function JourneyView({
   itinerary,
   config,
   isOrganizer,
@@ -813,8 +841,13 @@ function JourneyView({
   const phaseGroups = useMemo(() => buildPhaseGroups(config?.phases, days, lang), [config?.phases, days, lang]);
   const [selectedPhase, setSelectedPhase] = useState(phaseGroups[0]?.id || "");
   const activePhase = phaseGroups.find((phase) => phase.id === selectedPhase) || phaseGroups[0];
-  const [selected, setSelected] = useState(activePhase?.days[0]?.date || "");
-  const activeDate = activePhase?.days.some((day) => day.date === selected) ? selected : activePhase?.days[0]?.date || "";
+  // The dates a phase offers: the ones with a plan, or — while that is still
+  // empty — the calendar the interview already established for it.
+  const phaseDates = activePhase?.days.length
+    ? activePhase.days.map((day) => day.date)
+    : activePhase?.calendar ?? [];
+  const [selected, setSelected] = useState(phaseDates[0] || "");
+  const activeDate = phaseDates.includes(selected) ? selected : phaseDates[0] || "";
   const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
   const daySpineRef = useRef<HTMLElement>(null);
@@ -829,10 +862,8 @@ function JourneyView({
   }, [activePhase?.id, onHeroPhaseChange]);
 
   useEffect(() => {
-    if (activePhase?.days.length && !activePhase.days.some((day) => day.date === selected)) {
-      setSelected(activePhase.days[0].date);
-    }
-  }, [activePhase, selected]);
+    if (phaseDates.length && !phaseDates.includes(selected)) setSelected(phaseDates[0]!);
+  }, [phaseDates, selected]);
 
   useEffect(() => {
     if (!focus?.phaseId || handledFocus.current === focus) return;
@@ -897,8 +928,11 @@ function JourneyView({
   const beginNew = () => {
     const fallbackPhase = config?.phases?.[0];
     setDraft({
+      // The phase and day on screen, because that is the one being planned.
+      // `dates.start` before `start`: the transformer writes the former, and
+      // reading only the latter quietly landed every new item on today.
       phase_id: activePhase?.id || fallbackPhase?.id || "",
-      date: activeDate || fallbackPhase?.start || new Date().toISOString().slice(0, 10),
+      date: activeDate || fallbackPhase?.dates?.start || fallbackPhase?.start || new Date().toISOString().slice(0, 10),
       text_he: "",
       text_en: "",
       time: "",
@@ -908,6 +942,21 @@ function JourneyView({
     setTimeMode("none");
     setEditing("new");
   };
+  /**
+   * A date that does not belong to the phase it is being filed under.
+   *
+   * Usually a slip — the day strip was on Tokyo and the date picker went to a
+   * Kyoto date — and occasionally deliberate: a night train, a day trip
+   * counted against the leg that paid for it. So it is a question, not a rule.
+   * Asked for 2026-09-12: "he will get a warning that this does not make sense
+   * and ask him to verify, but if he approves don't block".
+   */
+  const draftPhaseDates = phaseGroups.find((group) => group.id === draft.phase_id)?.calendar ?? [];
+  const dateOutsidePhase = Boolean(
+    draft.phase_id && draft.date && draftPhaseDates.length && !draftPhaseDates.includes(draft.date),
+  );
+  const draftPhaseName = phaseGroups.find((group) => group.id === draft.phase_id)?.title || draft.phase_id;
+
   const beginEdit = (item: ItineraryItem) => {
     setDraft({
       phase_id: item.phase_id,
@@ -935,16 +984,22 @@ function JourneyView({
             className={phase.id === activePhase?.id ? "active" : ""}
             onClick={() => {
               setSelectedPhase(phase.id);
-              setSelected(phase.days[0]?.date || "");
+              setSelected(phase.days[0]?.date || phase.calendar[0] || "");
             }}
           >
             <i>{index + 1}</i>
             <span>{phase.title}</span>
-            <small>{phase.days.length
-              ? `${phase.days.length} ${phase.days.length === 1 ? "day" : "days"}`
-              : phase.venues.length
-                ? copy(lang, `${phase.venues.length} ${phase.venues.length === 1 ? "place" : "places"}`, `${phase.venues.length} מקומות`)
-                : copy(lang, "no plan yet", "אין עדיין תוכנית")}</small>
+            <small>{(() => {
+              // The SHAPE of the trip, which the interview settles long before
+              // anyone writes what happens in those days: three days in Tokyo,
+              // one in Hakone. A day with nothing in it is still a day.
+              const count = phase.days.length || phase.calendar.length;
+              if (count) return copy(lang, `${count} ${count === 1 ? "day" : "days"}`, `${count} ${count === 1 ? "יום" : "ימים"}`);
+              if (phase.venues.length) {
+                return copy(lang, `${phase.venues.length} ${phase.venues.length === 1 ? "place" : "places"}`, `${phase.venues.length} מקומות`);
+              }
+              return copy(lang, "no plan yet", "אין עדיין תוכנית");
+            })()}</small>
           </button>
         ))}
       </aside>
@@ -955,12 +1010,15 @@ function JourneyView({
           {day?.lodging_context?.name ? <p>Tonight: {day.lodging_context.name}</p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <div className="day-selector" aria-label="Days in selected phase">
-            {(activePhase?.days || []).map((entry) => (
-              <button key={`${entry.phase_id}-${entry.date}`} className={entry.date === activeDate ? "active" : ""} onClick={() => setSelected(entry.date)}>
-                <span>{dateLabel(entry.date, lang)}</span>
-                <small>{daySelectorSubtitle(entry, lang)}</small>
-              </button>
-            ))}
+            {phaseDates.map((date) => {
+              const planned = activePhase?.days.find((entry) => entry.date === date);
+              return (
+                <button key={`${activePhase?.id}-${date}`} className={date === activeDate ? "active" : ""} onClick={() => setSelected(date)}>
+                  <span>{dateLabel(date, lang)}</span>
+                  <small>{planned ? daySelectorSubtitle(planned, lang) : copy(lang, "open", "פנוי")}</small>
+                </button>
+              );
+            })}
           </div>
         </div>
         {isOrganizer && editing ? (
@@ -970,6 +1028,9 @@ function JourneyView({
             onSubmit={(event) => {
               event.preventDefault();
               if (!draft.phase_id || !draft.date || !draft.text_he.trim()) return;
+              if (dateOutsidePhase && !window.confirm(copy(lang,
+                `${draft.date} is not one of ${draftPhaseName}'s days. Save it there anyway?`,
+                `${draft.date} אינו אחד מהימים של ${draftPhaseName}. לשמור שם בכל זאת?`))) return;
               const time = timeMode === "none" ? null : draft.time?.trim() || null;
               saveMutation.mutate({ itemUid: editing === "new" ? undefined : editing.item_uid, input: { ...draft, text_he: draft.text_he.trim(), time, location_url: draft.location_url?.trim() || null } });
             }}
@@ -988,6 +1049,13 @@ function JourneyView({
                 </select>
               </label>
               <label>{copy(lang, "Date", "תאריך")}<input type="date" value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} required /></label>
+              {dateOutsidePhase ? (
+                <p className="editor-warning" role="status">
+                  {copy(lang,
+                    `That date is not one of ${draftPhaseName}'s days — check the phase, or save anyway if you meant it.`,
+                    `התאריך הזה אינו אחד מהימים של ${draftPhaseName} — בדקו את השלב, או שמרו בכל זאת אם זו הכוונה.`)}
+                </p>
+              ) : null}
               <label>{copy(lang, "When", "מתי")}
                 <select value={timeMode} onChange={(event) => {
                   const nextMode = event.target.value as ItineraryTimeMode;

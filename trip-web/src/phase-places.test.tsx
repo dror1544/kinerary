@@ -9,7 +9,7 @@
  */
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildPhaseGroups, PhasePlaces } from "./App";
+import { buildPhaseGroups, datesInPhase, PhasePlaces } from "./App";
 
 afterEach(cleanup);
 
@@ -62,5 +62,57 @@ describe("the phases the itinerary offers", () => {
   it("a day for a phase the config does not have still gets a group of its own", () => {
     const groups = buildPhaseGroups(PHASES, [{ date: "2026-10-01", phase_id: "kyoto" }] as never[], "en");
     expect(groups.map((group) => group.id)).toContain("kyoto");
+  });
+});
+
+describe("the shape of a trip, before anything is planned in it", () => {
+  // Asked for 2026-09-12: "if from the interview you get the structured trip
+  // and it is known (for example 3 days in Tokyo, one in Hakone and 2 in
+  // Kyoto) then that structure should be reflected on the journey page, on the
+  // days — they may be empty but structured."
+  it("gives a phase every date it covers", () => {
+    expect(datesInPhase({ start: "2026-09-19", end: "2026-09-21" }))
+      .toEqual(["2026-09-19", "2026-09-20", "2026-09-21"]);
+  });
+
+  it("a one-day leg is one day, not none", () => {
+    expect(datesInPhase({ start: "2026-09-22", end: "2026-09-22" })).toEqual(["2026-09-22"]);
+    expect(datesInPhase({ start: "2026-09-22" })).toEqual(["2026-09-22"]);
+  });
+
+  it("crosses a month and a year without losing or inventing a day", () => {
+    expect(datesInPhase({ start: "2026-09-29", end: "2026-10-02" }))
+      .toEqual(["2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"]);
+    expect(datesInPhase({ start: "2026-12-31", end: "2027-01-01" })).toEqual(["2026-12-31", "2027-01-01"]);
+  });
+
+  it("says nothing when there is nothing to say", () => {
+    expect(datesInPhase(undefined)).toEqual([]);
+    expect(datesInPhase({ start: "soon", end: "later" })).toEqual([]);
+    // An end before its start is not a range.
+    expect(datesInPhase({ start: "2026-09-21", end: "2026-09-19" })).toEqual([]);
+  });
+
+  it("reaches the journey through the phase groups", () => {
+    const groups = buildPhaseGroups(
+      [
+        { id: "tokyo", title: { en: "Tokyo" }, dates: { start: "2026-09-19", end: "2026-09-21" } },
+        { id: "hakone", title: { en: "Hakone" }, dates: { start: "2026-09-22", end: "2026-09-22" } },
+      ],
+      [],
+      "en",
+    );
+    expect(groups.map((group) => group.calendar.length)).toEqual([3, 1]);
+  });
+
+  it("a phase with a real plan uses the plan, not the calendar", () => {
+    const days = [{ date: "2026-09-19", phase_id: "tokyo" }] as never[];
+    const groups = buildPhaseGroups(
+      [{ id: "tokyo", title: { en: "Tokyo" }, dates: { start: "2026-09-19", end: "2026-09-21" } }],
+      days,
+      "en",
+    );
+    expect(groups[0].days).toHaveLength(1);
+    expect(groups[0].calendar).toHaveLength(3);
   });
 });
