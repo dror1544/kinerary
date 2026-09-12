@@ -125,6 +125,69 @@ describe("dispatchUpdate — the branch table", () => {
     });
   });
 
+  test("Hermes's own commands never reach the gateway", { skip: SKIP }, async () => {
+    // The hole this closes: /help, /model, /reset, /sethome are Hermes's, not
+    // the trip's, and under the relay they arrive as ordinary text. Forwarded,
+    // they handed a family group the controls of the runtime their assistant
+    // runs on — on 2026-09-12 a group's first contact answered "type /help to
+    // see the available commands" and the leak guard started catching
+    // `sethome` on its way into the room.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000555", "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio", private_url: "https://japan-2026.example", language: "en",
+        })],
+      );
+      for (const command of ["/help", "/model gpt-5", "/reset", "/sethome", "/new"]) {
+        const decision = await dispatchUpdate(fix.pool, msg("700000555", command));
+        assert.equal(decision.kind, "reply", `${command} must not reach a gateway`);
+        if (decision.kind !== "reply") return;
+        assert.match(decision.reply.text, /Rio/);
+        // The answer is the opposite of a command list: there is nothing here
+        // to operate, and saying so is the point.
+        assert.match(decision.reply.text, /just talk to me/i);
+      }
+    });
+  });
+
+  test("an unknown command says so; /help simply helps", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000556", "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "Rio", language: "en" })],
+      );
+      const unknown = await dispatchUpdate(fix.pool, msg("700000556", "/sethome"));
+      assert.equal(unknown.kind === "reply" && /\/sethome isn't one of my commands/.test(unknown.reply.text), true);
+      const help = await dispatchUpdate(fix.pool, msg("700000556", "/help"));
+      assert.equal(help.kind === "reply" && /isn't one of my commands/.test(help.reply.text), false,
+        "asking for help is not an error");
+    });
+  });
+
+  test("the group is told in its own language, and only the organizer is told about /group", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "-1002000999", "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "יפו", language: "he" })],
+      );
+      const inGroup = await dispatchUpdate(fix.pool, msg("-1002000999", "/help", "supergroup"));
+      assert.equal(inGroup.kind, "reply");
+      if (inGroup.kind !== "reply") return;
+      assert.match(inGroup.reply.text, /יפו/);
+      // /group binds a group to a trip and is issued from the organizer's own
+      // chat. Naming it inside the group would be an invitation to nothing.
+      assert.doesNotMatch(inGroup.reply.text, /\/group/);
+
+      await bindCompanion(fix, "700000557", "companion-japan");
+      const inDm = await dispatchUpdate(fix.pool, msg("700000557", "/help"));
+      assert.equal(inDm.kind === "reply" && /\/group/.test(inDm.reply.text), true);
+    });
+  });
+
   test("an unknown chat is refused, never routed", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const decision = await dispatchUpdate(fix.pool, msg("700000444", "hello?"));

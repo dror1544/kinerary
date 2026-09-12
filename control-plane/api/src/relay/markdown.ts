@@ -16,7 +16,8 @@
  * their inner text escaped by their own rules, and everything between them
  * escaped wholesale.
  *
- * Deliberately supports a small set — links, code, bold, italic. An agent
+ * Deliberately supports a small set — links, code, bold, italic, and headings
+ * (which Telegram has no entity for, so they become bold lines). An agent
  * writing a table or a blockquote gets it escaped into visible punctuation,
  * which is legible and safe. The alternative, a full CommonMark translator,
  * is a large surface for a chat message and would still not cover everything
@@ -52,6 +53,17 @@ function escapeCode(code: string): string {
 const FENCE = /```([\s\S]*?)```/;
 const INLINE_CODE = /`([^`\n]+)`/;
 const LINK = /\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)/;
+/**
+ * A markdown heading, which Telegram has no entity for.
+ *
+ * Escaped as prose it renders as a literal "# Day 1" — the hash and all — so a
+ * companion that organises a day-by-day answer under headings produced worse
+ * output than one that wrote a wall of text. Telegram's idiom for a heading is
+ * a bold line, so that is what a heading becomes. Closing hashes (`## Day 1 ##`)
+ * are dropped with the opening ones; a hash that is not followed by a space
+ * ("#1 priority") is not a heading and is left as prose.
+ */
+const HEADING = /^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/m;
 const BOLD = /\*\*([^*\n]+)\*\*/;
 const ITALIC = /(?<![*\w])\*([^*\n]+)\*(?!\w)/;
 
@@ -78,6 +90,9 @@ export function toTelegramMarkdownV2(text: string): string {
           : `[${escapeMarkdownV2(url)}](${escapeUrl(url)})`;
       },
     },
+    // Before BOLD, and it does not matter which wins a tie: a heading is a whole
+    // line and bold is inside one.
+    { re: HEADING, render: (m) => `*${escapeMarkdownV2(m[1] ?? "")}*` },
     { re: BOLD, render: (m) => `*${escapeMarkdownV2(m[1] ?? "")}*` },
     { re: ITALIC, render: (m) => `_${escapeMarkdownV2(m[1] ?? "")}_` },
   ];

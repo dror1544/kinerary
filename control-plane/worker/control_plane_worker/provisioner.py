@@ -1070,9 +1070,19 @@ class ProvisionerWorker:
                 # finally adds the bot to a family group, this run is long over
                 # and the seed password exists nowhere else the control plane
                 # can read.
+                # `intro_facts`, NOT `notif_payload`. The two were transposed
+                # here until 2026-09-12, and the failure was silent in exactly
+                # the way a wrong variable is: the column existed, held valid
+                # JSON, and carried one true fact. What it did not carry was
+                # `assistant_name` — so when an organizer finally posted their
+                # binding token in the family group, the dispatcher found no
+                # name to greet with, fell through to the bare "this group is
+                # connected to the trip", and pinned nothing. The arrival
+                # message this column exists to make possible had never been
+                # composable since the column was added.
                 cur.execute(
                     "UPDATE control_plane.trips SET companion_intro = %s::jsonb WHERE id = %s",
-                    (notif_payload, trip_id),
+                    (json.dumps(intro_facts), trip_id),
                 )
                 cur.execute(
                     """

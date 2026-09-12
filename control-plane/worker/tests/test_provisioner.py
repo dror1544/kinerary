@@ -759,6 +759,46 @@ class CompanionProfileTests(unittest.TestCase):
         self.assertEqual(row["trip_id"], self.fix["trip_id"])
         self.assertEqual(row["hermes_profile"], handoff["profile"]["name"])
 
+    def test_the_group_introduction_facts_are_kept_on_the_trip(self) -> None:
+        """The GROUP arrival message is composed days later, out of this column.
+
+        Every line of it is a fact — the assistant's name, the site, the shared
+        login and who to use it as — and the dispatcher refuses to invent any of
+        them: with no `assistant_name` stored it falls through to a bare "this
+        group is connected to the trip" and pins nothing.
+
+        So "the column is non-null" is not the property worth asserting. It held
+        valid JSON all along. What it did not hold, until 2026-09-12, was
+        anything the message is made of: the write was handed `notif_payload`
+        (the site-ready line, `private_url` alone) where it meant `intro_facts`.
+        Every trip provisioned since migration 0044 got an uncomposable
+        introduction, and the first group to notice was a live family's.
+        """
+        deploy = FakeDeployAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=deploy, worker_id="test-companion-intro",
+            companion=FakeCompanionProfileAdapter(),
+        )
+        worker.run_once()
+
+        intro = self.conn.execute(
+            "SELECT companion_intro FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()["companion_intro"]
+
+        self.assertEqual(intro["assistant_name"], "Tal")
+        self.assertEqual(
+            intro["private_url"], f"https://{deploy.deployed[0]['slug']}.test.example"
+        )
+        self.assertIn("trip_title", intro)
+        self.assertIn("language", intro)
+        # Who to log in AS — the seed password is shared, so the username is
+        # the only thing telling two travellers apart.
+        self.assertEqual(
+            sorted(p["name"] for p in intro["login_usernames"]),
+            ["Eitan", "Noa"],
+        )
+
     def test_no_binding_written_when_the_companion_adapter_declines(self) -> None:
         class DecliningAdapter:
             def install(self, handoff: dict) -> str | None:

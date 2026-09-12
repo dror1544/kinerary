@@ -37,7 +37,8 @@ import {
   companionIntroFacts,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { groupBindingCommand, groupIntroText } from "../companion-intro.js";
+import { coerceLanguage, uiString } from "../intake-copy.js";
+import { companionHelpText, groupBindingCommand, groupIntroText } from "../companion-intro.js";
 import {
   extractGroupBindingToken,
   issueGroupBindingToken,
@@ -53,7 +54,7 @@ import {
   type MediaDeps,
   type TelegramUpdate,
 } from "./normalize.js";
-import { setFinishRequestedForChat, type SessionView } from "../interview.js";
+import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -496,6 +497,48 @@ export async function dispatchUpdate(
     if (route.kind === "interview") {
       const result = await setFinishRequestedForChat(db, chatId, true);
       if (result.ok) return { kind: "show_summary", chatId, view: result.view };
+    }
+  }
+
+  // ── A command is answered HERE, or it is not answered at all ───────────────
+  //
+  // Every command this router owns has been handled above. What is left is
+  // somebody else's command surface — and under the relay, "somebody else"
+  // means Hermes, whose own slash commands (/help, /model, /reset, /new,
+  // /sethome …) arrive as ordinary text and used to be forwarded to the
+  // gateway like any sentence. That handed a family group the controls of the
+  // runtime their assistant runs on: on 2026-09-12 a group's first contact
+  // answered "type /help to see the available commands", and the connector's
+  // leak guard then caught `sethome` and a model-fallback notice on their way
+  // into the room.
+  //
+  // Placed before the route-specific branches below so it covers BOTH gateway
+  // paths — the companion's and the interviewer's — rather than the one that
+  // happened to be reported. A chat with no trip is left alone: `unbound`
+  // already says the one true thing about it, and a help text for an assistant
+  // that does not exist would be worse.
+  if (parsed.kind === "command") {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "companion") {
+      const facts = await companionIntroFacts(db, route.tripId);
+      return {
+        kind: "reply",
+        reply: {
+          chatId,
+          text: companionHelpText({
+            assistantName: typeof facts?.assistant_name === "string" ? facts.assistant_name : null,
+            siteUrl: typeof facts?.private_url === "string" ? facts.private_url : null,
+            language: facts?.language === "he" ? "he" : "en",
+            isPrivateChat: message.chat?.type === "private",
+            unknownCommand: parsed.name === "help" ? null : parsed.name,
+          }),
+        },
+      };
+    }
+    if (route.kind === "interview") {
+      const session = await getSessionForChat(db, chatId);
+      const language = session.ok ? coerceLanguage(session.view.language) ?? "en" : "en";
+      return { kind: "reply", reply: { chatId, text: uiString("notMyCommand", language) } };
     }
   }
 

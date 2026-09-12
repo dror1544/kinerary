@@ -106,6 +106,26 @@ const GATEWAY_STATUS_PHRASES: readonly string[] = [
   "/sethome",
   "home channel set",
   "set as home channel",
+  // The harness asking a FAMILY for permission to run a shell command.
+  // Live 2026-09-12, in the family group, in answer to a question about the
+  // trip:
+  //
+  //     ⚠️ Dangerous command requires approval:
+  //     cd /opt/data/profiles/japan2026 && python3 -c "…mcp call trip-mcp…"
+  //     Reply /approve to execute this one operation, /approve session …
+  //
+  // Two failures in one message, and the leak is the smaller of them: the
+  // companion had no trip-mcp tools (its gateway parked the server at
+  // startup) and was improvising a shell command to reach them. The source
+  // fixes are elsewhere — the bridge restart in companion-install-host.sh,
+  // and `agent.disabled_toolsets` in the companion overlay. This is the
+  // fail-safe, because an approval prompt is never something a family can
+  // usefully answer and the words are the harness's own.
+  "requires approval",
+  "reply /approve",
+  "/approve session",
+  "/approve always",
+  "security scan —",
 ];
 
 /**

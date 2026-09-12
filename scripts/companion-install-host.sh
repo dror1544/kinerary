@@ -397,6 +397,28 @@ start_gateway_supervised() {
   fi
 }
 
+# Did the RUNNING gateway pick the bridge up? Read off its own log, not assumed.
+#
+# mcp_tool parks a server after three failed connects ("parking until a
+# reconnect is requested") and nothing ever requests one — so a gateway that
+# was started before trip-mcp existed stays toolless for the life of the
+# process, silently. Same discipline as interview-stack-deploy's check for the
+# interviewer's `*_for_chat` tools: grep the gateway's own registration line,
+# because an upstream process being alive proves nothing about what it loaded.
+gateway_registered_trip_mcp() {
+  local name="$1" from_line="$2" waited=0
+  local log="$HOME/.hermes/profiles/$name/logs/agent.log"
+  while [ "$waited" -lt 60 ]; do
+    if [ -f "$log" ] && tail -n "+$from_line" "$log" 2>/dev/null \
+         | grep -q "MCP server 'trip-mcp'.*registered [1-9][0-9]* tool"; then
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
 # ── The trip-mcp bridge, wired on THIS host ──────────────────────────────────
 #
 # The bridge is `node mcp.js` plus a `hermes mcp add` into the companion's
@@ -442,10 +464,42 @@ PYTOPO
   # REPO_ROOT: the bridge runs this checkout's mcp.js, the same checkout whose
   # templates rendered the companion. stdin from /dev/null so the backgrounded
   # bridge does not hold this SSH session open after the script returns.
+  # Where the gateway's log stands BEFORE the restart, so the check below reads
+  # this connection attempt rather than an older one.
+  GATEWAY_LOG="$HOME/.hermes/profiles/$PROFILE_NAME/logs/agent.log"
+  LOG_FROM=$(( $(wc -l < "$GATEWAY_LOG" 2>/dev/null || echo 0) + 1 ))
+
   if REPO_ROOT="$REPO_ROOT" "$DEPLOY_ROOT/setup-mcp.sh" "$PROFILE_NAME" "http://$SITE_IP:$SITE_PORT" \
        --vmid "$VMID" --trip-dir "$TRIP_DIR" --port "$MCP_PORT" < /dev/null > "$WORK/setup-mcp.log" 2>&1; then
-    printf 'WIRED %s\n' "$PROFILE_NAME"
-    exit 0
+    # RESTART, because the gateway is already running by now and read its
+    # config before this entry existed.
+    #
+    # The provisioner installs the companion (which starts its gateway) and
+    # THEN wires the bridge, so the gateway's first trip-mcp attempt is always
+    # too early: either the entry is absent, or it is there without the
+    # `transport: sse` that setup-mcp.sh patches in afterwards. On the wrong
+    # transport mcp_tool POSTs to the URL, mcp.js serves SSE only (GET /sse +
+    # POST /messages), the POST 404s, and after three of those the server is
+    # PARKED for the life of the process.
+    #
+    # Live on 2026-09-12, `japan2026`: POST /sse 404 ×3 at 14:11:23-30 →
+    # parked; the very next handshake at 14:11:32, made by setup-mcp.sh's own
+    # `hermes mcp test`, succeeded. The test passing is exactly why nobody
+    # noticed — the bridge was fine, the gateway just never reconnected. The
+    # family's companion answered questions about their trip with no trip
+    # tools at all, and tried to shell out to reach them.
+    start_gateway "$PROFILE_NAME"
+    if gateway_registered_trip_mcp "$PROFILE_NAME" "$LOG_FROM"; then
+      printf 'WIRED %s\n' "$PROFILE_NAME"
+      exit 0
+    fi
+    # Wired but not reachable BY THE AGENT, which is the only sense that
+    # matters. Reported as a failure rather than a WIRED with an asterisk: the
+    # provisioner treats a bridge failure as non-fatal and logs it, so the trip
+    # still finishes — with the one fact that would otherwise be invisible.
+    printf 'companion-install-host: %s gateway registered no trip-mcp tools after restart\n' "$PROFILE_NAME" >&2
+    tail -5 "$GATEWAY_LOG" >&2 2>/dev/null || true
+    die "trip-mcp wired for $TRIP_SLUG but $PROFILE_NAME's gateway did not register its tools"
   fi
   tail -20 "$WORK/setup-mcp.log" >&2
   die "setup-mcp.sh failed for $TRIP_SLUG"

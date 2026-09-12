@@ -329,3 +329,56 @@ export function organizerIntroMessages(facts: CompanionIntroFacts): string[] {
   if (facts.groupBindingToken) messages.push(groupBindingCommand(facts.groupBindingToken));
   return messages;
 }
+
+/**
+ * What the router answers when someone types a command at a companion.
+ *
+ * THE COMMAND SURFACE IS THE ROUTER'S, NOT THE AGENT'S. Hermes carries a large
+ * slash surface of its own — /help, /model, /reset, /new, /sethome — and under
+ * the relay every one of those arrives as ordinary text addressed to a trip
+ * assistant. Forwarded, they hand a family group the controls of the runtime
+ * their assistant happens to run on. On 2026-09-12 a group's very first contact
+ * answered "type /help to see the available commands" and the connector's leak
+ * guard then caught `sethome` and a model-fallback notice on their way into the
+ * room. None of that is the assistant's job and none of it is the family's
+ * business; it is plumbing, and a family should never be able to reach it by
+ * typing a slash.
+ *
+ * So the router answers commands itself, and this is what it says. The message
+ * is deliberately not a command list: there is nothing here to operate. The one
+ * command that exists — /group — is the organizer's, in the organizer's own
+ * chat, which is why it appears only there.
+ */
+export function companionHelpText(facts: {
+  assistantName?: string | null;
+  siteUrl?: string | null;
+  language: "he" | "en";
+  /** The organizer's private chat, the only place /group is worth naming. */
+  isPrivateChat: boolean;
+  /** The command they typed, when it was not one of ours. Shapes the opening. */
+  unknownCommand?: string | null;
+}): string {
+  const he = facts.language === "he";
+  const name = facts.assistantName?.trim() || null;
+  const parts: string[] = [];
+
+  if (he) {
+    if (facts.unknownCommand) parts.push(`‎/${facts.unknownCommand} היא לא פקודה שלי.`, "");
+    parts.push(
+      name ? `אני ${name} — פשוט דברו איתי, בלי פקודות.` : "פשוט דברו איתי, בלי פקודות.",
+      "אפשר לשאול מה בתוכנית היום, מתי יוצאים, איפה לאכול בסביבה — או לשלוח לי תמונה או אישור הזמנה ואשמור אותם לטיול.",
+    );
+    if (facts.siteUrl) parts.push("", `האתר של הטיול: ${facts.siteUrl}`);
+    if (facts.isPrivateChat) parts.push("", "‎/group — לחבר אותי לקבוצה המשפחתית שלכם.");
+    return parts.join("\n");
+  }
+
+  if (facts.unknownCommand) parts.push(`/${facts.unknownCommand} isn't one of my commands.`, "");
+  parts.push(
+    name ? `I'm ${name} — just talk to me, no commands needed.` : "Just talk to me, no commands needed.",
+    "Ask what's on today, when we leave, where to eat nearby — or send me a photo or a booking confirmation and I'll keep it with the trip.",
+  );
+  if (facts.siteUrl) parts.push("", `The trip site: ${facts.siteUrl}`);
+  if (facts.isPrivateChat) parts.push("", "/group — connect me to your family group.");
+  return parts.join("\n");
+}
