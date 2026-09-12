@@ -36,17 +36,17 @@ it('shows real updates and replies, with organizer-only links and icon settings'
   show(true); await screen.findByText('Meet at nine');
   expect(screen.getByText('Yes, nine works.')).toBeInTheDocument();
   expect(screen.queryByText('Waiting for the companion')).not.toBeInTheDocument();
-  expect(screen.getByRole('link', { name: 'Open Telegram group' })).toHaveAttribute('href', 'https://t.me/+trip');
+  expect(screen.getByRole('link', { name: 'Group link' })).toHaveAttribute('href', 'https://t.me/+trip');
   expect(screen.getByRole('link', { name: 'Private companion chat' })).toHaveAttribute('href', 'https://t.me/Kinerary_bot');
   expect(screen.getByRole('button', { name: 'Companion settings' })).toHaveTextContent('');
-  expect(screen.getByRole('button', { name: 'Copy group connection command' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
 });
 it('localizes shared visibility and does not show missing Telegram connections', async () => {
   vi.mocked(api).mockResolvedValue(empty); show(false, 'he');
   await screen.findByText('עדיין לא שותף כאן עדכון מהקבוצה.');
   expect(screen.getByText(/משותפות לכל משתתפי הטיול/)).toBeInTheDocument();
   expect(screen.queryByRole('link')).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'פתיחת קבוצת הטלגרם' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'קישור לקבוצה' })).toBeDisabled();
   await waitFor(() => expect(screen.getByRole('button', { name: 'שליחה לעוזר' })).toBeDisabled());
 });
 
@@ -60,5 +60,5 @@ it('shows the shared bot only to organizers without a dedicated trip bot', async
   await screen.findByText('No group update has been shared here yet.');
   expect(screen.queryByRole('link', { name: 'Private companion chat' })).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Private companion chat' })).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: 'Copy group connection command' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Copy command' })).not.toBeInTheDocument();
 });

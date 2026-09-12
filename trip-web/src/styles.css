@@ -1085,3 +1085,5 @@ textarea { min-height: 132px; resize: vertical; }
 .companion-message time { display: block; font-size: 0.75rem; opacity: .7; }
 .companion-message p, .companion-latest p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .companion-message blockquote { margin-inline: 0; padding-inline-start: 12px; border-inline-start: 2px solid #94b4a4; font-size: .85rem; }
+
+.companion-telegram-icon { width: 44px; min-height: 44px; padding: 0; justify-content: center; }

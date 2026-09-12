@@ -1,8 +1,12 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Bot, Send, MessageCircle, Copy } from 'lucide-react';
+import { Bot, Send, Copy } from 'lucide-react';
 import { api } from './api';
 import { CompanionTasks } from './CompanionTasks';
+
+function TelegramIcon() {
+  return <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.6 3.4 18.2 20c-.3 1.2-1 1.5-2 .9l-5.2-3.8-2.5 2.4c-.3.3-.5.5-1 .5l.4-5.3 9.6-8.7c.4-.4-.1-.6-.6-.3L5 13.2.9 11.9c-1.1-.3-1.1-1.1.2-1.6L20.8 2.7c.9-.3 1.7.2.8.7Z" /></svg>;
+}
 
 type Message = { id: string; author: string; text: string; kind: 'question' | 'reply' | 'group_update'; reply_to: string | null; created_at: string; answered?: number };
 type Conversation = { inbox_active: boolean; connection: { group_url: string | null } | null; latest_update: Message | null; messages: Message[] };
@@ -55,9 +59,9 @@ export function CompanionPanel({ name, lang, isOrganizer }: { name: string; lang
     <form onSubmit={event => { event.preventDefault(); if (draft.trim() && !send.isPending) { setNotice(''); send.mutate(draft.trim()); } }}>
       <label className="bot-input"><span>{copy('Question or suggestion', 'שאלה או הצעה')}</span><textarea maxLength={2000} value={draft} disabled={send.isPending} onChange={event => setDraft(event.target.value)} placeholder={copy('What would make today better?', 'מה יכול לשפר את היום שלכם?')} /></label>
       <div className="bot-actions"><button className="primary-action" disabled={!draft.trim() || send.isPending || !conversation.data} type="submit"><Send size={17} />{send.isPending ? copy('Saving…', 'שומרים…') : copy('Send to companion', 'שליחה לעוזר')}</button>
-        {groupUrl ? <a className="secondary-action" href={groupUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Open Telegram group', 'פתיחת קבוצת הטלגרם')}</a> : <button type="button" className="secondary-action" disabled><MessageCircle size={17} />{copy('Open Telegram group', 'פתיחת קבוצת הטלגרם')}</button>}
-        {isOrganizer && (privateUrl ? <a className="secondary-action" href={privateUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Private companion chat', 'שיחה פרטית עם העוזר')}</a> : <button type="button" className="secondary-action" disabled><MessageCircle size={17} />{copy('Private companion chat', 'שיחה פרטית עם העוזר')}</button>)}
-        {isOrganizer && <button type="button" className="secondary-action" disabled={!connection.data?.binding_command} onClick={copyCommand}><Copy size={17} />{copy('Copy group connection command', 'העתקת פקודת החיבור לקבוצה')}</button>}
+        {groupUrl ? <a className="secondary-action" href={groupUrl} target="_blank" rel="noreferrer"><TelegramIcon />{copy('Group link', 'קישור לקבוצה')}</a> : <button type="button" className="secondary-action" disabled><TelegramIcon />{copy('Group link', 'קישור לקבוצה')}</button>}
+        {isOrganizer && (privateUrl ? <a className="secondary-action companion-telegram-icon" aria-label={copy('Private companion chat', 'שיחה פרטית עם העוזר')} title={copy('Private companion chat', 'שיחה פרטית עם העוזר')} href={privateUrl} target="_blank" rel="noreferrer"><TelegramIcon /></a> : <button type="button" className="secondary-action companion-telegram-icon" aria-label={copy('Private companion chat', 'שיחה פרטית עם העוזר')} title={copy('Private companion chat', 'שיחה פרטית עם העוזר')} disabled><TelegramIcon /></button>)}
+        {isOrganizer && <button type="button" className="secondary-action" disabled={!connection.data?.binding_command} onClick={copyCommand}><Copy size={17} />{copy('Copy command', 'העתקת פקודה')}</button>}
       </div>
     </form>
     {conversation.data && !groupUrl && <p>{copy('No Telegram group is connected to this trip yet.', 'עדיין לא מחוברת קבוצת טלגרם לטיול הזה.')}</p>}
