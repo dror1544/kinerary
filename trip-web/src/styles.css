@@ -226,6 +226,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .destination-rail small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .day-spine { display: grid; gap: 18px; min-width: 0; }
 .day-heading { padding-bottom: 10px; border-bottom: 1px solid var(--kit-line); }
+.mobile-day-picker { display: none; }
 .day-selector {
   display: flex;
   gap: 8px;
@@ -714,6 +715,8 @@ textarea { min-height: 132px; resize: vertical; }
   z-index: 40;
   display: grid;
   justify-items: start;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
   background: rgba(16, 38, 58, .32);
   backdrop-filter: blur(5px);
 }
@@ -722,8 +725,13 @@ textarea { min-height: 132px; resize: vertical; }
   align-content: start;
   gap: 18px;
   width: min(390px, 92vw);
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: 100dvh;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   padding: 18px;
+  padding-bottom: max(18px, env(safe-area-inset-bottom));
   background: var(--kit-paper);
   box-shadow: -18px 0 44px rgba(16, 38, 58, .18);
 }
@@ -838,6 +846,10 @@ textarea { min-height: 132px; resize: vertical; }
 .login-panel a { display: inline-flex; margin-top: 16px; color: var(--kit-teal); font-weight: 800; }
 
 @media (max-width: 880px) {
+  .day-selector { display: none; }
+  .mobile-day-picker { display: grid; gap: 8px; margin-top: 18px; min-width: 0; font-weight: 700; }
+  .mobile-day-picker select { width: 100%; min-width: 0; min-height: 48px; padding: 12px; border: 1px solid var(--kit-line); border-radius: var(--kit-radius); background: white; color: var(--kit-ink); font: inherit; font-size: 16px; }
+
   .desktop-tabs, .desktop-shortcuts { display: none; }
   .today-grid, .journey-layout, .moments-layout { grid-template-columns: 1fr; }
   .destination-rail {

@@ -1011,6 +1011,16 @@ export function JourneyView({
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
           {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
+          <label className="mobile-day-picker">
+            <span>{copy(lang, "Day", "יום")}</span>
+            <select value={activeDate} onChange={(event) => setSelected(event.target.value)} disabled={!phaseDates.length}>
+              {!phaseDates.length && <option value="">{copy(lang, "No dates yet", "עדיין אין תאריכים")}</option>}
+              {phaseDates.map((date) => {
+                const planned = activePhase?.days.find((entry) => entry.date === date);
+                return <option key={date} value={date}>{dateLabel(date, lang)} — {planned ? daySelectorSubtitle(planned, lang) : copy(lang, "open", "פנוי")}</option>;
+              })}
+            </select>
+          </label>
           <div className="day-selector" aria-label="Days in selected phase">
             {phaseDates.map((date) => {
               const planned = activePhase?.days.find((entry) => entry.date === date);
@@ -2476,6 +2486,12 @@ function AppMenu({
   openTab: (tab: Tab) => void;
   openModule: (module: Module) => void;
 }) {
+  useEffect(() => {
+    if (!open) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [open]);
   if (!open) return null;
   return (
     <div className="menu-overlay" role="presentation" onClick={() => setOpen(false)}>

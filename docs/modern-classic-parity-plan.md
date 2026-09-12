@@ -216,3 +216,15 @@ was fetched again and remains `63f8bcc`. Required staged preflight checks pass
 with existing warnings about an unmirrored profile skill and absent generated
 directories. Source whitespace checks pass; the generated JavaScript retains
 Zod's whitespace inside code-generation template strings, as emitted by Vite.
+
+## Mobile follow-up — 2026-09-12
+
+Journey uses a labeled native day dropdown at widths up to 880px, sharing the
+same selected date and complete phase dates as the desktop strip. The side menu
+is constrained to the viewport and scrolls independently, with background page
+scroll locked while it is open and restored on close.
+
+Verified in a 390×844 browser: selecting March 12 changes Journey to the empty
+selected day; the 1195px menu content scrolls within an 844px panel, reaching
+Sign out at the bottom while page scroll stays at zero. All 90 SPA tests and
+the production build pass. No server changes.
