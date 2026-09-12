@@ -284,3 +284,10 @@ is fetched only after first opening. All 98 SPA tests and the build pass.
 
 - Inspected the user's existing Chrome tab with DevTools at 400px: editor selectors still used 16px text, unlike the day picker. All mobile selectors now use 20px text, 60px height and a 24px arrow with RTL placement. Editor labels and text/date fields use 18px text; inputs have a 56px minimum height. Native selection and forced-colors appearance are retained.
 - Verified the actual open tab after rebuilding: all four selectors measured 20px/60px and the screenshot showed the larger editor controls. Choosing exact time displayed its input; restored the initial selection without saving. Production build passed.
+
+### Opened mobile option lists — 2026-09-12
+
+- User clarified that the small element was the opened native options menu. The earlier field-size changes did not address it.
+- App selectors now present a mobile dialog with 20px option text, 56px rows, selected indication, scrolling and an X close control. Selection dispatches the real select's change event to preserve existing controlled forms. Desktop retains native select interaction.
+- Verified in the user's existing 400px Chrome tab: the large option list renders; pointer activation opens it, choosing exact time shows its input, and the initial value was restored without saving. Left the list open for inspection.
+- Validation: 101 SPA tests pass, including selection propagation, cancellation/focus restoration and desktop behavior; production build passes.

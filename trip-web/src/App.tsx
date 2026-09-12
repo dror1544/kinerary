@@ -1,3 +1,4 @@
+import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { datesInPhase } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
@@ -1032,13 +1033,13 @@ export function JourneyView({
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <label className="mobile-day-picker">
             <span>{copy(lang, "Day", "יום")}</span>
-            <select value={activeDate} onChange={(event) => setSelected(event.target.value)} disabled={!phaseDates.length}>
+            <MobileSelect value={activeDate} onChange={(event) => setSelected(event.target.value)} disabled={!phaseDates.length}>
               {!phaseDates.length && <option value="">{copy(lang, "No dates yet", "עדיין אין תאריכים")}</option>}
               {phaseDates.map((date) => {
                 const planned = activePhase?.days.find((entry) => entry.date === date);
                 return <option key={date} value={date}>{dateLabel(date, lang)} — {planned ? daySelectorSubtitle(planned, lang) : copy(lang, "open", "פנוי")}</option>;
               })}
-            </select>
+            </MobileSelect>
           </label>
           <div className="day-selector" aria-label="Days in selected phase">
             {phaseDates.map((date) => {
@@ -1075,9 +1076,9 @@ export function JourneyView({
             </div>
             <div className="editor-fields">
               <label>{copy(lang, "Phase", "שלב")}
-                <select value={draft.phase_id} onChange={(event) => setDraft({ ...draft, phase_id: event.target.value })}>
+                <MobileSelect value={draft.phase_id} onChange={(event) => setDraft({ ...draft, phase_id: event.target.value })}>
                   {(config?.phases || phaseGroups).map((phase) => <option key={phase.id} value={phase.id}>{"title" in phase ? text(phase.title, lang) || phase.id : phase.id}</option>)}
-                </select>
+                </MobileSelect>
               </label>
               <label>{copy(lang, "Date", "תאריך")}<input type="date" value={draft.date} onChange={(event) => setDraft({ ...draft, date: event.target.value })} required /></label>
               {dateOutsidePhase ? (
@@ -1088,7 +1089,7 @@ export function JourneyView({
                 </p>
               ) : null}
               <label>{copy(lang, "When", "מתי")}
-                <select value={timeMode} onChange={(event) => {
+                <MobileSelect value={timeMode} onChange={(event) => {
                   const nextMode = event.target.value as ItineraryTimeMode;
                   setTimeMode(nextMode);
                   setDraft({ ...draft, time: nextMode === "rough" ? "morning" : "" });
@@ -1096,18 +1097,18 @@ export function JourneyView({
                   <option value="none">{copy(lang, "No time", "ללא שעה")}</option>
                   <option value="exact">{copy(lang, "Exact time", "שעה מדויקת")}</option>
                   <option value="rough">{copy(lang, "Part of day", "חלק מהיום")}</option>
-                </select>
+                </MobileSelect>
               </label>
               {timeMode === "exact" ? <label>{copy(lang, "Exact time", "שעה מדויקת")}<input type="time" value={draft.time || ""} onChange={(event) => setDraft({ ...draft, time: event.target.value })} /></label> : null}
               {timeMode === "rough" ? <label>{copy(lang, "Part of day", "חלק מהיום")}
-                <select value={draft.time || "morning"} onChange={(event) => setDraft({ ...draft, time: event.target.value })}>
+                <MobileSelect value={draft.time || "morning"} onChange={(event) => setDraft({ ...draft, time: event.target.value })}>
                   {roughTimes.map((time) => <option key={time} value={time}>{itineraryTimeLabel(time, lang)}</option>)}
-                </select>
+                </MobileSelect>
               </label> : null}
               <label>{copy(lang, "Type", "סוג")}
-                <select value={draft.item_type || "activity"} onChange={(event) => setDraft({ ...draft, item_type: event.target.value })}>
+                <MobileSelect value={draft.item_type || "activity"} onChange={(event) => setDraft({ ...draft, item_type: event.target.value })}>
                   {["activity", "travel", "meal", "lodging", "free_time", "booking", "task", "note"].map((type) => <option key={type} value={type}>{type.replace("_", " ")}</option>)}
-                </select>
+                </MobileSelect>
               </label>
               <label className="editor-field-wide">{copy(lang, "Activity name", "שם הפעילות")}<input value={draft.text_he} onChange={(event) => setDraft({ ...draft, text_he: event.target.value })} required /></label>
               <p className="editor-note">{copy(lang, "Write the activity once, in Hebrew or English. After you save, Kinerary adds the other language and looks up the location, Waze, website, and tickets when available.", "כותבים את הפעילות פעם אחת, בעברית או באנגלית. לאחר השמירה קינררי מוסיף את השפה השנייה ומחפש מיקום, Waze, אתר וכרטיסים כשיש כאלה.")}</p>
@@ -1389,8 +1390,8 @@ export function BookingCreatePanel({ config, isOrganizer, lang }: { config?: Tri
       {extractionError ? <div className="extract-error" role="alert"><AlertTriangle size={18} aria-hidden="true" /><div><strong>{lang === "he" ? "החילוץ נכשל" : "Extraction failed"}</strong><span>{extractionError}</span></div></div> : null}
       {extractMutation.isSuccess ? <p className="saved-note">{lang === "he" ? "הפרטים חולצו — כדאי לעבור עליהם לפני השמירה." : "Details extracted — please review them before saving."}</p> : null}
       <div className="booking-create-fields">
-        <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></select></label>
+        <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase || defaultPhase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required placeholder={lang === "he" ? "לדוגמה: טיסת JL 12" : "For example: Flight JL 12"} /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -1471,8 +1472,8 @@ export function BookingEditPanel({ booking, config, lang, onClose }: { booking: 
         <button className="icon-action" type="button" onClick={onClose} aria-label={lang === "he" ? "סגירת עריכת הזמנה" : "Close booking editor"}><X size={18} /></button>
       </div>
       <div className="booking-create-fields">
-        <label>{lang === "he" ? "שלב" : "Phase"}<select value={draft.phase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</select></label>
-        <label>{lang === "he" ? "סוג" : "Type"}<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></select></label>
+        <label>{lang === "he" ? "שלב" : "Phase"}<MobileSelect value={draft.phase} onChange={(event) => setDraft({ ...draft, phase: event.target.value })} required><option value="" disabled>{lang === "he" ? "בחירת שלב" : "Choose a phase"}</option>{(config?.phases || []).map((phase) => <option key={phase.id} value={phase.id}>{text(phase.title, lang) || phase.id}</option>)}</MobileSelect></label>
+        <label>{lang === "he" ? "סוג" : "Type"}<MobileSelect value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}><option value="flight">{lang === "he" ? "טיסה" : "Flight"}</option><option value="hotel">{lang === "he" ? "לינה" : "Stay"}</option><option value="car">{lang === "he" ? "רכב" : "Car"}</option><option value="attraction">{lang === "he" ? "אטרקציה" : "Attraction"}</option><option value="other">{lang === "he" ? "אחר" : "Other"}</option></MobileSelect></label>
         <label className="editor-field-wide">{lang === "he" ? "שם ההזמנה" : "Booking name"}<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
         <label>{lang === "he" ? "מתאריך" : "From"}<input type="date" value={draft.date_from} onChange={(event) => setDraft({ ...draft, date_from: event.target.value })} /></label>
         <label>{lang === "he" ? "עד תאריך" : "To"}<input type="date" value={draft.date_to} onChange={(event) => setDraft({ ...draft, date_to: event.target.value })} /></label>
@@ -2149,8 +2150,8 @@ export function BudgetView({ config, lang }: { config?: TripConfig; lang: Lang }
       <form className="budget-add-panel" onSubmit={addItem}>
         <div><span className="panel-label"><Plus size={15} /> {copy(lang, "Add a cost", "הוספת הוצאה")}</span><h3>{copy(lang, "Keep the shared picture current", "עדכון התמונה המשותפת")}</h3></div>
         <div className="budget-add-fields">
-          <label>{copy(lang, "Trip phase", "שלב בטיול")}<select value={phase} onChange={(event) => setPhase(event.target.value)}><option value="general">{copy(lang, "Whole trip", "כל הטיול")}</option><option value="intl_flights">{copy(lang, "International flights", "טיסות בינלאומיות")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</select></label>
-          <label>{copy(lang, "Category", "קטגוריה")}<select value={category} onChange={(event) => setCategory(event.target.value)}>{Object.entries(budgetCategoryMeta).filter(([key]) => !["lodging", "activities"].includes(key)).map(([key, meta]) => <option key={key} value={key}>{meta.icon} {meta[lang]}</option>)}</select></label>
+          <label>{copy(lang, "Trip phase", "שלב בטיול")}<MobileSelect value={phase} onChange={(event) => setPhase(event.target.value)}><option value="general">{copy(lang, "Whole trip", "כל הטיול")}</option><option value="intl_flights">{copy(lang, "International flights", "טיסות בינלאומיות")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</MobileSelect></label>
+          <label>{copy(lang, "Category", "קטגוריה")}<MobileSelect value={category} onChange={(event) => setCategory(event.target.value)}>{Object.entries(budgetCategoryMeta).filter(([key]) => !["lodging", "activities"].includes(key)).map(([key, meta]) => <option key={key} value={key}>{meta.icon} {meta[lang]}</option>)}</MobileSelect></label>
           <label>{copy(lang, "Description", "תיאור")}<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
           <label>{copy(lang, "Amount (USD)", "סכום (USD)")}<input type="number" min="0" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} /></label>
           <label className="checkbox-field"><input type="checkbox" checked={isEstimate} onChange={(event) => setIsEstimate(event.target.checked)} /> {copy(lang, "This is an estimate", "זו הערכה")}</label>
@@ -2249,7 +2250,7 @@ export function PhotosView({ config, currentUser, lang }: { config?: TripConfig;
       </div>
       <form className="photo-upload-panel" onSubmit={submitUpload}>
         <label className="upload-control"><Upload size={18} /><span>{file?.name || copy(lang, "Choose photo", "בחירת תמונה")}</span><input type="file" accept="image/*" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
-        <label>{copy(lang, "Album", "אלבום")}<select value={uploadPhase} onChange={(event) => setUploadPhase(event.target.value)}><option value="general">{copy(lang, "General", "כללי")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</select></label>
+        <label>{copy(lang, "Album", "אלבום")}<MobileSelect value={uploadPhase} onChange={(event) => setUploadPhase(event.target.value)}><option value="general">{copy(lang, "General", "כללי")}</option>{config?.phases?.map((item) => <option key={item.id} value={item.id}>{text(item.title, lang)}</option>)}</MobileSelect></label>
         <label className="photo-caption-field">{copy(lang, "Caption", "כיתוב")}<input value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={copy(lang, "What was happening?", "מה קרה כאן?")} /></label>
         <button className="primary-action" type="submit" disabled={busy}>{busy ? copy(lang, "Uploading…", "מעלה…") : copy(lang, "Add to gallery", "הוספה לגלריה")}</button>
         {error ? <p className="form-error" role="alert">{error}</p> : null}

@@ -1031,3 +1031,14 @@ textarea { min-height: 132px; resize: vertical; }
 @media (max-width: 880px) and (forced-colors: active) {
   .modern-trip-app select { appearance: auto; background-image: none; }
 }
+
+.mobile-select-dialog { width: min(440px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--kit-line); border-radius: 18px; color: var(--kit-ink); background: var(--kit-surface); box-shadow: var(--kit-shadow); }
+.mobile-select-dialog::backdrop { background: rgba(16,38,58,.45); }
+.mobile-select-content { padding: 18px; }
+.mobile-select-content header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.mobile-select-content h2 { margin: 0; font-size: 22px; }
+.mobile-select-close { width: 44px; height: 44px; flex-shrink: 0; border: 0; border-radius: 50%; background: var(--kit-paper); color: var(--kit-ink); font-size: 28px; cursor: pointer; }
+.mobile-select-options { display: grid; gap: 8px; }
+.mobile-select-options button { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 56px; padding: 14px 16px; border: 1px solid var(--kit-line); border-radius: 10px; background: var(--kit-paper); color: var(--kit-ink); text-align: start; font-size: 20px; line-height: 1.4; cursor: pointer; }
+.mobile-select-options button[aria-pressed=true] { background: #dff3ef; border-color: var(--kit-teal); font-weight: 700; }
+.mobile-select-options button:disabled { opacity: .5; cursor: default; }
