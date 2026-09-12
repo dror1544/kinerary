@@ -1063,11 +1063,39 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // the same terms as a brand-new participant; redeemed the same way, through
 // POST /api/auth/enroll. Does not touch trip.config.json or re-seed the
 // user — the row already exists, only its password needs to change.
-app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, (req, res) => {
+app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(404).json({ error: 'user_not_found' });
   }
+
+  // `to: 'trip_password'` — back to the password the trip was seeded with.
+  //
+  // The one-time link below is the better mechanism and stays the default: the
+  // person picks a secret nobody else knows, and no credential is spoken in a
+  // chat. But it is three steps and a working link, and the case this exists
+  // for is a family member who changed their password, forgot it, and is
+  // standing in an airport. The trip password is already shared — the
+  // assistant's introduction hands it to the whole group — so restoring it
+  // discloses nothing that was not already disclosed, and the organizer can
+  // simply say "use the trip password again".
+  //
+  // Never echoed in the response: the organizer already has it, and a password
+  // in a JSON body is a password in an access log and in whatever chat relays
+  // it. Sessions already issued are not revoked, which is this app's standing
+  // posture (see PUT /api/auth/password) rather than something new here.
+  if (String(req.body?.to || '') === 'trip_password') {
+    if (!SEED_PASSWORD) {
+      return res.status(409).json({
+        error: 'no_trip_password',
+        detail: 'This trip was seeded with per-participant random passwords, so there is no shared one to restore. Reset without `to` and relay the one-time link.',
+      });
+    }
+    const hash = await bcrypt.hash(SEED_PASSWORD, 10);
+    db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, uname);
+    return res.json({ ok: true, username: uname, restored: 'trip_password' });
+  }
+
   const token = crypto.randomBytes(24).toString('hex');
   pendingEnrollments.set(token, { username: uname, at: Date.now() });
   res.json({ ok: true, username: uname, enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000 });

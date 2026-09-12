@@ -218,10 +218,16 @@ mcp.tool('add_participant',
 
 mcp.tool('reset_participant_password',
   'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
-  'Returns a one-time enrollment_token for the organizer to relay; never collect the new password directly in chat. ' +
-  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL fragment (#), not a query string (?).', {
-  username: z.string().describe('Existing participant username'),
-}, async ({ username }) => ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, {})));
+  'TWO WAYS. Default: returns a one-time enrollment_token for the organizer to relay as "<trip site URL>/#enroll=<enrollment_token>" — ' +
+  'a URL fragment (#), not a query string (?) — and the person chooses a secret nobody else knows. ' +
+  'Or to: "trip_password", which puts their login back to the shared trip password the introduction already gave the group: ' +
+  'fewer steps, for someone who forgot theirs and needs in now. ' +
+  'Never collect a new password in chat, and never read a password out — say "the trip password" and let them use the one they were given.', {
+  username: z.string().describe('Existing participant username — see get_config for who exists'),
+  to: z.enum(['trip_password']).optional()
+    .describe('Omit for the one-time link. "trip_password" restores the shared trip password instead — refused with no_trip_password on a trip seeded with per-person random passwords.'),
+}, async ({ username, to }) =>
+  ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, to ? { to } : {})));
 
 mcp.tool('bind_participant_telegram',
   'Bind a Telegram numeric ID to an EXISTING participant, enabling Telegram login for them — e.g. "bind @dror to dror". ' +

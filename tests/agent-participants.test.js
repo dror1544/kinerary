@@ -210,6 +210,42 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.equal(loginRes.status, 200);
   });
 
+  test('reset-password can put a forgotten password back to the trip password', async () => {
+    // The case this exists for: someone changed their password, forgot it, and
+    // is standing in an airport. The trip password is already shared — the
+    // assistant's introduction hands it to the whole group — so the organizer
+    // can simply restore it rather than relaying a link.
+    const changed = await api('/api/agent/participants/dana/reset-password', { method: 'POST', token: aliceToken });
+    const { enrollment_token } = await changed.json();
+    await api('/api/auth/enroll', { method: 'POST', body: { token: enrollment_token, password: 'something-dana-forgets' } });
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'dana', password: '1234' } })).status, 401,
+      'the trip password should not work while a personal one is set');
+
+    const restore = await api('/api/agent/participants/dana/reset-password', {
+      method: 'POST', token: aliceToken, body: { to: 'trip_password' },
+    });
+    assert.equal(restore.status, 200);
+    const body = await restore.json();
+    assert.equal(body.restored, 'trip_password');
+    assert.ok(!JSON.stringify(body).includes('1234'), 'the password itself is never echoed back');
+
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'dana', password: '1234' } })).status, 200,
+      'the trip password works again');
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'dana', password: 'something-dana-forgets' } })).status, 401,
+      'and the forgotten one no longer does');
+  });
+
+  test('restoring the trip password is organizer-or-agent only, like every other reset', async () => {
+    const anon = await api('/api/agent/participants/dana/reset-password', { method: 'POST', body: { to: 'trip_password' } });
+    assert.equal(anon.status, 401);
+    const nonOrganizer = await api('/api/agent/participants/dana/reset-password', {
+      method: 'POST', token: bobToken, body: { to: 'trip_password' },
+    });
+    assert.equal(nonOrganizer.status, 403, 'a family member cannot reset another member');
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'dana', password: '1234' } })).status, 200,
+      'and the refused calls changed nothing');
+  });
+
   test('reset-password works for a Telegram-bound participant too', async () => {
     // guy was added earlier in this file with telegram_id set and no
     // enrollment token at all — reset-password should still work for them,
