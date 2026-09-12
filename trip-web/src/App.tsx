@@ -691,16 +691,44 @@ function TripClockPanel({
   );
 }
 
+export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
+  item: ItineraryItem;
+  config?: TripConfig;
+  lang: Lang;
+  onOpenItinerary: (focus: JourneyFocus) => void;
+}) {
+  const title = itemTitle(item, lang);
+  const phase = config?.phases?.find((entry) => entry.id === item.phase_id);
+  const destination = text(phase?.title, lang);
+  const mapUrl = safeExternalUrl(item.location_url) || safeExternalUrl(item.booking?.location_url)
+    || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}`;
+  const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
+  return <article className="timeline-item compact upcoming-activity">
+    <div className="time-rail"><span>{itineraryTimeLabel(item.time, lang)}</span><i /></div>
+    <div className="item-body">
+      <div className="item-kicker"><MapPin size={16} /><span>{copy(lang, "Up next", "הפעילות הבאה")}</span></div>
+      <h3><button className="upcoming-plan-link" type="button" aria-label={copy(lang, `View ${title} in the plan`, `פתיחת ${title} בתוכנית`)} onClick={() => onOpenItinerary({ phaseId: item.phase_id, date: item.date || undefined, itemUid: item.item_uid })}>{title}</button></h3>
+      <small className="upcoming-plan-hint">{copy(lang, "View in plan", "פתיחה בתוכנית")}</small>
+      <div className="item-actions upcoming-actions">
+        <a className="item-action" href={mapUrl} target="_blank" rel="noreferrer"><MapPin size={15} />Google Maps</a>
+        {confirmationUrl && <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking!.conf_file!} label={<><ShieldCheck size={15} />{copy(lang, "View confirmation", "צפייה באישור")}</>} />}
+      </div>
+    </div>
+  </article>;
+}
+
 function TodayView({
   itinerary,
   config,
   lang,
   isOrganizer,
+  onOpenItinerary,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
   lang: Lang;
   isOrganizer?: boolean;
+  onOpenItinerary: (focus: JourneyFocus) => void;
 }) {
   const today = useQuery({ queryKey: ["today"], queryFn: getToday });
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
@@ -715,12 +743,10 @@ function TodayView({
       <div className="focus-panel">
         <span className="panel-label">{today.data ? phaseLabel(today.data.phase, lang) : copy(lang, "Today", "היום")}</span>
         <h2>{next ? itemTitle(next, lang) : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
-        <p>
-          {today.data?.phase === "pre_trip" && today.data.countdown_days != null
-            ? copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)
-            : copy(lang, "Now and next stay current without a page reload.", "האירוע הנוכחי והבא מתעדכנים בלי לרענן את העמוד.")}
-        </p>
-        {next ? <TimelineItem item={next} compact lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} /> : null}
+        {today.data?.phase === "pre_trip" && today.data.countdown_days != null ? (
+          <p>{copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)}</p>
+        ) : null}
+        {next ? <UpcomingActivity item={next} config={config} lang={lang} onOpenItinerary={onOpenItinerary} /> : null}
         <TripClockPanel config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
       </div>
 
@@ -2631,7 +2657,7 @@ export default function App() {
     window.location.hash = module;
     setMenuOpen(false);
   };
-  const openMapItinerary = (pin: MapPin) => {
+  const openMapItinerary = (pin: JourneyFocus) => {
     setJourneyFocus({ phaseId: pin.phaseId, date: pin.date, itemUid: pin.itemUid });
     setActiveTab("journey");
     setActiveModule(null);
@@ -2645,7 +2671,7 @@ export default function App() {
       ? todayPhaseId(config.data, itinerary.data, today.data)
       : "";
   const tabContent = {
-    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
+    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,

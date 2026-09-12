@@ -1053,3 +1053,12 @@ textarea { min-height: 132px; resize: vertical; }
 
 .weather-navigation .weather-today { width: auto; min-width: 44px; margin: 0 auto; padding: 0 8px; border-radius: 8px; color: var(--kit-teal); font: inherit; font-weight: 600; }
 .weather-navigation .weather-today:disabled { color: var(--kit-muted); opacity: .45; }
+
+.upcoming-activity { position: relative; }
+.upcoming-plan-link { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: start; cursor: pointer; }
+.upcoming-plan-link::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.upcoming-activity:has(.upcoming-plan-link:hover) { border-color: var(--kit-teal); }
+.upcoming-plan-link:focus-visible { outline: none; }
+.upcoming-plan-link:focus-visible::after { outline: 2px solid var(--kit-teal); outline-offset: -3px; }
+.upcoming-plan-hint { display: block; margin-top: 6px; color: var(--kit-muted); }
+.upcoming-actions { position: relative; z-index: 1; width: fit-content; }
