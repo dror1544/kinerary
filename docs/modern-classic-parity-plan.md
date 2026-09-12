@@ -267,3 +267,10 @@ Expanded rating and RSVP panels now show an explicit Collapse control; the
 original action also changes to Hide while open. Collapsing returns keyboard
 focus to that action and preserves unsaved panel input for reopening. Content
 is fetched only after first opening. All 98 SPA tests and the build pass.
+
+### Document access demo — 2026-09-12
+
+- Journey's attached booking confirmation now offers both view and download in the activity actions, matching Bookings.
+- The disposable preview generates a sample PDF outside git, attaches it to Breakfast through the booking/plan APIs, and checks the active Journey includes it. Regular member document GET returns 200; anonymous GET returns 401.
+- Verified the Hebrew action controls as Bob in Chrome and rendered the sample PDF with Quick Look. Browser automation did not confirm opening the popup or completing a download; those click outcomes remain a manual check.
+- Validation: SPA build and all 98 tests pass; fresh preview setup succeeds with the Journey attachment assertion.
