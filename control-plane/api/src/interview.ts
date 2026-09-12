@@ -3474,6 +3474,40 @@ export async function saveSourceDocument(
   return { ok: true, chars: doc.text.length };
 }
 
+/**
+ * The same, for the router.
+ *
+ * `saveSourceDocument` is keyed by the session token, which the agent holds and
+ * the router does not — it works from the chat a message arrived in. On the
+ * interpret path nobody was calling either, so a confirmed intake built from a
+ * four-page itinerary carried `source_document: null` and the document it came
+ * from was gone: the relay's media store is in-memory with a TTL. Keeping it is
+ * what makes a later re-extraction — or a human asking "where did this come
+ * from" — possible at all.
+ */
+export async function saveSourceDocumentForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+  filename?: string,
+): Promise<{ ok: true; chars: number } | { ok: false; reason: "NOT_FOUND" | "INVALID_REQUEST" }> {
+  const body = String(text ?? "");
+  if (!body.trim()) return { ok: false, reason: "INVALID_REQUEST" };
+  const doc = {
+    filename: String(filename ?? "").replace(/[<>]/g, "").slice(0, 200) || null,
+    text: body.slice(0, SOURCE_DOCUMENT_MAX_CHARS),
+    savedAt: new Date().toISOString(),
+  };
+  const res = await db.query(
+    `UPDATE control_plane.intake_sessions
+     SET source_document = $2::jsonb, updated_at = now()
+     WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+    [chatId, JSON.stringify(doc)],
+  );
+  if (res.rowCount === 0) return { ok: false, reason: "NOT_FOUND" };
+  return { ok: true, chars: doc.text.length };
+}
+
 // ── country_reference: cross-trip consular contacts ──────────────────────────
 
 export type ConsularContact = { name: { he: string; en: string }; phone: string };

@@ -61,6 +61,7 @@ import {
   expiredSessionLanguage,
   touchSessionDeadline,
   answersForChat,
+  saveSourceDocumentForChat,
   hasPendingInbound,
   deferQuestionForChat,
   deferredRequired,
@@ -86,6 +87,7 @@ import {
 } from "../interpret.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { documentText } from "../document-text.js";
+import { extractItinerary, foldExtractedIntoPhases } from "../itinerary-extract.js";
 import { provisionOnConfirm } from "../planner.js";
 
 /**
@@ -154,6 +156,14 @@ export interface TripBotPollerDeps {
    * just a slower one, and is deliberately not an error.
    */
   modelRunner?: StructuredModelRunner;
+  /**
+   * The day-by-day extractor, injectable for tests.
+   *
+   * Defaults to the real one, which runs on the shared model runner when
+   * `EXTRACT_RUNNER` is set — so the router can call it directly, with no
+   * Hermes profile and no MCP round trip.
+   */
+  extractItinerary?: typeof extractItinerary;
   /**
    * Signup-approval handling, for the topology where the trip bot and the
    * signup bot are THE SAME BOT.
@@ -940,6 +950,14 @@ async function runDocumentPath(
   // `phases` proposals and let the last one win on nothing better than order.
   const source = texts.join("\n\n");
 
+  // KEEP IT. The relay's media store is in-memory with a TTL, so once the
+  // extraction has run the document is gone — and a confirmed intake built from
+  // a four-page itinerary carried `source_document: null`, with no way to ask
+  // later where any of it came from, or to re-extract when the extractor gets
+  // better. The agent path has always staged it; the interpret path never did.
+  void saveSourceDocumentForChat(deps.db, burst.chatId, source, documents[0]?.filename)
+    .catch(() => { /* best-effort, exactly like the agent path's */ });
+
   if (!deps.modelRunner) {
     await say(uiString("documentNothing", language));
     await ask();
@@ -993,6 +1011,8 @@ async function runDocumentPath(
       }));
     }
   }
+
+  await foldItineraryFromDocument(deps, burst, source, log);
 
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
@@ -1705,6 +1725,100 @@ export async function renderDueRouterPrompts(
  * a script for the agent to read out — `SOUL.md` requires it to call
  * `get_interview_for_chat` and trust that over any text, this note included.
  */
+/**
+ * The day-by-day a document describes, on the phases it describes them for.
+ *
+ * The general extraction that runs over a shared document answers the
+ * interview's questions — destination, dates, who is coming, which stops. It
+ * does not produce an itinerary, and asking it to was how a five-day Tokyo leg
+ * came back with a single day in it: one prompt cannot both survey a document
+ * for twenty answers and transcribe a schedule out of it.
+ *
+ * `extract_itinerary` is the pass built for exactly that, and it has been
+ * unreachable from a chat interview since it was written: it is a token-scoped
+ * MCP tool, and the interpret path has no agent to call tools. It needs no
+ * Hermes profile any more either — with `EXTRACT_RUNNER` set it runs on the
+ * shared model runner, which the relay already has. So the router calls it
+ * itself, right after the document's answers land.
+ *
+ * Best-effort throughout, like every other document step: a failure leaves the
+ * interview exactly as the general extraction left it, and the organizer is
+ * told nothing, because nothing they asked for has failed.
+ */
+export async function foldItineraryFromDocument(
+  deps: TripBotPollerDeps,
+  burst: { chatId: string; sessionId: string },
+  documentText: string,
+  log: (line: string) => void,
+): Promise<void> {
+  const store = await answersForChat(deps.db, burst.chatId);
+  const phasesAnswer = store?.answers.phases;
+  if (!phasesAnswer || phasesAnswer.kind !== "structured" || !Array.isArray(phasesAnswer.data)) return;
+  const phases = phasesAnswer.data as Record<string, unknown>[];
+  if (phases.length === 0) return;
+  // Already has an itinerary: this is a second document, or a retry. Leave it.
+  if (phases.every((phase) => Array.isArray(phase.days) && phase.days.length > 0)) return;
+
+  const destinationAnswer = store?.answers.destination;
+  const destination = destinationAnswer?.kind === "text" ? destinationAnswer.text
+    : destinationAnswer?.kind === "choice_other" ? (destinationAnswer.other_text ?? "")
+    : "";
+  const travelers = (store?.answers.travelers?.kind === "structured" && Array.isArray(store.answers.travelers.data)
+    ? store.answers.travelers.data
+    : []
+  ).flatMap((t) => {
+    const name = (t as { name?: unknown })?.name;
+    return typeof name === "string" && name.trim() ? [name.trim()] : [];
+  });
+
+  const extract = deps.extractItinerary ?? extractItinerary;
+  let result: Awaited<ReturnType<typeof extractItinerary>>;
+  try {
+    result = await extract({
+      destination,
+      phases: phases.map((phase) => ({
+        name: String(phase.name ?? phase.name_en ?? ""),
+        ...(typeof phase.start === "string" ? { start: phase.start } : {}),
+        ...(typeof phase.end === "string" ? { end: phase.end } : {}),
+      })),
+      travelers,
+      documentText,
+    });
+  } catch {
+    log(structuredLog("warn", "interview.itinerary_extract_threw", { session_id: burst.sessionId }));
+    return;
+  }
+
+  if (!result.ok) {
+    log(structuredLog("info", "interview.itinerary_extract_failed", {
+      session_id: burst.sessionId,
+      reason: result.reason,
+      detail: (result.detail ?? "").slice(0, 200),
+    }));
+    return;
+  }
+
+  const folded = foldExtractedIntoPhases(phases, result.phases);
+  if (folded.daysAdded === 0 && folded.venuesAdded === 0) {
+    log(structuredLog("info", "interview.itinerary_extract_empty", {
+      session_id: burst.sessionId,
+      warnings: result.warnings.slice(0, 3),
+    }));
+    return;
+  }
+
+  const written = await submitAnswerForChat(
+    deps.db, burst.chatId, "phases", null, undefined, folded.phases,
+  );
+  log(structuredLog(written.ok ? "info" : "warn", "interview.itinerary_extracted", {
+    session_id: burst.sessionId,
+    days: folded.daysAdded,
+    venues: folded.venuesAdded,
+    written: written.ok,
+    ...(written.ok ? {} : { reason: written.reason }),
+  }));
+}
+
 async function handBackToInterviewer(
   view: SessionView,
   chatId: string,

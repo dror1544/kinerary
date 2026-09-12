@@ -477,6 +477,58 @@ async function resolveVenueLinks(phases: ExtractedPhase[], destination: string):
  * exactly the CLI path that has always run, so nothing about the current
  * acceptance path moves until the environment says so.
  */
+/**
+ * Fold an extraction's days and venues back into the `phases` answer.
+ *
+ * The interviewer has always done this by hand — read `extract_itinerary`'s
+ * result, merge it into what it captured, re-submit `phases`. The router on the
+ * interpret path has no interviewer to do it, which is why a document with a
+ * day-by-day produced phases with names and dates and nothing in them.
+ *
+ * Matched on `phaseIndex`, never on name: two "Tokyo" stops are the ordinary
+ * case for a trip that returns to its arrival city, and a name match would give
+ * the second one's days to the first.
+ *
+ * Existing days WIN. A re-run must never quietly replace an itinerary somebody
+ * has already corrected, and the same document extracted twice is the common
+ * way that would happen.
+ */
+export function foldExtractedIntoPhases(
+  phases: readonly unknown[],
+  extracted: readonly ExtractedPhase[],
+): { phases: unknown[]; daysAdded: number; venuesAdded: number } {
+  const out = phases.map((phase) => (phase && typeof phase === "object" ? { ...(phase as Record<string, unknown>) } : phase));
+  let daysAdded = 0;
+  let venuesAdded = 0;
+
+  for (const found of extracted) {
+    const target = out[found.phaseIndex];
+    if (!target || typeof target !== "object") continue;
+    const phase = target as Record<string, unknown>;
+
+    if (found.days.length && !(Array.isArray(phase.days) && phase.days.length)) {
+      phase.days = found.days;
+      daysAdded += found.days.length;
+    }
+    // Venues merge by name rather than replacing: `planned` places named in the
+    // conversation and venues named in the document are both real, and the
+    // document's carry a URL the conversation's do not.
+    if (found.venues.length) {
+      const existing = Array.isArray(phase.venues) ? [...phase.venues] : [];
+      const seen = new Set(existing.map((v) => JSON.stringify((v as { name?: unknown })?.name ?? "").toLowerCase()));
+      for (const venue of found.venues) {
+        const key = JSON.stringify(venue.name).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        existing.push(venue);
+        venuesAdded += 1;
+      }
+      phase.venues = existing;
+    }
+  }
+  return { phases: out, daysAdded, venuesAdded };
+}
+
 export async function extractItinerary(
   args: ExtractItineraryArgs,
   runner: StructuredModelRunner | undefined = modelRunnerFromEnv(),

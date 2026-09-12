@@ -15,14 +15,17 @@ import {
   startFromDeepLink,
 } from "../src/chat-router.js";
 import {
+  answersForChat,
   claimFloor,
   finalizeMultiChoiceForChat,
   getSessionForChat,
+  submitAnswerForChat,
   toggleMultiChoiceForChat,
 } from "../src/interview.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
+  foldItineraryFromDocument,
 } from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
@@ -265,6 +268,101 @@ describe("a tap is always answered", () => {
         fix.telegram.sent.length > before,
         "the organizer tapped and the router owes them the next step",
       );
+    });
+  });
+});
+
+describe("the itinerary a document describes", () => {
+  // `extract_itinerary` — the pass built to turn a plan document into a
+  // day-by-day — has been unreachable from a chat interview since it was
+  // written: it is a token-scoped MCP tool, and the interpret path has no agent
+  // to call tools. The general extraction that DOES run answers the interview's
+  // questions, and asking one prompt to do both is how a five-day Tokyo leg
+  // came back with one day in it (2026-09-12).
+  const dayOn = (date: string) => ({ date, items: [{ time: null, text: { he: "משהו", en: "Something" } }] });
+
+  async function phasesFor(fix: Fixture, chatId: string) {
+    const store = await answersForChat(fix.pool, chatId);
+    const answer = store?.answers.phases;
+    return answer?.kind === "structured" ? (answer.data as Record<string, unknown>[]) : [];
+  }
+
+  test("the router runs it itself, and the days land on the right phase", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100301";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [
+        { name: "Tokyo", start: "2026-09-19", end: "2026-09-21" },
+        { name: "Kyoto", start: "2026-09-22", end: "2026-09-23" },
+      ]);
+
+      await foldItineraryFromDocument(
+        {
+          db: fix.pool, telegram: fix.telegram, connector: fix.connector,
+          extractItinerary: async () => ({
+            ok: true,
+            warnings: [],
+            venueLinksDeferred: [],
+            phases: [
+              { name: "Tokyo", phaseIndex: 0, days: [dayOn("2026-09-19"), dayOn("2026-09-20")], venues: [] },
+              { name: "Kyoto", phaseIndex: 1, days: [dayOn("2026-09-22")], venues: [] },
+            ],
+          }),
+        },
+        { chatId, sessionId: "sess_test" },
+        "Day 1: Tokyo. Day 2: Tokyo. Day 4: Kyoto.",
+        () => {},
+      );
+
+      const phases = await phasesFor(fix, chatId);
+      assert.equal((phases[0]?.days as unknown[])?.length, 2);
+      assert.equal((phases[1]?.days as unknown[])?.length, 1);
+    });
+  });
+
+  test("a phase that already has an itinerary is left alone", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100302";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [
+        { name: "Tokyo", days: [dayOn("2026-09-19")] },
+      ]);
+      let called = false;
+
+      await foldItineraryFromDocument(
+        {
+          db: fix.pool, telegram: fix.telegram, connector: fix.connector,
+          extractItinerary: async () => { called = true; return { ok: true, warnings: [], venueLinksDeferred: [], phases: [] }; },
+        },
+        { chatId, sessionId: "sess_test" },
+        "a document",
+        () => {},
+      );
+
+      assert.equal(called, false, "nothing to do, so nothing is spent asking a model");
+      const phases = await phasesFor(fix, chatId);
+      assert.equal((phases[0]?.days as unknown[])?.length, 1);
+    });
+  });
+
+  test("an extraction that fails leaves the interview exactly as it was", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100303";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [{ name: "Tokyo" }]);
+
+      await foldItineraryFromDocument(
+        {
+          db: fix.pool, telegram: fix.telegram, connector: fix.connector,
+          extractItinerary: async () => { throw new Error("the model is down"); },
+        },
+        { chatId, sessionId: "sess_test" },
+        "a document",
+        () => {},
+      );
+
+      const phases = await phasesFor(fix, chatId);
+      assert.deepEqual(phases, [{ name: "Tokyo" }], "no days, no damage, no message to the organizer");
     });
   });
 });

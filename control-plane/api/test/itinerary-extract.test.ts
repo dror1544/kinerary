@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
 import {
+  foldExtractedIntoPhases,
   normaliseExtractedItinerary,
   buildExtractPrompt,
   buildVenueLinkPrompt,
@@ -22,6 +23,63 @@ const JAPAN_PHASES: PhaseRef[] = [
   { name: "Osaka", start: "2026-09-27", end: "2026-09-30" },
   { name: "Tokyo", start: "2026-09-30", end: "2026-10-03" },
 ];
+
+describe("foldExtractedIntoPhases", () => {
+  // The interviewer folded an extraction into `phases` by hand. The router on
+  // the interpret path has no interviewer, which is why a document with a
+  // day-by-day produced phases with names, dates and nothing in them.
+  const day = (date: string) => ({ date, items: [{ time: "10:00", text: { he: "משהו", en: "Something" } }] });
+
+  test("gives each phase its own days, by index rather than by name", () => {
+    // Two Tokyo stops is the ordinary shape of a trip that flies home from
+    // where it landed. Matching on name would give the second one's days to
+    // the first.
+    const phases = [{ name: "Tokyo" }, { name: "Kyoto" }, { name: "Tokyo" }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-19")], venues: [] },
+      { name: "Tokyo", phaseIndex: 2, days: [day("2026-10-01"), day("2026-10-02")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 3);
+    assert.deepEqual((folded[0] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-09-19"]);
+    assert.equal((folded[1] as { days?: unknown }).days, undefined, "Kyoto had no extraction and gains nothing");
+    assert.deepEqual((folded[2] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-10-01", "2026-10-02"]);
+  });
+
+  test("an itinerary already there wins — a re-run never overwrites it", () => {
+    const phases = [{ name: "Tokyo", days: [day("2026-09-19")] }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-20"), day("2026-09-21")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 0);
+    assert.deepEqual((folded[0] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-09-19"]);
+  });
+
+  test("venues merge rather than replace, and a name already there is not doubled", () => {
+    const phases = [{ name: "Tokyo", venues: [{ name: { he: "סקייטרי", en: "Tokyo Skytree" } }] }];
+    const { phases: folded, venuesAdded } = foldExtractedIntoPhases(phases, [
+      {
+        name: "Tokyo", phaseIndex: 0, days: [],
+        venues: [
+          { name: { he: "סקייטרי", en: "Tokyo Skytree" } },
+          { name: { he: "טימלאב", en: "TeamLab Planets" }, url: "https://teamlab.example" },
+        ],
+      },
+    ]);
+    assert.equal(venuesAdded, 1);
+    const venues = (folded[0] as { venues: { name: { en: string }; url?: string }[] }).venues;
+    assert.equal(venues.length, 2);
+    assert.equal(venues[1]?.url, "https://teamlab.example", "the document's URL survives the merge");
+  });
+
+  test("an extraction for a phase that is not there changes nothing", () => {
+    const phases = [{ name: "Tokyo" }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Osaka", phaseIndex: 7, days: [day("2026-09-30")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 0);
+    assert.deepEqual(folded, phases);
+  });
+});
 
 describe("normaliseExtractedItinerary", () => {
   test("keeps a well-formed day and mirrors the language it was given", () => {
