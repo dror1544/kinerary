@@ -161,7 +161,7 @@ describe("Modern trip SPA", () => {
     expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.getByText("Ben")).toBeInTheDocument();
     expect(screen.getByText("You")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /tasks and packing/i })).toHaveAttribute("href", expect.stringContaining("classic.html"));
+    expect(screen.getByRole("link", { name: /readiness/i })).toHaveAttribute("href", "#readiness");
   });
 
   it("fetches protected booking documents with the stored bearer token", async () => {

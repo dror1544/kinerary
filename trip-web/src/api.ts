@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parityFields, phaseParityFields } from "./parity-schema";
 
 export const runtimeUrl = (window as unknown as { runtimePath?: (path: string) => string }).runtimePath || ((path: string) => path);
 
@@ -36,7 +37,8 @@ export const tokenStore = {
  */
 export const UNAUTHORIZED_EVENT = "kinerary:unauthorized";
 
-async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+
   const headers = new Headers(init.headers);
   const token = tokenStore.get();
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -48,7 +50,10 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     // so the app can ask for a real sign-in rather than rendering around a
     // session that cannot answer. The login endpoint's own 401 — wrong
     // password — is left alone: there is no session to end.
-    if (response.status === 401 && token && !path.startsWith("/api/auth/login")) {
+    // A Google credential can fail while the trip session is still valid.
+    // Also ignore a late rejection from a session that has since been replaced.
+    if (response.status === 401 && token && tokenStore.get() === token
+      && path !== "/api/auth/login" && payload.error !== "invalid_id_token") {
       tokenStore.clear();
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     }
@@ -63,8 +68,10 @@ export const bilingualSchema = z.union([
 ]).optional();
 
 export const configSchema = z.object({
+  ...parityFields,
   meta: z.object({
     title: z.string().optional(),
+    admin: z.string().optional(),
     destination: z.string().optional(),
     homePhoto: z.string().optional(),
     mapPhoto: z.string().optional(),
@@ -74,6 +81,7 @@ export const configSchema = z.object({
     logoAlt: z.string().optional(),
   }).optional(),
   phases: z.array(z.object({
+    ...phaseParityFields,
     id: z.string(),
     title: bilingualSchema,
     start: z.string().optional(),
@@ -81,17 +89,6 @@ export const configSchema = z.object({
     hero: z.object({ photo: z.string().optional() }).optional(),
     mapStop: z.object({ lat: z.number().optional(), lng: z.number().optional(), name: bilingualSchema }).optional(),
     dates: z.object({ start: z.string().optional(), end: z.string().optional() }).optional(),
-    // The places a phase means to visit, with the map links the transformer
-    // derives for each. Parsed since 2026-09-12: they were dropped here, so a
-    // trip whose itinerary is places-without-days had nothing to render at all.
-    venues: z.array(z.object({
-      id: z.string().optional(),
-      name: bilingualSchema,
-      maps: z.string().optional(),
-      waze: z.string().optional(),
-      url: z.string().optional(),
-      tickets: z.string().optional(),
-    })).optional(),
     accommodation: z.object({
       name: bilingualSchema,
       name_en: z.string().optional(),
@@ -166,7 +163,7 @@ export type ItineraryDay = {
   date: string;
   label_he?: string | null;
   label_en?: string | null;
-  lodging_context?: { name?: string | null; address?: string | null; location_url?: string | null } | null;
+  lodging_context?: { name?: z.infer<typeof bilingualSchema> | null; address?: z.infer<typeof bilingualSchema> | null; location_url?: string | null } | null;
 };
 
 export type ActiveItinerary = {
@@ -176,6 +173,7 @@ export type ActiveItinerary = {
 };
 
 export type ItineraryItemInput = {
+  expected_revision?: string;
   phase_id: string;
   date: string;
   text_he: string;
@@ -320,9 +318,9 @@ export const getItinerary = () => api<unknown>("/api/itinerary/active").then((va
   days: z.array(z.any()),
   items: z.array(itemSchema),
 }).parse(value) as ActiveItinerary);
-export const createItineraryItem = (input: ItineraryItemInput) => api<ItineraryMutation>("/api/itinerary/items", { method: "POST", body: JSON.stringify(input) });
-export const updateItineraryItem = (itemUid: string, input: ItineraryItemInput) => api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify(input) });
-export const deleteItineraryItem = (itemUid: string) => api<{ ok: true; revision: string }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "DELETE" });
+export const createItineraryItem = (input: ItineraryItemInput) => api<ItineraryMutation>("/api/itinerary/items", { method: "POST", body: JSON.stringify(input), headers: input.expected_revision ? {"If-Match":input.expected_revision} : {} });
+export const updateItineraryItem = (itemUid: string, input: ItineraryItemInput) => api<ItineraryMutation>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "PATCH", body: JSON.stringify(input), headers: input.expected_revision ? {"If-Match":input.expected_revision} : {} });
+export const deleteItineraryItem = (itemUid: string, revision?: string) => api<{ ok: true; revision: string }>(`/api/itinerary/items/${encodeURIComponent(itemUid)}`, { method: "DELETE", headers: revision ? {"If-Match": revision} : {} });
 export const getBookings = () => api<unknown>("/api/bookings").then((value) => z.array(bookingSchema).parse(value));
 export async function getAuthenticatedDocument(path: string) {
   const headers = new Headers();

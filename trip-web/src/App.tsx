@@ -1,3 +1,11 @@
+import { datesInPhase } from "./phase-calendar";
+export { datesInPhase } from "./phase-calendar";
+import { ImmichAlbum } from "./immich";
+import { Readiness, CurrencyConverter } from "./readiness";
+import { GroupActivities, LostFound } from "./group-utilities";
+import { Account, GoogleSignIn, Enrollment } from "./account";
+import { PlanTools } from "./plan-tools";
+import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -95,7 +103,7 @@ import {
 } from "./api";
 
 type Tab = "today" | "journey" | "moments" | "more";
-type Module = "bookings" | "map" | "budget" | "photos";
+type Module = "bookings" | "map" | "budget" | "photos" | "readiness" | "account" | "activities" | "lostfound" | "trivia" | "plan-tools";
 type Lang = "he" | "en";
 type BookingFilter = "phase" | "today" | "current" | "flight" | "hotel" | "attraction";
 type ItineraryTimeMode = "exact" | "rough" | "none";
@@ -179,6 +187,12 @@ const moduleShortcuts: Array<{ id: Module; en: string; he: string }> = [
   { id: "map", en: "Map", he: "מפה" },
   { id: "budget", en: "Budget", he: "תקציב" },
   { id: "photos", en: "Photos", he: "תמונות" },
+  { id: "readiness", en: "Readiness", he: "הכנות ומידע" },
+  { id: "account", en: "Account", he: "חשבון" },
+  { id: "activities", en: "Group activities", he: "פעילויות קבוצתיות" },
+  { id: "lostfound", en: "Lost & Found", he: "אבידות ומציאות" },
+  { id: "trivia", en: "Trivia", he: "טריוויה" },
+  { id: "plan-tools", en: "Plan tools", he: "כלי מסלול" },
 ];
 
 function moduleLabel(module: Module, lang: Lang) {
@@ -309,6 +323,7 @@ function todayPhaseId(config?: TripConfig, itinerary?: ActiveItinerary, today?: 
 }
 
 function LoginScreen() {
+  const lang = preferredLang();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -339,10 +354,10 @@ function LoginScreen() {
     <main className="login-shell">
       <section className="login-panel" aria-label="Sign in">
         <img className="login-logo" src={brandLogo} alt="Kinerary" />
-        <h1>Open your trip</h1>
-        <p>Sign in to see today, the living itinerary, moments, and your trip companion.</p>
+        <h1>{copy(lang,"Open your trip","כניסה לטיול")}</h1>
+        <p>{copy(lang,"Sign in to see your trip.","היכנסו לצפייה בטיול שלכם.")}</p>
         {roster.length > 0 ? (
-          <div className="login-roster" aria-label="Who are you?">
+          <div className="login-roster" aria-label={copy(lang,"Who are you?","מי אתם?")}>
             {roster.map((person) => (
               <button
                 key={person.username}
@@ -351,23 +366,26 @@ function LoginScreen() {
                 aria-pressed={person.username === username}
                 onClick={() => setUsername(person.username)}
               >
-                {person.name || person.name_en || person.username}
+                {personName(person, lang)}
               </button>
             ))}
           </div>
         ) : null}
+
         <form onSubmit={submit}>
           <label>
-            Username
+            {copy(lang,"Username","שם משתמש")}
             <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
           </label>
           <label>
-            Password
+            {copy(lang,"Password","סיסמה")}
             <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" />
           </label>
           {error ? <p className="form-error">{error}</p> : null}
-          <button className="primary-action" type="submit">Sign in</button>
+          <button className="primary-action" type="submit">{copy(lang,"Sign in","כניסה")}</button>
         </form>
+        <GoogleSignIn lang={lang} onSuccess={()=>window.location.reload()}/>
+        <a href="#lostfound">{copy(lang,"Found something belonging to this group?","מצאתם חפץ של הקבוצה?")}</a>
       </section>
     </main>
   );
@@ -436,7 +454,7 @@ export function Hero({
           ))}
         </div>
         <div className="desktop-shortcuts" aria-label="Modern modules">
-          {moduleShortcuts.map((shortcut) => (
+          {moduleShortcuts.slice(0,4).map((shortcut) => (
             <a
               key={shortcut.id}
               href={`#${shortcut.id}`}
@@ -464,7 +482,7 @@ export function Hero({
             <span>{personName(currentUser, lang)}</span>
           </button>
         ) : null}
-        <button className="menu-button" type="button" onClick={openMenu} aria-label="Open menu">
+        <button className="menu-button" type="button" onClick={openMenu} aria-label={copy(lang,"Open menu","פתיחת תפריט")}>
           <Menu size={20} />
         </button>
       </nav>
@@ -596,11 +614,11 @@ function CompanionPanel({
         <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder={context} />
       </label>
       <div className="bot-actions">
-        {askHref ? <a className="primary-action" href={askHref} target="_blank" rel="noreferrer"><Send size={17} /> Ask in Telegram</a> : null}
+        {askHref ? <a className="primary-action" href={askHref} target="_blank" rel="noreferrer"><Send size={17} /> {copy(lang,"Ask in Telegram","שאלה בטלגרם")}</a> : null}
         <button className="secondary-action" type="button" disabled={!message.trim() || reportMutation.isPending} onClick={() => reportMutation.mutate()}>
           <AlertTriangle size={17} /> Flag plan issue
         </button>
-        {isOrganizer && privateHref ? <a className="secondary-action" href={privateHref} target="_blank" rel="noreferrer"><MessageCircle size={17} /> Private organizer chat</a> : null}
+        {isOrganizer && privateHref ? <a className="secondary-action" href={privateHref} target="_blank" rel="noreferrer"><MessageCircle size={17} /> {copy(lang,"Private organizer chat","שיחה פרטית למארגן")}</a> : null}
       </div>
       {saved ? <small className="saved-note">{saved}</small> : null}
     </section>
@@ -697,7 +715,7 @@ function TodayView({
       <aside className="ops-strip">
         <section className="mini-panel">
           <CloudSun size={20} />
-          <h3>Weather</h3>
+          <h3>{copy(lang,"Weather","מזג אוויר")}</h3>
           <p>
             {weather.data?.temperature_max != null
               ? `${Math.round(weather.data.temperature_min || 0)}-${Math.round(weather.data.temperature_max)} C`
@@ -707,15 +725,15 @@ function TodayView({
         </section>
         <section className="mini-panel">
           <Plane size={20} />
-          <h3>Flights</h3>
+          <h3>{copy(lang,"Flights","טיסות")}</h3>
           <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
-          {flights.data?.statuses[0]?.stale ? <small>Using last known status</small> : null}
+          {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
         </section>
         <section className="mini-panel">
           <Bot size={20} />
           <h3>{companionName}</h3>
           <p>{hermes.data?.available ? "Available for trip checks." : "Profile visible; live checks not configured."}</p>
-          {hermes.data?.telegram_username ? <a href={telegramUrl(hermes.data.telegram_username)}>Open conversation</a> : null}
+          {hermes.data?.telegram_username ? <a href={telegramUrl(hermes.data.telegram_username)}>{copy(lang,"Open conversation","פתיחת שיחה")}</a> : null}
         </section>
       </aside>
 
@@ -730,59 +748,25 @@ function TodayView({
 
       <section className="section-band">
         <div className="section-heading">
-          <h2>Readiness</h2>
-          <p>Flights, lodging, cars, and tickets stay separate from the daily plan.</p>
+          <h2>{copy(lang,"Readiness","הכנות")}</h2>
+          <p>{copy(lang,"Flights, lodging, cars, and tickets stay separate from the daily plan.","טיסות, לינה, רכבים וכרטיסים מוצגים בנפרד מהמסלול היומי.")}</p>
         </div>
         <div className="readiness-list">
+          <a href="#readiness">{copy(lang,"Tasks, packing and useful information","משימות, אריזה ומידע שימושי")}</a>
           {missing.length ? missing.map((item) => (
             <article key={item.id} className="readiness-row">
               <AlertTriangle size={18} />
               <span>{item.name}</span>
               <small>{item.next_action}</small>
             </article>
-          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>Core confirmations look complete.</span><small>Budget remains in its own module.</small></article>}
+          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>{copy(lang,"Core confirmations look complete.","האישורים העיקריים נראים מלאים.")}</span><small>{copy(lang,"Budget remains in its own module.","התקציב מוצג במסך נפרד.")}</small></article>}
         </div>
       </section>
     </section>
   );
 }
 
-/**
- * The phases the itinerary shows, and what each one has to show.
- *
- * Pure and exported, because the defect it carried was one word: phases with
- * no days were filtered out, so an interview-built trip — five phases with
- * their dates, their hotels and their places, and no day-by-day because
- * nothing yet writes one — rendered as an empty itinerary. Reported
- * 2026-09-12: "no phases, no locations, no data". A phase is a phase whether
- * or not its days exist.
- */
-/**
- * Every date a phase covers, from its own date range.
- *
- * The interview establishes the SHAPE of a trip — three days in Tokyo, one in
- * Hakone, two in Kyoto — well before anyone writes what happens in them. Those
- * days exist; they are just empty. Showing them is what turns the journey page
- * from "nothing here" into a plan waiting to be filled, and gives an organizer
- * somewhere to put the first activity. Asked for 2026-09-12.
- *
- * Derived on the page, never written down: the day is real, but "empty day" is
- * not a fact worth recording in an immutable intake or a trip config.
- */
-export function datesInPhase(dates?: { start?: string; end?: string }): string[] {
-  const start = dates?.start;
-  const end = dates?.end || start;
-  if (!start || !/^\d{4}-\d{2}-\d{2}$/.test(start) || !end || !/^\d{4}-\d{2}-\d{2}$/.test(end)) return [];
-  const out: string[] = [];
-  // UTC throughout: these are calendar dates, and a local-midnight Date shifts
-  // them by a day for anyone east or west of the machine that renders it.
-  for (let day = new Date(`${start}T00:00:00Z`); day <= new Date(`${end}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) {
-    out.push(day.toISOString().slice(0, 10));
-    if (out.length > 400) break;  // a trip, not a century
-  }
-  return out;
-}
-
+// Keep configured phases even before they have persisted itinerary days.
 export function buildPhaseGroups(
   configPhases: TripConfig["phases"],
   days: ItineraryDay[],
@@ -804,7 +788,7 @@ export function buildPhaseGroups(
       days: days.filter((day) => day.phase_id === phase.id),
       venues: phase.venues || [],
       dates: phase.dates,
-      calendar: datesInPhase(phase.dates),
+      calendar: datesInPhase(phase.dates || { start: phase.start, end: phase.end }),
     }));
     const configuredIds = new Set(configured.map((phase) => phase.id));
     const orphanGroups = Array.from(new Set(days.map((day) => day.phase_id).filter((id) => !configuredIds.has(id)))).map((id) => ({
@@ -817,6 +801,7 @@ export function buildPhaseGroups(
     }));
     return [...configured, ...orphanGroups];
 }
+
 
 export function JourneyView({
   itinerary,
@@ -927,7 +912,7 @@ export function JourneyView({
     },
   });
   const removeMutation = useMutation({
-    mutationFn: deleteItineraryItem,
+    mutationFn: (uid: string) => deleteItineraryItem(uid, itinerary?.revision),
     onSuccess: () => {
       setEditing(null);
       void queryClient.invalidateQueries({ queryKey: ["itinerary"] });
@@ -941,6 +926,8 @@ export function JourneyView({
       // The phase and day on screen, because that is the one being planned.
       // `dates.start` before `start`: the transformer writes the former, and
       // reading only the latter quietly landed every new item on today.
+      expected_revision: itinerary?.revision,
+
       phase_id: activePhase?.id || fallbackPhase?.id || "",
       date: activeDate || fallbackPhase?.dates?.start || fallbackPhase?.start || new Date().toISOString().slice(0, 10),
       text_he: "",
@@ -969,6 +956,7 @@ export function JourneyView({
 
   const beginEdit = (item: ItineraryItem) => {
     setDraft({
+      expected_revision: itinerary?.revision,
       phase_id: item.phase_id,
       date: item.date || activeDate,
       text_he: item.text_he,
@@ -1016,8 +1004,12 @@ export function JourneyView({
       <section ref={daySpineRef} className="day-spine">
         <div className="day-heading">
           <span className="panel-label">{activePhase?.title || "Journey"}</span>
-          <h2>{day?.label_en || day?.label_he || "Daily itinerary"}</h2>
-          {day?.lodging_context?.name ? <p>Tonight: {day.lodging_context.name}</p> : null}
+          <div className="journey-tools">
+          <a href="#activities">{copy(lang,"Activity RSVPs and venue feedback","השתתפות בפעילויות ודירוג מקומות")}</a>
+          {isOrganizer&&<a href="#plan-tools">{copy(lang,"Day titles, swaps and original plan","כותרות ימים, החלפות והמסלול המקורי")}</a>}
+          </div>
+          <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
+          {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
           {isOrganizer ? <button className="secondary-action journey-edit-trigger" type="button" onClick={beginNew}><Plus size={17} /> {copy(lang, "Add itinerary item", "הוספת פריט למסלול")}</button> : null}
           <div className="day-selector" aria-label="Days in selected phase">
             {phaseDates.map((date) => {
@@ -1092,7 +1084,7 @@ export function JourneyView({
               <p className="editor-note">{copy(lang, "Write the activity once, in Hebrew or English. After you save, Kinerary adds the other language and looks up the location, Waze, website, and tickets when available.", "כותבים את הפעילות פעם אחת, בעברית או באנגלית. לאחר השמירה קינררי מוסיף את השפה השנייה ומחפש מיקום, Waze, אתר וכרטיסים כשיש כאלה.")}</p>
               <label className="editor-field-wide">{copy(lang, "Google Maps or location link", "קישור Google Maps או מיקום")}<input type="url" value={draft.location_url || ""} onChange={(event) => setDraft({ ...draft, location_url: event.target.value })} placeholder="https://..." /></label>
             </div>
-            {saveMutation.isError ? <p className="form-error">{saveMutation.error instanceof Error ? saveMutation.error.message : copy(lang, "Could not save the itinerary item.", "לא ניתן לשמור את פריט המסלול.")}</p> : null}
+            {saveMutation.isError ? <p className="form-error">{saveMutation.error instanceof Error && saveMutation.error.message === "itinerary_changed_reload_before_retry" ? copy(lang,"The itinerary changed. Your draft is retained; cancel and reopen to review the latest version.","המסלול השתנה. הטיוטה נשמרה; בטלו ופתחו מחדש כדי לבדוק את הגרסה העדכנית.") : copy(lang,"Could not save the itinerary item. Your draft is retained.","לא ניתן לשמור את פריט המסלול. הטיוטה נשמרה.")}</p> : null}
             <div className="editor-actions">
               <button className="primary-action" type="submit" disabled={saveMutation.isPending || !draft.phase_id || !draft.date || !draft.text_he.trim()}>{saveMutation.isPending ? copy(lang, "Saving…", "שומר…") : copy(lang, "Save revision", "שמירת גרסה")}</button>
               <button className="secondary-action" type="button" onClick={() => setEditing(null)}>{copy(lang, "Cancel", "ביטול")}</button>
@@ -1100,6 +1092,7 @@ export function JourneyView({
           </form>
         ) : null}
         {isOrganizer && enrichmentNote ? <p className="enrichment-note"><Sparkles size={16} /> {enrichmentNote}</p> : null}
+        {removeMutation.isError ? <p className="form-error">{copy(lang,"Could not remove the item. Refresh the plan before retrying.","לא ניתן להסיר את הפריט. רעננו את המסלול לפני ניסיון נוסף.")}</p> : null}
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
@@ -1112,6 +1105,7 @@ export function JourneyView({
           )) : activePhase && !activePhase.days.length ? (
             <PhasePlaces venues={activePhase.venues} lang={lang} />
           ) : <p className="empty-state">{copy(lang, "No structured items for this phase day yet.", "אין עדיין פריטים מתוזמנים ליום הזה.")}</p>}
+
         </div>
       </section>
     </section>
@@ -1145,10 +1139,10 @@ export function PhasePlaces({ venues, lang }: {
           <li key={venue.id || index}>
             <strong>{text(venue.name, lang) || venue.id}</strong>
             <span className="phase-place-links">
-              {venue.maps ? <a href={venue.maps} target="_blank" rel="noreferrer">{copy(lang, "Maps", "מפות")}</a> : null}
-              {venue.waze ? <a href={venue.waze} target="_blank" rel="noreferrer">Waze</a> : null}
-              {venue.tickets || venue.url
-                ? <a href={venue.tickets || venue.url} target="_blank" rel="noreferrer">{copy(lang, "Tickets", "כרטיסים")}</a>
+              {safeExternalUrl(venue.maps) ? <a href={safeExternalUrl(venue.maps)!} target="_blank" rel="noreferrer">{copy(lang, "Maps", "מפות")}</a> : null}
+              {safeExternalUrl(venue.waze) ? <a href={safeExternalUrl(venue.waze)!} target="_blank" rel="noreferrer">Waze</a> : null}
+              {safeExternalUrl(venue.tickets || venue.url)
+                ? <a href={safeExternalUrl(venue.tickets || venue.url)!} target="_blank" rel="noreferrer">{copy(lang, "Tickets", "כרטיסים")}</a>
                 : null}
             </span>
           </li>
@@ -1158,7 +1152,8 @@ export function PhasePlaces({ venues, lang }: {
   );
 }
 
-function MomentsView({ todayDate }: { todayDate?: string }) {
+function MomentsView({ todayDate, lang }: { todayDate?: string; lang: Lang }) {
+
   const queryClient = useQueryClient();
   const moments = useQuery({ queryKey: ["moments"], queryFn: getMoments });
   const [caption, setCaption] = useState("");
@@ -1173,11 +1168,11 @@ function MomentsView({ todayDate }: { todayDate?: string }) {
   return (
     <section className="moments-layout">
       <form className="moment-composer" onSubmit={(event) => { event.preventDefault(); mutation.mutate(); }}>
-        <span className="panel-label"><GalleryHorizontalEnd size={16} /> Moments</span>
-        <h2>Capture the day while it is still fresh.</h2>
+        <span className="panel-label"><GalleryHorizontalEnd size={16} /> {copy(lang,"Moments","רגעים")}</span>
+        <h2>{copy(lang,"Capture the day while it is still fresh.","שמרו את הרגעים כשהיום עוד טרי בזיכרון.")}</h2>
         <label>
-          Caption
-          <textarea value={caption} onChange={(event) => setCaption(event.target.value)} placeholder="A small memory, a funny line, a place worth remembering..." />
+          {copy(lang,"Caption","כיתוב")}
+          <textarea value={caption} onChange={(event) => setCaption(event.target.value)} placeholder={copy(lang,"A small memory, a funny line, a place worth remembering…","זיכרון קטן, משפט מצחיק, מקום שכדאי לזכור…")} />
         </label>
         <button className="primary-action" type="submit" disabled={!caption.trim() || mutation.isPending}>
           <Plus size={18} /> Save draft
@@ -1186,12 +1181,12 @@ function MomentsView({ todayDate }: { todayDate?: string }) {
       <div className="moment-feed">
         {(moments.data || []).map((moment) => (
           <article key={moment.id} className="moment-card">
-            <small>{moment.visibility === "draft" ? "Private draft" : "Published"} {moment.date ? `- ${moment.date}` : ""}</small>
+            <small>{moment.visibility === "draft" ? copy(lang,"Private draft","טיוטה פרטית") : copy(lang,"Published","פורסם")} {moment.date ? `- ${moment.date}` : ""}</small>
             <h3>{moment.caption}</h3>
             {moment.body ? <p>{moment.body}</p> : null}
           </article>
         ))}
-        {!moments.data?.length ? <p className="empty-state">No moments yet.</p> : null}
+        {!moments.data?.length ? <p className="empty-state">{copy(lang,"No moments yet.","אין רגעים עדיין.")}</p> : null}
       </div>
     </section>
   );
@@ -1246,7 +1241,7 @@ function AuthenticatedDocumentAction({ url, filename, download, label }: { url: 
   return <span className="document-action"><button type="button" onClick={open}>{label}</button>{error ? <small className="form-error">{error}</small> : null}</span>;
 }
 
-function BookingActions({ booking }: { booking: Booking }) {
+function BookingActions({ booking, lang }: { booking: Booking; lang: Lang }) {
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", booking.conf_file);
   const appleWalletUrl = safeFileUrl("/api/bookings/wallet-apple", booking.pkpass_file);
   const locationUrl = safeExternalUrl(booking.location_url);
@@ -1254,8 +1249,8 @@ function BookingActions({ booking }: { booking: Booking }) {
   const walletUrl = safeExternalUrl(booking.apple_wallet_url) || appleWalletUrl;
   return (
     <div className="action-strip">
-      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> Confirmation</>} /> : null}
-      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} download label={<><Download size={15} /> Download</>} /> : null}
+      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang,"Confirmation","אישור")}</>} /> : null}
+      {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={booking.conf_file || "confirmation.pdf"} download label={<><Download size={15} /> {copy(lang,"Download","הורדה")}</>} /> : null}
       {locationUrl ? <a href={locationUrl} target="_blank" rel="noreferrer"><MapPin size={15} /> Google Maps</a> : null}
       {googleWalletUrl ? <a href={googleWalletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Google Wallet</a> : null}
       {walletUrl ? (booking.pkpass_file ? <AuthenticatedDocumentAction url={appleWalletUrl} filename={booking.pkpass_file} download label={<><TicketCheck size={15} /> Apple Wallet</>} /> : <a href={walletUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> Apple Wallet</a>) : null}
@@ -1544,7 +1539,7 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
                   <h4>{booking.name}</h4>
                   <p>{bookingDateLine(booking, lang)}</p>
                   {booking.passengers ? <small>{booking.passengers}</small> : null}
-                  <BookingActions booking={booking} />
+                  <BookingActions booking={booking} lang={lang} />
                   {isOrganizer && booking.review_status === "draft" ? <button className="secondary-action" type="button" disabled={approveMutation.isPending} onClick={() => approveMutation.mutate(booking.id)}>{approveMutation.isPending ? "Approving..." : "Approve for members"}</button> : null}
                   {isOrganizer ? <button className="secondary-action" type="button" onClick={() => setEditingBookingId((current) => current === booking.id ? null : booking.id)}><Pencil size={15} /> {lang === "he" ? "עריכה" : "Edit"}</button> : null}
                   {isOrganizer && editingBookingId === booking.id ? <BookingEditPanel booking={booking} config={config} lang={lang} onClose={() => setEditingBookingId(null)} /> : null}
@@ -2280,6 +2275,7 @@ export function PhotosView({ config, currentUser, lang }: { config?: TripConfig;
 
 export function MoreView({ config, currentUser, isOrganizer, lang, openModule }: { config?: TripConfig; currentUser?: CurrentUser; isOrganizer?: boolean; lang: Lang; openModule: (module: Module) => void }) {
   const [busy, setBusy] = useState(false);
+  const [heroError,setHeroError] = useState(false);
   const queryClient = useQueryClient();
 
   async function uploadHero(event: React.ChangeEvent<HTMLInputElement>) {
@@ -2290,36 +2286,32 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
     body.set("focal_x", "0.5");
     body.set("focal_y", "0.42");
     setBusy(true);
+    setHeroError(false);
     try {
       const token = tokenStore.get();
-      await fetch(runtimeUrl("/api/ui-settings/hero"), {
+      const response = await fetch(runtimeUrl("/api/ui-settings/hero"), {
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         body,
       });
+      if (!response.ok) throw new Error("upload failed");
       queryClient.invalidateQueries({ queryKey: ["ui"] });
+    } catch {
+      setHeroError(true);
     } finally {
       setBusy(false);
     }
   }
 
-  const workflows: Array<{ label: string; module?: Module; classic?: boolean }> = [
-    { label: "Account, avatar and sign-in", classic: true },
-    { label: "Bookings, PDFs and wallet", module: "bookings" },
-    { label: "Maps and country info", module: "map" },
-    { label: "Budget", module: "budget" },
-    { label: "Photos and reactions", module: "photos" },
-    { label: "Tasks and packing", classic: true },
-    { label: "RSVP, ratings and comments", classic: true },
-    { label: "Lost and found", classic: true },
-    { label: "Trivia and leaderboard", classic: true },
-  ];
+  const workflows: Array<{ label: string; module: Module }> = moduleShortcuts
+    .filter(m => m.id !== "plan-tools" || isOrganizer)
+    .map(m=>({label:m[lang],module:m.id}));
   return (
     <section className="more-layout">
       <div className="section-heading">
-        <span className="panel-label"><Settings size={16} /> More</span>
-        <h2>Modern for the trip. Classic for established group utilities.</h2>
-        <p>{config?.meta?.title || "This trip"} keeps budget and costs outside the daily itinerary. Legacy-only tools stay available to every traveler.</p>
+        <span className="panel-label"><Settings size={16} /> {copy(lang,"More","עוד")}</span>
+        <h2>{copy(lang,"Everything for your trip","כל מה שצריך לטיול")}</h2>
+        <p>{copy(lang,"Manage your preparations, account and group activities.","נהלו את ההכנות, החשבון והפעילויות הקבוצתיות.")}</p>
       </div>
       <section className="participants-panel" aria-labelledby="participants-heading">
         <div className="participants-heading">
@@ -2347,10 +2339,11 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
       </section>
       {isOrganizer ? (
         <section className="organizer-tools">
-          <h3>Presentation</h3>
+          <h3>{copy(lang,"Appearance","מראה")}</h3>
+          {heroError && <p role="alert">{copy(lang,"Could not upload the picture. Please try again.","לא ניתן להעלות את התמונה. נסו שוב.")}</p>}
           <label className="upload-control">
             <Upload size={18} />
-            <span>{busy ? "Uploading..." : "Change hero picture"}</span>
+            <span>{busy ? copy(lang,"Uploading…","מעלה…") : copy(lang,"Change hero picture","שינוי תמונת הטיול")}</span>
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
           <MemberLogins config={config} lang={lang} />
@@ -2360,7 +2353,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
         {isOrganizer ? (
           <a className="workflow-link organizer-only" href={classicHref()}>
             <ChevronLeft size={16} />
-            <span>Open Classic organizer fallback</span>
+            <span>{copy(lang,"Open Classic organizer fallback","פתיחת הגרסה הקלאסית למארגן")}</span>
           </a>
         ) : null}
         {workflows.map((workflow) => (
@@ -2375,7 +2368,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             }}
           >
             <ChevronLeft size={16} />
-            <span>{workflow.label}{workflow.classic ? <small className="workflow-legacy">Classic</small> : null}</span>
+            <span>{workflow.label}</span>
           </a>
         ))}
       </div>
@@ -2489,7 +2482,7 @@ function AppMenu({
       <aside className="app-menu" role="dialog" aria-modal="true" aria-label="Trip menu" onClick={(event) => event.stopPropagation()}>
         <div className="menu-head">
           <img src={brandLogo} alt="Kinerary" />
-          <button type="button" onClick={() => setOpen(false)} aria-label="Close menu"><X size={20} /></button>
+          <button type="button" onClick={() => setOpen(false)} aria-label={copy(lang,"Close menu","סגירת תפריט")}><X size={20} /></button>
         </div>
         {currentUser ? (
           <section className="signed-in-user" aria-label={copy(lang, "Signed-in user", "המשתמש המחובר")}>
@@ -2514,7 +2507,7 @@ function AppMenu({
         </div>
         <div className="menu-section">
           <small>{lang === "he" ? "כלי הטיול" : "Trip tools"}</small>
-          {moduleShortcuts.map((shortcut) => (
+          {moduleShortcuts.filter(m=>m.id!=="plan-tools"||isOrganizer).map((shortcut) => (
             <button key={shortcut.id} type="button" onClick={() => openModule(shortcut.id)}>{shortcut[lang]}</button>
           ))}
         </div>
@@ -2530,7 +2523,7 @@ function AppMenu({
           >
             {lang === "he" ? "Switch to English" : "עברית"}
           </button>
-          {isOrganizer ? <a href={classicHref()}>Open Classic organizer fallback</a> : null}
+          {isOrganizer ? <a href={classicHref()}>{copy(lang,"Open Classic organizer fallback","פתיחת הגרסה הקלאסית למארגן")}</a> : null}
           <button
             type="button"
             className="danger-menu"
@@ -2561,6 +2554,7 @@ export default function App() {
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
   const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [enrollment, setEnrollment] = useState(() => initialHash.startsWith("enroll=") ? initialHash.slice(7) : "");
   // State, not a read: the session can end while the app is open — a token the
   // server refuses is cleared by `api()`, which says so. Rendering the shell
   // around a dead session is what made the site look empty rather than closed.
@@ -2589,7 +2583,9 @@ export default function App() {
 
   useEffect(() => {
     const syncHash = () => {
+      window.scrollTo({top:0});
       const next = window.location.hash.replace("#", "");
+      setEnrollment(next.startsWith("enroll=") ? next.slice(7) : "");
       if (isTab(next)) {
         setActiveTab(next);
         setActiveModule(null);
@@ -2600,7 +2596,8 @@ export default function App() {
     return () => window.removeEventListener("hashchange", syncHash);
   }, []);
 
-  if (!authed) return <LoginScreen />;
+  if (enrollment) return <Enrollment token={enrollment} lang={lang}/>;
+  if (!authed) return activeModule === "lostfound" ? <main className="app-content"><LostFound lang={lang} authenticated={false}/><a href="#today">{copy(lang,"Back to sign in","חזרה לכניסה")}</a></main> : <LoginScreen />;
 
   const tabs = Object.keys(tabIcons) as Tab[];
   const openTab = (tab: Tab) => {
@@ -2630,14 +2627,20 @@ export default function App() {
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
     journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
-    moments: <MomentsView todayDate={today.data?.today} />,
+    moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];
   const moduleContent = activeModule ? {
     bookings: <BookingsView config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} />,
     map: <MapView config={config.data} itinerary={itinerary.data} lang={lang} onOpenItinerary={openMapItinerary} />,
-    budget: <BudgetView config={config.data} lang={lang} />,
-    photos: <PhotosView config={config.data} currentUser={me.data} lang={lang} />,
+    budget: <><BudgetView config={config.data} lang={lang} /><CurrencyConverter lang={lang}/></>,
+    photos: <><PhotosView config={config.data} currentUser={me.data} lang={lang} /><ImmichAlbum config={config.data} lang={lang}/></>,
+    readiness: <Readiness config={config.data} lang={lang}/>,
+    account: <Account currentUser={me.data} lang={lang}/>,
+    activities: <GroupActivities config={config.data} currentUser={me.data} lang={lang}/>,
+    lostfound: <LostFound lang={lang}/>,
+    trivia: <Trivia config={config.data} currentUser={me.data} lang={lang}/>,
+    "plan-tools": me.data?.is_organizer ? <PlanTools config={config.data} itinerary={itinerary.data} lang={lang}/> : <p>{copy(lang,"Organizer access required.","נדרשת הרשאת מארגן.")}</p>,
   }[activeModule] : null;
   const content = moduleContent || tabContent;
 

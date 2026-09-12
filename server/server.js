@@ -3464,6 +3464,7 @@ function triviaPublicState() {
     status: triviaState.status,
     gameId: triviaState.gameId,
     questionIndex: triviaState.questionIndex,
+    pausedRemainingMs: triviaState.pausedRemainingMs,
     question,
     nextPersons: nextQ ? nextQ.persons : null,
     players: triviaState.players,

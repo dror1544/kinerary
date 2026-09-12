@@ -2,6 +2,7 @@
 // transaction, so MCP/API/background writers cannot forget to notify and a
 // rollback cannot emit an event. No trip content or row identifiers go on wire.
 const TABLES = {
+  task_done: 'tasks', rsvps: 'rsvps', lost_found: 'lost-found',
   bookings: 'bookings', budget_items: 'budget', photos: 'photos',
   photo_reactions: 'photo-reactions', photo_comments: 'photo-comments',
   venue_comments: 'comments', ratings: 'ratings',

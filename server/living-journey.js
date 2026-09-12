@@ -1029,7 +1029,40 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     });
   });
 
-  app.post('/api/itinerary/items', organizerOrAgentRequired, (req, res) => {
+  // Optional optimistic concurrency for Modern editors. Legacy callers keep
+  // their existing contract. The check and synchronous SQLite write execute
+  // in the same request turn, with no asynchronous gap.
+  function itineraryRevisionMatches(req, res, next) {
+    const expected = req.headers['if-match'];
+    if (expected && expected !== getState(db)?.active_version_id) {
+      return res.status(409).json({ error: 'itinerary_changed_reload_before_retry' });
+    }
+    next();
+  }
+
+  app.patch('/api/itinerary/days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
+    const { phase_id, date, label_he, label_en } = req.body || {};
+    if (!phase_id || !ISO_DATE_RE.test(date || '') || typeof label_he !== 'string' || typeof label_en !== 'string') return res.status(400).json({ error: 'invalid_day' });
+    const phase = config.phases?.find(phase => phase.id === phase_id);
+    const start = phase?.dates?.start || phase?.start;
+    const end = phase?.dates?.end || phase?.end || start;
+    const existing = activeRows(db)?.days.some(day => day.phase_id === phase_id && day.date === date);
+    // Calendar-only days become persisted only when the organizer gives them a title.
+    if (!existing && !(start && end && date >= start && date <= end)) return res.status(404).json({ error: 'day_not_found' });
+    const revision = cloneWith(db, req.user.username, 'Organizer changed day title', rows => {
+      let day = rows.days.find(day => day.phase_id === phase_id && day.date === date);
+      if (!day) {
+        day = { phase_id, date, label_he: null, label_en: null, ...dayContextForPhase(phase, date), sort_order: rows.days.length };
+        rows.days.push(day);
+      }
+      day.label_he = label_he.trim() || null;
+      day.label_en = label_en.trim() || null;
+    });
+    updateLegacyFromActive(db);
+    res.json({ revision });
+  });
+
+  app.post('/api/itinerary/items', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const body = req.body || {};
     const bad = requireFields(body, ['phase_id', 'date', 'text_he']);
     if (bad) return res.status(400).json({ error: bad });
@@ -1066,7 +1099,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     res.status(201).json({ revision: nextId, item_uid: uid, enrichment });
   });
 
-  app.patch('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
+  app.patch('/api/itinerary/items/:item_uid', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const uid = req.params.item_uid;
     const body = req.body || {};
     for (const field of ['phase_id', 'date', 'text_he']) {
@@ -1122,7 +1155,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     res.json({ revision: nextId, item_uid: uid, ...(enrichment ? { enrichment } : {}) });
   });
 
-  app.delete('/api/itinerary/items/:item_uid', organizerOrAgentRequired, (req, res) => {
+  app.delete('/api/itinerary/items/:item_uid', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const uid = req.params.item_uid;
     let touched = false;
     const nextId = cloneWith(db, req.user.username, 'Organizer removed itinerary item', (rows) => {
@@ -1135,7 +1168,7 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     res.json({ ok: true, revision: nextId });
   });
 
-  app.post('/api/itinerary/swap-days', organizerOrAgentRequired, (req, res) => {
+  app.post('/api/itinerary/swap-days', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
     const { phase_id, date_a, date_b } = req.body || {};
     if (!phase_id || !ISO_DATE_RE.test(date_a || '') || !ISO_DATE_RE.test(date_b || '') || date_a === date_b) {
       return res.status(400).json({ error: 'phase_id, date_a and date_b are required' });

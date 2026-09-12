@@ -62,3 +62,24 @@ describe("a token the server refuses", () => {
     expect(tokenStore.get()).toBe("someone-elses-live-session");
   });
 });
+
+
+it("keeps the trip session when Google linking rejects its provider credential", async () => {
+  const { api } = await import("./api");
+  tokenStore.set("valid-trip-session");
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "invalid_id_token" }), { status: 401 })));
+  await expect(api("/api/auth/google-link", { method: "PUT", body: JSON.stringify({ idToken: "rejected" }) })).rejects.toThrow("invalid_id_token");
+  expect(tokenStore.get()).toBe("valid-trip-session");
+});
+
+it("does not let a late 401 clear a replacement session", async () => {
+  const { api } = await import("./api");
+  tokenStore.set("old-session");
+  let respond!: (response: Response) => void;
+  vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(resolve => { respond = resolve; })));
+  const request = api("/api/auth/me");
+  tokenStore.set("replacement-session");
+  respond(new Response(JSON.stringify({ error: "invalid_token" }), { status: 401 }));
+  await expect(request).rejects.toThrow("invalid_token");
+  expect(tokenStore.get()).toBe("replacement-session");
+});

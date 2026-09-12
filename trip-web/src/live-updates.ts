@@ -3,13 +3,14 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { runtimeUrl, tokenStore } from './api';
 
 const DEPENDENCIES: Record<string, string[]> = {
-  itinerary: ['itinerary', 'today', 'confirmations'],
+  itinerary: ['itinerary', 'today', 'confirmations', 'revisions'],
   bookings: ['bookings', 'itinerary', 'today', 'confirmations'],
   budget: ['budget'],
   photos: ['photos', 'photo-reactions', 'photo-comments', 'moments', 'today'],
   'photo-reactions': ['photo-reactions'],
   'photo-comments': ['photo-comments'],
-  comments: ['moments', 'today'], ratings: ['moments', 'today'],
+  comments: ['venue-comments', 'moments', 'today'], ratings: ['ratings', 'moments', 'today'],
+  tasks: ['tasks'], rsvps: ['rsvps'], 'lost-found': ['lost-found'],
   moments: ['moments', 'today'], ui: ['ui'],
 };
 const ALL = [...new Set(Object.values(DEPENDENCIES).flat())];

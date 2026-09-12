@@ -952,3 +952,29 @@ textarea { min-height: 132px; resize: vertical; }
   line-height: 1.5;
 }
 .day-selector button small { opacity: .8; }
+/* Shared module styling for the Classic parity workflows. */
+.parity-layout { display: grid; gap: 24px; width: 100%; min-width: 0; }
+.parity-panel { background: var(--surface, #fff); border: 1px solid #dde3df; border-radius: 20px; padding: clamp(18px, 3vw, 32px); min-width: 0; overflow-wrap: anywhere; }
+.parity-panel h2 { margin-top: 0; }
+.parity-panel h3 { margin-block: 18px 10px; }
+.parity-panel form, .parity-panel label:not(.parity-check) { display: grid; gap: 8px; }
+.parity-panel form { gap: 16px; margin-block: 16px; }
+.parity-panel input:not([type=checkbox]):not([type=radio]), .parity-panel textarea, .parity-panel select { width: 100%; min-width: 0; padding: 10px 12px; border-radius: 10px; border: 1px solid #b7c4bd; background: white; color: #203a30; font: inherit; }
+.parity-panel textarea { min-height: 90px; }
+.parity-panel button { border: 1px solid #a6b8ac; background: #f2f7f3; border-radius: 10px; padding: 10px 16px; color: #203a30; font: inherit; cursor: pointer; min-height: 44px; }
+.parity-panel button:disabled { opacity: .55; cursor: default; }
+.parity-panel button[aria-pressed=true] { background: #214f42; color: white; }
+.parity-panel button:focus-visible, .parity-panel input:focus-visible { outline: 3px solid #cc6f42; outline-offset: 3px; }
+.parity-actions, .parity-fields { display: flex; gap: 12px; flex-wrap: wrap; margin-block: 12px; }
+.parity-fields > label { flex: 1 1 150px; }
+.parity-check { display: flex; align-items: start; gap: 12px; padding-block: 10px; }
+.parity-check input { width: 22px; height: 22px; flex-shrink: 0; }
+.parity-row { border-bottom: 1px solid #dfe7e1; padding-block: 14px; }
+.parity-panel [role=alert] { color: #8d271a; }
+.avatar-crop-preview { width: 240px; height: 240px; overflow: hidden; border-radius: 50%; margin-block: 16px; }
+.avatar-crop-preview img { width: 100%; height: 100%; object-fit: cover; }
+.trivia-answers { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+@media(max-width:480px) { .trivia-answers { grid-template-columns: 1fr; } }
+
+.journey-tools { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-block: 12px; }
+.journey-tools a { color: var(--kit-teal); text-decoration: underline; text-underline-offset: 3px; }
