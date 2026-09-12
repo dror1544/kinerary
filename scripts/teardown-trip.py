@@ -126,6 +126,38 @@ def original_slug(slug: str) -> str:
     return re.sub(r"-\d{8}(-\d+)?$", "", slug[len("retired-"):])
 
 
+def resource_slug(slug: str, trips_root: Path) -> str:
+    """The name a trip's RESOURCES were built under — container, host, deploy dir.
+
+    Normally the original slug: retirement renames the database row, and the
+    container it named stays named what it was. But a trip can also be BUILT
+    after it was retired, and then everything it owns carries the retired name.
+    Live on 2026-09-12: an automated run with `--stop-after confirm --teardown`
+    retired its trip while the build that confirming had started was still
+    running; the worker finished it under `retired-draft-sreq-…-20260912`, and
+    this script, looking only under the original name, reported "infra: nothing
+    to do" over a running container, an NPM host and a Cloudflare record.
+
+    So: the original name when that is where the deploy dir is, the current slug
+    when only it has one. Both existing is the ordinary retired case and keeps
+    the original, which is what every earlier teardown relied on.
+    """
+    orig = original_slug(slug)
+    if orig != slug and not (trips_root / orig).is_dir() and (trips_root / slug).is_dir():
+        return slug
+    return orig
+
+
+def expected_lxc_name(name: str) -> str:
+    """compute.py's rule, mirrored: Proxmox hostnames stop at 63 characters.
+
+    Without the cut, any slug long enough to be truncated — every `draft-sreq-`
+    trip, and every retired one — failed the "does this topology describe this
+    trip" check and was refused, however correct the topology was.
+    """
+    return f"trip-{name}"[:63]
+
+
 def load_provisioning_env() -> None:
     """The env the worker's compose up is given: provisioning.env, and on the VM
     vm.env over it. Compose's later --env-file wins; here setdefault keeps the
@@ -156,7 +188,7 @@ def resolve(target: str) -> dict:
     if trip["lifecycle_state"] in REFUSED_STATES:
         raise Refused(f"{trip['slug']} is {trip['lifecycle_state']} — real people have used it; not a teardown target")
 
-    trip["orig"] = original_slug(trip["slug"])
+    trip["orig"] = resource_slug(trip["slug"], DEPLOY_ROOT / "trips")
     bound = psql(
         f"SELECT hermes_profile FROM control_plane.telegram_chat_bindings WHERE trip_id = '{trip['id']}' "
         "AND hermes_profile IS NOT NULL ORDER BY created_at DESC LIMIT 1")
@@ -392,7 +424,7 @@ def main() -> int:
         from provisioning.models import load_topology
         raw = yaml.safe_load(topology_path.read_text())
         topo = load_topology(raw)
-        if topo.lxc.name != f"trip-{orig}" or not topo.proxy.hostname.startswith(f"{orig}."):
+        if topo.lxc.name != expected_lxc_name(orig) or not topo.proxy.hostname.startswith(f"{orig}."):
             print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.proxy.hostname})")
             return 2
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
