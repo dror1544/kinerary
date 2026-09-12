@@ -207,6 +207,12 @@ function schema(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS trip_daily_messages (
+      date TEXT PRIMARY KEY,
+      he TEXT NOT NULL,
+      en TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS provider_observations (
       provider TEXT NOT NULL,
       cache_key TEXT NOT NULL,
@@ -920,6 +926,7 @@ function buildTodayContext(db, config) {
   return {
     today,
     time_zone: clock.time_zone,
+    companion_message: db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(today) || null,
     phase,
     first_date: firstDate,
     last_date: lastDate,
@@ -1190,6 +1197,17 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     });
     updateLegacyFromActive(db);
     res.json({ revision: nextId });
+  });
+
+  app.post('/api/agent/daily-message', organizerOrAgentRequired, (req, res) => {
+    const { date, he, en } = req.body || {};
+    if (date !== localClock(config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
+    if (![he, en].every(value => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 280)) {
+      return res.status(400).json({ error: 'he_and_en_required_max_280_characters' });
+    }
+    db.prepare('INSERT INTO trip_daily_messages (date, he, en) VALUES (?, ?, ?) ON CONFLICT(date) DO UPDATE SET he = excluded.he, en = excluded.en')
+      .run(date, he.trim(), en.trim());
+    res.json(db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(date));
   });
 
   app.get('/api/today', authRequired, (_req, res) => {

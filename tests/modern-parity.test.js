@@ -382,3 +382,24 @@ test("a calendar-only day can receive a title without inventing an activity or c
   const legacy = await (await api("/api/phases/ny/plan/days", { token: owner })).json();
   assert.ok(legacy.some(d => d.date === date && d.label_en === "Open day"));
 });
+
+test("daily encouragement is scoped, validated, dated, and visible to members", async () => {
+  const read = async (token = member) => (await api('/api/today', { token })).json();
+  const today = (await read()).today;
+  const body = { date: today, he: 'קחו את היום בקצב שלכם.', en: 'Take today at your own pace.' };
+  assert.equal((await api('/api/today')).status, 401);
+  assert.equal((await api('/api/agent/daily-message', { method: 'POST', body })).status, 401);
+  assert.equal((await api('/api/agent/daily-message', { method: 'POST', body, token: member })).status, 403);
+  assert.equal((await read()).companion_message, null);
+  assert.equal((await api('/api/agent/daily-message', { method: 'POST', body: { ...body, date: '2000-01-01' }, apiKey: 'test-hermes-key' })).status, 409);
+  for (const en of ['', ' ', 'x'.repeat(281), 42]) {
+    assert.equal((await api('/api/agent/daily-message', { method: 'POST', body: { ...body, en }, apiKey: 'test-hermes-key' })).status, 400);
+  }
+  const result = await api('/api/agent/daily-message', { method: 'POST', body, apiKey: 'test-hermes-key' });
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), body);
+  assert.deepEqual((await read()).companion_message, body);
+  const updated = { ...body, en: 'Leave room for a little discovery.' };
+  assert.equal((await api('/api/agent/daily-message', { method: 'POST', body: updated, token: owner })).status, 200);
+  assert.deepEqual((await read()).companion_message, updated);
+});

@@ -643,7 +643,7 @@ function CompanionPanel({
   );
 }
 
-function TripClockPanel({
+export function TripClockPanel({
   config,
   itinerary,
   today,
@@ -681,11 +681,11 @@ function TripClockPanel({
               ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
               : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`)}
         </h3>
-        <p>
-          {totalDays && totalIndex > 0
-            ? copy(lang, `Trip day ${totalIndex} of ${totalDays}. The page keeps following destination-local time.`, `יום ${totalIndex} מתוך ${totalDays} בטיול. העמוד מתעדכן לפי השעה המקומית ביעד.`)
-            : copy(lang, "Countdown, current phase, and next event all move with the trip clock.", "הספירה לאחור, השלב הנוכחי והאירוע הבא מתעדכנים עם שעון הטיול.")}
-        </p>
+        {totalDays > 0 && totalIndex > 0 && <p>{copy(lang, `Trip day ${totalIndex} of ${totalDays}.`, `יום ${totalIndex} מתוך ${totalDays} בטיול.`)}</p>}
+        <p>{(today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || copy(lang,
+          "Take today at your own pace. Some of the best moments are the ones you didn't plan.",
+          "קחו את היום בקצב שלכם. לפעמים הרגעים הכי יפים הם אלה שלא תכננתם.",
+        )}</p>
       </div>
     </section>
   );
@@ -730,7 +730,7 @@ function TodayView({
   isOrganizer?: boolean;
   onOpenItinerary: (focus: JourneyFocus) => void;
 }) {
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
@@ -1516,7 +1516,7 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
   const [filter, setFilter] = useState<BookingFilter>("phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
   const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
   const allRows = bookings.data || [];
   const activePhaseId = today.data?.current?.phase_id || today.data?.next?.phase_id || null;
   const rows = useMemo(() => allRows.filter((booking) => {

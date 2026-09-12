@@ -11,7 +11,7 @@ const DEPENDENCIES: Record<string, string[]> = {
   'photo-comments': ['photo-comments'],
   comments: ['venue-comments', 'moments', 'today'], ratings: ['ratings', 'moments', 'today'],
   tasks: ['tasks'], rsvps: ['rsvps'], 'lost-found': ['lost-found'],
-  moments: ['moments', 'today'], ui: ['ui'],
+  moments: ['moments', 'today'], ui: ['ui'], 'daily-message': ['today'],
 };
 const ALL = [...new Set(Object.values(DEPENDENCIES).flat())];
 

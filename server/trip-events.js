@@ -9,7 +9,7 @@ const TABLES = {
   phase_plan_items: 'itinerary', phase_plan_days: 'itinerary',
   itinerary_plan_items: 'itinerary', itinerary_plan_days: 'itinerary',
   trip_itinerary_state: 'itinerary', trip_moments: 'moments',
-  trip_ui_settings: 'ui',
+  trip_ui_settings: 'ui', trip_daily_messages: 'daily-message',
 };
 
 function createTripEvents(db, { tables = TABLES, pollMs = 250 } = {}) {

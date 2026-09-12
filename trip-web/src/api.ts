@@ -191,6 +191,7 @@ export type ItineraryMutation = {
 
 export type TodayContext = {
   today: string;
+  companion_message?: { date: string; he: string; en: string } | null;
   phase: "pre_trip" | "flight_day" | "active_day" | "transfer_day" | "post_trip";
   countdown_days: number | null;
   current: ItineraryItem | null;
