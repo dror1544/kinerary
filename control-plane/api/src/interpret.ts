@@ -1010,13 +1010,34 @@ export async function extractIntakeFromDocument(
     timeoutMs?: number;
   },
 ): Promise<InterpretResult> {
-  const result = await runner.run<InterpretPayload>({
+  const once = () => runner.run<InterpretPayload>({
     task: EXTRACT_INTAKE_TASK,
     prompt: buildExtractIntakePrompt(args),
     schema: INTERPRET_OUTPUT_SCHEMA,
     parse: (raw) => parseInterpretPayload(raw, []),
     ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
   });
+
+  let result = await once();
+
+  // NOTHING AT ALL IS WORTH ASKING TWICE.
+  //
+  // The runner retries a failure; this is the other case — a clean answer with
+  // an empty `proposals`, which reads as "there is nothing about a trip in this
+  // document" and is said to the organizer in exactly those words. On
+  // 2026-09-12 the same four-page itinerary, through the same model at the same
+  // effort, gave four proposals, then one, then none: 4/1/0 across three runs,
+  // the empty one returning in 32 seconds against 110 for the good one. The
+  // document had not changed. Neither had the prompt.
+  //
+  // One more attempt, and only when the first produced nothing — a retry that
+  // fires on a real answer would double the cost of every document read for
+  // nothing. A second empty answer is taken at its word.
+  if (result.ok && result.value.proposals.length === 0) {
+    const second = await once();
+    if (second.ok && second.value.proposals.length > 0) result = second;
+  }
+
   if (!result.ok) {
     return { ok: false, reason: result.reason, detail: result.detail, attempts: result.attempts, ms: result.ms };
   }

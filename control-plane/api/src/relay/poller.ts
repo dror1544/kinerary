@@ -63,6 +63,8 @@ import {
   answersForChat,
   saveSourceDocumentForChat,
   hasPendingInbound,
+  isReadingDocument,
+  markReadingDocument,
   deferQuestionForChat,
   deferredRequired,
   undeferAllForChat,
@@ -964,6 +966,26 @@ async function runDocumentPath(
     return;
   }
 
+  await markReadingDocument(deps.db, burst.chatId, true);
+  try {
+    await readDocumentInto(deps, burst, source, state, language, say, ask, log);
+  } finally {
+    await markReadingDocument(deps.db, burst.chatId, false);
+  }
+}
+
+/** The read itself — everything that must happen before the router speaks. */
+async function readDocumentInto(
+  deps: TripBotPollerDeps,
+  burst: { chatId: string; sessionId: string },
+  source: string,
+  state: { outstanding: string[]; answered: string[] },
+  language: Language,
+  say: (text: string) => Promise<void>,
+  ask: () => Promise<void>,
+  log: (line: string) => void,
+): Promise<void> {
+  if (!deps.modelRunner) return;
   const result = await extractIntakeFromDocument(deps.modelRunner, {
     documentText: source,
     outstanding: state.outstanding,
@@ -2026,6 +2048,18 @@ async function sendNextStep(
   const onInterpretPath = await isInterpretPath(deps.db, chatId);
   if (onInterpretPath && (await hasPendingInbound(deps.db, chatId))) {
     (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_inbound", {
+      session_id: view.sessionId,
+    }));
+    return false;
+  }
+  // AND WHILE IT IS ACTUALLY BEING READ. The check above covers the queue, and
+  // its own note assumed that was enough. It is not: the scan fires on a
+  // session merely awaiting the machine once the document floor has passed,
+  // and the read outlasts that floor by minutes. So the router asked the trip
+  // type in the middle of reading a document that answers it — and the answer
+  // given by hand then made the document's own proposal ALREADY_ANSWERED.
+  if (onInterpretPath && (await isReadingDocument(deps.db, chatId))) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_document_read", {
       session_id: view.sessionId,
     }));
     return false;

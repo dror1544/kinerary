@@ -7,6 +7,7 @@ import {
   burstKey,
   evidenceAppears,
   exampleEchoes,
+  extractIntakeFromDocument,
   interpretBurst,
   parseInterpretPayload,
   storedOutcomes,
@@ -265,6 +266,55 @@ describe("exampleEchoes — a value that came from the prompt, not the person", 
   test("a question with no example cannot echo, and a malformed one is not a crash", () => {
     assert.deepEqual(exampleEchoes(undefined, { data: ["anything"] }, ""), []);
     assert.deepEqual(exampleEchoes("{not json", { data: ["anything"] }, ""), []);
+  });
+});
+
+describe("extractIntakeFromDocument — nothing at all is worth asking twice", () => {
+  // 2026-09-12: the same four-page itinerary, the same model, the same effort,
+  // three runs — four proposals, then one, then none. The empty one came back
+  // in 32 seconds against 110 for the good one, and the organizer was told "I
+  // read it, but I couldn't find anything about the trip in it."
+  function runnerReturning(...payloads: { proposals: unknown[] }[]) {
+    let call = 0;
+    return {
+      run: async ({ parse }: { parse: (raw: unknown) => unknown }) => {
+        const payload = payloads[Math.min(call, payloads.length - 1)]!;
+        call += 1;
+        return { ok: true as const, value: parse(payload), attempts: 1, ms: 10 };
+      },
+      calls: () => call,
+    };
+  }
+
+  const args = { documentText: "Tokyo 19-23 September", outstanding: ["destination"], language: "he" };
+  const proposal = {
+    questionId: "destination", value: { kind: "text", text: "Japan" },
+    confidence: 0.9, evidence: "Tokyo",
+  };
+
+  test("an empty answer is tried once more", async () => {
+    const runner = runnerReturning({ proposals: [] }, { proposals: [proposal] });
+    const result = await extractIntakeFromDocument(runner as never, args);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.payload.proposals.length, 1);
+    assert.equal(runner.calls(), 2);
+  });
+
+  test("a second empty answer is taken at its word", async () => {
+    const runner = runnerReturning({ proposals: [] });
+    const result = await extractIntakeFromDocument(runner as never, args);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("unreachable");
+    assert.equal(result.payload.proposals.length, 0);
+    assert.equal(runner.calls(), 2, "twice, and no more");
+  });
+
+  test("a real answer is never re-asked — a document read is not cheap", async () => {
+    const runner = runnerReturning({ proposals: [proposal] });
+    const result = await extractIntakeFromDocument(runner as never, args);
+    assert.equal(result.ok, true);
+    assert.equal(runner.calls(), 1);
   });
 });
 

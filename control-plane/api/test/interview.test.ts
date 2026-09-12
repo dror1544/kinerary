@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { issueEnrollment } from "../src/enrollment.js";
 import {
+  answersForChat,
+  submitAnswerForChat,
   INTAKE_QUESTIONS,
   INTAKE_SCHEMA_VERSION,
   validateAnswer,
@@ -780,6 +782,47 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       assert.equal(after.ok, true);
       if (!after.ok) throw new Error("unreachable");
       assert.ok(!after.view.optionalRemaining.map((q) => q.id).includes("dietary"));
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("an expired session accepts no answers — it is not the chat's interview any more", { skip: SKIP }, async () => {
+    // 2026-09-12, live. A run was torn down and a new one started in the same
+    // chat. Twelve answers went into the OLD trip's session — expired, its trip
+    // already retired — while the router read the new one, found all ten
+    // required questions missing, and asked the trip type again after every
+    // answer. Each answer made it worse: the writers' row-lock ordered by
+    // `updated_at DESC` with no expiry condition, so the wrong session kept
+    // winning precisely because it was the one being written to.
+    //
+    // The invariant, asserted where it is cheap to assert: a write by CHAT
+    // cannot reach an expired session. Readers already refused to see one.
+    const fix = await setupFixture(pool);
+    try {
+      const chatId = `7009${Math.floor(Math.random() * 100000)}`;
+      const started = await startSession(fix.pool, await issuedEnrollmentToken(fix));
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+      await pool.query("UPDATE control_plane.intake_sessions SET telegram_chat_id = $1 WHERE id = $2",
+        [chatId, started.sessionId]);
+
+      const live = await submitAnswerForChat(pool, chatId, "trip_type", "family");
+      assert.equal(live.ok, true, "while it is live, the chat's session takes answers");
+
+      await pool.query("UPDATE control_plane.intake_sessions SET expired_at = now() WHERE id = $1", [started.sessionId]);
+
+      const afterExpiry = await submitAnswerForChat(pool, chatId, "trip_type", "friends");
+      assert.equal(afterExpiry.ok, false, "an expired session is not the chat's interview");
+      if (afterExpiry.ok) throw new Error("unreachable");
+      assert.equal(afterExpiry.reason, "NOT_FOUND");
+
+      const stored = await pool.query<{ option: string }>(
+        "SELECT answers->'trip_type'->>'option_id' AS option FROM control_plane.intake_sessions WHERE id = $1",
+        [started.sessionId],
+      );
+      assert.equal(stored.rows[0]?.option, "family", "and the write did not reach it");
+      assert.equal(await answersForChat(pool, chatId), null, "the router sees no interview here either");
     } finally {
       await teardownFixture(fix);
     }

@@ -804,6 +804,38 @@ export async function touchSessionDeadline(
  * seventh caller cannot forget it. Once the burst is claimed `pending_inbound`
  * is empty again and the document path owns the turn synchronously.
  */
+/** How long a read may hold the router before it is assumed dead. */
+const DOCUMENT_READ_MAX_MS = 15 * 60 * 1000;
+
+/** Mark a document read as started or finished. Best-effort by design. */
+export async function markReadingDocument(db: pg.Pool, chatId: string, reading: boolean): Promise<void> {
+  await updateUiStateForChat(db, chatId, (ui) => {
+    if (reading) return { ...ui, readingDocumentSince: new Date().toISOString() };
+    const { readingDocumentSince: _done, ...rest } = ui;
+    return rest;
+  }).catch(() => undefined);
+}
+
+/**
+ * Is a document being read in this chat right now?
+ *
+ * The companion to `hasPendingInbound`, covering the part it does not: the read
+ * itself. A stale mark — a process that died mid-read — expires rather than
+ * silencing the router forever.
+ */
+export async function isReadingDocument(db: pg.Pool, chatId: string): Promise<boolean> {
+  const rows = await db.query<{ since: string | null }>(
+    `SELECT ui_state->>'reading_document_since' AS since
+       FROM control_plane.intake_sessions
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+    [chatId],
+  );
+  const since = rows.rows[0]?.since;
+  if (!since) return false;
+  const started = Date.parse(since);
+  return Number.isFinite(started) && Date.now() - started < DOCUMENT_READ_MAX_MS;
+}
+
 export async function hasPendingInbound(db: pg.Pool, chatId: string): Promise<boolean> {
   // ANY pending message, not only a document.
   //
@@ -951,7 +983,7 @@ export async function questionStateForChat(
 ): Promise<{ outstanding: string[]; answered: string[] } | null> {
   const rows = await db.query<{ answers: AnswerStore }>(
     `SELECT answers FROM control_plane.intake_sessions
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
   );
   const answers = rows.rows[0]?.answers;
@@ -1208,6 +1240,27 @@ export interface InterviewUiState {
    */
   multiPending?: string;
   /**
+   * A document is being READ right now — not queued, being read.
+   *
+   * `hasPendingInbound` covers the queue, and its own note assumed that was
+   * enough: "once the burst is claimed the document path owns the turn
+   * synchronously". It does own it, but `advanceRouterOwnedQuestions` scans for
+   * sessions merely awaiting the machine, and a document turn's floor is 90
+   * seconds while the read takes two to eight minutes. So the router filled the
+   * silence with a router-owned question — the trip type — in the middle of
+   * reading a document that answers it.
+   *
+   * That is not only noise: an answer given by hand during the wait makes the
+   * document's own proposal for it ALREADY_ANSWERED, and the file loses to the
+   * question it was about to answer. Spotted by the organizer, 2026-09-12:
+   * "when I upload a file and immediately get asked about the trip type, this
+   * could indicate a problem."
+   *
+   * Timestamped rather than boolean so a process that dies mid-read cannot
+   * silence the router forever.
+   */
+  readingDocumentSince?: string;
+  /**
    * The optional question the interviewer has asked the router to put next.
    *
    * Optional questions are not walked automatically when an interviewer is
@@ -1295,6 +1348,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(record.opening_done === true ? { openingDone: true } : {}),
     ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
     ...(typeof record.multi_pending === "string" ? { multiPending: record.multi_pending } : {}),
+    ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
   };
 }
 
@@ -1311,6 +1365,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.openingDone ? { opening_done: true } : {}),
     ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
     ...(ui.multiPending ? { multi_pending: ui.multiPending } : {}),
+    ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
   });
 }
 
@@ -1459,7 +1514,7 @@ export async function markAwaitingMachine(
   await db.query(
     `UPDATE control_plane.intake_sessions
         SET awaiting = 'machine', awaiting_since = now(), awaiting_floor_seconds = $2
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId, floorSeconds ?? null],
   );
 }
@@ -1477,7 +1532,7 @@ export async function claimFloor(db: pg.Pool, chatId: string): Promise<boolean> 
   const result = await db.query(
     `UPDATE control_plane.intake_sessions
         SET awaiting = 'person', awaiting_since = now()
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND awaiting = 'machine'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND awaiting = 'machine' AND expired_at IS NULL`,
     [chatId],
   );
   return (result.rowCount ?? 0) > 0;
@@ -1823,7 +1878,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
   }>(
     `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId],
   );
   const [session] = row.rows;
@@ -2049,7 +2104,7 @@ export async function queueInboundMessage(
     `UPDATE control_plane.intake_sessions
         SET pending_inbound = pending_inbound || to_jsonb($2::jsonb),
             inbound_settle_due_at = now()
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId, JSON.stringify(event)],
   );
 }
@@ -2463,9 +2518,20 @@ async function lockSession(
     return row.rows[0] ?? null;
   }
   const row = await client.query<LockedSession>(
+    // EXPIRED IS NOT A CANDIDATE, and this is the row-lock every writer goes
+    // through. Without that condition the ordering below picks the most
+    // recently updated unconfirmed session — which, once answers start landing
+    // on the wrong one, is the wrong one, harder, with every write.
+    //
+    // Live on 2026-09-12: a chat whose previous interview had been expired by a
+    // new deep link had twelve answers written into the expired session while
+    // the router read the live one, found all ten required questions missing,
+    // and asked the trip type again. Every answer the organizer gave made the
+    // split worse. Readers already filtered `expired_at`; the writers did not,
+    // so the two halves disagreed about which session the chat was even having.
     `SELECT ${columns}
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1
+     WHERE telegram_chat_id = $1 AND expired_at IS NULL
      ORDER BY (state <> 'confirmed') DESC, updated_at DESC
      LIMIT 1
      FOR UPDATE`,
@@ -2862,7 +2928,7 @@ export async function advancePhaseForChat(
   await db.query(
     `UPDATE control_plane.intake_sessions
         SET phase = $2, state = $3
-      WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+      WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
     [chatId, to, stateForPhase(to)],
   );
   await updateUiStateForChat(db, chatId, (ui) => ({ ...ui, pendingEntry: to }));
@@ -3052,7 +3118,7 @@ export async function setLanguageForChat(
   const updated = await db.query<{ id: string }>(
     `UPDATE control_plane.intake_sessions
         SET language = $1, updated_at = now()
-      WHERE telegram_chat_id = $2 AND state <> 'confirmed'
+      WHERE telegram_chat_id = $2 AND state <> 'confirmed' AND expired_at IS NULL
       RETURNING id`,
     [language, chatId],
   );
