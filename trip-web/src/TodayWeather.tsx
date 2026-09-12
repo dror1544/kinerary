@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CloudSun } from "lucide-react";
+import { ChevronLeft, ChevronRight, CloudSun } from "lucide-react";
 import { getWeather, type ActiveItinerary, type TripConfig } from "./api";
 
 type Lang = "en" | "he";
@@ -26,7 +26,13 @@ export function TodayWeather({ config, itinerary, today, lang }: {
   config?: TripConfig; itinerary?: ActiveItinerary; today: string; lang: Lang;
 }) {
   const [offset, setOffset] = useState(0);
-  const date = shiftDate(today, offset);
+  const tripDates = itinerary?.days.length
+    ? itinerary.days.map((day) => day.date)
+    : config?.phases?.map((phase) => phase.end || phase.dates?.end || "") || [];
+  const lastTripDay = tripDates.filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)).sort().at(-1);
+  const requestedDate = shiftDate(today, offset);
+  const date = lastTripDay && lastTripDay >= today && requestedDate > lastTripDay ? lastTripDay : requestedDate;
+  const dayOffset = Math.round((Date.parse(date) - Date.parse(today)) / 86400000);
   const phase = weatherPhase(config, itinerary, date);
   const stop = phase?.mapStop;
   const mapped = Number.isFinite(stop?.lat) && Number.isFinite(stop?.lng);
@@ -40,12 +46,20 @@ export function TodayWeather({ config, itinerary, today, lang }: {
   const dates = weather.data?.forecast_dates || horizon.data?.forecast_dates || [];
   const nextDate = shiftDate(date, 1);
   const copy = (en: string, he: string) => lang === "he" ? he : en;
+  const atTripEnd = Boolean(lastTripDay && date >= lastTripDay);
+  const canAdvance = Boolean(lastTripDay && nextDate <= lastTripDay && dates.includes(nextDate));
+  const BackArrow = lang === "he" ? ChevronRight : ChevronLeft;
+  const NextArrow = lang === "he" ? ChevronLeft : ChevronRight;
   const name = label(stop?.name, lang) || label(phase?.title, lang) || phase?.id;
   return <section className="mini-panel weather-panel" aria-label={copy("Weather", "מזג אוויר")}>
     <CloudSun size={20} />
     <h3>{copy("Weather", "מזג אוויר")}</h3>
     <strong>{name || copy("No planned location", "אין מיקום מתוכנן")}</strong>
-    <div className="weather-date">{offset === 0 ? copy("Today", "היום") : offset === 1 ? copy("Tomorrow", "מחר") : ""}{offset < 2 ? " · " : ""}{new Intl.DateTimeFormat(lang === "he" ? "he-IL" : "en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(`${date}T12:00:00Z`))}</div>
+    <nav className="weather-navigation" dir={lang === "he" ? "rtl" : "ltr"} aria-label={copy("Forecast days", "ימי התחזית")}>
+      <button type="button" aria-label={copy("Back", "הקודם")} title={copy("Back", "הקודם")} disabled={dayOffset === 0} onClick={() => setOffset(dayOffset - 1)}><BackArrow size={20} aria-hidden="true" /></button>
+      <div className="weather-date">{dayOffset === 0 ? copy("Today", "היום") : dayOffset === 1 ? copy("Tomorrow", "מחר") : ""}{dayOffset < 2 ? " · " : ""}{new Intl.DateTimeFormat(lang === "he" ? "he-IL" : "en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(`${date}T12:00:00Z`))}</div>
+      <button type="button" aria-label={copy("Next", "הבא")} title={copy("Next", "הבא")} disabled={!canAdvance} onClick={() => setOffset(dayOffset + 1)}><NextArrow size={20} aria-hidden="true" /></button>
+    </nav>
     <div aria-live="polite">
       {!mapped ? <p>{copy("No mapped location for this day.", "אין מיקום במפה ליום הזה.")}</p>
         : weather.isPending ? <p>{copy("Loading forecast…", "טוענים תחזית…")}</p>
@@ -55,10 +69,7 @@ export function TodayWeather({ config, itinerary, today, lang }: {
         </> : <p>{copy("Forecast unavailable for this day.", "אין תחזית זמינה ליום הזה.")}</p>}
       {mapped && weather.data?.stale && <small>{copy("Last known forecast", "התחזית האחרונה הידועה")}{weather.data.fetched_at ? ` · ${new Date(weather.data.fetched_at).toLocaleString(lang === "he" ? "he-IL" : "en-GB")}` : ""}</small>}
     </div>
-    <nav className="weather-navigation" aria-label={copy("Forecast days", "ימי התחזית")}>
-      <button className="secondary-action" disabled={offset === 0} onClick={() => setOffset(offset - 1)}>{copy("Back", "הקודם")}</button>
-      <button className="secondary-action" disabled={!dates.includes(nextDate)} onClick={() => setOffset(offset + 1)}>{copy("Next", "הבא")}</button>
-    </nav>
-    {dates.length > 0 && !dates.includes(nextDate) && <small>{copy("Latest available forecast day", "היום האחרון בתחזית הזמינה")}</small>}
+    {atTripEnd ? <small>{copy("Last trip day", "היום האחרון בטיול")}</small>
+      : dates.length > 0 && !dates.includes(nextDate) && <small>{copy("Latest available forecast day", "היום האחרון בתחזית הזמינה")}</small>}
   </section>;
 }

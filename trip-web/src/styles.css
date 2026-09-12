@@ -1043,7 +1043,10 @@ textarea { min-height: 132px; resize: vertical; }
 .mobile-select-options button[aria-pressed=true] { background: #dff3ef; border-color: var(--kit-teal); font-weight: 700; }
 .mobile-select-options button:disabled { opacity: .5; cursor: default; }
 
-.weather-date { margin-top: 8px; font-size: 13px; }
-.weather-navigation { display: flex; gap: 8px; margin: 12px 0 8px; }
-.weather-navigation button { flex: 1; justify-content: center; }
-.weather-navigation button:disabled { opacity: .45; cursor: default; }
+.weather-date { min-width: 0; text-align: center; font-size: 13px; line-height: 1.4; }
+.weather-navigation { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 4px; margin: 8px -8px; }
+.weather-navigation button { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--kit-ink); cursor: pointer; }
+.weather-navigation button svg { color: inherit; }
+.weather-navigation button:hover:not(:disabled) { background: var(--kit-paper); }
+.weather-navigation button:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: -2px; }
+.weather-navigation button:disabled { color: var(--kit-muted); opacity: .35; cursor: default; }
