@@ -370,6 +370,30 @@ export function evidenceAppears(evidence: string, source: string): boolean {
  * passes because the example does not contain it. What cannot pass is a value
  * whose only provenance is the prompt.
  */
+/**
+ * Keys whose values the system ASKS the model to produce, not to quote.
+ *
+ * `travelers`' own prompt says it outright: "If the names aren't in Latin
+ * script, transliterate them YOURSELF and submit that as each person's English
+ * spelling." A transliteration is derived by construction — it cannot appear in
+ * a Hebrew source, and requiring it to is requiring the model to disobey the
+ * instruction it was given.
+ *
+ * That is not hypothetical. On 2026-09-12 an automated run stalled forever on
+ * "who's coming": the organizer answered "דרור אלול, שירן אלול…", the model
+ * read it correctly, and the gate rejected the whole answer as EXAMPLE_ECHO
+ * over one string — `Elul`. The example's family is "Elul", the source spells
+ * it אלול, and the guard's two conditions (in the example, not in the source)
+ * were both satisfied by a correct transliteration of a real surname. The
+ * question was re-asked, answered identically, rejected identically, three
+ * times, until the run gave up.
+ *
+ * Exempting these keys costs nothing the guard was built for: an invented
+ * traveller lifted wholesale from the example still trips on `name`
+ * ("דנה אלול"), which is quoted content and not derived from anything.
+ */
+const DERIVED_KEYS = new Set(["family", "family_en", "name_en"]);
+
 export function exampleEchoes(example: string | undefined, value: unknown, source: string): string[] {
   if (!example) return [];
   let parsed: unknown;
@@ -381,7 +405,7 @@ export function exampleEchoes(example: string | undefined, value: unknown, sourc
   const fromExample = new Set(collectStrings(parsed).map(fold));
   if (fromExample.size === 0) return [];
   const haystack = fold(source);
-  return collectStrings(value).filter((candidate) => {
+  return collectStrings(value, [], { skipKeys: DERIVED_KEYS }).filter((candidate) => {
     const folded = fold(candidate);
     // Short tokens are shared by everything ("he", "en") and say nothing about
     // where a value came from.
@@ -397,11 +421,27 @@ export function exampleEchoes(example: string | undefined, value: unknown, sourc
   });
 }
 
-/** Every string inside a value, at any depth — keys are not values. */
-function collectStrings(value: unknown, out: string[] = []): string[] {
+/**
+ * Every string inside a value, at any depth — keys are not values.
+ *
+ * `skipKeys` drops a field's value rather than the field: used on the VALUE
+ * side of the echo test, where a transliteration the prompt asked for is not
+ * evidence of copying (see DERIVED_KEYS). The EXAMPLE side is collected whole,
+ * so an example string still counts as example content wherever it appears.
+ */
+function collectStrings(
+  value: unknown,
+  out: string[] = [],
+  options: { skipKeys?: ReadonlySet<string> } = {},
+): string[] {
   if (typeof value === "string") out.push(value);
-  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
-  else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out, options);
+  else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      if (options.skipKeys?.has(key)) continue;
+      collectStrings(item, out, options);
+    }
+  }
   return out;
 }
 

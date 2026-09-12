@@ -242,6 +242,45 @@ describe("exampleEchoes — a value that came from the prompt, not the person", 
     );
   });
 
+  test("never flags a transliteration the prompt asked the model to invent", () => {
+    // The run that found this: `--scenario all`, japan, 2026-09-12. The
+    // organizer answered "who's coming" with five Hebrew names; the model
+    // transliterated them as instructed; the gate threw the whole answer away
+    // over `Elul`, the example's family name, which the Hebrew source of course
+    // does not contain in Latin script. The question was re-asked and
+    // re-rejected three times until the runner gave up.
+    //
+    // The travelers prompt says it in as many words: "transliterate them
+    // YOURSELF and submit that as each person's English spelling". A value the
+    // system asks to be DERIVED cannot also be required to appear verbatim.
+    const TRAVELERS_EXAMPLE = '[{"name": "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", "name_en": "Dana Elul", "age": 12, "family": "Elul"}]';
+    const said = "\u05d3\u05e8\u05d5\u05e8 \u05d0\u05dc\u05d5\u05dc, \u05e9\u05d9\u05e8\u05df \u05d0\u05dc\u05d5\u05dc";
+    assert.deepEqual(
+      exampleEchoes(TRAVELERS_EXAMPLE, {
+        kind: "structured",
+        data: [
+          { name: "\u05d3\u05e8\u05d5\u05e8 \u05d0\u05dc\u05d5\u05dc", name_en: "Dror Elul", family: "Elul" },
+          { name: "\u05e9\u05d9\u05e8\u05df \u05d0\u05dc\u05d5\u05dc", name_en: "Shiran Elul", family: "Elul" },
+        ],
+      }, said),
+      [],
+      "a correct transliteration of a real surname is not an echo",
+    );
+  });
+
+  test("still catches a traveller lifted wholesale out of the example", () => {
+    // The exemption is scoped to DERIVED fields, so an invented person is
+    // caught by the one field that is quoted rather than produced: their name.
+    const TRAVELERS_EXAMPLE = '[{"name": "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", "name_en": "Dana Elul", "age": 12, "family": "Elul"}]';
+    assert.deepEqual(
+      exampleEchoes(TRAVELERS_EXAMPLE, {
+        kind: "structured",
+        data: [{ name: "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", name_en: "Dana Elul", family: "Elul" }],
+      }, "we are four adults, no names given"),
+      ["\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc"],
+    );
+  });
+
   test("says nothing about values the example never had", () => {
     assert.deepEqual(exampleEchoes(EXAMPLE, { data: [{ planned: ["Sumo Hall"] }] }, "no mention here"), []);
   });
