@@ -346,6 +346,24 @@ server {{
     try_files $uri =404;
   }}
 
+  # The classic app's own script and stylesheet are NOT content-hashed, and a
+  # trip's hostname outlives the trip: a slug comes back, a container is
+  # rebuilt, and the browser is holding the last trip's app.js. With no
+  # Cache-Control at all it may serve that from cache without asking. On
+  # 2026-09-12 a deployed fix was invisible to the organizer for exactly this
+  # reason — the page revalidated, the script it loads did not.
+  location ~* ^/[^/]+\\.(js|css)$ {{
+    add_header Cache-Control "no-cache, must-revalidate";
+    try_files $uri =404;
+  }}
+
+  # The modern bundle IS content-hashed, so a changed file is a changed name and
+  # the old one can be kept forever.
+  location ^~ /modern/assets/ {{
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    try_files $uri =404;
+  }}
+
   location /avatars/ {{
     return 404;
   }}

@@ -180,6 +180,16 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("ln -sfn /nfs/tokyo-2026/media/avatars /opt/kinerary/site/avatars", bootstrap)
         self.assertIn("listen 8080", bootstrap)
         self.assertIn("systemctl enable nginx kinerary-server", bootstrap)
+        # A trip's hostname outlives the trip: a slug comes back, a container is
+        # rebuilt, and a browser still holds the last one's app.js. Only *.html
+        # carried a cache policy, so the page revalidated and the script it
+        # loads did not — on 2026-09-12 a deployed fix was invisible to the
+        # organizer for exactly that reason. The classic assets are not
+        # content-hashed and must always revalidate; the modern bundle is, so
+        # its name changes when its content does and it can be kept forever.
+        self.assertIn('location ~* ^/[^/]+\\.(js|css)$', bootstrap)
+        self.assertIn("location ^~ /modern/assets/", bootstrap)
+        self.assertIn("max-age=31536000, immutable", bootstrap)
         # The debian-12 template generates only C.utf8, so every apt/perl call
         # emits multi-line "Setting locale failed" warnings. Harmless in
         # themselves, but they filled the truncated stderr this transport
