@@ -785,6 +785,48 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
     }
   });
 
+  test("'none of these' ends the dietary line — the scope follow-up is not asked", { skip: SKIP }, async () => {
+    // 2026-09-12, the organizer's own interview: they ticked אין and were asked
+    // "זה נוגע לכולם או לאנשים מסוימים?" — whose are the dietary needs there
+    // are none of. Their note: "if none is selected this question should be
+    // avoided". `dietary_scope` says "for each thing ticked above", so there
+    // has to be something ticked, and "none" is the tick that means there is not.
+    const fix = await setupFixture(pool);
+    try {
+      const started = await startSession(fix.pool, await issuedEnrollmentToken(fix));
+      assert.equal(started.ok, true);
+      if (!started.ok) throw new Error("unreachable");
+
+      assert.ok(
+        !started.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
+        "before anything is ticked there is nothing to scope either",
+      );
+
+      const none = await submitAnswer(
+        fix.pool, started.sessionToken, "dietary", null, undefined, undefined, undefined, ["none"],
+      );
+      assert.equal(none.ok, true);
+      if (!none.ok) throw new Error("unreachable");
+      assert.ok(
+        !none.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
+        "nothing applies to anyone, so there is nobody to ask about",
+      );
+
+      // Ticking a real restriction is what makes the follow-up mean something.
+      const real = await submitAnswer(
+        fix.pool, started.sessionToken, "dietary", null, undefined, undefined, undefined, ["vegetarian", "nut_allergy"],
+      );
+      assert.equal(real.ok, true);
+      if (!real.ok) throw new Error("unreachable");
+      assert.ok(
+        real.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
+        "with restrictions recorded, whose they are is a real question",
+      );
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("skipping an optional question retires it and moves the interview on", { skip: SKIP }, async () => {
     // Without a skip an optional question has only one exit — answering it —
     // which is how "optional" became "mandatory" for an organizer who did not

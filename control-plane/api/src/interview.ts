@@ -136,6 +136,25 @@ export interface IntakeQuestion {
    */
   derive?: (answers: AnswerStore) => string | null;
   /**
+   * Whether this question applies at all, given what is already recorded.
+   *
+   * A FOLLOW-UP is not the same thing as an optional question. `required:
+   * false` means "you may skip this"; a follow-up means "this only exists in
+   * some conversations at all". `dietary_scope` asks whose the dietary needs
+   * are — and an organizer who ticked "none of these" has said there are none,
+   * so asking whose they are is a question with no possible answer.
+   *
+   * Live on 2026-09-12: אין was ticked, and the interview asked "זה נוגע
+   * לכולם או לאנשים מסוימים?" — the organizer's own note: "if none is selected
+   * this question should be avoided".
+   *
+   * Absent means always applicable, which is every other question today.
+   * Scoped to the optional walk and to what the interviewer may nominate: a
+   * REQUIRED question that does not apply would be a contradiction, since
+   * confirmation is gated on the required set being answered.
+   */
+  applies?: (answers: AnswerStore) => boolean;
+  /**
    * A second, distinct question from "is this the right shape" (`dataShape`,
    * checked before this ever runs): "does this actually establish what the
    * question exists to establish." A structured answer can be a well-formed
@@ -439,6 +458,13 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     dataShape: "object",
     dataExample: "{\"kosher_style\": \"everyone\", \"lactose_free\": [\"Dana\"]}",
     required: false,
+    // "For each thing ticked above" — so there has to be something ticked, and
+    // "none of these" is the one tick that means there is not.
+    applies: (answers) => {
+      const dietary = answers.dietary;
+      if (!dietary || dietary.kind !== "multi_choice") return false;
+      return dietary.option_ids.some((id) => id !== EXCLUSIVE_OPTION_ID);
+    },
   },
   {
     // REQUIRED as of 2026-09-11. Optional, it was the one skippable question
@@ -1362,6 +1388,10 @@ function pendingAskQuestion(
   if (!ui.pendingAsk || ui.finishRequested) return null;
   const question = questions.find((q) => q.id === ui.pendingAsk);
   if (!question || isSkipped(ui, question.id)) return null;
+  // A nomination cannot revive a question that does not apply: the agent reads
+  // `optionalRemaining`, which already excludes it, but nothing stopped it
+  // naming one anyway.
+  if (question.applies && !question.applies(answers)) return null;
   return question;
 }
 
@@ -1379,7 +1409,8 @@ function unansweredOptionalQuestions(
       !q.required &&
       !RETIRED_QUESTION_IDS.has(q.id) &&
       (answers[q.id] === undefined || ui.multiPending === q.id) &&
-      !isSkipped(ui, q.id),
+      !isSkipped(ui, q.id) &&
+      (q.applies?.(answers) ?? true),
   );
 }
 
