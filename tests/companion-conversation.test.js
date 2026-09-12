@@ -31,6 +31,7 @@ test('shared questions persist, agent replies clear inbox, member cannot imperso
   assert.equal((await agent('/api/agent/companion/messages', { text: 'wrong trip', kind: 'reply', reply_to: 'foreign' })).status, 404);
 });
 test('connection secrets stay organizer-only and group feed is explicitly published', async () => {
+  assert.equal((await (await api('/api/companion/connection', { token: owner })).json()).organizer_bot_username, 'Kinerary_bot');
   const binding_command = '/group KIN-ABCDEFGH';
   for (const invalid of ['/group abcdefghijklmnopqrstuvwxyz', '/group KIN-00000000']) {
     assert.equal((await agent('/api/agent/companion/connection', { binding_command: invalid, binding_expires_at: new Date(Date.now() + 60000).toISOString() })).status, 400);
@@ -42,7 +43,7 @@ test('connection secrets stay organizer-only and group feed is explicitly publis
   assert.equal((await (await api('/api/companion/connection', { token: owner })).json()).binding_command, binding_command);
   assert.equal((await agent('/api/agent/companion/messages', { kind: 'group_update', text: 'Meet at 9.' })).status, 201);
   const feed = await (await api('/api/companion/conversation', { token: member })).json();
-  assert.equal(feed.latest_update.text, 'Meet at 9.'); assert.ok(!JSON.stringify(feed).includes('KIN-ABCDEFGH'));
+  assert.equal(feed.latest_update.text, 'Meet at 9.'); assert.ok(!JSON.stringify(feed).includes('bot_username')); assert.ok(!JSON.stringify(feed).includes('Kinerary_bot')); assert.ok(!JSON.stringify(feed).includes('KIN-ABCDEFGH'));
   assert.equal((await agent('/api/agent/companion/connection', {})).status, 200);
   assert.equal((await (await api('/api/companion/connection', { token: owner })).json()).binding_command, null);
 });

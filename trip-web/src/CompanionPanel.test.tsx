@@ -28,7 +28,7 @@ it('preserves the draft when saving fails', async () => {
   await screen.findByRole('alert'); expect(screen.getByRole('textbox')).toHaveValue('My idea');
 });
 it('shows real updates and replies, with organizer-only links and icon settings', async () => {
-  vi.mocked(api).mockImplementation(path => Promise.resolve(path.endsWith('/connection') ? { binding_command: '/group KIN-ABCDEFGH' } : {
+  vi.mocked(api).mockImplementation(path => Promise.resolve(path.endsWith('/connection') ? { binding_command: '/group KIN-ABCDEFGH', organizer_bot_username: 'Kinerary_bot' } : {
     ...empty, connection: { group_url: 'https://t.me/+trip', bot_username: 'trip_bot' },
     latest_update: { text: 'Meet at nine', created_at: '2026-09-12T09:00:00Z' },
     messages: [{ id: 'q', author: 'bob', text: 'Later?', kind: 'question', created_at: '2026-09-12T09:00:00Z', answered: 1 }, { id: 'r', author: 'companion', text: 'Yes, nine works.', kind: 'reply', reply_to: 'q', created_at: '2026-09-12T09:01:00Z' }],
@@ -37,7 +37,7 @@ it('shows real updates and replies, with organizer-only links and icon settings'
   expect(screen.getByText('Yes, nine works.')).toBeInTheDocument();
   expect(screen.queryByText('Waiting for the companion')).not.toBeInTheDocument();
   expect(screen.getByRole('link', { name: 'Open Telegram group' })).toHaveAttribute('href', 'https://t.me/+trip');
-  expect(screen.getByRole('link', { name: 'Private companion chat' })).toHaveAttribute('href', 'https://t.me/trip_bot');
+  expect(screen.getByRole('link', { name: 'Private companion chat' })).toHaveAttribute('href', 'https://t.me/Kinerary_bot');
   expect(screen.getByRole('button', { name: 'Companion settings' })).toHaveTextContent('');
   expect(screen.getByRole('button', { name: 'Copy group connection command' })).toBeInTheDocument();
 });
@@ -48,4 +48,17 @@ it('localizes shared visibility and does not show missing Telegram connections',
   expect(screen.queryByRole('link')).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'פתיחת קבוצת הטלגרם' })).toBeDisabled();
   await waitFor(() => expect(screen.getByRole('button', { name: 'שליחה לעוזר' })).toBeDisabled());
+});
+
+it('shows the shared bot only to organizers without a dedicated trip bot', async () => {
+  vi.mocked(api).mockImplementation(path => Promise.resolve(path.endsWith('/connection') ? { binding_command: null, organizer_bot_username: 'Kinerary_bot' } : empty));
+  show(true);
+  expect(await screen.findByRole('link', { name: 'Private companion chat' })).toHaveAttribute('href', 'https://t.me/Kinerary_bot');
+  expect(screen.getByText('/group')).toBeInTheDocument();
+  cleanup();
+  show(false);
+  await screen.findByText('No group update has been shared here yet.');
+  expect(screen.queryByRole('link', { name: 'Private companion chat' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Private companion chat' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Copy group connection command' })).not.toBeInTheDocument();
 });

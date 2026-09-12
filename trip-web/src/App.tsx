@@ -698,7 +698,7 @@ function TodayView({
 
       </aside>
 
-      <CompanionPanel name={companionName} telegramUsername={hermes.data?.telegram_username} isOrganizer={isOrganizer} lang={lang} />
+      <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />
 
       <section className="section-band">
         <div className="section-heading">

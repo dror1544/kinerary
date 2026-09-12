@@ -21,7 +21,7 @@ function registerCompanionConversation({ app, db, authRequired, organizerOrAgent
   };
   app.get('/api/companion/conversation', authRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
-    const connection = db.prepare('SELECT group_url, bot_username, checked_at FROM companion_connection WHERE id=1').get() || null;
+    const connection = db.prepare('SELECT group_url, checked_at FROM companion_connection WHERE id=1').get() || null;
     const inboxCheck = db.prepare('SELECT checked_at FROM companion_inbox_status WHERE id=1').get();
     res.json({ connection, inbox_active: !!inboxCheck && Date.now() - Date.parse(inboxCheck.checked_at) < 10 * 60 * 1000,
       latest_update: db.prepare("SELECT * FROM companion_conversation WHERE kind='group_update' ORDER BY created_at DESC, rowid DESC LIMIT 1").get() || null,
@@ -53,7 +53,7 @@ function registerCompanionConversation({ app, db, authRequired, organizerOrAgent
   app.get('/api/companion/connection', organizerOrAgentRequired, (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const row = db.prepare('SELECT * FROM companion_connection WHERE id=1').get();
-    res.json({ binding_command: row && Date.parse(row.binding_expires_at) > Date.now() ? row.binding_command : null });
+    res.json({ organizer_bot_username: 'Kinerary_bot', binding_command: row && Date.parse(row.binding_expires_at) > Date.now() ? row.binding_command : null });
   });
   app.post('/api/agent/companion/connection', authRequired, agentOnly, (req, res) => {
     const { group_url = null, bot_username = null, binding_command = null, binding_expires_at = null } = req.body || {};

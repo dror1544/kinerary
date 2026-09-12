@@ -5,19 +5,19 @@ import { api } from './api';
 import { CompanionTasks } from './CompanionTasks';
 
 type Message = { id: string; author: string; text: string; kind: 'question' | 'reply' | 'group_update'; reply_to: string | null; created_at: string; answered?: number };
-type Conversation = { inbox_active: boolean; connection: { group_url: string | null; bot_username: string | null } | null; latest_update: Message | null; messages: Message[] };
-export function CompanionPanel({ name, lang, isOrganizer, telegramUsername }: { name: string; lang: 'he' | 'en'; isOrganizer?: boolean; telegramUsername?: string | null }) {
+type Conversation = { inbox_active: boolean; connection: { group_url: string | null } | null; latest_update: Message | null; messages: Message[] };
+export function CompanionPanel({ name, lang, isOrganizer }: { name: string; lang: 'he' | 'en'; isOrganizer?: boolean }) {
   const copy = (en: string, he: string) => lang === 'he' ? he : en;
   const [draft, setDraft] = useState('');
   const [notice, setNotice] = useState('');
   const client = useQueryClient();
   const conversation = useQuery({ queryKey: ['companion-conversation'], queryFn: () => api<Conversation>('/api/companion/conversation'), refetchInterval: 15_000 });
-  const connection = useQuery({ queryKey: ['companion-connection'], queryFn: () => api<{ binding_command: string | null }>('/api/companion/connection'), enabled: !!isOrganizer, refetchInterval: 30_000 });
+  const connection = useQuery({ queryKey: ['companion-connection'], queryFn: () => api<{ binding_command: string | null; organizer_bot_username: string }>('/api/companion/connection'), enabled: !!isOrganizer, refetchInterval: 30_000 });
   const send = useMutation({
     mutationFn: (text: string) => api('/api/companion/conversation', { method: 'POST', body: JSON.stringify({ text }) }),
     onSuccess: () => { setDraft(''); setNotice(copy('Saved. Waiting for the companion to reply.', 'נשמר. ממתינים לתשובת העוזר.')); void client.invalidateQueries({ queryKey: ['companion-conversation'] }); },
   });
-  const username = conversation.data?.connection?.bot_username || telegramUsername;
+  const username = isOrganizer ? connection.data?.organizer_bot_username : null;
   const privateUrl = username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}` : null;
   const groupUrl = conversation.data?.connection?.group_url;
   const stamp = (value: string) => new Date(value).toLocaleString(lang === 'he' ? 'he-IL' : 'en-GB', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -61,7 +61,6 @@ export function CompanionPanel({ name, lang, isOrganizer, telegramUsername }: { 
       </div>
     </form>
     {conversation.data && !groupUrl && <p>{copy('No Telegram group is connected to this trip yet.', 'עדיין לא מחוברת קבוצת טלגרם לטיול הזה.')}</p>}
-    {isOrganizer && !privateUrl && <p>{copy('A Telegram bot must be assigned to this trip before its chat and group connection command can be used.', 'יש לשייך בוט טלגרם לטיול לפני שאפשר לפתוח שיחה או להשתמש בפקודת החיבור לקבוצה.')}</p>}
     {isOrganizer && privateUrl && !connection.data?.binding_command && <p>{copy('To get a new group connection command, open the private companion chat and send', 'לקבלת פקודת חיבור חדשה לקבוצה, פתחו את השיחה הפרטית עם העוזר ושלחו')} <code dir="ltr">/group</code>. {copy('The bot returns the trip-specific command to paste into your group.', 'הבוט יחזיר את הפקודה של הטיול להדבקה בקבוצה.')}</p>}
     {send.isError && <p role="alert">{copy('Message was not saved. Try again; if you already have five unanswered messages, wait for a reply.', 'ההודעה לא נשמרה. נסו שוב; אם כבר יש חמש הודעות ללא מענה, המתינו לתשובה.')}</p>}
     {notice && <p role="status">{notice}</p>}
