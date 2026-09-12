@@ -62,3 +62,20 @@ it.each(["en", "he"] as const)("uses icon-only arrows with the correct direction
   expect(next.querySelector(lang === "he" ? ".lucide-chevron-left" : ".lucide-chevron-right")).not.toBeNull();
   expect(screen.getByRole("navigation")).toHaveAttribute("dir", lang === "he" ? "rtl" : "ltr");
 });
+
+it.each(["en", "he"] as const)("returns directly to today from a later forecast in %s", async (lang) => {
+  vi.mocked(getWeather).mockImplementation(async (lat, _lon, date) => ({ source: "open-meteo", date, forecast_dates: ["2026-09-12", "2026-09-13", "2026-09-14"], temperature_max: lat === 35 ? 28 : 22 }));
+  show(config, lang);
+  const todayButton = screen.getByRole("button", { name: lang === "he" ? "היום" : "Today" });
+  expect(todayButton).toBeDisabled();
+  await screen.findByText(lang === "he" ? "מקסימום 28°C · מינימום —" : "High 28°C · Low —");
+  fireEvent.click(screen.getByRole("button", { name: lang === "he" ? "הבא" : "Next" }));
+  await screen.findByText(lang === "he" ? "מקסימום 22°C · מינימום —" : "High 22°C · Low —");
+  fireEvent.click(screen.getByRole("button", { name: lang === "he" ? "הבא" : "Next" }));
+  expect(todayButton).toBeEnabled();
+  fireEvent.click(todayButton);
+  expect(screen.getByText("Tokyo")).toBeInTheDocument();
+  expect(screen.getByText(lang === "he" ? "מקסימום 28°C · מינימום —" : "High 28°C · Low —")).toBeInTheDocument();
+  expect(todayButton).toBeDisabled();
+  expect(screen.getByRole("button", { name: lang === "he" ? "הקודם" : "Back" })).toBeDisabled();
+});

@@ -1050,3 +1050,6 @@ textarea { min-height: 132px; resize: vertical; }
 .weather-navigation button:hover:not(:disabled) { background: var(--kit-paper); }
 .weather-navigation button:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: -2px; }
 .weather-navigation button:disabled { color: var(--kit-muted); opacity: .35; cursor: default; }
+
+.weather-navigation .weather-today { width: auto; min-width: 44px; margin: 0 auto; padding: 0 8px; border-radius: 8px; color: var(--kit-teal); font: inherit; font-weight: 600; }
+.weather-navigation .weather-today:disabled { color: var(--kit-muted); opacity: .45; }

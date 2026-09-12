@@ -57,7 +57,9 @@ export function TodayWeather({ config, itinerary, today, lang }: {
     <strong>{name || copy("No planned location", "אין מיקום מתוכנן")}</strong>
     <nav className="weather-navigation" dir={lang === "he" ? "rtl" : "ltr"} aria-label={copy("Forecast days", "ימי התחזית")}>
       <button type="button" aria-label={copy("Back", "הקודם")} title={copy("Back", "הקודם")} disabled={dayOffset === 0} onClick={() => setOffset(dayOffset - 1)}><BackArrow size={20} aria-hidden="true" /></button>
-      <div className="weather-date">{dayOffset === 0 ? copy("Today", "היום") : dayOffset === 1 ? copy("Tomorrow", "מחר") : ""}{dayOffset < 2 ? " · " : ""}{new Intl.DateTimeFormat(lang === "he" ? "he-IL" : "en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(`${date}T12:00:00Z`))}</div>
+      <div className="weather-date"><span>{dayOffset === 0 ? copy("Today", "היום") : dayOffset === 1 ? copy("Tomorrow", "מחר") : ""}{dayOffset < 2 ? " · " : ""}{new Intl.DateTimeFormat(lang === "he" ? "he-IL" : "en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(`${date}T12:00:00Z`))}</span>
+        <button className="weather-today" type="button" disabled={dayOffset === 0} onClick={() => setOffset(0)}>{copy("Today", "היום")}</button>
+      </div>
       <button type="button" aria-label={copy("Next", "הבא")} title={copy("Next", "הבא")} disabled={!canAdvance} onClick={() => setOffset(dayOffset + 1)}><NextArrow size={20} aria-hidden="true" /></button>
     </nav>
     <div aria-live="polite">
