@@ -948,6 +948,7 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+require('./companion-control').registerCompanionControl({ app, authRequired, organizerOrAgentRequired, fetchImpl: fetch });
 
 app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   const agent = TRIP_CONFIG.agent || null;

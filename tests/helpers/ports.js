@@ -22,6 +22,7 @@
  */
 
 export const PORTS = {
+  companionControl:        3201,
   // ── Full trip servers ──────────────────────────────────────────────────
   telegramSso:              3095,
   telegramSsoConfigResync:  3100,

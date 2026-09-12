@@ -1,3 +1,4 @@
+import { CompanionTasks } from "./CompanionTasks";
 import { TodayWeather } from "./TodayWeather";
 import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
@@ -763,6 +764,7 @@ function TodayView({
           <h3>{companionName}</h3>
           <p>{hermes.data?.available ? "Available for trip checks." : "Profile visible; live checks not configured."}</p>
           {hermes.data?.telegram_username ? <a href={telegramUrl(hermes.data.telegram_username)}>{copy(lang,"Open conversation","פתיחת שיחה")}</a> : null}
+          {isOrganizer && <CompanionTasks lang={lang} />}
         </section>
       </aside>
 

@@ -1062,3 +1062,12 @@ textarea { min-height: 132px; resize: vertical; }
 .upcoming-plan-link:focus-visible::after { outline: 2px solid var(--kit-teal); outline-offset: -3px; }
 .upcoming-plan-hint { display: block; margin-top: 6px; color: var(--kit-muted); }
 .upcoming-actions { position: relative; z-index: 1; width: fit-content; }
+
+.companion-settings { margin-top: 12px; }
+.companion-settings > section { margin-top: 12px; }
+.companion-task { border-top: 1px solid var(--kit-line); padding: 14px 0; }
+.companion-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.companion-task-heading button { border: 1px solid var(--kit-line); border-radius: 999px; padding: 8px 12px; background: var(--kit-paper); color: var(--kit-muted); cursor: pointer; }
+.companion-task-heading button[aria-checked=true] { background: var(--kit-teal); color: white; }
+.companion-task button:disabled { opacity: .5; cursor: default; }
+.companion-task p { margin: 8px 0; }
