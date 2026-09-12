@@ -274,3 +274,8 @@ is fetched only after first opening. All 98 SPA tests and the build pass.
 - The disposable preview generates a sample PDF outside git, attaches it to Breakfast through the booking/plan APIs, and checks the active Journey includes it. Regular member document GET returns 200; anonymous GET returns 401.
 - Verified the Hebrew action controls as Bob in Chrome and rendered the sample PDF with Quick Look. Browser automation did not confirm opening the popup or completing a download; those click outcomes remain a manual check.
 - Validation: SPA build and all 98 tests pass; fresh preview setup succeeds with the Journey attachment assertion.
+
+### Mobile selector sizing — 2026-09-12
+
+- Select elements inherit the site font and keyboard focus treatment. Mobile form selectors use 16px text and a 52px minimum height; Journey's day picker uses 18px text and a 56px minimum height.
+- Validation: production build passed. At a 390px Chrome viewport, the Hebrew day picker measured 56px tall with 18px text; selecting March 12 updated the selected day and displayed its empty itinerary state.

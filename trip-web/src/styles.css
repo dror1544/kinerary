@@ -9,10 +9,10 @@ body {
   background: var(--kit-paper);
   font-family: var(--kit-font-body);
 }
-button, input, textarea, a { font: inherit; }
+button, input, textarea, select, a { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; text-decoration: none; }
-button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible {
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
   outline: 0;
   box-shadow: var(--kit-focus);
 }
@@ -1004,3 +1004,21 @@ textarea { min-height: 132px; resize: vertical; }
 @media (prefers-reduced-motion: reduce) { .star-rating-option svg { transition: none; } }
 
 .parity-panel .activity-panel-collapse { display: flex; align-items: center; gap: 8px; margin-inline-start: auto; margin-bottom: 16px; }
+
+/* Native pickers keep the same readable type and touch size across mobile forms. */
+@media (max-width: 880px) {
+  .modern-trip-app select {
+    width: 100%;
+    min-width: 0;
+    min-height: 52px;
+    padding: 12px 16px;
+    font-family: inherit;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+  .mobile-day-picker select {
+    min-height: 56px;
+    font-size: 18px;
+    font-weight: 700;
+  }
+}
