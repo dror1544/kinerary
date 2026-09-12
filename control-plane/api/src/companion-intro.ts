@@ -34,6 +34,16 @@ export interface CompanionIntroFacts {
   language: "he" | "en";
   /** The shared site login. Null when no seed password was configured. */
   loginPassword?: string | null;
+  /**
+   * Who to log in AS, name by name.
+   *
+   * The password alone is half a credential. The site's accounts are the
+   * travellers, one username each, and the modern site has no name picker to
+   * choose from — so "log in with your name and the password" left an organizer
+   * on 2026-09-12 typing at a form with no way to know that אלה is `ella`.
+   * Listed here so the introduction can say it outright.
+   */
+  loginUsernames?: readonly { name: string; username: string }[] | null;
   /** The shared bot's @username, for the add-to-group link. */
   botUsername?: string | null;
   /** Payload for the add-to-group deep link — the trip slug. */
@@ -51,6 +61,31 @@ export interface CompanionIntroFacts {
   groupBindingToken?: string | null;
   /** The group's own invite link, when the bot could read one. Group message only. */
   groupInviteUrl?: string | null;
+}
+
+/**
+ * The login block: the password, and the name each person types to use it.
+ *
+ * Every traveller shares one password, so the username is the only thing that
+ * distinguishes them — and it is derived from their name rather than chosen, so
+ * nobody can guess it. An empty list falls back to the old wording, which is
+ * what a trip with no seeded accounts still gets.
+ */
+function loginLines(facts: CompanionIntroFacts): string[] {
+  const he = facts.language === "he";
+  if (!facts.loginPassword) return [he ? "הכניסה מהאתר עצמו." : "Log in from the site itself."];
+  const people = (facts.loginUsernames ?? []).filter((p) => p.username);
+  if (people.length === 0) {
+    return [he
+      ? `הכניסה עם השם שלכם והסיסמה: ${facts.loginPassword}`
+      : `Log in with your name and the password: ${facts.loginPassword}`];
+  }
+  return [
+    he
+      ? `הכניסה לאתר — שם המשתמש שלכם והסיסמה ${facts.loginPassword}:`
+      : `Log in with your username and the password ${facts.loginPassword}:`,
+    ...people.map((p) => `• ${p.name} — ${p.username}`),
+  ];
 }
 
 /**
@@ -140,9 +175,7 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
       "",
       `האתר: ${facts.siteUrl}`,
     );
-    parts.push(facts.loginPassword
-      ? `הכניסה עם השם שלכם והסיסמה: ${facts.loginPassword}`
-      : "הכניסה מהאתר עצמו.");
+    parts.push(...loginLines(facts));
     if (schedule.length) {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
@@ -174,9 +207,7 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
     "",
     `The site: ${facts.siteUrl}`,
   );
-  parts.push(facts.loginPassword
-    ? `Log in with your name and the password: ${facts.loginPassword}`
-    : "Log in from the site itself.");
+  parts.push(...loginLines(facts));
   if (schedule.length) {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
@@ -231,7 +262,7 @@ export function groupIntroText(
       `האתר של הטיול: ${facts.siteUrl}`,
     );
     if (showPassword) {
-      parts.push(`הכניסה עם השם שלכם והסיסמה: ${facts.loginPassword}`);
+      parts.push(...loginLines(facts));
     } else if (facts.organizerName) {
       parts.push(`לפרטי הכניסה — ${facts.organizerName}.`);
     }
@@ -255,7 +286,7 @@ export function groupIntroText(
     `The trip site: ${facts.siteUrl}`,
   );
   if (showPassword) {
-    parts.push(`Log in with your name and the password: ${facts.loginPassword}`);
+    parts.push(...loginLines(facts));
   } else if (facts.organizerName) {
     parts.push(`Ask ${facts.organizerName} for the login.`);
   }

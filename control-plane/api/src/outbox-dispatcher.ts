@@ -19,6 +19,20 @@ function payloadString(row: OutboxRow, key: string): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+/** `[{name, username}]` as written by the provisioner, or null if absent/malformed. */
+function payloadPeople(row: OutboxRow, key: string): { name: string; username: string }[] | null {
+  const value = row.payload?.[key];
+  if (!Array.isArray(value)) return null;
+  const people = value.flatMap((entry) => {
+    const name = (entry as { name?: unknown })?.name;
+    const username = (entry as { username?: unknown })?.username;
+    return typeof name === "string" && typeof username === "string" && name && username
+      ? [{ name, username }]
+      : [];
+  });
+  return people.length > 0 ? people : null;
+}
+
 /**
  * Wording for the `operator_*` types. These are addressed to the operator's own
  * chat id, NOT to an organizer, which is why they may carry identifiers and
@@ -98,6 +112,7 @@ function messageTextFor(row: OutboxRow, options?: DispatchOptions): string | str
       siteUrl: url,
       language: payloadString(row, "language") === "he" ? "he" : "en",
       loginPassword: payloadString(row, "login_password"),
+      loginUsernames: payloadPeople(row, "login_usernames"),
       botUsername: options?.botUsername ?? null,
       tripSlug: payloadString(row, "trip_slug"),
       organizerName: payloadString(row, "organizer"),

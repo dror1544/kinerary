@@ -20,6 +20,48 @@ const BASE: CompanionIntroFacts = {
   proactive: { morning_briefing: "07:30", flight_changes: true, photo_recap: false },
 };
 
+const TRAVELLERS = [
+  { name: "ניר סולומון", username: "nirsolomon" },
+  { name: "אלה", username: "ella" },
+];
+
+describe("the login the introduction hands over", () => {
+  // 2026-09-12: an organizer got "log in with your name and the password" and a
+  // site that would not open. The accounts were the travellers, one username
+  // each, derived from their names — and the modern site has no name picker, so
+  // there was nothing to pick from and nothing to type.
+  test("names the username beside the password", () => {
+    const text = organizerIntroText({ ...BASE, loginUsernames: TRAVELLERS });
+    assert.match(text, /Log in with your username and the password trip-seed-pw:/);
+    assert.match(text, /• ניר סולומון — nirsolomon/);
+    assert.match(text, /• אלה — ella/);
+  });
+
+  test("in Hebrew too", () => {
+    const text = organizerIntroText({ ...BASE, language: "he", loginUsernames: TRAVELLERS });
+    assert.match(text, /שם המשתמש שלכם והסיסמה trip-seed-pw:/);
+    assert.match(text, /• אלה — ella/);
+  });
+
+  test("the family group gets it as well — they are the ones logging in", () => {
+    const text = groupIntroText({ ...BASE, loginUsernames: TRAVELLERS }, { includePassword: true });
+    assert.match(text, /• nirsolomon|• ניר סולומון — nirsolomon/);
+    assert.match(text, /trip-seed-pw/);
+  });
+
+  test("no accounts to name falls back to the old wording, not to an empty list", () => {
+    const text = organizerIntroText({ ...BASE, loginUsernames: [] });
+    assert.match(text, /Log in with your name and the password: trip-seed-pw/);
+    assert.ok(!text.includes("•  —"), "no empty bullet");
+  });
+
+  test("no password at all still says where to go", () => {
+    const text = organizerIntroText({ ...BASE, loginPassword: null, loginUsernames: TRAVELLERS });
+    assert.match(text, /Log in from the site itself\./);
+    assert.ok(!text.includes("nirsolomon"), "usernames are useless without the password");
+  });
+});
+
 describe("groupAddUrl", () => {
   test("asks for the admin rights it will need, at the moment they are granted", () => {
     // Pinning the arrival message and reading an invite link both need admin.

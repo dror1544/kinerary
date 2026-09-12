@@ -1044,6 +1044,18 @@ class ProvisionerWorker:
                     "language": meta_cfg.get("defaultLang")
                     if meta_cfg.get("defaultLang") in ("he", "en") else "en",
                     "login_password": self._seed_password or None,
+                    # WHO to log in as. The seed password is shared, so the
+                    # username is the only thing telling two travellers apart —
+                    # and it is derived from their name (`ella`, `nirsolomon`),
+                    # not chosen, so it cannot be guessed from the site. The
+                    # modern site has no name picker either, which on
+                    # 2026-09-12 left an organizer with a password and no idea
+                    # what to type beside it.
+                    "login_usernames": [
+                        {"name": p.get("name") or p.get("username"), "username": p.get("username")}
+                        for p in (config.get("participants") or [])
+                        if p.get("username")
+                    ],
                     "proactive": agent_cfg.get("proactive") or {},
                 }
                 # The site-ready line only. Without `assistant_name` the
