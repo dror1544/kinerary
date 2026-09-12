@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
-import { runtimeUrl, tokenStore } from './api';
+import { startEventStream } from './event-stream';
 
 const DEPENDENCIES: Record<string, string[]> = {
   itinerary: ['itinerary', 'today', 'confirmations', 'revisions'],
@@ -46,11 +46,7 @@ export function useLiveEditGuard(active: boolean, resource: string) {
 // runtimeUrl and same-origin cookies also support the managed runtime gateway.
 export function startTripUpdates(client: QueryClient) {
   const guard = guardFor(client);
-  let stopped = false;
-  let controller: AbortController | undefined;
-  let retry: ReturnType<typeof setTimeout> | undefined;
   let batch: ReturnType<typeof setTimeout> | undefined;
-  let backoff = 1000;
   const pending = new Set<string>();
   const seen: Record<string, number> = {};
   function schedule(keys = ALL) {
@@ -71,47 +67,13 @@ export function startTripUpdates(client: QueryClient) {
     try {
       const data = JSON.parse(frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n'));
       if (!data.revisions || typeof data.revisions !== 'object') return;
-      if (event === 'ready') { backoff = 1000; schedule(); }
+      if (event === 'ready') { schedule(); }
       for (const [resource, revision] of Object.entries(data.revisions)) {
         if (!Object.hasOwn(DEPENDENCIES, resource) || !Number.isSafeInteger(revision) || Number(revision) < 0) continue;
         if (seen[resource] !== revision) schedule(DEPENDENCIES[resource]);
         seen[resource] = Number(revision);
       }
     } catch { /* Ignore malformed notifications; bounded polling still catches up. */ }
-  }
-  async function connect() {
-    controller = new AbortController();
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    try {
-      const token = tokenStore.get();
-      const response = await fetch(runtimeUrl('/api/events'), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: 'same-origin', signal: controller.signal,
-      });
-      if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream') || !response.body) throw new Error('Event stream unavailable');
-      reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (!stopped) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        buffer = buffer.replace(/\r\n/g, '\n');
-        if (buffer.length > 64 * 1024) throw new Error('Event too large');
-        let end;
-        while ((end = buffer.indexOf('\n\n')) !== -1) {
-          receive(buffer.slice(0, end)); buffer = buffer.slice(end + 2);
-        }
-      }
-    } catch { /* Offline, auth expired, or proxy unavailable: retry with a cap. */ }
-    finally {
-      await reader?.cancel().catch(() => undefined);
-      reader?.releaseLock();
-      if (!stopped) {
-        retry = setTimeout(connect, backoff);
-        backoff = Math.min(backoff * 2, 30_000);
-      }
-    }
   }
   function foreground() {
     if (document.visibilityState !== 'hidden') schedule([...ALL, 'config', 'me', 'hermes', 'flights', 'weather']);
@@ -123,11 +85,11 @@ export function startTripUpdates(client: QueryClient) {
   guard.released.add(released);
   document.addEventListener('visibilitychange', foreground);
   window.addEventListener('online', foreground);
-  void connect();
+  const stopStream = startEventStream('/api/events', receive);
   return () => {
-    stopped = true; controller?.abort();
+    stopStream();
     guard.released.delete(released);
-    clearTimeout(retry); clearTimeout(batch); clearInterval(polling);
+    clearTimeout(batch); clearInterval(polling);
     document.removeEventListener('visibilitychange', foreground);
     window.removeEventListener('online', foreground);
   };

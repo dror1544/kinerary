@@ -1,6 +1,9 @@
+import { VenueLinks } from "./venue-links";
+import { safeExternalUrl } from "./external-url";
+export { safeExternalUrl } from "./external-url";
 import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
-import { datesInPhase } from "./phase-calendar";
+import { datesInPhase, phaseDates as mergePhaseDates } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
 import { ImmichAlbum } from "./immich";
 import { Readiness, CurrencyConverter } from "./readiness";
@@ -281,15 +284,6 @@ export function PersonAvatar({
   return <img className={`person-avatar ${size}`} src={source} alt="" onError={() => setFailed(true)} />;
 }
 
-export function safeExternalUrl(value?: string | null) {
-  if (!value) return "";
-  try {
-    const url = new URL(value);
-    return ["https:", "http:"].includes(url.protocol) ? url.toString() : "";
-  } catch {
-    return "";
-  }
-}
 
 function tripLogoUrl(value?: string) {
   if (!value) return null;
@@ -860,11 +854,15 @@ export function JourneyView({
   // hiding it would lose an item somebody wrote.
   const phaseDates = useMemo(() => {
     const planned = activePhase?.days.map((day) => day.date) ?? [];
-    return [...new Set([...(activePhase?.calendar ?? []), ...planned])].sort();
+    return mergePhaseDates(activePhase?.calendar ?? [], planned);
   }, [activePhase]);
   const [selected, setSelected] = useState(phaseDates[0] || "");
   const activeDate = phaseDates.includes(selected) ? selected : phaseDates[0] || "";
   const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
+  const activityLinks = useMemo(() => new globalThis.Map((itinerary?.items || []).map(item => [item.item_uid, {
+    rsvpId: rsvpForItem(item, config, itinerary)?.id,
+    venueId: venueForItem(item, config)?.id,
+  }])), [config, itinerary]);
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
   const daySpineRef = useRef<HTMLElement>(null);
   const handledFocus = useRef<JourneyFocus | null>(null);
@@ -1126,7 +1124,7 @@ export function JourneyView({
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
-              <TimelineItem item={item} rsvpId={rsvpForItem(item, config, itinerary)?.id} venueId={venueForItem(item, config)?.id} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              <TimelineItem item={item} {...activityLinks.get(item.item_uid)} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
@@ -1169,11 +1167,7 @@ export function PhasePlaces({ venues, lang }: {
           <li key={venue.id || index}>
             <strong>{text(venue.name, lang) || venue.id}</strong>
             <span className="phase-place-links">
-              {safeExternalUrl(venue.maps) ? <a href={safeExternalUrl(venue.maps)!} target="_blank" rel="noreferrer">{copy(lang, "Maps", "מפות")}</a> : null}
-              {safeExternalUrl(venue.waze) ? <a href={safeExternalUrl(venue.waze)!} target="_blank" rel="noreferrer">Waze</a> : null}
-              {safeExternalUrl(venue.tickets || venue.url)
-                ? <a href={safeExternalUrl(venue.tickets || venue.url)!} target="_blank" rel="noreferrer">{copy(lang, "Tickets", "כרטיסים")}</a>
-                : null}
+              <VenueLinks venue={venue} lang={lang} />
             </span>
           </li>
         ))}

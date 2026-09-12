@@ -1,4 +1,4 @@
-import { datesInPhase } from "./phase-calendar";
+import { datesInPhase, phaseDates } from "./phase-calendar";
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type ActiveItinerary, type TripConfig } from "./api";
@@ -27,8 +27,8 @@ export function PlanTools({
     [dateB, setDateB] = useState("");
   const [he, setHe] = useState(""),
     [en, setEn] = useState(""),
-    [editing, setEditing] = useState(false),
     [revision, setRevision] = useState("");
+  const editing = Boolean(dateA);
   const [confirmed, setConfirmed] = useState(false);
   useEffect(() => {
     if (!phase && config?.phases?.length) setPhase(config.phases[0].id);
@@ -57,10 +57,9 @@ export function PlanTools({
       api("/api/itinerary/swap-days", {
         method: "POST",
         body: JSON.stringify(body),
-        headers: { "If-Match": revision || itinerary?.revision || "" },
+        headers: { "If-Match": revision },
       }),
     () => {
-      setEditing(false);
       setDateA("");
       setDateB("");
     },
@@ -80,7 +79,6 @@ export function PlanTools({
         headers: { "If-Match": revision },
       }),
     () => {
-      setEditing(false);
       setDateA("");
       setDateB("");
     },
@@ -93,17 +91,17 @@ export function PlanTools({
   );
   const persistedDays = itinerary?.days.filter((d) => d.phase_id === phase) || [];
   const phaseConfig = config?.phases?.find((p) => p.id === phase);
-  const selectedDays = [...new Set([
-    ...datesInPhase(phaseConfig?.dates || { start: phaseConfig?.start, end: phaseConfig?.end }),
-    ...persistedDays.map((d) => d.date),
-  ])].sort().map((date) => persistedDays.find((d) => d.date === date) || { phase_id: phase, date });
+  const selectedDays = phaseDates(
+    datesInPhase(phaseConfig?.dates || { start: phaseConfig?.start, end: phaseConfig?.end }),
+    persistedDays.map((d) => d.date),
+  ).map((date) => persistedDays.find((d) => d.date === date) || { phase_id: phase, date });
   function selectDay(value: string) {
     setDateA(value);
+    setDateB("");
     const d = selectedDays.find((d) => d.date === value);
     setHe(d?.label_he || "");
     setEn(d?.label_en || "");
     setRevision(itinerary?.revision || "");
-    setEditing(true);
   }
   const changed =
     itinerary?.items.filter((item) => {
@@ -142,7 +140,6 @@ export function PlanTools({
                 setPhase(e.target.value);
                 setDateA("");
                 setDateB("");
-                setEditing(false);
               }}
             >
               {config?.phases?.map((p) => (
@@ -178,7 +175,7 @@ export function PlanTools({
                 {tr(lang, "English day title", "כותרת היום באנגלית")}
                 <input value={en} onChange={(e) => setEn(e.target.value)} />
               </label>
-              <button disabled={label.isPending}>
+              <button disabled={!revision || label.isPending || action.isPending}>
                 {tr(lang, "Save day title", "שמירת כותרת היום")}
               </button>
             </form>
@@ -196,7 +193,7 @@ export function PlanTools({
               </select>
             </label>
             <button
-              disabled={!dateB || action.isPending}
+              disabled={!revision || !dateB || dateB === dateA || action.isPending || label.isPending}
               onClick={() =>
                 action.mutate({ phase_id: phase, date_a: dateA, date_b: dateB })
               }
@@ -206,8 +203,8 @@ export function PlanTools({
 
             <button
               onClick={() => {
-                setEditing(false);
                 setDateA("");
+                setDateB("");
               }}
             >
               {tr(

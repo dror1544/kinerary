@@ -1,9 +1,8 @@
+import { startEventStream } from "./event-stream";
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
-  runtimeUrl,
-  tokenStore,
   type CurrentUser,
   type TripConfig,
 } from "./api";
@@ -47,76 +46,18 @@ const getState = () => api<TriviaState>("/api/trivia/state");
 export function useTriviaConnection(
   enabled: boolean,
   gameId?: string,
-  status?: string,
 ) {
   const client = useQueryClient();
   const [connected, setConnected] = useState(false);
   useEffect(() => {
+    setConnected(false);
     if (!enabled) return;
-    let stopped = false,
-      timer: ReturnType<typeof setTimeout> | undefined,
-      controller: AbortController;
-    let delay = 1000;
-    async function connect() {
-      controller = new AbortController();
-      try {
-        const token = tokenStore.get();
-        const response = await fetch(runtimeUrl("/api/trivia/events"), {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-          credentials: "same-origin",
-          signal: controller.signal,
-        });
-        if (!response.ok || !response.body)
-          throw new Error("Stream unavailable");
-        setConnected(true);
-        delay = 1000;
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        try {
-          while (!stopped) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            buffer = buffer.replace(/\r\n/g, "\n");
-            if (buffer.length > 65536) throw new Error("Event too large");
-            let end;
-            while ((end = buffer.indexOf("\n\n")) >= 0) {
-              const frame = buffer.slice(0, end);
-              buffer = buffer.slice(end + 2);
-              if (
-                frame.includes("event: state") ||
-                frame.includes("event: answer_count")
-              ) {
-                void client.invalidateQueries({ queryKey: ["trivia"] });
-                if (frame.includes("event: state"))
-                  void client.invalidateQueries({
-                    queryKey: ["trivia-scores"],
-                  });
-              }
-            }
-          }
-        } finally {
-          await reader.cancel().catch(() => {});
-          reader.releaseLock();
-        }
-      } catch {
-        /* Polling also refreshes state while reconnecting. */
-      } finally {
-        if (!stopped) {
-          setConnected(false);
-          timer = setTimeout(connect, delay);
-          delay = Math.min(delay * 2, 15000);
-        }
-      }
-    }
-    void connect();
-    return () => {
-      stopped = true;
-      controller?.abort();
-      clearTimeout(timer);
-    };
-  }, [enabled, client, gameId, status === "lobby"]);
+    return startEventStream("/api/trivia/events", frame => {
+      const event = frame.split("\n").find(line => line.startsWith("event:"))?.slice(6).trim();
+      if (event === "state" || event === "answer_count") void client.invalidateQueries({ queryKey: ["trivia"] });
+      if (event === "state") void client.invalidateQueries({ queryKey: ["trivia-scores"] });
+    }, setConnected);
+  }, [enabled, client, gameId]);
   return connected;
 }
 export function Trivia({
@@ -128,10 +69,13 @@ export function Trivia({
   config?: TripConfig;
   lang: Lang;
 }) {
+  const client = useQueryClient();
+  const gameId = client.getQueryData<TriviaState>(["trivia"])?.gameId;
+  const connected = useTriviaConnection(true, gameId);
   const state = useQuery({
     queryKey: ["trivia"],
     queryFn: getState,
-    refetchInterval: 5000,
+    refetchInterval: connected ? 60_000 : 5000,
   });
   const history = useQuery({
     queryKey: ["trivia-scores"],
@@ -146,11 +90,6 @@ export function Trivia({
         }>
       >("/api/trivia/scores"),
   });
-  const connected = useTriviaConnection(
-    true,
-    state.data?.gameId,
-    state.data?.status,
-  );
   const answer = useAction(lang, ["trivia"], (answerIndex: number) =>
     api("/api/trivia/answer", {
       method: "POST",
@@ -170,22 +109,6 @@ export function Trivia({
     currentUser?.username ===
     (config?.meta?.admin || config?.participants?.[0]?.username);
   const q = state.data?.question;
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 250);
-    return () => clearInterval(timer);
-  }, []);
-  const remaining = q
-    ? Math.max(
-        0,
-        Math.ceil(
-          (state.data?.pausedRemainingMs ??
-            q.duration * 1000 -
-              q.elapsedMs -
-              Math.max(0, now - state.dataUpdatedAt)) / 1000,
-        ),
-      )
-    : 0;
   const status = state.data?.status || "idle";
   const actions =
     status === "lobby"
@@ -238,7 +161,7 @@ export function Trivia({
             <p>
               {q.number} / {q.total}{" "}
               {status === "question" &&
-                `${remaining} ${tr(lang, "seconds", "שניות")}`}{" "}
+                <TriviaCountdown question={q} pausedRemainingMs={state.data?.pausedRemainingMs} updatedAt={state.dataUpdatedAt} lang={lang} />}{" "}
               {state.data?.pausedRemainingMs != null &&
                 tr(lang, "Paused", "מושהה")}
             </p>
@@ -303,6 +226,18 @@ export function Trivia({
     </div>
   );
 }
+function TriviaCountdown({ question, pausedRemainingMs, updatedAt, lang }: { question: NonNullable<TriviaState["question"]>; pausedRemainingMs?: number | null; updatedAt: number; lang: Lang }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    if (pausedRemainingMs != null) return;
+    const timer = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(timer);
+  }, [pausedRemainingMs, updatedAt]);
+  const remaining = Math.max(0, Math.ceil((pausedRemainingMs ?? question.duration * 1000 - question.elapsedMs - Math.max(0, now - updatedAt)) / 1000));
+  return <>{remaining} {tr(lang, "seconds", "שניות")}</>;
+}
+
 function QuestionBank({ lang }: { lang: Lang }) {
   const rows = useQuery({
     queryKey: ["trivia-questions"],

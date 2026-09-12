@@ -32,7 +32,7 @@ it('coalesces notifications, refreshes dependencies, ignores duplicates, and cat
   emit('ready', { bookings: 2 });
   await vi.advanceTimersByTimeAsync(150);
   expect(invalidate.mock.calls.some(call => call[0]?.queryKey?.[0] === 'budget')).toBe(true);
-  stop(); source.close();
+  stop(); // Shared transport cancels and closes the reader during cleanup.
 });
 
 it('polls when streaming fails and refreshes on foreground', async () => {

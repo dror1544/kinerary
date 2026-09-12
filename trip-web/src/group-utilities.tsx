@@ -1,3 +1,4 @@
+import { VenueLinks } from "./venue-links";
 import { StarRating } from "./star-rating";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -22,7 +23,6 @@ import {
   QueryState,
   useAction,
   ActionState,
-  External,
   type Lang,
 } from "./parity-ui";
 
@@ -189,11 +189,7 @@ export function GroupActivities({
           {p.venues?.map((v, index) => (
             <Section key={v.id || `${p.id}-${index}`} title={bi(v.name, lang) || v.id || tr(lang, "Place", "מקום")}>
               <div className="parity-actions">
-                <External url={v.maps}>{tr(lang, "Maps", "מפה")}</External>
-                <External url={v.waze}>Waze</External>
-                <External url={v.tickets || v.url}>
-                  {tr(lang, "Official site / tickets", "אתר רשמי / כרטיסים")}
-                </External>
+                <VenueLinks venue={v} lang={lang} ticketsLabel={tr(lang, "Official site / tickets", "אתר רשמי / כרטיסים")} />
               </div>
               {v.id && <VenueFeedback
                 id={v.id}
