@@ -16,7 +16,11 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe("mobile option picker", () => {
   it("opens readable options and updates the existing controlled select handler", () => {
     render(<Example />);
-    fireEvent.pointerDown(screen.getByRole("combobox", { name: "When" }));
+    const trigger = screen.getByRole("combobox", { name: "When" });
+    fireEvent.pointerDown(trigger);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.pointerUp(trigger);
+    fireEvent.click(trigger);
     expect(screen.getByRole("dialog", { name: "When" })).toBeVisible();
     expect(screen.getByRole("button", { name: /Morning/ })).toHaveFocus();
     expect(screen.getByRole("button", { name: "Unavailable" })).toBeDisabled();
@@ -36,6 +40,8 @@ describe("mobile option picker", () => {
     vi.stubGlobal("matchMedia", () => ({ matches: false }));
     render(<Example />);
     fireEvent.pointerDown(screen.getByRole("combobox"));
+    fireEvent.pointerUp(screen.getByRole("combobox"));
+    fireEvent.click(screen.getByRole("combobox"));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "evening" } });
     expect(screen.getByRole("combobox")).toHaveValue("evening");

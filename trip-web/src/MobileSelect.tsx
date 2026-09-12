@@ -36,6 +36,12 @@ export function MobileSelect(props: Props) {
     <select {...props} ref={select}
       onPointerDown={event => {
         props.onPointerDown?.(event);
+        // Suppress the native menu, but wait for the completed click to open.
+        // Opening on pointerdown lets the same tap land on the new dialog.
+        if (!event.defaultPrevented && !props.disabled && mobile()) event.preventDefault();
+      }}
+      onClick={event => {
+        props.onClick?.(event);
         if (!event.defaultPrevented && !props.disabled && mobile()) { event.preventDefault(); show(); }
       }}
       onKeyDown={event => {

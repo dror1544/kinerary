@@ -291,3 +291,9 @@ is fetched only after first opening. All 98 SPA tests and the build pass.
 - App selectors now present a mobile dialog with 20px option text, 56px rows, selected indication, scrolling and an X close control. Selection dispatches the real select's change event to preserve existing controlled forms. Desktop retains native select interaction.
 - Verified in the user's existing 400px Chrome tab: the large option list renders; pointer activation opens it, choosing exact time shows its input, and the initial value was restored without saving. Left the list open for inspection.
 - Validation: 101 SPA tests pass, including selection propagation, cancellation/focus restoration and desktop behavior; production build passes.
+
+### Mobile selector opening gesture — 2026-09-12
+
+- Defer opening from pointerdown to the completed click, while suppressing the native picker on pointerdown. This prevents the opening gesture from landing on the newly inserted dialog and immediately choosing an option or dismissing it.
+- Regression coverage now checks the press/release/click sequence: no dialog before click, then it stays open for a separate selection. All 101 SPA tests and the production build pass.
+- Refreshed the user's mobile tab and restored its unsaved Type value (lodging). Keyboard opening is verified. Browser pointer automation timed out, so a complete live tap remains unconfirmed.
