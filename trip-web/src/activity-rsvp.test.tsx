@@ -57,8 +57,9 @@ it("saves an inline rating to the linked venue and shows the user's selection", 
   expect(fetch).not.toHaveBeenCalled();
   const card = screen.getByRole("heading", { name: "Museum" }).closest("article")!;
   fireEvent.click(within(card).getByRole("button", { name: "Rate" }));
-  fireEvent.click(within(card).getByRole("button", { name: "5 ★" }));
-  await waitFor(() => expect(within(card).getByRole("button", { name: "5 ★" })).toHaveAttribute("aria-pressed", "true"));
+  await waitFor(() => expect(within(card).getByRole("radio", { name: "5 out of 5 stars" })).toBeEnabled());
+  fireEvent.click(within(card).getByRole("radio", { name: "5 out of 5 stars" }));
+  await waitFor(() => expect(within(card).getByRole("radio", { name: "5 out of 5 stars" })).toBeChecked());
   const call = fetch.mock.calls.find(([,init]) => init?.method === "POST")!;
   expect(JSON.parse(String(call[1]!.body))).toEqual({ venue: "museum-venue", rating: 5 });
   client.clear();

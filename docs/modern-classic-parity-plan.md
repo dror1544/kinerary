@@ -250,3 +250,13 @@ can link by `item_uid`, or by an unambiguous exact title within the phase;
 venues without IDs and ambiguous matches do not create rating actions.
 The fresh disposable demo on port 4200 enables both actions on Breakfast,
 New York, March 11. All 95 SPA tests and the production build pass.
+
+## Star rating control — 2026-09-12
+
+Replaced numbered rating buttons with five cumulative star icons: hover previews
+without saving, selecting a star saves the rating, and the saved stars remain
+filled. Native radio inputs provide keyboard interaction and accessible labels;
+44px targets and RTL ordering support phones and Hebrew. Pending submissions
+disable the control. Tests verify preview/selection, saved state, RTL labels,
+and inline API submission. All 97 SPA tests and the build pass. Browser preview
+inspection timed out during this follow-up; no visual browser pass is claimed.

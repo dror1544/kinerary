@@ -1,3 +1,4 @@
+import { StarRating } from "./star-rating";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { CurrentUser, TripConfig } from "./api";
@@ -53,19 +54,8 @@ export function VenueFeedback({
   return (
     <div>
       <QueryState query={ratings} lang={lang} />
-      <fieldset disabled={rate.isPending}>
-        <legend>{tr(lang, "Your rating", "הדירוג שלך")}</legend>
-        {[1, 2, 3, 4, 5].map((n) => (
-          <button
-            key={n}
-            type="button"
-            aria-pressed={ratings.data?.[id]?.[username || ""] === n}
-            onClick={() => rate.mutate(n)}
-          >
-            {n} ★
-          </button>
-        ))}
-      </fieldset>
+      <StarRating lang={lang} value={rate.isPending ? rate.variables : ratings.data?.[id]?.[username || ""]}
+        disabled={rate.isPending || ratings.isPending || ratings.isError} onChange={value => rate.mutate(value)} />
       <ActionState action={rate} lang={lang} />
       <ul>
         {Object.entries(ratings.data?.[id] || {}).map(([name, stars]) => (

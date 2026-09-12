@@ -990,3 +990,15 @@ textarea { min-height: 132px; resize: vertical; }
 
 .journey-tools { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-block: 12px; }
 .journey-tools a { color: var(--kit-teal); text-decoration: underline; text-underline-offset: 3px; }
+
+.star-rating { border: 0; padding: 0; margin: 0 0 12px; min-width: 0; }
+.star-rating legend { padding: 0; margin-bottom: 8px; font-weight: 700; }
+.star-rating-options { display: flex; width: fit-content; gap: 2px; }
+.parity-panel .star-rating-option { position: relative; display: grid; place-items: center; width: 44px; height: 44px; cursor: pointer; color: #747b80; border-radius: 8px; }
+.star-rating-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.star-rating-option svg { fill: transparent; stroke-width: 1.7; transition: fill 100ms, color 100ms; }
+.parity-panel .star-rating-option.is-filled { color: #a96900; }
+.star-rating-option.is-filled svg { fill: #fbbc04; }
+.star-rating-option:has(input:focus-visible) { outline: 3px solid var(--kit-teal); outline-offset: 1px; }
+.star-rating:disabled .star-rating-option { cursor: default; opacity: .65; }
+@media (prefers-reduced-motion: reduce) { .star-rating-option svg { transition: none; } }
