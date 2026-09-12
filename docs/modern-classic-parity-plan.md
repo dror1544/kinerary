@@ -260,3 +260,10 @@ filled. Native radio inputs provide keyboard interaction and accessible labels;
 disable the control. Tests verify preview/selection, saved state, RTL labels,
 and inline API submission. All 97 SPA tests and the build pass. Browser preview
 inspection timed out during this follow-up; no visual browser pass is claimed.
+
+## Collapsing activity panels — 2026-09-12
+
+Expanded rating and RSVP panels now show an explicit Collapse control; the
+original action also changes to Hide while open. Collapsing returns keyboard
+focus to that action and preserves unsaved panel input for reopening. Content
+is fetched only after first opening. All 98 SPA tests and the build pass.

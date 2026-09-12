@@ -64,3 +64,22 @@ it("saves an inline rating to the linked venue and shows the user's selection", 
   expect(JSON.parse(String(call[1]!.body))).toEqual({ venue: "museum-venue", rating: 5 });
   client.clear();
 });
+
+it("collapses activity panels, returns focus, and keeps unsaved input when reopened", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url === "/api/ratings" ? {} : []), { headers: { "content-type": "application/json" } })));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const combined = { phases: [{ ...config.phases![0], venues: [{ id: "museum-venue", name: "Museum" }] }] };
+  render(<QueryClientProvider client={client}><JourneyView config={combined} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} lang="en" onHeroPhaseChange={vi.fn()} /></QueryClientProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "RSVP" }));
+  fireEvent.change(screen.getByLabelText("RSVP note (optional)"), { target: { value: "Keep my note" } });
+  fireEvent.click(screen.getByRole("button", { name: "Collapse RSVP" }));
+  expect(screen.queryByRole("region", { name: "Activity RSVP" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "RSVP" })).toHaveFocus();
+  fireEvent.click(screen.getByRole("button", { name: "RSVP" }));
+  expect(screen.getByLabelText("RSVP note (optional)")).toHaveValue("Keep my note");
+  fireEvent.click(screen.getByRole("button", { name: "Rate" }));
+  fireEvent.click(screen.getByRole("button", { name: "Collapse rating" }));
+  expect(screen.queryByRole("region", { name: "Activity rating and comments" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Rate" })).toHaveFocus();
+  client.clear();
+});

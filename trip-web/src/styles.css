@@ -1002,3 +1002,5 @@ textarea { min-height: 132px; resize: vertical; }
 .star-rating-option:has(input:focus-visible) { outline: 3px solid var(--kit-teal); outline-offset: 1px; }
 .star-rating:disabled .star-rating-option { cursor: default; opacity: .65; }
 @media (prefers-reduced-motion: reduce) { .star-rating-option svg { transition: none; } }
+
+.parity-panel .activity-panel-collapse { display: flex; align-items: center; gap: 8px; margin-inline-start: auto; margin-bottom: 16px; }

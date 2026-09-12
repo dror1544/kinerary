@@ -517,6 +517,9 @@ function TimelineItem({
 }) {
   const [rsvpOpen, setRsvpOpen] = useState(false);
   const [ratingOpen, setRatingOpen] = useState(false);
+  const [visitedPanels, setVisitedPanels] = useState({ rating: false, rsvp: false });
+  const ratingButton = useRef<HTMLButtonElement>(null);
+  const rsvpButton = useRef<HTMLButtonElement>(null);
   const Icon = item.item_type === "travel" || item.booking?.type === "flight" ? Plane : item.item_type === "meal" ? TicketCheck : MapPin;
   const title = itemTitle(item, lang);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
@@ -554,8 +557,8 @@ function TimelineItem({
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
         <div className="item-actions" aria-label={`Actions for ${title}`}>
-          {venueId && <button className="item-action" type="button" aria-expanded={ratingOpen} aria-controls={`rating-${item.item_uid}`} onClick={() => setRatingOpen(open => !open)}><Star size={15} />{copy(lang, "Rate", "דירוג")}</button>}
-          {rsvpId && <button className="item-action" type="button" aria-expanded={rsvpOpen} aria-controls={`rsvp-${item.item_uid}`} onClick={() => setRsvpOpen(open => !open)}><CheckCircle2 size={15} />{copy(lang, "RSVP", "אישור השתתפות")}</button>}
+          {venueId && <button className="item-action" type="button" aria-expanded={ratingOpen} aria-controls={`rating-${item.item_uid}`} ref={ratingButton} onClick={() => { setVisitedPanels(p => ({ ...p, rating: true })); setRatingOpen(open => !open); }}><Star size={15} />{ratingOpen ? copy(lang, "Hide rating", "סגירת הדירוג") : copy(lang, "Rate", "דירוג")}</button>}
+          {rsvpId && <button className="item-action" type="button" aria-expanded={rsvpOpen} aria-controls={`rsvp-${item.item_uid}`} ref={rsvpButton} onClick={() => { setVisitedPanels(p => ({ ...p, rsvp: true })); setRsvpOpen(open => !open); }}><CheckCircle2 size={15} />{rsvpOpen ? copy(lang, "Hide RSVP", "סגירת ההשתתפות") : copy(lang, "RSVP", "אישור השתתפות")}</button>}
           {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking?.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</>} /> : null}
           {ticketUrl ? <a className="item-action" href={ticketUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
           {websiteUrl ? <a className="item-action" href={websiteUrl} target="_blank" rel="noreferrer"><Globe2 size={15} /> {copy(lang, "Site", "אתר")}</a> : null}
@@ -564,8 +567,8 @@ function TimelineItem({
           {extraLinks.map((link) => <a key={`${link.label}-${link.url}`} className="item-action" href={link.url} target="_blank" rel="noreferrer"><ExternalLink size={15} /> {link.label}</a>)}
           {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {copy(lang, "Ask", "שאלו")}</a> : null}
         </div>
-        {venueId && ratingOpen && <section className="parity-panel" id={`rating-${item.item_uid}`} aria-label={copy(lang, "Activity rating and comments", "דירוג ותגובות לפעילות")}><VenueFeedback key={venueId} id={venueId} username={username} lang={lang} /></section>}
-        {rsvpId && rsvpOpen && <section className="parity-panel activity-rsvp-panel" id={`rsvp-${item.item_uid}`} aria-label={copy(lang, "Activity RSVP", "השתתפות בפעילות")}><ActivityRsvp key={rsvpId} id={rsvpId} lang={lang} /></section>}
+        {venueId && visitedPanels.rating && <section hidden={!ratingOpen} className="parity-panel" id={`rating-${item.item_uid}`} aria-label={copy(lang, "Activity rating and comments", "דירוג ותגובות לפעילות")}><button className="activity-panel-collapse" type="button" onClick={() => { setRatingOpen(false); ratingButton.current?.focus(); }}><X size={16} />{copy(lang, "Collapse rating", "סגירת הדירוג")}</button><VenueFeedback key={venueId} id={venueId} username={username} lang={lang} /></section>}
+        {rsvpId && visitedPanels.rsvp && <section hidden={!rsvpOpen} className="parity-panel activity-rsvp-panel" id={`rsvp-${item.item_uid}`} aria-label={copy(lang, "Activity RSVP", "השתתפות בפעילות")}><button className="activity-panel-collapse" type="button" onClick={() => { setRsvpOpen(false); rsvpButton.current?.focus(); }}><X size={16} />{copy(lang, "Collapse RSVP", "סגירת ההשתתפות")}</button><ActivityRsvp key={rsvpId} id={rsvpId} lang={lang} /></section>}
       </div>
     </article>
   );
