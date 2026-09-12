@@ -841,11 +841,21 @@ export function JourneyView({
   const phaseGroups = useMemo(() => buildPhaseGroups(config?.phases, days, lang), [config?.phases, days, lang]);
   const [selectedPhase, setSelectedPhase] = useState(phaseGroups[0]?.id || "");
   const activePhase = phaseGroups.find((phase) => phase.id === selectedPhase) || phaseGroups[0];
-  // The dates a phase offers: the ones with a plan, or — while that is still
-  // empty — the calendar the interview already established for it.
-  const phaseDates = activePhase?.days.length
-    ? activePhase.days.map((day) => day.date)
-    : activePhase?.calendar ?? [];
+  // EVERY date the phase covers, whether or not something is planned in it.
+  //
+  // Either/or was wrong and under-reported the trip: a Tokyo leg written
+  // 19–23 September, with one day planned, showed one day and hid the other
+  // four — while the leg with nothing planned at all showed its whole range.
+  // Reported 2026-09-12: "Tokyo for example of the first phase is 19/9-23
+  // (even written explicitly on the document) but again it shows only 1 day.
+  // However last phase which is also Tokyo shows the four days."
+  //
+  // A planned day outside the phase's own range still appears — it exists, and
+  // hiding it would lose an item somebody wrote.
+  const phaseDates = useMemo(() => {
+    const planned = activePhase?.days.map((day) => day.date) ?? [];
+    return [...new Set([...(activePhase?.calendar ?? []), ...planned])].sort();
+  }, [activePhase]);
   const [selected, setSelected] = useState(phaseDates[0] || "");
   const activeDate = phaseDates.includes(selected) ? selected : phaseDates[0] || "";
   const dayItems = itinerary?.items.filter((item) => item.date === activeDate && (!activePhase?.id || item.phase_id === activePhase.id)) || [];
@@ -993,7 +1003,7 @@ export function JourneyView({
               // The SHAPE of the trip, which the interview settles long before
               // anyone writes what happens in those days: three days in Tokyo,
               // one in Hakone. A day with nothing in it is still a day.
-              const count = phase.days.length || phase.calendar.length;
+              const count = new Set([...phase.calendar, ...phase.days.map((day) => day.date)]).size;
               if (count) return copy(lang, `${count} ${count === 1 ? "day" : "days"}`, `${count} ${count === 1 ? "יום" : "ימים"}`);
               if (phase.venues.length) {
                 return copy(lang, `${phase.venues.length} ${phase.venues.length === 1 ? "place" : "places"}`, `${phase.venues.length} מקומות`);

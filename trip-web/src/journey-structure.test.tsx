@@ -72,6 +72,59 @@ describe("a trip with structure and no plan", () => {
   });
 });
 
+describe("a phase with part of its plan written", () => {
+  // 2026-09-12, from a real trip: Tokyo 19–23 September with a single day
+  // planned showed ONE day and hid the other four, while the leg with nothing
+  // planned showed its whole range. Under-reporting a trip reads as the site
+  // losing the trip, and it is the thing that made the organizer worry.
+  function renderPartlyPlanned() {
+    return render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JourneyView
+          itinerary={{
+            days: [{ date: "2026-09-20", phase_id: "tokyo", label_en: "Day 2" }],
+            items: [],
+          } as never}
+          config={CONFIG}
+          isOrganizer
+          lang="en"
+          onHeroPhaseChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("still offers every day of the phase, not only the planned one", () => {
+    renderPartlyPlanned();
+    const strip = screen.getByLabelText("Days in selected phase");
+    expect(within(strip).getAllByRole("button")).toHaveLength(3);
+    expect(within(strip).getAllByText("open")).toHaveLength(2);
+  });
+
+  it("counts the whole leg in the rail", () => {
+    renderPartlyPlanned();
+    expect(within(screen.getByLabelText("Trip phases")).getByText("3 days")).toBeInTheDocument();
+  });
+
+  it("keeps a planned day that falls outside the phase's own range", () => {
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JourneyView
+          itinerary={{ days: [{ date: "2026-09-25", phase_id: "tokyo" }], items: [] } as never}
+          config={CONFIG}
+          isOrganizer
+          lang="en"
+          onHeroPhaseChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    const strip = screen.getByLabelText("Days in selected phase");
+    expect(within(strip).getAllByRole("button")).toHaveLength(4);
+    // Sorted, so the stray day sits after the range rather than first.
+    expect(within(strip).getAllByRole("button").at(-1)!.textContent).toMatch(/25/);
+  });
+});
+
 describe("a date filed under the wrong leg", () => {
   it("says so, and still lets the organizer mean it", async () => {
     const post = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
