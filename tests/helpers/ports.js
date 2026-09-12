@@ -39,6 +39,7 @@ export const PORTS = {
   itineraryPlanLayerServer: 3118,  // moved off 3107 (currencyRates)
   configDayLinksServer:     3114,  // moved off 3110 (scheduleReviewMockHermes)
 
+  modernParity:           3298,
   modernEnrichment:        3194,
   heroHttp:                3196,
   tripEventsHttp:          3198,
