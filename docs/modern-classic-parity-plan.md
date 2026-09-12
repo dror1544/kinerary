@@ -279,3 +279,8 @@ is fetched only after first opening. All 98 SPA tests and the build pass.
 
 - Select elements inherit the site font and keyboard focus treatment. Mobile form selectors use 16px text and a 52px minimum height; Journey's day picker uses 18px text and a 56px minimum height.
 - Validation: production build passed. At a 390px Chrome viewport, the Hebrew day picker measured 56px tall with 18px text; selecting March 12 updated the selected day and displayed its empty itinerary state.
+
+### Mobile editor sizing follow-up — 2026-09-12
+
+- Inspected the user's existing Chrome tab with DevTools at 400px: editor selectors still used 16px text, unlike the day picker. All mobile selectors now use 20px text, 60px height and a 24px arrow with RTL placement. Editor labels and text/date fields use 18px text; inputs have a 56px minimum height. Native selection and forced-colors appearance are retained.
+- Verified the actual open tab after rebuilding: all four selectors measured 20px/60px and the screenshot showed the larger editor controls. Choosing exact time displayed its input; restored the initial selection without saving. Production build passed.

@@ -1005,20 +1005,29 @@ textarea { min-height: 132px; resize: vertical; }
 
 .parity-panel .activity-panel-collapse { display: flex; align-items: center; gap: 8px; margin-inline-start: auto; margin-bottom: 16px; }
 
-/* Native pickers keep the same readable type and touch size across mobile forms. */
+/* Keep native picker behavior, with readable text and a clearly visible arrow. */
 @media (max-width: 880px) {
   .modern-trip-app select {
+    appearance: none;
     width: 100%;
     min-width: 0;
-    min-height: 52px;
-    padding: 12px 16px;
+    min-height: 60px;
+    padding: 14px 16px;
+    padding-inline-end: 48px;
     font-family: inherit;
-    font-size: 16px;
-    line-height: 1.5;
-  }
-  .mobile-day-picker select {
-    min-height: 56px;
-    font-size: 18px;
+    font-size: 20px;
     font-weight: 700;
+    line-height: 1.5;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2310263a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 16px center;
+    background-size: 24px;
   }
+  [dir=rtl] .modern-trip-app select { background-position: left 16px center; }
+  .editor-fields { gap: 18px; }
+  .editor-fields label { gap: 8px; font-size: 18px; }
+  .editor-fields input { min-height: 56px; font-size: 18px; padding: 12px 16px; }
+}
+@media (max-width: 880px) and (forced-colors: active) {
+  .modern-trip-app select { appearance: auto; background-image: none; }
 }
