@@ -1,4 +1,4 @@
-import { CompanionTasks } from "./CompanionTasks";
+import { CompanionPanel } from "./CompanionPanel";
 import { TodayWeather } from "./TodayWeather";
 import { MobileSelect } from "./MobileSelect";
 import { rsvpForItem, venueForItem } from "./activity-rsvp";
@@ -16,7 +16,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
-  Bot,
   CalendarDays,
   Camera,
   CheckCircle2,
@@ -92,7 +91,6 @@ import {
   resetParticipantPassword,
   login,
   postPhotoComment,
-  reportIssue,
   runtimeUrl,
   tokenStore,
   UNAUTHORIZED_EVENT,
@@ -582,68 +580,6 @@ type JourneyFocus = {
   itemUid?: string;
 };
 
-function CompanionPanel({
-  config,
-  hermes,
-  next,
-  todayDate,
-  isOrganizer,
-  lang,
-}: {
-  config?: TripConfig;
-  hermes?: Awaited<ReturnType<typeof getHermes>>;
-  next?: ItineraryItem | null;
-  todayDate?: string;
-  isOrganizer?: boolean;
-  lang: Lang;
-}) {
-  const [message, setMessage] = useState("");
-  const [saved, setSaved] = useState("");
-  const name = botDisplayName(config, hermes?.identity.name, lang);
-  const context = next ? `About ${todayDate || "today"} - ${itemTitle(next, lang)}` : `About ${todayDate || "the trip plan"}`;
-  const askHref = telegramUrl(hermes?.telegram_username, `${context}\n\n${message || "I have a question about today's plan."}`);
-  const privateHref = telegramUrl(hermes?.telegram_username, `[Organizer private]\n${context}\n\n${message || "Please review this privately."}`);
-  const reportMutation = useMutation({
-    mutationFn: () => reportIssue({
-      title: `${name} member question`,
-      detail: `${context}\n\n${message}`.slice(0, 1000),
-      phase_id: next?.phase_id || null,
-      date: next?.date || todayDate || null,
-      item_uid: next?.item_uid || null,
-      severity: "info",
-    }),
-    onSuccess: () => {
-      setSaved("Saved to the organizer issue queue.");
-      setMessage("");
-    },
-  });
-
-  return (
-    <section className="companion-panel">
-      <div className="companion-head">
-        <img src={brandMark} alt="" />
-        <div>
-          <span className="panel-label"><Bot size={16} /> {name}</span>
-          <h3>{lang === "he" ? "שאלו על התוכנית של היום" : "Ask about the day plan"}</h3>
-        </div>
-      </div>
-      <p>{hermes?.available ? "Fresh checks are available for plan questions and confirmations." : "Telegram handoff is ready when the bot is configured; reports still reach the organizer queue."}</p>
-      <label className="bot-input">
-        <span>{lang === "he" ? "מה לבדוק?" : "What should the companion check?"}</span>
-        <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder={context} />
-      </label>
-      <div className="bot-actions">
-        {askHref ? <a className="primary-action" href={askHref} target="_blank" rel="noreferrer"><Send size={17} /> {copy(lang,"Ask in Telegram","שאלה בטלגרם")}</a> : null}
-        <button className="secondary-action" type="button" disabled={!message.trim() || reportMutation.isPending} onClick={() => reportMutation.mutate()}>
-          <AlertTriangle size={17} /> Flag plan issue
-        </button>
-        {isOrganizer && privateHref ? <a className="secondary-action" href={privateHref} target="_blank" rel="noreferrer"><MessageCircle size={17} /> {copy(lang,"Private organizer chat","שיחה פרטית למארגן")}</a> : null}
-      </div>
-      {saved ? <small className="saved-note">{saved}</small> : null}
-    </section>
-  );
-}
-
 export function TripClockPanel({
   config,
   itinerary,
@@ -759,23 +695,10 @@ function TodayView({
           <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
           {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
         </section>
-        <section className="mini-panel">
-          <Bot size={20} />
-          <h3>{companionName}</h3>
-          <p>{hermes.data?.available ? "Available for trip checks." : "Profile visible; live checks not configured."}</p>
-          {hermes.data?.telegram_username ? <a href={telegramUrl(hermes.data.telegram_username)}>{copy(lang,"Open conversation","פתיחת שיחה")}</a> : null}
-          {isOrganizer && <CompanionTasks lang={lang} />}
-        </section>
+
       </aside>
 
-      <CompanionPanel
-        config={config}
-        hermes={hermes.data}
-        next={next}
-        todayDate={today.data?.today}
-        isOrganizer={isOrganizer}
-        lang={lang}
-      />
+      <CompanionPanel name={companionName} telegramUsername={hermes.data?.telegram_username} isOrganizer={isOrganizer} lang={lang} />
 
       <section className="section-band">
         <div className="section-heading">

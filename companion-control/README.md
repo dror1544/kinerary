@@ -65,8 +65,8 @@ raw prompts, scripts, tokens, chat IDs, or personal details in UI labels.
 
 No real job is created, run, paused, or resumed by merely deploying the UI.
 Deploying the adapter requires selecting the correct trip profile and registry.
-The group-message feed, binding-command retrieval, and website conversations
-are separate integrations; these scheduler controls do not claim to implement them.
+The shared conversation and connection metadata are documented below; the
+scheduler controls only manage explicitly registered tasks.
 
 ## Verification
 
@@ -78,3 +78,37 @@ npm test --prefix trip-web -- src/CompanionTasks.test.tsx
 
 The Python test uses a disposable profile, real Hermes cron storage and APIs,
 and no running scheduler; it never sends a message or executes a job.
+
+## Website companion card
+
+The Today card now owns the shared website conversation and scheduler controls;
+the duplicate status card is removed. Website messages are visible to **all trip
+members**, explicitly stated above the input. This is not an organizer-private
+channel. The trip database persists questions and replies across restarts.
+
+Runtime routes:
+- `GET/POST /api/companion/conversation`: authenticated shared feed / question.
+  Server assigns the author, limits text to 2,000 characters and outstanding
+  questions to five per member. Saving means pending, not delivered or answered.
+  The card displays an offline notice when no agent inbox check occurred in the
+  last ten minutes; it never infers bot availability from a saved message.
+- `GET /api/agent/companion/inbox`: agent-key-only unanswered questions.
+- `POST /api/agent/companion/messages`: agent-key-only replies or group updates.
+  Replies reference an existing question; retries return the first saved reply.
+- `POST /api/agent/companion/connection`: agent-key-only verified Telegram links
+  and optional control-plane-issued binding command with its real expiry.
+- `GET /api/companion/connection`: organizer/agent-only unexpired command.
+  The shared feed never includes that command. No raw trip config is served.
+
+MCP tools `get_companion_inbox`, `publish_companion_reply`,
+`publish_companion_group_update`, and `set_companion_connection` connect the
+trip companion to this store. Group updates are mirrored **after confirmed
+Telegram delivery**, never from private history. Links open Telegram for the
+user to compose/send; opening the card does not send messages.
+
+Activation requires a real assigned trip profile, the updated MCP tool set, a
+healthy recurring inbox check, and verified Telegram connection metadata. The
+profile SOUL template specifies that workflow. This code does not assign a
+profile, mint binding tokens, read Telegram histories, or install a cron job into
+an arbitrary existing profile. Until activated, questions remain visibly pending
+and absent connections are hidden. Copying the group command rechecks expiry.
