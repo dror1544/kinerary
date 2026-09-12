@@ -33,7 +33,7 @@ export function CompanionTasks({ lang }: { lang: 'he' | 'en' }) {
   };
   const audience = (value: Task['audience']) => value === 'website' ? copy('Website', 'אתר הטיול') : value === 'group' ? copy('Telegram group', 'קבוצת הטלגרם') : copy('Organizer privately', 'למארגן בפרטי');
   return <div className="companion-settings">
-    <button type="button" className="secondary-action" aria-expanded={open} onClick={() => setOpen(!open)}><Settings2 size={16} />{copy('Companion settings', 'הגדרות העוזר')}</button>
+    <button type="button" className="secondary-action companion-settings-toggle" aria-label={copy('Companion settings', 'הגדרות העוזר')} title={copy('Companion settings', 'הגדרות העוזר')} aria-expanded={open} onClick={() => setOpen(!open)}><Settings2 size={18} aria-hidden="true" /></button>
     {open && <section aria-label={copy('Scheduled updates', 'עדכונים מתוזמנים')}>
       <h4>{copy('Scheduled updates', 'עדכונים מתוזמנים')}</h4>
       {tasks.isPending && <p>{copy('Loading scheduled updates…', 'טוענים עדכונים מתוזמנים…')}</p>}

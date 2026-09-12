@@ -1071,3 +1071,5 @@ textarea { min-height: 132px; resize: vertical; }
 .companion-task-heading button[aria-checked=true] { background: var(--kit-teal); color: white; }
 .companion-task button:disabled { opacity: .5; cursor: default; }
 .companion-task p { margin: 8px 0; }
+
+.companion-settings-toggle { width: 44px; height: 44px; padding: 0; justify-content: center; }
