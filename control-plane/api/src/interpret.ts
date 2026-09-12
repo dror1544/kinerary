@@ -510,6 +510,27 @@ export interface ApplyProposalsContext {
   /** Default 0.7. One threshold, not a per-question table, until there is
    *  evidence a per-question one is needed. */
   minConfidence?: number;
+  /**
+   * The question the router has ON SCREEN, if any.
+   *
+   * The confidence floor exists to stop the model VOLUNTEERING uncertain
+   * answers to questions nobody asked — a side-extraction that turns out wrong
+   * is an answer the organizer never gave. It was never meant to refuse the
+   * reply to a question the router itself just asked, and refusing that is a
+   * loop with no exit: the router asks, the organizer answers, the gate
+   * refuses, the router asks the same question again. Live on 2026-09-12 —
+   * "מי מהנוסעים זה אתה?", answered "דרור, אבא של המשפחה", read as `Dror` at
+   * 0.4 and then 0.55, refused twice, asked a third time. An organizer in that
+   * position retypes the same words and gets the same silence; the run gave up
+   * after four minutes, and a person would give up too.
+   *
+   * So a proposal for the question on screen is exempt from the floor, and
+   * from that alone. Evidence must still be in the source and values must
+   * still not come from the example: those say the answer is not theirs. A low
+   * confidence only says the model is unsure, and the recap is where the
+   * organizer sees what was recorded and corrects it.
+   */
+  pendingQuestionId?: string | null;
 }
 
 export const DEFAULT_MIN_CONFIDENCE = 0.7;
@@ -705,7 +726,9 @@ export function applyProposals(
     if (RETIRED_QUESTION_IDS.has(p.questionId)) return { reason: "NOT_OUTSTANDING", detail: "retired question" };
     if (answered.has(p.questionId)) return { reason: "ALREADY_ANSWERED" };
     if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
-    if (p.confidence < minConfidence) return { reason: "LOW_CONFIDENCE" };
+    if (p.confidence < minConfidence && p.questionId !== ctx.pendingQuestionId) {
+      return { reason: "LOW_CONFIDENCE" };
+    }
     if (!evidenceAppears(p.evidence, ctx.sourceText)) return { reason: "EVIDENCE_NOT_IN_SOURCE" };
     const echoed = exampleEchoes(questions.find((q) => q.id === p.questionId)?.dataExample, p.value, ctx.sourceText);
     if (echoed.length > 0) return { reason: "EXAMPLE_ECHO", detail: echoed.slice(0, 4).join(", ") };
@@ -763,7 +786,9 @@ export function applyProposals(
     if (answered.has(proposal.questionId)) return reject(proposal, "ALREADY_ANSWERED");
     if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
-    if (proposal.confidence < minConfidence) return reject(proposal, "LOW_CONFIDENCE");
+    if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
+      return reject(proposal, "LOW_CONFIDENCE");
+    }
     if (!evidenceAppears(proposal.evidence, ctx.sourceText)) return reject(proposal, "EVIDENCE_NOT_IN_SOURCE");
     const echoed = exampleEchoes(questions.find((q) => q.id === proposal.questionId)?.dataExample, proposal.value, ctx.sourceText);
     if (echoed.length > 0) return reject(proposal, "EXAMPLE_ECHO", echoed.slice(0, 4).join(", "));

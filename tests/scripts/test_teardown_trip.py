@@ -105,6 +105,38 @@ class OriginalSlug(unittest.TestCase):
         self.assertEqual(teardown.original_slug("italy-2026"), "italy-2026")
 
 
+class ResourceSlug(unittest.TestCase):
+    """Where a trip's container and deploy dir actually live."""
+
+    def test_a_retired_trip_keeps_its_original_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "japan-2026").mkdir()
+            self.assertEqual(teardown.resource_slug("retired-japan-2026-20260911", Path(d)), "japan-2026")
+
+    def test_a_trip_built_after_it_was_retired_is_found_under_the_retired_name(self):
+        # 2026-09-12: `--stop-after confirm --teardown` retired the trip while
+        # the build confirming had started was still running, and the worker
+        # finished it under the retired slug. Looking only under the original
+        # name reported "nothing to do" over a live container.
+        slug = "retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-20260912"
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / slug).mkdir()
+            self.assertEqual(teardown.resource_slug(slug, Path(d)), slug)
+
+    def test_an_unretired_trip_is_its_own_slug(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(teardown.resource_slug("italy-2026", Path(d)), "italy-2026")
+
+    def test_the_container_name_is_cut_where_proxmox_cuts_it(self):
+        # compute.py's `f"trip-{slug}"[:63]`. The live container was named
+        # `trip-retired-draft-sreq-…-202609`; comparing against the uncut name
+        # refused a topology that described the trip exactly.
+        slug = "retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-20260912"
+        self.assertEqual(teardown.expected_lxc_name(slug),
+                         "trip-retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-202609")
+        self.assertEqual(teardown.expected_lxc_name("japan-2026"), "trip-japan-2026")
+
+
 class Resolve(unittest.TestCase):
     def fake_psql(self, trip: dict, bound: str = "", shared: str = "0", open_: str = "0"):
         def psql(sql: str) -> str:
