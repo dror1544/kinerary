@@ -286,8 +286,33 @@ export function parseInterpretPayload(raw: unknown, allowedMessageIds: readonly 
  */
 const INVISIBLE = /[‎‏‪-‮⁦-⁩­﻿​-‍]/g;
 
+/**
+ * Case, whitespace — and the punctuation a document and a model spell
+ * differently.
+ *
+ * A PDF writes a date range with an en dash ("19–23 September"), a hotel name
+ * with a curly apostrophe, a quotation with typographic quotes. A model reading
+ * it and quoting it back types the ASCII forms almost every time. Same text,
+ * different bytes, no match — and on 2026-09-12 that refused the phases
+ * extracted from a four-page itinerary as EVIDENCE_NOT_IN_SOURCE, so the
+ * organizer was asked for every stop and date the document had already given.
+ *
+ * Normalizing these cannot let an invention through: a hotel the model made up
+ * is different WORDS, not different punctuation.
+ */
+const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+const SINGLE_QUOTES = /[\u2018\u2019\u201A\u201B\u2032\u2035]/g;
+const DOUBLE_QUOTES = /[\u201C\u201D\u201E\u201F\u2033\u2036]/g;
+
 function fold(text: string): string {
-  return text.replace(INVISIBLE, "").toLowerCase().replace(/\s+/g, " ").trim();
+  return text
+    .replace(INVISIBLE, "")
+    .replace(DASHES, "-")
+    .replace(SINGLE_QUOTES, "'")
+    .replace(DOUBLE_QUOTES, '"')
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** One line of a claim, folded and stripped of surrounding punctuation. */

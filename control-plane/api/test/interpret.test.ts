@@ -268,6 +268,26 @@ describe("exampleEchoes — a value that came from the prompt, not the person", 
   });
 });
 
+describe("evidenceAppears — a document and a model spell punctuation differently", () => {
+  // 2026-09-12: a four-page itinerary was read correctly and its `phases`
+  // proposal was refused as EVIDENCE_NOT_IN_SOURCE, so the organizer was asked
+  // for every stop and date the document had already given. A PDF writes
+  // "19–23 September"; a model quoting it types "19-23 September".
+  test("an en dash in the source matches a hyphen in the quote", () => {
+    assert.equal(evidenceAppears("Tokyo 19-23 September", "Itinerary: Tokyo 19–23 September"), true);
+    assert.equal(evidenceAppears("Tokyo 19–23 September", "Itinerary: Tokyo 19-23 September"), true);
+  });
+
+  test("typographic quotes match their ASCII spelling, both ways", () => {
+    assert.equal(evidenceAppears("the \"Hoshino\" stay", "booked the “Hoshino” stay"), true);
+    assert.equal(evidenceAppears("O'Hare transfer", "O’Hare transfer"), true);
+  });
+
+  test("and none of that lets a different WORD through", () => {
+    assert.equal(evidenceAppears("Hotel Okura", "Itinerary: Tokyo 19–23 September, OMO3 Asakusa"), false);
+  });
+});
+
 describe("applyProposals — the gate", () => {
   test("refuses a value copied out of the question's example", () => {
     const questions: IntakeQuestion[] = [
@@ -878,31 +898,25 @@ describe("structured questions name their fields", () => {
 
     const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
     // `planned` is deliberately NOT one the transformer reads — see below.
+    // No `days`: the survey pass does not transcribe itineraries — see the note
+    // on the question. `extract_itinerary` produces them, and `_derive_phases`
+    // reads them off this answer once they are folded in.
     assert.deepEqual(
       Object.keys(phases[0]).sort(),
-      ["accommodation", "days", "end", "name", "name_en", "planned", "start"],
+      ["accommodation", "end", "name", "name_en", "planned", "start"],
     );
     assert.equal(typeof phases[0].accommodation, "object", "accommodation is an object, not a string");
     assert.ok("name" in phases[0].accommodation);
   });
 
-  test("a phase's days are shaped the way the site reads them", () => {
-    // `_derive_phases` passes `days` straight through to trip.config.json, and
-    // both site renderers read {date, label, items:[{time, text}]}. A document
-    // with a dated day-by-day had nowhere to land before this: the organizer's
-    // report, 2026-09-12 — "there are dates on the document for the planned
-    // activities but they were not captured".
+  test("the day shape the site reads is pinned where days are made", () => {
+    // It used to be asserted on this question's example, back when the survey
+    // pass was asked for days too. That work moved to `extract_itinerary` —
+    // `itinerary-extract.test.ts` holds the shape now, against the normaliser
+    // that actually produces it. Kept as a pointer so the contract is findable
+    // from the place it used to live.
     const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
-    // MORE THAN ONE, deliberately. With a single day in it the example reads as
-    // "give me a day": the first live extraction returned exactly one day for a
-    // five-day leg described day by day, losing four (2026-09-12).
-    assert.ok(phases[0].days.length >= 2, "the example shows a list of days, not a day");
-    const day = phases[0].days[0];
-    assert.deepEqual(Object.keys(day).sort(), ["date", "items", "label"]);
-    assert.match(day.date, /^\d{4}-\d{2}-\d{2}$/);
-    assert.deepEqual(Object.keys(day.label).sort(), ["en", "he"], "bilingual, like every other label on the site");
-    assert.deepEqual(Object.keys(day.items[0]).sort(), ["text", "time"]);
-    assert.deepEqual(Object.keys(day.items[0].text).sort(), ["en", "he"]);
+    assert.equal(phases[0].days, undefined, "asking this call for days is what made it stop finishing");
   });
 
   /**

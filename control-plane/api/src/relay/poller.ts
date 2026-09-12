@@ -1012,8 +1012,6 @@ async function runDocumentPath(
     }
   }
 
-  await foldItineraryFromDocument(deps, burst, source, log);
-
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
     // PROPOSED vs ACCEPTED, and MALFORMED alongside both — the interpret log
@@ -1032,6 +1030,11 @@ async function runDocumentPath(
     merged: decisions.accepted.filter((a) => a.mergedFrom).length,
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
+    // WHICH question was refused, not only how many and why. "rejected: 1,
+    // reasons: [EVIDENCE_NOT_IN_SOURCE]" cost a live diagnosis on 2026-09-12:
+    // the organizer was asked for every stop and date their document had
+    // already given, and nothing in the log said it was `phases` that fell.
+    rejected_questions: decisions.rejected.map((r) => `${r.questionId}:${r.reason}`),
     ms: result.ms,
   }));
 
@@ -1075,6 +1078,16 @@ async function runDocumentPath(
     }
   }
   await ask();
+
+  // LAST, and deliberately. The itinerary extraction is a second model call,
+  // and the general one above already takes minutes — running it before the
+  // recap left an organizer watching nothing happen for seven minutes on
+  // 2026-09-12, having been told the document was being read. What they were
+  // waiting for was already written; only the day-by-day was still coming.
+  //
+  // So they get the recap and the next question first, and the itinerary lands
+  // behind it, on a `phases` answer that is already recorded.
+  await foldItineraryFromDocument(deps, burst, source, log, say, language);
 }
 
 /**
@@ -1750,6 +1763,8 @@ export async function foldItineraryFromDocument(
   burst: { chatId: string; sessionId: string },
   documentText: string,
   log: (line: string) => void,
+  say?: (text: string) => Promise<void>,
+  language: Language = DEFAULT_LANGUAGE,
 ): Promise<void> {
   const store = await answersForChat(deps.db, burst.chatId);
   const phasesAnswer = store?.answers.phases;
@@ -1817,6 +1832,8 @@ export async function foldItineraryFromDocument(
     written: written.ok,
     ...(written.ok ? {} : { reason: written.reason }),
   }));
+  // An extraction nobody can see reads as a document that was not understood.
+  if (written.ok && folded.daysAdded > 0 && say) await say(uiString("documentDays", language));
 }
 
 async function handBackToInterviewer(

@@ -355,6 +355,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
+    // Said only when a day-by-day actually landed. An extraction nobody can
+    // see reads as a document that was not understood — the same reason the
+    // planned places are listed rather than hidden inside a phase name.
+    documentDays: "I've also put the day-by-day from your plan onto each stop — you'll see it on the trip site, and we can change anything on it later.",
     // NOT the same as finding nothing, and it took a live run to see why that
     // matters: the organizer sent a booking PDF full of dates and hotels and
     // was told there was nothing about the trip in it. There was. The reading
@@ -435,6 +439,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
+    documentDays: "הוספתי גם את התוכנית היומית מהמסמך לכל עצירה — תראו אותה באתר של הטיול, ותמיד אפשר לשנות.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
