@@ -36,6 +36,7 @@ import {
   DOCUMENT_FLOOR_SECONDS,
   claimDueRouterPrompts,
   claimFloor,
+  finalizeMultiChoiceForChat,
   markAwaitingMachine,
   claimStalledAgentTurns,
   openAgentTurn,
@@ -451,6 +452,29 @@ async function applyInterviewCallback(
   const ack = (text?: string) =>
     deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text });
 
+  /**
+   * Answer the tap, and do not let a concurrent scan swallow the answer.
+   *
+   * `applyDecision` hands the floor to the machine when a tap arrives, so a
+   * view built after that says `machine`. If the reply still goes out as
+   * nothing, the floor was taken from under it mid-send — the scan's own
+   * `sendNextStep` ends by handing the floor back to the organizer whenever
+   * the question is already on their screen, which for a SKIP is exactly the
+   * question that is no longer on it. One retry, on a fresh view.
+   *
+   * Only when the view we sent said `machine`: a view that says `person` means
+   * the floor was the organizer's before the tap was even processed — the
+   * agent's turn, say — and speaking over that is the duplicate-message bug
+   * the floor exists to prevent.
+   */
+  const respond = async (view: SessionView) => {
+    if (await sendNextStep(view, decision.chatId, deps, strings)) return;
+    if (view.awaiting !== "machine") return;
+    await markAwaitingMachine(deps.db, decision.chatId);
+    const fresh = await getSessionForChat(deps.db, decision.chatId);
+    if (fresh.ok) await sendNextStep(fresh.view, decision.chatId, deps, strings);
+  };
+
   if (parsed.kind === "answer") {
     const question = findQuestion(parsed.questionId);
     if (!question) {
@@ -494,7 +518,7 @@ async function applyInterviewCallback(
         replyMarkup: undefined,
       });
     }
-    await sendNextStep(result.view, decision.chatId, deps, strings);
+    await respond(result.view);
     return;
   }
 
@@ -542,7 +566,9 @@ async function applyInterviewCallback(
       if (chosenBefore.length === 0) {
         return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
       }
-      return beforeFinalize;
+      // What ENDS the selection. Every tick wrote itself already; this is the
+      // moment the question counts as answered and the interview may move on.
+      return finalizeMultiChoiceForChat(deps.db, decision.chatId, parsed.questionId);
     })();
     if (!view.ok) {
       await ack("I couldn't do that — try again.");
@@ -564,7 +590,21 @@ async function applyInterviewCallback(
         replyMarkup: undefined,
       });
     }
-    await sendNextStep(view.view, decision.chatId, deps, strings);
+    // THE FLOOR, for this tap only.
+    //
+    // `skipQuestionForChat` and `finalizeMultiChoiceForChat` return views whose
+    // `awaiting` is `buildSessionView`'s default — "person" — regardless of the
+    // session. `sendNextStep` reads the floor off the view it is given and says
+    // nothing while it is the organizer's turn, so a tapped Skip recorded the
+    // skip, collapsed the keyboard to "(דילגו)", and then said nothing at all.
+    // Two minutes of that on 2026-09-12, until the organizer typed something
+    // and the interpret path carried on as normal.
+    //
+    // The machine owes this message: `applyDecision` took the floor when the
+    // tap arrived. Said here rather than in the view builders because a
+    // truthful floor everywhere also lets the router speak over an agent
+    // mid-turn, which is a different question with its own tests.
+    await respond({ ...view.view, awaiting: "machine" });
     return;
   }
 
@@ -580,7 +620,7 @@ async function applyInterviewCallback(
       return;
     }
     await ack();
-    await sendNextStep(view.view, decision.chatId, deps, strings);
+    await respond(view.view);
     return;
   }
 
@@ -591,7 +631,7 @@ async function applyInterviewCallback(
       return;
     }
     await ack();
-    await sendNextStep(result.view, decision.chatId, deps, strings);
+    await respond(result.view);
     return;
   }
 
@@ -602,7 +642,7 @@ async function applyInterviewCallback(
       return;
     }
     await ack();
-    await sendNextStep(result.view, decision.chatId, deps, strings);
+    await respond(result.view);
     return;
   }
 
@@ -696,7 +736,7 @@ async function applyInterviewCallback(
     // for the organizer to invent a topic. Multi-select is tappable now, so
     // the old reason for not doing this is gone.
     if (result.ok && result.view.nextQuestion) {
-      await sendNextStep(result.view, decision.chatId, deps, strings);
+      await respond(result.view);
     }
     return;
   }
@@ -1786,7 +1826,7 @@ async function restateExpectation(
     return false;
   }
 
-  if (!(await claimFloor(deps.db, chatId))) return false;
+  if (!(await takeFloor(chatId, view, deps))) return false;
   (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.expectation_restated", {
     session_id: view.sessionId,
     reason,
@@ -1797,6 +1837,25 @@ async function restateExpectation(
     replyMarkup: rendered.replyMarkup ?? undefined,
   });
   return true;
+}
+
+/**
+ * Take the floor to speak, and say so in the log when we cannot.
+ *
+ * `claimFloor` returning false means somebody else claimed it between our read
+ * and our send — in practice the periodic scan, which hands the floor back to
+ * the organizer whenever the question is already on their screen. Every call
+ * site then did a bare `return false`, so the router went quiet with no line
+ * anywhere saying why. On 2026-09-12 an organizer tapped Skip, watched the
+ * keyboard collapse, and waited two minutes in front of a relay log that
+ * recorded nothing at all.
+ */
+async function takeFloor(chatId: string, view: SessionView, deps: TripBotPollerDeps): Promise<boolean> {
+  if (await claimFloor(deps.db, chatId)) return true;
+  (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_lost", {
+    session_id: view.sessionId,
+  }));
+  return false;
 }
 
 async function sendNextStep(
@@ -1866,7 +1925,7 @@ async function sendNextStep(
       }));
       const back = await getSessionForChat(deps.db, chatId);
       const question = (back.ok ? back.view.nextQuestion : null) ?? missing[0]!;
-      if (!(await claimFloor(deps.db, chatId))) return false;
+      if (!(await takeFloor(chatId, view, deps))) return false;
       const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
       await deps.telegram.sendMessage({
         chatId,
@@ -1978,7 +2037,7 @@ async function sendNextStep(
       // if the router got here first this returns false and the message waits
       // for the organizer's next turn rather than landing on top of what was
       // just said.
-      if (!(await claimFloor(deps.db, chatId))) return false;
+      if (!(await takeFloor(chatId, view, deps))) return false;
       await clearPendingSayForChat(deps.db, chatId);
       await deps.telegram.sendMessage({
         chatId,
@@ -2026,7 +2085,7 @@ async function sendNextStep(
     // there is nothing to remember to set. `offeredMore` is still read for
     // sessions that predate the phase column and have not transitioned since.
     if (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore)) {
-      if (!(await claimFloor(deps.db, chatId))) return false;
+      if (!(await takeFloor(chatId, view, deps))) return false;
       const rendered = renderEssentialsDone(view.language);
       await clearPendingEntryForChat(deps.db, chatId);
       await markOfferedMoreForChat(deps.db, chatId);
@@ -2100,7 +2159,7 @@ async function sendNextStep(
 
   // The question or the recap. Claimed last, immediately before it goes out,
   // so a slow render cannot leave the floor held by a message nobody sent.
-  if (!(await claimFloor(deps.db, chatId))) return false;
+  if (!(await takeFloor(chatId, view, deps))) return false;
   await deps.telegram.sendMessage({ chatId, text, replyMarkup });
   if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
   return true;

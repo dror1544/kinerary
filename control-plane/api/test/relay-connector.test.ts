@@ -212,6 +212,22 @@ describe("RelayConnector — outbound actions", () => {
     });
   });
 
+  test("prose is handed over unescaped — one converter, and it is telegram-api's", async () => {
+    // 2026-09-12: this layer escaped too, so `sendMessage` escaped an escaped
+    // string and Telegram rejected the entities. What reached the organizer was
+    // the first escaping, delivered as plain text: "…שלי\." and a link written
+    // "japan\-2026\.ara\-united\.store". The dialect is honoured one layer
+    // down, once, so what crosses this boundary is what the agent wrote.
+    await withConnector(async (h) => {
+      const content = "אני בודקת את זה עכשיו. הקישור: https://japan-2026.ara-united.store";
+      await roundTrip(h, { op: "send", chat_id: "900", content });
+      assert.deepEqual(h.telegram.sent, [
+        { chatId: "900", text: content, replyTo: undefined, parseMode: "MarkdownV2" },
+      ]);
+      assert.ok(!h.telegram.sent[0].text.includes("\\"), "no escaping happens here");
+    });
+  });
+
   test("on an interview chat the agent cannot send at all", async () => {
     // TRACK 4 · one voice, one writer.
     //

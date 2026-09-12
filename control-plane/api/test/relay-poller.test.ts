@@ -11,9 +11,15 @@ import {
   answerCallbackData,
   CONFIRM_CALLBACK_DATA,
   KEEP_PLANNING_CALLBACK_DATA,
+  skipCallbackData,
   startFromDeepLink,
 } from "../src/chat-router.js";
-import { getSessionForChat } from "../src/interview.js";
+import {
+  claimFloor,
+  finalizeMultiChoiceForChat,
+  getSessionForChat,
+  toggleMultiChoiceForChat,
+} from "../src/interview.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
@@ -66,7 +72,12 @@ class FakeTelegram implements TelegramClient {
     });
     return { ok: true, messageId: String(this.sent.length) };
   }
-  async editMessageText(): Promise<SendResult> { return { ok: true }; }
+  /** Lets a test act at the exact moment the router edits a message. */
+  onEdit: (() => Promise<void>) | null = null;
+  async editMessageText(): Promise<SendResult> {
+    if (this.onEdit) await this.onEdit();
+    return { ok: true };
+  }
   async sendChatAction(): Promise<void> { /* no-op */ }
   async answerCallbackQuery(params: { callbackQueryId: string; text?: string }): Promise<void> {
     this.answered.push(params);
@@ -163,6 +174,100 @@ async function beginInterview(fix: Fixture, chatId: string): Promise<string> {
   assert.equal(started.kind, "started");
   return started.kind === "started" ? started.sessionId : "";
 }
+
+// ── What a tap owes the organizer ────────────────────────────────────────────
+
+describe("a multi-select waits for Done", () => {
+  test("ticking an option does not answer the question", { skip: SKIP }, async () => {
+    // 2026-09-12, first organizer-run interview on the VM: "the first click
+    // triggers the next question without waiting for finish button click".
+    //
+    // Every tick has to be WRITTEN — Telegram keeps no selection state, so the
+    // ticks are redrawn from what we stored — and writing an answer is what
+    // made the question answered. One tap, and the set the organizer was
+    // halfway through choosing was final.
+    await withFixture(async (fix) => {
+      const chatId = "700100201";
+      await beginInterview(fix, chatId);
+
+      const first = await toggleMultiChoiceForChat(fix.pool, chatId, "dietary", "vegetarian");
+      assert.ok(first.ok);
+      assert.deepEqual(first.view.selections.dietary, ["vegetarian"], "the tick is remembered");
+      assert.ok(
+        first.view.optionalRemaining.some((q) => q.id === "dietary"),
+        "still a question the interview has to come back to",
+      );
+
+      const second = await toggleMultiChoiceForChat(fix.pool, chatId, "dietary", "gluten_free");
+      assert.ok(second.ok);
+      assert.deepEqual(
+        [...(second.view.selections.dietary ?? [])].sort(),
+        ["gluten_free", "vegetarian"],
+        "a multi-select answer is the whole set, not the last tap",
+      );
+      assert.ok(
+        second.view.optionalRemaining.some((q) => q.id === "dietary"),
+        "two taps, still not finished",
+      );
+
+      const done = await finalizeMultiChoiceForChat(fix.pool, chatId, "dietary");
+      assert.ok(done.ok);
+      assert.ok(
+        !done.view.optionalRemaining.some((q) => q.id === "dietary"),
+        "Done is what ends it",
+      );
+      assert.deepEqual(
+        [...(done.view.selections.dietary ?? [])].sort(),
+        ["gluten_free", "vegetarian"],
+        "and the set survives finishing",
+      );
+    });
+  });
+
+  test("skipping mid-selection finishes it too, rather than leaving it open", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100202";
+      await beginInterview(fix, chatId);
+      await toggleMultiChoiceForChat(fix.pool, chatId, "dietary", "vegan");
+      await turn(fix, tap(chatId, skipCallbackData("dietary")));
+      const after = await getSessionForChat(fix.pool, chatId);
+      assert.ok(after.ok);
+      assert.ok(
+        !after.view.optionalRemaining.some((q) => q.id === "dietary"),
+        "a skipped question does not come back because it was mid-tick",
+      );
+    });
+  });
+});
+
+describe("a tap is always answered", () => {
+  test("even when the scan takes the floor mid-send", { skip: SKIP }, async () => {
+    // 2026-09-12: Skip on the last optional question recorded the skip and
+    // collapsed the keyboard to "(דילגו)" — then silence, until the organizer
+    // typed "לא" two minutes later and the recap appeared.
+    //
+    // The tap had the floor: `applyDecision` marks the machine as owing the
+    // next message the moment an update arrives. What it did not have was the
+    // floor by the time it spoke — the interpret path's scan runs every couple
+    // of seconds and ends by handing the floor back whenever the question is
+    // already on screen, and `claimFloor` failing was a bare `return false`.
+    // `onEdit` reproduces it exactly: the scan's claim, while the keyboard
+    // collapses.
+    await withFixture(async (fix) => {
+      const chatId = "700100203";
+      await beginInterview(fix, chatId);
+      fix.telegram.onEdit = async () => { await claimFloor(fix.pool, chatId); };
+
+      const before = fix.telegram.sent.length;
+      await turn(fix, tap(chatId, skipCallbackData("planning_help")));
+
+      assert.ok(
+        fix.telegram.sent.length > before,
+        "the organizer tapped and the router owes them the next step",
+      );
+    });
+  });
+});
 
 // ── The organizer flow ───────────────────────────────────────────────────────
 

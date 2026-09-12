@@ -1152,6 +1152,22 @@ export interface InterviewUiState {
    */
   deferred?: string[];
   /**
+   * The multi-select question being ticked right now.
+   *
+   * A multi-select answer IS the whole set, so every tap has to be written down
+   * — Telegram keeps no selection state of its own and the ticks are redrawn
+   * from what we stored. But a written answer is also what makes a question
+   * answered, so on 2026-09-12 the first tap on `dietary` ended the question:
+   * the next one went out while `Done` was still sitting on the organizer's
+   * screen, mid-selection.
+   *
+   * So the selection is recorded and the question stays current until `Done` or
+   * `Skip` finalizes it. Every other writer — a typed answer through the
+   * interpret path, the agent submitting the whole set — clears it, because
+   * either of those IS the finalization.
+   */
+  multiPending?: string;
+  /**
    * The optional question the interviewer has asked the router to put next.
    *
    * Optional questions are not walked automatically when an interviewer is
@@ -1238,6 +1254,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(typeof record.pending_ask_text === "string" ? { pendingAskText: record.pending_ask_text } : {}),
     ...(record.opening_done === true ? { openingDone: true } : {}),
     ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
+    ...(typeof record.multi_pending === "string" ? { multiPending: record.multi_pending } : {}),
   };
 }
 
@@ -1253,6 +1270,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.pendingAskText ? { pending_ask_text: ui.pendingAskText } : {}),
     ...(ui.openingDone ? { opening_done: true } : {}),
     ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
+    ...(ui.multiPending ? { multi_pending: ui.multiPending } : {}),
   });
 }
 
@@ -1292,7 +1310,9 @@ function nextUnansweredQuestion(
   ui: InterviewUiState = {},
 ): IntakeQuestion | null {
   const deferred = new Set(ui.deferred ?? []);
-  const unanswered = questions.filter((q) => q.required && answers[q.id] === undefined);
+  const unanswered = questions.filter(
+    (q) => q.required && (answers[q.id] === undefined || ui.multiPending === q.id),
+  );
   return unanswered.find((q) => !deferred.has(q.id)) ?? null;
 }
 
@@ -1358,7 +1378,7 @@ function unansweredOptionalQuestions(
     (q) =>
       !q.required &&
       !RETIRED_QUESTION_IDS.has(q.id) &&
-      answers[q.id] === undefined &&
+      (answers[q.id] === undefined || ui.multiPending === q.id) &&
       !isSkipped(ui, q.id),
   );
 }
@@ -2322,6 +2342,25 @@ interface LockedSession {
   ui_state: unknown;
   language: string | null;
   source_document: unknown;
+  /**
+   * Available, and deliberately not fed to `buildSessionView` here.
+   *
+   * Its `phase` and `awaiting` parameters both default — to "opening" and
+   * "person" — and the two transactional writers below pass neither, so every
+   * view they return claims the organizer holds the floor. That is what made a
+   * tapped Skip silent on 2026-09-12: the skip was recorded, the keyboard
+   * collapsed, and `sendNextStep` refused to speak on a view that said it was
+   * the organizer's turn.
+   *
+   * Passing them through looks like the fix and is not: `state` is projected
+   * from `phase`, and a truthful floor lets the router speak in the middle of
+   * an AGENT turn — three Track 8 tests reject exactly that, and they are
+   * right to. So the floor is corrected where a tap is being answered
+   * (`applyInterviewCallback`), and the defaults here are left alone until
+   * someone takes on the arbitration question properly.
+   */
+  phase: InterviewPhase;
+  awaiting: AwaitingParty;
 }
 
 /**
@@ -2345,7 +2384,7 @@ async function lockSession(
   client: pg.PoolClient,
   locator: SessionLocator,
 ): Promise<LockedSession | null> {
-  const columns = "id, trip_id, user_id, state, answers, ui_state, language, source_document";
+  const columns = "id, trip_id, user_id, state, answers, ui_state, language, source_document, phase, awaiting";
   if (locator.by === "token") {
     const row = await client.query<LockedSession>(
       `SELECT ${columns}
@@ -2988,10 +3027,13 @@ export async function skipQuestionForChat(
   // fail at confirm with NOT_ALL_REQUIRED_ANSWERED, which reads to the
   // organizer as the interview breaking at the last step.
   if (!question || question.required) return { ok: false, reason: "NOT_FOUND" };
-  return updateUiStateForChat(db, chatId, (ui) => ({
-    ...ui,
-    skipped: [...new Set([...(ui.skipped ?? []), questionId])],
-  }));
+  return updateUiStateForChat(db, chatId, (ui) => {
+    const { multiPending, ...rest } = ui;
+    return {
+      ...(multiPending === questionId ? rest : ui),
+      skipped: [...new Set([...(ui.skipped ?? []), questionId])],
+    };
+  });
 }
 
 /**
@@ -3067,7 +3109,32 @@ export async function toggleMultiChoiceForChat(
   else if (optionId === EXCLUSIVE_OPTION_ID) next = [EXCLUSIVE_OPTION_ID];
   else next = [...existing.filter((id) => id !== EXCLUSIVE_OPTION_ID), optionId];
 
-  return submitAnswerForChat(db, chatId, questionId, null, undefined, undefined, next);
+  // Deliberately NOT `submitAnswerForChat`: that advances the phase, and a tick
+  // mid-selection is exactly the moment the interview must not move.
+  return submitAnswerVia(db, { by: "chat", chatId }, questionId, null, undefined, undefined, next, true);
+}
+
+/**
+ * `Done` on a multi-select: the set on screen is the answer.
+ *
+ * Nothing new is recorded — every tick already wrote itself — so this only ends
+ * the ticking, which is what makes the question answered and lets the interview
+ * move on.
+ */
+export async function finalizeMultiChoiceForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<GetSessionResult> {
+  const cleared = await updateUiStateForChat(db, chatId, (ui) =>
+    ui.multiPending === questionId ? (({ multiPending: _drop, ...rest }) => rest)(ui) : ui,
+  );
+  if (!cleared.ok) return cleared;
+  // The phase advance every other answer gets from `submitAnswerForChat`. The
+  // last required answer ends `essentials`, and on a multi-select that answer
+  // is finished HERE, not at the first tick.
+  const moved = await advancePhaseForChat(db, chatId);
+  return moved ? await getSessionForChat(db, chatId) : cleared;
 }
 
 /** The option ids currently recorded for a multi-select question. */
@@ -3112,6 +3179,8 @@ async function submitAnswerVia(
   otherText?: string,
   structuredData?: unknown,
   optionIds?: readonly string[],
+  /** A tick on a multi-select keyboard, not a finished answer. */
+  ticking = false,
 ): Promise<SubmitAnswerResult> {
   const client = await db.connect();
   try {
@@ -3128,12 +3197,19 @@ async function submitAnswerVia(
     }
 
     const updatedAnswers = { ...session.answers, [questionId]: validation.answer };
-    const ui = parseUiState(session.ui_state);
+    const stored = parseUiState(session.ui_state);
+    // Ticking keeps the question current; anything else is a finished answer,
+    // and a finished answer on the question being ticked ends the ticking.
+    const ui: InterviewUiState = ticking
+      ? { ...stored, multiPending: questionId }
+      : stored.multiPending === undefined
+        ? stored
+        : (({ multiPending: _drop, ...rest }) => rest)(stored);
     const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
 
     await client.query(
-      "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, updated_at = now() WHERE id = $3",
-      [JSON.stringify(updatedAnswers), newState, session.id],
+      "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, ui_state = $3::jsonb, updated_at = now() WHERE id = $4",
+      [JSON.stringify(updatedAnswers), newState, serializeUiState(ui), session.id],
     );
 
     await client.query("COMMIT");

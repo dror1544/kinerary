@@ -35,7 +35,6 @@ import {
   type WireMessageEvent,
 } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
-import { toTelegramMarkdownV2 } from "./markdown.js";
 
 /**
  * A `Content-Disposition` value that Node will actually accept.
@@ -440,7 +439,16 @@ export class RelayConnector {
           // dropped. Reported as "the link is not identified, it looks like plain
           // text". Escaping the prose and leaving the entities alone is what
           // makes the dialect we advertise true.
-          text: toTelegramMarkdownV2(action.content),
+          //
+          // THE ESCAPE BELONGS TO ONE LAYER, and it is telegram-api.ts:
+          // `sendMessage` converts whenever parseMode is set. Escaping here as
+          // well ran the converter twice, and \. became \\\., which Telegram
+          // rejects as an entity — so the fallback fired and delivered the
+          // FIRST escaping as plain text. Live on 2026-09-12: a companion's
+          // message reached the organizer as "יש בעיה טכנית עם הדפדפן שלי\." and
+          // a link written "japan\-2026\.ara\-united\.store". Raw here; the
+          // dialect is honoured one layer down, once.
+          text: action.content,
           replyTo: action.reply_to,
           parseMode: "MarkdownV2",
         });
@@ -454,8 +462,8 @@ export class RelayConnector {
           messageId: action.message_id,
           // Same reason as `send`: an edit is agent prose too, and an edit that
           // fails to parse leaves the ORIGINAL message on screen, so the loss
-          // is even quieter.
-          text: toTelegramMarkdownV2(action.content),
+          // is even quieter. Escaped once, by telegram-api.ts.
+          text: action.content,
           parseMode: "MarkdownV2",
         });
         return edited.ok ? { success: true } : { success: false, error: edited.error ?? "EDIT_FAILED" };
