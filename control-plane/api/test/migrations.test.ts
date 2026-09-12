@@ -76,6 +76,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
+      // 0050 is deliberately absent here: two unmerged branches each claim that
+      // number (telegram_organizer_links, plan_reviews), and a duplicate
+      // number with different content is the collision worth avoiding. A gap
+      // is not: the runner applies whatever it has not recorded, in name order.
+      "0051_trip_person_links.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -132,6 +137,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
+      // 0050 is deliberately absent here: two unmerged branches each claim that
+      // number (telegram_organizer_links, plan_reviews), and a duplicate
+      // number with different content is the collision worth avoiding. A gap
+      // is not: the runner applies whatever it has not recorded, in name order.
+      "0051_trip_person_links.sql",
     ]);
   } finally {
     await reset(client);

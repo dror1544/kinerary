@@ -582,6 +582,7 @@ class ChatIdRecipientTests(unittest.TestCase):
         with self.conn.transaction():
             # A4: a binding is opened whenever an organizer chat id is known,
             # companion or not, so these fixtures now leave one behind.
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
@@ -722,7 +723,10 @@ class CompanionProfileTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
         self.identity_id = f"idnt_{rnd()}"
-        self.chat_id = "800000" + rnd(3)
+        # DIGITS. A Telegram private chat id is a number, and both the schema
+        # and the writer of trip_person_links refuse anything else — a group id
+        # is not a person. The old fixture was hex, which no chat id ever is.
+        self.chat_id = "8" + str(secrets.randbelow(10**9)).zfill(9)
         with self.conn.transaction():
             self.conn.execute(
                 """INSERT INTO control_plane.user_identities
@@ -734,6 +738,7 @@ class CompanionProfileTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
@@ -798,6 +803,56 @@ class CompanionProfileTests(unittest.TestCase):
             sorted(p["name"] for p in intro["login_usernames"]),
             ["Eitan", "Noa"],
         )
+
+    def test_the_organizer_is_recorded_as_a_person_not_only_as_a_route(self) -> None:
+        """The chat binding says WHERE a message routes. This says WHO sent it.
+
+        Both facts exist in the same transaction — `_resolve_organizers` has
+        already turned the organizer_identity answer into a participant, and the
+        chat about to be bound is that organizer's own interview chat — and
+        until 2026-09-12 only the first was written. A companion could route a
+        message perfectly and still have nothing to call the person who sent it,
+        which is fine in a DM (the only private chat bound is the organizer's)
+        and useless in a family group, where every sender is anonymous.
+        """
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-person-link",
+            companion=FakeCompanionProfileAdapter(),
+        )
+        worker.run_once()
+
+        row = self.conn.execute(
+            "SELECT telegram_user_id, participant_username, display_name, role, verified_via "
+            "FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "the organizer's chat was bound but nobody was recorded as owning it")
+        self.assertEqual(row["telegram_user_id"], self.chat_id)
+        # COMPANION_INTAKE's organizer_identity is "Noa", which _resolve_organizers
+        # matches to the traveller of that name — the same resolution that writes
+        # agent.organizers, now reaching the router as well.
+        self.assertEqual(row["participant_username"], "noa")
+        self.assertEqual(row["display_name"], "Noa")
+        self.assertEqual((row["role"], row["verified_via"]), ("organizer", "interview_chat"))
+
+    def test_a_group_chat_id_is_never_recorded_as_a_person(self) -> None:
+        """A group id is not a person — the one mistake this table must refuse.
+
+        Nothing calls it that way today, which is precisely when a guard is
+        worth having: the next writer is a family member binding themselves,
+        and "whoever spoke in the group" is the shape that would be reached for.
+        """
+        from control_plane_worker.provisioner import link_organizer_person
+
+        self.conn.rollback()
+        self.assertFalse(
+            link_organizer_person(self.conn, self.fix["trip_id"], "-1002000777", "noa", "Noa")
+        )
+        row = self.conn.execute(
+            "SELECT 1 FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNone(row)
 
     def test_no_binding_written_when_the_companion_adapter_declines(self) -> None:
         class DecliningAdapter:
@@ -1551,6 +1606,7 @@ class OrganizerFullNameReachesCompanionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
@@ -1798,6 +1854,7 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.intake_sessions WHERE id = %s", (self.session_id,))
             self.conn.execute("DELETE FROM control_plane.interview_enrollments WHERE id = %s", (self.enrollment_id,))

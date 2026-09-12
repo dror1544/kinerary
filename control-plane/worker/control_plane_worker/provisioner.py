@@ -315,6 +315,59 @@ def attach_profile_to_orphan_bindings(
         return cur.rowcount or 0
 
 
+def link_organizer_person(
+    conn: psycopg.Connection,
+    trip_id: str,
+    telegram_user_id: str,
+    participant_username: str,
+    display_name: str | None,
+) -> bool:
+    """Records WHO the chat being bound belongs to, not just where it routes.
+
+    `bind_chat_to_trip` answers "which companion serves this chat". This
+    answers "and whose chat is it" — the join that was missing, between the
+    participant `_resolve_organizers` already picked out of the intake and the
+    chat id the binding is about to use. Both are in hand in the same
+    transaction; until 2026-09-12 nothing put them in the same row, so the
+    assistant could route a message perfectly and still have no idea it was
+    talking to the organizer (migration 0051 has the full story).
+
+    Private-chat ids only. A group id is not a person, and the one place this
+    is called from passes the organizer's own chat — but the schema and this
+    guard both say so, because the next caller will be a family member binding
+    themselves and "whoever spoke in the group" is exactly the mistake to make
+    impossible rather than to avoid.
+
+    Returns whether a row is now there. Non-fatal by construction: a trip whose
+    identity link fails still routes, exactly as every trip did before this
+    existed.
+    """
+    if not telegram_user_id.isdigit() or not participant_username:
+        return False
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO control_plane.trip_person_links
+                  (id, trip_id, telegram_user_id, participant_username,
+                   display_name, role, verified_via)
+                VALUES (%s, %s, %s, %s, %s, 'organizer', 'interview_chat')
+                ON CONFLICT (trip_id, telegram_user_id) DO UPDATE
+                   SET participant_username = EXCLUDED.participant_username,
+                       display_name = EXCLUDED.display_name,
+                       role = EXCLUDED.role
+                """,
+                (
+                    f"tpl_{secrets.token_hex(16)}",
+                    trip_id,
+                    telegram_user_id,
+                    participant_username,
+                    display_name,
+                ),
+            )
+    return True
+
+
 def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
@@ -1233,6 +1286,40 @@ class ProvisionerWorker:
         else:
             try:
                 outcome = bind_chat_to_trip(conn, recipient_chat_id, trip_id, hermes_profile)
+                # The same chat, as a PERSON. Deliberately here and not in its
+                # own step: the two facts are one fact — this chat is the
+                # organizer's — and separating them is how one of them came to
+                # be recorded for months while the other was not.
+                organizer_username = next(
+                    iter((config.get("agent") or {}).get("organizers") or []), None
+                )
+                if organizer_username:
+                    organizer_display = next(
+                        (
+                            p.get("name") or p.get("name_en")
+                            for p in (config.get("participants") or [])
+                            if p.get("username") == organizer_username
+                        ),
+                        None,
+                    )
+                    try:
+                        linked = link_organizer_person(
+                            conn, trip_id, recipient_chat_id,
+                            organizer_username, organizer_display,
+                        )
+                        logger.info(
+                            "provisioner.organizer_person_linked" if linked
+                            else "provisioner.organizer_person_link_skipped",
+                            extra={"trip_id": trip_id, "participant": organizer_username},
+                        )
+                    except Exception:
+                        # Routing is the load-bearing half and it is already
+                        # done. A trip that cannot say who the organizer is
+                        # behaves exactly as every trip did before this.
+                        logger.warning(
+                            "provisioner.organizer_person_link_failed",
+                            extra={"trip_id": trip_id}, exc_info=True,
+                        )
                 if hermes_profile:
                     # Every OTHER chat already bound to this trip and still
                     # waiting for a companion — a family group bound by token

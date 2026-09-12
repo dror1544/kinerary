@@ -35,6 +35,7 @@ import {
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
+  resolveTripPerson,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { coerceLanguage, uiString } from "../intake-copy.js";
@@ -565,6 +566,25 @@ export async function dispatchUpdate(
       isReplyToAssistant,
     });
     if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
+
+    // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
+    // Telegram, where every sender writes their own — so the assistant was
+    // being told "Dror" by the one party with an interest in the answer, and
+    // in a family group it had nothing else to go on at all. A trip person
+    // link is the control plane's own record (migration 0051), written at
+    // provisioning from the interview chat, so it outranks anything the
+    // update carries. Unknown senders keep their Telegram name: it is what
+    // their family calls them, and the alternative is a blank where a person
+    // should be.
+    if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
+      const person = await resolveTripPerson(
+        db, outcome.route.tripId, outcome.event.source.user_id,
+      );
+      if (person?.displayName) {
+        outcome.event.source.user_name = person.displayName;
+        log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
+      }
+    }
     return { kind: "to_gateway", event: outcome.event };
   }
 

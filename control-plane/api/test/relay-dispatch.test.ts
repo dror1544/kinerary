@@ -188,6 +188,52 @@ describe("dispatchUpdate — the branch table", () => {
     });
   });
 
+  test("a known sender reaches the assistant by their name on the trip", { skip: SKIP }, async () => {
+    // Telegram's display name is set by the sender, so it is not identity —
+    // and in a family group it was the only thing the assistant had. The trip
+    // person link is the control plane's own record, written at provisioning
+    // from the interview chat.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "-1002000111", "companion-japan");
+      // A group message only reaches the assistant when it addresses it by
+      // name — the relevance gate the shared bot depends on.
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1",
+        [fix.tripId, ["Rio"]],
+      );
+      await fix.pool.query(
+        `INSERT INTO control_plane.trip_person_links
+           (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
+         VALUES ('tpl_' || md5(random()::text), $1, '777', 'nirsolomon', $2, 'organizer', 'interview_chat')`,
+        [fix.tripId, "ניר סולומון"],
+      );
+
+      const update = msg("-1002000111", "Rio, what time do we leave?", "supergroup");
+      const decision = await dispatchUpdate(fix.pool, update);
+      assert.equal(decision.kind, "to_gateway");
+      if (decision.kind !== "to_gateway") return;
+      // msg() sends from Telegram user 777 calling themselves "Dror".
+      assert.equal(decision.event.source.user_name, "ניר סולומון");
+      assert.equal(decision.event.source.user_id, "777");
+    });
+  });
+
+  test("a sender the trip does not know keeps their Telegram name", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "-1002000222", "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1",
+        [fix.tripId, ["Rio"]],
+      );
+      const decision = await dispatchUpdate(
+        fix.pool, msg("-1002000222", "Rio, where are we staying?", "supergroup"),
+      );
+      assert.equal(decision.kind, "to_gateway");
+      if (decision.kind !== "to_gateway") return;
+      assert.equal(decision.event.source.user_name, "Dror");
+    });
+  });
+
   test("an unknown chat is refused, never routed", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const decision = await dispatchUpdate(fix.pool, msg("700000444", "hello?"));
