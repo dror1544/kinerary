@@ -893,6 +893,10 @@ describe("structured questions name their fields", () => {
     // report, 2026-09-12 — "there are dates on the document for the planned
     // activities but they were not captured".
     const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
+    // MORE THAN ONE, deliberately. With a single day in it the example reads as
+    // "give me a day": the first live extraction returned exactly one day for a
+    // five-day leg described day by day, losing four (2026-09-12).
+    assert.ok(phases[0].days.length >= 2, "the example shows a list of days, not a day");
     const day = phases[0].days[0];
     assert.deepEqual(Object.keys(day).sort(), ["date", "items", "label"]);
     assert.match(day.date, /^\d{4}-\d{2}-\d{2}$/);

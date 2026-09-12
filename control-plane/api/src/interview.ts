@@ -382,7 +382,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "phases",
     type: "structured",
-    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally. If a document gives a DATED day-by-day — activities under a date, with or without times — put it in `days`: that is the itinerary the family opens on the day, and without it a leg arrives on the site as a name and a date range. Never invent one: days come from what the document actually says.",
+    prompt: "Where are you going, and when? List each stop: a short place name (city or region — e.g. \"Dallas\", not \"Dallas (boys; Mavericks game September 6)\"), date range, and accommodation (with confirmation number) if already booked. Keep any extra context — who's on this leg, an event, a plan detail — out of the name; it's fine to just not record it structurally. If a document gives a DATED day-by-day — activities under a date, with or without times — put it in `days`: that is the itinerary the family opens on the day, and without it a leg arrives on the site as a name and a date range. ONE ENTRY PER DATED DAY THE DOCUMENT GIVES, all of them, not a sample: a five-day leg described day by day is five entries, and returning one is losing four. Never invent one, and leave out a day the document says nothing about — an empty day is not a day with nothing in it.",
     dataShape: "array",
     // `planned` holds places the trip means to visit on this leg but has NOT
     // booked. The distinction from `travel_anchors` is EVIDENCE OF BOOKING —
@@ -393,7 +393,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // belongs; `_derive_phases` folds it into that phase's `venues[]`
     // (`_planned_as_venues`, transformer.py) so enrichment geocodes it the
     // same as a venue `extract_itinerary` found, just without a url.
-    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}, \"planned\": [\"Tokyo Skytree\", \"TeamLab Planets\"], \"days\": [{\"date\": \"2026-09-19\", \"label\": {\"he\": \"יום 1 — נחיתה\", \"en\": \"Day 1 — arrival\"}, \"items\": [{\"time\": \"10:00\", \"text\": {\"he\": \"נחיתה בנאריטה\", \"en\": \"Land at Narita\"}}]}]}]",
+    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}, \"planned\": [\"Tokyo Skytree\", \"TeamLab Planets\"], \"days\": [{\"date\": \"2026-09-19\", \"label\": {\"he\": \"יום 1 — נחיתה\", \"en\": \"Day 1 — arrival\"}, \"items\": [{\"time\": \"10:00\", \"text\": {\"he\": \"נחיתה בנאריטה\", \"en\": \"Land at Narita\"}}]}, {\"date\": \"2026-09-20\", \"label\": {\"he\": \"יום 2 — אסקוסה\", \"en\": \"Day 2 — Asakusa\"}, \"items\": [{\"time\": null, \"text\": {\"he\": \"בוקר חופשי\", \"en\": \"Free morning\"}}]}]}]",
     required: true,
   },
   {
