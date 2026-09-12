@@ -421,6 +421,8 @@ def stage_site(ctx: dict) -> None:
     ip = next((l.split("ipv4:")[1].strip().split("/")[0]
                for l in topology.read_text().splitlines() if "ipv4:" in l), "")
     check(bool(ip), f"container ip {ip}", "no ipv4 in topology")
+    ctx["ip"] = ip
+    ctx["vmid"] = vmid_for(topology)
 
     code = subprocess.run(
         ["curl", "-s", "-o", "/dev/null", "-m", "10", "-w", "%{http_code}", f"http://{ip}:8080/"],
@@ -490,6 +492,7 @@ def stage_content(ctx: dict, scenario: str) -> None:
                       f"{v['id']}.{field} is not a real URL: {url!r}")
     if venues:
         ok(f"{len(venues)} venue(s), links well-formed")
+    ctx["planned_places"] = list(spec.get("expect_planned", []))
 
 
 def stage_own_content(ctx: dict) -> None:
@@ -541,6 +544,20 @@ def stage_own_content(ctx: dict) -> None:
     # Every stop named in the interview has to be findable on some phase. Phases
     # with the same name collapse into one (_derive_phases), so this asks for
     # presence, never for a count.
+    # The places the organizer named per leg — "Tokyo Skytree", "TeamLab
+    # Planets". The transformer files them as venues (`_planned_as_venues`), and
+    # a place that reaches neither a venue nor a day item has been dropped
+    # between the interview and the site. Carried into ctx for stage_served,
+    # which asks the SITE for them rather than the file.
+    planned = [str(place).strip()
+               for raw in _structured_items(data, "phases") if isinstance(raw, dict)
+               for place in (raw.get("planned") or []) if str(place).strip()]
+    ctx["planned_places"] = planned
+    for place in planned:
+        check(place.lower() in json.dumps(phases, ensure_ascii=False).lower(),
+              f"a place you named is on the site: {place}",
+              f"{place!r} was named in the interview and is on no phase")
+
     named = [n for n in (_phase_name(raw) for raw in _structured_items(data, "phases")) if n]
     check(bool(phases), f"{len(phases)} phase(s) on the site", "the site has no phases")
     missing = [n for n in named if n.lower() not in json.dumps(phases, ensure_ascii=False).lower()]
@@ -579,6 +596,86 @@ def _phase_name(raw: object) -> str:
     if not isinstance(raw, dict):
         return ""
     return str(raw.get("name") or raw.get("name_en") or "").strip()
+
+
+def stage_served(ctx: dict) -> None:
+    """What a traveller actually gets, asked for the way a traveller asks.
+
+    Every content check before this one read `trip.config.json` — off the disk,
+    then out of the container. Both can be perfect while the site shows nothing,
+    and on 2026-09-12 they were: five phases with their dates and their places
+    sat in the config of a trip whose itinerary rendered empty, and the run had
+    called it green. So this logs in and reads what the site serves.
+    """
+    stage("The site serves it — logged in, the way a traveller reads it")
+    ip, slug = ctx["ip"], ctx["slug"]
+    env = subprocess.run(
+        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
+         f"pct exec {ctx['vmid']} -- cat /opt/kinerary/.env"],
+        capture_output=True, text=True,
+    ).stdout
+    password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
+    check(bool(password), "the site has a shared password to log in with",
+          "no SEED_PASSWORD in the container's .env — nobody can log in to this trip at all")
+
+    username = next((p.get("username") for p in (ctx["config"].get("participants") or []) if p.get("username")), "")
+    check(bool(username), f"a traveller to log in as ({username})", "the config has no participant with a username")
+
+    def site(path: str, token: str = "") -> dict:
+        out = subprocess.run(
+            ["curl", "-s", "-m", "15", f"http://{ip}:8080{path}"]
+            + (["-H", f"Authorization: Bearer {token}"] if token else []),
+            capture_output=True, text=True,
+        ).stdout
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            raise Failed(f"{path} did not answer JSON: {out[:200]!r}")
+
+    # Logged out, the config is refused — the reason a locked site and a broken
+    # one look identical from outside, and worth asserting rather than assuming.
+    check(site("/api/config").get("error") == "unauthorized",
+          "logged out, the trip's data is refused", "the site served its config to nobody in particular")
+
+    login = subprocess.run(
+        ["curl", "-s", "-m", "15", "-X", "POST", f"http://{ip}:8080/api/auth/login",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps({"username": username, "password": password})],
+        capture_output=True, text=True,
+    ).stdout
+    token = (json.loads(login or "{}") or {}).get("token", "")
+    check(bool(token), f"'{username}' can log in with the trip password",
+          f"login refused for '{username}' — the credentials the introduction hands out do not work")
+
+    served = site("/api/config", token)
+    phases = served.get("phases") or []
+    check(len(phases) == len(ctx["config"].get("phases") or []),
+          f"the site serves all {len(phases)} phase(s)",
+          f"the container holds {len(ctx['config'].get('phases') or [])} phases and the site serves {len(phases)}")
+
+    # THE THING THE PAGE IS MADE OF. A phase with neither a day plan nor a place
+    # renders as an empty tab, which is what "the site has no data" looked like.
+    #
+    # Per phase this is a note, not a failure: an organizer who names Hakone as
+    # a stop and nothing to do there yet has said something true, and a test
+    # that refuses it would refuse every honest interview. A trip where NO
+    # phase has anything is the regression — that is a site showing nothing.
+    bare = [p.get("id") for p in phases if not (p.get("days") or p.get("venues"))]
+    if bare:
+        note(f"{len(bare)} phase(s) carry no plan and no places yet: {', '.join(str(b) for b in bare)}")
+    check(any(p.get("days") or p.get("venues") for p in phases),
+          "the phases have something on them — a day plan or the places they are planned around",
+          "every phase the site serves is empty: the trip renders as nothing at all")
+
+    blob = json.dumps(served, ensure_ascii=False).lower()
+    for place in ctx.get("planned_places", []):
+        check(place.lower() in blob, f"the site serves a place you named: {place}",
+              f"{place!r} was in the interview, is not in what the site serves")
+
+    itinerary = site("/api/itinerary/active", token)
+    check("days" in itinerary or "items" in itinerary,
+          "the living itinerary answers for a signed-in traveller",
+          f"/api/itinerary/active returned {str(itinerary)[:120]}")
 
 
 def stage_companion(ctx: dict) -> None:
@@ -745,6 +842,7 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
             return 0
         stage_site(ctx)
         stage_own_content(ctx) if scenario == OWN else stage_content(ctx, scenario)
+        stage_served(ctx)
         stage_companion(ctx)
         stage_mcp(ctx)
         print(f"\n{GREEN}✓ full cycle green ({scenario}){RESET}: site, content, companion and MCP all verified.")
