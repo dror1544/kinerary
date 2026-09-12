@@ -1857,11 +1857,11 @@ export function InteractiveMap({
     <>
       <div className="map-toolbar" aria-label={lang === "he" ? "ניווט בין נקודות" : "Location navigation"}>
         <button className="map-control-button" type="button" onClick={() => moveTo(activeIndex - 1)}>
-          <ChevronLeft size={16} /> {lang === "he" ? "הקודם" : "Previous"}
+          {lang === "he" ? <ChevronRight size={16} /> : <ChevronLeft size={16} />} {lang === "he" ? "הקודם" : "Previous"}
         </button>
         <span className="map-location-counter" aria-live="polite">{activePin ? `${activeIndex + 1} / ${pins.length} · ${activePin.title}` : ""}</span>
         <button className="map-control-button" type="button" onClick={() => moveTo(activeIndex + 1)}>
-          {lang === "he" ? "הבא" : "Next"} <ChevronRight size={16} />
+          {lang === "he" ? "הבא" : "Next"} {lang === "he" ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
         </button>
         <button className="map-control-button" type="button" onClick={showAll}>
           <Globe2 size={16} /> {lang === "he" ? "הצג הכל" : "Show all"}
