@@ -84,6 +84,7 @@ import {
   reportIssue,
   runtimeUrl,
   tokenStore,
+  UNAUTHORIZED_EVENT,
   togglePhotoReaction,
   updateBooking,
   updateBudgetItem,
@@ -382,6 +383,7 @@ export function Hero({
   openTab,
   openModule,
   openMenu,
+  currentUser,
 }: {
   config?: TripConfig;
   settings?: { hero: { url: string | null; focal_x: number; focal_y: number } };
@@ -392,6 +394,7 @@ export function Hero({
   openTab: (tab: Tab) => void;
   openModule: (module: Module) => void;
   openMenu: () => void;
+  currentUser?: CurrentUser;
 }) {
   const activePhase = config?.phases?.find((phase) => phase.id === heroPhaseId);
   const activePhaseName = activePhase ? text(activePhase.title, lang) : "";
@@ -444,6 +447,23 @@ export function Hero({
             </a>
           ))}
         </div>
+        {/*
+          WHO IS SIGNED IN, without opening anything.
+          
+          It lived only inside the slide-out menu, so on a site that looked
+          empty there was no way to tell whether you were signed in as the
+          wrong person, or at all. Reported 2026-09-12: "it is impossible to
+          see who is logged in, which makes the above state even more
+          annoying." The button still opens the menu — where signing out is —
+          so this adds a fact, not a control.
+        */}
+        {currentUser ? (
+          <button className="hero-identity" type="button" onClick={openMenu}
+            aria-label={copy(lang, `Signed in as ${personName(currentUser, lang)} — open menu`, `מחוברים בתור ${personName(currentUser, lang)} — פתיחת התפריט`)}>
+            <PersonAvatar username={currentUser.username} name={personName(currentUser, lang)} color={currentUser.color} avatarFile={currentUser.avatar_file} size="small" />
+            <span>{personName(currentUser, lang)}</span>
+          </button>
+        ) : null}
         <button className="menu-button" type="button" onClick={openMenu} aria-label="Open menu">
           <Menu size={20} />
         </button>
@@ -2463,7 +2483,15 @@ export default function App() {
   const [journeyHeroPhaseId, setJourneyHeroPhaseId] = useState("");
   const [journeyFocus, setJourneyFocus] = useState<JourneyFocus | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const authed = Boolean(tokenStore.get());
+  // State, not a read: the session can end while the app is open — a token the
+  // server refuses is cleared by `api()`, which says so. Rendering the shell
+  // around a dead session is what made the site look empty rather than closed.
+  const [authed, setAuthed] = useState(() => Boolean(tokenStore.get()));
+  useEffect(() => {
+    const ended = () => setAuthed(false);
+    window.addEventListener(UNAUTHORIZED_EVENT, ended);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, ended);
+  }, []);
   useTripUpdates(authed);
   const config = useQuery({ queryKey: ["config"], queryFn: getConfig, enabled: authed });
   const me = useQuery({ queryKey: ["me"], queryFn: getMe, enabled: authed });
@@ -2537,7 +2565,7 @@ export default function App() {
 
   return (
     <div className="modern-trip-app">
-      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} />
+      <Hero config={config.data} settings={ui.data} lang={lang} activeTab={activeTab} activeModule={activeModule} heroPhaseId={heroPhaseId} openTab={openTab} openModule={openModule} openMenu={() => setMenuOpen(true)} currentUser={me.data} />
       <main className="app-content">{content}</main>
       <AppMenu open={menuOpen} lang={lang} currentUser={me.data} isOrganizer={me.data?.is_organizer} setOpen={setMenuOpen} setLang={setLang} openTab={openTab} openModule={openModule} />
       <nav className="bottom-nav" aria-label="Primary">

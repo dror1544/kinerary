@@ -926,3 +926,18 @@ textarea { min-height: 132px; resize: vertical; }
 }
 .phase-place-links { display: flex; flex-wrap: wrap; gap: 10px; }
 .phase-place-links a { color: var(--kit-teal); font-weight: 700; }
+
+.hero-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255,255,255,.45);
+  border-radius: 999px;
+  padding: 4px 12px 4px 4px;
+  color: white;
+  background: rgba(16,38,58,.35);
+  font-weight: 700;
+  cursor: pointer;
+}
+.hero-identity span { max-width: 12ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 620px) { .hero-identity span { display: none; } }

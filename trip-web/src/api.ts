@@ -22,6 +22,20 @@ export const tokenStore = {
   },
 };
 
+/**
+ * A session that no longer works is not a session.
+ *
+ * Every trip on this platform can be served from a hostname a previous trip
+ * used — slugs are reused, containers are rebuilt, and each one signs its own
+ * tokens. So a browser arrives holding a token from a trip that no longer
+ * exists, and the only thing the app used to ask was whether a token was
+ * PRESENT. It was, so the shell rendered, every request behind it answered 401,
+ * and the result was a site that looked empty while claiming to be open.
+ * Reported 2026-09-12: "this state that allow me to see the modern site with
+ * bad login (like it is empty) is bothering and should not be allowed".
+ */
+export const UNAUTHORIZED_EVENT = "kinerary:unauthorized";
+
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   const token = tokenStore.get();
@@ -30,6 +44,14 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(runtimeUrl(path), { ...init, headers });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
+    // 401 while carrying a token: the token is the problem. Drop it and say so,
+    // so the app can ask for a real sign-in rather than rendering around a
+    // session that cannot answer. The login endpoint's own 401 — wrong
+    // password — is left alone: there is no session to end.
+    if (response.status === 401 && token && !path.startsWith("/api/auth/login")) {
+      tokenStore.clear();
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
     throw new Error(payload.error || "Request failed");
   }
   return response.status === 204 ? (undefined as T) : response.json();
