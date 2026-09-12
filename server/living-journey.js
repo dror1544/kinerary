@@ -879,8 +879,10 @@ async function weatherObservation(db, fetchImpl, query) {
   const date = ISO_DATE_RE.test(String(query.date || '')) ? String(query.date) : new Date().toISOString().slice(0, 10);
   const cacheKey = `${latitude.toFixed(3)},${longitude.toFixed(3)}|${date}`;
   const cached = cachedObservation(db, 'weather', cacheKey);
-  if (cached && !cached.stale) return cached;
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(latitude)}&longitude=${encodeURIComponent(longitude)}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=14&timezone=auto`;
+  if (cached && !cached.stale && (cached.temperature_max != null || cached.temperature_min != null)) return cached;
+  // The trip clock can still be on yesterday in the destination timezone.
+  // Include that boundary day instead of hiding its weather.
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(latitude)}&longitude=${encodeURIComponent(longitude)}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=14&past_days=1&timezone=auto`;
   try {
     const response = await fetchImpl(url, { timeout: 8000 });
     if (!response.ok) throw new Error(`weather ${response.status}`);

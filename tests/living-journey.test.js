@@ -37,7 +37,8 @@ test('living journey seeds immutable original and active itinerary versions once
 
     // Exercise the weather response and its cached provider horizon.
     let fetches = 0;
-    const journey = create({ db, config, raw, mediaDir: dir, fetchImpl: async () => {
+    const journey = create({ db, config, raw, mediaDir: dir, fetchImpl: async (url) => {
+      assert.equal(new URL(url).searchParams.get('past_days'), '1');
       fetches++;
       return { ok: true, json: async () => ({ daily: {
         time: ['2026-09-12', '2026-09-13'],
