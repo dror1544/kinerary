@@ -55,11 +55,14 @@ export function CompanionPanel({ name, lang, isOrganizer, telegramUsername }: { 
     <form onSubmit={event => { event.preventDefault(); if (draft.trim() && !send.isPending) { setNotice(''); send.mutate(draft.trim()); } }}>
       <label className="bot-input"><span>{copy('Question or suggestion', 'שאלה או הצעה')}</span><textarea maxLength={2000} value={draft} disabled={send.isPending} onChange={event => setDraft(event.target.value)} placeholder={copy('What would make today better?', 'מה יכול לשפר את היום שלכם?')} /></label>
       <div className="bot-actions"><button className="primary-action" disabled={!draft.trim() || send.isPending || !conversation.data} type="submit"><Send size={17} />{send.isPending ? copy('Saving…', 'שומרים…') : copy('Send to companion', 'שליחה לעוזר')}</button>
-        {groupUrl && <a className="secondary-action" href={groupUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Open Telegram group', 'פתיחת קבוצת הטלגרם')}</a>}
-        {isOrganizer && privateUrl && <a className="secondary-action" href={privateUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Private companion chat', 'שיחה פרטית עם העוזר')}</a>}
-        {isOrganizer && connection.data?.binding_command && <button type="button" className="secondary-action" onClick={copyCommand}><Copy size={17} />{copy('Copy group connection command', 'העתקת פקודת החיבור לקבוצה')}</button>}
+        {groupUrl ? <a className="secondary-action" href={groupUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Open Telegram group', 'פתיחת קבוצת הטלגרם')}</a> : <button type="button" className="secondary-action" disabled><MessageCircle size={17} />{copy('Open Telegram group', 'פתיחת קבוצת הטלגרם')}</button>}
+        {isOrganizer && (privateUrl ? <a className="secondary-action" href={privateUrl} target="_blank" rel="noreferrer"><MessageCircle size={17} />{copy('Private companion chat', 'שיחה פרטית עם העוזר')}</a> : <button type="button" className="secondary-action" disabled><MessageCircle size={17} />{copy('Private companion chat', 'שיחה פרטית עם העוזר')}</button>)}
+        {isOrganizer && <button type="button" className="secondary-action" disabled={!connection.data?.binding_command} onClick={copyCommand}><Copy size={17} />{copy('Copy group connection command', 'העתקת פקודת החיבור לקבוצה')}</button>}
       </div>
     </form>
+    {conversation.data && !groupUrl && <p>{copy('No Telegram group is connected to this trip yet.', 'עדיין לא מחוברת קבוצת טלגרם לטיול הזה.')}</p>}
+    {isOrganizer && !privateUrl && <p>{copy('A Telegram bot must be assigned to this trip before its chat and group connection command can be used.', 'יש לשייך בוט טלגרם לטיול לפני שאפשר לפתוח שיחה או להשתמש בפקודת החיבור לקבוצה.')}</p>}
+    {isOrganizer && privateUrl && !connection.data?.binding_command && <p>{copy('To get a new group connection command, open the private companion chat and send', 'לקבלת פקודת חיבור חדשה לקבוצה, פתחו את השיחה הפרטית עם העוזר ושלחו')} <code dir="ltr">/group</code>. {copy('The bot returns the trip-specific command to paste into your group.', 'הבוט יחזיר את הפקודה של הטיול להדבקה בקבוצה.')}</p>}
     {send.isError && <p role="alert">{copy('Message was not saved. Try again; if you already have five unanswered messages, wait for a reply.', 'ההודעה לא נשמרה. נסו שוב; אם כבר יש חמש הודעות ללא מענה, המתינו לתשובה.')}</p>}
     {notice && <p role="status">{notice}</p>}
   </section>;

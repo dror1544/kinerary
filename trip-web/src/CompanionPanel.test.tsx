@@ -28,7 +28,7 @@ it('preserves the draft when saving fails', async () => {
   await screen.findByRole('alert'); expect(screen.getByRole('textbox')).toHaveValue('My idea');
 });
 it('shows real updates and replies, with organizer-only links and icon settings', async () => {
-  vi.mocked(api).mockImplementation(path => Promise.resolve(path.endsWith('/connection') ? { binding_command: '/group abcdefghijklmnopqrstuvwxyz' } : {
+  vi.mocked(api).mockImplementation(path => Promise.resolve(path.endsWith('/connection') ? { binding_command: '/group KIN-ABCDEFGH' } : {
     ...empty, connection: { group_url: 'https://t.me/+trip', bot_username: 'trip_bot' },
     latest_update: { text: 'Meet at nine', created_at: '2026-09-12T09:00:00Z' },
     messages: [{ id: 'q', author: 'bob', text: 'Later?', kind: 'question', created_at: '2026-09-12T09:00:00Z', answered: 1 }, { id: 'r', author: 'companion', text: 'Yes, nine works.', kind: 'reply', reply_to: 'q', created_at: '2026-09-12T09:01:00Z' }],
@@ -46,5 +46,6 @@ it('localizes shared visibility and does not show missing Telegram connections',
   await screen.findByText('עדיין לא שותף כאן עדכון מהקבוצה.');
   expect(screen.getByText(/משותפות לכל משתתפי הטיול/)).toBeInTheDocument();
   expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'פתיחת קבוצת הטלגרם' })).toBeDisabled();
   await waitFor(() => expect(screen.getByRole('button', { name: 'שליחה לעוזר' })).toBeDisabled());
 });

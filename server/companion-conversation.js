@@ -59,7 +59,7 @@ function registerCompanionConversation({ app, db, authRequired, organizerOrAgent
     const { group_url = null, bot_username = null, binding_command = null, binding_expires_at = null } = req.body || {};
     if ((group_url !== null && (typeof group_url !== 'string' || !/^https:\/\/t\.me\/(?:\+[A-Za-z0-9_-]+|[A-Za-z0-9_]+)$/.test(group_url))) ||
         (bot_username !== null && (typeof bot_username !== 'string' || !/^[A-Za-z0-9_]{5,32}$/.test(bot_username))) ||
-        (binding_command !== null && (typeof binding_command !== 'string' || !/^\/group [A-Za-z0-9_-]{16,256}$/.test(binding_command) || typeof binding_expires_at !== 'string' || !(Date.parse(binding_expires_at) > Date.now())))) return res.status(400).json({ error: 'invalid_connection' });
+        (binding_command !== null && (typeof binding_command !== 'string' || !/^\/group KIN-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/.test(binding_command) || typeof binding_expires_at !== 'string' || !(Date.parse(binding_expires_at) > Date.now())))) return res.status(400).json({ error: 'invalid_connection' });
     db.prepare('INSERT OR REPLACE INTO companion_connection VALUES (1,?,?,?,?,?)').run(group_url, bot_username, binding_command, binding_expires_at, new Date().toISOString());
     res.json({ ok: true });
   });
