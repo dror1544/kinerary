@@ -323,6 +323,63 @@ export function evidenceAppears(evidence: string, source: string): boolean {
   return lines.every((line) => haystack.includes(line));
 }
 
+/**
+ * Values the model copied out of the question's own example.
+ *
+ * The prompt shows each structured question a populated example so the model
+ * uses the right FIELD NAMES — `name`, not `place`. The values in it were
+ * realistic on purpose, and that is the flaw: for a trip to Japan, the
+ * `phases` example's own "Tokyo Skytree" and "TeamLab Planets" are a perfectly
+ * plausible answer. Live on 2026-09-12, an organizer's confirmed intake
+ * recorded exactly those two as their planned places; they had sent a four-page
+ * itinerary naming neither, and their own report says it: "only the one I
+ * mentioned as example... which makes me suspicious about the prompt".
+ *
+ * The evidence gate did not catch it because evidence and value are different
+ * things: the model quoted a real line from the document — the gate checks that
+ * — and attached values from the example. Nothing tied the value to the source.
+ *
+ * So: a string that the example contains and the source does not is an echo.
+ * Both halves are required. A real trip whose document says "Tokyo Skytree"
+ * passes, because then it IS in the source; a normalized date or an option id
+ * passes because the example does not contain it. What cannot pass is a value
+ * whose only provenance is the prompt.
+ */
+export function exampleEchoes(example: string | undefined, value: unknown, source: string): string[] {
+  if (!example) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(example);
+  } catch {
+    return [];
+  }
+  const fromExample = new Set(collectStrings(parsed).map(fold));
+  if (fromExample.size === 0) return [];
+  const haystack = fold(source);
+  return collectStrings(value).filter((candidate) => {
+    const folded = fold(candidate);
+    // Short tokens are shared by everything ("he", "en") and say nothing about
+    // where a value came from.
+    if (folded.length < 4) return false;
+    // NORMALIZED values are the dangerous false positive, and dates are the
+    // whole class: the example's "2026-09-19" is a real date a real document
+    // can mean while writing "19 September", so it is absent from the source
+    // for the best of reasons. The organizer whose report produced this guard
+    // departs on exactly that date. Anything without a letter in it — dates,
+    // times, numbers, confirmation codes — is left to the evidence gate.
+    if (!/\p{L}/u.test(folded)) return false;
+    return fromExample.has(folded) && !haystack.includes(folded);
+  });
+}
+
+/** Every string inside a value, at any depth — keys are not values. */
+function collectStrings(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+  else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+  return out;
+}
+
 // ── The gate ─────────────────────────────────────────────────────────────────
 
 export type RejectReason =
@@ -330,6 +387,8 @@ export type RejectReason =
   | "LOW_CONFIDENCE"
   /** The quoted span is not in the message. */
   | "EVIDENCE_NOT_IN_SOURCE"
+  /** The VALUE came from the question's example rather than from the source. */
+  | "EXAMPLE_ECHO"
   /** Already answered: a change, and changes are confirmed, not applied. */
   | "ALREADY_ANSWERED"
   /** Not a question the interview is currently asking (or a retired one). */
@@ -583,6 +642,8 @@ export function applyProposals(
     if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
     if (p.confidence < minConfidence) return { reason: "LOW_CONFIDENCE" };
     if (!evidenceAppears(p.evidence, ctx.sourceText)) return { reason: "EVIDENCE_NOT_IN_SOURCE" };
+    const echoed = exampleEchoes(questions.find((q) => q.id === p.questionId)?.dataExample, p.value, ctx.sourceText);
+    if (echoed.length > 0) return { reason: "EXAMPLE_ECHO", detail: echoed.slice(0, 4).join(", ") };
     return null;
   };
 
@@ -639,6 +700,8 @@ export function applyProposals(
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
     if (proposal.confidence < minConfidence) return reject(proposal, "LOW_CONFIDENCE");
     if (!evidenceAppears(proposal.evidence, ctx.sourceText)) return reject(proposal, "EVIDENCE_NOT_IN_SOURCE");
+    const echoed = exampleEchoes(questions.find((q) => q.id === proposal.questionId)?.dataExample, proposal.value, ctx.sourceText);
+    if (echoed.length > 0) return reject(proposal, "EXAMPLE_ECHO", echoed.slice(0, 4).join(", "));
 
     const validated = validateProposed(proposal, questions);
     if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
@@ -702,7 +765,13 @@ function describeQuestion(q: IntakeQuestion): string {
     // The FIELD NAMES, not just array-or-object. Without them a model invents
     // its own and the answer passes every check here before breaking the site
     // downstream — `phases: [{place, …}]` where the transformer reads `name`.
-    if (q.dataExample) lines.push(`  use exactly these fields: ${q.dataExample}`);
+    // FIELD NAMES are the contract; the values are an illustration. Said this
+    // way round because "use exactly these" over a realistic example is an
+    // invitation to copy it, and on 2026-09-12 a model did — see
+    // `exampleEchoes`, which refuses the result rather than trusting wording.
+    if (q.dataExample) {
+      lines.push(`  use exactly these FIELD NAMES (the values are an illustration — never copy them): ${q.dataExample}`);
+    }
   }
   return lines.join("\n");
 }

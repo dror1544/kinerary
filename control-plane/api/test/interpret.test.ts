@@ -6,6 +6,7 @@ import {
   buildInterpretPrompt,
   burstKey,
   evidenceAppears,
+  exampleEchoes,
   interpretBurst,
   parseInterpretPayload,
   storedOutcomes,
@@ -215,7 +216,83 @@ describe("parseInterpretPayload — the schema is this function", () => {
   });
 });
 
+describe("exampleEchoes — a value that came from the prompt, not the person", () => {
+  // 2026-09-12. An organizer's confirmed intake recorded their planned places
+  // as exactly "Tokyo Skytree" and "TeamLab Planets" — the two values in the
+  // `phases` question's own example — from a four-page itinerary naming
+  // neither. Their report: "only the one I mentioned as example... which makes
+  // me suspicious about the prompt."
+  const EXAMPLE = '[{"name": "Tokyo", "planned": ["Tokyo Skytree", "TeamLab Planets"]}]';
+
+  test("catches a value the example contains and the source does not", () => {
+    const echoed = exampleEchoes(
+      EXAMPLE,
+      { kind: "structured", data: [{ name: "Tokyo", planned: ["Tokyo Skytree", "TeamLab Planets"] }] },
+      "Day 1: arrive Tokyo. Day 2: Sumo Hall Hirakuza Osaka.",
+    );
+    assert.deepEqual(echoed.sort(), ["TeamLab Planets", "Tokyo Skytree"]);
+  });
+
+  test("lets the same value through when the source really says it", () => {
+    assert.deepEqual(
+      exampleEchoes(EXAMPLE, { data: [{ planned: ["Tokyo Skytree"] }] }, "Tuesday: Tokyo Skytree at 10:00"),
+      [],
+      "a real trip to Tokyo Skytree is not an echo — it is an answer",
+    );
+  });
+
+  test("says nothing about values the example never had", () => {
+    assert.deepEqual(exampleEchoes(EXAMPLE, { data: [{ planned: ["Sumo Hall"] }] }, "no mention here"), []);
+  });
+
+  test("ignores short tokens, which every trip shares", () => {
+    assert.deepEqual(exampleEchoes('["he", "en"]', { data: ["he", "en"] }, "nothing"), []);
+  });
+
+  test("never flags a normalized date — the whole false-positive class", () => {
+    // The example's dates are real dates. A document that says "19 September"
+    // yields "2026-09-19", which is absent from the source for the best of
+    // reasons — and the organizer whose report produced this guard departs on
+    // exactly the date the example carries.
+    assert.deepEqual(
+      exampleEchoes('[{"start": "2026-09-19", "end": "2026-09-23"}]',
+        { data: [{ start: "2026-09-19", end: "2026-09-23" }] },
+        "Tokyo, 19-23 September"),
+      [],
+    );
+  });
+
+  test("a question with no example cannot echo, and a malformed one is not a crash", () => {
+    assert.deepEqual(exampleEchoes(undefined, { data: ["anything"] }, ""), []);
+    assert.deepEqual(exampleEchoes("{not json", { data: ["anything"] }, ""), []);
+  });
+});
+
 describe("applyProposals — the gate", () => {
+  test("refuses a value copied out of the question's example", () => {
+    const questions: IntakeQuestion[] = [
+      ...QUESTIONS,
+      {
+        id: "phases", type: "structured", prompt: "Where are you going, and when?", required: true,
+        dataShape: "array",
+        dataExample: '[{"name": "Tokyo", "planned": ["Tokyo Skytree", "TeamLab Planets"]}]',
+      },
+    ];
+    const { accepted, rejected } = applyProposals(
+      [proposal({
+        questionId: "phases",
+        value: { kind: "structured", data: [{ name: "Tokyo", planned: ["Tokyo Skytree", "TeamLab Planets"] }] },
+        // A REAL quote from the document — which is exactly why the evidence
+        // gate passed it and something else had to catch the value.
+        evidence: "Tokyo",
+      })],
+      { ...CTX, questions, outstanding: ["phases"], sourceText: "Tokyo, 19-23 September. Osaka, 24-26." },
+    );
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected[0]?.reason, "EXAMPLE_ECHO");
+    assert.match(rejected[0]?.detail ?? "", /Tokyo Skytree/);
+  });
+
   test("accepts a well-evidenced, confident, valid proposal", () => {
     const { accepted, rejected } = applyProposals([proposal()], CTX);
     assert.equal(rejected.length, 0);
@@ -803,10 +880,25 @@ describe("structured questions name their fields", () => {
     // `planned` is deliberately NOT one the transformer reads — see below.
     assert.deepEqual(
       Object.keys(phases[0]).sort(),
-      ["accommodation", "end", "name", "name_en", "planned", "start"],
+      ["accommodation", "days", "end", "name", "name_en", "planned", "start"],
     );
     assert.equal(typeof phases[0].accommodation, "object", "accommodation is an object, not a string");
     assert.ok("name" in phases[0].accommodation);
+  });
+
+  test("a phase's days are shaped the way the site reads them", () => {
+    // `_derive_phases` passes `days` straight through to trip.config.json, and
+    // both site renderers read {date, label, items:[{time, text}]}. A document
+    // with a dated day-by-day had nowhere to land before this: the organizer's
+    // report, 2026-09-12 — "there are dates on the document for the planned
+    // activities but they were not captured".
+    const phases = JSON.parse(INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!);
+    const day = phases[0].days[0];
+    assert.deepEqual(Object.keys(day).sort(), ["date", "items", "label"]);
+    assert.match(day.date, /^\d{4}-\d{2}-\d{2}$/);
+    assert.deepEqual(Object.keys(day.label).sort(), ["en", "he"], "bilingual, like every other label on the site");
+    assert.deepEqual(Object.keys(day.items[0]).sort(), ["text", "time"]);
+    assert.deepEqual(Object.keys(day.items[0].text).sort(), ["en", "he"]);
   });
 
   /**
@@ -837,9 +929,15 @@ describe("structured questions name their fields", () => {
     assert.match(prompt, /A price beside a name is not a booking/);
   });
 
-  test("the example reaches the extraction prompt", () => {
+  test("the example reaches the extraction prompt as FIELD NAMES, not as values to copy", () => {
+    // It used to say "use exactly these fields" over a fully realistic
+    // example, which for a Japan trip reads as "these are good answers" — and
+    // on 2026-09-12 a model answered with the example's own places. The
+    // wording is the first half of the fix; `exampleEchoes` is the half that
+    // does not depend on a model reading carefully.
     const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases"], language: "he" });
-    assert.match(prompt, /use exactly these fields/);
+    assert.match(prompt, /use exactly these FIELD NAMES/);
+    assert.match(prompt, /never copy them/);
     assert.ok(prompt.includes('"name": "Tokyo"'), "the field names themselves are in the prompt");
   });
 });
