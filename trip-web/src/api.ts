@@ -236,6 +236,23 @@ export type PhotoComment = z.infer<typeof photoCommentSchema>;
 export type PhotoReactions = Record<string, Record<string, string[]>>;
 export type PhotoComments = Record<string, PhotoComment[]>;
 
+/**
+ * Who can sign in, before anyone has.
+ *
+ * The accounts are the travellers and their usernames are DERIVED from their
+ * names (`ella`, `nirsolomon`), so a person cannot guess their own — and on
+ * 2026-09-12 an organizer with the trip's password sat at this form with
+ * nothing to type. `/api/config/roster` is deliberately public for exactly
+ * this: names and usernames, no credentials. Classic has used it for its
+ * picker all along.
+ */
+export async function getLoginRoster(): Promise<{ username: string; name?: string; name_en?: string }[]> {
+  const payload = await api<{ participants?: { username?: string; name?: string; name_en?: string }[] }>(
+    "/api/config/roster",
+  );
+  return (payload.participants ?? []).flatMap((p) => (p.username ? [{ ...p, username: p.username }] : []));
+}
+
 export async function login(username: string, password: string) {
   const payload = await api<{ token: string }>("/api/auth/login", {
     method: "POST",

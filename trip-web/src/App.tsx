@@ -76,6 +76,7 @@ import {
   getToday,
   getUiSettings,
   getWeather,
+  getLoginRoster,
   login,
   postPhotoComment,
   reportIssue,
@@ -308,6 +309,17 @@ function LoginScreen() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  // The roster is public and the usernames are derived, not chosen — so the
+  // names go on screen and the field gets filled by tapping one. A trip whose
+  // roster cannot be read still gets the plain form, which is what this was.
+  const [roster, setRoster] = useState<{ username: string; name?: string; name_en?: string }[]>([]);
+  useEffect(() => {
+    let live = true;
+    getLoginRoster()
+      .then((people) => { if (live) setRoster(people); })
+      .catch(() => { /* the typed field still works */ });
+    return () => { live = false; };
+  }, []);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -326,6 +338,21 @@ function LoginScreen() {
         <img className="login-logo" src={brandLogo} alt="Kinerary" />
         <h1>Open your trip</h1>
         <p>Sign in to see today, the living itinerary, moments, and your trip companion.</p>
+        {roster.length > 0 ? (
+          <div className="login-roster" aria-label="Who are you?">
+            {roster.map((person) => (
+              <button
+                key={person.username}
+                type="button"
+                className={person.username === username ? "login-chip is-selected" : "login-chip"}
+                aria-pressed={person.username === username}
+                onClick={() => setUsername(person.username)}
+              >
+                {person.name || person.name_en || person.username}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <form onSubmit={submit}>
           <label>
             Username

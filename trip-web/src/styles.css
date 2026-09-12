@@ -819,6 +819,17 @@ textarea { min-height: 132px; resize: vertical; }
   background: rgba(255,255,255,.93);
   box-shadow: var(--kit-shadow);
 }
+.login-roster { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.login-chip {
+  border: 1px solid var(--kit-line);
+  border-radius: 999px;
+  padding: 8px 14px;
+  color: var(--kit-ink);
+  background: white;
+  font-weight: 700;
+  cursor: pointer;
+}
+.login-chip.is-selected { color: white; background: var(--kit-teal); border-color: transparent; }
 .login-panel h1 { margin: 16px 0 0; font: 800 36px/1.05 var(--kit-font-display); }
 .login-logo { display: block; width: 172px; height: auto; }
 .login-panel p { color: var(--kit-ink-soft); line-height: 1.6; }
