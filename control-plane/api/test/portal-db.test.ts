@@ -81,6 +81,7 @@ after(async () => {
   await pool.query("DELETE FROM control_plane.web_sessions WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider, passwordInviteeId].filter(Boolean)]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = ANY($1)", [[ids.ownedTrip, ids.otherTrip]]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   await pool.query("DELETE FROM control_plane.users WHERE id = ANY($1)", [[ids.owner, ids.member, ids.outsider]]);
   if (passwordInviteeId) await pool.query("DELETE FROM control_plane.users WHERE id = $1", [passwordInviteeId]);

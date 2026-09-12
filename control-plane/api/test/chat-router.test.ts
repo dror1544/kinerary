@@ -54,8 +54,8 @@ describe("parseInbound", () => {
   });
 
   test("other commands are classified as commands, not text", () => {
-    assert.deepEqual(parseInbound("/select"), { kind: "command", name: "select" });
-    assert.deepEqual(parseInbound("/HELP"), { kind: "command", name: "help" });
+    assert.deepEqual(parseInbound("/select"), { kind: "command", name: "select", argument: null });
+    assert.deepEqual(parseInbound("/HELP"), { kind: "command", name: "help", argument: null });
   });
 
   test("ordinary conversation is text", () => {

@@ -306,6 +306,16 @@ export async function applyDecision(
       return;
     }
 
+    case "callback_reply":
+      // Answer the query FIRST. Telegram spins the button until it is
+      // answered, so doing this after the send would leave the organizer
+      // watching a spinner for the duration of the message they are waiting
+      // for. Fire-and-forget by contract — answerCallbackQuery returns void
+      // and a failure here must not cost them the sentence itself.
+      await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId });
+      await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
+      return;
+
     case "show_summary":
       await sendNextStep(decision.view, decision.chatId, deps, strings);
       return;

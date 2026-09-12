@@ -402,6 +402,40 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // for a button that does not exist.
     expiredWriteAfter:
       "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
+
+    // ── /trips and /switch ──────────────────────────────────────────────
+    // One shared bot serves every trip, so "which one is this chat on?" has no
+    // answer visible anywhere in the conversation. These are that answer.
+    tripsHeader: "Here are your trips:",
+    tripsCurrent: "← this chat",
+    tripsFooter: "Tap one to point this chat at it.",
+    // The organizer has no trips linked to this Telegram account. Says what to
+    // do about it rather than only what is missing.
+    tripsEmpty: "I don't have any trips linked to this chat yet. Open the link from your Kinerary signup and I'll set one up with you.",
+    // In a group the answer would list trips the rest of the room has no claim
+    // to — including, on a shared bot, another family's.
+    tripsInGroup: "I can only show your trips in our private chat.",
+    switchDone: "This chat is now on",
+    switchUnchanged: "This chat is already on",
+    // Bound, but nothing is behind it yet. Said at the moment of switching so
+    // it reads as a state of the trip, not as the switch having failed.
+    switchNoCompanion: "The site is ready — I'm still finishing this trip's assistant, so give me a moment before asking me about it.",
+    // ONE sentence for every refusal: not yours, and no such trip. A
+    // distinguishable refusal confirms a guess to whoever is guessing.
+    switchRefused: "I can't switch to that one. Send /trips to see the ones I have for you.",
+    switchInGroup: "I can only switch trips in our private chat — this group stays on its own trip.",
+    switchInInterview: "We're in the middle of setting up a trip. Let's finish this one first, then I can switch.",
+    // Migration 0042's reachability. Worth surfacing: this is the exact state
+    // that produced "I don't have a trip for this chat" about a site that was
+    // provisioned perfectly.
+    tripUnreachable: "(site not responding)",
+
+    // Telegram's ⌘ menu. Descriptions, not sentences: they are read in a list
+    // of four, next to the command itself.
+    cmdTrips: "Your trips, and which one this chat is on",
+    cmdSwitch: "Point this chat at a different trip",
+    cmdGroup: "Connect me to your family group",
+    cmdDone: "Show me everything you have so far",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -456,8 +490,58 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+
+    tripsHeader: "הטיולים שלך:",
+    tripsCurrent: "← הצ׳אט הזה",
+    tripsFooter: "בחרו אחד כדי לחבר אליו את הצ׳אט הזה.",
+    tripsEmpty: "אין לי עדיין טיולים המשויכים לצ׳אט הזה. פתחו את הקישור מההרשמה ל‑Kinerary ונקים אחד יחד.",
+    tripsInGroup: "אני יכול להראות את הטיולים שלך רק בצ׳אט הפרטי בינינו.",
+    switchDone: "הצ׳אט הזה מחובר עכשיו אל",
+    switchUnchanged: "הצ׳אט הזה כבר מחובר אל",
+    switchNoCompanion: "האתר מוכן — אני עדיין מסיים את העוזר של הטיול הזה, אז תנו לי רגע לפני שתשאלו אותי עליו.",
+    switchRefused: "אני לא יכול לעבור לשם. שלחו ‎/trips‎ כדי לראות את הטיולים שיש לי עבורכם.",
+    switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
+    switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
+    tripUnreachable: "(האתר לא מגיב)",
+
+    cmdTrips: "הטיולים שלך, ולאיזה מהם הצ׳אט הזה מחובר",
+    cmdSwitch: "חיבור הצ׳אט הזה לטיול אחר",
+    cmdGroup: "חיבור שלי לקבוצה המשפחתית",
+    cmdDone: "הצגת כל מה שנאסף עד עכשיו",
   },
 };
+
+/**
+ * What each `trips.lifecycle_state` means to the person who owns the trip.
+ *
+ * The raw enum is an engineering vocabulary — `ready_private`,
+ * `provisioning_approved` — and showing it in a trip list asks the organizer
+ * to learn a state machine to answer "is my site up?". Twelve states collapse
+ * to the handful of situations they can actually tell apart.
+ *
+ * A state with no entry falls through to the raw value rather than to a blank:
+ * a reader seeing `sealed` and not knowing what it means is a smaller failure
+ * than a trip whose status line is empty.
+ */
+const LIFECYCLE_COPY: Record<string, Localised> = {
+  pending_signup_approval: { en: "waiting for approval", he: "ממתין לאישור" },
+  draft: { en: "not started", he: "טרם התחיל" },
+  intake_in_progress: { en: "setting it up", he: "בהקמה" },
+  intake_confirmed: { en: "details confirmed", he: "הפרטים אושרו" },
+  planned: { en: "planned", he: "מתוכנן" },
+  provisioning_approved: { en: "building", he: "בבנייה" },
+  provisioning: { en: "building", he: "בבנייה" },
+  ready_private: { en: "site ready", he: "האתר מוכן" },
+  activation_approved: { en: "site ready", he: "האתר מוכן" },
+  active: { en: "live", he: "פעיל" },
+  completed: { en: "finished", he: "הסתיים" },
+  sealed: { en: "archived", he: "בארכיון" },
+};
+
+/** The organizer-facing name for a trip's lifecycle state. */
+export function lifecycleLabel(state: string, language: Language = DEFAULT_LANGUAGE): string {
+  return pick(LIFECYCLE_COPY[state], language) ?? state;
+}
 
 export function uiString(key: string, language: Language = DEFAULT_LANGUAGE): string {
   return UI_STRINGS[language]?.[key] ?? UI_STRINGS[DEFAULT_LANGUAGE][key] ?? key;

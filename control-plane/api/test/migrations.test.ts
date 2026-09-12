@@ -76,10 +76,12 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claim that
-      // number (telegram_organizer_links, plan_reviews), and a duplicate
-      // number with different content is the collision worth avoiding. A gap
-      // is not: the runner applies whatever it has not recorded, in name order.
+      // 0050 is THIS branch's claim on that number. Sprint-5 left the gap
+      // because two unmerged branches claim it — telegram_organizer_links
+      // (here) and plan_reviews — so whichever lands second renumbers. This
+      // one is already applied to the dev control plane under this exact
+      // name, which is the cost of renumbering it now rather than the other.
+      "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
@@ -137,10 +139,12 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claim that
-      // number (telegram_organizer_links, plan_reviews), and a duplicate
-      // number with different content is the collision worth avoiding. A gap
-      // is not: the runner applies whatever it has not recorded, in name order.
+      // 0050 is THIS branch's claim on that number. Sprint-5 left the gap
+      // because two unmerged branches claim it — telegram_organizer_links
+      // (here) and plan_reviews — so whichever lands second renumbers. This
+      // one is already applied to the dev control plane under this exact
+      // name, which is the cost of renumbering it now rather than the other.
+      "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);
   } finally {
