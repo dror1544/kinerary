@@ -240,3 +240,13 @@ date, and exact title in either language. Ambiguous or unmarked items receive
 no RSVP action; stable links survive day/title edits. Group participation
 remains available under More for entries without a matching itinerary card.
 Build and all 93 SPA tests pass, including inline submission and matching rules.
+
+## Ratings on activity cards — 2026-09-12
+
+Journey cards linked to a venue now offer Rate alongside RSVP. Ratings and
+comments expand inside the card and reuse the venue's existing records,
+including the current user's selected stars and own-comment controls. A venue
+can link by `item_uid`, or by an unambiguous exact title within the phase;
+venues without IDs and ambiguous matches do not create rating actions.
+The fresh disposable demo on port 4200 enables both actions on Breakfast,
+New York, March 11. All 95 SPA tests and the production build pass.

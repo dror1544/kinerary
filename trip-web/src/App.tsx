@@ -1,9 +1,9 @@
-import { rsvpForItem } from "./activity-rsvp";
+import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { datesInPhase } from "./phase-calendar";
 export { datesInPhase } from "./phase-calendar";
 import { ImmichAlbum } from "./immich";
 import { Readiness, CurrencyConverter } from "./readiness";
-import { GroupActivities, LostFound, ActivityRsvp } from "./group-utilities";
+import { GroupActivities, LostFound, ActivityRsvp, VenueFeedback } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
 import { Trivia } from "./trivia";
@@ -17,6 +17,7 @@ import {
   CalendarDays,
   Camera,
   CheckCircle2,
+  Star,
   ChevronLeft,
   ChevronRight,
   Clock3,
@@ -499,6 +500,8 @@ function TimelineItem({
   item,
   compact = false,
   rsvpId,
+  venueId,
+  username,
   lang = "en",
   botName,
   telegramUsername,
@@ -506,11 +509,14 @@ function TimelineItem({
   item: ItineraryItem;
   compact?: boolean;
   rsvpId?: string;
+  venueId?: string;
+  username?: string;
   lang?: Lang;
   botName?: string;
   telegramUsername?: string | null;
 }) {
   const [rsvpOpen, setRsvpOpen] = useState(false);
+  const [ratingOpen, setRatingOpen] = useState(false);
   const Icon = item.item_type === "travel" || item.booking?.type === "flight" ? Plane : item.item_type === "meal" ? TicketCheck : MapPin;
   const title = itemTitle(item, lang);
   const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
@@ -548,6 +554,7 @@ function TimelineItem({
           {item.confirmation_state && item.confirmation_state !== "verified" ? <span><AlertTriangle size={14} /> {copy(lang, "Needs review", "נדרשת בדיקה")}</span> : null}
         </div>
         <div className="item-actions" aria-label={`Actions for ${title}`}>
+          {venueId && <button className="item-action" type="button" aria-expanded={ratingOpen} aria-controls={`rating-${item.item_uid}`} onClick={() => setRatingOpen(open => !open)}><Star size={15} />{copy(lang, "Rate", "דירוג")}</button>}
           {rsvpId && <button className="item-action" type="button" aria-expanded={rsvpOpen} aria-controls={`rsvp-${item.item_uid}`} onClick={() => setRsvpOpen(open => !open)}><CheckCircle2 size={15} />{copy(lang, "RSVP", "אישור השתתפות")}</button>}
           {confirmationUrl ? <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking?.conf_file || "confirmation.pdf"} label={<><ShieldCheck size={15} /> {copy(lang, "Confirmation", "אישור")}</>} /> : null}
           {ticketUrl ? <a className="item-action" href={ticketUrl} target="_blank" rel="noreferrer"><TicketCheck size={15} /> {copy(lang, "Tickets", "כרטיסים")}</a> : null}
@@ -557,6 +564,7 @@ function TimelineItem({
           {extraLinks.map((link) => <a key={`${link.label}-${link.url}`} className="item-action" href={link.url} target="_blank" rel="noreferrer"><ExternalLink size={15} /> {link.label}</a>)}
           {askUrl ? <a className="item-action companion" href={askUrl} target="_blank" rel="noreferrer"><MessageCircle size={15} /> {copy(lang, "Ask", "שאלו")}</a> : null}
         </div>
+        {venueId && ratingOpen && <section className="parity-panel" id={`rating-${item.item_uid}`} aria-label={copy(lang, "Activity rating and comments", "דירוג ותגובות לפעילות")}><VenueFeedback key={venueId} id={venueId} username={username} lang={lang} /></section>}
         {rsvpId && rsvpOpen && <section className="parity-panel activity-rsvp-panel" id={`rsvp-${item.item_uid}`} aria-label={copy(lang, "Activity RSVP", "השתתפות בפעילות")}><ActivityRsvp key={rsvpId} id={rsvpId} lang={lang} /></section>}
       </div>
     </article>
@@ -813,6 +821,7 @@ export function JourneyView({
   itinerary,
   config,
   isOrganizer,
+  username,
   lang,
   botName,
   telegramUsername,
@@ -822,6 +831,7 @@ export function JourneyView({
   itinerary?: ActiveItinerary;
   config?: TripConfig;
   isOrganizer?: boolean;
+  username?: string;
   lang: Lang;
   botName?: string;
   telegramUsername?: string | null;
@@ -1111,7 +1121,7 @@ export function JourneyView({
         <div className="timeline">
           {dayItems.length ? dayItems.map((item) => (
             <div className="timeline-item-wrap" id={`itinerary-item-${encodeURIComponent(item.item_uid)}`} key={item.item_uid}>
-              <TimelineItem item={item} rsvpId={rsvpForItem(item, config, itinerary)?.id} lang={lang} botName={botName} telegramUsername={telegramUsername} />
+              <TimelineItem item={item} rsvpId={rsvpForItem(item, config, itinerary)?.id} venueId={venueForItem(item, config)?.id} username={username} lang={lang} botName={botName} telegramUsername={telegramUsername} />
               {isOrganizer ? <div className="timeline-editor-actions">
                 <button type="button" onClick={() => beginEdit(item)}><Pencil size={15} /> {copy(lang, "Edit", "עריכה")}</button>
                 <button className="danger-text" type="button" disabled={removeMutation.isPending} onClick={() => { if (window.confirm(copy(lang, "Remove this itinerary item?", "להסיר את הפריט הזה מהמסלול?"))) removeMutation.mutate(item.item_uid); }}><Trash2 size={15} /> {copy(lang, "Remove", "הסרה")}</button>
@@ -2647,7 +2657,7 @@ export default function App() {
       : "";
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
-    journey: <JourneyView itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
+    journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];

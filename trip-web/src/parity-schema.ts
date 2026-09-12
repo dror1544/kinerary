@@ -63,6 +63,7 @@ export const phaseParityFields = {
     .array(
       z.object({
         id: z.string().optional(),
+        item_uid: z.string().optional(),
         name: bi,
         tickets: z.string().optional(),
         url: z.string().optional(),

@@ -47,8 +47,8 @@ config.packing_general = [
 ];
 config.phases[0].venues = [
   {
-    id: "fixture-museum",
-    name: { en: "Fixture museum", he: "מוזיאון לדוגמה" },
+    id: "fixture-breakfast-venue",
+    name: config.phases[0].days[0].items[0].text,
   },
 ];
 config.phases[1].venues = [{ name: { en: "Mountain museum", he: "מוזיאון ההרים" }, tickets: "https://example.com/tickets" }];

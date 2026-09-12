@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, expect, it, vi } from "vitest";
 import { JourneyView } from "./App";
-import { rsvpForItem } from "./activity-rsvp";
+import { rsvpForItem, venueForItem } from "./activity-rsvp";
 import { configSchema, type ItineraryItem } from "./api";
 const item: ItineraryItem = { item_uid: "museum-1", phase_id: "ny", date: "2027-03-11", text_he: "מוזיאון", text_en: "Museum", item_type: "activity" };
 const config = configSchema.parse({ phases: [{ id: "ny", rsvp_activities: [{ id: "museum-rsvp", item_uid: "museum-1", title: "Museum" }] }] });
@@ -33,5 +33,33 @@ it("opens RSVP inside the marked Journey card and saves to its existing RSVP rec
   const call = fetch.mock.calls.find(call => (call as unknown as [string, RequestInit])[1]?.method === "POST") as unknown as [string, RequestInit];
   expect(call[0]).toBe("/api/rsvps/museum-rsvp");
   expect(JSON.parse(String(call[1].body)).status).toBe("yes");
+  client.clear();
+});
+
+it("offers venue ratings only for an unambiguous identified venue", () => {
+  const linked = configSchema.parse({ phases: [{ id: "ny", venues: [{ id: "venue-1", item_uid: item.item_uid, name: "Renamed museum" }] }] });
+  expect(venueForItem(item, linked)?.id).toBe("venue-1");
+  expect(venueForItem({ ...item, item_uid: "other" }, linked)).toBeUndefined();
+  const ambiguous = configSchema.parse({ phases: [{ id: "ny", venues: [{ id: "a", name: "Museum" }, { id: "b", name: "Museum" }] }] });
+  expect(venueForItem(item, ambiguous)).toBeUndefined();
+  expect(venueForItem(item, { phases: [{ id: "ny", venues: [{ name: "Museum" }] }] })).toBeUndefined();
+});
+
+it("saves an inline rating to the linked venue and shows the user's selection", async () => {
+  let saved = false;
+  const fetch = vi.fn(async (url: string, init: RequestInit = {}) => {
+    if (url === "/api/ratings" && init.method === "POST") saved = true;
+    return new Response(JSON.stringify(url === "/api/ratings" ? (saved ? { "museum-venue": { alice: 5 } } : {}) : []), { headers: { "content-type": "application/json" } });
+  });
+  vi.stubGlobal("fetch", fetch);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(<QueryClientProvider client={client}><JourneyView config={{ phases: [{ id: "ny", venues: [{ id: "museum-venue", name: "Museum" }] }] }} itinerary={{ revision: "r1", days: [{ phase_id: "ny", date: item.date! }], items: [item] }} username="alice" lang="en" onHeroPhaseChange={vi.fn()} /></QueryClientProvider>);
+  expect(fetch).not.toHaveBeenCalled();
+  const card = screen.getByRole("heading", { name: "Museum" }).closest("article")!;
+  fireEvent.click(within(card).getByRole("button", { name: "Rate" }));
+  fireEvent.click(within(card).getByRole("button", { name: "5 ★" }));
+  await waitFor(() => expect(within(card).getByRole("button", { name: "5 ★" })).toHaveAttribute("aria-pressed", "true"));
+  const call = fetch.mock.calls.find(([,init]) => init?.method === "POST")!;
+  expect(JSON.parse(String(call[1]!.body))).toEqual({ venue: "museum-venue", rating: 5 });
   client.clear();
 });

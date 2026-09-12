@@ -19,3 +19,16 @@ export function rsvpForItem(item: ItineraryItem, config?: TripConfig, itinerary?
   if (!activity.item_uid && itinerary && itinerary.items.filter(candidate => matches(activity, candidate)).length !== 1) return undefined;
   return activity;
 }
+
+
+// Ratings belong to the venue, so repeated visits share the same record.
+export function venueForItem(item: ItineraryItem, config?: TripConfig) {
+  const normalize = (value?: string | null) => (value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+  const matches = (config?.phases?.find(p => p.id === item.phase_id)?.venues || []).filter(venue => {
+    if (!venue.id) return false;
+    if (venue.item_uid) return venue.item_uid === item.item_uid;
+    const names = typeof venue.name === "string" ? [venue.name] : [venue.name?.he, venue.name?.en];
+    return names.some(name => normalize(name) && [item.text_he, item.text_en].some(text => normalize(text) === normalize(name)));
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
