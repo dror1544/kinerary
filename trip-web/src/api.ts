@@ -191,6 +191,7 @@ export type ItineraryMutation = {
 
 export type TodayContext = {
   today: string;
+  companion_message?: { date: string; he: string; en: string } | null;
   phase: "pre_trip" | "flight_day" | "active_day" | "transfer_day" | "post_trip";
   countdown_days: number | null;
   current: ItineraryItem | null;
@@ -370,4 +371,4 @@ export const getHermes = () => api<{ identity: { name: string }; available: bool
 export const reportIssue = (input: { title: string; detail?: string; phase_id?: string | null; date?: string | null; item_uid?: string | null; severity?: "info" | "warning" | "critical" }) => api<{ id: string }>("/api/issues/report", { method: "POST", body: JSON.stringify(input) });
 export const getConfirmations = () => api<{ items: Array<{ id: number; type: string; name: string; state: string; next_action?: string | null }> }>("/api/confirmations/summary");
 export const getFlightStatus = () => api<{ statuses: Array<{ facts: { id: number; name: string; identifier: string | null }; source: string; stale?: boolean; status: unknown }> }>("/api/operations/flights");
-export const getWeather = (lat: number, lon: number, date: string) => api<{ source: string; date: string; stale?: boolean; fetched_at?: string | null; temperature_max?: number | null; temperature_min?: number | null; precipitation_probability?: number | null }>(`/api/operations/weather?lat=${lat}&lon=${lon}&date=${date}`);
+export const getWeather = (lat: number, lon: number, date: string) => api<{ source: string; date: string; forecast_dates?: string[]; stale?: boolean; fetched_at?: string | null; temperature_max?: number | null; temperature_min?: number | null; precipitation_probability?: number | null }>(`/api/operations/weather?lat=${lat}&lon=${lon}&date=${date}`);

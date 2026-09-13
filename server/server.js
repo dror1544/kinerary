@@ -948,6 +948,8 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 });
 
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
+require('./companion-conversation').registerCompanionConversation({ app, db, authRequired, organizerOrAgentRequired });
+require('./companion-control').registerCompanionControl({ app, authRequired, organizerOrAgentRequired, fetchImpl: fetch });
 
 app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   const agent = TRIP_CONFIG.agent || null;
@@ -1223,6 +1225,10 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   let content;
   try { content = sanitizeConfig(JSON.parse(row.content)); } catch { return res.status(500).json({ error: 'stored version is not valid JSON' }); }
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
+});
+
+require('./site-icons').registerSiteIcons(app, {
+  tripDir: TRIP_DIR, siteDir: SITE_DIR, getLogo: () => TRIP_CONFIG.meta?.logo,
 });
 
 app.get('/api/trip/logo', (_req, res) => {

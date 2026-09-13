@@ -207,6 +207,12 @@ function schema(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS trip_daily_messages (
+      date TEXT PRIMARY KEY,
+      he TEXT NOT NULL,
+      en TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS provider_observations (
       provider TEXT NOT NULL,
       cache_key TEXT NOT NULL,
@@ -891,8 +897,10 @@ async function weatherObservation(db, fetchImpl, query) {
   const date = ISO_DATE_RE.test(String(query.date || '')) ? String(query.date) : new Date().toISOString().slice(0, 10);
   const cacheKey = `${latitude.toFixed(3)},${longitude.toFixed(3)}|${date}`;
   const cached = cachedObservation(db, 'weather', cacheKey);
-  if (cached && !cached.stale) return cached;
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(latitude)}&longitude=${encodeURIComponent(longitude)}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=14&timezone=auto`;
+  if (cached && !cached.stale && (cached.temperature_max != null || cached.temperature_min != null)) return cached;
+  // The trip clock can still be on yesterday in the destination timezone.
+  // Include that boundary day instead of hiding its weather.
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(latitude)}&longitude=${encodeURIComponent(longitude)}&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=14&past_days=1&timezone=auto`;
   try {
     const response = await fetchImpl(url, { timeout: 8000 });
     if (!response.ok) throw new Error(`weather ${response.status}`);
@@ -901,6 +909,7 @@ async function weatherObservation(db, fetchImpl, query) {
     const normalized = {
       source: 'open-meteo',
       date,
+      forecast_dates: (raw?.daily?.time || []).filter((day) => ISO_DATE_RE.test(day)),
       temperature_max: index >= 0 ? raw.daily.temperature_2m_max?.[index] ?? null : null,
       temperature_min: index >= 0 ? raw.daily.temperature_2m_min?.[index] ?? null : null,
       precipitation_probability: index >= 0 ? raw.daily.precipitation_probability_max?.[index] ?? null : null,
@@ -929,6 +938,7 @@ function buildTodayContext(db, config) {
   return {
     today,
     time_zone: clock.time_zone,
+    companion_message: db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(today) || null,
     phase,
     first_date: firstDate,
     last_date: lastDate,
@@ -1199,6 +1209,17 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     });
     updateLegacyFromActive(db);
     res.json({ revision: nextId });
+  });
+
+  app.post('/api/agent/daily-message', organizerOrAgentRequired, (req, res) => {
+    const { date, he, en } = req.body || {};
+    if (date !== localClock(config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
+    if (![he, en].every(value => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 280)) {
+      return res.status(400).json({ error: 'he_and_en_required_max_280_characters' });
+    }
+    db.prepare('INSERT INTO trip_daily_messages (date, he, en) VALUES (?, ?, ?) ON CONFLICT(date) DO UPDATE SET he = excluded.he, en = excluded.en')
+      .run(date, he.trim(), en.trim());
+    res.json(db.prepare('SELECT date, he, en FROM trip_daily_messages WHERE date = ?').get(date));
   });
 
   app.get('/api/today', authRequired, (_req, res) => {

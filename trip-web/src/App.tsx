@@ -1,3 +1,5 @@
+import { CompanionPanel } from "./CompanionPanel";
+import { TodayWeather } from "./TodayWeather";
 import { VenueLinks } from "./venue-links";
 import { safeExternalUrl } from "./external-url";
 export { safeExternalUrl } from "./external-url";
@@ -17,7 +19,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
-  Bot,
   CalendarDays,
   Camera,
   CheckCircle2,
@@ -25,7 +26,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
-  CloudSun,
   Download,
   DollarSign,
   Compass,
@@ -90,12 +90,10 @@ import {
   getPhotos,
   getToday,
   getUiSettings,
-  getWeather,
   getLoginRoster,
   resetParticipantPassword,
   login,
   postPhotoComment,
-  reportIssue,
   runtimeUrl,
   tokenStore,
   UNAUTHORIZED_EVENT,
@@ -576,69 +574,7 @@ type JourneyFocus = {
   itemUid?: string;
 };
 
-function CompanionPanel({
-  config,
-  hermes,
-  next,
-  todayDate,
-  isOrganizer,
-  lang,
-}: {
-  config?: TripConfig;
-  hermes?: Awaited<ReturnType<typeof getHermes>>;
-  next?: ItineraryItem | null;
-  todayDate?: string;
-  isOrganizer?: boolean;
-  lang: Lang;
-}) {
-  const [message, setMessage] = useState("");
-  const [saved, setSaved] = useState("");
-  const name = botDisplayName(config, hermes?.identity.name, lang);
-  const context = next ? `About ${todayDate || "today"} - ${itemTitle(next, lang)}` : `About ${todayDate || "the trip plan"}`;
-  const askHref = telegramUrl(hermes?.telegram_username, `${context}\n\n${message || "I have a question about today's plan."}`);
-  const privateHref = telegramUrl(hermes?.telegram_username, `[Organizer private]\n${context}\n\n${message || "Please review this privately."}`);
-  const reportMutation = useMutation({
-    mutationFn: () => reportIssue({
-      title: `${name} member question`,
-      detail: `${context}\n\n${message}`.slice(0, 1000),
-      phase_id: next?.phase_id || null,
-      date: next?.date || todayDate || null,
-      item_uid: next?.item_uid || null,
-      severity: "info",
-    }),
-    onSuccess: () => {
-      setSaved("Saved to the organizer issue queue.");
-      setMessage("");
-    },
-  });
-
-  return (
-    <section className="companion-panel">
-      <div className="companion-head">
-        <img src={brandMark} alt="" />
-        <div>
-          <span className="panel-label"><Bot size={16} /> {name}</span>
-          <h3>{lang === "he" ? "שאלו על התוכנית של היום" : "Ask about the day plan"}</h3>
-        </div>
-      </div>
-      <p>{hermes?.available ? "Fresh checks are available for plan questions and confirmations." : "Telegram handoff is ready when the bot is configured; reports still reach the organizer queue."}</p>
-      <label className="bot-input">
-        <span>{lang === "he" ? "מה לבדוק?" : "What should the companion check?"}</span>
-        <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder={context} />
-      </label>
-      <div className="bot-actions">
-        {askHref ? <a className="primary-action" href={askHref} target="_blank" rel="noreferrer"><Send size={17} /> {copy(lang,"Ask in Telegram","שאלה בטלגרם")}</a> : null}
-        <button className="secondary-action" type="button" disabled={!message.trim() || reportMutation.isPending} onClick={() => reportMutation.mutate()}>
-          <AlertTriangle size={17} /> Flag plan issue
-        </button>
-        {isOrganizer && privateHref ? <a className="secondary-action" href={privateHref} target="_blank" rel="noreferrer"><MessageCircle size={17} /> {copy(lang,"Private organizer chat","שיחה פרטית למארגן")}</a> : null}
-      </div>
-      {saved ? <small className="saved-note">{saved}</small> : null}
-    </section>
-  );
-}
-
-function TripClockPanel({
+export function TripClockPanel({
   config,
   itinerary,
   today,
@@ -676,14 +612,40 @@ function TripClockPanel({
               ? copy(lang, `Day ${phaseDayIndex} in ${destination}`, `יום ${phaseDayIndex} ב${destination}`)
               : copy(lang, `Now tracking ${destination}`, `עוקבים עכשיו אחרי ${destination}`)}
         </h3>
-        <p>
-          {totalDays && totalIndex > 0
-            ? copy(lang, `Trip day ${totalIndex} of ${totalDays}. The page keeps following destination-local time.`, `יום ${totalIndex} מתוך ${totalDays} בטיול. העמוד מתעדכן לפי השעה המקומית ביעד.`)
-            : copy(lang, "Countdown, current phase, and next event all move with the trip clock.", "הספירה לאחור, השלב הנוכחי והאירוע הבא מתעדכנים עם שעון הטיול.")}
-        </p>
+        {totalDays > 0 && totalIndex > 0 && <p>{copy(lang, `Trip day ${totalIndex} of ${totalDays}.`, `יום ${totalIndex} מתוך ${totalDays} בטיול.`)}</p>}
+        <p>{(today?.companion_message?.date === today?.today && today?.companion_message?.[lang]) || copy(lang,
+          "Take today at your own pace. Some of the best moments are the ones you didn't plan.",
+          "קחו את היום בקצב שלכם. לפעמים הרגעים הכי יפים הם אלה שלא תכננתם.",
+        )}</p>
       </div>
     </section>
   );
+}
+
+export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
+  item: ItineraryItem;
+  config?: TripConfig;
+  lang: Lang;
+  onOpenItinerary: (focus: JourneyFocus) => void;
+}) {
+  const title = itemTitle(item, lang);
+  const phase = config?.phases?.find((entry) => entry.id === item.phase_id);
+  const destination = text(phase?.title, lang);
+  const mapUrl = safeExternalUrl(item.location_url) || safeExternalUrl(item.booking?.location_url)
+    || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([title, destination].filter(Boolean).join(", "))}`;
+  const confirmationUrl = safeFileUrl("/api/bookings/confirmation", item.booking?.conf_file);
+  return <article className="timeline-item compact upcoming-activity">
+    <div className="time-rail"><span>{itineraryTimeLabel(item.time, lang)}</span><i /></div>
+    <div className="item-body">
+      <div className="item-kicker"><MapPin size={16} /><span>{copy(lang, "Up next", "הפעילות הבאה")}</span></div>
+      <h3><button className="upcoming-plan-link" type="button" aria-label={copy(lang, `View ${title} in the plan`, `פתיחת ${title} בתוכנית`)} onClick={() => onOpenItinerary({ phaseId: item.phase_id, date: item.date || undefined, itemUid: item.item_uid })}>{title}</button></h3>
+      <small className="upcoming-plan-hint">{copy(lang, "View in plan", "פתיחה בתוכנית")}</small>
+      <div className="item-actions upcoming-actions">
+        <a className="item-action" href={mapUrl} target="_blank" rel="noreferrer"><MapPin size={15} />Google Maps</a>
+        {confirmationUrl && <AuthenticatedDocumentAction url={confirmationUrl} filename={item.booking!.conf_file!} label={<><ShieldCheck size={15} />{copy(lang, "View confirmation", "צפייה באישור")}</>} />}
+      </div>
+    </div>
+  </article>;
 }
 
 function TodayView({
@@ -691,22 +653,18 @@ function TodayView({
   config,
   lang,
   isOrganizer,
+  onOpenItinerary,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
   lang: Lang;
   isOrganizer?: boolean;
+  onOpenItinerary: (focus: JourneyFocus) => void;
 }) {
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
   const confirmations = useQuery({ queryKey: ["confirmations"], queryFn: getConfirmations });
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
-  const firstStop = config?.phases?.find((phase) => Number.isFinite(phase.mapStop?.lat) && Number.isFinite(phase.mapStop?.lng))?.mapStop;
-  const weather = useQuery({
-    queryKey: ["weather", firstStop?.lat, firstStop?.lng, today.data?.today],
-    queryFn: () => getWeather(firstStop!.lat!, firstStop!.lng!, today.data!.today),
-    enabled: Boolean(Number.isFinite(firstStop?.lat) && Number.isFinite(firstStop?.lng) && today.data?.today),
-  });
   const missing = confirmations.data?.items.filter((item) => item.state !== "verified").slice(0, 3) || [];
   const next = today.data?.next || itinerary?.items[0] || null;
   const companionName = botDisplayName(config, hermes.data?.identity.name, lang);
@@ -716,48 +674,25 @@ function TodayView({
       <div className="focus-panel">
         <span className="panel-label">{today.data ? phaseLabel(today.data.phase, lang) : copy(lang, "Today", "היום")}</span>
         <h2>{next ? itemTitle(next, lang) : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
-        <p>
-          {today.data?.phase === "pre_trip" && today.data.countdown_days != null
-            ? copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)
-            : copy(lang, "Now and next stay current without a page reload.", "האירוע הנוכחי והבא מתעדכנים בלי לרענן את העמוד.")}
-        </p>
-        {next ? <TimelineItem item={next} compact lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} /> : null}
+        {today.data?.phase === "pre_trip" && today.data.countdown_days != null ? (
+          <p>{copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)}</p>
+        ) : null}
+        {next ? <UpcomingActivity item={next} config={config} lang={lang} onOpenItinerary={onOpenItinerary} /> : null}
         <TripClockPanel config={config} itinerary={itinerary} today={today.data} next={next} lang={lang} />
       </div>
 
       <aside className="ops-strip">
-        <section className="mini-panel">
-          <CloudSun size={20} />
-          <h3>{copy(lang,"Weather","מזג אוויר")}</h3>
-          <p>
-            {weather.data?.temperature_max != null
-              ? `${Math.round(weather.data.temperature_min || 0)}-${Math.round(weather.data.temperature_max)} C`
-              : "Last known weather appears here when available."}
-          </p>
-          {weather.data?.stale ? <small>Stale: {weather.data.fetched_at || "not refreshed yet"}</small> : null}
-        </section>
+        {today.data?.today && <TodayWeather key={today.data.today} config={config} itinerary={itinerary} today={today.data.today} lang={lang} />}
         <section className="mini-panel">
           <Plane size={20} />
           <h3>{copy(lang,"Flights","טיסות")}</h3>
           <p>{flights.data?.statuses[0]?.facts.name || today.data?.flights[0]?.name || "Stored booking facts are the fallback."}</p>
           {flights.data?.statuses[0]?.stale ? <small>{copy(lang,"Using last known status","מציגים את המצב האחרון הידוע")}</small> : null}
         </section>
-        <section className="mini-panel">
-          <Bot size={20} />
-          <h3>{companionName}</h3>
-          <p>{hermes.data?.available ? "Available for trip checks." : "Profile visible; live checks not configured."}</p>
-          {hermes.data?.telegram_username ? <a href={telegramUrl(hermes.data.telegram_username)}>{copy(lang,"Open conversation","פתיחת שיחה")}</a> : null}
-        </section>
+
       </aside>
 
-      <CompanionPanel
-        config={config}
-        hermes={hermes.data}
-        next={next}
-        todayDate={today.data?.today}
-        isOrganizer={isOrganizer}
-        lang={lang}
-      />
+      <CompanionPanel name={companionName} isOrganizer={isOrganizer} lang={lang} />
 
       <section className="section-band">
         <div className="section-heading">
@@ -772,7 +707,7 @@ function TodayView({
               <span>{item.name}</span>
               <small>{item.next_action}</small>
             </article>
-          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>{copy(lang,"Core confirmations look complete.","האישורים העיקריים נראים מלאים.")}</span><small>{copy(lang,"Budget remains in its own module.","התקציב מוצג במסך נפרד.")}</small></article>}
+          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>{copy(lang,"Core confirmations look complete.","האישורים העיקריים נראים מלאים.")}</span><small><a href="#budget">{copy(lang,"Budget remains in its own module.","התקציב מוצג במסך נפרד.")}</a></small></article>}
         </div>
       </section>
     </section>
@@ -1022,9 +957,9 @@ export function JourneyView({
       </aside>
       <section ref={daySpineRef} className="day-spine">
         <div className="day-heading">
-          <span className="panel-label">{activePhase?.title || "Journey"}</span>
-          <div className="journey-tools">
-          {isOrganizer&&<a href="#plan-tools">{copy(lang,"Day titles, swaps and original plan","כותרות ימים, החלפות והמסלול המקורי")}</a>}
+          <div className="day-heading-top">
+            <span className="panel-label">{activePhase?.title || "Journey"}</span>
+            {isOrganizer && <a className="journey-settings" href="#plan-tools" aria-label={copy(lang, "Plan settings", "הגדרות מסלול")}><Settings size={20} aria-hidden="true" /></a>}
           </div>
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
           {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
@@ -1500,7 +1435,7 @@ function BookingsView({ config, isOrganizer, lang }: { config?: TripConfig; isOr
   const [filter, setFilter] = useState<BookingFilter>("phase");
   const [editingBookingId, setEditingBookingId] = useState<number | null>(null);
   const bookings = useQuery({ queryKey: ["bookings"], queryFn: getBookings });
-  const today = useQuery({ queryKey: ["today"], queryFn: getToday });
+  const today = useQuery({ queryKey: ["today"], queryFn: getToday, refetchInterval: 60_000 });
   const allRows = bookings.data || [];
   const activePhaseId = today.data?.current?.phase_id || today.data?.next?.phase_id || null;
   const rows = useMemo(() => allRows.filter((booking) => {
@@ -2641,7 +2576,7 @@ export default function App() {
     window.location.hash = module;
     setMenuOpen(false);
   };
-  const openMapItinerary = (pin: MapPin) => {
+  const openMapItinerary = (pin: JourneyFocus) => {
     setJourneyFocus({ phaseId: pin.phaseId, date: pin.date, itemUid: pin.itemUid });
     setActiveTab("journey");
     setActiveModule(null);
@@ -2655,7 +2590,7 @@ export default function App() {
       ? todayPhaseId(config.data, itinerary.data, today.data)
       : "";
   const tabContent = {
-    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} />,
+    today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} />,
     journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,

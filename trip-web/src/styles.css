@@ -280,6 +280,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   padding: clamp(18px, 3vw, 26px);
   background: linear-gradient(135deg, rgba(95,211,196,.16), rgba(255,255,255,.96));
 }
+.day-heading-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.plan-tools-back { justify-self: start; text-decoration: none; }
+.journey-settings { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: var(--kit-radius); color: var(--kit-teal); }
+.journey-settings:hover { background: rgba(95,211,196,.14); }
+.journey-settings:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: 2px; }
 .editor-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
 .editor-heading h3 { margin: 7px 0 0; font: 800 24px/1.15 var(--kit-font-display); }
 .editor-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
@@ -988,8 +993,6 @@ textarea { min-height: 132px; resize: vertical; }
 .trivia-answers { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
 @media(max-width:480px) { .trivia-answers { grid-template-columns: 1fr; } }
 
-.journey-tools { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-block: 12px; }
-.journey-tools a { color: var(--kit-teal); text-decoration: underline; text-underline-offset: 3px; }
 
 .star-rating { border: 0; padding: 0; margin: 0 0 12px; min-width: 0; }
 .star-rating legend { padding: 0; margin-bottom: 8px; font-weight: 700; }
@@ -1042,3 +1045,48 @@ textarea { min-height: 132px; resize: vertical; }
 .mobile-select-options button { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 56px; padding: 14px 16px; border: 1px solid var(--kit-line); border-radius: 10px; background: var(--kit-paper); color: var(--kit-ink); text-align: start; font-size: 20px; line-height: 1.4; cursor: pointer; }
 .mobile-select-options button[aria-pressed=true] { background: #dff3ef; border-color: var(--kit-teal); font-weight: 700; }
 .mobile-select-options button:disabled { opacity: .5; cursor: default; }
+
+.weather-date { min-width: 0; text-align: center; font-size: 13px; line-height: 1.4; }
+.weather-navigation { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 4px; margin: 8px -8px; }
+.weather-navigation button { display: grid; place-items: center; width: 44px; height: 44px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--kit-ink); cursor: pointer; }
+.weather-navigation button svg { color: inherit; }
+.weather-navigation button:hover:not(:disabled) { background: var(--kit-paper); }
+.weather-navigation button:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: -2px; }
+.weather-navigation button:disabled { color: var(--kit-muted); opacity: .35; cursor: default; }
+
+.weather-navigation .weather-today { width: auto; min-width: 44px; margin: 0 auto; padding: 0 8px; border-radius: 8px; color: var(--kit-teal); font: inherit; font-weight: 600; }
+.weather-navigation .weather-today:disabled { color: var(--kit-muted); opacity: .45; }
+
+.upcoming-activity { position: relative; }
+.upcoming-plan-link { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: start; cursor: pointer; }
+.upcoming-plan-link::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
+.upcoming-activity:has(.upcoming-plan-link:hover) { border-color: var(--kit-teal); }
+.upcoming-plan-link:focus-visible { outline: none; }
+.upcoming-plan-link:focus-visible::after { outline: 2px solid var(--kit-teal); outline-offset: -3px; }
+.upcoming-plan-hint { display: block; margin-top: 6px; color: var(--kit-muted); }
+.upcoming-actions { position: relative; z-index: 1; width: fit-content; }
+
+.companion-settings { margin-top: 12px; }
+.companion-settings > section { margin-top: 12px; }
+.companion-task { border-top: 1px solid var(--kit-line); padding: 14px 0; }
+.companion-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.companion-task-heading button { border: 1px solid var(--kit-line); border-radius: 999px; padding: 8px 12px; background: var(--kit-paper); color: var(--kit-muted); cursor: pointer; }
+.companion-task-heading button[aria-checked=true] { background: var(--kit-teal); color: white; }
+.companion-task button:disabled { opacity: .5; cursor: default; }
+.companion-task p { margin: 8px 0; }
+
+.companion-settings-toggle { width: 44px; height: 44px; padding: 0; justify-content: center; }
+
+.companion-panel { position: relative; }
+.companion-panel > .companion-settings { position: absolute; inset-inline-end: 20px; top: 20px; z-index: 2; }
+.companion-panel > .companion-settings > section { position: absolute; inset-inline-end: 0; width: min(340px, 80vw); max-height: 65vh; overflow-y: auto; padding: 20px; background: var(--surface, #fff); border: 1px solid #dce5e1; border-radius: 18px; box-shadow: 0 12px 35px #1232; }
+.companion-panel .companion-head { padding-inline-end: 54px; }
+.companion-latest { padding: 16px; border-radius: 16px; background: #edf5f0; margin-block: 18px; }
+.companion-messages { max-height: 360px; overflow-y: auto; display: grid; gap: 12px; margin-block: 18px; }
+.companion-message { padding: 14px; border: 1px solid #dce5e1; border-radius: 14px; }
+.companion-message.reply { background: #f2f7f4; }
+.companion-message time { display: block; font-size: 0.75rem; opacity: .7; }
+.companion-message p, .companion-latest p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.companion-message blockquote { margin-inline: 0; padding-inline-start: 12px; border-inline-start: 2px solid #94b4a4; font-size: .85rem; }
+
+.companion-telegram-icon { width: 44px; min-height: 44px; padding: 0; justify-content: center; }
