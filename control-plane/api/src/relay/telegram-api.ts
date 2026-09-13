@@ -118,6 +118,18 @@ export interface TelegramClient {
   getMe(): Promise<BotSelf | null>;
   getUpdates(params: { offset: number; timeoutSeconds: number; allowedUpdates: string[] }): Promise<unknown[]>;
   deleteWebhookIfPresent(): Promise<void>;
+  /**
+   * Publishes the typed-command menu Telegram shows behind the ⌘ button.
+   *
+   * Optional so a client that predates it — the conformance stub, a test fake
+   * — is still a TelegramClient. A missing menu is an undiscoverable but fully
+   * working command surface, which is the pre-existing state, not a regression.
+   */
+  setMyCommands?(params: {
+    commands: { command: string; description: string }[];
+    scope?: { type: string };
+    languageCode?: string;
+  }): Promise<boolean>;
 }
 
 export class HttpTelegramClient implements TelegramClient {
@@ -295,6 +307,22 @@ export class HttpTelegramClient implements TelegramClient {
       name: chat.title ?? chat.username ?? chat.first_name ?? chatId,
       type: chat.type ?? "private",
     };
+  }
+
+  async setMyCommands(params: {
+    commands: { command: string; description: string }[];
+    scope?: { type: string };
+    languageCode?: string;
+  }): Promise<boolean> {
+    const res = await this.post("setMyCommands", {
+      commands: params.commands,
+      ...(params.scope ? { scope: params.scope } : {}),
+      // Telegram treats an ABSENT language_code as the fallback menu and an
+      // empty string as a language — so the key is omitted rather than sent
+      // blank, or the default menu would be filed under a language nobody has.
+      ...(params.languageCode ? { language_code: params.languageCode } : {}),
+    });
+    return res.ok;
   }
 
   async getMe(): Promise<BotSelf | null> {
