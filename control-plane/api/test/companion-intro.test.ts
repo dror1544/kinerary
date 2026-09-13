@@ -205,6 +205,104 @@ describe("groupIntroText", () => {
     assert.match(text, /[֐-׿]/);
     assert.match(text, /trip-seed-pw/);
   });
+
+  // 2026-09-14: "Ask me anything here" said nothing about what a group member
+  // actually has to DO for a message to get answered. These lock in the three
+  // real triggers isAddressedToAssistant honours (relay/addressing.ts) — a
+  // change to one without the other would let this message promise a way in
+  // the router does not accept, or hide one it does.
+  describe("how to get its attention", () => {
+    test("names the bot's actual @username, not a placeholder", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /@Kinerary_bot/);
+    });
+
+    test("explains Telegram's Reply action, not just 'send a message after'", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /Reply to one of my messages/);
+    });
+
+    test("gives one ready-to-use example using the assistant's own name", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /"Rio, what are we doing tomorrow\?"/);
+    });
+
+    test("omits the @mention bullet when no bot username is configured", () => {
+      const text = groupIntroText({ ...BASE, botUsername: null }, { includePassword: true });
+      assert.doesNotMatch(text, /Mention me:/);
+      // The other two triggers still stand without it.
+      assert.match(text, /Reply to one of my messages/);
+    });
+
+    test("says it stays quiet, never that it cannot see an unaddressed message", () => {
+      // Once the bot is a group admin, Telegram delivers every message to it —
+      // the choice not to answer is the router's, not a limit on what reaches
+      // it. Overclaiming "I can't see it" would be false, not just modest.
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /stay quiet/);
+      assert.doesNotMatch(text, /can't see|cannot see/i);
+    });
+
+    test("a booking confirmation needs the same addressing as anything else", () => {
+      // The gate reads message.text ?? message.caption ?? "" — a document with
+      // no caption addressing the assistant is ignored exactly like unaddressed
+      // small talk, so "send me booking confirmations" alone overpromised.
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /mention me or reply to my message when you send the confirmation/);
+    });
+  });
+
+  describe("adding the site to the phone's Home Screen", () => {
+    test("covers iPhone/Safari and Android/Chrome as two separate flows", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /On iPhone \(Safari\)/);
+      assert.match(text, /Add to Home Screen/);
+      assert.match(text, /On Android \(Chrome\)/);
+      assert.match(text, /Install and create shortcut/);
+    });
+
+    test("the Android fallback does not require a real install to work", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /Create shortcut/);
+    });
+
+    test("tells a Telegram in-app-browser visitor to open it in the real browser", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /Opened this from inside Telegram/);
+    });
+
+    test("never calls it a download, and promises nothing unverified", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.doesNotMatch(text, /download/i);
+      assert.doesNotMatch(text, /offline|push notification/i);
+    });
+
+    test("in Hebrew, uses the actual Safari share-sheet labels", () => {
+      const text = groupIntroText({ ...BASE, assistantName: "ריו", language: "he" }, { includePassword: true });
+      assert.match(text, /"שיתוף"/);
+      assert.match(text, /"הוספה למסך הבית"/);
+      assert.match(text, /"הוסף"/);
+      assert.match(text, /"פתיחה ביישום רשת"/);
+    });
+  });
+
+  describe("getting to know the group over the trip", () => {
+    test("frames it as accumulated preferences, with a concrete example", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /we prefer later starts/);
+    });
+
+    test("separates sharing a preference from asking for a plan change", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.match(text, /ask me to update it/);
+      assert.match(text, /a passing comment won't change anything on its own/);
+    });
+
+    test("never overpromises total recall or automatic updates", () => {
+      const text = groupIntroText(BASE, { includePassword: true });
+      assert.doesNotMatch(text, /remember everything|learn from every message|automatically update/i);
+    });
+  });
 });
 
 describe("the group-binding token in the organizer's message", () => {
