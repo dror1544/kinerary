@@ -5,7 +5,12 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
+import {
+  startFromDeepLink,
+  answerCallbackData,
+  CONFIRM_CALLBACK_DATA,
+  setCompanionExpectsReply,
+} from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -541,6 +546,81 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
         fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
       );
       assert.equal(decision.kind, "ignore");
+    });
+  });
+});
+
+describe("companion reply-capture through dispatchUpdate (migration 0048)", { skip: SKIP }, () => {
+  test("an open window lets the very next unaddressed group message through, once", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001000";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await setCompanionExpectsReply(fix.pool, chatId, true);
+
+      const first = await dispatchUpdate(fix.pool, msg(chatId, "Friday works for us", "group"));
+      assert.equal(first.kind, "to_gateway", "the window captures the very next message, whoever sends it");
+
+      const second = await dispatchUpdate(fix.pool, msg(chatId, "anyway, who's driving?", "group"));
+      assert.deepEqual(
+        second,
+        { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "one-shot: the window was already spent by the first message",
+      );
+    });
+  });
+
+  test("an unaddressed group message with no open window is ignored, as today", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001001";
+      await bindCompanion(fix, chatId, "companion-japan");
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "just chatting amongst ourselves", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a window past its floor lapses instead of capturing", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001002";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.telegram_chat_bindings
+            SET awaiting_reply_since = now() - interval '1 hour', awaiting_reply_floor_seconds = 150
+          WHERE chat_id = $1`,
+        [chatId],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "Friday works", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a per-trip opt-out defeats capture even with a fresh window", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001003";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1",
+        [fix.tripId],
+      );
+      await setCompanionExpectsReply(fix.pool, chatId, true);
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "Friday works", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("an @mention still addresses the assistant normally, independent of any window", async () => {
+    // Guards against the new `capturedAsReply ||` short-circuit having broken
+    // the ordinary gate it sits beside.
+    await withFixture(async (fix) => {
+      const chatId = "-1002001004";
+      await bindCompanion(fix, chatId, "companion-japan");
+      const decision = await dispatchUpdate(
+        fix.pool,
+        msg(chatId, "@kinerary_bot what time is our flight?", "group"),
+        DEFAULT_STRINGS,
+        () => {},
+        { id: "8463178587", username: "kinerary_bot" },
+      );
+      assert.equal(decision.kind, "to_gateway");
     });
   });
 });

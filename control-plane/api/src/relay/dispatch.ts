@@ -35,6 +35,7 @@ import {
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
+  consumeExpectsReplyWindow,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { groupBindingCommand, groupIntroText } from "../companion-intro.js";
@@ -514,13 +515,27 @@ export async function dispatchUpdate(
         : Boolean(repliedTo.is_bot)
       : false;
 
-    const addressed = isAddressedToAssistant({
-      chatType: outcome.event.source.chat_type,
-      text: outcome.event.text,
-      assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
-      botUsername: botIdentity.username,
-      isReplyToAssistant,
-    });
+    // Migration 0048: the assistant's own last message here may have asked a
+    // question it wants answered, in which case the VERY NEXT message in this
+    // chat is addressed to it, whoever sends it — no @mention/name/reply-to
+    // needed. Attempted unconditionally, ahead of the ordinary gate below: the
+    // atomic claim also clears the window on a hit, so a second message, even
+    // one still inside the window, finds nothing left to claim (one-shot).
+    // `route.kind === "companion"` is structural, not a real branch here —
+    // normalizeUpdate never reaches this point for an interview or unbound
+    // chat — mirrored only to match the ternary just below it.
+    const capturedAsReply =
+      outcome.route.kind === "companion" ? await consumeExpectsReplyWindow(db, chatId) : false;
+
+    const addressed =
+      capturedAsReply ||
+      isAddressedToAssistant({
+        chatType: outcome.event.source.chat_type,
+        text: outcome.event.text,
+        assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+        botUsername: botIdentity.username,
+        isReplyToAssistant,
+      });
     if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
     return { kind: "to_gateway", event: outcome.event };
   }

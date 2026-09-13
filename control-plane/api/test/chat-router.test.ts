@@ -11,6 +11,7 @@ import {
   answerCallbackData,
   callbackDataFits,
   CONFIRM_CALLBACK_DATA,
+  consumeExpectsReplyWindow,
   findQuestion,
   KEEP_PLANNING_CALLBACK_DATA,
   parseCallbackData,
@@ -19,6 +20,7 @@ import {
   renderDocumentOffer,
   renderQuestion,
   resolveChatRoute,
+  setCompanionExpectsReply,
   startFromDeepLink,
 } from "../src/chat-router.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -590,6 +592,87 @@ describe("resolveChatRoute — closed bindings", () => {
         "companion-new",
         "the binding in force, not the one it replaced",
       );
+    });
+  });
+});
+
+describe("companion reply-capture window (migration 0048)", () => {
+  async function bindCompanion(fix: Fixture, chatId: string): Promise<void> {
+    await fix.pool.query(
+      "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, $4)",
+      [`tcb_${randomBytes(16).toString("hex")}`, chatId, fix.tripId, "trip-companion"],
+    );
+  }
+
+  test("opening a window makes it capturable exactly once", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800004000");
+      await setCompanionExpectsReply(fix.pool, "800004000", true);
+
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004000"), true, "first message captures it");
+      assert.equal(
+        await consumeExpectsReplyWindow(fix.pool, "800004000"),
+        false,
+        "a second message finds nothing left to claim",
+      );
+    });
+  });
+
+  test("a chat with no open window is never captured", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800004001");
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004001"), false);
+    });
+  });
+
+  test("a window past its floor lapses instead of capturing", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800004002");
+      // Written directly as already-expired, rather than waiting out a real
+      // TTL: same lazy-expiry idiom as intake_sessions.awaiting_since — a
+      // stale window is simply inert wherever it's read, never swept.
+      await fix.pool.query(
+        `UPDATE control_plane.telegram_chat_bindings
+            SET awaiting_reply_since = now() - interval '1 hour', awaiting_reply_floor_seconds = $2
+          WHERE chat_id = $1`,
+        ["800004002", 150],
+      );
+
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004002"), false);
+    });
+  });
+
+  test("a per-trip opt-out defeats capture even with a fresh window", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800004003");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1",
+        [fix.tripId],
+      );
+      await setCompanionExpectsReply(fix.pool, "800004003", true);
+
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004003"), false);
+    });
+  });
+
+  test("setting expects=false clears a previously open window", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "800004004");
+      await setCompanionExpectsReply(fix.pool, "800004004", true);
+      await setCompanionExpectsReply(fix.pool, "800004004", false);
+
+      assert.equal(
+        await consumeExpectsReplyWindow(fix.pool, "800004004"),
+        false,
+        "the agent's follow-up chit-chat cancelled the pending capture",
+      );
+    });
+  });
+
+  test("a chat with no open binding is a no-op, not an error", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await assert.doesNotReject(setCompanionExpectsReply(fix.pool, "800004999", true));
+      assert.equal(await consumeExpectsReplyWindow(fix.pool, "800004999"), false);
     });
   });
 });

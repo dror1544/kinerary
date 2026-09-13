@@ -29,7 +29,7 @@ import { structuredLog } from "../redaction.js";
 import { resolveSecretRef } from "../secrets.js";
 import type { SignupConfig } from "../signup.js";
 import { RelayConnector } from "./connector.js";
-import { resolveChatRoute } from "../chat-router.js";
+import { resolveChatRoute, setCompanionExpectsReply } from "../chat-router.js";
 import { sayForChat,
   agentAlreadySpokeThisTurn,
 } from "../interview.js";
@@ -243,6 +243,11 @@ async function main(): Promise<void> {
             if (await agentAlreadySpokeThisTurn(runtime.db!, chatId)) return false;
             const said = await sayForChat(runtime.db!, chatId, text);
             return said.ok;
+          },
+          // Migration 0048: lets a companion send that's a question open the
+          // one-shot reply-capture window on its chat's binding.
+          setExpectsReply: async (chatId: string, expects: boolean) => {
+            await setCompanionExpectsReply(runtime.db!, chatId, expects);
           },
         }
       : {}),

@@ -128,6 +128,18 @@ export interface ConnectorOptions {
    * the organizer is lost, and a turn that spoke is not mistaken for a stall.
    */
   interviewSay?: (chatId: string, text: string) => Promise<boolean>;
+  /**
+   * Records whether the assistant's last companion (group) send expects a
+   * reply, so the router's addressing gate can auto-capture the very next
+   * message in that chat for one turn (migration 0048). `expects` mirrors
+   * `SendAction.expectsReply`.
+   *
+   * Never called on an interview chat — that branch above returns before
+   * reaching Telegram at all, so this option only ever sees companion sends.
+   * A predicate/setter pair rather than a database handle, same reasoning as
+   * `interviewChat`/`interviewSay`: the connector's job is the wire.
+   */
+  setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
 }
 
 export class RelayConnector {
@@ -435,6 +447,21 @@ export class RelayConnector {
           // honouring it.
           parseMode: "MarkdownV2",
         });
+        // Only a message that actually reached Telegram may open (or clear) a
+        // capture window — a failed send asked nothing, so nothing here
+        // should change. A write failure is logged and swallowed: the send
+        // itself already succeeded or failed on its own terms, and there is
+        // nothing about this side-effect worth reporting a delivered message
+        // as failed over.
+        if (sent.ok && this.options.setExpectsReply) {
+          try {
+            await this.options.setExpectsReply(action.chat_id, action.expectsReply);
+          } catch (error) {
+            this.log(structuredLog("warn", "relay.expects_reply_write_failed", {
+              safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+            }));
+          }
+        }
         return sent.ok
           ? { success: true, message_id: sent.messageId }
           : { success: false, error: sent.error ?? "SEND_FAILED" };
