@@ -58,6 +58,12 @@ export interface TelegramMessage {
   video?: { file_id?: string; mime_type?: string; file_name?: string };
   date?: number;
   message_thread_id?: number;
+  /**
+   * True only for a message in a forum topic. A plain reply in a supergroup
+   * without topics carries `message_thread_id` too — the id of the message its
+   * reply chain started from — so the thread id alone does not mean a topic.
+   */
+  is_topic_message?: boolean;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
   /**
    * Telegram's two announcements of a group becoming a supergroup. The chat id
@@ -428,7 +434,10 @@ export function toWireEvent(
   text: string,
   profile: string,
 ): WireMessageEvent {
-  const hasThread = message.message_thread_id !== undefined;
+  // Only `is_topic_message` marks a forum topic. Keyed on the thread id alone,
+  // every reply to a different bot message in a supergroup became its own
+  // session, and the companion answered each with no memory (2026-09-13).
+  const hasThread = message.is_topic_message === true && message.message_thread_id !== undefined;
   const source: WireSessionSource = {
     platform: "telegram",
     chat_id: chatId,
