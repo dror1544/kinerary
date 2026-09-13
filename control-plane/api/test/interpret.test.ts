@@ -217,6 +217,52 @@ describe("parseInterpretPayload — the schema is this function", () => {
   });
 });
 
+describe("the answer to the question on screen is not refused for confidence", () => {
+  // 2026-09-12, `--scenario japan`: the router asked "מי מהנוסעים זה אתה?",
+  // the organizer answered "דרור, אבא של המשפחה", and the model read it as
+  // `Dror` at 0.4 — then, asked again, at 0.55. Both below the floor, both
+  // refused, the same question asked a third time. There is no exit from that
+  // by answering: the same words produce the same reading. The run gave up
+  // after four minutes; a person gives up sooner.
+  const base = (questionId: string, confidence: number) => ([{
+    questionId, confidence,
+    value: { kind: "text", text: "Dror" },
+    evidence: "\u05d3\u05e8\u05d5\u05e8, \u05d0\u05d1\u05d0 \u05e9\u05dc \u05d4\u05de\u05e9\u05e4\u05d7\u05d4",
+  }] as never);
+
+  const ctx = (pending: string | null) => ({
+    sourceText: "\u05d3\u05e8\u05d5\u05e8, \u05d0\u05d1\u05d0 \u05e9\u05dc \u05d4\u05de\u05e9\u05e4\u05d7\u05d4",
+    outstanding: ["organizer_identity", "bot_name"],
+    answered: [],
+    pendingQuestionId: pending,
+  });
+
+  test("a low-confidence reply to the pending question is accepted", () => {
+    const decided = applyProposals(base("organizer_identity", 0.4), ctx("organizer_identity"));
+    assert.equal(decided.accepted.length, 1);
+    assert.equal(decided.accepted[0]?.questionId, "organizer_identity");
+    assert.deepEqual(decided.askAnyway, [], "nothing to re-ask: it was just answered");
+  });
+
+  test("the same read for a question nobody asked is still refused", () => {
+    // The floor's actual job: a side-extraction the model volunteered.
+    const decided = applyProposals(base("organizer_identity", 0.4), ctx("bot_name"));
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "LOW_CONFIDENCE");
+  });
+
+  test("the exemption is only the floor — evidence is still required", () => {
+    const decided = applyProposals(
+      [{ questionId: "organizer_identity", confidence: 0.4,
+         value: { kind: "text", text: "Dror" },
+         evidence: "something the organizer never wrote" }] as never,
+      ctx("organizer_identity"),
+    );
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "EVIDENCE_NOT_IN_SOURCE");
+  });
+});
+
 describe("exampleEchoes — a value that came from the prompt, not the person", () => {
   // 2026-09-12. An organizer's confirmed intake recorded their planned places
   // as exactly "Tokyo Skytree" and "TeamLab Planets" — the two values in the
@@ -239,6 +285,45 @@ describe("exampleEchoes — a value that came from the prompt, not the person", 
       exampleEchoes(EXAMPLE, { data: [{ planned: ["Tokyo Skytree"] }] }, "Tuesday: Tokyo Skytree at 10:00"),
       [],
       "a real trip to Tokyo Skytree is not an echo — it is an answer",
+    );
+  });
+
+  test("never flags a transliteration the prompt asked the model to invent", () => {
+    // The run that found this: `--scenario all`, japan, 2026-09-12. The
+    // organizer answered "who's coming" with five Hebrew names; the model
+    // transliterated them as instructed; the gate threw the whole answer away
+    // over `Elul`, the example's family name, which the Hebrew source of course
+    // does not contain in Latin script. The question was re-asked and
+    // re-rejected three times until the runner gave up.
+    //
+    // The travelers prompt says it in as many words: "transliterate them
+    // YOURSELF and submit that as each person's English spelling". A value the
+    // system asks to be DERIVED cannot also be required to appear verbatim.
+    const TRAVELERS_EXAMPLE = '[{"name": "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", "name_en": "Dana Elul", "age": 12, "family": "Elul"}]';
+    const said = "\u05d3\u05e8\u05d5\u05e8 \u05d0\u05dc\u05d5\u05dc, \u05e9\u05d9\u05e8\u05df \u05d0\u05dc\u05d5\u05dc";
+    assert.deepEqual(
+      exampleEchoes(TRAVELERS_EXAMPLE, {
+        kind: "structured",
+        data: [
+          { name: "\u05d3\u05e8\u05d5\u05e8 \u05d0\u05dc\u05d5\u05dc", name_en: "Dror Elul", family: "Elul" },
+          { name: "\u05e9\u05d9\u05e8\u05df \u05d0\u05dc\u05d5\u05dc", name_en: "Shiran Elul", family: "Elul" },
+        ],
+      }, said),
+      [],
+      "a correct transliteration of a real surname is not an echo",
+    );
+  });
+
+  test("still catches a traveller lifted wholesale out of the example", () => {
+    // The exemption is scoped to DERIVED fields, so an invented person is
+    // caught by the one field that is quoted rather than produced: their name.
+    const TRAVELERS_EXAMPLE = '[{"name": "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", "name_en": "Dana Elul", "age": 12, "family": "Elul"}]';
+    assert.deepEqual(
+      exampleEchoes(TRAVELERS_EXAMPLE, {
+        kind: "structured",
+        data: [{ name: "\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc", name_en: "Dana Elul", family: "Elul" }],
+      }, "we are four adults, no names given"),
+      ["\u05d3\u05e0\u05d4 \u05d0\u05dc\u05d5\u05dc"],
     );
   });
 
@@ -1006,7 +1091,11 @@ describe("structured questions name their fields", () => {
     const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases"], language: "he" });
     assert.match(prompt, /use exactly these FIELD NAMES/);
     assert.match(prompt, /never copy them/);
-    assert.ok(prompt.includes('"name": "Tokyo"'), "the field names themselves are in the prompt");
+    // The example itself, whatever its values: they were Tokyo until the
+    // example stopped being the e2e japan fixture (2026-09-13).
+    const example = INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!;
+    assert.ok(prompt.includes(example), "the field names themselves are in the prompt");
+    assert.ok(prompt.includes('"name":'));
   });
 });
 

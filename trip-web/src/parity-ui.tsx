@@ -1,3 +1,4 @@
+import { safeExternalUrl } from "./external-url";
 import { useState, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 export type Lang = "he" | "en";
@@ -106,9 +107,10 @@ export function External({
   url?: string;
   children: ReactNode;
 }) {
-  if (!url || !/^https?:\/\//i.test(url)) return null;
+  const href = safeExternalUrl(url);
+  if (!href) return null;
   return (
-    <a href={url} target="_blank" rel="noopener noreferrer">
+    <a href={href} target="_blank" rel="noopener noreferrer">
       {children}
     </a>
   );

@@ -35,9 +35,19 @@ import {
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
+  resolveTripPerson,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { groupBindingCommand, groupIntroText } from "../companion-intro.js";
+import { coerceLanguage, uiString } from "../intake-copy.js";
+import {
+  companionHelpText,
+  groupBindingCommand,
+  groupIntroText,
+  renameConfirmation,
+  renameRefused,
+  renameUsage,
+} from "../companion-intro.js";
+import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
   issueGroupBindingToken,
@@ -53,7 +63,7 @@ import {
   type MediaDeps,
   type TelegramUpdate,
 } from "./normalize.js";
-import { setFinishRequestedForChat, type SessionView } from "../interview.js";
+import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -464,6 +474,42 @@ export async function dispatchUpdate(
     };
   }
 
+  // Renaming the assistant: `/name סולו` or `/name סולו / Solo`.
+  //
+  // Anyone in a chat bound to the trip, group or DM — no approval, by Dror's
+  // rule of 2026-09-13. Router-owned because the router is what has to HEAR a
+  // new name: a group message reaches the companion only when it names the
+  // assistant, and the names that count are `trips.assistant_names`. A family
+  // renamed their assistant in conversation that day; it agreed, saved the
+  // name to its own memory, and every message using it was dropped here as
+  // NOT_ADDRESSED. The companion's `set_assistant_names` tool does the same
+  // write from its side (companion-mcp.ts).
+  //
+  // Mid-interview it is not ours to handle — the assistant's name is still a
+  // question there — so it falls through to the command gate's answer.
+  if (parsed.kind === "command" && (parsed.name === "name" || parsed.name === "rename")) {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "unbound") {
+      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    }
+    if (route.kind === "companion") {
+      const facts = await companionIntroFacts(db, route.tripId);
+      const language = facts?.language === "he" ? "he" : "en";
+      const argument = /^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?\s+([\s\S]+)$/.exec(text.trim())?.[1]?.trim() ?? "";
+      if (!argument) {
+        return { kind: "reply", reply: { chatId, text: renameUsage(language, await getAssistantNames(db, route.tripId)) } };
+      }
+      const names = parseAssistantNames(argument);
+      if (!names.ok) {
+        log(structuredLog("info", "trip_bot.rename_refused", { reason: names.reason }));
+        return { kind: "reply", reply: { chatId, text: renameRefused(language) } };
+      }
+      const now = await setAssistantNames(db, route.tripId, names.names);
+      log(structuredLog("info", "trip_bot.renamed", { via: "command", names: now?.length ?? 0 }));
+      return { kind: "reply", reply: { chatId, text: renameConfirmation(language, now ?? names.names) } };
+    }
+  }
+
   // The organizer asking for a group-binding token, in their own DM. Router-
   // owned rather than agent-owned for the same reason the introduction is: the
   // token is a credential, and one the agent got slightly wrong is a token that
@@ -499,6 +545,48 @@ export async function dispatchUpdate(
     }
   }
 
+  // ── A command is answered HERE, or it is not answered at all ───────────────
+  //
+  // Every command this router owns has been handled above. What is left is
+  // somebody else's command surface — and under the relay, "somebody else"
+  // means Hermes, whose own slash commands (/help, /model, /reset, /new,
+  // /sethome …) arrive as ordinary text and used to be forwarded to the
+  // gateway like any sentence. That handed a family group the controls of the
+  // runtime their assistant runs on: on 2026-09-12 a group's first contact
+  // answered "type /help to see the available commands", and the connector's
+  // leak guard then caught `sethome` and a model-fallback notice on their way
+  // into the room.
+  //
+  // Placed before the route-specific branches below so it covers BOTH gateway
+  // paths — the companion's and the interviewer's — rather than the one that
+  // happened to be reported. A chat with no trip is left alone: `unbound`
+  // already says the one true thing about it, and a help text for an assistant
+  // that does not exist would be worse.
+  if (parsed.kind === "command") {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "companion") {
+      const facts = await companionIntroFacts(db, route.tripId);
+      return {
+        kind: "reply",
+        reply: {
+          chatId,
+          text: companionHelpText({
+            assistantName: typeof facts?.assistant_name === "string" ? facts.assistant_name : null,
+            siteUrl: typeof facts?.private_url === "string" ? facts.private_url : null,
+            language: facts?.language === "he" ? "he" : "en",
+            isPrivateChat: message.chat?.type === "private",
+            unknownCommand: parsed.name === "help" ? null : parsed.name,
+          }),
+        },
+      };
+    }
+    if (route.kind === "interview") {
+      const session = await getSessionForChat(db, chatId);
+      const language = session.ok ? coerceLanguage(session.view.language) ?? "en" : "en";
+      return { kind: "reply", reply: { chatId, text: uiString("notMyCommand", language) } };
+    }
+  }
+
   const outcome = await normalizeUpdate(db, update, options.media, options.canReachProfile);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
@@ -522,6 +610,25 @@ export async function dispatchUpdate(
       isReplyToAssistant,
     });
     if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
+
+    // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
+    // Telegram, where every sender writes their own — so the assistant was
+    // being told "Dror" by the one party with an interest in the answer, and
+    // in a family group it had nothing else to go on at all. A trip person
+    // link is the control plane's own record (migration 0051), written at
+    // provisioning from the interview chat, so it outranks anything the
+    // update carries. Unknown senders keep their Telegram name: it is what
+    // their family calls them, and the alternative is a blank where a person
+    // should be.
+    if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
+      const person = await resolveTripPerson(
+        db, outcome.route.tripId, outcome.event.source.user_id,
+      );
+      if (person?.displayName) {
+        outcome.event.source.user_name = person.displayName;
+        log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
+      }
+    }
     return { kind: "to_gateway", event: outcome.event };
   }
 

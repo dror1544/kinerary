@@ -268,6 +268,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ A few more questions",
     documentOffer: "Before we start on details — if you already have a plan, a booking confirmation, tickets or a spreadsheet for this trip, send it here and I'll read it instead of making you type it all out.",
     noDocument: "I don't have one",
+    // Typed a command mid-interview. Router-owned like every other command:
+    // the interview is a conversation with buttons, and the runtime's own
+    // slash surface is not part of it — see companionHelpText.
+    notMyCommand: "That isn't one of my commands — just answer in the chat, or use the buttons.",
     // THE FIRST THING ANYONE SEES.
     //
     // It exists because of what it is asking for: names, dates, dietary needs,
@@ -416,6 +420,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     askMore: "➕ עוד כמה שאלות",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
+    notMyCommand: "זו לא פקודה שלי — פשוט ענו כאן בצ'אט, או השתמשו בכפתורים.",
     introduction: [
       "היי — אני העוזר שמקים לכם את הטיול. שיחה אחת, וזהו.",
       "",

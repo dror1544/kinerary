@@ -297,3 +297,16 @@ is fetched only after first opening. All 98 SPA tests and the build pass.
 - Defer opening from pointerdown to the completed click, while suppressing the native picker on pointerdown. This prevents the opening gesture from landing on the newly inserted dialog and immediately choosing an option or dismissing it.
 - Regression coverage now checks the press/release/click sequence: no dialog before click, then it stays open for a separate selection. All 101 SPA tests and the production build pass.
 - Refreshed the user's mobile tab and restored its unsaved Type value (lodging). Keyboard opening is verified. Browser pointer automation timed out, so a complete live tap remains unconfirmed.
+
+### PR 46 review follow-up — 2026-09-12
+
+Implemented the recommended pre-merge fixes:
+
+- Plan Tools derives editing from the selected day, clears the swap target when selecting another day, uses the captured revision for both mutations, and disables submissions without a snapshot or during the other mutation.
+- Trivia and trip updates share authenticated SSE transport, including content-type/frame limits, retry and cancellation handling. Trivia reconnects for a new game, not on lobby-to-question changes. Polling backs off to a 60-second safety refresh while connected and uses 5 seconds while disconnected. Countdown state lives in a child mounted only for a visible question and does not tick while paused.
+- One helper merges configured calendar dates and persisted days. RSVP/rating matching shares name normalization while preserving distinct identity rules; Journey memoizes associations outside organizer keystroke rendering.
+- Parity and primary venue displays share URL validation and venue links. Malformed HTTP-looking values are rejected consistently.
+
+Validation: all 109 SPA tests pass (16 files), TypeScript/production build passes, source diff checks pass. Added checks for cleared-day editing, captured revisions on both mutation paths, absent revisions, date union, malformed URLs, Trivia new-game vs phase lifecycle and idle timer/connected polling behavior. Existing activity matching and draft retention suites remain green. Live disposable-demo HTTP: anonymous trivia SSE 401; fixture member 200, text/event-stream, valid initial state frame. No runtime/auth route changes or deployment.
+
+Deferred nonblocking work: avatar discovery caching, the runtime existence-query optimization, bilingual/schema consolidation and cosmetic tuple/ternary/re-export cleanup. Bilingual fallback order currently produces equivalent results for the supported languages. Panel draft-retention behavior is preserved. No review comments were posted.

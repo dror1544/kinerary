@@ -105,6 +105,38 @@ class OriginalSlug(unittest.TestCase):
         self.assertEqual(teardown.original_slug("italy-2026"), "italy-2026")
 
 
+class ResourceSlug(unittest.TestCase):
+    """Where a trip's container and deploy dir actually live."""
+
+    def test_a_retired_trip_keeps_its_original_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "japan-2026").mkdir()
+            self.assertEqual(teardown.resource_slug("retired-japan-2026-20260911", Path(d)), "japan-2026")
+
+    def test_a_trip_built_after_it_was_retired_is_found_under_the_retired_name(self):
+        # 2026-09-12: `--stop-after confirm --teardown` retired the trip while
+        # the build confirming had started was still running, and the worker
+        # finished it under the retired slug. Looking only under the original
+        # name reported "nothing to do" over a live container.
+        slug = "retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-20260912"
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / slug).mkdir()
+            self.assertEqual(teardown.resource_slug(slug, Path(d)), slug)
+
+    def test_an_unretired_trip_is_its_own_slug(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(teardown.resource_slug("italy-2026", Path(d)), "italy-2026")
+
+    def test_the_container_name_is_cut_where_proxmox_cuts_it(self):
+        # compute.py's `f"trip-{slug}"[:63]`. The live container was named
+        # `trip-retired-draft-sreq-…-202609`; comparing against the uncut name
+        # refused a topology that described the trip exactly.
+        slug = "retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-20260912"
+        self.assertEqual(teardown.expected_lxc_name(slug),
+                         "trip-retired-draft-sreq-ed12c0c6fe8c5a4bfe926c1493094675-202609")
+        self.assertEqual(teardown.expected_lxc_name("japan-2026"), "trip-japan-2026")
+
+
 class Resolve(unittest.TestCase):
     def fake_psql(self, trip: dict, bound: str = "", shared: str = "0", open_: str = "0"):
         def psql(sql: str) -> str:
@@ -148,3 +180,80 @@ class Resolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeepContainer(unittest.TestCase):
+    """--keep-container: the renames that keep a kept site out of the next
+    trip's way. Each one is a real hazard for the trip that takes the freed
+    slug — see the docstring of scripts/teardown-trip.py."""
+
+    RAW = {
+        "version": 1, "name": "japan-2026",
+        "proxmox": {"node": "proxmox", "vmid": "101", "lxc": {
+            "name": "trip-japan-2026", "template": "local:vztmpl/debian.tar.zst", "storage": "local",
+            "cores": 2, "memory_mb": 1024, "disk_gb": 8, "bridge": "vmbr0", "ipv4": "192.168.0.95/24",
+            "gateway": "192.168.0.1", "nameserver": "192.168.0.41",
+            "nfs_host_dir": "/mnt/pve/truenas-nfs/japan-2026", "nfs_mount_path": "/nfs/japan-2026"}},
+        "npm": {"hostname": "japan-2026.example.store", "forward_host": "192.168.0.95", "forward_port": 8080},
+        "cloudflare": {"tunnel_id": "t", "hostname": "japan-2026.example.store", "service": "http://localhost:80"},
+    }
+
+    def test_every_name_a_new_trip_of_the_slug_would_derive_is_moved_away(self):
+        out = teardown.reference_topology(self.RAW, "japan-2026")
+        lxc = out["proxmox"]["lxc"]
+        self.assertEqual(out["name"], "ref-japan-2026")
+        # provisioning finds a container by name: a kept trip-japan-2026 would be adopted
+        self.assertNotEqual(lxc["name"], teardown.expected_lxc_name("japan-2026"))
+        # a first provision of japan-2026 wipes nfs/japan-2026
+        self.assertEqual(lxc["nfs_host_dir"], "/mnt/pve/truenas-nfs/ref-japan-2026")
+        self.assertEqual(out["npm"]["hostname"], "ref-japan-2026.example.store")
+
+    def test_the_address_and_the_path_inside_the_container_do_not_move(self):
+        out = teardown.reference_topology(self.RAW, "japan-2026")
+        # the site's own .env names the mount path; the IP allocator reads ipv4
+        self.assertEqual(out["proxmox"]["lxc"]["nfs_mount_path"], "/nfs/japan-2026")
+        self.assertIn("ipv4: 192.168.0.95/24", yaml.safe_dump(out))
+        self.assertEqual(out["npm"]["forward_host"], "192.168.0.95")
+
+    def test_the_input_is_not_changed_and_the_result_still_loads(self):
+        before = json.dumps(self.RAW, sort_keys=True)
+        out = teardown.reference_topology(self.RAW, "japan-2026")
+        self.assertEqual(json.dumps(self.RAW, sort_keys=True), before)
+        import sys
+        sys.path.insert(0, str(SCRIPT.parents[1]))
+        from provisioning.models import load_topology
+        self.assertEqual(load_topology(out).lxc.name, "ref-japan-2026")
+
+    def test_a_failure_after_stopping_still_starts_the_container_again(self):
+        commands = []
+        class Ssh:
+            def run(self, command):
+                commands.append(command)
+                if command.startswith("mv "):
+                    raise RuntimeError("mv failed")
+                return ""
+        class Proxmox:
+            ssh = Ssh()
+            def inspect(self, spec):
+                return {"vmid": "101", "status": "running", "name": spec.name}
+        prov = mock.Mock(proxmox=Proxmox())
+        topo = mock.Mock(lxc=mock.Mock(name="trip-japan-2026", nfs_host_dir="/mnt/pve/truenas-nfs/japan-2026",
+                                       nfs_mount_path="/nfs/japan-2026"))
+        with self.assertRaises(RuntimeError):
+            teardown.keep_container(prov, topo, "japan-2026")
+        self.assertEqual(commands[-1], "pct start 101")
+        self.assertIn("pct stop 101", commands)
+
+    def test_an_existing_reference_dir_is_never_merged_into(self):
+        class Ssh:
+            def run(self, command):
+                if command.startswith("test -e"):
+                    return "EXISTS\n"
+                raise AssertionError(f"ran {command!r} after finding the target exists")
+        class Proxmox:
+            ssh = Ssh()
+            def inspect(self, spec):
+                return {"vmid": "101", "status": "running", "name": "trip-japan-2026"}
+        topo = mock.Mock(lxc=mock.Mock(nfs_host_dir="/mnt/pve/truenas-nfs/japan-2026", nfs_mount_path="/nfs/japan-2026"))
+        with self.assertRaises(RuntimeError):
+            teardown.keep_container(mock.Mock(proxmox=Proxmox()), topo, "japan-2026")

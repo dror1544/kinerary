@@ -76,3 +76,30 @@ describe("MarkdownV2 escaping", () => {
     assert.equal(t.bodies[1].text, PROSE);
   });
 });
+
+describe("headings become bold lines", () => {
+  test("a heading renders as bold, not as a literal hash", () => {
+    const out = toTelegramMarkdownV2("## יום 1 — טוקיו\nנחיתה ב-NRT");
+    assert.match(out, /\*יום 1 — טוקיו\*/);
+    assert.doesNotMatch(out, /\\#/);
+  });
+
+  test("every heading level, and closing hashes are dropped", () => {
+    assert.match(toTelegramMarkdownV2("# Day one"), /^\*Day one\*$/);
+    assert.match(toTelegramMarkdownV2("### Day one ###"), /^\*Day one\*$/);
+  });
+
+  test("a hash that is not a heading stays prose", () => {
+    // "#1 priority" is how people write "number one", and Telegram is happy to
+    // show it — as long as the hash is escaped rather than eaten.
+    const out = toTelegramMarkdownV2("#1 priority");
+    assert.equal(out, "\\#1 priority");
+  });
+
+  test("headings do not disturb the entities around them", () => {
+    const out = toTelegramMarkdownV2("## Plan\nsee [the site](https://japan-2026.example) — **today**");
+    assert.match(out, /\*Plan\*/);
+    assert.match(out, /\[the site\]\(https:\/\/japan-2026\.example\)/);
+    assert.match(out, /\*today\*/);
+  });
+});

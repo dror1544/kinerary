@@ -48,7 +48,21 @@ class BridgeRequest(unittest.TestCase):
         venv = self.home / ".hermes/hermes-agent/venv/bin"
         venv.mkdir(parents=True)
         (venv / "python3").symlink_to(sys.executable)
+        (venv / "python").symlink_to(sys.executable)
         (self.home / ".hermes/profiles/italy2026").mkdir(parents=True)
+        # After wiring, the script restarts the gateway and waits for the
+        # gateway's OWN log to say it registered trip-mcp tools (c430f8e). A
+        # stand-in for each way it starts one — launchctl on macOS, the
+        # `hermes` s6 wrapper elsewhere — writes that line the way a real
+        # gateway would. They come first on PATH, so a test run never loads a
+        # real launchd job.
+        registered = ('mkdir -p "$HOME/.hermes/profiles/italy2026/logs"; '
+                      "echo \"INFO tools.mcp_tool: MCP server 'trip-mcp' (HTTP): registered 44 tool(s)\" "
+                      '>> "$HOME/.hermes/profiles/italy2026/logs/agent.log"')
+        self.bin = self.home / "bin"
+        self.bin.mkdir()
+        self._exe(self.bin / "launchctl", f'#!/bin/sh\n[ "$1" = bootstrap ] && {{ {registered}; }}\nexit 0\n')
+        self._exe(self.bin / "hermes", f'#!/bin/sh\ncase "$*" in *"gateway start"*) {registered};; esac\nexit 0\n')
         self.deploy = self.home / "kinerary-deploy"
         (self.deploy / "trips/italy-2026").mkdir(parents=True)
         (self.deploy / "trips/italy-2026/topology.yaml").write_text(TOPOLOGY)
@@ -65,7 +79,7 @@ class BridgeRequest(unittest.TestCase):
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def send(self, request: dict) -> subprocess.CompletedProcess:
-        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin"}
         return subprocess.run(["bash", str(SCRIPT)], input=json.dumps(request), capture_output=True,
                               text=True, env=env, timeout=60)
 

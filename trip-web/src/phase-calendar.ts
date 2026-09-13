@@ -11,3 +11,8 @@ export function datesInPhase(dates?: { start?: string; end?: string }): string[]
   }
   return out;
 }
+
+// Calendar dates remain visible even when only some days have planned content.
+export function phaseDates(calendar: readonly string[], planned: readonly string[]) {
+  return [...new Set([...calendar, ...planned])].sort();
+}

@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
+
+import yaml
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -263,3 +266,34 @@ class SshCompanionProfileAdapterTests(unittest.TestCase):
                     list(expected.parameters),
                     "adapters must stay interchangeable — the K3s implementation replaces this one",
                 )
+
+
+class CompanionOverlayTemplateTests(unittest.TestCase):
+    """The rendered profile must not re-enable Hermes's own onboarding.
+
+    Kept here rather than in the template directory because the trap is a YAML
+    one and nothing else would catch it: `profile_build: off` is a YAML 1.1
+    BOOLEAN, and the reader (agent/onboarding.py) accepts only the string —
+    `isinstance(mode, str) and mode.lower() == "off"`. Unquoted, the setting
+    parses cleanly, reads as False, falls back to the default "ask", and the
+    family's first message is answered with an offer to build a user profile.
+    That is what happened on 2026-09-12, and a config that looks right while
+    doing nothing is exactly the failure a test is for.
+    """
+
+    OVERLAY = (
+        Path(__file__).resolve().parents[3]
+        / "profile-templates/familytrip-companion/templates/config.overlay.yaml.tpl"
+    )
+
+    def test_hermes_onboarding_is_off_as_a_string(self) -> None:
+        overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
+        onboarding = overlay["onboarding"]
+        self.assertEqual(onboarding["profile_build"], "off")
+        self.assertIsInstance(
+            onboarding["profile_build"], str,
+            "a bare `off` is the boolean False here, which the reader ignores",
+        )
+        # And the one-shot flag is spent before the profile ever speaks.
+        self.assertIs(onboarding["seen"]["profile_build_offered"], True)
+

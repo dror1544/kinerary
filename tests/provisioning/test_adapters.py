@@ -168,6 +168,10 @@ class AdapterTests(unittest.TestCase):
         # Found 2026-08-28 when the first adapter-created container (CT101)
         # died exactly there, mid-bootstrap.
         self.assertIn("--unprivileged 0", create_and_start)
+        # Back after a host reboot, and only once TrueNAS (order 1) serves
+        # the NFS mount this container needs.
+        self.assertIn("--onboot 1", create_and_start)
+        self.assertIn("--startup order=3", create_and_start)
         self.assertIn("&& pct start 203", create_and_start)
 
         # deploy.sh assumes nginx/Node/the systemd unit/.env already exist —

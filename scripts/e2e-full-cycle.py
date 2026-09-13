@@ -663,9 +663,19 @@ def stage_served(ctx: dict) -> None:
     bare = [p.get("id") for p in phases if not (p.get("days") or p.get("venues"))]
     if bare:
         note(f"{len(bare)} phase(s) carry no plan and no places yet: {', '.join(str(b) for b in bare)}")
-    check(any(p.get("days") or p.get("venues") for p in phases),
-          "the phases have something on them — a day plan or the places they are planned around",
-          "every phase the site serves is empty: the trip renders as nothing at all")
+    # An empty trip is only a regression when something was NAMED. The places an
+    # organizer gave are checked one by one below, so a named place that fails to
+    # reach the site still fails the run. A trip where nothing was named — the
+    # `manual` scenario types stops and dates and no attractions — renders empty
+    # because it IS empty, and failing it made a correct result permanently red.
+    # Filling it is the companion's job, and only with approval (Dror,
+    # 2026-09-13): it offers a draft and writes nothing until someone says yes.
+    if ctx.get("planned_places"):
+        check(any(p.get("days") or p.get("venues") for p in phases),
+              "the phases have something on them — a day plan or the places they are planned around",
+              "every phase the site serves is empty: the trip renders as nothing at all")
+    elif not any(p.get("days") or p.get("venues") for p in phases):
+        note("nothing was named, so nothing is served — the companion offers a draft, and writes only on approval")
 
     blob = json.dumps(served, ensure_ascii=False).lower()
     for place in ctx.get("planned_places", []):

@@ -94,4 +94,27 @@ describe("internal leak detection", () => {
       assert.equal(detectInternalLeak(text).leaks, false, text);
     }
   });
+
+  test("an approval prompt never reaches a family group", () => {
+    // Verbatim from 2026-09-12, posted into a family group in answer to a
+    // question about the trip. Nobody in that room can judge it, and a "yes"
+    // from anyone there would be a real shell command.
+    const prompt = [
+      "\u26a0\ufe0f Dangerous command requires approval:",
+      'cd /opt/data/profiles/japan2026 && python3 -c "',
+      "import json",
+      "Reason: Security scan \u2014 [HIGH] Inline interpreter with suspicious payload",
+      "Reply /approve to execute this one operation, /approve session to approve this pattern",
+    ].join("\n");
+    assert.equal(detectInternalLeak(prompt).leaks, true);
+  });
+
+  test("the approval phrases do not swallow real trip sentences", () => {
+    for (const text of [
+      "The restaurant requires a reservation, not approval.",
+      "\u05d4\u05de\u05dc\u05d5\u05df \u05d0\u05d9\u05e9\u05e8 \u05d0\u05ea \u05d4\u05d4\u05d6\u05de\u05e0\u05d4.",
+    ]) {
+      assert.equal(detectInternalLeak(text).leaks, false, text);
+    }
+  });
 });

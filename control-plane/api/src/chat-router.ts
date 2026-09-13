@@ -167,6 +167,42 @@ export async function companionIntroFacts(
   return rows[0]?.companion_intro ?? null;
 }
 
+/**
+ * Who this Telegram sender is ON THIS TRIP, when we know.
+ *
+ * The chat binding says which companion serves a chat; this says whose voice
+ * just arrived in it. Written at provisioning for the organizer (migration
+ * 0051) from the two facts that were already in hand there — the interview's
+ * chat id, and the participant `_resolve_organizers` matched their answer to.
+ *
+ * Null for everyone else, which is most people: a family group is full of
+ * senders nobody has ever bound. The caller must degrade to the Telegram
+ * display name rather than guessing, because that name is set by the sender
+ * and is not identity.
+ */
+export async function resolveTripPerson(
+  db: pg.Pool,
+  tripId: string,
+  telegramUserId: string,
+): Promise<{ username: string; displayName: string | null; role: string } | null> {
+  if (!tripId || !telegramUserId) return null;
+  const { rows } = await db.query<{
+    participant_username: string;
+    display_name: string | null;
+    role: string;
+  }>(
+    `SELECT participant_username, display_name, role
+       FROM control_plane.trip_person_links
+      WHERE trip_id = $1 AND telegram_user_id = $2
+      LIMIT 1`,
+    [tripId, telegramUserId],
+  );
+  const row = rows[0];
+  return row
+    ? { username: row.participant_username, displayName: row.display_name, role: row.role }
+    : null;
+}
+
 export async function migrateChatBinding(
   db: pg.Pool,
   fromChatId: string,

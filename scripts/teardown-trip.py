@@ -28,6 +28,18 @@ found a step that quietly undoes itself. This is that run's order, as a command:
 
     scripts/teardown-trip.py --trip italy-2026                      # the plan
     scripts/teardown-trip.py --trip trip_1e35d697ca... --execute    # do it
+    scripts/teardown-trip.py --trip japan-2026 --keep-container --execute
+
+--keep-container tears the TRIP down and keeps its SITE running on the LAN, as a
+reference beside newer builds (2026-09-13, japan-2026). Everything above runs,
+except that the container is not destroyed: the public hostname goes (DNS,
+ingress, NPM), and the container is renamed ref-<slug> with its NFS data moved
+to a ref-<slug> directory under the same mount path inside it. Its deploy dir
+becomes trips/ref-<slug> with a rewritten topology. All three renames exist for
+the next trip that takes the freed slug: provisioning finds a container BY NAME
+(it would adopt, and its teardown would destroy, a kept trip-<slug>), a first
+provision WIPES nfs/<slug>, and the IP allocator only knows an address is taken
+from a topology under trips/.
 
 REFUSES a trip past ready_private (activation_approved, active, completed,
 sealed) — real people have used those — and a profile that another trip's open
@@ -38,14 +50,18 @@ the only copy of whatever the trip held.
 from __future__ import annotations
 
 import argparse
+import copy
+import dataclasses
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -126,6 +142,98 @@ def original_slug(slug: str) -> str:
     return re.sub(r"-\d{8}(-\d+)?$", "", slug[len("retired-"):])
 
 
+def resource_slug(slug: str, trips_root: Path) -> str:
+    """The name a trip's RESOURCES were built under — container, host, deploy dir.
+
+    Normally the original slug: retirement renames the database row, and the
+    container it named stays named what it was. But a trip can also be BUILT
+    after it was retired, and then everything it owns carries the retired name.
+    Live on 2026-09-12: an automated run with `--stop-after confirm --teardown`
+    retired its trip while the build that confirming had started was still
+    running; the worker finished it under `retired-draft-sreq-…-20260912`, and
+    this script, looking only under the original name, reported "infra: nothing
+    to do" over a running container, an NPM host and a Cloudflare record.
+
+    So: the original name when that is where the deploy dir is, the current slug
+    when only it has one. Both existing is the ordinary retired case and keeps
+    the original, which is what every earlier teardown relied on.
+    """
+    orig = original_slug(slug)
+    if orig != slug and not (trips_root / orig).is_dir() and (trips_root / slug).is_dir():
+        return slug
+    return orig
+
+
+def expected_lxc_name(name: str) -> str:
+    """compute.py's rule, mirrored: Proxmox hostnames stop at 63 characters.
+
+    Without the cut, any slug long enough to be truncated — every `draft-sreq-`
+    trip, and every retired one — failed the "does this topology describe this
+    trip" check and was refused, however correct the topology was.
+    """
+    return f"trip-{name}"[:63]
+
+
+def reference_name(orig: str) -> str:
+    """What a kept container, its data dir and its deploy dir are renamed to."""
+    return f"ref-{orig}"[:63]
+
+
+def reference_topology(raw: dict, orig: str) -> dict:
+    """The topology a kept site lives under: every name that a new trip of the
+    same slug would derive is moved to ref-<slug>; the address, the mount path
+    inside the container and everything else stay what they are."""
+    ref = reference_name(orig)
+    out = copy.deepcopy(raw)
+    out["name"] = ref
+    lxc = out["proxmox"]["lxc"]
+    lxc["name"] = ref
+    lxc["nfs_host_dir"] = f"{lxc['nfs_host_dir'].rstrip('/').rsplit('/', 1)[0]}/{ref}"
+    for section in ("npm", "cloudflare"):
+        host = out.get(section, {}).get("hostname", "")
+        if host.startswith(f"{orig}."):
+            out[section]["hostname"] = ref + host[len(orig):]
+    out["reference"] = {"of": orig, "kept": f"{datetime.now():%Y-%m-%d}",
+                        "note": "a kept site, not a live trip: no DNS, no NPM host, no companion"}
+    return out
+
+
+def keep_container(prov, topo, orig: str) -> dict:
+    """Stop, rename, move its data, start. The container is left running on any
+    failure after it was stopped, so a half-done keep never takes a site down."""
+    ref = reference_name(orig)
+    live = prov.proxmox.inspect(topo.lxc)
+    if not live:
+        raise RuntimeError(f"no container named {topo.lxc.name} to keep")
+    vmid = shlex.quote(live["vmid"])
+    old_dir = topo.lxc.nfs_host_dir.rstrip("/")
+    new_dir = f"{old_dir.rsplit('/', 1)[0]}/{ref}"
+    run = prov.proxmox.ssh.run
+    if run(f"test -e {shlex.quote(new_dir)} && echo EXISTS || true").strip() == "EXISTS":
+        raise RuntimeError(f"{new_dir} already exists — refusing to merge two sites' data")
+    run(f"pct stop {vmid}")
+    try:
+        run(f"mv {shlex.quote(old_dir)} {shlex.quote(new_dir)}")
+        run(f"pct set {vmid} --hostname {shlex.quote(ref)} "
+            f"--mp0 {shlex.quote(f'{new_dir},mp={topo.lxc.nfs_mount_path}')}")
+    finally:
+        run(f"pct start {vmid}")
+    return {"vmid": live["vmid"], "name": ref, "nfs_host_dir": new_dir}
+
+
+def site_answers(host: str, port: int, seconds: int = 90) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}/", timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
 def load_provisioning_env() -> None:
     """The env the worker's compose up is given: provisioning.env, and on the VM
     vm.env over it. Compose's later --env-file wins; here setdefault keeps the
@@ -156,7 +264,7 @@ def resolve(target: str) -> dict:
     if trip["lifecycle_state"] in REFUSED_STATES:
         raise Refused(f"{trip['slug']} is {trip['lifecycle_state']} — real people have used it; not a teardown target")
 
-    trip["orig"] = original_slug(trip["slug"])
+    trip["orig"] = resource_slug(trip["slug"], DEPLOY_ROOT / "trips")
     bound = psql(
         f"SELECT hermes_profile FROM control_plane.telegram_chat_bindings WHERE trip_id = '{trip['id']}' "
         "AND hermes_profile IS NOT NULL ORDER BY created_at DESC LIMIT 1")
@@ -367,6 +475,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--trip", required=True, help="trip id (trip_...) or slug")
     ap.add_argument("--execute", action="store_true", help="actually tear down (default: print the plan)")
+    ap.add_argument("--keep-container", action="store_true",
+                    help="keep the site running on the LAN as ref-<slug> (see above) instead of destroying it")
     ap.add_argument("--settle-seconds", type=int, default=70,
                     help="how long to watch for the profile directory coming back (one cron tick)")
     args = ap.parse_args()
@@ -392,7 +502,7 @@ def main() -> int:
         from provisioning.models import load_topology
         raw = yaml.safe_load(topology_path.read_text())
         topo = load_topology(raw)
-        if topo.lxc.name != f"trip-{orig}" or not topo.proxy.hostname.startswith(f"{orig}."):
+        if topo.lxc.name != expected_lxc_name(orig) or not topo.proxy.hostname.startswith(f"{orig}."):
             print(f"{RED}refused{RESET}: {topology_path} does not describe {orig} ({topo.lxc.name}, {topo.proxy.hostname})")
             return 2
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
@@ -402,10 +512,15 @@ def main() -> int:
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
         ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
         ("bridge", b is not None, f"stop trip-mcp pid {b[0]} on :{b[1]}" if b else "no bridge"),
-        ("infra", topo is not None, f"Cloudflare + NPM + LXC for {orig}" if topo else "never provisioned"),
+        ("infra", topo is not None,
+         (f"Cloudflare + NPM for {orig}; KEEP the container as {reference_name(orig)} "
+          f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
+          else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or not trip["slug"].startswith("retired-"),
          f"close {trip['open_bindings']} binding(s), retire slug {trip['slug']}"),
-        ("deploy dir", trip_dir.is_dir(), f"move {trip_dir} to retired-trips/"),
+        ("deploy dir", trip_dir.is_dir(),
+         f"move {trip_dir} to trips/{reference_name(orig)} (keeps its IP claimed)" if args.keep_container
+         else f"move {trip_dir} to retired-trips/"),
         ("profile", (PROFILES / profile).is_dir(), f"hermes profile delete {profile}"),
     ]
     state = infra_state(prov, topo) if topo else None
@@ -420,6 +535,14 @@ def main() -> int:
         if state["npm"] and state["npm"].get("forward_host") != topo.proxy.forward_host:
             print(f"{RED}refused{RESET}: NPM forwards {topo.proxy.hostname} to {state['npm'].get('forward_host')}, "
                   f"not {topo.proxy.forward_host} — someone else's host")
+            return 2
+    if args.keep_container:
+        kept_dir = DEPLOY_ROOT / "trips" / reference_name(orig)
+        if not topo or not (state and state["lxc"]):
+            print(f"{RED}refused{RESET}: --keep-container needs a running container for {orig}; there is none")
+            return 2
+        if kept_dir.exists():
+            print(f"{RED}refused{RESET}: {kept_dir} already exists — one kept site per slug")
             return 2
     if not args.execute:
         print(f"\n{DIM}dry run — re-run with --execute to do this{RESET}")
@@ -464,7 +587,22 @@ def main() -> int:
             say(f"{DIM}·{RESET}", f"bridge     pid {pid} is not the listener on :{port} — left alone")
 
     failed = False
-    if topo:
+    kept = None
+    if topo and args.keep_container:
+        prov.cloudflare.delete(topo.cloudflare)
+        prov.npm.delete(topo.proxy)
+        kept = keep_container(prov, topo, orig)
+        after = infra_state(prov, topo)
+        renamed = prov.proxmox.inspect(dataclasses.replace(topo.lxc, name=kept["name"]))
+        public_gone = not after["npm"] and not after["dns"] and not after["ingress"]
+        answers = site_answers(topo.proxy.forward_host, topo.proxy.forward_port)
+        ok = public_gone and not after["lxc"] and bool(renamed) and answers
+        say(f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}",
+            f"infra      public hostname gone={public_gone}; CT {kept['vmid']} is {kept['name']} "
+            f"({(renamed or {}).get('status')}), data at {kept['nfs_host_dir']}, "
+            f"site answers on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/ = {answers}")
+        failed |= not ok
+    elif topo:
         prov.cloudflare.delete(topo.cloudflare)
         prov.npm.delete(topo.proxy)
         prov.proxmox.delete(topo.lxc)
@@ -476,7 +614,14 @@ def main() -> int:
     new_slug = retire_in_db(trip)
     say(f"{GREEN}✓{RESET}", f"database   bindings closed, slug -> {new_slug}")
 
-    if trip_dir.is_dir():
+    if trip_dir.is_dir() and kept:
+        import yaml
+        kept_dir = DEPLOY_ROOT / "trips" / kept["name"]
+        trip_dir.rename(kept_dir)
+        raw = yaml.safe_load((kept_dir / "topology.yaml").read_text())
+        (kept_dir / "topology.yaml").write_text(yaml.safe_dump(reference_topology(raw, orig), sort_keys=False))
+        say(f"{GREEN}✓{RESET}", f"deploy dir {kept_dir} (its IP stays claimed)")
+    elif trip_dir.is_dir():
         retired = DEPLOY_ROOT / "retired-trips"
         retired.mkdir(exist_ok=True)
         trip_dir.rename(retired / f"{orig}-{stamp}")
@@ -504,7 +649,13 @@ def main() -> int:
             else:
                 say(f"{GREEN}✓{RESET}", "s6         no supervisor left for it")
 
-    print(f"\n{RED}✗ something remains{RESET}" if failed else f"\n{GREEN}✓ {orig} torn down{RESET}")
+    if failed:
+        print(f"\n{RED}✗ something remains{RESET}")
+    elif kept:
+        print(f"\n{GREEN}✓ {orig} torn down; its site is kept as {kept['name']} on "
+              f"http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/{RESET}")
+    else:
+        print(f"\n{GREEN}✓ {orig} torn down{RESET}")
     return 1 if failed else 0
 
 
