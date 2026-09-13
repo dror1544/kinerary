@@ -847,6 +847,24 @@ a sealed, scanned release artifact is promoted and selected by the planner.
 **Goal:** connect one long-lived organizer companion profile to isolated trip
 contexts and test groups without creating a per-trip Telegram bot.
 
+> **FINISHED — 2026-09-13 (declared by Dror).** The organizer interview (a
+> deterministic router with bounded LLM functions, document intake whose unsure
+> readings become Yes/No confirmations), the shared Trip Bot and chat→trip
+> routing, one-approval provisioning, and the trip companion with its trip-mcp
+> run end to end on the Proxmox VM (`kinerary-cp`, `@Kinerary_bot`): automated
+> `japan`, `multi` and `manual` cycles green, and a person's `own` run verified
+> through site, content, companion and trip-mcp
+> (`docs/test-reports/vm-e2e-2026-09-13.md`; how to repeat it:
+> `docs/e2e-full-test.md`).
+>
+> Merged into `integration/sprint-5-plus`: #66 (the VM stack, document
+> suggestions, the bot swap, the reply-thread fix) and #63. Still to land
+> before `main` (#40): #47 and #64, which conflict with integration — see
+> `docs/sprint5-closeout-handoff.md`. Follow-ups that do not block the sprint:
+> #65, #67, #68, #69.
+>
+> The box below is the 2026-09-02 snapshot, kept for history.
+
 > **Status as of 2026-09-02 — partially delivered, PR #29 open against
 > `integration/sprint-5-plus` (16 commits, unreviewed).** Working detail,
 > landmines and the bring-up runbook live in
