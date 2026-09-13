@@ -155,6 +155,23 @@ function listJoin(items: readonly string[], lang: "he" | "en"): string {
  * Order is deliberate: who I am → what I can do → your site and how to get in →
  * how to bring me to the family. The last is the action; it goes last so it is
  * the thing still on screen when they stop reading.
+ *
+ * THE GROUP STEPS ARE A SEQUENCE, NOT A LIST — 2026-09-13, reported live: an
+ * organizer read "Make me an admin, so I can pin the welcome message" as the
+ * first instruction, because it was. Nothing before it said to add the bot to
+ * the group at all, and nothing named the account to add — the assistant had
+ * just introduced itself as a personalised name (`assistantName`), which is
+ * not a Telegram handle and cannot be searched for. So it now reads as three
+ * numbered steps that happen in this order and says so: (1) add the actual
+ * bot account — named explicitly, by its real @username, because the
+ * personalised name this message greets them with is not it — (2) make it an
+ * admin AND say which right that unlocks and why (pinning the welcome
+ * message, not a request for every permission Telegram offers), (3) paste the
+ * token line into THAT group, not back here. The recovery note is scoped to
+ * what redemption actually requires: the token arrives as a `/group` command,
+ * which reaches the bot once it is a member regardless of admin state (see
+ * `groupAddUrl`) — so "do steps 1 and 2, then paste it again" is true, not
+ * merely reassuring.
  */
 export function organizerIntroText(facts: CompanionIntroFacts): string {
   const he = facts.language === "he";
@@ -180,16 +197,25 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
     if (addUrl || facts.groupBindingToken) {
-      parts.push("", "כדי שאהיה גם בקבוצה המשפחתית:");
-      if (addUrl) {
-        parts.push(`1. מוסיפים אותי עם הקישור הזה: ${addUrl}`, "   (בוחרים קבוצה קיימת, או פותחים חדשה ואז מוסיפים)");
+      parts.push("", "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול:");
+      if (facts.botUsername) {
+        parts.push(
+          `1. מוסיפים את @${facts.botUsername} לקבוצה — זה החשבון שלי, למרות שכאן אני מציג את עצמי בתור ${facts.assistantName}.`,
+        );
+        if (addUrl) {
+          parts.push(`   מוסיפים עם הקישור הזה: ${addUrl}`, "   (בוחרים קבוצה קיימת, או פותחים חדשה ואז מוסיפים), או מחפשים ידנית לפי @" + facts.botUsername + " ומוסיפים.");
+        }
+      } else {
+        parts.push("1. מוסיפים אותי לקבוצה.");
       }
-      parts.push(`${addUrl ? "2" : "1"}. הופכים אותי למנהל, כדי שאוכל להצמיד את הודעת הפתיחה`);
+      parts.push(
+        "2. אחרי שאני בקבוצה, הופכים אותי למנהל ומדליקים לי הרשאת \"הצמדת הודעות\" (Pin messages) — זה מה שנותן לי להצמיד את הודעת הפתיחה, כדי שכולם ימצאו בקלות את האתר והפרטים החשובים. אין צורך להדליק שום הרשאה אחרת.",
+      );
       if (facts.groupBindingToken) {
         parts.push(
-          `${addUrl ? "3" : "2"}. שולחים לקבוצה את השורה שבהודעה הבאה שלי`,
+          "3. אחר כך, בקבוצה עצמה — לא כאן — מעתיקים את השורה המלאה מההודעה הבאה שלי ומדביקים אותה שם.",
           "",
-          "שלחתם לפני שהפכתם אותי למנהל? לא נורא — שלחו שוב אחר כך ואשלים את ההגדרה.",
+          "שלחתם את השורה מוקדם מדי? פשוט משלימים את שלבים 1 ו-2, ואז מדביקים את השורה שוב בקבוצה.",
         );
       }
     }
@@ -212,18 +238,28 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
   if (addUrl || facts.groupBindingToken) {
-    parts.push("", "To bring me into the family group:");
-    if (addUrl) {
-      parts.push(`1. Add me with this link: ${addUrl}`, "   (pick an existing group, or make a new one first)");
+    parts.push("", "To bring me into the family or trip group:");
+    if (facts.botUsername) {
+      parts.push(
+        `1. Add @${facts.botUsername} to that group — that's my actual account, even though I'm introducing myself here as ${facts.assistantName}.`,
+      );
+      if (addUrl) {
+        parts.push(
+          `   Use this link: ${addUrl}`,
+          "   (pick an existing group, or make a new one first), or search for @" + facts.botUsername + " and add it yourself.",
+        );
+      }
+    } else {
+      parts.push("1. Add me to the group.");
     }
     parts.push(
-      `${addUrl ? "2" : "1"}. Make me an admin, so I can pin the welcome message`,
+      "2. Once I'm in the group, make me an admin and turn on the \"Pin messages\" permission — that's what lets me pin the welcome message, so everyone can find the site and the essentials at a glance. Nothing else needs to be switched on.",
     );
     if (facts.groupBindingToken) {
       parts.push(
-        `${addUrl ? "3" : "2"}. Post the line in my next message into the group`,
+        "3. Then, in that group — not here — copy the whole line from my next message and paste it in.",
         "",
-        "Posted it before making me an admin? No problem — post it again afterwards and I'll finish setting up.",
+        "Sent that line too early? Just finish steps 1 and 2, then paste the line again in the group.",
       );
     }
   }
