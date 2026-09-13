@@ -155,6 +155,23 @@ function listJoin(items: readonly string[], lang: "he" | "en"): string {
  * Order is deliberate: who I am → what I can do → your site and how to get in →
  * how to bring me to the family. The last is the action; it goes last so it is
  * the thing still on screen when they stop reading.
+ *
+ * THE GROUP STEPS ARE A SEQUENCE, NOT A LIST — 2026-09-13, reported live: an
+ * organizer read "Make me an admin, so I can pin the welcome message" as the
+ * first instruction, because it was. Nothing before it said to add the bot to
+ * the group at all, and nothing named the account to add — the assistant had
+ * just introduced itself as a personalised name (`assistantName`), which is
+ * not a Telegram handle and cannot be searched for. So it now reads as three
+ * numbered steps that happen in this order and says so: (1) add the actual
+ * bot account — named explicitly, by its real @username, because the
+ * personalised name this message greets them with is not it — (2) make it an
+ * admin AND say which right that unlocks and why (pinning the welcome
+ * message, not a request for every permission Telegram offers), (3) paste the
+ * token line into THAT group, not back here. The recovery note is scoped to
+ * what redemption actually requires: the token arrives as a `/group` command,
+ * which reaches the bot once it is a member regardless of admin state (see
+ * `groupAddUrl`) — so "do steps 1 and 2, then paste it again" is true, not
+ * merely reassuring.
  */
 export function organizerIntroText(facts: CompanionIntroFacts): string {
   const he = facts.language === "he";
@@ -180,16 +197,25 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
       parts.push("", `אשלח מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
     if (addUrl || facts.groupBindingToken) {
-      parts.push("", "כדי שאהיה גם בקבוצה המשפחתית:");
-      if (addUrl) {
-        parts.push(`1. מוסיפים אותי עם הקישור הזה: ${addUrl}`, "   (בוחרים קבוצה קיימת, או פותחים חדשה ואז מוסיפים)");
+      parts.push("", "כדי שאהיה גם בקבוצה המשפחתית או קבוצת הטיול:");
+      if (facts.botUsername) {
+        parts.push(
+          `1. מוסיפים את @${facts.botUsername} לקבוצה — זה החשבון שלי, למרות שכאן אני מציג את עצמי בתור ${facts.assistantName}.`,
+        );
+        if (addUrl) {
+          parts.push(`   מוסיפים עם הקישור הזה: ${addUrl}`, "   (בוחרים קבוצה קיימת, או פותחים חדשה ואז מוסיפים), או מחפשים ידנית לפי @" + facts.botUsername + " ומוסיפים.");
+        }
+      } else {
+        parts.push("1. מוסיפים אותי לקבוצה.");
       }
-      parts.push(`${addUrl ? "2" : "1"}. הופכים אותי למנהל, כדי שאוכל להצמיד את הודעת הפתיחה`);
+      parts.push(
+        "2. אחרי שאני בקבוצה, הופכים אותי למנהל ומדליקים לי הרשאת \"הצמדת הודעות\" (Pin messages) — זה מה שנותן לי להצמיד את הודעת הפתיחה, כדי שכולם ימצאו בקלות את האתר והפרטים החשובים. אין צורך להדליק שום הרשאה אחרת.",
+      );
       if (facts.groupBindingToken) {
         parts.push(
-          `${addUrl ? "3" : "2"}. שולחים לקבוצה את השורה שבהודעה הבאה שלי`,
+          "3. אחר כך, בקבוצה עצמה — לא כאן — מעתיקים את השורה המלאה מההודעה הבאה שלי ומדביקים אותה שם.",
           "",
-          "שלחתם לפני שהפכתם אותי למנהל? לא נורא — שלחו שוב אחר כך ואשלים את ההגדרה.",
+          "שלחתם את השורה מוקדם מדי? פשוט משלימים את שלבים 1 ו-2, ואז מדביקים את השורה שוב בקבוצה.",
         );
       }
     }
@@ -212,22 +238,106 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
     parts.push("", `I'll send you ${listJoin(schedule, "en")} without being asked.`);
   }
   if (addUrl || facts.groupBindingToken) {
-    parts.push("", "To bring me into the family group:");
-    if (addUrl) {
-      parts.push(`1. Add me with this link: ${addUrl}`, "   (pick an existing group, or make a new one first)");
+    parts.push("", "To bring me into the family or trip group:");
+    if (facts.botUsername) {
+      parts.push(
+        `1. Add @${facts.botUsername} to that group — that's my actual account, even though I'm introducing myself here as ${facts.assistantName}.`,
+      );
+      if (addUrl) {
+        parts.push(
+          `   Use this link: ${addUrl}`,
+          "   (pick an existing group, or make a new one first), or search for @" + facts.botUsername + " and add it yourself.",
+        );
+      }
+    } else {
+      parts.push("1. Add me to the group.");
     }
     parts.push(
-      `${addUrl ? "2" : "1"}. Make me an admin, so I can pin the welcome message`,
+      "2. Once I'm in the group, make me an admin and turn on the \"Pin messages\" permission — that's what lets me pin the welcome message, so everyone can find the site and the essentials at a glance. Nothing else needs to be switched on.",
     );
     if (facts.groupBindingToken) {
       parts.push(
-        `${addUrl ? "3" : "2"}. Post the line in my next message into the group`,
+        "3. Then, in that group — not here — copy the whole line from my next message and paste it in.",
         "",
-        "Posted it before making me an admin? No problem — post it again afterwards and I'll finish setting up.",
+        "Sent that line too early? Just finish steps 1 and 2, then paste the line again in the group.",
       );
     }
   }
   return parts.join("\n");
+}
+
+/**
+ * How to get the assistant's attention in a group, and what happens otherwise.
+ *
+ * Three real triggers — matches `isAddressedToAssistant` in
+ * `relay/addressing.ts` exactly, so this can never promise a way in that the
+ * router does not honour: an @mention, a reply to one of its own messages, or
+ * its configured name said plainly. A DOCUMENT is not a special case — the
+ * addressing gate reads `message.text ?? message.caption ?? ""`, so a booking
+ * confirmation posted with no caption addressing the assistant is ignored
+ * exactly like unaddressed small talk would be. That is stated here rather
+ * than left to be discovered by a confirmation nobody realised never landed.
+ *
+ * Careful about ONE distinction: the gate declines to ANSWER an unaddressed
+ * message, which is not the same as Telegram declining to DELIVER it. Once the
+ * bot is a group admin it receives every message; the choice not to jump in is
+ * ours, not a limit of what reaches it. So this says the assistant "stays
+ * quiet", never that it "can't see" what was not addressed to it.
+ */
+function addressingLines(facts: CompanionIntroFacts): string[] {
+  const he = facts.language === "he";
+  const handle = (facts.botUsername ?? "").trim().replace(/^@/, "");
+  if (he) {
+    return [
+      "כדי לפנות אליי כאן, אחת משלוש דרכים:",
+      ...(handle ? [`• מתייגים אותי: @${handle}`] : []),
+      "• עונים (Reply) להודעה שלי — לא סתם כותבים אחריה",
+      `• פשוט אומרים את השם שלי, למשל: "${facts.assistantName}, מה בתוכנית מחר?"`,
+      "",
+      "בשיחה הרגילה שלכם אני נשאר בשקט ומצטרף רק כשפונים אליי באחת הדרכים האלה — לעדכונים הקבועים (אם הוגדרו) זה לא נוגע, הם מגיעים בלי שצריך לפנות אליי.",
+    ];
+  }
+  return [
+    "To get my attention here, any of these works:",
+    ...(handle ? [`• Mention me: @${handle}`] : []),
+    "• Reply to one of my messages — not just sending the next one",
+    `• Just say my name, like: "${facts.assistantName}, what are we doing tomorrow?"`,
+    "",
+    "During your own conversation I stay quiet, and only jump in when you address me one of these ways — any scheduled updates below still arrive on their own either way.",
+  ];
+}
+
+/**
+ * Adding the site to a phone's Home Screen — a shortcut, not an install.
+ *
+ * No service worker is registered (`site/manifest.json` exists; nothing
+ * subscribes it), so this never claims offline access, push notifications or
+ * a persistent login — none of that is implemented, and a shortcut icon is
+ * not evidence that it is.
+ *
+ * Android is deliberately hedged: whether Chrome offers "Install" (a real,
+ * manifest-driven install) or only "Create shortcut" depends on the device
+ * and Chrome version, and nothing here can tell in advance. Both paths are
+ * given so the instruction is correct either way, per the site's own icon and
+ * manifest either being picked up or not. The Hebrew Chrome menu strings are
+ * NOT independently verified the way the Hebrew Safari ones were — flagged in
+ * the PR, not guessed at here.
+ */
+function homeScreenLines(lang: "he" | "en"): string[] {
+  if (lang === "he") {
+    return [
+      "רוצים שהאתר יהיה תמיד במרחק לחיצה? אפשר להוסיף אותו למסך הבית של הטלפון.",
+      "באייפון (Safari): פותחים את האתר ב-Safari, מקישים על \"שיתוף\" (או על עוד ⋯ ואז \"שיתוף\"), ובוחרים \"הוספה למסך הבית\". אם מוצע \"פתיחה ביישום רשת\" — מדליקים גם אותו, ואז מקישים \"הוסף\".",
+      "באנדרואיד (Chrome): פותחים את האתר ב-Chrome, מקישים על שלוש הנקודות ⋮, ובוחרים \"התקנה ויצירת קיצור דרך\". אם מוצע \"התקן\" — זו האפשרות הפשוטה ביותר; אם לא, בוחרים \"יצירת קיצור דרך\" ואז \"הוסף\".",
+      "נפתח מתוך טלגרם? צריך לפתוח אותו קודם ב-Safari או ב-Chrome (או להעתיק את הקישור לשם) — ההוספה למסך הבית עובדת רק מתוך הדפדפן עצמו.",
+    ];
+  }
+  return [
+    "Want the site one tap away? You can add it to your phone's Home Screen.",
+    "On iPhone (Safari): open the site in Safari, tap Share (or More ⋯, then Share), and choose \"Add to Home Screen.\" Turn on \"Open as Web App\" if it's offered, then tap \"Add.\"",
+    "On Android (Chrome): open the site in Chrome, tap the ⋮ menu, and choose \"Install and create shortcut.\" Tap \"Install\" if that's offered — the simplest option — or \"Create shortcut\" then \"Add\" if not.",
+    "Opened this from inside Telegram? Open it in Safari or Chrome first (or copy the link there) — adding to the Home Screen only works from the browser itself.",
+  ];
 }
 
 /**
@@ -239,6 +349,18 @@ export function organizerIntroText(facts: CompanionIntroFacts): string {
  * that a password in a group is durable, searchable, and visible to everyone
  * ever added to that group. Both are true; the choice is the deployment's, and
  * turning it off changes nothing else about the message.
+ *
+ * REVISED 2026-09-14 — reported live: "Ask me anything here" told a group
+ * nothing about what actually triggers a reply, the site was never offered as
+ * a Home Screen shortcut, and nothing said that this keeps getting better
+ * with use rather than being fixed at setup. See `addressingLines` and
+ * `homeScreenLines` above for the two new sections; the third is the closing
+ * paragraph inline below, which deliberately separates a shared PREFERENCE
+ * ("we prefer later starts" — kept in mind for future suggestions) from a
+ * PLAN CHANGE (asked for directly, acted on directly) — the assistant's
+ * memory is trip context and preferences building up over the trip, not the
+ * underlying model retraining on the conversation, and nothing here claims
+ * an offhand comment silently edits the schedule.
  */
 export function groupIntroText(
   facts: CompanionIntroFacts,
@@ -254,10 +376,12 @@ export function groupIntroText(
     parts.push(
       `שלום לכולם! אני ${facts.assistantName}, העוזר של${title ? ` ${title}` : " הטיול"}.`,
       "",
-      "אפשר לפנות אליי כאן בכל שאלה:",
-      "• מה בתוכנית היום, מתי יוצאים, איפה ישנים",
+      "הנה מה שאני יודע לעשות:",
+      "• לענות על שאלות על התוכנית — מה יש היום, מתי יוצאים, איפה ישנים",
       "• לעדכן את התוכנית — להוסיף או להזיז פעילויות",
-      "• לשלוח לי אישורי הזמנה כדי שיהיו זמינים לכולם",
+      "• לשמור אישורי הזמנה — כשמתייגים אותי או עונים להודעה שלי בהודעת האישור, אמצא אותו כשתצטרכו",
+      "",
+      ...addressingLines(facts),
       "",
       `האתר של הטיול: ${facts.siteUrl}`,
     );
@@ -266,9 +390,14 @@ export function groupIntroText(
     } else if (facts.organizerName) {
       parts.push(`לפרטי הכניסה — ${facts.organizerName}.`);
     }
+    parts.push("", ...homeScreenLines("he"));
     if (facts.groupInviteUrl) {
       parts.push("", `קישור להצטרפות לקבוצה: ${facts.groupInviteUrl}`);
     }
+    parts.push(
+      "",
+      "אני אכיר אתכם קצת יותר טוב ככל שהטיול מתקדם — ספרו לי מה נהניתם ממנו, ממה הייתם מוותרים, או למשל \"אנחנו מעדיפים להתחיל מאוחר יותר\", ואני אזכור את זה כשאציע דברים. אם משהו באמת משתנה — טיסה, הזמנה, תוכנית ליום מסוים — תגידו לי ישירות ותבקשו שאעדכן; אני לא משנה כלום מעצמי מהערה אגבית.",
+    );
     if (schedule.length) {
       parts.push("", `אשלח לכאן מיוזמתי: ${listJoin(schedule, "he")}.`);
     }
@@ -278,10 +407,12 @@ export function groupIntroText(
   parts.push(
     `Hello everyone! I'm ${facts.assistantName}, the assistant for${title ? ` ${title}` : " this trip"}.`,
     "",
-    "Ask me anything here:",
-    "• What's on today, when we leave, where we're staying",
+    "Here's what I can do:",
+    "• Answer questions about the plan — what's on today, when we leave, where we're staying",
     "• Change the plan — add or move activities",
-    "• Send me booking confirmations so everyone can find them",
+    "• Keep booking confirmations — mention me or reply to my message when you send the confirmation, and I'll find it when you need it",
+    "",
+    ...addressingLines(facts),
     "",
     `The trip site: ${facts.siteUrl}`,
   );
@@ -290,9 +421,14 @@ export function groupIntroText(
   } else if (facts.organizerName) {
     parts.push(`Ask ${facts.organizerName} for the login.`);
   }
+  parts.push("", ...homeScreenLines("en"));
   if (facts.groupInviteUrl) {
     parts.push("", `Group invite link: ${facts.groupInviteUrl}`);
   }
+  parts.push(
+    "",
+    "I'll get to know you a little better as the trip goes on — tell me what you enjoyed, what you'd rather skip, or something like \"we prefer later starts,\" and I'll keep it in mind for what I suggest. If something actually changes — a flight, a booking, a plan for the day — tell me directly and ask me to update it; a passing comment won't change anything on its own.",
+  );
   if (schedule.length) {
     parts.push("", `I'll post ${listJoin(schedule, "en")} here without being asked.`);
   }
