@@ -14,6 +14,17 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRenderContext } from './helpers/dom.js';
+import { readFileSync } from 'fs';
+import vm from 'vm';
+
+// The site's real translation table, so an assertion on a label tests the
+// label the family reads.
+const REAL_T = (() => {
+  // translations.js ends with `window.T = T`, so it needs a window to write to.
+  const sandbox = { window: {} };
+  vm.runInNewContext(readFileSync(new URL('../site/translations.js', import.meta.url), 'utf8'), sandbox);
+  return sandbox.window.T;
+})();
 
 const PHASE = {
   id: 'tokyo',
@@ -71,3 +82,50 @@ describe('a phase with places and no days', () => {
     assert.equal(el.innerHTML.trim(), '');
   });
 });
+
+describe('every date of a phase is a day — empty ones included', () => {
+  // Reported 2026-09-13 on a live trip: Tokyo ran 19–23 September, the 19th and
+  // 20th had bookings, and the site drew those two days and nothing else.
+  // "Where is the 21, it has no plan but should have shown it." An empty day is
+  // where the next activity gets added; hiding it hides the gap.
+  const PLAN = {
+    tokyo: [
+      { id: 'p1', date: '2026-09-19', text_he: 'צק אין', text_en: 'Check in', time: '' },
+      { id: 'p2', date: '2026-09-20', text_he: 'סקייטרי', text_en: 'Skytree', time: '10:00' },
+    ],
+  };
+  const dayBlocks = el => [...el.querySelectorAll('.day-block')];
+
+  test('the unplanned 21st, 22nd and 23rd are drawn between the planned days', () => {
+    const el = render(PHASE, { PHASE_PLAN: PLAN });
+    const text = el.textContent;
+    for (const day of ['September 19', 'September 20', 'September 21', 'September 22', 'September 23']) {
+      assert.match(text, new RegExp(day), `${day} is missing from the phase`);
+    }
+    assert.equal(dayBlocks(el).length, 5, 'one block per date, no more and no less');
+    assert.ok(text.indexOf('September 20') < text.indexOf('September 21'), 'in date order');
+  });
+
+  test('an empty day says it is empty', () => {
+    // The harness carries its own minimal T, so the label the page shows is
+    // passed in — from translations.js, not retyped here.
+    const el = render(PHASE, { PHASE_PLAN: PLAN, T: REAL_T });
+    const empty = el.querySelector('[data-plan-day="2026-09-21"]');
+    assert.ok(empty, 'the 21st has its own block');
+    assert.match(empty.textContent, /Nothing planned for this day yet/);
+  });
+
+  test('the organizer can add an activity straight onto an empty day', () => {
+    const el = render(PHASE, { PHASE_PLAN: PLAN, isOrganizer: true });
+    const add = el.querySelector('[data-plan-day="2026-09-21"] [data-plan-add="tokyo"]');
+    assert.ok(add, 'the empty day carries the add row');
+    assert.equal(add.getAttribute('data-plan-date'), '2026-09-21', 'and it adds to THAT date');
+  });
+
+  test('with no plan and no schedule, the days still show — and so do the places', () => {
+    const el = render(PHASE);
+    assert.equal(dayBlocks(el).filter(b => b.matches('[data-plan-day]')).length, 5);
+    assert.match(el.textContent, /Planned places/, 'the places are not hidden by the empty days');
+  });
+});
+

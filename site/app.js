@@ -4134,32 +4134,30 @@ document.addEventListener('click', (ev) => {
   }
 });
 
-function renderDays(phase) {
-  const el = document.getElementById(`sched-${phase.id}`);
-  if (!el) return;
-  const tr = T[currentLang] || T['he'];
-  const dbItems = PHASE_PLAN[phase.id] || [];
-  let html = '';
+// Every calendar date a phase covers, from its own range.
+//
+// The site drew a day only when something was already planned on it, so a
+// Tokyo leg of 19–23 September with bookings on the 19th and 20th showed two
+// days and hid three. An empty day is not a missing day: it is where the
+// organizer adds the next activity, and hiding it hides the gap. Reported
+// 2026-09-13 — "where is the 21, it has no plan but should have shown it".
+// UTC throughout, and the same rule as trip-web's datesInPhase.
+function _phaseRangeDates(phase) {
+  const start = phase?.dates?.start || phase?.start;
+  const end = phase?.dates?.end || phase?.end || start;
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
+  if (!start || !iso.test(start) || !end || !iso.test(end)) return [];
+  const out = [];
+  for (let d = new Date(`${start}T00:00:00Z`); d <= new Date(`${end}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1)) {
+    out.push(d.toISOString().slice(0, 10));
+    if (out.length > 400) break;  // a trip, not a century
+  }
+  return out;
+}
 
-  // ── DB plan items (organizer's current plan — higher precedence) ──
-  if (dbItems.length) {
-    // group by date; items with no date go into '' bucket
-    const buckets = {};
-    for (const item of dbItems) {
-      const key = item.date || '';
-      if (!buckets[key]) buckets[key] = [];
-      buckets[key].push(item);
-    }
-    // unscheduled first, then sorted dates
-    const keys = [
-      ...(buckets[''] ? [''] : []),
-      ...Object.keys(buckets).filter(k => k).sort(),
-    ];
-    for (const key of keys) {
-      // The date alone doesn't say what the day IS. Prefer the stored headline
-      // (carried over from the config schedule, or written by enrichment) and
-      // fall back to the formatted date only when there isn't one yet.
-      const label = key
+// A day's heading: its stored headline when there is one, else the date.
+function _planDayLabel(phase, key, tr) {
+  return key
         ? (() => {
             const d = new Date(key + 'T12:00:00');
             const he = d.toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
@@ -4180,18 +4178,59 @@ function renderDays(phase) {
             return `<span class="lang-he">${esc(he)}</span><span class="lang-en">${esc(en)}</span>${suffix}${corrected}`;
           })()
         : _biSpan({ he: T.he.plan_unscheduled, en: T.en.plan_unscheduled });
+}
+
+// A date in the phase with nothing on it yet — shown, said to be empty, and
+// (for the organizer) the place to add the first activity.
+function _emptyDayBlock(phase, date, tr) {
+  return `<div class="day-block db-plan-block plan-empty-block" data-plan-day="${esc(date)}">
+    <div class="day-label">${_planDayLabel(phase, date, tr)}</div>
+    <ul><li class="plan-empty-day">${_biSpan({ he: T.he.plan_day_empty, en: T.en.plan_day_empty })}</li>${_buildAddItemRow(phase.id, date, tr)}</ul>
+  </div>`;
+}
+
+function renderDays(phase) {
+  const el = document.getElementById(`sched-${phase.id}`);
+  if (!el) return;
+  const tr = T[currentLang] || T['he'];
+  const dbItems = PHASE_PLAN[phase.id] || [];
+  let html = '';
+
+  // ── DB plan items (organizer's current plan — higher precedence) ──
+  if (dbItems.length) {
+    // group by date; items with no date go into '' bucket
+    const buckets = {};
+    for (const item of dbItems) {
+      const key = item.date || '';
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(item);
+    }
+    // unscheduled first, then sorted dates
+    const keys = [
+      ...(buckets[''] ? [''] : []),
+      ...[...new Set([...Object.keys(buckets).filter(k => k), ..._phaseRangeDates(phase)])].sort(),
+    ];
+    for (const key of keys) {
+      // The date alone doesn't say what the day IS. Prefer the stored headline
+      // (carried over from the config schedule, or written by enrichment) and
+      // fall back to the formatted date only when there isn't one yet.
+      const label = _planDayLabel(phase, key, tr);
+      if (!buckets[key]) { html += _emptyDayBlock(phase, key, tr); continue; }
       const itemsHtml = buckets[key].map(item => _buildPlanItemRow(item, phase.id, tr)).join('');
       const addRow = _buildAddItemRow(phase.id, key, tr);
-      html += `<div class="day-block db-plan-block">
+      html += `<div class="day-block db-plan-block" data-plan-day="${esc(key)}">
         <div class="day-label">${label}</div>
         <ul>${itemsHtml}${addRow}</ul>
       </div>`;
     }
     // organizer: show an "add to a new date" row
     if (isOrganizer) html += _buildNewDateRow(phase.id, tr);
-  } else if (isOrganizer) {
+  } else {
+    // No plan layer yet. With a config schedule the days are drawn below; with
+    // neither, the phase's own dates still are — empty, and addable.
+    if (!phase.days?.length) html += _phaseRangeDates(phase).map(date => _emptyDayBlock(phase, date, tr)).join('');
     // no DB items yet — show a single add row so organizer can start the plan
-    html += _buildNewDateRow(phase.id, tr);
+    if (isOrganizer) html += _buildNewDateRow(phase.id, tr);
   }
 
   // ── Config days (original schedule — lower precedence) ──
@@ -4202,7 +4241,7 @@ function renderDays(phase) {
   if (phase.days?.length) {
     const supersededByPlan = dbItems.length > 0;
     if (!supersededByPlan || isOrganizer) {
-      const daysHtml = phase.days.map(day => {
+      const configBlocks = phase.days.map(day => {
         const items = (day.items || []).map(item => {
           // Provision-time enrichment matches a day line to the phase venue it
           // names and copies the venue's links onto the item — the extract
@@ -4215,11 +4254,18 @@ function renderDays(phase) {
             }).join('');
           return `<li>${item.time ? `<strong>${item.time}</strong> — ` : ''}${_biSpan(item.text)}${nav ? ` <span class="day-item-links">${nav}</span>` : ''}</li>`;
         }).join('');
-        return `<div class="day-block">
+        return { date: day.date || '', html: `<div class="day-block">
           <div class="day-label">${_biSpan(day.label)}</div>
           <ul>${items}</ul>
-        </div>`;
-      }).join('');
+        </div>` };
+      });
+      const emptyBlocks = supersededByPlan ? [] : _phaseRangeDates(phase)
+        .filter(date => !phase.days.some(day => day.date === date))
+        .map(date => ({ date, html: _emptyDayBlock(phase, date, tr) }));
+      const daysHtml = [
+        ...configBlocks.filter(b => !b.date),
+        ...[...configBlocks.filter(b => b.date), ...emptyBlocks].sort((a, b) => a.date.localeCompare(b.date)),
+      ].map(b => b.html).join('');
 
       html += supersededByPlan
         ? `<div class="loc-panel plan-orig-panel">
@@ -4240,7 +4286,7 @@ function renderDays(phase) {
   // empty while the trip config listed Tokyo Skytree and TeamLab Planets on it.
   // Shown only when there is no plan and no schedule — once either exists, it
   // IS the schedule and this would duplicate it.
-  if (!html && phase.venues?.length) {
+  if (!dbItems.length && !phase.days?.length && phase.venues?.length) {
     const rows = phase.venues.map(v => {
       const nav = [['🗺️', v.maps], ['🔵', v.waze], ['🎫', v.tickets || v.url]]
         .map(([icon, u]) => {

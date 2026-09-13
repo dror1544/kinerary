@@ -257,6 +257,11 @@ function dayContextForPhase(phase, date) {
   };
 }
 
+// A link worth rendering as an href, or nothing.
+function httpOrNull(u) {
+  return typeof u === 'string' && /^https?:\/\//i.test(u.trim()) ? u.trim() : null;
+}
+
 function rowsFromConfig(config) {
   const days = [];
   const items = [];
@@ -296,10 +301,17 @@ function rowsFromConfig(config) {
           item_type: normalizeType(item.type),
           text_he: text,
           text_en: enText || null,
-          location_url: firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
-          waze_url: null,
+          // The links enrichment attaches BESIDE the text first — `maps`,
+          // `waze`, `url`/`tickets`, matched from the phase's venues at
+          // provisioning — then any written inline. This read only the inline
+          // form, so every interview-built trip (whose links are always
+          // siblings) reached the site with no location on any day: on
+          // 2026-09-13 Skytree, teamLab, Sagano and the Sumo Hall all carried
+          // maps and Waze links in the config and none in the itinerary.
+          location_url: httpOrNull(item.maps) || firstMapHref(item.text?.he) || firstMapHref(item.text?.en) || null,
+          waze_url: httpOrNull(item.waze),
           website_url: null,
-          ticket_url: null,
+          ticket_url: httpOrNull(item.tickets) || httpOrNull(item.url),
           booking_id: null,
           confirmation_state: normalizeConfirmation(item.confirmation_state || 'verified'),
           duration_minutes: Number.isFinite(Number(item.duration_minutes)) ? Number(item.duration_minutes) : null,

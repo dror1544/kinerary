@@ -531,8 +531,10 @@ describe('C. renderDays() after a swap', () => {
 
   test('a participant sees one block per date, each holding the swapped plan', () => {
     const el = render({ isOrganizer: false });
-    const blocks = [...el.querySelectorAll('.day-block')];
-    assert.equal(blocks.length, 2, 'expected exactly two day blocks, one per date');
+    // Planned days only: every date of the phase now has a block, and the
+    // empty ones are not what this test is about.
+    const blocks = [...el.querySelectorAll('.day-block:not(.plan-empty-block)')];
+    assert.equal(blocks.length, 2, 'expected exactly two planned day blocks, one per date');
 
     const [first, second] = blocks;
     // Dates render as formatted labels, so identify the blocks by their content.
@@ -570,7 +572,7 @@ describe('C. renderDays() after a swap', () => {
     assert.match(panel.textContent, /Original schedule/,
       'the comparison view must be labelled as the original, not shown as the live plan');
     // Still exactly two live day blocks; the comparison lives inside the panel.
-    const live = [...el.querySelectorAll('.day-block')].filter(b => !panel.contains(b));
+    const live = [...el.querySelectorAll('.day-block:not(.plan-empty-block)')].filter(b => !panel.contains(b));
     assert.equal(live.length, 2);
   });
 });
@@ -610,12 +612,15 @@ describe('D. A booking update is not evidence the active plan changed', () => {
 
   test('and the rendered schedule still shows the pre-swap plan', async () => {
     const el = renderFor(await planItems(), await planDays(), { isOrganizer: false });
-    const blocks = [...el.querySelectorAll('.day-block')];
+    // By date, not by position: every date of the phase is a day block now,
+    // planned or not, so the first block is the phase's first date — not the
+    // first day anything was planned on.
+    const day13 = el.querySelector(`.day-block[data-plan-day="${DAY_13}"]`);
     // 13/8 is still Diamond Head: the booking edit changed nothing here, which
     // is precisely why "updated on the site" was a false claim.
-    assert.match(blocks[0].textContent, /Diamond Head \+ Waikiki/);
-    assert.ok(blocks[0].textContent.includes('Diamond Head — hike'));
-    assert.ok(!blocks[0].textContent.includes('Halona Blowhole Lookout'),
+    assert.match(day13.textContent, /Diamond Head \+ Waikiki/);
+    assert.ok(day13.textContent.includes('Diamond Head — hike'));
+    assert.ok(!day13.textContent.includes('Halona Blowhole Lookout'),
       'the booking notes must not surface as the day plan');
   });
 

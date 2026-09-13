@@ -1,10 +1,31 @@
+// NULL IS ABSENT. Every optional field below accepts null as well as undefined.
+//
+// The server writes null for a value it does not have — an untimed day item is
+// `"time": null` — and zod's `.optional()` accepts undefined only. On
+// 2026-09-13 a live interview-built trip carried five `time: null` items, so
+// `configSchema.parse` threw on the whole config: the modern site lost its
+// hero, its map stops and every phase's date range, fell back to planned days
+// only, and showed "Offline or stale data" over a server that had answered 200
+// to every request. One optional field took the whole config down with it, so
+// the rule is applied to the whole file rather than to the field that failed.
 import { z } from "zod";
-const bi = z
-  .union([
-    z.string(),
-    z.object({ he: z.string().optional(), en: z.string().optional() }),
-  ])
-  .optional();
+// Null on the wire means absent — converted BEFORE validation, so the schema
+// (and every type inferred from it) stays exactly `optional()`. Two rejected
+// alternatives: `.nullable()` leaks null into ten consumers written against
+// `string | undefined`; `.transform()` makes the optional key required in the
+// output type and broke every fixture that omits one.
+const nullAsAbsent = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === null ? undefined : value), schema);
+const optStr = nullAsAbsent(z.string().optional());
+const optBool = nullAsAbsent(z.boolean().optional());
+const bi = nullAsAbsent(
+  z
+    .union([
+      z.string(),
+      z.object({ he: optStr, en: optStr }),
+    ])
+    .optional(),
+);
 const packing = z.array(z.tuple([bi, bi])).optional();
 export const parityFields = {
   tasks: z
@@ -13,7 +34,7 @@ export const parityFields = {
         id: z.string(),
         text: bi,
         owner: bi,
-        deadline: z.string().optional(),
+        deadline: optStr,
       }),
     )
     .optional(),
@@ -24,22 +45,22 @@ export const parityFields = {
         .record(
           z.string(),
           z.object({
-            flag: z.string().optional(),
-            callingCode: z.string().optional(),
+            flag: optStr,
+            callingCode: optStr,
             currency: z
               .object({
-                code: z.string().optional(),
-                name: z.string().optional(),
-                symbol: z.string().optional(),
+                code: optStr,
+                name: optStr,
+                symbol: optStr,
               })
               .optional(),
             emergency: z
               .object({
                 general: z.string().nullable().optional(),
-                police: z.string().optional(),
-                ambulance: z.string().optional(),
-                fire: z.string().optional(),
-                unified112: z.boolean().optional(),
+                police: optStr,
+                ambulance: optStr,
+                fire: optStr,
+                unified112: optBool,
               })
               .optional(),
           }),
@@ -57,18 +78,18 @@ export const parityFields = {
     .optional(),
 };
 export const phaseParityFields = {
-  short_id: z.string().optional(),
+  short_id: optStr,
   packing,
   venues: z
     .array(
       z.object({
-        id: z.string().optional(),
-        item_uid: z.string().optional(),
+        id: optStr,
+        item_uid: optStr,
         name: bi,
-        tickets: z.string().optional(),
-        url: z.string().optional(),
-        maps: z.string().optional(),
-        waze: z.string().optional(),
+        tickets: optStr,
+        url: optStr,
+        maps: optStr,
+        waze: optStr,
       }),
     )
     .optional(),
@@ -76,22 +97,22 @@ export const phaseParityFields = {
     .array(
       z.object({
         id: z.string(),
-        item_uid: z.string().optional(),
+        item_uid: optStr,
         title: bi,
         name: bi,
         desc: bi,
         price: bi,
-        date: z.string().optional(),
+        date: optStr,
       }),
     )
     .optional(),
   days: z
     .array(
       z.object({
-        date: z.string().optional(),
+        date: optStr,
         label: bi,
         items: z
-          .array(z.object({ time: z.string().optional(), text: bi }))
+          .array(z.object({ time: optStr, text: bi }))
           .optional(),
       }),
     )
