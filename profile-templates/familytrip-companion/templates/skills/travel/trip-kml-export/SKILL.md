@@ -43,8 +43,11 @@ bookings = mcp__trip_mcp__get_bookings()   # may be empty — that's ok
 ```
 
 ### 2. Run the export script
+The script lives in this skill's own folder. `skill_view("trip-kml-export")` returns that folder as
+`skill_dir`; build the path from it. There is no environment variable for it.
+
 ```bash
-SCRIPT="$PROFILE_SKILLS_DIR/travel/trip-kml-export/scripts/trip_kml_export.py"
+SCRIPT="<skill_dir>/scripts/trip_kml_export.py"
 OUTPUT="/tmp/trip_export_$(date +%s).kml"
 
 echo '{"config": <config_json>, "bookings": <bookings_json>}' \
@@ -60,7 +63,7 @@ bookings_json = ...   # list/dict from get_bookings
 
 payload = json.dumps({"config": config_json, "bookings": bookings_json}, ensure_ascii=False)
 output_path = f"/tmp/trip_{int(time.time())}.kml"
-script = "$PROFILE_SKILLS_DIR/travel/trip-kml-export/scripts/trip_kml_export.py"
+script = f"{skill_dir}/scripts/trip_kml_export.py"   # skill_dir from skill_view("trip-kml-export")
 
 result = subprocess.run(
     ["python3", script, "--filter", FILTER_MODE, "--output", output_path],
@@ -77,7 +80,7 @@ print(meta)   # {"ok": true, "file": "...", "placemarks": N, "trip": "..."}
 
 ### 4. Send the file
 - **To the group** (if organizer approved or request came from group): send as file attachment via Telegram — include a short message with the filter label and a usage tip.
-- **To the organizer only** (if in doubt): send privately to שירן.
+- **To the organizer only** (if in doubt): send privately to the organizer.
 
 **Message template (group):**
 ```

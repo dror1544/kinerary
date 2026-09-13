@@ -262,7 +262,8 @@ if [ -d "$HERMES_PROFILES" ]; then
     [ -d "$dest" ] || continue
     name="$(basename "$dest")"
     profile="$(basename "$(dirname "$(dirname "$(dirname "$dest")")")")"
-    if [ ! -d ".agents/skills/$name" ]; then
+    # A skill the companion template ships has its repo copy there, not in .agents/skills.
+    if [ ! -d ".agents/skills/$name" ] && ! compgen -G "profile-templates/*/templates/skills/*/$name" >/dev/null; then
       UNCAPTURED="$UNCAPTURED $profile/$name"
       UNCAPTURED_N=$((UNCAPTURED_N + 1))
     fi
