@@ -138,6 +138,6 @@ Zero messages from any traveler between Aug 16 and trip end. Possible causes: re
 
 ## Data Sources
 
-- Hermes session database (Telegram message log, profile `shiranusa2026`)
+- Hermes session database (Telegram message log, the trip's companion profile)
 - Live trip config via trip MCP (`get_config`, `get_bookings`, `health_check`)
 - Conversation transcripts reviewed during the trip (Aug 9–17)

@@ -122,8 +122,8 @@ def build_companion_handoff(
             # japan-2026.
 
             # Everything that creates the server already agreed on trip-mcp:
-            # kinerary-deploy/setup-mcp.sh registers it under that name, the live
-            # shiranusa2026 profile uses it, and this template's OWN skills call it
+            # kinerary-deploy/setup-mcp.sh registers it under that name, the longest-running
+            # live trip profile uses it, and this template's OWN skills call it
             # (trip-daily-planning's `get_config` via trip-mcp, trip_kml_export.py).
             # Only the handoff contract said trip-site, so the handoff was the outlier.
             "site_connection_name": "trip-mcp",
