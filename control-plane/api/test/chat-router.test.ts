@@ -215,22 +215,23 @@ describe("renderQuestion", () => {
       const { text } = renderDocumentOffer(language);
 
       // 1. Who is asking.
-      assert.match(text, language === "he" ? /אני העוזר/ : /I'm the assistant/, language);
+      assert.match(text, language === "he" ? /Kinerary/ : /Kinerary/, language);
 
       // 2. What it will ask about, and that it is a conversation, not a form.
-      assert.match(text, language === "he" ? /לא טופס/ : /isn't a form/, language);
+      assert.match(text, language === "he" ? /בלי טפסים/ : /No forms/, language);
 
       // 3. What happens to what you send — used AND retrievable afterwards.
       //    "You can have it back" is the difference between handing something
-      //    over and giving it away, and is the half most easily dropped.
-      assert.match(text, language === "he" ? /נשמר עם הטיול/ : /stays with your trip/, language);
+      //    over and giving it away, and is the half most easily dropped
+      //    (2026-09-13: a rewrite did drop it, on the first pass).
+      assert.match(text, language === "he" ? /בחזרה בכל שלב/ : /back anytime/, language);
       assert.match(text, language === "he" ? /באתר הטיול/ : /on the trip site/, language);
 
       // 4. The endgame, concretely: a site AND an assistant that joins the
       //    family group. A promise of "something personalised" is not what
       //    makes someone willing to type their family into a chat window.
       assert.match(text, language === "he" ? /אתר טיול פרטי/ : /private trip website/, language);
-      assert.match(text, language === "he" ? /לקבוצה המשפחתית/ : /family group chat/, language);
+      assert.match(text, language === "he" ? /לקבוצת המשפחה/ : /family group chat/, language);
     }
   });
 

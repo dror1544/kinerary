@@ -287,18 +287,33 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // is a picture, and a picture is what makes someone willing to type their
     // children's names into a chat window.
     //
-    // The documents paragraph says "you can ask me for it later" because that
-    // is the difference between handing something over and giving it away.
+    // Names the product outright ("your Kinerary travel assistant") rather
+    // than staying anonymous — Dror's call, 2026-09-13: this bot is not the
+    // one the family ends up chatting with day to day (that one gets its own
+    // name a few questions from now), so it can say who it is without
+    // colliding with the assistant it is about to help create.
+    //
+    // "Kinerary builds a shared memory of your trip" is what used to be
+    // phrased as "ask me for it later" — same promise (nothing sent here is
+    // thrown away), framed as continuity rather than storage.
     introduction: [
-      "Hi — I'm the assistant that sets your trip up. One conversation, and it's done.",
+      "Hi 👋 I'm your Kinerary travel assistant.",
       "",
-      "I'll ask about the trip: where, when, who's coming, how you like to travel. It isn't a form — answer in your own words, in whatever language you're comfortable in, and skip anything you'd rather not say.",
+      "Give me one conversation, and I'll turn what you already know about your trip into something you can actually travel with.",
       "",
-      "If you already have flight confirmations, hotel bookings, tickets or a plan you wrote, send them here. I'll read them and use them, so I don't ask you for what you already have written down. Everything you send stays with your trip — ask me for any of it later here in the chat, or find it on the trip site.",
+      "I'll ask you a few simple questions — where you're going, when, who's coming, what matters to each of you, and how you like to travel. No forms, no rigid fields. Just answer naturally, in any language you prefer. If you don't know something yet, skip it — we can fill it in later.",
       "",
-      "At the end you get two things: a private trip website for everyone coming, and an assistant of your own. You can add it to the family group chat, and during the trip it answers questions, keeps the plan, and remembers what everyone booked.",
+      "Already have flight confirmations, hotel bookings, tickets, reservations, spreadsheets, PDFs, screenshots, or an itinerary someone put together? Send them here. I'll read through them, extract what matters, and use what's already known instead of making you repeat it.",
       "",
-      "So — send me anything you've got, or just say the word and I'll start asking.",
+      "As we go, Kinerary builds a shared memory of your trip — your plans, bookings, preferences, people, places, and decisions. Ask for any of it back anytime, right here or on the trip site.",
+      "",
+      "When we're done, you'll have a private trip website for everyone traveling with you, plus a personal travel assistant that actually knows your trip.",
+      "",
+      "You can add it to your family group chat, ask it questions before or during the trip, check what's planned next, find a reservation, remember who booked what, or simply ask: \"What are we doing tomorrow?\"",
+      "",
+      "The goal is simple: you enjoy the trip — Kinerary keeps track of everything else.",
+      "",
+      "So send me whatever you already have, or just type \"Let's start\" and I'll take it from there.",
     ].join("\n"),
     // Said when the interviewer has gone quiet and the router picks the thread
     // back up. Deliberately says nothing about why: the organizer does not need
@@ -431,15 +446,23 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     noDocument: "אין לי מסמך",
     notMyCommand: "זו לא פקודה שלי — פשוט ענו כאן בצ'אט, או השתמשו בכפתורים.",
     introduction: [
-      "היי — אני העוזר שמקים לכם את הטיול. שיחה אחת, וזהו.",
+      "היי 👋 אני עוזר הטיולים שלכם מבית Kinerary.",
       "",
-      "אשאל אתכם על הטיול: לאן, מתי, מי מגיע ואיך אתם אוהבים לטייל. זה לא טופס — ענו במילים שלכם, בכל שפה שנוח לכם, ואם משהו לא מתאים פשוט דלגו.",
+      "תנו לי שיחה אחת, ואהפוך את מה שאתם כבר יודעים על הטיול לתוכנית שאפשר לצאת איתה לדרך.",
       "",
-      "אם כבר יש לכם אישורי טיסה, הזמנות מלון, כרטיסים או תוכנית שכתבתם — שלחו לכאן. אקרא ואשתמש בזה, כדי לא לשאול אתכם על מה שכבר כתוב אצלכם. כל מה שתשלחו נשמר עם הטיול — תוכלו לבקש ממני כל דבר מזה גם אחר כך כאן בצ'אט, או למצוא אותו באתר הטיול.",
+      "אשאל אתכם כמה שאלות פשוטות — לאן אתם נוסעים, מתי, מי מגיע, מה חשוב לכל אחד מכם, ואיך אתם אוהבים לטייל. בלי טפסים, בלי שדות נוקשים. פשוט ענו באופן טבעי, בכל שפה שנוח לכם. אם אתם עוד לא יודעים משהו, דלגו עליו — נשלים את זה בהמשך.",
       "",
-      "בסוף מקבלים שני דברים: אתר טיול פרטי לכל מי שנוסע, ועוזר אישי משלכם. אפשר להוסיף אותו לקבוצה המשפחתית, ובמהלך הטיול הוא עונה על שאלות, מחזיק את התוכנית וזוכר מה כל אחד הזמין.",
+      "כבר יש לכם אישורי טיסה, הזמנות מלון, כרטיסים, הזמנות, קובצי אקסל, PDF-ים, צילומי מסך, או תוכנית שמישהו כבר הכין? שלחו אותם לכאן. אני אקרא אותם, אוציא מהם את מה שחשוב, ואשתמש במה שכבר ידוע במקום לגרום לכם לחזור על זה.",
       "",
-      "אז — שלחו לי כל מה שיש לכם, או תגידו ונתחיל בשאלות.",
+      "תוך כדי, Kinerary בונה זיכרון משותף של הטיול שלכם — התוכניות, ההזמנות, ההעדפות, האנשים, המקומות וההחלטות. אפשר לבקש כל אחד מהם בחזרה בכל שלב, כאן בצ׳אט או באתר הטיול.",
+      "",
+      "כשנסיים, יהיו לכם אתר טיול פרטי לכל מי שנוסע, ועוזר טיולים אישי שבאמת מכיר את הטיול שלכם.",
+      "",
+      "אפשר להוסיף אותו לקבוצת המשפחה, לשאול אותו שאלות לפני הטיול או במהלכו, לבדוק מה מתוכנן בהמשך, למצוא הזמנה, לזכור מי הזמין מה, או פשוט לשאול: \"מה אנחנו עושים מחר?\"",
+      "",
+      "המטרה פשוטה: אתם נהנים מהטיול — Kinerary דואג לכל השאר.",
+      "",
+      "אז שלחו לי מה שכבר יש לכם, או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
