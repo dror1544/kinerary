@@ -586,14 +586,34 @@ def _carry_venue_links_to_days(phase: dict[str, Any], label: str, destination: s
     that actually mentions the place. Each link is only added when the item
     doesn't already carry one — a hand-authored value wins."""
     days = phase.get("days")
-    venues = phase.get("venues")
-    if not isinstance(days, list) or not isinstance(venues, list):
+    if not isinstance(days, list):
         return
+    venues = phase.get("venues") if isinstance(phase.get("venues"), list) else []
+
+    # THE HOTEL IS A PLACE TOO. `_add_phase_nav` gives the accommodation its own
+    # maps / waze links (searched by hotel name + city), and the map pins the
+    # phase on it — but only `venues` were ever turned into needles, so the day
+    # line that names the hotel ("Check in at OMO3 Asakusa by Hoshino Resorts")
+    # never got them. The hotels are a trip's anchors: where the day starts and
+    # ends, and the one address everyone needs. Reported 2026-09-13 — "these
+    # locations are shown on the map but not on the plan". A phase with a hotel
+    # and no venues (Hakone, a closing Tokyo leg) used to return before looking
+    # at a single item.
+    places: list[Any] = list(venues)
+    lodgings = [phase.get("accommodation")] + [
+        h for h in (phase.get("hotels") if isinstance(phase.get("hotels"), list) else [])
+    ]
+    for acc in lodgings:
+        if not isinstance(acc, dict):
+            continue
+        for name in (acc.get("name"), acc.get("name_en"), acc.get("hotel")):
+            if isinstance(name, str) and name.strip():
+                places.append({**acc, "name": name})
 
     # (needle, {link key: url}); matched longest-needle-first so a specific
     # venue ("Tokyo Station") wins over a bare "Tokyo" when both are on the phase.
     needles: list[tuple[str, dict[str, str]]] = []
-    for venue in venues:
+    for venue in places:
         if not isinstance(venue, dict):
             continue
         links = {

@@ -20,8 +20,6 @@ import { digestTelegramId } from "../src/identity.js";
 import { uiString } from "../src/intake-copy.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
-import { publishCommandMenu } from "../src/relay/command-menu.js";
-import type { TelegramClient } from "../src/relay/telegram-api.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -492,66 +490,5 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
     await withFixture(async ({ pool }) => {
       assert.deepEqual(await listOrganizerTrips(pool, "-1004305582269", "-1004305582269"), []);
     });
-  });
-});
-
-
-describe("the ⌘ menu", () => {
-  function fakeClient(setMyCommands?: TelegramClient["setMyCommands"]): TelegramClient {
-    return {
-      async sendMessage() { return { ok: true }; },
-      async editMessageText() { return { ok: true }; },
-      async sendChatAction() { /* no-op */ },
-      async answerCallbackQuery() { /* no-op */ },
-      async getChatInfo() { return null; },
-      async getMe() { return null; },
-      async getUpdates() { return []; },
-      async deleteWebhookIfPresent() { /* no-op */ },
-      ...(setMyCommands ? { setMyCommands } : {}),
-    } as TelegramClient;
-  }
-
-  test("offers the commands in private chats only, in every language it draws", async () => {
-    const calls: { commands: string[]; scope?: string; languageCode?: string }[] = [];
-    const ok = await publishCommandMenu(fakeClient(async (params) => {
-      calls.push({
-        commands: params.commands.map((c) => c.command),
-        scope: params.scope?.type,
-        languageCode: params.languageCode,
-      });
-      return true;
-    }));
-
-    assert.equal(ok, true);
-    // A default menu plus one per language.
-    assert.deepEqual(calls.map((c) => c.languageCode), [undefined, "en", "he"]);
-    for (const call of calls) {
-      assert.equal(call.scope, "all_private_chats", "a group must not be offered /switch");
-      assert.deepEqual(call.commands, ["trips", "switch", "group", "done"]);
-    }
-    // Telegram surfaces its own Start button; a menu entry for a command that
-    // does nothing without a token is a dead end.
-    assert.equal(calls.some((c) => c.commands.includes("start")), false);
-  });
-
-  test("the descriptions are actually translated, not English twice", async () => {
-    const byLanguage = new Map<string, string[]>();
-    await publishCommandMenu(fakeClient(async (params) => {
-      if (params.languageCode) byLanguage.set(params.languageCode, params.commands.map((c) => c.description));
-      return true;
-    }));
-    assert.notDeepEqual(byLanguage.get("he"), byLanguage.get("en"));
-    assert.equal(byLanguage.get("he")?.every((d) => /[\u0590-\u05FF]/.test(d)), true);
-  });
-
-  test("a failed publish is reported, never fatal — the commands still work", async () => {
-    assert.equal(await publishCommandMenu(fakeClient(async () => false)), false);
-    assert.equal(
-      await publishCommandMenu(fakeClient(async () => { throw new Error("network"); })),
-      false,
-      "a throw at boot must not cost the deployment its relay",
-    );
-    // A client that predates setMyCommands is a TelegramClient too.
-    assert.equal(await publishCommandMenu(fakeClient()), false);
   });
 });

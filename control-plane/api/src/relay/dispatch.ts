@@ -43,7 +43,15 @@ import {
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
-import { companionHelpText, groupBindingCommand, groupIntroText } from "../companion-intro.js";
+import {
+  companionHelpText,
+  groupBindingCommand,
+  groupIntroText,
+  renameConfirmation,
+  renameRefused,
+  renameUsage,
+} from "../companion-intro.js";
+import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
   issueGroupBindingToken,
@@ -484,6 +492,42 @@ export async function dispatchUpdate(
     };
   }
 
+  // Renaming the assistant: `/name סולו` or `/name סולו / Solo`.
+  //
+  // Anyone in a chat bound to the trip, group or DM — no approval, by Dror's
+  // rule of 2026-09-13. Router-owned because the router is what has to HEAR a
+  // new name: a group message reaches the companion only when it names the
+  // assistant, and the names that count are `trips.assistant_names`. A family
+  // renamed their assistant in conversation that day; it agreed, saved the
+  // name to its own memory, and every message using it was dropped here as
+  // NOT_ADDRESSED. The companion's `set_assistant_names` tool does the same
+  // write from its side (companion-mcp.ts).
+  //
+  // Mid-interview it is not ours to handle — the assistant's name is still a
+  // question there — so it falls through to the command gate's answer.
+  if (parsed.kind === "command" && (parsed.name === "name" || parsed.name === "rename")) {
+    const route = await resolveChatRoute(db, chatId);
+    if (route.kind === "unbound") {
+      return { kind: "reply", reply: { chatId, text: strings.unbound } };
+    }
+    if (route.kind === "companion") {
+      const facts = await companionIntroFacts(db, route.tripId);
+      const language = facts?.language === "he" ? "he" : "en";
+      const argument = /^\/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?\s+([\s\S]+)$/.exec(text.trim())?.[1]?.trim() ?? "";
+      if (!argument) {
+        return { kind: "reply", reply: { chatId, text: renameUsage(language, await getAssistantNames(db, route.tripId)) } };
+      }
+      const names = parseAssistantNames(argument);
+      if (!names.ok) {
+        log(structuredLog("info", "trip_bot.rename_refused", { reason: names.reason }));
+        return { kind: "reply", reply: { chatId, text: renameRefused(language) } };
+      }
+      const now = await setAssistantNames(db, route.tripId, names.names);
+      log(structuredLog("info", "trip_bot.renamed", { via: "command", names: now?.length ?? 0 }));
+      return { kind: "reply", reply: { chatId, text: renameConfirmation(language, now ?? names.names) } };
+    }
+  }
+
   // The organizer asking for a group-binding token, in their own DM. Router-
   // owned rather than agent-owned for the same reason the introduction is: the
   // token is a credential, and one the agent got slightly wrong is a token that
@@ -570,14 +614,6 @@ export async function dispatchUpdate(
     if (route.kind === "interview") {
       const result = await setFinishRequestedForChat(db, chatId, true);
       if (result.ok) return { kind: "show_summary", chatId, view: result.view };
-    }
-    // The ⌘ menu offers /done in EVERY private chat — Telegram cannot scope a
-    // menu by route — so a companion DM receives it too. Letting it fall to the
-    // catch-all below would answer "/done isn't one of my commands": the bot
-    // disowning an entry in its own menu.
-    if (route.kind === "companion") {
-      const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
-      return { kind: "reply", reply: { chatId, text: uiString("doneNoInterview", language) } };
     }
   }
 

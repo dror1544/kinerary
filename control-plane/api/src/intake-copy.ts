@@ -429,14 +429,6 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // that produced "I don't have a trip for this chat" about a site that was
     // provisioned perfectly.
     tripUnreachable: "(site not responding)",
-
-    // Telegram's ⌘ menu. Descriptions, not sentences: they are read in a list
-    // of four, next to the command itself.
-    cmdTrips: "Your trips, and which one this chat is on",
-    cmdSwitch: "Point this chat at a different trip",
-    cmdGroup: "Connect me to your family group",
-    cmdDone: "Show me everything you have so far",
-    doneNoInterview: "That one is for while we're planning a trip — there's no interview running in this chat.",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -504,12 +496,6 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
-
-    cmdTrips: "הטיולים שלך, ולאיזה מהם הצ׳אט הזה מחובר",
-    cmdSwitch: "חיבור הצ׳אט הזה לטיול אחר",
-    cmdGroup: "חיבור שלי לקבוצה המשפחתית",
-    cmdDone: "הצגת כל מה שנאסף עד עכשיו",
-    doneNoInterview: "זו פקודה לזמן תכנון הטיול — אין כרגע ריאיון פתוח בצ'אט הזה.",
   },
 };
 

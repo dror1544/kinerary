@@ -298,23 +298,28 @@ and the command list only changes when the code does.
 
 **Scoped, not global.** The commands are not the same everywhere, and a menu
 offering `/switch` in a family group advertises something that will be
-refused. What shipped:
+refused. What shipped is one menu per scope, published for the unlabelled
+default, `en` and `he` — this branch's commands merged by union into the
+router's own `/help` and `/name` menu from integration (db3f0fe):
 
 | Scope | Commands |
 |---|---|
-| `all_private_chats` — once unlabelled, once per language in `LANGUAGES` | `/trips`, `/switch`, `/group`, `/done` |
-| groups, and the unscoped default | nothing — left as they are |
+| `default`, `all_private_chats` | `/help`, `/name`, `/group`, `/trips`, `/switch` |
+| `all_group_chats` | `/help`, `/name` |
 
-This design first offered `/interview` and `/url` privately and `/url` in groups
-and by default. Those wait on the commands themselves (§6, §8); a menu entry
-for a command the router cannot answer is the dead end this section exists to
-avoid.
+Groups get a menu of their own rather than none: leaving a group's menu alone
+is what kept sixty stale Hermes commands in a live family group on 2026-09-13.
+`/done` is not offered; it means something only mid-interview. This design
+first offered `/interview` and `/url` too — those wait on the commands
+themselves (§6, §8), since a menu entry for a command the router cannot answer
+is the dead end this section exists to avoid.
 
 `/start` is deliberately absent — Telegram surfaces its own Start button, and
 a menu entry for a command that is useless without a token is a dead end.
 
-**Localised.** `setMyCommands` takes a `language_code`; the descriptions come
-from `intake-copy.ts` for the same reason §1 gives. This is the second half of
+**Localised.** `setMyCommands` takes a `language_code`; the descriptions are
+kept per language beside the menu, in `command-menu.ts`, for the same reason §1
+gives. This is the second half of
 the localisation point, and skipping it produces a Hebrew conversation under
 an English menu.
 
