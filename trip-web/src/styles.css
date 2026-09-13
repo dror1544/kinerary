@@ -281,6 +281,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   background: linear-gradient(135deg, rgba(95,211,196,.16), rgba(255,255,255,.96));
 }
 .day-heading-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.plan-tools-back { justify-self: start; text-decoration: none; }
 .journey-settings { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: var(--kit-radius); color: var(--kit-teal); }
 .journey-settings:hover { background: rgba(95,211,196,.14); }
 .journey-settings:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: 2px; }

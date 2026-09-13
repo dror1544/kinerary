@@ -1,5 +1,6 @@
 import { datesInPhase } from "./phase-calendar";
 import { useEffect, useState } from "react";
+import { ArrowLeft, ArrowRight } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type ActiveItinerary, type TripConfig } from "./api";
 import { useLiveEditGuard } from "./live-updates";
@@ -132,6 +133,10 @@ export function PlanTools({
     ) || [];
   return (
     <div className="parity-layout">
+      <a className="secondary-action plan-tools-back" href="#journey">
+        {lang === "he" ? <ArrowRight size={18} aria-hidden="true" /> : <ArrowLeft size={18} aria-hidden="true" />}
+        {tr(lang, "Back to trip planning", "חזרה לתכנון הטיול")}
+      </a>
       <Section title={tr(lang, "Organizer plan tools", "כלי מסלול למארגן")}>
         <div className="parity-fields">
           <label>
