@@ -270,6 +270,26 @@ provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
 the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
 byte-identical to before the run.
 
+## Boot order on the Proxmox host
+
+Set 2026-09-13, after a host reboot brought back only the guests with `onboot`
+and left the family's site down:
+
+| Guest | onboot | startup | why |
+|---|---|---|---|
+| VM 103 TrueNAS | 1 | `order=1,up=120` | serves the NFS mount every trip container needs; 120s before the next starts |
+| VM 110 kinerary-cp | 1 | `order=2` | control plane, relay, Hermes |
+| trip containers | 1 | `order=3` | set at creation by `provisioning/adapters.py` |
+
+`scripts/trip-autostart.py --trip <slug> [--on|--off]` shows or changes one trip
+(run with `sudo KINERARY_DEPLOY_ROOT=/opt/kinerary-deploy` here). Two things do
+NOT come back on their own after a VM reboot and still need a hand: each trip's
+trip-mcp bridge (`setup-mcp.sh --restart-only --trip-dir <trip dir>` as `hermes`),
+and the companion gateway's parked trip-mcp connection (restart the gateway after
+the bridge). Never write a vzdump to `truenas-nfs`: TrueNAS runs on this same host,
+and on 2026-09-13 a container dump into it froze TrueNAS, every NFS mount and the
+control-plane VM until the host was rebooted.
+
 ## Provisioning from the VM
 
 Off by default while the Mac stack is live. Three `vm.env` flags switch it on
