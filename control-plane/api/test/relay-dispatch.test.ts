@@ -8,6 +8,7 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
+import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
@@ -633,7 +634,7 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       );
 
       const decision = await dispatchUpdate(
-        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587" },
+        fix.pool, joinUpdate(chatId), undefined, undefined, { id: "8463178587", username: "Kinerary_bot" },
       );
       assert.equal(decision.kind, "group_intro");
       if (decision.kind !== "group_intro") return;
@@ -644,6 +645,55 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       assert.match(decision.text, /07:30/);
       // It is already in the group; offering an add-to-group link would be absurd.
       assert.doesNotMatch(decision.text, /startgroup/);
+      // Reported live, 2026-09-14: this call site read companion_intro but never
+      // passed botUsername or login_usernames through to groupIntroText, so the
+      // real message silently lost the @mention trigger and fell back to the
+      // "log in with your name" line even though per-person usernames existed.
+      assert.match(decision.text, /@Kinerary_bot/);
+    });
+  });
+
+  test("the group message names botUsername and every traveller's login, not just the password", async () => {
+    // Same gap as above, the OTHER call site: a `/group <token>` command
+    // posted in a not-yet-bound group, which is the path a real organizer
+    // actually uses (they add the bot, then paste the token). No test at all
+    // exercised this rendering before; companionIntroFacts's data was correct,
+    // dispatch.ts's group_bound branch just never read botUsername/
+    // login_usernames off it.
+    await withFixture(async (fix) => {
+      const chatId = "-1002000999";
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({
+          assistant_name: "Rio",
+          trip_title: "Japan 2026",
+          private_url: "https://japan-2026.example",
+          language: "en",
+          login_password: "seed-pw",
+          login_usernames: [{ name: "Dana", username: "dana" }, { name: "Omri", username: "omri" }],
+        })],
+      );
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "77", { ttlSeconds: 3600 });
+      assert.equal(issued.ok, true);
+      if (!issued.ok) return;
+      const tokenMessage = {
+        update_id: 92,
+        message: {
+          message_id: 8,
+          chat: { id: chatId, type: "supergroup" },
+          from: { id: 77, is_bot: false, first_name: "Dror" },
+          text: `/group ${issued.token}`,
+        },
+      } as never;
+
+      const decision = await dispatchUpdate(
+        fix.pool, tokenMessage, undefined, undefined, { id: "8463178587", username: "Kinerary_bot" },
+      );
+      assert.equal(decision.kind, "group_intro");
+      if (decision.kind !== "group_intro") return;
+      assert.match(decision.text, /@Kinerary_bot/);
+      assert.match(decision.text, /Dana .+ dana/);
+      assert.match(decision.text, /Omri .+ omri/);
     });
   });
 

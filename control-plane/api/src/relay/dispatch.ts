@@ -35,6 +35,7 @@ import {
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
+  companionIntroLoginUsernames,
   resolveTripPerson,
 } from "../chat-router.js";
 import { isAddressedToAssistant } from "./addressing.js";
@@ -337,6 +338,8 @@ export async function dispatchUpdate(
           siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
           language: facts.language === "he" ? "he" : "en",
           loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          loginUsernames: companionIntroLoginUsernames(facts),
+          botUsername: botIdentity.username,
           organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
           proactive: (facts.proactive as never) ?? null,
         },
@@ -466,6 +469,8 @@ export async function dispatchUpdate(
           siteUrl: typeof facts.private_url === "string" ? facts.private_url : "",
           language: facts.language === "he" ? "he" : "en",
           loginPassword: typeof facts.login_password === "string" ? facts.login_password : null,
+          loginUsernames: companionIntroLoginUsernames(facts),
+          botUsername: botIdentity.username,
           organizerName: typeof facts.organizer === "string" ? facts.organizer : null,
           proactive: (facts.proactive as never) ?? null,
         },
