@@ -1,0 +1,382 @@
+# compose.vm.yml — the control plane on the Proxmox VM `kinerary-cp` (VMID 110).
+#
+# Derived from compose.local.yml, with every developer-machine assumption taken
+# out: no dev `dist/` or worker-source overlays (the VM runs the images it
+# built), no /Users paths, no Docker Desktop `host.docker.internal`.
+#
+# Services: postgres, migrate, api, worker, relay, interview-mcp, hermes.
+#
+# Run from control-plane/deployment/ on the VM, env files in this order (later
+# wins, so vm.env overrides the shared provisioning.env):
+#
+#   sudo docker compose -f compose.vm.yml \
+#     --env-file /opt/kinerary-deploy/provisioning.env \
+#     --env-file /opt/kinerary-deploy/vm.env up -d --wait
+#
+# Provisioning is OFF unless vm.env turns it on. While the Mac stack is live the
+# VM's worker must not provision: IP allocation is a scan of this deploy root's
+# own topology files (compute.py _ips_already_claimed), so it cannot see trips
+# the Mac worker creates, and both workers edit the same RPi4 cloudflared config.
+name: kinerary-cp
+
+x-api-image: &api-image
+  image: kinerary-cp/api:${KINERARY_REV:?set KINERARY_REV in vm.env}
+  build:
+    context: ../..
+    dockerfile: control-plane/api/Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kinerary_control_plane
+      POSTGRES_USER: kinerary_control_plane
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - control_plane_postgres_data:/var/lib/postgresql/data
+    # Loopback only, never the LAN. The relay (A5b) runs with host networking
+    # and reads the database directly, so it needs a host address; nothing off
+    # the VM does. On the Mac this was 0.0.0.0:5433 — this is tighter.
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kinerary_control_plane -d kinerary_control_plane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [private]
+
+  migrate:
+    <<: *api-image
+    command: ["node", "dist/migrate.js"]
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      CONTROL_PLANE_MIGRATIONS_DIR: /app/migrations
+    secrets: [control_plane_database_url]
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [private]
+
+  api:
+    <<: *api-image
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      CONTROL_PLANE_CHAT_ROUTING_KEY: ${CONTROL_PLANE_CHAT_ROUTING_KEY:-}
+      CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:-}
+      # Unlike compose.local.yml there is no default of 1 here: a deployment
+      # only ever selects a manifest-backed, digest-verified release.
+      CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-}
+      # startSession is reachable here too (POST /v1/interview), not only
+      # through the router. Without this a session started that way lands on
+      # the agent path, and this VM has no Hermes to answer it.
+      INTERPRET_PATH_DEFAULT: ${INTERPRET_PATH_DEFAULT:-}
+    # telegram_creds and trip_bot_creds are one file on purpose (see the secrets
+    # block): identical refs are how the api stands its approval poller down in
+    # favour of the relay's single getUpdates loop.
+    secrets: [control_plane_database_url, telegram_creds, approval_signing_key, telegram_webhook_secret, telegram_super_admin_chat_id, trip_bot_creds]
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    # Loopback by default, the same posture as the Mac. Reach it from another
+    # machine with `ssh -L 4310:127.0.0.1:4310`; widening it is a vm.env change.
+    ports:
+      - "${CONTROL_PLANE_BIND_IP:-127.0.0.1}:4310:4310"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4310/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [ingress, private]
+
+  worker:
+    image: kinerary-cp/worker:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    build:
+      context: ../..
+      dockerfile: control-plane/worker/Dockerfile
+    # root for the same two reasons as compose.local.yml: deploy.sh hardcodes
+    # $HOME/.ssh/id_ed25519_proxmox_hermes, and the mounted keys are 0600 root.
+    user: root
+    command: ["python", "-m", "control_plane_worker", "provision", "--poll-seconds", "10"]
+    environment:
+      HOME: /root
+      CONTROL_PLANE_DATABASE_URL_FILE: /run/secrets/control_plane_database_url
+      PROVISIONER_DEPLOY_ROOT: ${PROVISIONER_DEPLOY_ROOT:-}
+      REPO_ROOT: ${REPO_ROOT:-}
+      PROVISIONER_VMID_MAP: ${PROVISIONER_VMID_MAP:-}
+      PROVISIONER_COMPANION_TEMPLATES_DIR: ${PROVISIONER_COMPANION_TEMPLATES_DIR:-}
+      # Companion and MCP bridge default OFF here, unlike compose.local.yml,
+      # until a provisioning run on this VM is coordinated with the Mac's (A6).
+      # Both go over the companion SSH forced command to this VM's `hermes` user;
+      # on Linux, companion-install-host.sh starts the gateway as an s6 slot in
+      # the Hermes container instead of a launchd plist.
+      PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-0}
+      PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-0}
+      # Companion host = this VM, reached from the container as
+      # host.docker.internal (extra_hosts below). The key is VM-only — it never
+      # authorizes into the Mac — and ~hermes/.ssh/authorized_keys pins it to one
+      # forced command, scripts/companion-install-host.sh, the same trust
+      # boundary as on the Mac. The host key is pinned, not trusted on first use.
+      PROVISIONER_COMPANION_SSH_HOST: ${PROVISIONER_COMPANION_SSH_HOST:-}
+      PROVISIONER_COMPANION_SSH_USER: ${PROVISIONER_COMPANION_SSH_USER:-}
+      PROVISIONER_COMPANION_SSH_KEY: ${PROVISIONER_COMPANION_SSH_KEY:-}
+      PROVISIONER_COMPANION_SSH_KNOWN_HOSTS: ${PROVISIONER_COMPANION_SSH_KNOWN_HOSTS:-}
+      PROVISIONER_COMPUTE_ENABLED: ${PROVISIONER_COMPUTE_ENABLED:-}
+      PROXMOX_NODE: ${PROXMOX_NODE:-}
+      PROXMOX_STORAGE: ${PROXMOX_STORAGE:-}
+      PROXMOX_BRIDGE: ${PROXMOX_BRIDGE:-}
+      PROXMOX_LXC_TEMPLATE: ${PROXMOX_LXC_TEMPLATE:-}
+      PROXMOX_GATEWAY: ${PROXMOX_GATEWAY:-}
+      PROXMOX_NAMESERVER: ${PROXMOX_NAMESERVER:-}
+      PROXMOX_HOST: ${PROXMOX_HOST:-}
+      PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-}
+      PROXMOX_SSH_KEY: /root/.ssh/id_ed25519_proxmox_hermes
+      RPI_HOST: ${RPI_HOST:-}
+      RPI_SSH_USER: ${RPI_SSH_USER:-}
+      RPI_SSH_KEY: /root/.ssh/id_ed25519_rpi4_hermes
+      PROVISIONER_LXC_IP_POOL: ${PROVISIONER_LXC_IP_POOL:-}
+      PROVISIONER_LXC_HOSTNAME_DOMAIN: ${PROVISIONER_LXC_HOSTNAME_DOMAIN:-}
+      PROVISIONER_LXC_TUNNEL_ID: ${PROVISIONER_LXC_TUNNEL_ID:-}
+      PROVISIONER_SEED_PASSWORD: ${PROVISIONER_SEED_PASSWORD:-}
+      CONTROL_PLANE_OPERATOR_CHAT_ID: ${CONTROL_PLANE_OPERATOR_CHAT_ID:-}
+      NPM_URL: ${NPM_URL:-}
+      NPM_API_TOKEN: ${NPM_API_TOKEN:-}
+      NPM_IDENTITY: ${NPM_IDENTITY:-}
+      NPM_SECRET: ${NPM_SECRET:-}
+      CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+    volumes:
+      - ${KINERARY_DEPLOY_ROOT_HOST:-/opt/kinerary-deploy}:/deploy-root
+      - ${KINERARY_REPO_HOST:-/opt/kinerary}:/repo:ro
+      - /root/.ssh/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
+      - /root/.ssh/id_ed25519_rpi4_hermes:/root/.ssh/id_ed25519_rpi4_hermes:ro
+      # Pinned on the VM with ssh-keyscan when it was built, so the worker
+      # verifies Proxmox and the RPi4 instead of trusting first use.
+      - /root/.ssh/known_hosts:/root/.ssh/known_hosts:ro
+      - /root/.ssh/id_ed25519_kinerary_companion_vm:/root/.ssh/id_ed25519_kinerary_companion:ro
+      - /root/.ssh/known_hosts_companion_vm:/root/.ssh/known_hosts_companion:ro
+    # Docker Desktop defines host.docker.internal; Linux does not.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    secrets: [control_plane_database_url]
+    healthcheck:
+      test: ["CMD", "python", "-m", "control_plane_worker", "check-database"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [private]
+
+  # The router: "the only getUpdates loop on the shared trip bot, and the bot
+  # token itself" (relay/server.ts). Hermes never owns the bot; its gateways are
+  # this process's WebSocket clients.
+  #
+  # Host networking, deliberately. relay.bind_host is schema-pinned to loopback
+  # (config.ts) because the socket sends as the bot, and its gateway clients
+  # (Hermes, A4) run on this host's loopback. Off the compose network it cannot
+  # resolve `postgres`, so its database secret is the host-addressable twin of
+  # the same URL, reaching the loopback-published port above.
+  relay:
+    image: kinerary-cp/agent-runtime:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    command: ["node", "dist/relay/server.js"]
+    network_mode: host
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      # The interview runs here, agentless: the router reaches startSession, and
+      # the interpret path shells out to the CLI model-runner.ts names. `:?`
+      # makes a missing value fail `up` rather than silently bringing the agent
+      # back — the same line scripts/relay-restart.sh draws on the Mac.
+      INTERPRET_PATH_DEFAULT: ${INTERPRET_PATH_DEFAULT:?INTERPRET_PATH_DEFAULT must be set}
+      INTERPRET_RUNNER: ${INTERPRET_RUNNER:?INTERPRET_RUNNER must be set}
+      INTERPRET_MODEL: ${INTERPRET_MODEL:-}
+      EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
+      EXTRACT_MODEL: ${EXTRACT_MODEL:-}
+      CODEX_HOME: /codex
+      # Empty = api.telegram.org. The e2e runner's automated organizer points it
+      # at a loopback Telegram stand-in through vm-relay-restart.sh, and puts it
+      # back in a `finally`; the relay accepts https, or http to loopback only.
+      TELEGRAM_API_ROOT: ${TELEGRAM_API_ROOT:-}
+      # The CLI's own config dir, holding ONLY {"effortLevel": "xhigh"}. On the Mac
+      # every `claude -p` loads ~/.claude/settings.json — Dror's personal
+      # effortLevel: xhigh — and interpretation quality turned out to depend on it
+      # (2026-09-11: at default effort the VM mapped answers to the wrong question).
+      # Explicit here so this VM matches the Mac on purpose, not by inheritance.
+      CLAUDE_CONFIG_DIR: /home/node/.claude-config
+    # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
+    # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
+    # rotating state (codex and anthropic OAuth are each logged into separately:
+    # two holders of one refresh token lock each other out). Root-only files.
+    env_file:
+      - path: /opt/agent-auth/claude.env
+      - path: /opt/agent-auth/openrouter.env
+        required: false
+    volumes:
+      - /opt/agent-auth/codex:/codex
+      - /opt/agent-auth/claude-config:/home/node/.claude-config
+    secrets:
+      - source: control_plane_database_url_host
+        target: control_plane_database_url
+      - telegram_creds
+      - trip_bot_creds
+      - relay_gateway_secret
+      # The relay's bot is also the signup bot, so it subsumes the api's
+      # approval poller (relay.subsumes_approval_poller) and resolves the whole
+      # signup block. On the Mac the relay-host profile reads every file in
+      # .local-secrets/, which is why these were never listed anywhere; in a
+      # container only what is mounted exists, and the relay exits
+      # relay.start_failed without them.
+      - approval_signing_key
+      - telegram_super_admin_chat_id
+      - telegram_webhook_secret
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # The interview MCP sidecar: the *_for_chat tools the trip-intake gateway
+  # registers. Host networking because interview-mcp.ts binds 127.0.0.1
+  # unconditionally, and its one caller — the Hermes gateway — is on this host's
+  # loopback. Same image as the relay, and no docker socket: with
+  # EXTRACT_RUNNER=claude its extract tool goes through model-runner's claude
+  # CLI, and consular/venue lookups shell out to `hermes` only when a
+  # HERMES_*_PROFILE is set, which it is not (here or on the Mac).
+  #
+  # INTERVIEW_MCP_KEY is what trip-intake presents as X-API-Key (its config.yaml,
+  # line under mcp_servers.interview). CONTROL_PLANE_INTERVIEW_AGENT_KEY is the
+  # api<->sidecar pair; one name on both sides so a half-set pair cannot exist.
+  # Both VM-only, in vm.env.
+  # Companion control — the one narrow way a trip's companion reaches the
+  # control plane: renaming itself, so the router hears the new name
+  # (companion-mcp.ts). Loopback only, host network like the relay, and
+  # authenticated with the relay's own gateway-token format, verified against
+  # the relay's gateway secret — a companion can only act on the trip its
+  # profile serves, and no new secret exists for it.
+  companion-mcp:
+    image: kinerary-cp/api:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    command: ["node", "dist/companion-mcp.js"]
+    network_mode: host
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      COMPANION_MCP_PORT: "4313"
+    secrets:
+      - source: control_plane_database_url_host
+        target: control_plane_database_url
+      - relay_gateway_secret
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  interview-mcp:
+    image: kinerary-cp/agent-runtime:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    command: ["node", "dist/interview-mcp.js"]
+    network_mode: host
+    environment:
+      CONTROL_PLANE_API_BASE_URL: http://127.0.0.1:4310
+      INTERVIEW_MCP_PORT: "4311"
+      INTERVIEW_MCP_KEY: ${INTERVIEW_MCP_KEY:?INTERVIEW_MCP_KEY must be set}
+      CONTROL_PLANE_INTERVIEW_AGENT_KEY: ${CONTROL_PLANE_INTERVIEW_AGENT_KEY:?CONTROL_PLANE_INTERVIEW_AGENT_KEY must be set}
+      EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
+      EXTRACT_MODEL: ${EXTRACT_MODEL:-}
+      CODEX_HOME: /codex
+      CLAUDE_CONFIG_DIR: /home/node/.claude-config
+    env_file:
+      - path: /opt/agent-auth/claude.env
+      - path: /opt/agent-auth/openrouter.env
+        required: false
+    volumes:
+      - /opt/agent-auth/codex:/codex
+      - /opt/agent-auth/claude-config:/home/node/.claude-config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Hermes — the AI runtime, built from the fork's own Dockerfile at a pinned
+  # revision (HERMES_REV; the source tree records it in /opt/hermes-src/.hermes-rev).
+  # Kinerary profiles only — trip-intake and kinerary-extract — staged from the
+  # Mac with every bot token and provider key stripped and no gateway_state.json,
+  # so nothing auto-starts from inherited intent. Never copy other profiles or the
+  # global ~/.hermes/.env here: they poll other live bots directly, and the
+  # container auto-starts any profile whose last state was "running".
+  #
+  # The relay owns every bot; Hermes gateways are its WebSocket clients. Host
+  # networking because the relay binds loopback only (config.ts) and gateways
+  # reach it at 127.0.0.1:4312.
+  #
+  # No /var/run/docker.sock, deliberately: it would hand the AI runtime root over
+  # every container on this VM, the control plane included — the opposite of the
+  # k3s plan's rule that Hermes gets no authority over runtime resources. The
+  # terminal toolset (compatibility ledger C12) stays off for Kinerary profiles.
+  #
+  # `sleep infinity` as the main process, not the fork's legacy `gateway run`:
+  # that command seeds the DEFAULT gateway as running (hermes_cli/container_boot.py)
+  # and this deployment has none. Every gateway is an s6 slot, started with
+  # `hermes -p <profile> gateway start`, which records the intent that brings it
+  # back on the next boot.
+  hermes:
+    image: kinerary-cp/hermes:${HERMES_REV:?set HERMES_REV in vm.env}
+    container_name: hermes
+    network_mode: host
+    command: ["sleep", "infinity"]
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+    volumes:
+      - /opt/hermes-data:/opt/data
+    depends_on:
+      relay:
+        condition: service_started
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ./.local-secrets/postgres_password
+  control_plane_database_url:
+    file: ./.local-secrets/control_plane_database_url
+  telegram_creds:
+    file: ./.local-secrets/telegram_creds
+  approval_signing_key:
+    file: ./.local-secrets/approval_signing_key
+  telegram_webhook_secret:
+    file: ./.local-secrets/telegram_webhook_secret
+  telegram_super_admin_chat_id:
+    file: ./.local-secrets/telegram_super_admin_chat_id
+  # Same file as telegram_creds — one bot, two roles. See compose.local.yml.
+  trip_bot_creds:
+    file: ./.local-secrets/telegram_creds
+  relay_gateway_secret:
+    file: ./.local-secrets/relay_gateway_secret
+  # The relay's view of the same database, through 127.0.0.1:5433.
+  control_plane_database_url_host:
+    file: ./.local-secrets/control_plane_database_url_host
+
+configs:
+  architecture_profile:
+    file: ../config/architecture.local.example.json
+
+volumes:
+  control_plane_postgres_data:
+
+networks:
+  ingress: {}
+  private: {}

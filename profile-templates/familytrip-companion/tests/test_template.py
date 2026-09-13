@@ -14,6 +14,18 @@ class Tests(unittest.TestCase):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['interview']['organizer_private']['bot_token']='x'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertNotEqual(c.returncode,0); self.assertIn('secret-like key',c.stderr)
  def test_raw_intake_rejected(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['interview']['raw_intake']={'answer':'x'}; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertNotEqual(c.returncode,0); self.assertIn('raw intake must remain outside',c.stderr)
+ def test_soul_states_the_assigned_gender(self):
+  # The bug this covers: gender reached group-context.json and nothing else,
+  # so the assistant inferred its own from how its name sounds — wrong in
+  # every Hebrew first-person sentence. Asserted per value, not once, because
+  # a hardcoded sentence in the template would pass a single-gender check.
+  for gender,expected,forbidden in [('male','**masculine**','**feminine**'),('female','**feminine**','**masculine**'),('neutral','avoid gendering yourself','**masculine**')]:
+   d=json.loads((ROOT/'example.handoff.json').read_text()); d['assistant']['gender']=gender
+   td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+   soul=(o/'SOUL.md').read_text()
+   self.assertIn(expected,soul,gender); self.assertNotIn(forbidden,soul,gender)
+   self.assertIn('assigned, never inferred',soul,gender)
+   self.assertIn(d['assistant']['name'],soul.split('assigned, never inferred')[1][:400],gender)
  def test_profile_description_is_yaml_safe(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['profile']['description']='A trip: "quoted"'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr); self.assertIn('description: "A trip: \\"quoted\\""',(o/'profile.yaml').read_text())
 if __name__=='__main__': unittest.main()

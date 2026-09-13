@@ -22,3 +22,16 @@ mcp_servers:
     connect_timeout: 60
     headers:
       X-API-Key: <INTERVIEW_MCP_KEY>
+
+
+# Suppresses a Hermes housekeeping notice that otherwise reaches the organizer
+# directly on Telegram — an upstream gap, not something wrong with our own
+# config. Hermes's own _TELEGRAM_NOISY_STATUS_RE already filters the sibling
+# "auto-LOWERED compression threshold" notice from messaging platforms; the
+# "auto-compaction was RAISED" one uses different wording and is not covered
+# by that regex, so it goes through unfiltered. This turns off just the
+# notice — the underlying autoraise behavior (more context budget before
+# summarizing) is left on. Found live 2026-09-05: "ℹ Codex gpt-5.6-luna caps
+# context at 272K, so auto-compaction was raised..." reached the organizer.
+compression:
+  codex_gpt55_autoraise_notice: false

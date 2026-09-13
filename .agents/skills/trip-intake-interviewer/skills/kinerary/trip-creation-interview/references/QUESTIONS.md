@@ -12,13 +12,11 @@ Question IDs, types and requiredness below match `INTAKE_QUESTIONS` in the contr
 
 Where the trip goes. City, region, or country — whatever the organizer naturally says first is fine; you don't need to press for a more specific answer than they're ready to give.
 
-## group_size — required, choice
+## headcount and trip length — no longer asked
 
-A rough headcount band (2 / 3–5 / 6–10 / 10+) is enough here — the exact roster comes later in `travelers`. If they give an exact number, map it to the right band or use "other" with the literal number.
+There is deliberately no `group_size` or `trip_duration` question. Both are derived from answers you collect anyway: the headcount is counted off the `travelers` roster, and the length is the gap between `departure_date` and `return_date`.
 
-## trip_duration — required, choice
-
-A rough length (weekend / about a week / two weeks / a month or more) if exact dates aren't known yet. If they *do* know exact dates, you don't need to labor over this — a quick "sounds like about two weeks" and move on to the precise dates below.
+Don't reintroduce them conversationally either. Asking "how many people?" right before "who's coming?" reads as not listening, and a real organizer said so — the two answers can also disagree, and the roster is the one with names in it. If someone volunteers "there'll be about eight of us", treat it as context for the roster question, not as an answer to record.
 
 ## departure_date / return_date — both required, text
 
@@ -40,6 +38,34 @@ Submit as:
 ]
 ```
 `age` is optional per traveler if genuinely unknown — omit the field rather than guessing. `family` should be a short household/family label shared by everyone in that group (e.g. two spellings of the same family name should match exactly, since it's used to group people on the site).
+
+**If the names aren't written in Latin script, transliterate them yourself** and submit your spelling as `name_en` (and `family_en` for the household label). Do **not** ask the organizer to write the names out again in English — they just typed the whole list once, and asking for it a second time in another script is the same work twice. Transliterate, submit, and show what you chose in the same message that confirms what you recorded, so a correction costs one word:
+
+> רשמתי — איתן (52), נועה (19), משפחת שגיא. באנגלית כתבתי Eitan, Noa, Sagi — תקנו אותי אם מישהו כותב את שמו אחרת.
+
+Then keep going. This is an offer to correct, not a question to wait on: answers overwrite, so if the organizer comes back with "it's Sagie" three messages later, re-submit `travelers` with the fix. Each person's `username` is derived from the Latin spelling, so a missing one leaves the site showing the family a name they won't recognise as themselves — and a spelling nobody objected to is a much better default than none at all.
+
+If the organizer **does** give a spelling, take it exactly as given: a person's own transliteration of their name is not something to correct or standardise, and yours does not override theirs.
+
+```json
+[
+  { "name": "איתן", "name_en": "Eitan", "age": 52, "family": "שגיא", "family_en": "Sagi" }
+]
+```
+
+## planning_help — optional, text
+
+What the organizer would like help planning *after* setup — days they haven't
+worked out, places they're unsure about, bookings still to make.
+
+Ask it near the end, once the structure is settled, and keep it light: it is
+explicitly optional and must not hold up confirmation. Do **not** start
+planning with them here — this interview is for structure, and the trip
+assistant does the day-to-day planning once the site exists. Recording the ask
+is the whole job.
+
+Their answer becomes a standing instruction on the trip assistant, so it picks
+this up on its first turn rather than the organizer having to say it twice.
 
 ## phases — required, structured (array)
 

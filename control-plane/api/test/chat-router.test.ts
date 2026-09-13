@@ -1,0 +1,639 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { applyMigrations } from "../src/migrations.js";
+import { issueEnrollment } from "../src/enrollment.js";
+import { confirmIntake, submitAnswer, INTAKE_QUESTIONS } from "../src/interview.js";
+import { askText, uiString } from "../src/intake-copy.js";
+import {
+  answerCallbackData,
+  callbackDataFits,
+  CONFIRM_CALLBACK_DATA,
+  findQuestion,
+  KEEP_PLANNING_CALLBACK_DATA,
+  parseCallbackData,
+  parseInbound,
+  renderConfirmPrompt,
+  renderDocumentOffer,
+  renderQuestion,
+  resolveChatRoute,
+  startFromDeepLink,
+} from "../src/chat-router.js";
+import { testDatabaseUrl } from "./support/test-database.js";
+
+// ── Pure decision logic — no database required ───────────────────────────────
+
+describe("parseInbound", () => {
+  test("extracts a deep-link payload from /start", () => {
+    assert.deepEqual(parseInbound("/start abc123_-XY"), { kind: "start", payload: "abc123_-XY" });
+  });
+
+  test("strips the @botusername Telegram appends in group chats", () => {
+    assert.deepEqual(parseInbound("/start@kinerary_bot abc123"), { kind: "start", payload: "abc123" });
+  });
+
+  test("a bare /start is a start with no payload, not a rejection", () => {
+    // The user tapped Telegram's own Start button. That is a real entry point
+    // and needs its own reply, so it must stay distinguishable here.
+    assert.deepEqual(parseInbound("/start"), { kind: "start", payload: null });
+    assert.deepEqual(parseInbound("/start@kinerary_bot"), { kind: "start", payload: null });
+  });
+
+  test("a payload outside Telegram's deep-link alphabet is treated as absent", () => {
+    for (const bad of ["/start not a token", "/start ../../etc/passwd", "/start tok;DROP TABLE trips"]) {
+      assert.deepEqual(parseInbound(bad), { kind: "start", payload: null }, bad);
+    }
+  });
+
+  test("a payload longer than Telegram's 64-char limit is treated as absent", () => {
+    assert.deepEqual(parseInbound(`/start ${"a".repeat(65)}`), { kind: "start", payload: null });
+    const atLimit = "a".repeat(64);
+    assert.deepEqual(parseInbound(`/start ${atLimit}`), { kind: "start", payload: atLimit });
+  });
+
+  test("other commands are classified as commands, not text", () => {
+    assert.deepEqual(parseInbound("/select"), { kind: "command", name: "select" });
+    assert.deepEqual(parseInbound("/HELP"), { kind: "command", name: "help" });
+  });
+
+  test("ordinary conversation is text", () => {
+    assert.deepEqual(parseInbound("  we want to go in July  "), { kind: "text", text: "we want to go in July" });
+  });
+
+  test("a message that merely mentions /start is text, not a command", () => {
+    assert.deepEqual(parseInbound("what does /start do?"), { kind: "text", text: "what does /start do?" });
+  });
+});
+
+describe("callback data", () => {
+  test("round-trips a question/option pair", () => {
+    const data = answerCallbackData("trip_type", "group_of_families");
+    assert.deepEqual(parseCallbackData(data), {
+      kind: "answer",
+      questionId: "trip_type",
+      optionId: "group_of_families",
+    });
+  });
+
+  test("recognises the confirm pair", () => {
+    assert.deepEqual(parseCallbackData(CONFIRM_CALLBACK_DATA), { kind: "confirm" });
+    assert.deepEqual(parseCallbackData(KEEP_PLANNING_CALLBACK_DATA), { kind: "keep_planning" });
+  });
+
+  test("rejects malformed or injected callback data", () => {
+    for (const bad of ["", "a:", "a:only_one_part", "a:q:o:extra", "a:q:o'; DROP TABLE", "totally-unknown"]) {
+      assert.deepEqual(parseCallbackData(bad), { kind: "unknown" }, JSON.stringify(bad));
+    }
+  });
+
+  test("every real intake option fits Telegram's 64-byte callback_data limit", () => {
+    // renderQuestion drops an option that would not fit, so a question whose
+    // ids grew past the limit would silently lose a button. Catch it here.
+    for (const question of INTAKE_QUESTIONS) {
+      for (const option of question.options ?? []) {
+        const data = answerCallbackData(question.id, option.id);
+        assert.ok(callbackDataFits(data), `${data} exceeds 64 bytes`);
+      }
+    }
+  });
+});
+
+describe("renderQuestion", () => {
+  const choiceQuestion = INTAKE_QUESTIONS.find((q) => q.type === "choice" && (q.options?.length ?? 0) > 0);
+
+  test("a choice question renders one button per option", () => {
+    assert.ok(choiceQuestion, "expected at least one choice question in the intake set");
+    const rendered = renderQuestion(choiceQuestion);
+    assert.ok(rendered.replyMarkup, "choice question should carry a keyboard");
+    assert.equal(rendered.replyMarkup.inline_keyboard.length, choiceQuestion.options?.length);
+    for (const row of rendered.replyMarkup.inline_keyboard) {
+      assert.equal(row.length, 1, "one option per row");
+      assert.ok(callbackDataFits(row[0].callback_data));
+    }
+  });
+
+  test("the options are not also echoed into the message text", () => {
+    // Flagged twice in the live signup run: a list beside the buttons brings
+    // back the "am I supposed to type this?" ambiguity the buttons remove.
+    assert.ok(choiceQuestion);
+    const rendered = renderQuestion(choiceQuestion);
+    assert.equal(rendered.text, choiceQuestion.prompt);
+    for (const option of choiceQuestion.options ?? []) {
+      assert.ok(
+        !rendered.text.includes(option.label),
+        `option label "${option.label}" leaked into the message text`,
+      );
+    }
+  });
+
+  test("a multi-select renders toggles, ticks what is chosen, and offers Done", () => {
+    // Before this the router refused multi_choice taps outright and left the
+    // question to the agent, whose `clarify` cannot draw a keyboard here — so
+    // dietary arrived as a numbered list with Hermes's "(Recommended)" stuck
+    // on the first option (2026-09-04 run 2).
+    const multi = INTAKE_QUESTIONS.find((q) => q.type === "multi_choice");
+    assert.ok(multi, "expected a multi_choice question in the intake set");
+    const chosen = multi.options![1]!.id;
+    const rendered = renderQuestion(multi, [chosen]);
+    assert.ok(rendered.replyMarkup);
+
+    const buttons = rendered.replyMarkup.inline_keyboard.flat();
+    const ticked = buttons.filter((b) => b.text.startsWith("✅"));
+    assert.equal(ticked.length, 1, "exactly the chosen option is ticked");
+    assert.ok(ticked[0]!.callback_data.startsWith(`t:${multi.id}:${chosen}`));
+    // A toggle must never be recorded as a whole answer: `a:` would replace
+    // the set with one option and silently drop every other selection.
+    assert.ok(
+      buttons.every((b) => !b.callback_data.startsWith(`a:${multi.id}:`)),
+      "multi-select options are toggles, not answers",
+    );
+    assert.ok(buttons.some((b) => b.callback_data === `n:${multi.id}`), "and there is a Done");
+  });
+
+  test("optional questions carry Skip and 'That's everything'; required ones do not", () => {
+    // A question with no visible way out reads as required. That is how every
+    // optional question became mandatory-looking in run 2.
+    const optional = INTAKE_QUESTIONS.find((q) => !q.required && q.type === "choice");
+    const required = INTAKE_QUESTIONS.find((q) => q.required && q.type === "choice");
+    assert.ok(optional && required);
+
+    const optionalButtons = renderQuestion(optional).replyMarkup!.inline_keyboard.flat();
+    assert.ok(optionalButtons.some((b) => b.callback_data === `k:${optional.id}`), "Skip");
+    assert.ok(optionalButtons.some((b) => b.callback_data === "c:done"), "That's everything");
+
+    const requiredButtons = renderQuestion(required).replyMarkup!.inline_keyboard.flat();
+    assert.ok(
+      requiredButtons.every((b) => !b.callback_data.startsWith("k:") && b.callback_data !== "c:done"),
+      "a required question offers no way past it",
+    );
+  });
+
+  test("a required text question renders no keyboard, and shows organizer copy", () => {
+    const textQuestion = INTAKE_QUESTIONS.find((q) => q.type === "text" && q.required);
+    assert.ok(textQuestion, "expected a required text question in the intake set");
+    const rendered = renderQuestion(textQuestion);
+    assert.equal(rendered.replyMarkup, null, "nothing to tap on a free-text question");
+    // `prompt` is the interviewer's field spec. What a person reads is `ask`.
+    assert.equal(rendered.text, askText(textQuestion));
+  });
+
+  test("the interview opens by offering to read a document, in the right language", () => {
+    // The router split took this away by accident: the router asks the
+    // required questions itself now, so it got there first and the organizer's
+    // very first message became "what date does the trip start?" — with no
+    // hint that the PDF they already have would answer it (run 5).
+    const he = renderDocumentOffer("he");
+    assert.ok(he.text.includes("מסמך") || he.text.includes("תוכנית"), he.text);
+    const buttons = he.replyMarkup!.inline_keyboard.flat();
+    assert.equal(buttons.length, 1, "one way past it, and no way to answer a question yet");
+    assert.equal(buttons[0]!.callback_data, "c:nodoc");
+    assert.equal(buttons[0]!.text, "אין לי מסמך");
+
+    const en = renderDocumentOffer();
+    assert.notEqual(en.text, he.text, "and it is a real translation, not a fallback");
+  });
+
+  /**
+   * The opening has to earn the data it is about to ask for.
+   *
+   * It asks for children's names, dietary needs, dates, and booking
+   * confirmations with reference numbers on them. Someone handing that over is
+   * owed three answers first — who is asking, what happens to what they send,
+   * and what they get at the end — and for a long time the opening was one
+   * line about documents, which answers none of them.
+   *
+   * Asserted as four claims rather than a string match, so the wording stays
+   * free to improve and the promises cannot quietly go missing.
+   */
+  test("the opening introduces itself, says what happens to a document, and names the endgame", () => {
+    for (const language of ["he", "en"] as const) {
+      const { text } = renderDocumentOffer(language);
+
+      // 1. Who is asking.
+      assert.match(text, language === "he" ? /אני העוזר/ : /I'm the assistant/, language);
+
+      // 2. What it will ask about, and that it is a conversation, not a form.
+      assert.match(text, language === "he" ? /לא טופס/ : /isn't a form/, language);
+
+      // 3. What happens to what you send — used AND retrievable afterwards.
+      //    "You can have it back" is the difference between handing something
+      //    over and giving it away, and is the half most easily dropped.
+      assert.match(text, language === "he" ? /נשמר עם הטיול/ : /stays with your trip/, language);
+      assert.match(text, language === "he" ? /באתר הטיול/ : /on the trip site/, language);
+
+      // 4. The endgame, concretely: a site AND an assistant that joins the
+      //    family group. A promise of "something personalised" is not what
+      //    makes someone willing to type their family into a chat window.
+      assert.match(text, language === "he" ? /אתר טיול פרטי/ : /private trip website/, language);
+      assert.match(text, language === "he" ? /לקבוצה המשפחתית/ : /family group chat/, language);
+    }
+  });
+
+  test("the opening does not make the same offer twice", () => {
+    // The introduction already says what to send. Appending `documentOffer`
+    // after it repeated the whole invitation one paragraph later, which is how
+    // an opening starts reading as terms and conditions.
+    const { text } = renderDocumentOffer("he");
+    assert.equal(text.includes(uiString("documentOffer", "he")), false);
+  });
+
+  test("a question is drawn in the interview's language, buttons included", () => {
+    // A Hebrew interview used to get Hebrew from the agent and English from
+    // the router, alternating, inside the same conversation.
+    const dietary = INTAKE_QUESTIONS.find((q) => q.id === "dietary")!;
+    const he = renderQuestion(dietary, [], "he");
+    assert.equal(he.text, askText(dietary, "he"));
+    assert.notEqual(he.text, askText(dietary, "en"), "the Hebrew copy is actually different");
+    const labels = he.replyMarkup!.inline_keyboard.flat().map((b) => b.text);
+    assert.ok(labels.some((l) => l.includes("צמחוני")), labels.join(" | "));
+    assert.ok(labels.some((l) => l.includes("סיימתי")), "Done is translated too");
+    assert.ok(labels.some((l) => l.includes("דלג")), "and so is Skip");
+  });
+
+  test("an untranslated language falls back to English rather than blank", () => {
+    // A missing translation must degrade to a sentence in the wrong language.
+    // A blank message is not a smaller failure than an untranslated one.
+    const dietary = INTAKE_QUESTIONS.find((q) => q.id === "dietary")!;
+    const rendered = renderQuestion(dietary, [], "fr" as never);
+    assert.equal(rendered.text, askText(dietary, "en"));
+    assert.ok(rendered.replyMarkup!.inline_keyboard.flat().every((b) => b.text.trim() !== ""));
+  });
+});
+
+describe("renderConfirmPrompt", () => {
+  test("offers Confirm and Keep planning as buttons", () => {
+    const rendered = renderConfirmPrompt("Here is your trip so far.");
+    const [row] = rendered.replyMarkup!.inline_keyboard;
+    assert.equal(row.length, 2);
+    assert.deepEqual(
+      row.map((b) => b.callback_data),
+      [CONFIRM_CALLBACK_DATA, KEEP_PLANNING_CALLBACK_DATA],
+    );
+  });
+
+  test("does not ask the organizer to type the word CONFIRM", () => {
+    const rendered = renderConfirmPrompt("Here is your trip so far.");
+    assert.ok(!rendered.text.includes("CONFIRM"));
+  });
+});
+
+describe("findQuestion", () => {
+  test("resolves a known id and refuses an unknown one", () => {
+    assert.equal(findQuestion(INTAKE_QUESTIONS[0].id)?.id, INTAKE_QUESTIONS[0].id);
+    assert.equal(findQuestion("no_such_question"), null);
+  });
+});
+
+// ── Routing and the deep link — database required ───────────────────────────
+
+const databaseUrl = testDatabaseUrl();
+const SKIP = !databaseUrl;
+const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+
+function testId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString("hex")}`;
+}
+
+interface Fixture {
+  pool: pg.Pool;
+  tripId: string;
+  userId: string;
+}
+
+async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  try {
+    const userId = testId("user");
+    const tripId = testId("trip");
+    await pool.query(
+      "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'Owner')",
+      [userId],
+    );
+    await pool.query(
+      "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+      [tripId, tripId.replace(/_/g, "-")],
+    );
+    await pool.query(
+      "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+      [testId("memb"), tripId, userId],
+    );
+    await fn({ pool, tripId, userId });
+  } finally {
+    await pool.end();
+  }
+}
+
+async function issueToken(fix: Fixture): Promise<string> {
+  const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+  assert.ok(issued.ok, `enrollment issue failed: ${JSON.stringify(issued)}`);
+  return issued.token;
+}
+
+describe("resolveChatRoute (DB)", () => {
+  test("an unknown chat is unbound — fail closed", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      assert.deepEqual(await resolveChatRoute(fix.pool, "999000111"), { kind: "unbound" });
+    });
+  });
+
+  test("a chat with a live interview routes to that interview", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const token = await issueToken(fix);
+      const started = await startFromDeepLink(fix.pool, "555000111", token);
+      assert.equal(started.kind, "started");
+
+      const route = await resolveChatRoute(fix.pool, "555000111");
+      assert.equal(route.kind, "interview");
+      assert.equal(route.kind === "interview" && route.tripId, fix.tripId);
+    });
+  });
+
+  test("a chat bound with no companion yet resolves the trip, not 'unbound'", { skip: SKIP }, async () => {
+    // A4 (migration 0043). Routing and the assistant behind it are separate
+    // components. A binding with a NULL profile means "this chat belongs to
+    // this trip, and its assistant is not installed" — which must NOT collapse
+    // into `unbound`, because `unbound` makes the router answer "I don't have
+    // a trip for this chat". That sentence was told to a real organizer on
+    // 2026-09-06 about a trip that had provisioned perfectly.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, NULL)",
+        ["555000333", fix.tripId],
+      );
+      const route = await resolveChatRoute(fix.pool, "555000333");
+      assert.equal(route.kind, "companion", "the trip is known — this is not an unbound chat");
+      assert.equal(route.kind === "companion" && route.tripId, fix.tripId);
+      assert.equal(
+        route.kind === "companion" && route.hermesProfile, null,
+        "and the missing assistant is represented, not papered over",
+      );
+    });
+  });
+
+  test("a bound chat with no live interview routes to the companion", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["555000222", fix.tripId, "trip-companion-abc"],
+      );
+      const route = await resolveChatRoute(fix.pool, "555000222");
+      assert.equal(route.kind, "companion");
+      assert.equal(route.kind === "companion" && route.hermesProfile, "trip-companion-abc");
+    });
+  });
+
+  test("a live interview outranks a companion binding on the same chat", { skip: SKIP }, async () => {
+    // The organizer's DM is already bound to trip one; they start trip two
+    // from that same chat. Without this precedence the new interview could
+    // never take a turn — every message would go to the companion.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["555000333", fix.tripId, "trip-companion-first"],
+      );
+      const token = await issueToken(fix);
+      const started = await startFromDeepLink(fix.pool, "555000333", token);
+      assert.equal(started.kind, "started");
+
+      const route = await resolveChatRoute(fix.pool, "555000333");
+      assert.equal(route.kind, "interview");
+    });
+  });
+
+  test("confirming the interview hands the chat back to the companion", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ('tcb_' || md5(random()::text), $1, $2, $3)",
+        ["555000444", fix.tripId, "trip-companion-first"],
+      );
+      const token = await issueToken(fix);
+      const started = await startFromDeepLink(fix.pool, "555000444", token);
+      assert.equal(started.kind, "started");
+      const sessionToken = started.kind === "started" ? started : null;
+      assert.ok(sessionToken);
+
+      // Drive the session to confirmed directly: this test is about the
+      // routing flip, not about the answer validation covered elsewhere.
+      await fix.pool.query(
+        "UPDATE control_plane.intake_sessions SET state = 'confirmed' WHERE telegram_chat_id = $1",
+        ["555000444"],
+      );
+
+      const route = await resolveChatRoute(fix.pool, "555000444");
+      assert.equal(route.kind, "companion", "a confirmed session must stop outranking the binding");
+    });
+  });
+
+  test("one chat's interview is invisible to another chat", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const token = await issueToken(fix);
+      await startFromDeepLink(fix.pool, "555000555", token);
+      assert.deepEqual(await resolveChatRoute(fix.pool, "555000556"), { kind: "unbound" });
+    });
+  });
+});
+
+describe("startFromDeepLink (DB)", () => {
+  test("a valid token starts the interview and binds the chat", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const token = await issueToken(fix);
+      const outcome = await startFromDeepLink(fix.pool, "555000777", token);
+      assert.equal(outcome.kind, "started");
+      assert.equal(outcome.kind === "started" && outcome.tripId, fix.tripId);
+
+      const row = await fix.pool.query(
+        "SELECT telegram_chat_id FROM control_plane.intake_sessions WHERE trip_id = $1",
+        [fix.tripId],
+      );
+      assert.equal(row.rows[0].telegram_chat_id, "555000777");
+    });
+  });
+
+  test("the first question comes back with the session, so the reply needs no second call", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const token = await issueToken(fix);
+      const outcome = await startFromDeepLink(fix.pool, "555000778", token);
+      assert.equal(outcome.kind, "started");
+      assert.ok(outcome.kind === "started" && outcome.view.nextQuestion, "expected a first question");
+    });
+  });
+
+  test("a replayed deep link is rejected — the enrollment is single use", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const token = await issueToken(fix);
+      const first = await startFromDeepLink(fix.pool, "555000888", token);
+      assert.equal(first.kind, "started");
+
+      // A DIFFERENT chat replaying the same link must not get in, and must be
+      // left with no trip context at all.
+      const replay = await startFromDeepLink(fix.pool, "555000889", token);
+      assert.equal(replay.kind, "rejected");
+      assert.deepEqual(await resolveChatRoute(fix.pool, "555000889"), { kind: "unbound" });
+
+      // The reason is deliberately not pinned here. consumeEnrollmentInTx
+      // returns null for every non-issued state, so startSession reports
+      // INVALID_TOKEN for a consumed, revoked or unknown token alike. That is
+      // correct as security behavior — all three are refusals — but it means
+      // the router cannot yet tell an organizer "you already used that link"
+      // apart from "that link is not valid". Widening the taxonomy would
+      // change a reason code the HTTP and MCP paths also consume, so it is a
+      // deliberate follow-up, not a silent change made from here.
+    });
+  });
+
+  test("an unknown token is rejected without starting anything", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const outcome = await startFromDeepLink(fix.pool, "555000999", "notarealtoken");
+      assert.equal(outcome.kind, "rejected");
+      assert.equal(outcome.kind === "rejected" && outcome.reason, "INVALID_TOKEN");
+      assert.deepEqual(await resolveChatRoute(fix.pool, "555000999"), { kind: "unbound" });
+    });
+  });
+
+  test("an expired token is rejected", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 1 });
+      assert.ok(issued.ok);
+      await fix.pool.query(
+        "UPDATE control_plane.interview_enrollments SET expires_at = now() - interval '1 minute' WHERE id = $1",
+        [issued.enrollmentId],
+      );
+      const outcome = await startFromDeepLink(fix.pool, "555001000", issued.token);
+      assert.equal(outcome.kind, "rejected");
+    });
+  });
+
+  test("a bare /start with no payload is rejected, and consumes nothing", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const outcome = await startFromDeepLink(fix.pool, "555001100", null);
+      assert.equal(outcome.kind, "rejected");
+      assert.equal(outcome.kind === "rejected" && outcome.reason, "NO_PAYLOAD");
+    });
+  });
+
+  test("a second link in a chat already interviewing leaves that token unconsumed", { skip: SKIP }, async () => {
+    // The organizer taps an old link mid-interview. The running session must
+    // survive, and the untouched token must still work afterwards.
+    await withFixture(async (fix) => {
+      const first = await issueToken(fix);
+      const started = await startFromDeepLink(fix.pool, "555001200", first);
+      assert.equal(started.kind, "started");
+
+      const secondTripId = testId("trip");
+      await fix.pool.query(
+        "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+        [secondTripId, secondTripId.replace(/_/g, "-")],
+      );
+      await fix.pool.query(
+        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+        [testId("memb"), secondTripId, fix.userId],
+      );
+      const secondIssued = await issueEnrollment(fix.pool, fix.userId, secondTripId, {
+        enrollmentTtlSeconds: 3600,
+      });
+      assert.ok(secondIssued.ok);
+
+      const blocked = await startFromDeepLink(fix.pool, "555001200", secondIssued.token);
+      assert.equal(blocked.kind, "already_in_interview");
+
+      const state = await fix.pool.query(
+        "SELECT state FROM control_plane.interview_enrollments WHERE id = $1",
+        [secondIssued.enrollmentId],
+      );
+      assert.equal(state.rows[0].state, "issued", "the refused link must remain usable");
+    });
+  });
+
+  test("a group chat cannot start an interview, and the link survives", { skip: SKIP }, async () => {
+    // Telegram group ids are negative. An interview holds the organizer's own
+    // answers and its enrollment is scoped to one owner, so it must stay in a
+    // private DM; a group binds to a companion instead.
+    //
+    // The refusal has to come BEFORE the enrollment is consumed. interview.ts
+    // records a binding only for the private-chat shape, so letting the start
+    // through would burn a single-use link on a session no chat could reach.
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, {
+        enrollmentTtlSeconds: 3600,
+      });
+      assert.ok(issued.ok);
+
+      const outcome = await startFromDeepLink(fix.pool, "-1001234567890", issued.token);
+      assert.equal(outcome.kind, "rejected");
+      assert.equal(outcome.kind === "rejected" && outcome.reason, "NOT_PRIVATE_CHAT");
+
+      const sessions = await fix.pool.query(
+        "SELECT id FROM control_plane.intake_sessions WHERE trip_id = $1",
+        [fix.tripId],
+      );
+      assert.equal(sessions.rowCount, 0, "no session may be created for a group chat");
+
+      const state = await fix.pool.query(
+        "SELECT state FROM control_plane.interview_enrollments WHERE id = $1",
+        [issued.enrollmentId],
+      );
+      assert.equal(state.rows[0].state, "issued", "the link must still work in a DM");
+
+      assert.deepEqual(await resolveChatRoute(fix.pool, "-1001234567890"), { kind: "unbound" });
+
+      // And it really does still work, in the DM it was meant for.
+      const inDm = await startFromDeepLink(fix.pool, "555001300", issued.token);
+      assert.equal(inDm.kind, "started");
+    });
+  });
+});
+
+describe("resolveChatRoute — closed bindings", () => {
+  test("a closed binding stops routing entirely", { skip: SKIP }, async () => {
+    // Migration 0029 keeps closed bindings as history. An unfiltered read
+    // would keep routing the chat to the trip it was deliberately detached
+    // from — on a shared bot, that is another organizer's trip. This is the
+    // assertion that the `closed_at IS NULL` filter is actually present.
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile, closed_at, closed_reason)
+         VALUES ($1, $2, $3, $4, now(), 'organizer_reassigned')`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003000", fix.tripId, "companion-old"],
+      );
+
+      const route = await resolveChatRoute(fix.pool, "700003000");
+      assert.equal(route.kind, "unbound", "history must not route");
+    });
+  });
+
+  test("the open binding wins while a closed one for the same chat exists", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile, closed_at, closed_reason)
+         VALUES ($1, $2, $3, $4, now(), 'organizer_reassigned')`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003001", fix.tripId, "companion-old"],
+      );
+      await fix.pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings
+           (id, chat_id, trip_id, hermes_profile)
+         VALUES ($1, $2, $3, $4)`,
+        [`tcb_${randomBytes(16).toString("hex")}`, "700003001", fix.tripId, "companion-new"],
+      );
+
+      const route = await resolveChatRoute(fix.pool, "700003001");
+      assert.equal(route.kind, "companion");
+      assert.equal(
+        route.kind === "companion" ? route.hermesProfile : "",
+        "companion-new",
+        "the binding in force, not the one it replaced",
+      );
+    });
+  });
+});

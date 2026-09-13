@@ -4,6 +4,7 @@ import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonic
 import {
   INTAKE_QUESTIONS,
   INTAKE_SCHEMA_VERSION,
+  RETIRED_QUESTION_IDS,
   computeIntakeDigest,
   validateAnswer,
   type AnswerStore,
@@ -38,9 +39,21 @@ const CORRECTABLE_STATES = new Set([
 
 function normalizeCorrectionAnswers(input: Record<string, unknown>): AnswerStore | null {
   const known = new Set(INTAKE_QUESTIONS.map((q) => q.id));
-  if (Object.keys(input).some((id) => !known.has(id))) return null;
+  if (Object.keys(input).some((id) => !known.has(id) && !RETIRED_QUESTION_IDS.has(id))) return null;
 
   const normalized: AnswerStore = {};
+
+  // A retired question's stored answer is carried through untouched. There is
+  // no question definition left to validate it against, so it gets the one
+  // check that does not need one — it must still be a plain object, so a
+  // correction cannot smuggle an array or a scalar into the canonical record
+  // through an id the validator no longer covers.
+  for (const id of Object.keys(input)) {
+    if (!RETIRED_QUESTION_IDS.has(id)) continue;
+    const raw = input[id];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    normalized[id] = raw as AnswerStore[string];
+  }
   for (const question of INTAKE_QUESTIONS) {
     const raw = input[question.id];
     if (raw === undefined) {

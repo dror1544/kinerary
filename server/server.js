@@ -9,6 +9,9 @@ const path     = require('path');
 const crypto   = require('crypto');
 const Database = require('better-sqlite3');
 const { OAuth2Client } = require('google-auth-library');
+const livingJourney = require('./living-journey');
+const { createTripEvents } = require('./trip-events');
+const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
@@ -22,6 +25,35 @@ const app = express();
 app.use(express.json({ limit: '30mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+// Nginx must never serve documents directly: unlike images/scripts, a PDF,
+// DOCX, or Markdown file can contain confirmation numbers, passenger names,
+// PINs, or other trip-private material. In Docker this is the read-only
+// ./site mount; locally it resolves to the repository's site/ directory.
+const SITE_DIR = process.env.SITE_DIR || path.join(__dirname, '..', 'site');
+const CLASSIC_STATIC_FILES = new Map([
+  ['/classic.html', 'classic.html'],
+  ['/trivia.html', 'trivia.html'],
+  ['/app.js', 'app.js'],
+  ['/styles.css', 'styles.css'],
+  ['/translations.js', 'translations.js'],
+  ['/runtime-base.js', 'runtime-base.js'],
+  ['/manifest.json', 'manifest.json'],
+  ['/apple-wallet-badge.svg', 'apple-wallet-badge.svg'],
+  ['/google-wallet-badge.svg', 'google-wallet-badge.svg'],
+  ['/brand/favicon.svg', 'brand/favicon.svg'],
+  ['/brand/kinerary-icon.svg', 'brand/kinerary-icon.svg'],
+  ['/brand/logo.svg', 'brand/logo.svg'],
+  ['/brand/logo-reversed.svg', 'brand/logo-reversed.svg'],
+  ['/brand/mark.svg', 'brand/mark.svg'],
+]);
+for (const [route, relativeFile] of CLASSIC_STATIC_FILES) {
+  app.get(route, (_req, res) => res.sendFile(path.join(SITE_DIR, relativeFile)));
+}
+// The root is the variant loader and Modern is a bundled SPA.  These routes
+// are deliberately registered before API handlers but only match their exact
+// static prefixes, so gateway-prefixed API traffic keeps reaching its routes.
+app.get('/', (_req, res) => res.sendFile(path.join(SITE_DIR, 'index.html')));
+app.use('/modern', express.static(path.join(SITE_DIR, 'modern'), { index: 'index.html' }));
 
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
@@ -83,11 +115,7 @@ async function verifyGoogleToken(idToken) {
 const DATA_DIR    = process.env.DATA_DIR || '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const CONF_DIR    = path.join(DATA_DIR, 'confirmations');
-// Nginx must never serve documents directly: unlike images/scripts, a PDF,
-// DOCX, or Markdown file can contain confirmation numbers, passenger names,
-// PINs, or other trip-private material. In Docker this is the read-only
-// ./site mount; locally it resolves to the repository's site/ directory.
-const SITE_DIR = process.env.SITE_DIR || path.join(__dirname, '..', 'site');
+const MEDIA_DIR   = process.env.MEDIA_DIR || path.join(DATA_DIR, 'media');
 const STATIC_CONFIRMATIONS_DIR = path.join(SITE_DIR, 'confirmations');
 // Not under DATA_DIR: nginx serves this directory as static content directly
 // (docker-compose mounts ./site/avatars to /app/avatars here), so it has to
@@ -113,7 +141,7 @@ const RATINGS_FILE = path.join(DATA_DIR, 'ratings.json');
 const PHOTOS_FILE  = path.join(DATA_DIR, 'photos.json');
 const DB_FILE      = path.join(DATA_DIR, 'trip.db');
 
-[DATA_DIR, UPLOADS_DIR, CONF_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+[DATA_DIR, UPLOADS_DIR, CONF_DIR, MEDIA_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
 const TRIP_DIR = process.env.TRIP_DIR || path.join(__dirname, '..', 'trip');
@@ -331,6 +359,14 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 `);
+// Extraction creates a private organizer draft first. Existing installations
+// need additive migrations because CREATE TABLE IF NOT EXISTS does not change
+// their bookings table.
+for (const [col, decl] of [
+  ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
+]) {
+  try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
+}
 
 // ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
 // Snapshots trip.config.json into trip_config_versions whenever its content
@@ -396,6 +432,8 @@ for (const [col, decl] of [
   ['enrichment_status', "TEXT DEFAULT 'none'"],
   ['enriched_at',       'TEXT'],
   ['enrich_attempts',   'INTEGER DEFAULT 0'],
+  ['enrichment_values', "TEXT DEFAULT '{}'"],
+  ['enrichment_generation', 'INTEGER DEFAULT 0'],
   // Minutes-since-midnight, derived from `time` on write. `time` may hold a
   // rough token ("morning"), which would otherwise sort lexically — "afternoon"
   // before "morning" before "noon" — so ordering uses this instead.
@@ -403,6 +441,9 @@ for (const [col, decl] of [
   // Identifies the config day item this row was promoted from, so promoting
   // twice can't duplicate the schedule.
   ['config_ref',        'TEXT'],
+  // A compatibility-only identity for the Modern itinerary projection. It is
+  // intentionally distinct from config_ref, whose contract is config import.
+  ['itinerary_item_uid','TEXT'],
   // Ticketing state. needs_tickets/advance_booking come from enrichment;
   // booking_id (above) is set by deterministic matching against real bookings,
   // never by the model — "is this paid for" is a fact, not a judgment call.
@@ -431,6 +472,7 @@ for (const [col, decl] of [
   try { db.exec(`ALTER TABLE phase_plan_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_config_ref ON phase_plan_items(config_ref) WHERE config_ref IS NOT NULL'); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_item_uid ON phase_plan_items(itinerary_item_uid) WHERE itinerary_item_uid IS NOT NULL'); } catch {}
 // A day's headline ("Thu 13/8 — Diamond Head + Waikiki") says what the day IS;
 // grouping items by date alone loses it. Kept per (phase, date) rather than on
 // each item so it can't drift between rows of the same day.
@@ -454,9 +496,12 @@ for (const [col, decl] of [
   ['corrected_at',     'TEXT'],
   ['review_status',    "TEXT DEFAULT 'none'"],
   ['review_attempts',  'INTEGER DEFAULT 0'],
+  // Lets compatibility reconciliation delete only rows it previously wrote.
+  ['itinerary_day_key','TEXT'],
 ]) {
   try { db.exec(`ALTER TABLE phase_plan_days ADD COLUMN ${col} ${decl}`); } catch {}
 }
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_itinerary_day_key ON phase_plan_days(itinerary_day_key) WHERE itinerary_day_key IS NOT NULL'); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_plan_enrich ON phase_plan_items(enrichment_status)`); } catch {}
 // GET filters by phase_id on every page load and joinBooking() looks up
 // booking_id per row; neither had an index.
@@ -629,7 +674,9 @@ async function initData() {
   } catch (e) { console.error('Bookings seed failed:', e.message); }
 }
 
-initData().catch(console.error);
+const dataReady = initData();
+dataReady.catch(console.error);
+const controlPlaneAuth = createControlPlaneAuth({ app, db, tripDir: TRIP_DIR, config: () => TRIP_CONFIG, ready: dataReady, jwtSecret: JWT_SECRET });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 function getUser(username) {
@@ -655,6 +702,7 @@ function authRequired(req, res, next) {
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
     req.user = { username: payload.username };
     next();
   } catch {
@@ -823,6 +871,7 @@ function organizerOrAgentRequired(req, res, next) {
   let payload;
   try { payload = jwt.verify(token, JWT_SECRET); } catch { return res.status(401).json({ error: 'invalid_token' }); }
 
+  if (!controlPlaneAuth.validManagedPayload(payload)) return res.status(401).json({ error: 'invalid_token' });
   const organizers = normalizeOrganizers(TRIP_CONFIG.agent);
   // No configured organizer means nobody qualifies. Failing closed here matters
   // more than convenience: the alternative — treating "unset" as "everyone" —
@@ -832,6 +881,73 @@ function organizerOrAgentRequired(req, res, next) {
   req.user = { username: payload.username };
   next();
 }
+
+const journey = livingJourney.create({
+  db,
+  config: TRIP_CONFIG,
+  raw: TRIP_CONFIG_RAW,
+  fetchImpl: fetch,
+  mediaDir: MEDIA_DIR,
+  requestItemEnrichment: (itemUid, { titleChanged = false } = {}) => {
+    // A Modern edit projects into the Classic compatibility table. Queue just
+    // that projected row rather than re-running enrichment for the entire trip.
+    // The background worker owns model calls, so the save request remains fast.
+    if (titleChanged) {
+      db.prepare("UPDATE phase_plan_items SET enrichment_status = 'none', enrich_attempts = 0, " +
+        "enrichment_values = '{}', enrichment_generation = enrichment_generation + 1, " +
+        "needs_tickets = NULL, advance_booking = NULL WHERE itinerary_item_uid = ?").run(itemUid);
+    }
+    if (!HERMES_URL) return { configured: false, queued: false };
+    const result = db.prepare(
+      "UPDATE phase_plan_items SET enrichment_status = 'pending', enrich_attempts = 0 " +
+      "WHERE itinerary_item_uid = ? AND (enrichment_status IS NULL OR enrichment_status IN ('none', 'failed'))"
+    ).run(itemUid);
+    kickEnrichmentSoon();
+    return { configured: true, queued: Boolean(result.changes) };
+  },
+});
+
+// Install after livingJourney creates its tables. This runtime and its auth
+// credentials belong to exactly one trip; clients cannot select another DB.
+const tripEvents = createTripEvents(db);
+app.get('/api/events', authRequired, (req, res) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : req.query._t;
+  // authRequired already verified this token. End streams when it expires.
+  const expiry = token ? jwt.decode(token)?.exp : null;
+  tripEvents.stream(req, res, expiry ? expiry * 1000 : undefined);
+});
+
+const heroUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, MEDIA_DIR),
+    filename: (_req, file, cb) => {
+      const ext = ({ 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' })[file.mimetype] || path.extname(file.originalname || '').toLowerCase();
+      cb(null, `hero-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext || '.img'}`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.mimetype)),
+  limits: { fileSize: 8 * 1024 * 1024 },
+});
+
+app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('hero'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'image file required' });
+  const focalX = Number(req.body?.focal_x);
+  const focalY = Number(req.body?.focal_y);
+  db.prepare(
+    "UPDATE trip_ui_settings SET hero_media_file = ?, hero_media_original_name = ?, hero_media_mime = ?, hero_focal_x = ?, hero_focal_y = ?, updated_by = ?, updated_at = datetime('now') WHERE id = 1"
+  ).run(
+    req.file.filename,
+    req.file.originalname || null,
+    req.file.mimetype || null,
+    Number.isFinite(focalX) ? Math.max(0, Math.min(1, focalX)) : 0.5,
+    Number.isFinite(focalY) ? Math.max(0, Math.min(1, focalY)) : 0.45,
+    req.user.username
+  );
+  res.json(journey.uiSettings());
+});
+
+journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
 
 app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   const agent = TRIP_CONFIG.agent || null;
@@ -868,6 +984,16 @@ app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
     } : null,
     standing_instructions: instructions,
     needs,
+    // Same reasoning as disclosure_policy below — and the same failure it
+    // prevents: persona.gender was served as a bare value with nothing saying
+    // what to DO with it, so the assistant took its own gender from how its
+    // NAME sounds. Hebrew conjugates first-person verbs, so that is wrong in
+    // every sentence, not occasionally. The rendered SOUL.md carries the same
+    // rule (profile-templates/familytrip-companion), but a hand-built or older
+    // profile may only ever see this response.
+    persona_policy: agent ? {
+      gender: 'persona.gender is how you speak about YOURSELF: "male" → masculine forms, "female" → feminine, "neutral" → phrasings that avoid the choice (Hebrew has no neuter; do not alternate between the two forms, and do not write both with a slash). It is assigned, never inferred from persona.name — a name that reads feminine does not make you feminine. It does not change with the language you are answering in, or with who you are speaking to; how you address other people is a separate decision, made per person. Only the organizer can change it.',
+    } : undefined,
     // Spelled out in the payload rather than left to documentation, because the
     // consumer is a language model that may only ever see this response.
     disclosure_policy: {
@@ -937,11 +1063,39 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // the same terms as a brand-new participant; redeemed the same way, through
 // POST /api/auth/enroll. Does not touch trip.config.json or re-seed the
 // user — the row already exists, only its password needs to change.
-app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, (req, res) => {
+app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(404).json({ error: 'user_not_found' });
   }
+
+  // `to: 'trip_password'` — back to the password the trip was seeded with.
+  //
+  // The one-time link below is the better mechanism and stays the default: the
+  // person picks a secret nobody else knows, and no credential is spoken in a
+  // chat. But it is three steps and a working link, and the case this exists
+  // for is a family member who changed their password, forgot it, and is
+  // standing in an airport. The trip password is already shared — the
+  // assistant's introduction hands it to the whole group — so restoring it
+  // discloses nothing that was not already disclosed, and the organizer can
+  // simply say "use the trip password again".
+  //
+  // Never echoed in the response: the organizer already has it, and a password
+  // in a JSON body is a password in an access log and in whatever chat relays
+  // it. Sessions already issued are not revoked, which is this app's standing
+  // posture (see PUT /api/auth/password) rather than something new here.
+  if (String(req.body?.to || '') === 'trip_password') {
+    if (!SEED_PASSWORD) {
+      return res.status(409).json({
+        error: 'no_trip_password',
+        detail: 'This trip was seeded with per-participant random passwords, so there is no shared one to restore. Reset without `to` and relay the one-time link.',
+      });
+    }
+    const hash = await bcrypt.hash(SEED_PASSWORD, 10);
+    db.prepare('UPDATE users SET password = ? WHERE username = ?').run(hash, uname);
+    return res.json({ ok: true, username: uname, restored: 'trip_password' });
+  }
+
   const token = crypto.randomBytes(24).toString('hex');
   pendingEnrollments.set(token, { username: uname, at: Date.now() });
   res.json({ ok: true, username: uname, enrollment_token: token, expires_in_seconds: ENROLLMENT_TTL_MS / 1000 });
@@ -1712,6 +1866,10 @@ app.delete('/api/budget/:id', authRequired, (req, res) => {
 // ── BOOKINGS ──────────────────────────────────────────────────────────────────
 
 const HERMES_URL = (process.env.HERMES_URL || '').replace(/\/$/, '');
+// Booking extraction is provider-agnostic. The legacy variables remain as a
+// compatibility fallback while deployments move to the neutral names.
+const EXTRACTION_SERVICE_URL = (process.env.EXTRACTION_SERVICE_URL || HERMES_URL || '').replace(/\/$/, '');
+const EXTRACTION_SERVICE_KEY = process.env.EXTRACTION_SERVICE_API_KEY || HERMES_KEY;
 
 // With no enrichment worker, a row left 'pending' shows a permanent
 // "Finding links…" spinner. On a control-plane-provisioned trip the links
@@ -1725,36 +1883,39 @@ if (!HERMES_URL) {
 
 const extractUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
-  if (!HERMES_URL) return res.status(503).json({ error: 'HERMES_URL not configured' });
+async function extractBookingDetails(req) {
+  if (!EXTRACTION_SERVICE_URL) throw Object.assign(new Error('Booking extraction is not available right now'), { status: 503 });
   const url = req.body?.url;
   // The site's own "Extract Details with AI" upload (site/app.js) sends
   // pdf_base64/pdf_name as a JSON body, not multipart — req.file only gets
   // populated for an actual multipart caller (e.g. a direct API client).
   const pdfBase64 = req.file ? req.file.buffer.toString('base64') : req.body?.pdf_base64;
   const pdfName = req.file ? req.file.originalname : req.body?.pdf_name;
-  if (!pdfBase64 && !url) return res.status(400).json({ error: 'Provide a file or url' });
+  if (!pdfBase64 && !url) throw Object.assign(new Error('Provide a file or url'), { status: 400 });
 
+  const body = url
+    ? JSON.stringify({ url })
+    : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
+
+  const r = await fetch(`${EXTRACTION_SERVICE_URL}/extract`, {
+    method: 'POST',
+    headers: { 'X-API-Key': EXTRACTION_SERVICE_KEY, 'Content-Type': 'application/json' },
+    body,
+    // Longer than the extraction service's CLI bridge timeout — this call
+    // must not fail while the provider still has a legitimate request in
+    // progress, which would otherwise look like a failed upload.
+    timeout: 50000,
+  });
+  if (!r.ok) throw Object.assign(new Error(`Booking extraction service returned an error (status ${r.status})`), { status: 502 });
+  return r.json();
+}
+
+app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), async (req, res) => {
   try {
-    const body = url
-      ? JSON.stringify({ url })
-      : JSON.stringify({ pdf_base64: pdfBase64, pdf_name: pdfName || 'confirmation.pdf' });
-
-    const r = await fetch(`${HERMES_URL}/extract`, {
-      method: 'POST',
-      headers: { 'X-API-Key': HERMES_KEY, 'Content-Type': 'application/json' },
-      body,
-      // Longer than trip-mcp's own 45s execFile timeout on the hermes CLI
-      // call (mcp/mcp.js) — this used to be shorter (30s), so this call
-      // could time out and error here while trip-mcp's own call was still
-      // legitimately running, producing a confusing failure under load.
-      timeout: 50000,
-    });
-    if (!r.ok) { const t = await r.text(); throw new Error(`hermes ${r.status}: ${t}`); }
-    res.json(await r.json());
+    res.json(await extractBookingDetails(req));
   } catch (e) {
     console.error('[extract proxy]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -1772,6 +1933,9 @@ app.get('/api/bookings', authRequired, (req, res) => {
   let sql = 'SELECT * FROM bookings';
   const params = [];
   const wheres = [];
+  // Drafts are a private organizer workflow. Members only ever receive
+  // approved bookings, even if they guess the status query parameter.
+  if (!canReviewDrafts(req)) wheres.push("COALESCE(review_status, 'approved') = 'approved'");
   if (phase) { wheres.push('phase = ?'); params.push(phase); }
   if (type)  { wheres.push('type = ?');  params.push(type);  }
   if (wheres.length) sql += ' WHERE ' + wheres.join(' AND ');
@@ -1779,7 +1943,35 @@ app.get('/api/bookings', authRequired, (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.post('/api/bookings', authRequired, (req, res) => {
+app.post('/api/bookings/extract-draft', organizerOrAgentRequired, extractUpload.single('file'), async (req, res) => {
+  try {
+    const extracted = await extractBookingDetails(req);
+    const phase = typeof extracted.phase === 'string' ? extracted.phase : '';
+    const type = typeof extracted.type === 'string' ? extracted.type : 'other';
+    const name = typeof extracted.name === 'string' ? extracted.name.trim() : '';
+    const validTypes = new Set(['flight', 'hotel', 'car', 'attraction', 'other']);
+    if (!VALID_PLAN_PHASES.has(phase) || !validTypes.has(type) || !name) {
+      return res.status(422).json({ error: 'Extraction needs a valid phase, type, and name before a draft can be created', extracted });
+    }
+    const text = (key) => typeof extracted[key] === 'string' && extracted[key].trim() ? extracted[key].trim() : null;
+    const result = db.prepare(
+      "INSERT INTO bookings (phase,type,name,date_from,date_to,passengers,confirmation,pin,notes,cost,created_by,review_status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'draft')"
+    ).run(phase, type, name, text('date_from'), text('date_to'), text('passengers'), text('confirmation'), text('pin'), text('notes'), 0, req.user.username);
+    const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json({ ok: true, booking, extracted });
+  } catch (e) {
+    console.error('[extract draft]', e.message);
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post('/api/bookings/:id/approve', organizerOrAgentRequired, (req, res) => {
+  const result = db.prepare("UPDATE bookings SET review_status = 'approved' WHERE id = ? AND review_status = 'draft'").run(req.params.id);
+  if (!result.changes) return res.status(404).json({ error: 'draft booking not found' });
+  res.json({ ok: true });
+});
+
+app.post('/api/bookings', organizerOrAgentRequired, (req, res) => {
   const { phase, type, name, date_from, date_to, passengers, confirmation, pin, notes, cost, apple_wallet_url, google_wallet_url, location_url } = req.body || {};
   if (!phase || !type || !name) return res.status(400).json({ error: 'phase, type, name required' });
   const result = db.prepare(
@@ -1790,7 +1982,7 @@ app.post('/api/bookings', authRequired, (req, res) => {
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
-app.patch('/api/bookings/:id', authRequired, (req, res) => {
+app.patch('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const fields = ['phase','type','name','date_from','date_to','passengers','confirmation','pin','notes','cost','apple_wallet_url','google_wallet_url','location_url'];
   const updates = [];
   const params = [];
@@ -1803,7 +1995,7 @@ app.patch('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/bookings/:id', authRequired, (req, res) => {
+app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   const row = db.prepare('SELECT seed_key FROM bookings WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'not found' });
   if (row.seed_key) return res.status(403).json({ error: 'seed bookings cannot be deleted' });
@@ -1811,7 +2003,7 @@ app.delete('/api/bookings/:id', authRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings/:id/confirmation', authRequired, confUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, confUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pdf file required' });
   db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, conf_file: req.file.filename });
@@ -1868,7 +2060,7 @@ const pkpassUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-app.post('/api/bookings/:id/wallet-apple', authRequired, pkpassUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/wallet-apple', organizerOrAgentRequired, pkpassUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pkpass file required' });
   db.prepare('UPDATE bookings SET pkpass_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
   res.json({ ok: true, pkpass_file: req.file.filename });
@@ -1905,10 +2097,27 @@ function withCorrection(row) {
   };
 }
 
-function joinBooking(item) {
+// Drafts are a private organizer workflow, so every route that resolves a
+// booking has to say whose eyes the answer is for. Kept as one predicate
+// rather than repeated inline: GET /api/bookings had the only copy, and the
+// Classic plan projection below silently didn't.
+function canReviewDrafts(req) {
+  return Boolean(req?.user?.isAgent)
+      || normalizeOrganizers(TRIP_CONFIG.agent).includes(req?.user?.username);
+}
+
+// Classic's half of the same boundary living-journey.js's serializeItinerary()
+// enforces for Modern: a booking still in organizer review must not reach a
+// member through an attached plan-item card, only through /api/bookings.
+// Fails safe — a caller that forgets to pass the viewer's capability gets the
+// member-visible projection, never the draft.
+function joinBooking(item, { includeDrafts = false } = {}) {
   const withCorr = withCorrection(item);
   if (!item.booking_id) return withCorr;
-  const bk = db.prepare('SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?').get(item.booking_id);
+  const bk = db.prepare(
+    'SELECT id, name, confirmation, conf_file FROM bookings WHERE id = ?' +
+    (includeDrafts ? '' : " AND COALESCE(review_status, 'approved') = 'approved'")
+  ).get(item.booking_id);
   return { ...withCorr, booking: bk || null };
 }
 
@@ -2004,7 +2213,8 @@ app.get('/api/phases/:phase_id/plan', authRequired, (req, res) => {
     'SELECT * FROM phase_plan_items WHERE phase_id = ? ' +
     'ORDER BY date ASC, sort_order ASC, COALESCE(time_sort, 99999) ASC, id ASC'
   ).all(req.params.phase_id);
-  res.json(rows.map(joinBooking));
+  const includeDrafts = canReviewDrafts(req);
+  res.json(rows.map((row) => joinBooking(row, { includeDrafts })));
 });
 
 // Day headlines for a phase. Separate from the item list so /plan keeps its
@@ -2104,8 +2314,9 @@ app.post('/api/phases/:phase_id/plan', organizerOrAgentRequired, (req, res) => {
   );
   const created = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
   ensurePlanDay(req.params.phase_id, date || null);
+  journey.syncFromLegacy('legacy-plan-create');
   kickEnrichmentSoon();
-  res.status(201).json(joinBooking(created));
+  res.status(201).json(joinBooking(created, { includeDrafts: true }));
 });
 
 app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
@@ -2161,7 +2372,8 @@ app.patch('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res)
   if (dateMoved) { queuePhaseReview(req.params.phase_id); kickEnrichmentSoon(); }
   const updated = db.prepare('SELECT * FROM phase_plan_items WHERE id = ? AND phase_id = ?')
     .get(req.params.id, req.params.phase_id);
-  res.json({ ...joinBooking(updated), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
+  journey.syncFromLegacy('legacy-plan-update');
+  res.json({ ...joinBooking(updated, { includeDrafts: true }), ...(dateMoved ? { review: { status: HERMES_URL ? 'queued' : 'unavailable', scope: 'phase' } } : {}) });
 });
 
 app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res) => {
@@ -2169,6 +2381,7 @@ app.delete('/api/phases/:phase_id/plan/:id', organizerOrAgentRequired, (req, res
   const row = db.prepare('SELECT id FROM phase_plan_items WHERE id = ? AND phase_id = ?').get(req.params.id, req.params.phase_id);
   if (!row) return res.status(404).json({ error: 'not found' });
   db.prepare('DELETE FROM phase_plan_items WHERE id = ?').run(req.params.id);
+  journey.syncFromLegacy('legacy-plan-delete');
   // Every other DELETE in this file answers {ok:true}, and mcp/mcp.js's
   // apiDelete() parses the body unconditionally — a 204 made the agent's
   // delete_plan_item throw on every successful delete.
@@ -2225,6 +2438,7 @@ app.patch('/api/phases/:phase_id/plan/days/:date', organizerOrAgentRequired, (re
     'enrichment_status = excluded.enrichment_status, enrich_attempts = 0' +
     (clearCorrection ? ', label_he_prev = NULL, label_en_prev = NULL, correction_note = NULL, corrected_at = NULL' : '')
   ).run(phaseId, date, labelHe, labelEn, status);
+  journey.syncFromLegacy('legacy-plan-day-update');
   res.json(db.prepare(
     'SELECT phase_id, date, label_he, label_en, enrichment_status FROM phase_plan_days ' +
     'WHERE phase_id = ? AND date = ?'
@@ -2314,10 +2528,11 @@ app.post('/api/phases/:phase_id/plan/swap-days', organizerOrAgentRequired, (req,
   // phase. Queued, not run inline: a Hermes call takes ~30-90s and the laptop
   // it runs on is routinely closed — a schedule edit must not depend on that.
   queuePhaseReview(phaseId);
+  journey.syncFromLegacy('legacy-plan-swap-days');
   kickEnrichmentSoon();
   res.json({
     ok: true, phase_id: phaseId, swapped: [date_a, date_b], days,
-    items: items.map(joinBooking),
+    items: items.map((item) => joinBooking(item, { includeDrafts: true })),
     // The caller has to come back for this. get_phase_plan returns whatever
     // the reviewer has written by then, and an agent that made this change is
     // expected to relay those corrections to the organizer.
@@ -2386,6 +2601,13 @@ async function enrichOne(item) {
 // renderer never has to trust model output.
 function cleanLink(u) {
   return typeof u === 'string' && /^https?:\/\//i.test(u.trim()) ? u.trim() : null;
+}
+
+// Model-written itinerary text reaches every trip member. Strip markup before
+// persisting it, just as we do for generated day labels, and keep the model
+// bounded to a single itinerary-line-sized value.
+function cleanEnrichedText(value) {
+  return typeof value === 'string' && value.trim() ? stripTags(value).slice(0, 2000) : null;
 }
 
 function cleanBool(v) {
@@ -2523,19 +2745,46 @@ async function runEnrichmentPass() {
       db.prepare('UPDATE phase_plan_items SET enrich_attempts = enrich_attempts + 1 WHERE id = ?').run(item.id);
       try {
         const out = await enrichOne(item);
+        const current = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(item.id);
+        // The organizer may edit or delete an item while the provider is busy.
+        // Leave the newer generation pending instead of applying stale output.
+        if (!current || current.enrichment_generation !== item.enrichment_generation ||
+            current.text_he !== item.text_he || current.text_en !== item.text_en ||
+            current.date !== item.date || current.phase_id !== item.phase_id) continue;
+        // The organizer enters one title. The enrichment service supplies the
+        // companion language without overwriting Hebrew an organizer authored.
+        // If the primary field was entered in English, replace that temporary
+        // storage value with the Hebrew translation once it is available.
+        const primaryLooksHebrew = /[\u0590-\u05FF]/.test(current.text_he || '');
+        const translatedHe = !current.text_en && !primaryLooksHebrew ? cleanEnrichedText(out.text_he) : null;
+        const translatedEn = !current.text_en ? cleanEnrichedText(out.text_en) : null;
         // Link a real booking if one plainly matches, but never overwrite a
         // link an organizer or agent already set by hand.
-        const bookingId = item.booking_id || findMatchingBooking(item);
-        db.prepare(
-          "UPDATE phase_plan_items SET location_url = COALESCE(?, location_url), waze_url = ?, " +
-          'website_url = ?, ticket_url = ?, needs_tickets = ?, advance_booking = ?, ' +
-          "booking_id = COALESCE(?, booking_id), enrichment_status = 'done', " +
-          "enriched_at = datetime('now') WHERE id = ?"
-        ).run(cleanLink(out.maps_url), cleanLink(out.waze_url),
-              cleanLink(out.website_url), cleanLink(out.ticket_url),
-              cleanBool(out.needs_tickets), cleanBool(out.advance_booking),
-              bookingId, item.id);
+        const fields = {};
+        if (translatedHe) fields.text_he = translatedHe;
+        if (translatedEn) fields.text_en = translatedEn;
+        for (const [key, value] of Object.entries({
+          location_url: cleanLink(out.maps_url), waze_url: cleanLink(out.waze_url),
+          website_url: cleanLink(out.website_url), ticket_url: cleanLink(out.ticket_url),
+          needs_tickets: cleanBool(out.needs_tickets), advance_booking: cleanBool(out.advance_booking),
+          booking_id: current.booking_id ? null : findMatchingBooking(current),
+        })) {
+          if (current[key] == null || current[key] === '') {
+            if (value != null) fields[key] = value;
+          }
+        }
+        let generated;
+        try { generated = JSON.parse(current.enrichment_values || '{}'); } catch { generated = {}; }
+        db.transaction(() => {
+          const assignments = Object.keys(fields).map(key => `${key} = ?`);
+          db.prepare(`UPDATE phase_plan_items SET ${assignments.length ? assignments.join(', ') + ', ' : ''}
+            enrichment_values = ?, enrichment_status = 'done', enriched_at = datetime('now') WHERE id = ?`)
+            .run(...Object.values(fields), JSON.stringify({ ...generated, ...fields }), item.id);
+          journey.applyItemEnrichment(current, fields);
+        })();
       } catch (e) {
+        const current = db.prepare('SELECT enrichment_generation FROM phase_plan_items WHERE id = ?').get(item.id);
+        if (!current || current.enrichment_generation !== item.enrichment_generation) continue;
         const attempts = db.prepare('SELECT enrich_attempts a FROM phase_plan_items WHERE id = ?').get(item.id)?.a || 0;
         if (attempts >= ENRICH_MAX_ATTEMPTS) {
           db.prepare("UPDATE phase_plan_items SET enrichment_status = 'failed' WHERE id = ?").run(item.id);
@@ -2956,6 +3205,7 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
     });
   }
   kickEnrichmentSoon();
+  journey.syncFromLegacy('legacy-promote-config-days');
   res.json({ created: created.length, skipped: skipped.length, items: created });
 });
 
@@ -3075,8 +3325,9 @@ app.post('/api/phase-plan/import-from-bookings', organizerOrAgentRequired, (req,
     ).run(bk.phase, date, text, text, bk.location_url || null, bk.id, 'needs_review', 'migration');
     db.prepare('INSERT INTO phase_plan_import_log (booking_id) VALUES (?)').run(bk.id);
     const item = db.prepare('SELECT * FROM phase_plan_items WHERE id = ?').get(result.lastInsertRowid);
-    created.push(joinBooking(item));
+    created.push(joinBooking(item, { includeDrafts: true }));
   }
+  journey.syncFromLegacy('legacy-import-from-bookings');
   res.json({ created, skipped });
 });
 
@@ -3213,6 +3464,7 @@ function triviaPublicState() {
     status: triviaState.status,
     gameId: triviaState.gameId,
     questionIndex: triviaState.questionIndex,
+    pausedRemainingMs: triviaState.pausedRemainingMs,
     question,
     nextPersons: nextQ ? nextQ.persons : null,
     players: triviaState.players,
@@ -3584,4 +3836,5 @@ app.use((err, _req, res, _next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Trip server running on :${PORT}`));
+const HOST = process.env.HOST || undefined;
+app.listen(PORT, HOST, () => console.log(`Trip server running on ${HOST || '*'}:${PORT}`));

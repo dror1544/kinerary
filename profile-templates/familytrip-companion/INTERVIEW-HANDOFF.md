@@ -9,7 +9,10 @@ Only render after the organizer confirms the interview recap. Preserve `source.i
 - `profile.name`: a new lowercase Hermes profile name; never clone an organizer's name by default.
 - `trip.id`, title, dates, timezone, canonical site URL, and site connection name: provisioning output plus confirmed trip basics.
 - `assistant.name`: `bot_name`.
-- `assistant.gender`: `bot_gender`; ask explicitly for Hebrew trips.
+- `assistant.gender`: `bot_gender`; ask explicitly for Hebrew trips. It is
+  rendered into SOUL.md as the forms the assistant uses about itself — not
+  only stored in `references/group-context.json`, which is what let an
+  assistant gender itself off its own name.
 - `assistant.tone`: `bot_tone`.
 - `assistant.proactive`: `bot_proactive`, using the platform's default times when the interview collected only on/off choices.
 - `organizer.person_ref`: resolve `organizer_identity` to an opaque person reference in the generated roster. Do not guess when matching fails.

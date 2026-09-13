@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -8,6 +8,7 @@ import { resolvePendingVenueLinks } from "./venue-links.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
+import { GoogleOidcClient, HttpRuntimeAccountAdapter, type PortalDependencies } from "./portal.js";
 
 const profilePath = process.env.CONTROL_PLANE_ARCHITECTURE_PROFILE;
 if (!profilePath) throw new Error("CONTROL_PLANE_ARCHITECTURE_PROFILE is required");
@@ -25,6 +26,10 @@ const pool = createDatabasePool(connectionString, () => {
 });
 
 let signup: SignupDependencies | undefined;
+// Hoisted out of the signup block because the approval routes address their
+// operator notification to the same chat as the signup DM. One configured
+// operator, one chat id, resolved once.
+let operatorChatId: string | undefined;
 if (profile.signup) {
   const signupConfig = profile.signup;
   const [botToken, actionSecret, webhookSecret, superAdminChatId] = await Promise.all([
@@ -39,6 +44,7 @@ if (profile.signup) {
   // before this build's first provider construction, per the ordering
   // guarantee its own test asserts: an invalid profile must never reach a
   // constructed provider.
+  operatorChatId = superAdminChatId;
   const notification = validateBeforeProvider(profile, () => createNotificationAdapter(profile.adapters.messaging, {
     telegram: superAdminChatId ? { botToken, superAdminChatId, db: pool, log: (line) => process.stderr.write(`${line}\n`) } : undefined,
   }));
@@ -50,6 +56,7 @@ if (profile.signup) {
       actionTtlSeconds: signupConfig.action_ttl_seconds,
       messagingAdapter: profile.adapters.messaging,
       signupRateLimitCooldownSeconds: signupConfig.signup_rate_limit_cooldown_seconds,
+      autoApprove: signupConfig.auto_approve,
     },
     botToken,
     webhookSecret,
@@ -82,6 +89,7 @@ if (profile.signup) {
     db: pool,
     config: {
       approvalTtlSeconds: 86400,
+      operatorChatId,
     },
   };
 }
@@ -105,6 +113,29 @@ if (chatRoutingKey) {
   chatRouting = { db: pool, apiKey: chatRoutingKey };
 }
 
+let portal: PortalDependencies | undefined;
+if (profile.web) {
+  const [googleClientId, googleClientSecret, runtimeExchangeKey] = await Promise.all([resolveSecretRef(profile.web.google_client_id_secret_ref), resolveSecretRef(profile.web.google_client_secret_ref), resolveSecretRef(profile.web.runtime_exchange_key_secret_ref)]);
+  portal = { db: pool, google: new GoogleOidcClient(googleClientId, googleClientSecret, `${profile.web.public_origin}/v1/auth/google/callback`), runtimeAccounts: new HttpRuntimeAccountAdapter(profile.web.runtime_origin, runtimeExchangeKey), publicOrigin: profile.web.public_origin, runtimeOrigin: profile.web.runtime_origin, runtimeExchangeKey, runtimeUpstreamHostSuffixes: profile.web.runtime_upstream_host_suffixes, telegramBotUsername: profile.web.telegram_bot_username, sessionTtlSeconds: profile.web.session_ttl_seconds, enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400, approvalTtlSeconds: 86400, operatorChatId };
+}
+
+// The interviewer agent's chat-addressed interview routes, which the MCP
+// sidecar forwards `get_interview_for_chat` / `submit_answer_for_chat` to.
+// Same tier and pattern as chatRouting above, and deliberately the SAME env
+// var the sidecar reads for its own gate (interview-mcp.ts's AGENT_KEY): the
+// two are the ends of one process-to-process secret, so a deployment that
+// sets it on one side and not the other has a sidecar presenting a key the
+// API will reject, rather than two independently-named half-configurations.
+//
+// Optional, like every other block here. Absent, the routes stay unmounted
+// and the router keeps answering written messages itself — the state the bot
+// shipped in, and what `relay.interviewer_profile` being unset also means.
+let interviewAgent: InterviewAgentDependencies | undefined;
+const interviewAgentKey = process.env.CONTROL_PLANE_INTERVIEW_AGENT_KEY;
+if (interviewAgentKey) {
+  interviewAgent = { db: pool, apiKey: interviewAgentKey };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -113,6 +144,8 @@ const app = buildApp(profile, {
   planner,
   provisioner,
   chatRouting,
+  portal,
+  interviewAgent,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker
@@ -126,7 +159,16 @@ if (signup) {
   const timer = setInterval(() => {
     if (dispatching) return;
     dispatching = true;
-    dispatchPendingTripNotifications(pool, notification, (line) => process.stderr.write(`${line}\n`))
+    dispatchPendingTripNotifications(
+      pool,
+      notification,
+      (line) => process.stderr.write(`${line}\n`),
+      // For the add-to-group link in a companion introduction. Read from the
+      // profile rather than stored per outbox row: it belongs to the
+      // deployment, and a row written before a bot rename would otherwise hand
+      // an organizer a link to a handle that no longer resolves.
+      { botUsername: profile.web?.telegram_bot_username ?? null },
+    )
       .catch((error) => {
         process.stderr.write(`${structuredLog("error", "outbox.dispatch_loop_error", {
           safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
@@ -161,7 +203,39 @@ if (venueLinkSearchConfigured()) {
 // Telegram long polling, not the /v1/signup/callback webhook route — see
 // telegram-poller.ts's module doc. getUpdates fails while a webhook is still
 // registered for this bot, so clear one if present before the first poll.
-if (signup) {
+//
+// UNLESS the relay connector already owns this bot's update stream. Telegram
+// hands each update to exactly one getUpdates caller and answers a second
+// concurrent one with 409, so two loops on one token do not share the work —
+// they steal from each other, at random, and an approval tap goes missing
+// roughly half the time. The relay's poller subsumes this one in that case
+// (see relay/poller.ts's `approvals`).
+//
+// Detected by comparing the RESOLVED tokens rather than by a flag: a flag is
+// something to set wrong, while two secret_refs that happen to name the same
+// bot is a fact the process can simply observe. Nothing here is logged that
+// would reveal either token.
+let relayOwnsBotStream = false;
+if (signup && profile.relay) {
+  try {
+    const relayBotToken = await resolveSecretRef(profile.relay.telegram_bot_token_secret_ref);
+    relayOwnsBotStream = relayBotToken.trim() === signup.botToken.trim();
+  } catch (error) {
+    // A relay block whose token cannot be resolved is a misconfiguration, but
+    // not this process's to fail on — the relay runs separately and will fail
+    // loudly on its own. Assume no overlap, which is the status quo.
+    process.stderr.write(`${structuredLog("warn", "signup.relay_token_unresolved", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    })}\n`);
+  }
+}
+
+if (signup && relayOwnsBotStream) {
+  process.stderr.write(`${structuredLog("info", "signup.approval_poller_stood_down", {
+    reason: "RELAY_OWNS_BOT_STREAM",
+    hint: "the relay connector polls this bot and handles approval callbacks",
+  })}\n`);
+} else if (signup) {
   await deleteWebhookIfPresent(signup.botToken, (line) => process.stderr.write(`${line}\n`));
   startTelegramApprovalPoller({
     db: pool,

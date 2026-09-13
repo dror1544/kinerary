@@ -1,0 +1,2531 @@
+/**
+ * The Trip Bot's update loop — the one consumer of the shared bot's stream.
+ *
+ * `dispatch.ts` decides; this acts. Everything that touches Telegram or writes
+ * an answer happens here, which is what keeps the branch table testable
+ * without a token and this module testable with a fake client.
+ *
+ * **One loop per bot token, and this is it.** Telegram answers a second
+ * concurrent getUpdates for the same token with 409 and hands each update to
+ * exactly one caller, so a second poller does not duplicate traffic — it
+ * steals it, at random. That is why `allowedUpdates` here lists BOTH `message`
+ * and `callback_query`: this loop is not free to consume only the update types
+ * it cares about, because whatever it filters out is not delivered to anyone
+ * else either, it is simply dropped.
+ *
+ * `startTelegramApprovalPoller` runs a separate loop on the SIGNUP bot's
+ * token, which is a different bot — so the two do not contend today. The
+ * `approval_callback` branch below exists for the topology where they are
+ * merged onto one token, and is unreachable until then.
+ */
+import type pg from "pg";
+import {
+  findQuestion,
+  parseCallbackData,
+  renderConfirmPrompt,
+  renderEssentialsDone,
+  renderQuestion,
+  type InlineKeyboard,
+  type RenderedQuestion,
+} from "../chat-router.js";
+import {
+  closeAgentTurn,
+  confirmIntakeForChat,
+  getSessionForChat,
+  AGENT_FLOOR_SECONDS,
+  DOCUMENT_FLOOR_SECONDS,
+  claimDueRouterPrompts,
+  claimFloor,
+  finalizeMultiChoiceForChat,
+  markAwaitingMachine,
+  claimStalledAgentTurns,
+  openAgentTurn,
+  queueInboundMessage,
+  claimSettledInboundBursts,
+  listMachineAwaitingChats,
+  submitAnswerForChat,
+  type SessionView,
+  type IntakeQuestion,
+  askForMoreForChat,
+  clearPendingAskForChat,
+  clearPendingEntryForChat,
+  clearPendingSayForChat,
+  markOpeningDoneForChat,
+  hasOpenAgentTurn,
+  markOfferedMoreForChat,
+  questionStateForChat,
+  recordLastPromptForChat,
+  INTAKE_QUESTIONS,
+  claimExpiredSessions,
+  claimSessionsDueWarning,
+  expiredSessionLanguage,
+  touchSessionDeadline,
+  answersForChat,
+  saveSourceDocumentForChat,
+  hasPendingInbound,
+  isReadingDocument,
+  markReadingDocument,
+  deferQuestionForChat,
+  deferredRequired,
+  undeferAllForChat,
+  buildRecap,
+  selectedOptionIds,
+  setFinishRequestedForChat,
+  skipQuestionForChat,
+  toggleMultiChoiceForChat,
+} from "../interview.js";
+import {
+  applyProposals,
+  extractIntakeFromDocument,
+  burstKey,
+  claimInterpretation,
+  interpretBurst,
+  isInterpretPath,
+  markInterpretationCommitted,
+  recordInterpretationResult,
+  storedOutcomes,
+  submitArgsFor,
+  type ProposedAnswer,
+} from "../interpret.js";
+import type { StructuredModelRunner } from "../model-runner.js";
+import { documentText } from "../document-text.js";
+import { extractItinerary, foldExtractedIntoPhases } from "../itinerary-extract.js";
+import { provisionOnConfirm } from "../planner.js";
+
+/**
+ * Reading a booking PDF and turning it into answers took ~94 seconds on the
+ * real Japan document. Generous, because the alternative to waiting is asking
+ * the organizer to type what is already in the file.
+ */
+const DOCUMENT_EXTRACT_TIMEOUT_MS = Number(process.env.DOCUMENT_EXTRACT_TIMEOUT_MS || 240_000);
+import { digestTelegramId } from "../identity.js";
+import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
+import { processApprovalCallback, type SignupConfig } from "../signup.js";
+import type { MediaDeps } from "./normalize.js";
+import { askText, DEFAULT_LANGUAGE, optionLabel, uiString, type Language } from "../intake-copy.js";
+import { structuredLog } from "../redaction.js";
+import {
+  dispatchUpdate,
+  DEFAULT_STRINGS,
+  type BotIdentity,
+  type DispatchDecision,
+  type DispatchStrings,
+} from "./dispatch.js";
+import { toWireEvent, type TelegramUpdate } from "./normalize.js";
+import { agentTextIsInLanguage } from "./internal-leak.js";
+import type { WireMessageEvent } from "./protocol.js";
+import type { TelegramClient } from "./telegram-api.js";
+
+/** Just the part of RelayConnector this needs, so tests need no socket. */
+export interface InboundSink {
+  pushInbound(event: WireMessageEvent): boolean;
+  /**
+   * Whether a turn for this trip would reach a running companion.
+   *
+   * Optional so a test double can stay two lines. Absent means "assume
+   * reachable" — the behaviour every caller had before trips got their own
+   * gateway processes.
+   */
+  canReachProfile?(profile: string): boolean;
+}
+
+export interface TripBotPollerDeps {
+  db: pg.Pool;
+  telegram: TelegramClient;
+  connector: InboundSink;
+  strings?: DispatchStrings;
+  /**
+   * The shared bot's own @username and id, for the group relevance gate.
+   * Absent, the gate still works off the trip's assistant names — it just
+   * cannot recognise an @mention, and judges a reply by "replying to a bot"
+   * rather than "replying to us".
+   */
+  botIdentity?: BotIdentity;
+  /**
+   * The Hermes profile that serves written interview answers, from
+   * `relay.interviewer_profile`.
+   *
+   * Absent, a written mid-interview message is answered by the router itself
+   * rather than forwarded — the state the bot shipped in.
+   */
+  interviewerProfile?: string;
+  /** Re-host plane for inbound attachments; absent keeps text-only behaviour. */
+  media?: MediaDeps;
+  /**
+   * The bounded-call runner behind the interpret path
+   * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
+   * fall back to the router's own questions — which is a working interview,
+   * just a slower one, and is deliberately not an error.
+   */
+  modelRunner?: StructuredModelRunner;
+  /**
+   * The day-by-day extractor, injectable for tests.
+   *
+   * Defaults to the real one, which runs on the shared model runner when
+   * `EXTRACT_RUNNER` is set — so the router can call it directly, with no
+   * Hermes profile and no MCP round trip.
+   */
+  extractItinerary?: typeof extractItinerary;
+  /**
+   * Signup-approval handling, for the topology where the trip bot and the
+   * signup bot are THE SAME BOT.
+   *
+   * Telegram delivers each update to exactly one getUpdates caller and answers
+   * a second concurrent one with 409, so two loops on one token do not split
+   * the work — they steal from each other, at random. When the tokens
+   * coincide, this loop must therefore subsume telegram-poller.ts's rather
+   * than run beside it, and server.ts stands its own poller down.
+   *
+   * Absent when the two bots are genuinely different, in which case the
+   * approval branch is unreachable and stays defensive.
+   */
+  approvals?: { config: SignupConfig };
+  log?: (line: string) => void;
+}
+
+export interface PollerOptions {
+  /**
+   * Telegram's server-side long-poll window. The request blocks there until an
+   * update arrives or this elapses, so a busy loop costs one held connection
+   * rather than repeated polling.
+   */
+  longPollSeconds?: number;
+  /** How often to deliver what the agent has written, independent of polling. */
+  deliverIntervalMs?: number;
+  /** Cap on the backoff applied after a poll that looks like a failure. */
+  maxBackoffMs?: number;
+}
+
+const DEFAULT_LONG_POLL_SECONDS = 25;
+// How often the router checks whether the agent has written something to
+// deliver. Short, because this is the gap the organizer experiences between
+// answering and seeing the next question — it used to be up to a full
+// long-poll window.
+const DEFAULT_DELIVER_INTERVAL_MS = 700;
+const DEFAULT_MAX_BACKOFF_MS = 30_000;
+
+// ── Acting on one decision ───────────────────────────────────────────────────
+
+/**
+ * Performs the I/O for one dispatch decision.
+ *
+ * Exported so the whole decision→effect table can be exercised against a fake
+ * Telegram client, with no loop and no network.
+ */
+/**
+ * The interview chat an inbound decision belongs to, if any.
+ *
+ * Only the kinds that represent the ORGANIZER having just said something. A
+ * decision that is itself an outbound reply must not hand the floor back to
+ * the machine, or the router would answer its own message.
+ */
+function interviewChatOf(decision: DispatchDecision): string | null {
+  switch (decision.kind) {
+    case "interview_callback":
+    case "interview_text":
+    case "interview_to_gateway":
+    case "show_summary":
+      return decision.chatId;
+    default:
+      return null;
+  }
+}
+
+export async function applyDecision(
+  decision: DispatchDecision,
+  deps: TripBotPollerDeps,
+): Promise<void> {
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const log = deps.log ?? (() => {});
+
+  // The organizer has spoken, so the machine owes the next message and the
+  // deadline starts now. Restarting it here is the whole point of scoping this
+  // to the session: the clock measures how long WE take, never how long a
+  // person spends reading a question.
+  //
+  // A document/photo gets the wider DOCUMENT_FLOOR_SECONDS floor — run 12's
+  // evidence that a normal 30s deadline closes the turn out from under an
+  // agent still genuinely extracting a PDF. Every other inbound kind keeps the
+  // default (undefined here clears any earlier override on this session).
+  const chatId = interviewChatOf(decision);
+
+  // WRITING INTO A CLOSED INTERVIEW.
+  //
+  // Answered here, before the floor is touched or anything is queued, because
+  // the alternative is worse than silence: the message would be recorded
+  // against a session nobody is going to finish, and the organizer would get
+  // no reply and no reason.
+  //
+  // Only reached when the chat has NO live session — a fresh deep link makes a
+  // new one and leaves the expired one alone, so `expiredSessionLanguage`
+  // checks for that. A `/start` never lands here anyway: it is a `reply`
+  // decision with its own text, not an interview one.
+  if (chatId) {
+    const closedIn = await expiredSessionLanguage(deps.db, chatId);
+    if (closedIn) {
+      await deps.telegram.sendMessage({ chatId, text: uiString("expiredWriteAfter", closedIn) });
+      log(structuredLog("info", "interview.write_after_expiry", { chat_id_present: true }));
+      return;
+    }
+  }
+
+  if (chatId) {
+    // The ATTACHMENT decides this, not the re-host. `media_urls` is populated
+    // only when re-hosting succeeded, so reading the floor off it gave a failed
+    // upload the ordinary 30s budget — the case where the agent has the most to
+    // do and the least to work with. Run 14: the watchdog closed such a turn 28
+    // seconds in, and every write the agent made after that was refused, so the
+    // organizer was told their answer could not be saved. `media_urls` is kept
+    // in the test as well, for a companion-route event that carries media
+    // without this flag.
+    const isDocumentTurn = decision.kind === "interview_to_gateway" &&
+      (decision.hadAttachment || (decision.event.media_urls?.length ?? 0) > 0);
+    await markAwaitingMachine(deps.db, chatId, isDocumentTurn ? DOCUMENT_FLOOR_SECONDS : undefined);
+  }
+
+  switch (decision.kind) {
+    case "reply":
+      await deps.telegram.sendMessage({
+        chatId: decision.reply.chatId,
+        text: decision.reply.text,
+        replyMarkup: decision.reply.replyMarkup,
+      });
+      return;
+
+    case "to_gateway": {
+      const delivered = deps.connector.pushInbound(decision.event);
+      if (delivered) return;
+      // Nothing queues. The gateway being down means this turn is gone, so the
+      // organizer is told rather than left waiting on an answer that is never
+      // coming — see RelayConnector.pushInbound's own note.
+      log(structuredLog("warn", "trip_bot.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
+      await deps.telegram.sendMessage({
+        chatId: decision.event.source.chat_id,
+        text: strings.gatewayUnavailable,
+      });
+      return;
+    }
+
+    case "show_summary":
+      await sendNextStep(decision.view, decision.chatId, deps, strings);
+      return;
+
+    case "interview_callback":
+      await applyInterviewCallback(decision, deps, strings, log);
+      return;
+
+    case "interview_to_gateway": {
+      // An upload gets an immediate acknowledgement, from the router rather
+      // than the agent. The agent's reply cannot arrive until it has READ the
+      // document, which on a PDF is exactly the wait this message exists to
+      // cover — so the one side that can answer instantly answers, and it can
+      // only do that in the organizer's language because the session records
+      // it. Requested during the 2026-09-04 run 3. Unaffected by the settle
+      // window below: the organizer should see this the instant the file
+      // lands, burst or not.
+      if ((decision.event.media_urls?.length ?? 0) > 0) {
+        const view = await getSessionForChat(deps.db, decision.chatId);
+        const language = view.ok ? view.view.language : DEFAULT_LANGUAGE;
+        // ONE acknowledgement, and this is it.
+        //
+        // The interpret path used to add a second from `runDocumentPath` after
+        // the burst settled, so the organizer got "קיבלתי — קורא את זה עכשיו…"
+        // and then, seconds later, "קיבלתי — אני קורא את זה עכשיו. זה לוקח
+        // דקה…" — the same sentence twice, with a question wedged between them.
+        //
+        // Said HERE rather than there because here is instant: the burst has a
+        // settle window and reading takes a minute, and the acknowledgement is
+        // the one message whose entire job is to arrive immediately. The
+        // interpret path's wording is the better one — it sets the
+        // expectation — so it is used when that path will do the reading.
+        await deps.telegram.sendMessage({
+          chatId: decision.chatId,
+          text: uiString(
+            (await isInterpretPath(deps.db, decision.chatId)) ? "documentReading" : "fileReceived",
+            language,
+          ),
+        });
+      }
+      // Queued, not forwarded. Run 9: five rapid messages used to mean five
+      // immediate forwards, each tearing down the turn the last one opened —
+      // Hermes kept each torn-down turn's own conversation loop running
+      // regardless, producing several uncoordinated agent invocations
+      // fighting over the same questions. Queuing lets a burst finish before
+      // exactly one turn opens for the whole thing. See
+      // `flushSettledInboundBursts` for the other half.
+      //
+      // The settle window is deliberate latency, and Dror named the fix for
+      // it unprompted: "the writing… signal give the feeling there is
+      // someone on the other side and smooth the 2 sec delay." Best-effort —
+      // if it fails, the organizer waits the same two seconds either way.
+      await deps.telegram.sendChatAction({ chatId: decision.chatId }).catch(() => {});
+      // The deadline moves before anything slow. A conversation that is
+      // happening must never expire under the person having it — including
+      // while a model call or a document read is still in flight.
+      await touchSessionDeadline(deps.db, decision.chatId);
+      await queueInboundMessage(deps.db, decision.chatId, decision.event);
+      return;
+    }
+
+    case "interview_text": {
+      // Which reply is honest depends on what is actually pending — see the
+      // interview_text doc in dispatch.ts.
+      const session = await getSessionForChat(deps.db, decision.chatId);
+      const pending = session.ok ? session.view.nextQuestion : null;
+      const isTappable = pending?.type === "choice" || pending?.type === "multi_choice";
+      if (!isTappable) {
+        log(structuredLog("info", "trip_bot.written_answer_unsupported", {
+          session_id: decision.sessionId,
+          question_id: pending?.id ?? null,
+          question_type: pending?.type ?? null,
+        }));
+      }
+      await deps.telegram.sendMessage({
+        chatId: decision.chatId,
+        text: isTappable ? strings.tapAnOption : strings.writtenAnswerUnsupported,
+      });
+      return;
+    }
+
+    case "approval_callback": {
+      // Reachable exactly when the trip bot and the signup bot are one bot.
+      if (!deps.approvals) {
+        // The tokens are different, so this update cannot be ours — some other
+        // callback shape arrived. Dropping it is right; handling it would mean
+        // acting on an approval this process was never given the config for.
+        log(structuredLog("warn", "trip_bot.approval_callback_unconfigured", {}));
+        return;
+      }
+      // Same ref-expansion + verification path POST /v1/signup/callback and
+      // telegram-poller.ts both use. The sender identity is derived from the
+      // update Telegram delivered to us, never from the callback payload —
+      // that distinction is the whole authorization story for this action.
+      const resolved = (await resolveTelegramCallbackRef(deps.db, decision.data)) ?? decision.data;
+      const senderDigest = digestTelegramId(decision.fromId);
+      const result = await processApprovalCallback(
+        deps.db, resolved, senderDigest, deps.approvals.config,
+      );
+      await deps.telegram.answerCallbackQuery({
+        callbackQueryId: decision.callbackQueryId,
+        text:
+          result.outcome === "approved" ? "Approved"
+            : result.outcome === "rejected" ? "Rejected"
+              : result.outcome === "already_decided" ? "Already decided"
+                : "Could not process this action",
+      });
+      if (result.outcome === "error") {
+        log(structuredLog("warn", "trip_bot.approval_rejected", { safe_error_code: result.reason }));
+      }
+      return;
+    }
+
+    case "group_intro": {
+      const sent = await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.text });
+      log(structuredLog("info", "trip_bot.group_intro_sent", { ok: sent.ok }));
+      // The copyable line, on its own, after the instructions that point at it.
+      if (sent.ok && decision.followUp) {
+        await deps.telegram.sendMessage({ chatId: decision.chatId, text: decision.followUp });
+      }
+      // Pinning is best-effort by design. An unpinned introduction is a worse
+      // introduction, never a failed arrival — and the overwhelmingly common
+      // reason it fails is simply that nobody made the bot an admin.
+      if (decision.pin !== false && sent.ok && sent.messageId && deps.telegram.pinChatMessage) {
+        const pinned = await deps.telegram.pinChatMessage({
+          chatId: decision.chatId,
+          messageId: sent.messageId,
+        });
+        log(structuredLog("info", "trip_bot.group_intro_pin", { pinned }));
+      }
+      return;
+    }
+
+    case "ignore":
+      log(structuredLog("info", "trip_bot.ignored", { reason: decision.reason }));
+      return;
+  }
+}
+
+/**
+ * A tapped interview button: record it, acknowledge the tap, ask what's next.
+ *
+ * Note what is NOT passed to the write: no session id and no token. The chat
+ * the tap arrived in is the authority, and `submitAnswerForChat` resolves it in
+ * the same transaction that stores the answer — so a replayed or forged
+ * callback_data can only claim an option within the session its own chat
+ * already owns.
+ */
+async function applyInterviewCallback(
+  decision: Extract<DispatchDecision, { kind: "interview_callback" }>,
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+): Promise<void> {
+  const parsed = parseCallbackData(decision.data);
+  const ack = (text?: string) =>
+    deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text });
+
+  /**
+   * Answer the tap, and do not let a concurrent scan swallow the answer.
+   *
+   * `applyDecision` hands the floor to the machine when a tap arrives, so a
+   * view built after that says `machine`. If the reply still goes out as
+   * nothing, the floor was taken from under it mid-send — the scan's own
+   * `sendNextStep` ends by handing the floor back to the organizer whenever
+   * the question is already on their screen, which for a SKIP is exactly the
+   * question that is no longer on it. One retry, on a fresh view.
+   *
+   * Only when the view we sent said `machine`: a view that says `person` means
+   * the floor was the organizer's before the tap was even processed — the
+   * agent's turn, say — and speaking over that is the duplicate-message bug
+   * the floor exists to prevent.
+   */
+  const respond = async (view: SessionView) => {
+    if (await sendNextStep(view, decision.chatId, deps, strings)) return;
+    if (view.awaiting !== "machine") return;
+    await markAwaitingMachine(deps.db, decision.chatId);
+    const fresh = await getSessionForChat(deps.db, decision.chatId);
+    if (fresh.ok) await sendNextStep(fresh.view, decision.chatId, deps, strings);
+  };
+
+  if (parsed.kind === "answer") {
+    const question = findQuestion(parsed.questionId);
+    if (!question) {
+      await ack("That question is no longer part of the interview.");
+      return;
+    }
+    // A multi_choice answer is a set, so it arrives as `toggle` taps and a
+    // Done, never as a single `answer`. Reaching here with one means a stale
+    // keyboard from before multi-select existed.
+    if (question.type === "multi_choice") {
+      log(structuredLog("warn", "trip_bot.multi_choice_tap_refused", { question_id: question.id }));
+      await ack("Tap the options, then Done.");
+      return;
+    }
+
+    const result = await submitAnswerForChat(deps.db, decision.chatId, parsed.questionId, parsed.optionId);
+    if (!result.ok) {
+      log(structuredLog("warn", "trip_bot.answer_rejected", {
+        session_id: decision.sessionId,
+        question_id: parsed.questionId,
+        safe_error_code: result.reason,
+      }));
+      await ack("I couldn't record that — try again.");
+      return;
+    }
+    await ack();
+    // Collapse the keyboard the instant it is answered. Raised live on
+    // 2026-09-05: a single-choice tap left its own buttons sitting on screen
+    // exactly as before, with nothing to say the tap had registered — "on a
+    // multiple answer question after clicking a button no immediate response
+    // is done feeling it stuck". The organizer's next message is often the
+    // NEXT question anyway, arriving on its own schedule; this is the one
+    // piece of feedback that can be immediate regardless of how long that
+    // takes, because it needs nothing from the agent at all.
+    if (decision.messageId) {
+      const picked = optionLabel(question, parsed.optionId, result.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${askText(question, result.view.language)}\n\n✅ ${picked}`,
+        replyMarkup: undefined,
+      });
+    }
+    await respond(result.view);
+    return;
+  }
+
+  if (parsed.kind === "toggle") {
+    const result = await toggleMultiChoiceForChat(
+      deps.db, decision.chatId, parsed.questionId, parsed.optionId,
+    );
+    if (!result.ok) {
+      log(structuredLog("warn", "trip_bot.toggle_rejected", {
+        session_id: decision.sessionId,
+        question_id: parsed.questionId,
+        safe_error_code: result.reason,
+      }));
+      await ack("I couldn't record that — try again.");
+      return;
+    }
+    await ack();
+    // Redraw in place rather than sending a new message: a multi-select takes
+    // several taps, and one message per tap would bury the question under its
+    // own keyboards.
+    const question = findQuestion(parsed.questionId);
+    if (question && decision.messageId) {
+      const rendered = renderQuestion(question, selectedOptionIds(result.view, parsed.questionId), result.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+    }
+    return;
+  }
+
+  if (parsed.kind === "multi_done" || parsed.kind === "skip") {
+    // Done on an untouched multi-select is a skip: the organizer looked at the
+    // question and had nothing to add, which is not the same as an empty
+    // selection meaning "none of these apply".
+    const question = findQuestion(parsed.questionId);
+    const beforeFinalize = await getSessionForChat(deps.db, decision.chatId);
+    const chosenBefore = beforeFinalize.ok ? selectedOptionIds(beforeFinalize.view, parsed.questionId) : [];
+    const view = await (async () => {
+      if (parsed.kind === "skip") {
+        return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
+      }
+      if (chosenBefore.length === 0) {
+        return skipQuestionForChat(deps.db, decision.chatId, parsed.questionId);
+      }
+      // What ENDS the selection. Every tick wrote itself already; this is the
+      // moment the question counts as answered and the interview may move on.
+      return finalizeMultiChoiceForChat(deps.db, decision.chatId, parsed.questionId);
+    })();
+    if (!view.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    // Same collapse as a single-choice answer, once the multi-select is
+    // actually finalized rather than mid-tick: the live keyboard with its
+    // ticks is what the organizer needs while choosing, and exactly what
+    // should stop inviting taps the moment Done or Skip is pressed.
+    if (question && decision.messageId) {
+      const summary = chosenBefore.length > 0
+        ? chosenBefore.map((id) => optionLabel(question, id, view.view.language)).join(", ")
+        : uiString("skipped", view.view.language);
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${askText(question, view.view.language)}\n\n✅ ${summary}`,
+        replyMarkup: undefined,
+      });
+    }
+    // THE FLOOR, for this tap only.
+    //
+    // `skipQuestionForChat` and `finalizeMultiChoiceForChat` return views whose
+    // `awaiting` is `buildSessionView`'s default — "person" — regardless of the
+    // session. `sendNextStep` reads the floor off the view it is given and says
+    // nothing while it is the organizer's turn, so a tapped Skip recorded the
+    // skip, collapsed the keyboard to "(דילגו)", and then said nothing at all.
+    // Two minutes of that on 2026-09-12, until the organizer typed something
+    // and the interpret path carried on as normal.
+    //
+    // The machine owes this message: `applyDecision` took the floor when the
+    // tap arrived. Said here rather than in the view builders because a
+    // truthful floor everywhere also lets the router speak over an agent
+    // mid-turn, which is a different question with its own tests.
+    await respond({ ...view.view, awaiting: "machine" });
+    return;
+  }
+
+  if (parsed.kind === "no_document") {
+    // Nothing to record — the offer was a courtesy, and declining it just
+    // starts the questions. It does end the opening PHASE, though: without a
+    // marker an organizer who taps past the offer and then says nothing would
+    // sit in `opening` forever, since no answer exists to move them on.
+    await markOpeningDoneForChat(deps.db, decision.chatId);
+    const view = await getSessionForChat(deps.db, decision.chatId);
+    if (!view.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await respond(view.view);
+    return;
+  }
+
+  if (parsed.kind === "more") {
+    const result = await askForMoreForChat(deps.db, decision.chatId);
+    if (!result.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await respond(result.view);
+    return;
+  }
+
+  if (parsed.kind === "finish") {
+    const result = await setFinishRequestedForChat(deps.db, decision.chatId, true);
+    if (!result.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    await respond(result.view);
+    return;
+  }
+
+  if (parsed.kind === "confirm") {
+    // READ THE SESSION FIRST. `getSessionForChat` filters on
+    // `state <> 'confirmed'`, and confirming sets exactly that state — so once
+    // the confirm below succeeds this view can never be fetched again. Reading
+    // it afterwards returned NOT_FOUND every single time, which silently cost
+    // two things: the confirmation message fell back to English on a Hebrew
+    // interview, and `provisionOnConfirm` sat inside an `if (view.ok)` that was
+    // never true, so confirming built nothing and did not even log why.
+    const sessionBeforeConfirm = await getSessionForChat(deps.db, decision.chatId);
+    const result = await confirmIntakeForChat(deps.db, decision.chatId, log);
+    if (!result.ok) {
+      log(structuredLog("warn", "trip_bot.confirm_rejected", {
+        session_id: decision.sessionId,
+        safe_error_code: result.reason,
+      }));
+      await ack("I couldn't confirm that yet.");
+      await deps.telegram.sendMessage({
+        chatId: decision.chatId,
+        text:
+          result.reason === "NOT_ALL_REQUIRED_ANSWERED"
+            ? "There are still a few things I need before we lock this in."
+            : "Something went wrong confirming that. Nothing was lost — try again in a moment.",
+      });
+      return;
+    }
+    await ack("Confirmed");
+    // In the interview's own language, and naming the assistant they chose.
+    const confirmedView = sessionBeforeConfirm;
+    const confirmedLanguage = confirmedView.ok ? confirmedView.view.language : DEFAULT_LANGUAGE;
+    const named = await answersForChat(deps.db, decision.chatId);
+    const botName = (() => {
+      const answer = named?.answers.bot_name as { text?: unknown } | undefined;
+      const raw = typeof answer?.text === "string" ? answer.text.trim() : "";
+      // A name with markup or a newline in it would arrive as a broken
+      // sentence; better to fall back than to send something mangled.
+      return raw && raw.length <= 60 && !/[<>\n]/.test(raw) ? raw : "";
+    })();
+    await deps.telegram.sendMessage({
+      chatId: decision.chatId,
+      text: botName
+        ? uiString("intakeConfirmed", confirmedLanguage).replace("{name}", botName)
+        : uiString("intakeConfirmedNoName", confirmedLanguage),
+    });
+
+    // CONFIRMING IS THE APPROVAL, so provisioning starts here.
+    //
+    // A finished interview used to sit with no plan and no job, waiting for the
+    // organizer to approve — in a SPA — the thing they had just approved in the
+    // conversation. That is a second decision about the first one, and the
+    // button for it is not deployed.
+    //
+    // Best-effort by design: the intake is already confirmed and immutable, and
+    // the organizer has just been told their site is being built. A failure here
+    // is an operational problem to be retried, not something to take back.
+    if (confirmedView.ok) {
+      // The trip's owner, read from the membership rather than carried on the
+      // confirm result: `issueApproval` records WHO approved, and that has to
+      // be the organizer, not whichever session happened to be open.
+      const owner = await deps.db.query<{ user_id: string }>(
+        `SELECT user_id FROM control_plane.trip_memberships
+          WHERE trip_id = $1 AND role = 'owner' AND status = 'active' LIMIT 1`,
+        [confirmedView.view.tripId],
+      );
+      const ownerId = owner.rows[0]?.user_id ?? "";
+      const provisioned = await provisionOnConfirm(deps.db, confirmedView.view.tripId, ownerId)
+        .catch((error: unknown) => ({ ok: false as const, stage: "plan" as const, reason: String((error as Error)?.message ?? error) }));
+      log(structuredLog(provisioned.ok ? "info" : "warn", "interview.provisioning_started", {
+        session_id: confirmedView.view.sessionId,
+        trip_id: confirmedView.view.tripId,
+        ...(provisioned.ok ? { plan_id: provisioned.planId } : { stage: provisioned.stage, safe_error_code: provisioned.reason }),
+      }));
+    }
+    return;
+  }
+
+  if (parsed.kind === "keep_planning") {
+    // Clearing the finish request is what makes this button mean something. It
+    // used to print this sentence and leave the state untouched, so the recap
+    // returned on the very next answer and the organizer was back where they
+    // started — the loop the 2026-09-04 run hit twice.
+    const result = await setFinishRequestedForChat(deps.db, decision.chatId, false);
+    await ack();
+    await deps.telegram.sendMessage({
+      chatId: decision.chatId,
+      text: uiString("keepPlanningReply", result.ok ? result.view.language : DEFAULT_LANGUAGE),
+    });
+    // With optional questions still open, offering the next one beats waiting
+    // for the organizer to invent a topic. Multi-select is tappable now, so
+    // the old reason for not doing this is gone.
+    if (result.ok && result.view.nextQuestion) {
+      await respond(result.view);
+    }
+    return;
+  }
+
+  await ack();
+  log(structuredLog("info", "trip_bot.unknown_callback", { session_id: decision.sessionId }));
+}
+
+/**
+ * Sends whatever comes after an answer lands: the next question, or the
+ * confirm prompt once every required question is answered.
+ */
+/**
+ * Sends the next question — with its buttons — for every interview the agent
+ * has just written to.
+ *
+ * This is the return half of the router/agent split. The agent resolves what
+ * an organizer meant and records it; the router asks what comes next, because
+ * only the router can draw a keyboard. Before this existed, the first typed
+ * answer ended the tap flow permanently and a finished interview had no
+ * Confirm button at all.
+ *
+ * Failures are swallowed per session: one chat whose send fails must not stop
+ * the poll loop or block the other claims in the batch.
+ */
+/**
+ * Takes the floor back from an interviewer that has gone quiet, and speaks.
+ *
+ * The one failure Track 4 introduced. Making the agent the only voice removed
+ * chain-of-thought leaks, numbered lists and both floods — but it also means a
+ * stalled agent leaves the organizer looking at nothing, where before they at
+ * least got a stray message. Runs 4 and 6 both stalled, so this is a failure
+ * that has already happened twice rather than one being pre-empted.
+ *
+ * `claimStalledAgentTurns` closes the turn; `sendNextStep` then draws the next
+ * question from `intake-copy.ts` — the router's own copy, in the interview's
+ * language. Flat next to the agent's phrasing, and infinitely better than a
+ * conversation that simply stops.
+ */
+
+/**
+ * Delivers every burst of inbound messages that has gone quiet, as ONE
+ * message through ONE opened turn.
+ *
+ * This is `queueInboundMessage`'s other half. Run 9: five rapid messages used
+ * to mean five immediate, independent forwards, each tearing down the turn
+ * the last one opened while Hermes kept the torn-down turn's own conversation
+ * loop running regardless — several uncoordinated agent invocations fighting
+ * over the same questions. Waiting for the burst to settle and forwarding it
+ * once removes the race at its source: there is only ever one turn for one
+ * burst.
+ *
+ * Text joins with newlines — five lines about five travellers reads as one
+ * paragraph, not five separate messages run together. Media rides on the
+ * LAST queued event that carried any: a document arriving mid-burst is the
+ * rare case, and whichever one is freshest is the one worth keeping if more
+ * than one somehow lands in the same window.
+ */
+/**
+ * Folds a settled burst of inbound messages into the single event the agent
+ * sees.
+ *
+ * The organizer sends several things in one go — a sentence, then four files,
+ * then another sentence — and each arrives as its own Telegram update. They are
+ * one utterance, so they become one turn.
+ *
+ * EVERY FILE IS KEPT. Until 2026-09-07 this took the media of the last event
+ * that had any and discarded the rest: an organizer who uploaded five documents
+ * describing their trip had four silently dropped, and the assistant answered
+ * about one. From their side it read as being ignored, on files the bot had
+ * visibly accepted.
+ *
+ * Identity comes from the LAST message — that is the one the organizer is
+ * looking at — while text and media accumulate across all of them, in the order
+ * they were sent.
+ */
+export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEvent | null {
+  const last = events[events.length - 1];
+  if (!last) return null;
+
+  const mediaUrls = events.flatMap((e) => e.media_urls ?? []);
+  const media = events.flatMap((e) => e.media ?? []);
+  const text = events
+    .map((e) => e.text)
+    .filter((t) => t.trim().length > 0)
+    .join("\n");
+
+  return {
+    ...last,
+    text,
+    // Absent rather than empty when nothing was attached: an empty array is a
+    // claim that media was considered, and downstream reads `?.length` either
+    // way.
+    ...(mediaUrls.length ? { media_urls: mediaUrls } : {}),
+    ...(media.length ? { media } : {}),
+  };
+}
+
+/** The attachments in a burst, resolved back out of the relay's media store. */
+function documentsInBurst(
+  combined: WireMessageEvent,
+  deps: TripBotPollerDeps,
+): { bytes: Uint8Array; mime: string; filename?: string }[] {
+  const store = deps.media?.store;
+  if (!store?.get) return [];
+  const out: { bytes: Uint8Array; mime: string; filename?: string }[] = [];
+  for (const url of combined.media_urls ?? []) {
+    // The wire carries `{connector}/relay/media/{id}` — a URL rather than the
+    // bytes, because a Telegram file URL embeds the bot token and must never
+    // cross. Reading it back locally by id skips an HTTP round trip to
+    // ourselves and, more to the point, cannot be redirected anywhere.
+    const id = url.split("/").pop() ?? "";
+    const stored = id ? store.get(id) : null;
+    if (!stored) continue;
+    out.push({
+      bytes: new Uint8Array(stored.bytes),
+      mime: stored.mime,
+      ...(stored.filename ? { filename: stored.filename } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * Read what was uploaded, say what it said, and ask only for what is left.
+ *
+ * The shape of this is the product requirement, in order: acknowledge
+ * immediately (reading takes about ninety seconds and silence for that long
+ * reads as broken), read, report back what was taken so it can be corrected,
+ * then carry on with the questions the document could not answer.
+ *
+ * Every extracted answer goes through `applyProposals` exactly like a typed
+ * one. A document is not a privileged source — nothing here can write an
+ * option id that does not exist, and a proposal quoting text that is not in
+ * the file is refused before it is validated.
+ */
+async function runDocumentPath(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  documents: { bytes: Uint8Array; mime: string; filename?: string }[],
+  state: { outstanding: string[]; answered: string[] },
+  language: Language,
+  log: (line: string) => void,
+): Promise<void> {
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const say = async (text: string) => {
+    await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => {});
+  };
+
+  // The acknowledgement was already sent, the instant the file landed — see
+  // `interview_to_gateway` in `applyDecision`. Sending it again here is what
+  // produced the same sentence twice on 2026-09-09.
+
+  const texts: string[] = [];
+  let unreadable = 0;
+  let identity = 0;
+  for (const doc of documents) {
+    const read = await documentText(doc.bytes, doc.mime, doc.filename);
+    if (read.ok) {
+      texts.push(read.text);
+      log(structuredLog("info", "interview.document_read", {
+        session_id: burst.sessionId,
+        pages: read.pages,
+        chars: read.text.length,
+        truncated: read.truncated,
+      }));
+    } else if (read.reason === "IDENTITY_DOCUMENT") {
+      // Not a failure and not logged as one: refusing a passport is the
+      // system working. No detail either — there is nothing about it worth
+      // recording beyond that one arrived and was left alone.
+      identity += 1;
+      log(structuredLog("info", "interview.document_identity_refused", { session_id: burst.sessionId }));
+    } else {
+      unreadable += 1;
+      log(structuredLog("warn", "interview.document_unreadable", {
+        session_id: burst.sessionId,
+        reason: read.reason,
+        detail: read.detail,
+      }));
+    }
+  }
+
+  const ask = async () => {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
+  };
+
+  // Said whenever one arrived, even alongside readable files — someone who
+  // sent a passport should be told it was left unread, not have it silently
+  // disappear into a batch.
+  if (identity > 0) await say(uiString("documentIdentity", language));
+
+  if (texts.length === 0) {
+    if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
+    await ask();
+    return;
+  }
+
+  // Several files are read as ONE document. Five uploads describing one trip
+  // are one trip: extracting each separately would produce five competing
+  // `phases` proposals and let the last one win on nothing better than order.
+  const source = texts.join("\n\n");
+
+  // KEEP IT. The relay's media store is in-memory with a TTL, so once the
+  // extraction has run the document is gone — and a confirmed intake built from
+  // a four-page itinerary carried `source_document: null`, with no way to ask
+  // later where any of it came from, or to re-extract when the extractor gets
+  // better. The agent path has always staged it; the interpret path never did.
+  void saveSourceDocumentForChat(deps.db, burst.chatId, source, documents[0]?.filename)
+    .catch(() => { /* best-effort, exactly like the agent path's */ });
+
+  if (!deps.modelRunner) {
+    await say(uiString("documentNothing", language));
+    await ask();
+    return;
+  }
+
+  await markReadingDocument(deps.db, burst.chatId, true);
+  try {
+    await readDocumentInto(deps, burst, source, state, language, say, ask, log);
+  } finally {
+    await markReadingDocument(deps.db, burst.chatId, false);
+  }
+}
+
+/** The read itself — everything that must happen before the router speaks. */
+async function readDocumentInto(
+  deps: TripBotPollerDeps,
+  burst: { chatId: string; sessionId: string },
+  source: string,
+  state: { outstanding: string[]; answered: string[] },
+  language: Language,
+  say: (text: string) => Promise<void>,
+  ask: () => Promise<void>,
+  log: (line: string) => void,
+): Promise<void> {
+  if (!deps.modelRunner) return;
+  const result = await extractIntakeFromDocument(deps.modelRunner, {
+    documentText: source,
+    outstanding: state.outstanding,
+    language,
+    timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS,
+  });
+
+  if (!result.ok) {
+    log(structuredLog("warn", "interview.document_extract_failed", {
+      session_id: burst.sessionId,
+      reason: result.reason,
+      ms: result.ms,
+      // The detail was already being carried and thrown away, which made the
+      // first live BAD_OUTPUT unexplainable: the model answered, the parser
+      // refused it, and nothing anywhere said what it had actually returned.
+      // Truncated, and it is model output about a document the organizer chose
+      // to share — enough to diagnose the shape, not a copy of their booking.
+      detail: (result.detail ?? "").slice(0, 300),
+    }));
+    await say(uiString("documentExtractFailed", language));
+    await ask();
+    return;
+  }
+
+  const decisions = applyProposals(result.payload.proposals, {
+    sourceText: source,
+    outstanding: state.outstanding,
+    answered: state.answered,
+    unclear: result.payload.unclear,
+  });
+
+  const recorded: string[] = [];
+  for (const accepted of decisions.accepted) {
+    const args = submitArgsFor(accepted.proposal.value);
+    const written = await submitAnswerForChat(
+      deps.db, burst.chatId, accepted.questionId,
+      args.optionId, args.otherText, args.structuredData, args.optionIds,
+    );
+    if (written.ok) recorded.push(accepted.questionId);
+    else {
+      log(structuredLog("warn", "interview.document_write_refused", {
+        session_id: burst.sessionId,
+        question_id: accepted.questionId,
+        reason: written.reason,
+      }));
+    }
+  }
+
+  log(structuredLog("info", "interview.document_committed", {
+    session_id: burst.sessionId,
+    // PROPOSED vs ACCEPTED, and MALFORMED alongside both — the interpret log
+    // has carried all three from the start and this one carried neither.
+    // 2026-09-10: a real booking PDF read cleanly (4 pages, 4708 chars) and
+    // committed `accepted: 0, rejected: 0`. Those two numbers cannot tell you
+    // whether the model proposed nothing, or proposed things that never
+    // survived parsing — and the same document through
+    // `tools/extract-intake-check.ts` proposed four and had all four accepted.
+    // A whole session went into distinguishing two cases one field separates.
+    proposed: result.payload.proposals.length,
+    malformed: result.payload.malformed ?? 0,
+    accepted: decisions.accepted.length,
+    // An answer assembled from several proposals for one question — the case
+    // that, before merging, silently dropped a document's attractions.
+    merged: decisions.accepted.filter((a) => a.mergedFrom).length,
+    rejected: decisions.rejected.length,
+    reasons: decisions.rejected.map((r) => r.reason),
+    // WHICH question was refused, not only how many and why. "rejected: 1,
+    // reasons: [EVIDENCE_NOT_IN_SOURCE]" cost a live diagnosis on 2026-09-12:
+    // the organizer was asked for every stop and date their document had
+    // already given, and nothing in the log said it was `phases` that fell.
+    rejected_questions: decisions.rejected.map((r) => `${r.questionId}:${r.reason}`),
+    ms: result.ms,
+  }));
+
+  if (recorded.length === 0) {
+    await say(uiString("documentNothing", language));
+    await ask();
+    return;
+  }
+
+  // WHAT IT TOOK, in the organizer's own recap format, so they can correct it.
+  // An answer they never gave and cannot see is worse than being asked twice.
+  const view = await getSessionForChat(deps.db, burst.chatId);
+  if (view.ok) {
+    const answers = await answersForChat(deps.db, burst.chatId);
+    const lines = buildRecap(answers?.answers ?? {}, INTAKE_QUESTIONS, language)
+      .filter((entry) => recorded.includes(entry.questionId))
+      .map((entry) => `• ${entry.prompt}: ${entry.answerLabel}`);
+    // THE PLANNED PLACES, shown explicitly.
+    //
+    // They live inside `phases[].planned`, and the recap renders a phase by its
+    // NAME — so "Tokyo, Hakone, Kyoto" appeared and TeamLab, Skytree and the
+    // rest were invisible. They had been extracted correctly; the organizer
+    // reasonably read their absence as the document not having been understood,
+    // which is the one thing this message exists to prevent.
+    const planned: string[] = [];
+    for (const entry of (answers?.answers.phases as { data?: unknown } | undefined)?.data as
+      | { planned?: unknown }[]
+      | undefined ?? []) {
+      for (const place of Array.isArray(entry?.planned) ? entry.planned : []) {
+        if (typeof place === "string" && place.trim()) planned.push(place.trim());
+      }
+    }
+    const unique = [...new Set(planned)];
+    if (unique.length > 0) {
+      const shown = unique.slice(0, 12).join(", ");
+      lines.push(`• ${uiString("documentPlanned", language)}: ${shown}${unique.length > 12 ? ` +${unique.length - 12}` : ""}`);
+    }
+
+    if (lines.length > 0) {
+      await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
+    }
+  }
+  await ask();
+
+  // LAST, and deliberately. The itinerary extraction is a second model call,
+  // and the general one above already takes minutes — running it before the
+  // recap left an organizer watching nothing happen for seven minutes on
+  // 2026-09-12, having been told the document was being read. What they were
+  // waiting for was already written; only the day-by-day was still coming.
+  //
+  // So they get the recap and the next question first, and the itinerary lands
+  // behind it, on a `phases` answer that is already recorded.
+  await foldItineraryFromDocument(deps, burst, source, log, say, language);
+}
+
+/**
+ * The interview without an agent: interpret one settled burst, write what
+ * survives the gate, then let the router ask what it always would have.
+ *
+ * Every message the organizer sees still comes from `intake-copy.ts` by way of
+ * `sendNextStep`. Nothing the model returns reaches a screen — its whole output
+ * is `ProposedAnswer[]`, and `applyProposals` decides what any of it is allowed
+ * to write. That is the entire difference from the agent path.
+ *
+ * Failure is a value at every step. No runner, a rate limit, unparseable
+ * output, low confidence, evidence that is not in the message — each of them
+ * lands in the same place: the router asks its own question. A slower
+ * interview, never a silent one.
+ *
+ * Design: docs/interview-without-an-agent.md §3, §4, §6.
+ */
+async function runInterpretPath(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  combined: WireMessageEvent,
+  log: (line: string) => void,
+): Promise<void> {
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const sourceText = combined.text ?? "";
+  const messageIds = combined.message_id ? [combined.message_id] : [];
+  const key = burstKey(messageIds, sourceText);
+
+  // TAKE THE FLOOR FIRST, before anything slow.
+  //
+  // The organizer has just written, so it is the machine's turn — and on the
+  // agent path that transition came free with `openAgentTurn`, which this path
+  // deliberately never calls. Without it `sendNextStep` returns silently at its
+  // `awaiting === "person"` guard and `claimFloor` refuses, so every answer
+  // would be recorded correctly and the interview would go quiet: the exact
+  // symptom of runs 14–15, arrived at from the opposite direction.
+  //
+  // A document burst has already been given the wider DOCUMENT_FLOOR_SECONDS
+  // by the caller; do not narrow it here.
+  if ((combined.media_urls?.length ?? 0) === 0) {
+    await markAwaitingMachine(deps.db, burst.chatId, AGENT_FLOOR_SECONDS);
+  }
+
+  /**
+   * THE ORGANIZER SPOKE, SO SOMETHING IS OWED BACK.
+   *
+   * `sendNextStep` legitimately says nothing in several situations — the floor
+   * is not ours, the next thing is already on screen and the dedupe refuses to
+   * repeat it, the state is one it does not speak for. Every one of those is
+   * correct when NOBODY has spoken. After an organizer's message it is a
+   * dead end: they typed, and the interview went quiet.
+   *
+   * Live on 2026-09-10. The boundary offer — "add more details, or shall I
+   * show you a summary?" — carries both buttons, and the organizer answered it
+   * in words instead: "לא". `interpret` did its job and proposed nothing,
+   * because "no" answers the offer rather than any question in the schema.
+   * Nothing was owed by the ordinary rules, the dedupe held the line, and the
+   * session sat on `awaiting = 'machine'` until it expired. From the outside
+   * that is indistinguishable from a broken bot.
+   *
+   * So: if we said nothing, say we did not follow, and put back exactly what
+   * we are waiting for — with its buttons, so there is always a tap available
+   * to someone whose words we cannot parse. Never a bare "I didn't
+   * understand": that is the message that makes a person guess.
+   */
+  const ask = async () => {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (!after.ok) return;
+    if (await sendNextStep(after.view, burst.chatId, deps, strings)) return;
+    await restateExpectation(after.view, burst.chatId, deps, "NOT_UNDERSTOOD");
+  };
+
+  // Idempotency (§6). A redelivered burst, or a retry after the relay died
+  // mid-call, finds the row rather than paying for a second model call and
+  // writing the answers twice.
+  const claim = await claimInterpretation(deps.db, {
+    sessionId: burst.sessionId,
+    chatId: burst.chatId,
+    burstKey: key,
+    sourceText,
+  });
+  if (!claim.fresh && claim.row.committedAt) {
+    log(structuredLog("info", "interview.interpret_replayed", {
+      session_id: burst.sessionId,
+      burst_key: key,
+    }));
+    // Committed already, but the organizer may never have seen the question
+    // that followed — asking again is safe (the flood dedupe suppresses a
+    // genuine repeat), staying silent is not.
+    await ask();
+    return;
+  }
+
+  const state = await questionStateForChat(deps.db, burst.chatId);
+  if (!state) return;
+  const session = await getSessionForChat(deps.db, burst.chatId);
+  const language = session.ok ? session.view.language : DEFAULT_LANGUAGE;
+
+  // A DOCUMENT. Read it, and let what it says answer questions.
+  //
+  // Handled before the text branch and instead of it: someone who uploads a
+  // booking and types "it's all in here" has said nothing interpretable, and
+  // the file is the message. The whole exchange — acknowledge, read, report
+  // back, ask only for what is left — is the reason accepting a file is worth
+  // anything, and until now the bot accepted files and read none of them.
+  const documents = documentsInBurst(combined, deps);
+  if (documents.length > 0) {
+    await runDocumentPath(deps, burst, documents, state, language, log);
+    return;
+  }
+  // Which question is currently on the organizer's screen. Needed after the
+  // commit, to decide whether the interview may move past it — see `pace`.
+  const onScreen = session.ok && session.view.lastPrompt?.startsWith("q:")
+    ? session.view.lastPrompt.slice(2)
+    : null;
+
+  const interpretationId = claim.fresh ? claim.id : claim.row.id;
+  let proposals: ProposedAnswer[];
+  let malformed = 0;
+
+  if (!claim.fresh) {
+    // The crash window: the model answered, the commit did not land. Resume
+    // from what was stored rather than asking again — the answer is already
+    // paid for and re-asking could return something different.
+    proposals = claim.row.proposals;
+    log(structuredLog("info", "interview.interpret_resumed", {
+      session_id: burst.sessionId,
+      burst_key: key,
+      proposals: proposals.length,
+    }));
+  } else if (!deps.modelRunner) {
+    await recordInterpretationResult(deps.db, interpretationId, {
+      failureReason: "NOT_CONFIGURED",
+      attempts: 0,
+      durationMs: 0,
+    });
+    await markInterpretationCommitted(deps.db, interpretationId, { askAnyway: state.outstanding.slice(0, 1) });
+    await ask();
+    return;
+  } else {
+    const result = await interpretBurst(deps.modelRunner, {
+      sourceText,
+      outstanding: state.outstanding,
+      language,
+      onScreen,
+      messageIds,
+    });
+    if (!result.ok) {
+      log(structuredLog("warn", "interview.interpret_failed", {
+        session_id: burst.sessionId,
+        reason: result.reason,
+        attempts: result.attempts,
+        ms: result.ms,
+      }));
+      await recordInterpretationResult(deps.db, interpretationId, {
+        failureReason: result.reason,
+        attempts: result.attempts,
+        durationMs: result.ms,
+      });
+      await markInterpretationCommitted(deps.db, interpretationId, { askAnyway: state.outstanding.slice(0, 1) });
+      await ask();
+      return;
+    }
+    proposals = result.payload.proposals;
+    malformed = result.payload.malformed;
+    await recordInterpretationResult(deps.db, interpretationId, {
+      proposals,
+      attempts: result.attempts,
+      durationMs: result.ms,
+    });
+    log(structuredLog("info", "interview.interpret_ok", {
+      session_id: burst.sessionId,
+      proposals: proposals.length,
+      unclear: result.payload.unclear.length,
+      malformed,
+      attempts: result.attempts,
+      ms: result.ms,
+    }));
+  }
+
+  const decisions = applyProposals(proposals, {
+    sourceText,
+    outstanding: state.outstanding,
+    answered: state.answered,
+    unclear: [],
+    // The reply to the question we just asked is not a volunteered guess, and
+    // the confidence floor must not send the router round again to ask it a
+    // second time. See ApplyProposalsContext.pendingQuestionId.
+    pendingQuestionId: onScreen,
+  });
+
+  for (const accepted of decisions.accepted) {
+    const args = submitArgsFor(accepted.proposal.value);
+    const written = await submitAnswerForChat(
+      deps.db,
+      burst.chatId,
+      accepted.questionId,
+      args.optionId,
+      args.otherText,
+      args.structuredData,
+      args.optionIds,
+    );
+    if (!written.ok) {
+      // The gate passed it and the write refused it — the two validators
+      // disagreeing is worth seeing, not swallowing.
+      log(structuredLog("warn", "interview.interpret_write_refused", {
+        session_id: burst.sessionId,
+        question_id: accepted.questionId,
+        reason: written.reason,
+      }));
+    }
+  }
+
+  log(structuredLog("info", "interview.interpret_committed", {
+    session_id: burst.sessionId,
+    accepted: decisions.accepted.length,
+    merged: decisions.accepted.filter((a) => a.mergedFrom).length,
+    rejected: decisions.rejected.length,
+    reasons: decisions.rejected.map((r) => r.reason),
+  }));
+
+  // ACKNOWLEDGE AN OPEN ANSWER, and only an open one.
+  //
+  // Typing a list of names into a chat window and getting nothing back but the
+  // next question is the part that feels unheard. A BUTTON does not need this:
+  // the keyboard disappears and the next question arrives, which is already
+  // confirmation, and a message on top of it is noise.
+  //
+  // The understood VALUE goes with it, because that is the whole point — the
+  // organizer needs to see that it landed the way they meant, while correcting
+  // it is still cheap. Warmth without the value would be flattery; the value
+  // without warmth is a receipt.
+  const open = decisions.accepted.filter((a) => {
+    const q = INTAKE_QUESTIONS.find((x) => x.id === a.questionId);
+    return q?.type === "text" || q?.type === "structured";
+  });
+  if (open.length > 0) {
+    const said = await getSessionForChat(deps.db, burst.chatId);
+    const store = await answersForChat(deps.db, burst.chatId);
+    if (said.ok && store) {
+      const lines = buildRecap(store.answers, INTAKE_QUESTIONS, said.view.language)
+        .filter((entry) => open.some((a) => a.questionId === entry.questionId))
+        .map((entry) => `${entry.prompt}: ${entry.answerLabel}`);
+      if (lines.length === 1) {
+        await deps.telegram
+          .sendMessage({ chatId: burst.chatId, text: `${uiString("gotIt", said.view.language)} — ${lines[0]}` })
+          .catch(() => {});
+      } else if (lines.length > 1) {
+        await deps.telegram
+          .sendMessage({
+            chatId: burst.chatId,
+            text: `${uiString("gotItMore", said.view.language)}\n\n${lines.map((l) => `• ${l}`).join("\n")}`,
+          })
+          .catch(() => {});
+      }
+    }
+  }
+  await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
+
+  // PACING. An OPTIONAL question that was on screen and did not get answered
+  // is put behind us, so the interview moves to the next one.
+  //
+  // Without this the interview stalls, and the first end-to-end run showed it:
+  // every required question answered, then fifteen turns in a row on
+  // `travel_anchors` because the organizer's replies did not answer it and
+  // `optionalRemaining[0]` is always the same question. The flood dedupe
+  // suppressed the repeat, so the organizer saw nothing at all — the interview
+  // simply went quiet on a path that was working perfectly.
+  //
+  // On the agent path this was the agent's job: `ask_question_for_chat` decides
+  // WHICH optional question is worth asking now, what app.ts calls "the pacing
+  // half of the split". Removing the agent removed the pacing with it, and this
+  // is the deterministic rule that replaces it: each optional question is
+  // offered exactly once, in order, and then the interview goes on.
+  //
+  // Required questions are deliberately NOT skipped — the interview cannot
+  // proceed without them, so it re-asks, which is the behaviour it already had.
+  const unanswered = onScreen && !decisions.accepted.some((a) => a.questionId === onScreen);
+  const onScreenQuestion = onScreen ? INTAKE_QUESTIONS.find((q) => q.id === onScreen) : undefined;
+
+  if (unanswered && onScreenQuestion && !onScreenQuestion.required && !state.answered.includes(onScreen)) {
+    await skipQuestionForChat(deps.db, burst.chatId, onScreen);
+    log(structuredLog("info", "interview.optional_passed_over", {
+      session_id: burst.sessionId,
+      question_id: onScreen,
+    }));
+  }
+
+  // THE SILENCE. A REQUIRED question cannot be skipped, so when the organizer
+  // writes something that does not answer it the router still wants the same
+  // question — and `sendNextStep`'s "never send the same message twice" then
+  // suppresses it and sends nothing at all.
+  //
+  // Found live on 2026-09-08, first real run: three answers recorded perfectly,
+  // then a message about a document, then silence with `prompt_deduped
+  // q:departure_date` as the last thing in the log. The organizer spoke and got
+  // nothing back.
+  //
+  // The dedupe is right and stays — repeating a question verbatim is what runs
+  // 5 and 6 paid to stop. What was missing is the agent's other job: saying the
+  // same question a DIFFERENT way when a reply did not answer it. The stall
+  // watchdog already does exactly this for the agent path (distinct opening
+  // line, same question, buttons intact) and deliberately suppresses itself
+  // when the question is already on screen, because there nobody has spoken
+  // since. Here somebody has — which is precisely what makes re-asking an
+  // answer rather than noise.
+  if (unanswered && onScreenQuestion?.required && !state.answered.includes(onScreen)) {
+    await deferQuestionForChat(deps.db, burst.chatId, onScreen);
+    log(structuredLog("info", "interview.required_deferred", {
+      session_id: burst.sessionId,
+      question_id: onScreen,
+    }));
+  }
+
+  // The floor was taken when the burst arrived; the router speaks now. If the
+  // interview is at the boundary with an answer still set aside, that is
+  // `sendNextStep`'s to handle — for every path, not only this one.
+  //
+  // Deferring costs nothing because `confirmIntake` refuses without a required
+  // answer regardless; the only question was ever WHEN to come back for it:
+  // immediately, which pesters ("עוד צריך את זה: מתי הטיול מתחיל?" after every
+  // message about something else), or at the point it blocks something.
+  await ask();
+}
+
+export async function flushSettledInboundBursts(
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+  settleSeconds?: number,
+): Promise<void> {
+  let bursts: Awaited<ReturnType<typeof claimSettledInboundBursts>>;
+  try {
+    bursts = settleSeconds === undefined
+      ? await claimSettledInboundBursts(deps.db)
+      : await claimSettledInboundBursts(deps.db, 10, settleSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.inbound_burst_claim_failed", {}));
+    return;
+  }
+  for (const burst of bursts) {
+    try {
+      const events = burst.events as WireMessageEvent[];
+      const combined = combineBurst(events);
+      if (!combined) continue;
+
+      log(structuredLog("info", "trip_bot.inbound_burst_flushed", {
+        session_id: burst.sessionId,
+        messages_combined: events.length,
+      }));
+
+      // Same ordering as the old single-message path: the turn opens BEFORE
+      // the event goes out, so the agent may call back the moment it is
+      // handed the turn without racing a turn opened afterward.
+      // A burst carrying files is a document turn, and gets the wider floor —
+      // more so than a single upload, since the agent now has several to read.
+      // This path builds its own event rather than going through
+      // `applyDecision`, so it has to say so itself; without this the five-file
+      // burst above ran on the ordinary 30-second budget.
+      if ((combined.media_urls?.length ?? 0) > 0) {
+        await markAwaitingMachine(deps.db, burst.chatId, DOCUMENT_FLOOR_SECONDS);
+      }
+      // THE FORK. A session on the interpret path never opens an agent turn:
+      // one writer per session (docs/interview-without-an-agent.md §5), and the
+      // turn IS the agent's licence to write.
+      if (await isInterpretPath(deps.db, burst.chatId)) {
+        await runInterpretPath(deps, burst, combined, log);
+        continue;
+      }
+
+      const turn = await openAgentTurn(deps.db, burst.chatId, burst.sessionId);
+      const delivered = deps.connector.pushInbound(combined);
+      if (delivered) {
+        log(structuredLog("info", "trip_bot.interview_forwarded", {
+          session_id: burst.sessionId,
+          turn_id: turn.id,
+          messages_combined: events.length,
+        }));
+        continue;
+      }
+      await closeAgentTurn(deps.db, burst.chatId);
+      log(structuredLog("warn", "trip_bot.turn_lost", { reason: "GATEWAY_UNAVAILABLE" }));
+    } catch {
+      log(structuredLog("warn", "trip_bot.inbound_burst_flush_failed", { session_id: burst.sessionId }));
+    }
+  }
+}
+
+/**
+ * Warns an idle interview that it is about to close, and closes it when it is.
+ *
+ * Two claims rather than one pass, because they are different events with
+ * different copy and each must happen exactly once — both claim-and-mark in a
+ * single statement, the same `FOR UPDATE SKIP LOCKED` discipline every other
+ * claim here uses, so two ticks cannot both warn or both close.
+ *
+ * Neither message asks a question or carries a keyboard: there is nothing to
+ * tap, and the way back in is to write. Both lead with "nothing is lost",
+ * because that is the only thing the person actually wants to know.
+ */
+export async function closeIdleInterviews(
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  try {
+    for (const s of await claimSessionsDueWarning(deps.db)) {
+      // "Send anything to keep going" is true and not enough: someone who
+      // stopped because they did not know what was wanted is told, again, to
+      // send something. Restating the outstanding question — with its buttons
+      // — answers the question they actually have, and a tap is a cheaper way
+      // back in than composing a sentence. Falls back to the bare notice when
+      // there is genuinely nothing outstanding to show.
+      const view = await getSessionForChat(deps.db, s.chatId);
+      const restated = view.ok && await restateExpectation(view.view, s.chatId, deps, "EXPIRING");
+      if (!restated) {
+        await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expiringSoon", s.language) });
+      }
+      log(structuredLog("info", "interview.expiry_warned", { session_id: s.sessionId, restated: Boolean(restated) }));
+    }
+  } catch {
+    log(structuredLog("warn", "interview.expiry_warn_failed", {}));
+  }
+
+  try {
+    for (const s of await claimExpiredSessions(deps.db)) {
+      await deps.telegram.sendMessage({ chatId: s.chatId, text: uiString("expired", s.language) });
+      log(structuredLog("info", "interview.session_expired", { session_id: s.sessionId }));
+    }
+  } catch {
+    log(structuredLog("warn", "interview.expiry_close_failed", {}));
+  }
+}
+
+export async function recoverStalledInterviews(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  floorSeconds?: number,
+): Promise<void> {
+  let stalled: Array<{ sessionId: string; chatId: string }>;
+  try {
+    stalled = floorSeconds === undefined
+      ? await claimStalledAgentTurns(deps.db)
+      : await claimStalledAgentTurns(deps.db, 10, floorSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.stalled_turn_claim_failed", {}));
+    return;
+  }
+  for (const { sessionId, chatId } of stalled) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) continue;
+      const view = result.view;
+
+      // Rendered here rather than through `sendNextStep`, and the reason is a
+      // real interaction the tests found: the flood dedupe suppresses a repeat
+      // of the last prompt, and a stalled agent is usually stalled on the
+      // question the router just asked. Routed through sendNextStep the
+      // watchdog would fall silent exactly when it is needed. Re-sending the
+      // identical question instead would break "no message twice" — the run-5
+      // and run-6 rule. So the recovery gets its own opening line: distinct
+      // text, same question, buttons intact.
+      const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
+      if (!question) continue;
+
+      // If this question is ALREADY the last thing on the organizer's screen,
+      // re-sending it adds nothing and costs a great deal: a stalling agent
+      // makes the watchdog fire on every turn, and the organizer gets the same
+      // question again and again. Seen live on 2026-09-05 — "Getting this over
+      // and over again: נמשיך מכאן." The recovery exists to break silence, not
+      // to fill it.
+      if (view.lastPrompt === `q:${question.id}`) {
+        (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.recovery_suppressed", {
+          session_id: sessionId,
+          question_id: question.id,
+          reason: "ALREADY_ON_SCREEN",
+        }));
+        continue;
+      }
+
+      log(structuredLog("warn", "trip_bot.agent_floor_reclaimed", {
+        session_id: sessionId,
+        after_seconds: floorSeconds ?? AGENT_FLOOR_SECONDS,
+        question_id: question.id,
+      }));
+
+      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: `${uiString("resumed", view.language)}\n\n${rendered.text}`,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
+    } catch {
+      log(structuredLog("warn", "trip_bot.stalled_turn_recovery_failed", { session_id: sessionId }));
+    }
+  }
+}
+
+/**
+ * The router-owned question that is safe to ask right now, if any at all —
+ * see `routerOwned` on `IntakeQuestion`. Shared between `sendNextStep` and
+ * `advanceRouterOwnedQuestions` so the two can never quietly disagree about
+ * what "ready" means.
+ *
+ * Deliberately does not fire on the optional side until `offeredMore` is
+ * true — the organizer has to see the essentials-done "want to add more, or
+ * finish?" transition at least once before ANY optional question, router-
+ * owned or not. Pre-empting that with a fast, judgment-free question would
+ * read exactly like the form Track 4 was built to get away from: no "you're
+ * done with the required stuff" moment, just straight into more questions.
+ */
+function nextRouterOwnedQuestion(view: SessionView): IntakeQuestion | null {
+  if (view.nextQuestion) return view.nextQuestion.routerOwned ? view.nextQuestion : null;
+  if (!view.offeredMore) return null;
+  return view.optionalRemaining.find((q) => q.routerOwned) ?? null;
+}
+
+/**
+ * Track 8: asks whatever router-owned question is next, on its own clock —
+ * during normal progression (skipping the agent round-trip a fixed-choice
+ * question never needed) and, just as importantly, while an agent turn is
+ * open and doing something else entirely (document extraction, deciding
+ * which OTHER optional question to nominate). Productive progress instead of
+ * dead air, without touching or interrupting whatever the agent is doing:
+ * a router-owned answer is recorded through the same tap-handling path as
+ * any other button, which needs no open agent turn at all.
+ *
+ * Scoped to `awaiting = 'machine'` sessions only — if the organizer holds the
+ * floor, nothing is owed yet, so there is nothing to check. Calling
+ * `sendNextStep` speculatively for every candidate, every tick, is safe
+ * rather than wasteful: its own dedupe against `lastPrompt` (and the floor
+ * claim itself) makes a redundant call a silent no-op, the same protection
+ * `renderDueRouterPrompts` and the stalled-turn watchdog already lean on.
+ *
+ * Deliberately does not fall back to `nextQuestion` generally — only a
+ * question explicitly marked `routerOwned` ever gets asked here. Asking
+ * `destination` the instant a document is queued, before the agent has had
+ * any chance to read it, would defeat the entire reason to upload one.
+ *
+ * WHAT "WHILE A TURN IS OPEN" IS NARROWED TO, AND WHY
+ *
+ * "An agent turn is open" was the wrong proxy for "the agent is busy with
+ * something else". It is also true while the agent is mid-conversation,
+ * composing the very next thing it means to say — and in that state a
+ * router-owned question does not fill dead air, it talks over the
+ * interviewer. Run 13, verbatim: "it again competing with the agent on the
+ * questions."
+ *
+ * So the two cases are separated by what the turn is FOR, not by whether one
+ * exists. A turn carrying media is genuine async work: the agent is reading a
+ * document and will be a while, and a fixed-choice question asked meanwhile
+ * costs it nothing. Any other open turn is a conversation in progress, and
+ * the interviewer owns that until it hands the floor back.
+ *
+ * With no turn open at all, this fires freely — that is the latency half of
+ * Track 8, and there is nobody to compete with.
+ */
+export async function advanceRouterOwnedQuestions(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+): Promise<void> {
+  let candidates: Array<{ chatId: string; isAsyncWork: boolean }>;
+  try {
+    candidates = await listMachineAwaitingChats(deps.db);
+  } catch {
+    log(structuredLog("warn", "trip_bot.router_owned_scan_failed", {}));
+    return;
+  }
+  for (const { chatId, isAsyncWork } of candidates) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok || result.view.state !== "interviewing") continue;
+      // ROUTER-OWNED, or anything at all on the interpret path.
+      //
+      // This scan is what moves an interview forward on a tick, and it only
+      // ever proceeded for a ROUTER-OWNED question, because every other
+      // question belonged to the agent. On the interpret path nothing belongs
+      // to the agent, so an interview whose only remaining questions are
+      // ordinary optional ones was never handed to `sendNextStep` at all — it
+      // sat awaiting the machine with nobody scheduled to speak.
+      //
+      // That is the last of today's stalls: the walk was fixed, and then never
+      // called.
+      const onInterpret = await isInterpretPath(deps.db, chatId);
+      const somethingToAsk = onInterpret
+        ? Boolean(nextRouterOwnedQuestion(result.view) ?? result.view.nextQuestion ?? result.view.pendingAsk ?? result.view.optionalRemaining[0])
+        : Boolean(nextRouterOwnedQuestion(result.view));
+      if (!somethingToAsk) continue;
+      if (!isAsyncWork && (await hasOpenAgentTurn(deps.db, chatId))) {
+        log(structuredLog("info", "trip_bot.router_owned_yielded", {
+          session_id: result.view.sessionId,
+          reason: "AGENT_MID_CONVERSATION",
+        }));
+        continue;
+      }
+      await sendNextStep(result.view, chatId, deps, strings);
+    } catch {
+      log(structuredLog("warn", "trip_bot.router_owned_scan_item_failed", {}));
+    }
+  }
+}
+
+export async function renderDueRouterPrompts(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  /**
+   * How long the writing has to have stopped before the router speaks.
+   *
+   * Production waits `ROUTER_PROMPT_SETTLE_SECONDS`, because an agent
+   * recording a document's worth of answers asks the router to speak once per
+   * write, and run 6 received that as a flood. Tests pass 0: they control the
+   * writes exactly, so waiting real seconds would only make the suite slow.
+   */
+  settleSeconds?: number,
+): Promise<void> {
+  let due: Array<{ sessionId: string; chatId: string }>;
+  try {
+    due = settleSeconds === undefined
+      ? await claimDueRouterPrompts(deps.db)
+      : await claimDueRouterPrompts(deps.db, 10, settleSeconds);
+  } catch {
+    log(structuredLog("warn", "trip_bot.router_prompt_claim_failed", {}));
+    return;
+  }
+  for (const { sessionId, chatId } of due) {
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) continue;
+      await sendNextStep(result.view, chatId, deps, strings);
+      log(structuredLog("info", "trip_bot.router_prompt_sent", {
+        session_id: sessionId,
+        state: result.view.state,
+      }));
+    } catch {
+      log(structuredLog("warn", "trip_bot.router_prompt_failed", { session_id: sessionId }));
+    }
+  }
+}
+
+/**
+ * Gives the turn back to the interviewer after a tap it never saw.
+ *
+ * Taps are recorded by the router alone — no agent is involved, which is the
+ * whole point of the deterministic layer. But once the router stops walking
+ * the optional questions, a tap that leaves nothing to ask would leave the
+ * conversation silent: the organizer answered, and neither side speaks.
+ *
+ * So the router forwards a short factual note instead. It is deliberately not
+ * a script for the agent to read out — `SOUL.md` requires it to call
+ * `get_interview_for_chat` and trust that over any text, this note included.
+ */
+/**
+ * The day-by-day a document describes, on the phases it describes them for.
+ *
+ * The general extraction that runs over a shared document answers the
+ * interview's questions — destination, dates, who is coming, which stops. It
+ * does not produce an itinerary, and asking it to was how a five-day Tokyo leg
+ * came back with a single day in it: one prompt cannot both survey a document
+ * for twenty answers and transcribe a schedule out of it.
+ *
+ * `extract_itinerary` is the pass built for exactly that, and it has been
+ * unreachable from a chat interview since it was written: it is a token-scoped
+ * MCP tool, and the interpret path has no agent to call tools. It needs no
+ * Hermes profile any more either — with `EXTRACT_RUNNER` set it runs on the
+ * shared model runner, which the relay already has. So the router calls it
+ * itself, right after the document's answers land.
+ *
+ * Best-effort throughout, like every other document step: a failure leaves the
+ * interview exactly as the general extraction left it, and the organizer is
+ * told nothing, because nothing they asked for has failed.
+ */
+export async function foldItineraryFromDocument(
+  deps: TripBotPollerDeps,
+  burst: { chatId: string; sessionId: string },
+  documentText: string,
+  log: (line: string) => void,
+  say?: (text: string) => Promise<void>,
+  language: Language = DEFAULT_LANGUAGE,
+): Promise<void> {
+  const store = await answersForChat(deps.db, burst.chatId);
+  const phasesAnswer = store?.answers.phases;
+  if (!phasesAnswer || phasesAnswer.kind !== "structured" || !Array.isArray(phasesAnswer.data)) return;
+  const phases = phasesAnswer.data as Record<string, unknown>[];
+  if (phases.length === 0) return;
+  // Already has an itinerary: this is a second document, or a retry. Leave it.
+  if (phases.every((phase) => Array.isArray(phase.days) && phase.days.length > 0)) return;
+
+  const destinationAnswer = store?.answers.destination;
+  const destination = destinationAnswer?.kind === "text" ? destinationAnswer.text
+    : destinationAnswer?.kind === "choice_other" ? (destinationAnswer.other_text ?? "")
+    : "";
+  const travelers = (store?.answers.travelers?.kind === "structured" && Array.isArray(store.answers.travelers.data)
+    ? store.answers.travelers.data
+    : []
+  ).flatMap((t) => {
+    const name = (t as { name?: unknown })?.name;
+    return typeof name === "string" && name.trim() ? [name.trim()] : [];
+  });
+
+  const extract = deps.extractItinerary ?? extractItinerary;
+  let result: Awaited<ReturnType<typeof extractItinerary>>;
+  try {
+    result = await extract({
+      destination,
+      phases: phases.map((phase) => ({
+        name: String(phase.name ?? phase.name_en ?? ""),
+        ...(typeof phase.start === "string" ? { start: phase.start } : {}),
+        ...(typeof phase.end === "string" ? { end: phase.end } : {}),
+      })),
+      travelers,
+      documentText,
+    });
+  } catch {
+    log(structuredLog("warn", "interview.itinerary_extract_threw", { session_id: burst.sessionId }));
+    return;
+  }
+
+  if (!result.ok) {
+    log(structuredLog("info", "interview.itinerary_extract_failed", {
+      session_id: burst.sessionId,
+      reason: result.reason,
+      detail: (result.detail ?? "").slice(0, 200),
+    }));
+    return;
+  }
+
+  const folded = foldExtractedIntoPhases(phases, result.phases);
+  if (folded.daysAdded === 0 && folded.venuesAdded === 0) {
+    log(structuredLog("info", "interview.itinerary_extract_empty", {
+      session_id: burst.sessionId,
+      warnings: result.warnings.slice(0, 3),
+    }));
+    return;
+  }
+
+  const written = await submitAnswerForChat(
+    deps.db, burst.chatId, "phases", null, undefined, folded.phases,
+  );
+  log(structuredLog(written.ok ? "info" : "warn", "interview.itinerary_extracted", {
+    session_id: burst.sessionId,
+    days: folded.daysAdded,
+    venues: folded.venuesAdded,
+    written: written.ok,
+    ...(written.ok ? {} : { reason: written.reason }),
+  }));
+  // An extraction nobody can see reads as a document that was not understood.
+  if (written.ok && folded.daysAdded > 0 && say) await say(uiString("documentDays", language));
+}
+
+async function handBackToInterviewer(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+): Promise<void> {
+  if (!deps.interviewerProfile) return;
+  const log = deps.log ?? (() => {});
+
+  // NEVER ON THE INTERPRET PATH. There is no agent to hand back TO.
+  //
+  // Live on 2026-09-09, and one cause produced four symptoms: a button tap
+  // with nothing queued opened an agent turn and pushed to the gateway. The
+  // turn was never closed, because nothing on this path closes one. The
+  // trip-intake agent woke, found its sidecar down, and wrote "the MCP server
+  // is not reachable". Thirty seconds later the stall watchdog reclaimed the
+  // floor with "נמשיך מכאן" and repeated the question the organizer had just
+  // answered. And in between, the floor was held by a machine that could not
+  // act, so the organizer had to type "מה עכשיו" to shake it loose.
+  //
+  // The interpret path's own `sendNextStep` already covers the case this
+  // exists for: it asks the next question, or the boundary message, itself.
+  if (await isInterpretPath(deps.db, chatId)) {
+    log(structuredLog("info", "trip_bot.handback_skipped", {
+      session_id: view.sessionId,
+      reason: "INTERPRET_PATH",
+    }));
+    return;
+  }
+  // Already talking to it. Handing a second turn to an agent that is mid-turn
+  // is how run 5 turned into a bombardment: the handback opened a turn, the
+  // agent's next write scheduled another router prompt, that found nothing to
+  // ask and handed back again — nine turns and twenty-eight messages deep
+  // before anyone stopped it.
+  if (await hasOpenAgentTurn(deps.db, chatId)) {
+    log(structuredLog("info", "trip_bot.handback_skipped", {
+      session_id: view.sessionId,
+      reason: "TURN_ALREADY_OPEN",
+    }));
+    return;
+  }
+  // Same reasoning as the settle-window ack: a handback can take a while —
+  // the agent may be mid-turn on several optional questions — and this is the
+  // one thing that can be immediate regardless.
+  await deps.telegram.sendChatAction({ chatId }).catch(() => {});
+  const turn = await openAgentTurn(deps.db, chatId, view.sessionId);
+  const delivered = deps.connector.pushInbound(
+    toWireEvent(
+      { chat: { id: chatId, type: "private" } } as never,
+      chatId,
+      "[router] The organizer just answered with a button. Nothing is queued to ask them — "
+        + "read the interview state and carry on, or ask for the summary if you have everything.",
+      deps.interviewerProfile,
+    ),
+  );
+  log(structuredLog(delivered ? "info" : "warn", "trip_bot.interview_handback", {
+    session_id: view.sessionId,
+    turn_id: turn.id,
+    ...(delivered ? {} : { safe_error_code: "GATEWAY_UNAVAILABLE" }),
+  }));
+}
+
+/**
+ * What the router says after an answer lands: the next required question, the
+ * optional question the interviewer nominated, or the confirm recap.
+ *
+ * It does NOT walk the optional questions on its own while an interviewer is
+ * configured. It did for one live run, and marching the whole optional set in
+ * schema order turned the interview into a form — the organizer was asked for
+ * a timezone having already said Japan. With an interviewer present, which
+ * optional question to raise is its call; without one there is nobody else to
+ * ask, so the walk stays as the fallback.
+ */
+/**
+ * Say what the interview is waiting for, in the organizer's language, with
+ * whatever buttons that thing carries.
+ *
+ * The rule this serves: the interview never goes quiet on a person. Whatever
+ * the reason we have nothing new to say — a reply we could not parse, a
+ * session about to expire — the way out is the same, and it is never a bare
+ * "I didn't understand". That sentence tells someone they failed without
+ * telling them what would succeed, which is the stall-with-extra-steps.
+ *
+ * Deliberately re-sends something already on screen. `sendNextStep`'s dedupe
+ * is right that repeating a question unprompted is noise; this only runs when
+ * the alternative is silence, and then the same question with a line saying
+ * why it is back is the most useful thing there is.
+ *
+ * It re-renders rather than quoting the last message, so the buttons come
+ * back live — a keyboard from an older message still works in Telegram, but a
+ * person who has typed once and been misunderstood should not have to scroll
+ * up to find out that tapping was an option.
+ */
+async function restateExpectation(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+  reason: "NOT_UNDERSTOOD" | "EXPIRING",
+): Promise<boolean> {
+  const lead = uiString(reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : "didNotFollow", view.language);
+
+  // What is outstanding, most specific first. The BOUNDARY is the case that
+  // needed this: `state` is still `interviewing` there — everything required
+  // answered, every optional one skipped, `nextQuestion` null — so keying off
+  // the state would miss precisely the session that stalled.
+  const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
+  let rendered: RenderedQuestion;
+  if (question) {
+    rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+  } else if (view.state === "awaiting_confirmation") {
+    rendered = renderConfirmPrompt(
+      `${uiString("recapHeader", view.language)}\n\n`
+      + (view.recap ?? []).map((e) => `• ${e.prompt}\n  ${e.answerLabel}`).join("\n")
+      + `\n\n${uiString("recapFooter", view.language)}`,
+      view.language,
+    );
+  } else if (view.offeredMore) {
+    rendered = renderEssentialsDone(view.language);
+  } else {
+    return false;
+  }
+
+  if (!(await takeFloor(chatId, view, deps))) return false;
+  (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.expectation_restated", {
+    session_id: view.sessionId,
+    reason,
+  }));
+  await deps.telegram.sendMessage({
+    chatId,
+    text: `${lead}\n\n${rendered.text}`,
+    replyMarkup: rendered.replyMarkup ?? undefined,
+  });
+  return true;
+}
+
+/**
+ * Take the floor to speak, and say so in the log when we cannot.
+ *
+ * `claimFloor` returning false means somebody else claimed it between our read
+ * and our send — in practice the periodic scan, which hands the floor back to
+ * the organizer whenever the question is already on their screen. Every call
+ * site then did a bare `return false`, so the router went quiet with no line
+ * anywhere saying why. On 2026-09-12 an organizer tapped Skip, watched the
+ * keyboard collapse, and waited two minutes in front of a relay log that
+ * recorded nothing at all.
+ */
+async function takeFloor(chatId: string, view: SessionView, deps: TripBotPollerDeps): Promise<boolean> {
+  if (await claimFloor(deps.db, chatId)) return true;
+  (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_lost", {
+    session_id: view.sessionId,
+  }));
+  return false;
+}
+
+async function sendNextStep(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+  _strings: DispatchStrings,
+): Promise<boolean> {
+  let text: string;
+  let replyMarkup: InlineKeyboard | undefined;
+
+  // THE FLOOR. Nothing is sent while it is the organizer's turn — that is a
+  // conversation waiting on a human, not a fault. Run 7 got most questions
+  // twice because the router and the interviewer each decided independently
+  // that something was owed; this is the single fact that arbitrates them.
+  if (view.awaiting === "person") {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.floor_held_by_person", {
+      session_id: view.sessionId,
+    }));
+    return false;
+  }
+
+  // A DOCUMENT IS WAITING TO BE READ. Say nothing until it has been.
+  //
+  // The answer may be in the file, and asking for it first is the thing this
+  // whole feature exists to stop. Checked here because every router message
+  // comes through this function — `advanceRouterOwnedQuestions` reaches it by
+  // scanning for chats awaiting the machine, which an upload sets, and it
+  // asked the trip type in the two seconds between the file landing and the
+  // burst settling.
+  //
+  // INTERPRET PATH ONLY, and Track 8 is why: on the AGENT path asking a
+  // router-owned question while the agent reads a document is deliberate —
+  // the two work in parallel and the test calls it "the original motivating
+  // case". It is only wrong here, where the extraction about to run is what
+  // answers those same questions.
+  const onInterpretPath = await isInterpretPath(deps.db, chatId);
+  if (onInterpretPath && (await hasPendingInbound(deps.db, chatId))) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_inbound", {
+      session_id: view.sessionId,
+    }));
+    return false;
+  }
+  // AND WHILE IT IS ACTUALLY BEING READ. The check above covers the queue, and
+  // its own note assumed that was enough. It is not: the scan fires on a
+  // session merely awaiting the machine once the document floor has passed,
+  // and the read outlasts that floor by minutes. So the router asked the trip
+  // type in the middle of reading a document that answers it — and the answer
+  // given by hand then made the document's own proposal ALREADY_ANSWERED.
+  if (onInterpretPath && (await isReadingDocument(deps.db, chatId))) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.held_for_document_read", {
+      session_id: view.sessionId,
+    }));
+    return false;
+  }
+
+  // THE BOUNDARY. Nothing required left to ask, but a required answer is still
+  // missing — one that stepped aside after a reply did not answer it. Bring the
+  // set-aside questions back, and say why they are back, BEFORE anything
+  // optional and before the summary: this is the point where it actually
+  // blocks something, so "I still need this" informs rather than pesters.
+  //
+  // HERE, and not on the typed-message path where it used to live, because
+  // every router message comes through this function. On 2026-09-11 the
+  // automated full cycle's stops were read with LOW_CONFIDENCE and stepped
+  // aside; the last required question was then answered with a TAP, which
+  // never passed the typed path's check — so the router walked on to the
+  // optional questions, and "Finished" produced nothing at all, because the
+  // summary cannot open with a required answer missing. A person would have
+  // been stuck in front of a button that did nothing.
+  if (view.state === "interviewing" && !view.nextQuestion) {
+    const store = await answersForChat(deps.db, chatId);
+    const missing = store ? deferredRequired(store.answers) : [];
+    if (missing.length > 0) {
+      await undeferAllForChat(deps.db, chatId);
+      (deps.log ?? (() => {}))(structuredLog("info", "interview.required_raised_at_boundary", {
+        session_id: view.sessionId,
+        missing: missing.map((q) => q.id),
+      }));
+      const back = await getSessionForChat(deps.db, chatId);
+      const question = (back.ok ? back.view.nextQuestion : null) ?? missing[0]!;
+      if (!(await takeFloor(chatId, view, deps))) return false;
+      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: `${uiString("beforeWeFinish", view.language)}\n\n${rendered.text}`,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
+      return true;
+    }
+  }
+
+  // What there is to ask, worked out BEFORE the say is handled — because
+  // whether the say goes out alone depends on it. See the fold below.
+  // WHO WALKS THE OPTIONAL QUESTIONS.
+  //
+  // `!deps.interviewerProfile` is the agent-era rule: if an interviewer exists,
+  // it nominates which optional question is worth asking and the router must
+  // not walk them itself. Correct then, and silently wrong now — the relay
+  // still has `relay.interviewer_profile` configured, so on the interpret path
+  // this evaluated false and the built-in walk was OFF. That is why a skip
+  // recorded the answer and said nothing: `question` came out null and there
+  // was nothing left to send.
+  //
+  // On the interpret path there is no agent to nominate, so the router walks
+  // them — through THIS path, which already has the dedupe, the prompt key,
+  // the flood guard and the logging. An earlier fix added a second walk of its
+  // own further down; a second implementation of a thing that already exists
+  // is how the two disagree, and it has been removed.
+  const autoWalkOptional = !deps.interviewerProfile || onInterpretPath;
+  const question =
+    view.nextQuestion
+    ?? view.pendingAsk
+    ?? nextRouterOwnedQuestion(view)
+    ?? (autoWalkOptional && view.state === "interviewing" ? view.optionalRemaining[0] ?? null : null);
+
+  // Every agent write asks the router to speak. An agent that recorded five
+  // answers off one document therefore asked five times, and the organizer got
+  // the same question five times over. Saying nothing when there is nothing
+  // new to say is the whole fix.
+  const promptKey = view.state === "awaiting_confirmation" ? "recap" : question ? `q:${question.id}` : "";
+  const questionIsNew = Boolean(question) && promptKey !== view.lastPrompt;
+
+  /** The agent's words, folded in above the question rather than sent alone. */
+  let leadIn: string | null = null;
+
+  // The interviewer's own words go out first and alone. This is the `say`
+  // half of Track 4: the agent no longer reaches Telegram directly, so if it
+  // has something to tell the organizer, THIS is the only way it arrives.
+  // Delivered verbatim and then cleared, so a message is sent exactly once
+  // however many times the router is prompted to speak.
+  if (view.pendingSay) {
+    // The one deliberate exception to "the agent may always reclaim the
+    // floor": once the recap is on screen, the organizer's only outstanding
+    // decision is Confirm or Keep planning, and nothing may bury that button.
+    // Run 7 ended exactly this way — the agent kept talking after the recap,
+    // the organizer said "approved" in prose to it, and nothing happened,
+    // because only the button writes an intake version. Discarded rather than
+    // queued: the organizer taps Keep planning to reopen the conversation, at
+    // which point a fresh, contextual reply is what belongs there, not
+    // something written before they'd even seen the recap.
+    if (view.state === "awaiting_confirmation") {
+      // Suppress the stale say and FALL THROUGH — do not return. Returning
+      // here was a real bug, not just a trade-off: it exited the whole
+      // function before the recap-rendering code below ever ran, so the one
+      // case this was built to protect (an agent write landing in the SAME
+      // moment the interview reaches recap) produced total silence instead
+      // of the recap. Live on 2026-09-05: the organizer answered the last
+      // optional question, the agent tried to acknowledge it, and NOTHING
+      // reached the chat at all — not the ack, not the recap, not the
+      // Confirm button. The point was only ever to stop the AGENT'S WORDS
+      // burying the recap, never to stop the recap itself from being sent.
+      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.say_suppressed_during_recap", {
+        session_id: view.sessionId,
+      }));
+      await clearPendingSayForChat(deps.db, chatId);
+    } else if (questionIsNew) {
+      // THE FOLD, and the reason `question` is computed above rather than
+      // below: a say and a question outstanding at the same moment are one
+      // utterance — "here's what I recorded, and here's the next thing" —
+      // and sending the say ALONE ends the router's turn, because the send
+      // claims the floor and the question is left behind a floor that now
+      // belongs to the organizer. Nothing speaks again until they do.
+      //
+      // That is not hypothetical. Run 13, 2026-09-05, read off the agent log
+      // and the turn table:
+      //
+      //   23:04:47.591  ask_question_for_chat completes — trip_pace nominated,
+      //                 with the agent's own phrasing, floor reclaimed
+      //   23:04:50.553  the agent's turn ends; its closing text reaches the
+      //                 relay and becomes pendingSay
+      //   23:04:50.6    the router delivers that say, claims the floor, returns
+      //   ...           floor_held_by_person, every pass, for ELEVEN MINUTES
+      //   23:15:43      the organizer gives up and types "מה עכשיו?"
+      //
+      // `trip_pace` was never asked and never answered. The organizer had been
+      // TOLD it was asked — the closing text said so — which is why the stall
+      // read as the bot ignoring them rather than as the bot being stuck.
+      //
+      // `nominateQuestionForChat` already folds a say into the nomination, but
+      // only one that is still pending when the nomination runs. Here the say
+      // arrived AFTER the ask, which no nomination-time fold can catch. This
+      // one is race-free by construction: both values are read from the same
+      // session row in the same pass, so the order they were written in stops
+      // mattering.
+      leadIn = view.pendingSay;
+      await clearPendingSayForChat(deps.db, chatId);
+    } else {
+      // Nothing new to ask, so the say IS the message. Claim before sending:
+      // if the router got here first this returns false and the message waits
+      // for the organizer's next turn rather than landing on top of what was
+      // just said.
+      if (!(await takeFloor(chatId, view, deps))) return false;
+      await clearPendingSayForChat(deps.db, chatId);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: view.pendingSay,
+        // Agent-authored text is written in the dialect TELEGRAM_DESCRIPTOR
+        // advertises, so it has to be SENT in that dialect. The connector
+        // always did this; routing the same text through the router instead
+        // dropped it, and 2026-09-05's run 7 got raw asterisks for its
+        // trouble. Whoever delivers the agent's words owes them the same
+        // parse mode.
+        parseMode: "MarkdownV2",
+      });
+      return true;
+    }
+  }
+
+  if (promptKey && promptKey === view.lastPrompt) {
+    (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.prompt_deduped", {
+      session_id: view.sessionId,
+      prompt: promptKey,
+    }));
+    // THE QUESTION IS ALREADY ON THEIR SCREEN, so the turn is theirs.
+    //
+    // Returning while still holding the floor left the session `awaiting =
+    // machine` with nothing to say, and the tick scan — which looks for exactly
+    // that — picked it up again every couple of seconds and deduped again,
+    // forever. A busy loop that logs, on the interpret path only, because that
+    // scan does not reach these sessions on the agent path.
+    //
+    // Handing the floor back is also just true: we asked, they have not
+    // answered, we are waiting on them.
+    if (onInterpretPath) await claimFloor(deps.db, chatId);
+    return false;
+  }
+
+  if (!question && view.state !== "awaiting_confirmation") {
+    // The boundary between the required questions and the optional ones is the
+    // one place the router still speaks unprompted. Both exits — more
+    // questions, or the summary — are put in front of the organizer exactly
+    // once, so a fumbled nomination by the interviewer cannot strand them with
+    // no way forward, which is precisely what happened on 2026-09-04's run 4.
+    //
+    // "Exactly once" is now the ENTRY ACTION of the `optional` phase rather
+    // than a flag of its own: entering a phase happens once by definition, so
+    // there is nothing to remember to set. `offeredMore` is still read for
+    // sessions that predate the phase column and have not transitioned since.
+    if (view.pendingEntry === "optional" || (view.pendingEntry === null && !view.offeredMore)) {
+      if (!(await takeFloor(chatId, view, deps))) return false;
+      const rendered = renderEssentialsDone(view.language);
+      await clearPendingEntryForChat(deps.db, chatId);
+      await markOfferedMoreForChat(deps.db, chatId);
+      await deps.telegram.sendMessage({
+        chatId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+      return true;
+    }
+    // After that it is the interviewer's conversation to carry. Saying
+    // something anyway is how the router ended up talking over it.
+    await handBackToInterviewer(view, chatId, deps);
+    return false;
+  }
+
+  if (view.state === "awaiting_confirmation") {
+    const recap = (view.recap ?? [])
+      .map((entry) => `• ${entry.prompt}\n  ${entry.answerLabel}`)
+      .join("\n");
+    const rendered = renderConfirmPrompt(
+      `${uiString("recapHeader", view.language)}\n\n${recap}\n\n${uiString("recapFooter", view.language)}`,
+      view.language,
+    );
+    text = rendered.text;
+    replyMarkup = rendered.replyMarkup ?? undefined;
+  } else if (question) {
+    // Selections travel with the question: re-asking a half-ticked
+    // multi-select without them would show every option unticked and invite
+    // the organizer to tap the same ones off again.
+    // The agent's wording applies to the question IT nominated, never to a
+    // required question the router walked to on its own — otherwise a sentence
+    // written for `dietary` would end up above `departure_date`.
+    const nominated = view.pendingAsk?.id === question.id ? view.pendingAskText : null;
+    // A folded say leads; the nomination's own phrasing follows. Both are the
+    // agent's words for this same moment, so they belong in one message in
+    // the order they were written — exactly what nominateQuestionForChat
+    // produces when it wins its race, produced here whether it did or not.
+    const agentPhrasing = leadIn && nominated
+      ? `${leadIn}\n\n${nominated}`
+      : leadIn ?? nominated;
+    // The agent's words, unless they are in the wrong language. The router's own
+    // copy is fully localised, so falling back to it beats passing through a
+    // sentence the organizer cannot read. Run 15: "some of the messages from the
+    // bot came in English" — in an interview held entirely in Hebrew, after a
+    // rate-limit swapped the model mid-conversation.
+    const wrongLanguage = agentPhrasing !== null && agentPhrasing !== undefined
+      && !agentTextIsInLanguage(agentPhrasing, view.language);
+    if (wrongLanguage) {
+      (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.agent_phrasing_dropped", {
+        reason: "WRONG_LANGUAGE",
+        language: view.language,
+      }));
+    }
+    const phrasing = wrongLanguage ? null : agentPhrasing;
+    const rendered = renderQuestion(
+      question,
+      selectedOptionIds(view, question.id),
+      view.language,
+      phrasing,
+    );
+    text = rendered.text;
+    replyMarkup = rendered.replyMarkup ?? undefined;
+    if (view.pendingAsk?.id === question.id) await clearPendingAskForChat(deps.db, chatId);
+  } else {
+    // `interviewing` always has a next question now — required ones first,
+    // then optional ones not yet answered or skipped — and every other state
+    // is handled above, so this stays unreachable.
+    text = "Thanks — noted.";
+  }
+
+  // The question or the recap. Claimed last, immediately before it goes out,
+  // so a slow render cannot leave the floor held by a message nobody sent.
+  if (!(await takeFloor(chatId, view, deps))) return false;
+  await deps.telegram.sendMessage({ chatId, text, replyMarkup });
+  if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
+  return true;
+}
+
+// ── The loop ─────────────────────────────────────────────────────────────────
+
+/** Narrows one getUpdates element to something with a usable update_id. */
+function asUpdate(raw: unknown): TelegramUpdate | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const candidate = raw as { update_id?: unknown };
+  if (typeof candidate.update_id !== "number") return null;
+  return raw as TelegramUpdate;
+}
+
+/**
+ * Starts the update loop and returns a stop function.
+ *
+ * Awaits each poll rather than running on a timer: a long poll can outlast any
+ * sensible interval, and two overlapping getUpdates on one token is the 409
+ * this module exists to avoid.
+ */
+export function startTripBotPoller(
+  deps: TripBotPollerDeps,
+  options: PollerOptions = {},
+): () => void {
+  const log = deps.log ?? (() => {});
+  const strings = deps.strings ?? DEFAULT_STRINGS;
+  const longPollSeconds = options.longPollSeconds ?? DEFAULT_LONG_POLL_SECONDS;
+  const maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
+  const deliverIntervalMs = options.deliverIntervalMs ?? DEFAULT_DELIVER_INTERVAL_MS;
+
+  let offset = 0;
+  let stopped = false;
+  let backoffMs = 0;
+
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      // Never hold the process open on a backoff nap.
+      timer.unref?.();
+    });
+
+  async function run(): Promise<void> {
+    // Telegram refuses getUpdates outright while a webhook is registered for
+    // the same token, so this must happen before the first poll, not per tick.
+    await deps.telegram.deleteWebhookIfPresent();
+    log(structuredLog("info", "trip_bot.polling_started", { long_poll_seconds: longPollSeconds }));
+
+    while (!stopped) {
+      const startedAt = Date.now();
+      const raw = await deps.telegram.getUpdates({
+        offset,
+        timeoutSeconds: longPollSeconds,
+        // `my_chat_member` is how the bot learns it was added to a group — the
+        // moment the companion should introduce itself. Additive: an update
+        // type left out of this list is not delivered to anyone else either,
+        // it is simply dropped, so nothing loses traffic by its being here.
+        allowedUpdates: ["message", "callback_query", "my_chat_member"],
+      });
+      const elapsed = Date.now() - startedAt;
+
+      // Delivery is NOT done here — it runs on its own timer (`deliver`), so
+      // an agent reply written during a 25-second long poll is not held until
+      // that poll returns. Keeping it here as well would only add a duplicate
+      // claim attempt on a schedule the organizer cannot feel.
+
+      if (raw.length > 0) {
+        backoffMs = 0;
+      } else if (elapsed < longPollSeconds * 500) {
+        // A long poll that returns nothing should have blocked for roughly the
+        // full window. Returning empty and immediately means the call failed —
+        // getUpdates swallows its own errors and reports `[]` — so back off
+        // rather than spin a failing request as fast as the network allows.
+        backoffMs = backoffMs === 0 ? 1000 : Math.min(backoffMs * 2, maxBackoffMs);
+        log(structuredLog("warn", "trip_bot.poll_backoff", { backoff_ms: backoffMs }));
+      } else {
+        backoffMs = 0;
+      }
+
+      for (const item of raw) {
+        const update = asUpdate(item);
+        if (!update) continue;
+        // Advance the offset BEFORE handling. Telegram redelivers everything
+        // at or after `offset` until it moves, so an update that throws every
+        // time would otherwise be retried forever and block every update
+        // behind it — one poisoned message silencing the whole bot.
+        offset = Math.max(offset, update.update_id + 1);
+        // WHAT TELEGRAM ACTUALLY HANDED US, before anything interprets it.
+        //
+        // Three times running an organizer reported sending a PDF and the relay
+        // saw only text. Every downstream stage logs its own failure — a failed
+        // re-host warns, a failed dispatch errors — and all of them were
+        // silent, which left "the file never arrived" and "we dropped it
+        // somewhere before the first log line" indistinguishable. They are not
+        // the same problem and they have different fixes, so the earliest
+        // possible point says what it received.
+        //
+        // Shape only: which fields are present and how big. No text, no
+        // filenames, no chat id — this runs on every message of every
+        // interview, and a diagnostic that logs content is a diagnostic that
+        // has to be turned off again.
+        {
+          const m = (update as { message?: Record<string, unknown> }).message;
+          if (m) {
+            log(structuredLog("info", "trip_bot.update_shape", {
+              has_text: typeof m.text === "string",
+              has_caption: typeof m.caption === "string",
+              has_document: Boolean(m.document),
+              has_photo: Array.isArray(m.photo) && m.photo.length > 0,
+              has_video: Boolean(m.video),
+              has_audio: Boolean(m.audio) || Boolean(m.voice),
+              text_len: typeof m.text === "string" ? m.text.length : 0,
+              doc_size: (m.document as { file_size?: number } | undefined)?.file_size ?? 0,
+              doc_mime: (m.document as { mime_type?: string } | undefined)?.mime_type ?? null,
+            }));
+          }
+        }
+        try {
+          const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
+            interviewerProfile: deps.interviewerProfile,
+            media: deps.media,
+            // Asked per update rather than cached: a gateway can stop between
+            // one message and the next, and a stale "reachable" spends the
+            // organizer's turn on a socket that is gone.
+            ...(deps.connector.canReachProfile
+              ? { canReachProfile: (profile: string) => deps.connector.canReachProfile!(profile) }
+              : {}),
+          });
+          await applyDecision(decision, deps);
+        } catch (error) {
+          log(structuredLog("error", "trip_bot.update_failed", {
+            safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+          }));
+        }
+      }
+
+      // Unconditional, even at zero. `await` on an already-resolved promise
+      // only drains the microtask queue, so a getUpdates that returns without
+      // real I/O — a stubbed client, or a long-poll window of zero — would
+      // starve the macrotask queue entirely: timers would never fire and the
+      // stop flag below would never get a chance to be observed. A setTimeout
+      // of 0 is a macrotask, which is the point of it.
+      if (!stopped) await sleep(backoffMs);
+    }
+    log(structuredLog("info", "trip_bot.polling_stopped", {}));
+  }
+
+  /**
+   * Delivers what the agent has written, on its OWN clock.
+   *
+   * This used to run only inside the poll loop, right after `getUpdates`
+   * returns — which coupled every agent-authored message to the Telegram
+   * long-poll cycle. The sequence that produces was reported live on
+   * 2026-09-05 as "it takes a lot of time for the next question": the
+   * organizer answers, `getUpdates` returns immediately with their message,
+   * the loop finds nothing owed yet and blocks on the NEXT poll for 25
+   * seconds, and the agent's reply — written two seconds later — waits out
+   * that whole window before anyone sees it.
+   *
+   * Nothing about delivery has anything to do with when Telegram next hands us
+   * an update, so it gets its own timer. The claims are atomic
+   * (FOR UPDATE SKIP LOCKED), so running alongside the poll loop is safe.
+   */
+  async function deliver(): Promise<void> {
+    while (!stopped) {
+      try {
+        // Flushing a settled burst comes first: it is what opens the turn and
+        // gives the agent something to write, which the next two calls then
+        // deliver or watch for a stall on.
+        await flushSettledInboundBursts(deps, log);
+        await advanceRouterOwnedQuestions(deps, strings, log);
+        await renderDueRouterPrompts(deps, strings, log);
+        await recoverStalledInterviews(deps, strings, log);
+        await closeIdleInterviews(deps, log);
+      } catch (error) {
+        log(structuredLog("warn", "trip_bot.deliver_tick_failed", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        }));
+      }
+      await sleep(deliverIntervalMs);
+    }
+  }
+
+  void run().catch((error) => {
+    log(structuredLog("error", "trip_bot.poll_loop_crashed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+  });
+
+  void deliver().catch((error) => {
+    log(structuredLog("error", "trip_bot.deliver_loop_crashed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+  });
+
+  return () => {
+    stopped = true;
+  };
+}

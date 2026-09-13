@@ -275,6 +275,17 @@ describe('GET /api/agent/brief', () => {
     }
     assert.ok(brief.disclosure_policy?.organizer, 'the payload should state the disclosure rule, not assume the reader knows it');
   });
+
+  test('states what persona.gender is FOR, not just its value', async () => {
+    // The value alone was served for months and the assistant still gendered
+    // itself off its own name — masculine config, feminine Hebrew. A bare
+    // enum is data; the reader is a language model that needs the rule.
+    const res = await api('/api/agent/brief', { apiKey: 'test-hermes-key' });
+    const brief = await res.json();
+    assert.equal(brief.persona.gender, 'male');
+    assert.match(brief.persona_policy?.gender || '', /YOURSELF/);
+    assert.match(brief.persona_policy?.gender || '', /never inferred from persona\.name/);
+  });
 });
 
 // ── /api/config/warnings ────────────────────────────────────────────────────────
@@ -512,6 +523,32 @@ describe('/api/bookings CRUD', () => {
     const created = rows.find(b => b.name === 'Statue of Liberty Tour');
     assert.ok(created, 'newly created booking not found');
     assert.equal(created.cost, 75);
+  });
+
+  test('booking writes reject an authenticated family member', async () => {
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'bob', password: '1234' } });
+    const bobToken = (await login.json()).token;
+    const created = await api('/api/bookings', {
+      method: 'POST', token: bobToken,
+      body: { phase: 'ny', type: 'attraction', name: 'Unauthorized reservation' },
+    });
+    assert.equal(created.status, 403);
+
+    const rows = await (await api('/api/bookings', { token })).json();
+    const booking = rows.find(b => b.name === 'Statue of Liberty Tour');
+    assert.ok(booking, 'organizer booking should exist before the denied update');
+    const changed = await api(`/api/bookings/${booking.id}`, {
+      method: 'PATCH', token: bobToken, body: { name: 'Changed by member' },
+    });
+    assert.equal(changed.status, 403);
+    const deleted = await api(`/api/bookings/${booking.id}`, { method: 'DELETE', token: bobToken });
+    assert.equal(deleted.status, 403);
+    const uploadedConfirmation = await api(`/api/bookings/${booking.id}/confirmation`, { method: 'POST', token: bobToken });
+    assert.equal(uploadedConfirmation.status, 403);
+    const uploadedWallet = await api(`/api/bookings/${booking.id}/wallet-apple`, { method: 'POST', token: bobToken });
+    assert.equal(uploadedWallet.status, 403);
+    const unchanged = await (await api('/api/bookings', { token })).json();
+    assert.equal(unchanged.find(b => b.id === booking.id)?.name, 'Statue of Liberty Tour');
   });
 
   test('PATCH updates a non-seed booking', async () => {
@@ -1408,4 +1445,14 @@ describe('PUT /api/auth/password', () => {
     const newLogin = await api('/api/auth/login', { method: 'POST', body: { username: 'alice', password: 'newpass123' } });
     assert.equal(newLogin.status, 200);
   });
+});
+
+
+test('an unmanaged Classic runtime does not expose a session minting path', async () => {
+  const response = await api('/api/internal/control-plane/session', {
+    method: 'POST', apiKey: 'test-hermes-key', token,
+    body: { tripId: 'trip_testtest', userId: 'user_testtest', role: 'owner', runtimeUsername: 'alice' },
+  });
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: 'AUTHENTICATION_REQUIRED' });
 });

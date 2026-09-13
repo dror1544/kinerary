@@ -19,13 +19,14 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import http from 'http';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
 
 let token;
 let mockHermes;
 let lastMockRequest;
-const MOCK_PORT = 3103; // 3095-3102 already claimed by other test files
+const MOCK_PORT = PORTS.bookingExtractMockHermes;
 
 before(async () => {
   mockHermes = http.createServer((req, res) => {
@@ -34,14 +35,14 @@ before(async () => {
     req.on('end', () => {
       lastMockRequest = { headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString() || '{}') };
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ name: 'Mock Hotel', type: 'hotel' }));
+      res.end(JSON.stringify({ phase: 'ny', name: 'Mock Hotel', type: 'hotel', confirmation: 'MOCK-42' }));
     });
   });
   await new Promise(resolve => mockHermes.listen(MOCK_PORT, resolve));
 
   // Dedicated port — every other test file shares one hardcoded default,
   // and node:test runs files concurrently by default (see helpers/server.js).
-  await startTestServer({ HERMES_URL: `http://127.0.0.1:${MOCK_PORT}`, PORT: '3104' });
+  await startTestServer({ HERMES_URL: `http://127.0.0.1:${MOCK_PORT}`, PORT: String(PORTS.bookingExtractServer) });
   token = await loginAsAlice();
 });
 
@@ -108,5 +109,182 @@ describe('POST /api/bookings/extract', () => {
     assert.match(contentType, /application\/json/);
     const data = await res.json(); // throws if this is HTML, proving the fix
     assert.ok(data.error);
+  });
+});
+
+describe('POST /api/bookings/extract-draft', () => {
+  test('creates a private organizer draft, then makes it visible only after approval', async () => {
+    const created = await api('/api/bookings/extract-draft', {
+      method: 'POST', token, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(created.status, 201);
+    const { booking } = await created.json();
+    assert.equal(booking.review_status, 'draft');
+    assert.equal(booking.confirmation, 'MOCK-42');
+
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const memberRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(memberRows.some(row => row.id === booking.id), false, 'member must not see unapproved drafts');
+
+    // A draft linked by an organizer must remain redacted in every Modern
+    // participant projection, not only in the Classic bookings list.
+    const itineraryWrite = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: 'ny', date: '2027-03-11', text_he: 'טיוטת מלון פרטית', booking_id: booking.id },
+    });
+    assert.equal(itineraryWrite.status, 201);
+    const itineraryCreated = await itineraryWrite.json();
+    const active = await (await api('/api/itinerary/active', { token: bobToken })).json();
+    assert.equal(active.items.find(item => item.item_uid === itineraryCreated.item_uid)?.booking, null);
+    const confirmations = await (await api('/api/confirmations/summary', { token: bobToken })).json();
+    assert.equal(confirmations.items.some(item => item.id === booking.id), false, 'draft confirmation leaked through Modern summary');
+
+    // Classic's plan projection is the other half of the same boundary. It
+    // attaches the booking to the plan item by id, and joinBooking() looked it
+    // up without the visibility rule — so the member's booking list correctly
+    // excluded the draft while GET /api/phases/ny/plan handed over its name
+    // and confirmation code.
+    const classicWrite = await api('/api/phases/ny/plan', {
+      method: 'POST', token,
+      body: { date: '2027-03-11', text_he: 'טיוטה מצורפת', text_en: 'Draft attached', booking_id: booking.id },
+    });
+    assert.equal(classicWrite.status, 201);
+    const memberPlan = await (await api('/api/phases/ny/plan', { token: bobToken })).json();
+    const memberRow = memberPlan.find(row => row.booking_id === booking.id);
+    assert.ok(memberRow, 'the plan item itself is not the secret — only the booking behind it');
+    assert.equal(memberRow.booking, null, 'draft booking leaked through the Classic plan projection');
+    assert.equal(
+      JSON.stringify(memberPlan).includes(booking.confirmation), false,
+      `confirmation ${booking.confirmation} reached a member through /api/phases/ny/plan`,
+    );
+
+    // The organizer who attached it still sees what they attached.
+    const organizerPlan = await (await api('/api/phases/ny/plan', { token })).json();
+    assert.equal(organizerPlan.find(row => row.booking_id === booking.id)?.booking?.confirmation, booking.confirmation,
+      'an organizer reviewing drafts must still see the booking on the plan item');
+
+    const approved = await api(`/api/bookings/${booking.id}/approve`, { method: 'POST', token });
+    assert.equal(approved.status, 200);
+    const visibleRows = await (await api('/api/bookings', { token: bobToken })).json();
+    assert.equal(visibleRows.some(row => row.id === booking.id), true, 'approved draft should be visible to members');
+    const approvedPlan = await (await api('/api/phases/ny/plan', { token: bobToken })).json();
+    assert.equal(approvedPlan.find(row => row.booking_id === booking.id)?.booking?.confirmation, booking.confirmation,
+      'once approved, the booking should reach the member through the plan too');
+  });
+
+  test('rejects a member attempting to create a draft', async () => {
+    const bobLogin = await api('/api/auth/login', {
+      method: 'POST', body: { username: 'bob', password: '1234' },
+    });
+    const { token: bobToken } = await bobLogin.json();
+    const res = await api('/api/bookings/extract-draft', {
+      method: 'POST', token: bobToken, body: { url: 'https://example.com/confirmation' },
+    });
+    assert.equal(res.status, 403);
+  });
+
+  test('an ignored quality issue remains ignored after the engine recomputes', async () => {
+    const reported = await api('/api/issues/report', {
+      method: 'POST', token, body: { title: 'Keep ignored', detail: 'organizer decision' },
+    });
+    assert.equal(reported.status, 201);
+    const { id } = await reported.json();
+    const ignored = await api(`/api/issues/${id}`, { method: 'PATCH', token, body: { status: 'ignored' } });
+    assert.equal(ignored.status, 200);
+    const issues = await (await api('/api/issues', { token })).json();
+    assert.equal(issues.find(issue => issue.id === id)?.status, 'ignored');
+  });
+});
+
+// PR-28 review regression: updateLegacyFromActive() used to DELETE every
+// phase_plan_* row and re-insert, which destroyed Classic correction/enrichment
+// history. The fix switched to a keyed upsert — but an upsert with no delete
+// pass would instead let a Classic row survive after its Modern source was
+// removed, and could duplicate a row on repeated edits. These pin the reconcile.
+describe('Modern itinerary edits reconcile into the Classic plan', () => {
+  const PHASE = 'ny';
+  const DATE = '2027-03-11';
+  const planRows = async () => (await api(`/api/phases/${PHASE}/plan`, { token })).json();
+  const withText = (rows, text_en) => rows.filter((r) => r.text_en === text_en);
+
+  let keptUid;
+  let removedUid;
+
+  test('a Modern item is projected into the Classic plan', async () => {
+    const first = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני ראשון', text_en: 'Reconcile item A' },
+    });
+    const second = await api('/api/itinerary/items', {
+      method: 'POST', token,
+      body: { phase_id: PHASE, date: DATE, text_he: 'פריט מודרני שני', text_en: 'Reconcile item B' },
+    });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    const firstCreated = await first.json();
+    assert.deepEqual(firstCreated.enrichment, { configured: true, queued: true },
+      'a Modern item must start the background translation/link enrichment pass');
+    keptUid = firstCreated.item_uid;
+    removedUid = (await second.json()).item_uid;
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item A').length, 1);
+    assert.equal(withText(rows, 'Reconcile item B').length, 1);
+  });
+
+  test('deleting the Modern item removes it from the Classic plan — no resurrection', async () => {
+    const del = await api(`/api/itinerary/items/${removedUid}`, { method: 'DELETE', token });
+    assert.equal(del.status, 200);
+
+    const rows = await planRows();
+    assert.equal(withText(rows, 'Reconcile item B').length, 0,
+      'the deleted Modern item is still present in the Classic projection');
+    assert.equal(withText(rows, 'Reconcile item A').length, 1,
+      'the surviving item must not be dropped by the reconcile');
+  });
+
+  test('repeated Modern edits never duplicate the Classic row', async () => {
+    for (const text_en of ['Reconcile item A v2', 'Reconcile item A v3', 'Reconcile item A v4']) {
+      const res = await api(`/api/itinerary/items/${keptUid}`, { method: 'PATCH', token, body: { text_en } });
+      assert.equal(res.status, 200);
+    }
+    const rows = await planRows();
+    const mine = rows.filter((r) => (r.text_en || '').startsWith('Reconcile item A'));
+    assert.equal(mine.length, 1, `expected exactly one Classic row for the edited item, got ${mine.length}`);
+    assert.equal(mine[0].text_en, 'Reconcile item A v4');
+  });
+
+  test('Modern timeline orders exact and rough times before untimed items', async () => {
+    const date = '2027-03-12';
+    const created = [];
+    for (const [time, text_he] of [
+      [null, 'ללא שעה'],
+      ['evening', 'ערב'],
+      ['12:30', 'שתים-עשרה וחצי'],
+      ['afternoon', 'אחר הצהריים'],
+      ['08:00', 'שמונה'],
+      ['morning', 'בוקר'],
+    ]) {
+      const response = await api('/api/itinerary/items', {
+        method: 'POST', token,
+        body: { phase_id: PHASE, date, text_he, time },
+      });
+      assert.equal(response.status, 201);
+      created.push((await response.json()).item_uid);
+    }
+
+    const active = await (await api('/api/itinerary/active', { token })).json();
+    const times = active.items
+      .filter((item) => item.phase_id === PHASE && item.date === date)
+      .map((item) => item.time);
+    assert.deepEqual(times, ['08:00', 'morning', '12:30', 'afternoon', 'evening', null]);
+
+    for (const itemUid of created) {
+      const response = await api(`/api/itinerary/items/${itemUid}`, { method: 'DELETE', token });
+      assert.equal(response.status, 200);
+    }
   });
 });

@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
 const run = promisify(execFile);
-const DB_URL = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
 const apiDir = fileURLToPath(new URL("../", import.meta.url));
 const cliEntry = fileURLToPath(new URL("../src/release-cli.ts", import.meta.url));

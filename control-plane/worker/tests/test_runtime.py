@@ -8,7 +8,11 @@ from __future__ import annotations
 import os
 import unittest
 
-DATABASE_URL = os.environ.get("CONTROL_PLANE_TEST_DATABASE_URL")
+from tests.support.test_database import test_database_url
+
+# Refuses a database whose name does not mark it as scratch — these tests
+# write into whatever they are given. See tests/support/test_database.py.
+DATABASE_URL = test_database_url()
 
 try:
     import psycopg

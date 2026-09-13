@@ -218,10 +218,16 @@ mcp.tool('add_participant',
 
 mcp.tool('reset_participant_password',
   'Trigger a password reset for an existing participant (Telegram-bound or not — they may still want a password fallback). ' +
-  'Returns a one-time enrollment_token for the organizer to relay; never collect the new password directly in chat. ' +
-  'Build the link as "<trip site URL>/#enroll=<enrollment_token>" — a URL fragment (#), not a query string (?).', {
-  username: z.string().describe('Existing participant username'),
-}, async ({ username }) => ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, {})));
+  'TWO WAYS. Default: returns a one-time enrollment_token for the organizer to relay as "<trip site URL>/#enroll=<enrollment_token>" — ' +
+  'a URL fragment (#), not a query string (?) — and the person chooses a secret nobody else knows. ' +
+  'Or to: "trip_password", which puts their login back to the shared trip password the introduction already gave the group: ' +
+  'fewer steps, for someone who forgot theirs and needs in now. ' +
+  'Never collect a new password in chat, and never read a password out — say "the trip password" and let them use the one they were given.', {
+  username: z.string().describe('Existing participant username — see get_config for who exists'),
+  to: z.enum(['trip_password']).optional()
+    .describe('Omit for the one-time link. "trip_password" restores the shared trip password instead — refused with no_trip_password on a trip seeded with per-person random passwords.'),
+}, async ({ username, to }) =>
+  ok(await apiPost(`/api/agent/participants/${encodeURIComponent(username)}/reset-password`, to ? { to } : {})));
 
 mcp.tool('bind_participant_telegram',
   'Bind a Telegram numeric ID to an EXISTING participant, enabling Telegram login for them — e.g. "bind @dror to dror". ' +
@@ -251,6 +257,27 @@ mcp.tool('set_telegram_group',
 
 mcp.tool('get_budget', 'Get all trip budget items grouped by phase', {},
   async () => ok(await apiGet('/api/budget')));
+
+mcp.tool('add_budget_item',
+  'Add a known or estimated cost to the shared trip budget. Use a phase id from get_config, "intl_flights" for international flights, or "general" for a whole-trip cost.', {
+  phase: z.string().min(1).describe('Trip phase id, "intl_flights", or "general"'),
+  category: z.string().min(1).describe('Short category such as flight, hotel, transport, food, activity, shopping, or other'),
+  description: z.string().min(1).describe('Human-readable cost description'),
+  amount: z.number().nonnegative().describe('Amount in USD; use 0 with is_estimate true when the amount is still unknown'),
+  is_estimate: z.boolean().optional().describe('True when the amount is provisional rather than confirmed'),
+}, async (args) => ok(await apiPost('/api/budget', args)));
+
+mcp.tool('update_budget_item',
+  'Update the amount and/or description of an existing trip budget item.', {
+  id: z.number().int().positive().describe('Budget item id from get_budget'),
+  amount: z.number().nonnegative().optional().describe('Replacement amount in USD'),
+  description: z.string().min(1).optional().describe('Replacement description'),
+}, async ({ id, ...fields }) => ok(await apiPatch(`/api/budget/${id}`, fields)));
+
+mcp.tool('delete_budget_item',
+  'Delete a trip budget item after the organizer has clearly asked for its removal.', {
+  id: z.number().int().positive().describe('Budget item id from get_budget'),
+}, async ({ id }) => ok(await apiDelete(`/api/budget/${id}`)));
 
 mcp.tool('get_rsvps', 'Get RSVP status for a specific activity', {
   activityId: z.string().describe('Activity id from a phase\'s rsvp_activities[] in trip.config.json'),
@@ -859,7 +886,8 @@ app.post('/extract', requireSiteOrAgentKey, express.json({ limit: '30mb' }), asy
 
 // ── /enrich — links for a plan item ──────────────────────────────────────────
 // Called by the trip site's enrichment worker (server.js), not by an agent
-// directly. Returns links only; it never rewrites the organizer's own text.
+// directly. It returns safe operational links and the missing companion
+// language for an organizer-authored itinerary title.
 //
 // The model is told to omit anything it isn't sure of rather than guess a URL,
 // for the same reason resolveCost() refuses to let it invent exchange rates —
@@ -877,14 +905,19 @@ function buildEnrichPrompt({ text, text_he, date, context }) {
     '  advance_booking — true/false: does it typically sell out or require booking a',
     '                    timed slot ahead of the day? Only true when that is genuinely',
     '                    normal for this place, not merely possible.',
+    '  text_he     — the item title in Hebrew',
+    '  text_en     — the item title in English',
     '',
     'Rules:',
     '- Omit any key you are not confident about. Never invent or guess a URL.',
     '- Omit needs_tickets/advance_booking rather than guessing — "unknown" is a',
     '  useful answer, a wrong "no tickets needed" strands someone at the gate.',
     '- Prefer official sites over aggregators, blogs, or review sites.',
-    '- If the item is not a place (e.g. "pack the suitcases", "relaxed morning"),',
-    '  return {} — an empty object is the correct answer for a non-place.',
+    '- Return both text_he and text_en as a faithful, short translation of the',
+    '  organizer\'s item. Preserve proper place names; do not add details, advice,',
+    '  opening hours, or a time that the organizer did not provide.',
+    '- For a non-place item (e.g. "pack the suitcases", "relaxed morning"),',
+    '  still return text_he and text_en, but omit maps, Waze, website, and ticket keys.',
     '- For maps_url use https://www.google.com/maps/search/?api=1&query=<url-encoded place>',
     '- For waze_url use https://waze.com/ul?q=<url-encoded place>&navigate=yes',
     '',
@@ -1025,6 +1058,12 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
         if (typeof parsed[k] === 'string' && parsed[k].trim()) out[k] = parsed[k].trim().slice(0, 120);
       }
     } else {
+      // Translation is deliberately plain text. server.js strips markup again
+      // before storage, but malformed model output should not travel farther.
+      for (const k of ['text_he', 'text_en']) {
+        const v = parsed[k];
+        if (typeof v === 'string' && v.trim()) out[k] = v.trim().slice(0, 2000);
+      }
       // Only http(s) links survive the boundary. server.js re-checks this before
       // storing, and the renderer escapes regardless — but a bad link should not
       // travel this far in the first place.

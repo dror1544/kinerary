@@ -111,6 +111,7 @@ class LxcProvisionAdapter:
         disk_gb: int = 8,
         forward_port: int = 8080,
         seed_password: str = "",
+        control_plane_exchange_key: str = "",
         npm_identity: str = "",
         npm_secret: str = "",
         provisioner_factory: Callable[[], Provisioner] | None = None,
@@ -147,6 +148,7 @@ class LxcProvisionAdapter:
         self._disk_gb = disk_gb
         self._forward_port = forward_port
         self._seed_password = seed_password
+        self._control_plane_exchange_key = control_plane_exchange_key
         # Set per-call by create_container (the worker is single-threaded — one
         # job at a time via run_once), read by _build_provisioner when it
         # constructs the ProxmoxLxcAdapter.
@@ -347,6 +349,7 @@ class LxcProvisionAdapter:
         return Provisioner(
             ProxmoxLxcAdapter(
                 proxmox_ssh, seed_password=self._seed_password, reset_data=self._reset_data,
+                control_plane_exchange_key=self._control_plane_exchange_key,
             ),
             NpmProxyHostAdapter(npm_transport),
             CloudflareTunnelDnsAdapter(cloudflare_transport, self._cloudflare_zone_id, rpi_ssh),

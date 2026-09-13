@@ -180,6 +180,16 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("ln -sfn /nfs/tokyo-2026/media/avatars /opt/kinerary/site/avatars", bootstrap)
         self.assertIn("listen 8080", bootstrap)
         self.assertIn("systemctl enable nginx kinerary-server", bootstrap)
+        # A trip's hostname outlives the trip: a slug comes back, a container is
+        # rebuilt, and a browser still holds the last one's app.js. Only *.html
+        # carried a cache policy, so the page revalidated and the script it
+        # loads did not — on 2026-09-12 a deployed fix was invisible to the
+        # organizer for exactly that reason. The classic assets are not
+        # content-hashed and must always revalidate; the modern bundle is, so
+        # its name changes when its content does and it can be kept forever.
+        self.assertIn('location ~* ^/[^/]+\\.(js|css)$', bootstrap)
+        self.assertIn("location ^~ /modern/assets/", bootstrap)
+        self.assertIn("max-age=31536000, immutable", bootstrap)
         # The debian-12 template generates only C.utf8, so every apt/perl call
         # emits multi-line "Setting locale failed" warnings. Harmless in
         # themselves, but they filled the truncated stderr this transport
@@ -201,6 +211,10 @@ class AdapterTests(unittest.TestCase):
         # container (never sent over the wire), like JWT_SECRET.
         self.assertIn("HERMES_API_KEY=${HERMES_API_KEY}", bootstrap)
         self.assertRegex(bootstrap, r"HERMES_API_KEY=\$\(head -c 32 /dev/urandom")
+        # Newly provisioned trips open the Modern SPA at `/`. The root loader
+        # still honors the stored setting, so existing hand-built trips keep
+        # their Classic front door until an organizer changes it explicitly.
+        self.assertIn("TRIP_DESIGN_VARIANT=modern", bootstrap)
 
     def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
         # Without it a provisioned site has NO way in at all: Telegram SSO is
@@ -219,6 +233,17 @@ class AdapterTests(unittest.TestCase):
         # password containing a dollar sign.
         self.assertIn("'s3cret pw$x'", bootstrap)
         self.assertIn("SEED_PASSWORD=%s", bootstrap)
+
+    def test_exchange_key_is_private_and_shell_quoted(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        adapter = ProxmoxLxcAdapter(ssh, control_plane_exchange_key="exchange $key")
+        adapter.create(LXC_SPEC)
+        bootstrap = ssh.commands[3]
+        self.assertIn("'exchange $key'", bootstrap)
+        self.assertIn("CONTROL_PLANE_EXCHANGE_KEY=%s", bootstrap)
+        self.assertIn("chmod 600 /opt/kinerary/.env", bootstrap)
+        with self.assertRaises(ValueError):
+            ProxmoxLxcAdapter(ssh, control_plane_exchange_key="key\nJWT_SECRET=oops")
 
     def test_connect_timeout_and_command_timeout_are_independent(self) -> None:
         # Regression: one `timeout` served as BOTH the ssh ConnectTimeout and

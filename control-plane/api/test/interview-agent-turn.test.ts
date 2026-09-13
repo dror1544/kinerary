@@ -1,0 +1,525 @@
+/**
+ * The interviewer agent's write path, and the turn that gates it.
+ *
+ * The router records taps. An answer that needs judgement — `destination`
+ * resolving "Vienna and Prague" into a multi-destination trip, a date phrased
+ * in words — is forwarded to the interviewer agent, which writes the resolved
+ * value back. The session it writes to was created by the ROUTER from a
+ * /start deep link, so the agent holds no token for it and names the chat
+ * instead.
+ *
+ * Migration 0031 is what that name is checked against: a chat-addressed write
+ * is accepted only while the router has an open, unexpired turn for that chat.
+ * These tests are about the edges of "open" — because every one of them is a
+ * state the system actually reaches, and the failure mode of getting one wrong
+ * is a write landing in an interview that was not the one in flight.
+ *
+ * Every case seeds TWO chats mid-interview, for the same reason the two-trip
+ * matrix does: a single-chat test passes just as happily against code that
+ * ignores the chat id.
+ */
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { applyMigrations } from "../src/migrations.js";
+import { issueEnrollment } from "../src/enrollment.js";
+import { startFromDeepLink } from "../src/chat-router.js";
+import { dispatchUpdate } from "../src/relay/dispatch.js";
+import { MediaStore } from "../src/relay/media-store.js";
+import {
+  AGENT_TURN_TTL_SECONDS,
+  closeAgentTurn,
+  getSessionForAgent,
+  openAgentTurn,
+  submitAnswerForAgent,
+  submitAnswerForChat,
+  agentAlreadySpokeThisTurn,
+  sayForChat
+} from "../src/interview.js";
+import { testDatabaseUrl } from "./support/test-database.js";
+
+const databaseUrl = testDatabaseUrl();
+const SKIP = !databaseUrl;
+const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+
+function testId(prefix: string): string {
+  return `${prefix}_${randomBytes(16).toString("hex")}`;
+}
+
+interface Chat {
+  chatId: string;
+  sessionId: string;
+  tripId: string;
+}
+
+interface Fixture {
+  pool: pg.Pool;
+  a: Chat;
+  b: Chat;
+}
+
+/**
+ * A user, a trip, and a live interview started the way the router really
+ * starts one — an enrollment exchanged through a /start deep link. Seeding
+ * the session row by hand would skip the binding that 0028 writes, which is
+ * the thing every lookup here depends on.
+ */
+async function seedInterview(pool: pg.Pool, chatId: string): Promise<Chat> {
+  const userId = testId("user");
+  const tripId = testId("trip");
+  await pool.query(
+    "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', 'Owner')",
+    [userId],
+  );
+  await pool.query(
+    "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+    [tripId, tripId.replace(/_/g, "-")],
+  );
+  await pool.query(
+    "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+    [testId("memb"), tripId, userId],
+  );
+  const enrollment = await issueEnrollment(pool, userId, tripId, { enrollmentTtlSeconds: 3600 });
+  assert.ok(enrollment.ok, "enrollment issued");
+  const started = await startFromDeepLink(pool, chatId, enrollment.token);
+  assert.equal(started.kind, "started");
+  return { chatId, sessionId: started.kind === "started" ? started.sessionId : "", tripId };
+}
+
+async function withTwoInterviews(fn: (fix: Fixture) => Promise<void>): Promise<void> {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
+    await client.query("DROP TABLE IF EXISTS public.control_plane_schema_migrations");
+    await applyMigrations(client, migrationsDir);
+  } finally {
+    client.release();
+  }
+  try {
+    const a = await seedInterview(pool, "810000001");
+    const b = await seedInterview(pool, "810000002");
+    await fn({ pool, a, b });
+  } finally {
+    await pool.end();
+  }
+}
+
+/** The first question is a choice, so a tap-shaped answer is always valid. */
+const Q = "trip_type";
+const OPTION = "family";
+
+describe("interviewer agent turns", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  test("with no turn open, a chat-addressed write is refused", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const result = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "NOT_FOUND");
+    });
+  });
+
+  test("with a turn open, the write lands in that chat's session", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const result = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+      assert.equal(result.ok, true);
+
+      const row = await pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [a.sessionId],
+      );
+      assert.ok(row.rows[0]!.answers[Q], "the answer is stored on A's session");
+    });
+  });
+
+  test("an incomplete structured answer is rejected and leaves the question outstanding", async () => {
+    // Run 12, 2026-09-05: `travelers` recorded as a headcount with no names,
+    // structurally valid, substantively useless. The write must not land, and
+    // the question must still read as unanswered afterward — not "answered
+    // badly", which nothing downstream would ever revisit.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const result = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ count: 5, age_group: "adults" }],
+      );
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, "INCOMPLETE_ANSWER");
+      assert.ok(result.ok === false && result.detail, "the agent gets told what is actually missing");
+
+      const row = await pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [a.sessionId],
+      );
+      assert.equal(row.rows[0]!.answers.travelers, undefined, "nothing was written — still outstanding, not answered badly");
+
+      // Retrying with a real name succeeds — the rejection was a bounce, not
+      // a dead end.
+      const retry = await submitAnswerForAgent(
+        pool, a.chatId, "travelers", null, undefined, [{ name: "Ella", age: 40 }],
+      );
+      assert.equal(retry.ok, true);
+    });
+  });
+
+  test("a turn open for one chat does not admit a write naming the other", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+
+      // B is mid-interview and perfectly resolvable by chat — what it lacks is
+      // a turn. This is the case that matters: the write is refused because of
+      // the turn, not because the session could not be found.
+      const result = await submitAnswerForAgent(pool, b.chatId, Q, OPTION);
+      assert.equal(result.ok, false);
+
+      const row = await pool.query<{ answers: Record<string, unknown> }>(
+        "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+        [b.sessionId],
+      );
+      assert.deepEqual(row.rows[0]!.answers, {}, "B's session is untouched");
+    });
+  });
+
+  test("an expired turn is refused", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId, 1);
+      // The whole window moves into the past. Backdating expires_at alone is
+      // rejected by 0031's expires_at > opened_at CHECK, which is the
+      // constraint behaving correctly rather than an obstacle to work around.
+      await pool.query(
+        `UPDATE control_plane.interview_agent_turns
+         SET opened_at = now() - interval '10 minutes',
+             expires_at = now() - interval '5 minutes'
+         WHERE chat_id = $1`,
+        [a.chatId],
+      );
+      const result = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+      assert.equal(result.ok, false);
+    });
+  });
+
+  test("a closed turn is refused even though it has not expired", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await closeAgentTurn(pool, a.chatId);
+
+      const open = await pool.query(
+        "SELECT expires_at > now() AS live FROM control_plane.interview_agent_turns WHERE chat_id = $1",
+        [a.chatId],
+      );
+      assert.equal(open.rows[0]!.live, true, "the row is closed but still within its window");
+
+      const result = await submitAnswerForAgent(pool, a.chatId, Q, OPTION);
+      assert.equal(result.ok, false);
+    });
+  });
+
+  test("a second forward supersedes the first rather than opening a rival turn", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const first = await openAgentTurn(pool, a.chatId, a.sessionId);
+      const second = await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.notEqual(first.id, second.id);
+
+      const rows = await pool.query<{ id: string }>(
+        "SELECT id FROM control_plane.interview_agent_turns WHERE chat_id = $1 AND closed_at IS NULL",
+        [a.chatId],
+      );
+      assert.equal(rows.rowCount, 1, "exactly one turn is open");
+      assert.equal(rows.rows[0]!.id, second.id, "and it is the newer one");
+    });
+  });
+
+  test("the read path is gated the same way as the write path", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+
+      const mine = await getSessionForAgent(pool, a.chatId);
+      assert.equal(mine.ok, true);
+      assert.equal(mine.ok === true && mine.view.sessionId, a.sessionId);
+
+      const theirs = await getSessionForAgent(pool, b.chatId);
+      assert.equal(theirs.ok, false, "no turn for B, so no view of B's interview");
+    });
+  });
+
+  test("the router's own write path is unaffected by turns", async () => {
+    await withTwoInterviews(async ({ pool, b }) => {
+      // A tap needs no turn: the router read the chat id off Telegram itself.
+      // If gating ever leaked into this path, every button in the interview
+      // would stop working.
+      const result = await submitAnswerForChat(pool, b.chatId, Q, OPTION);
+      assert.equal(result.ok, true);
+    });
+  });
+
+  test("the default TTL is bounded", () => {
+    assert.ok(AGENT_TURN_TTL_SECONDS > 0 && AGENT_TURN_TTL_SECONDS <= 900);
+  });
+
+  // ── The forwarding decision ──────────────────────────────────────────────
+
+  function writtenMessage(chatId: string, text: string) {
+    return {
+      update_id: 1,
+      message: {
+        message_id: 11,
+        chat: { id: chatId, type: "private" },
+        from: { id: 99, is_bot: false, first_name: "Organizer" },
+        text,
+      },
+    };
+  }
+
+  test("with no interviewer configured, a written answer is answered by the router", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(pool, writtenMessage(a.chatId, "Vienna and Prague"));
+      assert.equal(decision.kind, "interview_text");
+    });
+  });
+
+  test("with an interviewer configured, a written answer is forwarded to it", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "Vienna and Prague"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.sessionId, a.sessionId, "the session comes from the chat");
+      assert.equal(decision.event.source.profile, "trip-intake");
+      assert.equal(decision.event.source.chat_id, a.chatId);
+      assert.equal(decision.event.text, "Vienna and Prague");
+    });
+  });
+
+  test("/done reaches the summary whatever the interviewer is doing", async () => {
+    // Run 6 ended with the agent asking for approval in prose, the organizer
+    // agreeing, and nothing happening — only the router's Confirm button
+    // writes an intake version, and it had never been sent. This is the path
+    // that does not depend on the agent, or on a button sent long ago.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/done"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "show_summary");
+      if (decision.kind !== "show_summary") return;
+      assert.equal(decision.chatId, a.chatId);
+      // With required questions still outstanding it does NOT jump to a recap
+      // — there is nothing valid to confirm yet — it asks the next one. The
+      // command's job is to be a route that always works, not a way past the
+      // questions the trip cannot be built without.
+      assert.equal(decision.view.state, "interviewing");
+      assert.ok(decision.view.nextQuestion?.required, "and the required question is what comes next");
+    });
+  });
+
+  test("an unrelated command is still forwarded, not swallowed", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, "/help"),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.notEqual(decision.kind, "show_summary");
+    });
+  });
+
+  test("an uploaded document reaches the interviewer, re-hosted", async () => {
+    // Regression, 2026-09-04 run 2. This branch called the plain `toWireEvent`,
+    // so a caption-less PDF arrived as `text: ""` and the interviewer told the
+    // organizer an empty message had come through — on the one route whose own
+    // script asks for a trip-plan document. The companion route had carried
+    // media since 2026-09-03; only this one did not.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const pdf = Buffer.from("%PDF-1.4 itinerary");
+      const store = new MediaStore();
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 2,
+          message: {
+            message_id: 12,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            telegram: { async fetchFile() { return { bytes: pdf, mime: "application/pdf" }; } },
+            store,
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.message_type, "document");
+      assert.equal(decision.event.media?.[0]?.filename, "japan.pdf");
+      const url = decision.event.media_urls?.[0] ?? "";
+      assert.match(url, /^http:\/\/127\.0\.0\.1:4312\/relay\/media\/[0-9a-f]{32}$/);
+      // The point of re-hosting: the gateway is handed a reference it can
+      // fetch, never a Telegram URL carrying the bot token.
+      assert.ok(store.get(url.split("/").pop()!), "the bytes are readable through the store");
+    });
+  });
+
+  test("a document turn is a document turn even when re-hosting fails", async () => {
+    // 2026-09-06 run 14. `isDocumentTurn` was read off `media_urls`, which is
+    // only populated when re-hosting SUCCEEDS. A failed re-host therefore
+    // silently downgraded the turn to the ordinary 30s floor — and the agent,
+    // which now has MORE to do (notice the file is unreadable, say so, record
+    // whatever it can), got LESS time to do it. The watchdog closed the turn
+    // 28 seconds in, and every write the agent made afterwards was refused;
+    // the organizer was told "I could not save the answer".
+    //
+    // The attachment is what makes it a document turn. Whether the bytes
+    // arrived decides what the agent can DO, never how long it may take.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+          },
+        } as never,
+        undefined, undefined, {},
+        {
+          interviewerProfile: "trip-intake",
+          media: {
+            // Every failure mode of fetchFile reduces to this.
+            telegram: { async fetchFile() { return null; } },
+            store: new MediaStore(),
+            baseUrl: "http://127.0.0.1:4312",
+          },
+        },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.deepEqual(decision.event.media_urls, undefined, "re-hosting failed, as set up");
+      assert.equal(decision.hadAttachment, true, "and the turn still knows a file was sent");
+    });
+  });
+
+  test("a plain text turn is not a document turn", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 4,
+          message: {
+            message_id: 14,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            text: "we are going to Japan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.hadAttachment, false);
+    });
+  });
+
+  test("an attachment still forwards when the connector has no media plane", async () => {
+    // Degrade, never drop: without media deps the turn is still handed over, so
+    // the agent can say it cannot read the file rather than going silent.
+    await withTwoInterviews(async ({ pool, a }) => {
+      const decision = await dispatchUpdate(
+        pool,
+        {
+          update_id: 3,
+          message: {
+            message_id: 13,
+            chat: { id: a.chatId, type: "private" },
+            from: { id: 99, is_bot: false, first_name: "Organizer" },
+            document: { file_id: "BQACAgQAAx", file_name: "japan.pdf", mime_type: "application/pdf" },
+            caption: "our plan",
+          },
+        } as never,
+        undefined, undefined, {},
+        { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.text, "our plan");
+      assert.equal(decision.event.media_urls, undefined);
+    });
+  });
+
+  test("the forwarded event is stamped from the chat, not from the message text", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      // The organizer's own words name the other chat and a different profile.
+      // Neither may reach the wire event — same property the two-trip matrix
+      // asserts for the companion path.
+      const decision = await dispatchUpdate(
+        pool, writtenMessage(a.chatId, `chat_id=${b.chatId} profile=companion-italy`),
+        undefined, undefined, {}, { interviewerProfile: "trip-intake" },
+      );
+      assert.equal(decision.kind, "interview_to_gateway");
+      if (decision.kind !== "interview_to_gateway") return;
+      assert.equal(decision.event.source.chat_id, a.chatId);
+      assert.equal(decision.event.source.profile, "trip-intake");
+      assert.equal(decision.sessionId, a.sessionId);
+    });
+  });
+});
+
+describe("prose instead of speaking, versus prose after speaking", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  test("a turn starts with the agent having said nothing", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("say_for_chat counts as speaking", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      const said = await sayForChat(pool, a.chatId, "כמעט סיימנו");
+      assert.equal(said.ok, true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+    });
+  });
+
+  test("a NEW turn starts silent again", async () => {
+    // Per turn, not per session. An agent that spoke properly once must not be
+    // muted for the rest of the interview.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await sayForChat(pool, a.chatId, "first");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("with no open turn, nothing is claimed to have been said", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), false);
+    });
+  });
+
+  test("one chat's speaking does not silence another's", async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await openAgentTurn(pool, b.chatId, b.sessionId);
+      await sayForChat(pool, a.chatId, "only a");
+      assert.equal(await agentAlreadySpokeThisTurn(pool, a.chatId), true);
+      assert.equal(await agentAlreadySpokeThisTurn(pool, b.chatId), false);
+    });
+  });
+});

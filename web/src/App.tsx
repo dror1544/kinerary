@@ -46,7 +46,6 @@ export function App() {
           <Route path="/trips/:tripId" element={<ProductApp view="trip" />} />
           <Route path="/trips/:tripId/app" element={<ProductApp view="runtime" />} />
           <Route path="/join" element={<ProductApp view="join" />} />
-          <Route path="/ops/provisioning" element={<ProductApp view="ops" />} />
           <Route path="/new-trip" element={<Navigate to="/trips/new" replace />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

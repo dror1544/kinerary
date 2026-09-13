@@ -57,11 +57,25 @@ const record = (n, data) => { state.steps[n] = { at: new Date().toISOString(), .
 // the repo directory, and a test credential on disk is still a credential on
 // disk. Pass it per invocation, or export KINERARY_TEST_PASSWORD.
 const password_ = () => flag("password") || process.env.KINERARY_TEST_PASSWORD || "";
-const authHeader = () => {
+const authCredential = () => {
   const email = state.email, password = password_();
   if (!email || !password) die("no credentials: pass --email once, and --password (or export KINERARY_TEST_PASSWORD) on every invocation");
-  return { "x-portal-password-login": Buffer.from(JSON.stringify({ email, password })).toString("base64url") };
+  return Buffer.from(JSON.stringify({ email, password })).toString("base64url");
 };
+
+const authHeader = () => ({ "x-portal-password-login": authCredential() });
+
+/**
+ * GET /v1/signup/status takes its credential as a QUERY PARAM, not a header.
+ *
+ * It is the one endpoint that does — it is reached before a session exists, so
+ * it re-authenticates from the URL (`?password=<base64url json>`, app.ts). Run
+ * 14 sat here polling `400 INVALID_REQUEST` sixty times and then declared the
+ * signup never approved, when the signup was simply never asked about
+ * correctly. A driver that reports a false negative about a live run is worse
+ * than one that crashes.
+ */
+const authQuery = () => `password=${authCredential()}`;
 
 async function call(method, path, { body, auth = true } = {}) {
   const url = `${API}${path}`;
@@ -74,7 +88,10 @@ async function call(method, path, { body, auth = true } = {}) {
     die(`${method} ${path} — could not reach ${API}: ${e.message}\n       is the control-plane API up?`);
   }
   let json; try { json = JSON.parse(text); } catch { json = null; }
-  say(`${C.d}    ${method} ${path} -> ${res.status} ${text.slice(0, 400)}${C.x}`);
+  // `password=` carries a base64url blob of the real email AND password, so the
+  // path cannot be echoed raw — these lines get pasted into run notes.
+  const shown = path.replace(/([?&]password=)[^&]*/, "$1<redacted>");
+  say(`${C.d}    ${method} ${shown} -> ${res.status} ${text.slice(0, 400)}${C.x}`);
   return { status: res.status, json, text };
 }
 
@@ -126,10 +143,15 @@ const steps = {
   }},
 
   7: { kind: "ai", title: "confirm the approval landed", async run() {
+    // The API's vocabulary is SignupStatus in signup.ts:
+    //   awaiting_approval | approved | declined | not_found
+    // "pending" is not one of them, so a `st !== "pending"` test treats the
+    // WAITING state as terminal and reports a live, un-approved signup as
+    // finished. Wait on the state that actually means waiting.
     const r = await poll("signup status", async () => {
-      const s = await call("GET", "/v1/signup/status");
+      const s = await call("GET", `/v1/signup/status?${authQuery()}`, { auth: false });
       const st = s.json?.status;
-      if (st && st !== "pending") return { done: true, st, body: s.json };
+      if (st && st !== "awaiting_approval" && st !== "pending") return { done: true, st, body: s.json };
       return { done: false, note: `status=${st ?? "?"}` };
     });
     if (!/approved|active|ready/i.test(String(r.st))) die(`signup ended in status '${r.st}', not approved`);
@@ -157,6 +179,9 @@ const steps = {
     state.planId = planId; save();
 
     warn("approving a plan is a real decision — this driver places the call because you started it");
+  // The approval also enqueues an operator Telegram DM, in its own transaction.
+  // Observability, not a gate: nothing below waits for it, and a run in which it
+  // never arrives is still a passing run.
     const a = await call("POST", `/v1/plans/${planId}/approve`, { body: {} });
     if (a.status !== 200 && a.status !== 201) die(`approve returned ${a.status}`);
     record(9, { kind: "ai", planId, approve: a.status });

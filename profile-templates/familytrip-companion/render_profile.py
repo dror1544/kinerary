@@ -5,6 +5,15 @@ from pathlib import Path
 from string import Template
 ROOT=Path(__file__).resolve().parent
 FORBIDDEN=re.compile(r'(?:^|_)(?:token|password|secret|api_?key|bot_?token|confirmation_code)(?:$|_)',re.I)
+# `gender` is required and validated, but it used to reach only
+# references/group-context.json — nothing in the prompt said which forms the
+# assistant uses about ITSELF, so it took the cue from how its own name sounds.
+# In Hebrew that is wrong in every first-person sentence, not occasionally.
+GENDER_RULE={
+ 'male':'You are {name}, and you speak about yourself in the **masculine**. In Hebrew: «אני בודק», «שמח לעזור», «הייתי שם» — never the feminine forms.',
+ 'female':'You are {name}, and you speak about yourself in the **feminine**. In Hebrew: «אני בודקת», «שמחה לעזור», «הייתי שם» — never the masculine forms.',
+ 'neutral':'You are {name}, and you avoid gendering yourself. Hebrew has no neuter, so reach for phrasings that do not force a choice — «אבדוק» rather than «אני בודק/בודקת», a noun where a participle would commit you. Do not alternate between masculine and feminine forms: that reads as a mistake rather than as neutrality, and do not write «בודק/ת» either.',
+}
 def bad(m): raise ValueError(m)
 def scan(v,path='$'):
  if isinstance(v,dict):
@@ -34,7 +43,7 @@ def render(d,out):
  validate(d)
  if out.exists() and any(out.iterdir()): bad(f'output is not empty: {out}')
  out.mkdir(parents=True,exist_ok=True); t=d['trip']; a=d['assistant']; o=d['organizer']
- v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-site'}
+ v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ASSISTANT_GENDER_RULE':GENDER_RULE[a['gender']].replace('{name}',a['name']),'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-mcp'}
  for src,dst in [('SOUL.md.tpl','SOUL.md'),('profile.yaml.tpl','profile.yaml'),('config.overlay.yaml.tpl','config.overlay.yaml')]: (out/dst).write_text(tpl(ROOT/'templates'/src,v))
  (out/'references').mkdir(); (out/'references/sources.md').write_text(tpl(ROOT/'templates/references/sources.md.tpl',v)); shutil.copytree(ROOT/'templates/skills',out/'skills')
  group={'schema_version':1,'trip':{k:t[k] for k in ('id','title','default_language','timezone')},'assistant':a,'preferences':d['interview'].get('group_safe',{})}

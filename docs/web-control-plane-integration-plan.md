@@ -453,7 +453,7 @@ This slice proves the account-to-named-trip relationship before changing provisi
 
 ## 16. Decisions to settle before Phase B
 
-1. Whether new web accounts require super-admin approval, only trip provisioning requires approval, or policy varies by environment/plan.
+1. ~~Whether new web accounts require super-admin approval, only trip provisioning requires approval, or policy varies by environment/plan.~~ **Settled 2026-09-05 (Dror).** New web accounts keep the super-admin signup approval. Trip provisioning is approved by the trip's own organizer — the separately configured operations administrator and its separation-of-duties check are removed, and the operator receives a non-blocking Telegram notification instead. Policy does not vary by environment or plan.
 2. The production account domain and active-trip domain pattern, because cookie scope and OIDC redirects depend on it.
 3. Whether email addresses are retained in PostgreSQL for notifications or delegated to an identity provider; either way, access and deletion rules must be explicit.
 4. Whether the first web interview is a native SPA conversation or a secure embedded/redirected form over the same interview API.

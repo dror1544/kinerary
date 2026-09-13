@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
 import {
+  foldExtractedIntoPhases,
   normaliseExtractedItinerary,
   buildExtractPrompt,
   buildVenueLinkPrompt,
   isRateLimited,
   acceptableVenueUrl,
+  EXTRACT_OUTPUT_SCHEMA,
   type PhaseRef,
 } from "../src/itinerary-extract.js";
 
@@ -21,6 +23,63 @@ const JAPAN_PHASES: PhaseRef[] = [
   { name: "Osaka", start: "2026-09-27", end: "2026-09-30" },
   { name: "Tokyo", start: "2026-09-30", end: "2026-10-03" },
 ];
+
+describe("foldExtractedIntoPhases", () => {
+  // The interviewer folded an extraction into `phases` by hand. The router on
+  // the interpret path has no interviewer, which is why a document with a
+  // day-by-day produced phases with names, dates and nothing in them.
+  const day = (date: string) => ({ date, items: [{ time: "10:00", text: { he: "משהו", en: "Something" } }] });
+
+  test("gives each phase its own days, by index rather than by name", () => {
+    // Two Tokyo stops is the ordinary shape of a trip that flies home from
+    // where it landed. Matching on name would give the second one's days to
+    // the first.
+    const phases = [{ name: "Tokyo" }, { name: "Kyoto" }, { name: "Tokyo" }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-19")], venues: [] },
+      { name: "Tokyo", phaseIndex: 2, days: [day("2026-10-01"), day("2026-10-02")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 3);
+    assert.deepEqual((folded[0] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-09-19"]);
+    assert.equal((folded[1] as { days?: unknown }).days, undefined, "Kyoto had no extraction and gains nothing");
+    assert.deepEqual((folded[2] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-10-01", "2026-10-02"]);
+  });
+
+  test("an itinerary already there wins — a re-run never overwrites it", () => {
+    const phases = [{ name: "Tokyo", days: [day("2026-09-19")] }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-20"), day("2026-09-21")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 0);
+    assert.deepEqual((folded[0] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-09-19"]);
+  });
+
+  test("venues merge rather than replace, and a name already there is not doubled", () => {
+    const phases = [{ name: "Tokyo", venues: [{ name: { he: "סקייטרי", en: "Tokyo Skytree" } }] }];
+    const { phases: folded, venuesAdded } = foldExtractedIntoPhases(phases, [
+      {
+        name: "Tokyo", phaseIndex: 0, days: [],
+        venues: [
+          { name: { he: "סקייטרי", en: "Tokyo Skytree" } },
+          { name: { he: "טימלאב", en: "TeamLab Planets" }, url: "https://teamlab.example" },
+        ],
+      },
+    ]);
+    assert.equal(venuesAdded, 1);
+    const venues = (folded[0] as { venues: { name: { en: string }; url?: string }[] }).venues;
+    assert.equal(venues.length, 2);
+    assert.equal(venues[1]?.url, "https://teamlab.example", "the document's URL survives the merge");
+  });
+
+  test("an extraction for a phase that is not there changes nothing", () => {
+    const phases = [{ name: "Tokyo" }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Osaka", phaseIndex: 7, days: [day("2026-09-30")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 0);
+    assert.deepEqual(folded, phases);
+  });
+});
 
 describe("normaliseExtractedItinerary", () => {
   test("keeps a well-formed day and mirrors the language it was given", () => {
@@ -297,5 +356,91 @@ describe("acceptableVenueUrl", () => {
     for (const u of ["not-a-url", "https://dup", "", "ftp://x.com", null, 42]) {
       assert.equal(acceptableVenueUrl(u), "", String(u));
     }
+  });
+});
+
+/**
+ * The schema handed to a provider that enforces it — the Codex CLI's
+ * `--output-schema`, OpenRouter's structured outputs.
+ *
+ * These rules are OpenAI's strict structured-output rules, and they are not
+ * advisory: a schema that breaks them is rejected outright before the model is
+ * ever called. Found live on 2026-09-08, on the first real PDF extraction —
+ * "'required' is required to be supplied and to be an array including every
+ * key in properties" — which cost a whole run to discover and is trivially
+ * checkable here.
+ */
+describe("EXTRACT_OUTPUT_SCHEMA obeys strict structured-output rules", () => {
+  type Node = Record<string, unknown>;
+
+  /** Walks every object node in the schema, reporting the path of each. */
+  function walk(node: unknown, path: string, visit: (n: Node, p: string) => void): void {
+    if (!node || typeof node !== "object") return;
+    const n = node as Node;
+    if (Array.isArray(n.anyOf)) {
+      n.anyOf.forEach((branch, i) => walk(branch, `${path}/anyOf[${i}]`, visit));
+      return;
+    }
+    if (n.type === "object") {
+      visit(n, path);
+      const props = (n.properties ?? {}) as Record<string, unknown>;
+      for (const [key, child] of Object.entries(props)) walk(child, `${path}/${key}`, visit);
+      return;
+    }
+    if (n.type === "array") walk(n.items, `${path}[]`, visit);
+  }
+
+  test("every object lists all of its properties as required", () => {
+    const offenders: string[] = [];
+    walk(EXTRACT_OUTPUT_SCHEMA, "$", (node, path) => {
+      const props = Object.keys((node.properties ?? {}) as Record<string, unknown>);
+      const required = new Set((node.required ?? []) as string[]);
+      const missing = props.filter((p) => !required.has(p));
+      if (missing.length) offenders.push(`${path}: ${missing.join(", ")}`);
+    });
+    assert.deepEqual(offenders, []);
+  });
+
+  test("every object refuses additional properties", () => {
+    const offenders: string[] = [];
+    walk(EXTRACT_OUTPUT_SCHEMA, "$", (node, path) => {
+      if (node.additionalProperties !== false) offenders.push(path);
+    });
+    assert.deepEqual(offenders, []);
+  });
+
+  // Strict mode has no optional fields, so anything the extractor may omit has
+  // to be expressed as nullable — and the normaliser then drops the null.
+  test("the fields the types call optional are nullable, not absent", () => {
+    const phases = (EXTRACT_OUTPUT_SCHEMA.properties as Node).phases as Node;
+    const phase = (phases.items as Node).properties as Node;
+    const day = ((phase.days as Node).items as Node).properties as Node;
+    const venue = ((phase.venues as Node).items as Node).properties as Node;
+
+    assert.ok(Array.isArray((day.label as Node).anyOf), "day.label is nullable via anyOf");
+    assert.deepEqual((venue.url as Node).type, ["string", "null"]);
+    assert.deepEqual((venue.area as Node).type, ["string", "null"]);
+    const item = ((day.items as Node).items as Node).properties as Node;
+    assert.deepEqual((item.time as Node).type, ["string", "null"]);
+  });
+
+  // The schema constrains shape. It cannot know a date must fall inside its
+  // phase, or that `<` in a label is an XSS sink — those stay in the normaliser.
+  test("the schema does not take over the normaliser's invariants", () => {
+    const { phases, warnings } = normaliseExtractedItinerary(
+      {
+        phases: [
+          {
+            name: "Tokyo",
+            days: [{ date: "2027-01-01", label: null, items: [{ time: null, text: { he: "x", en: "y" } }] }],
+            venues: [],
+          },
+        ],
+      },
+      [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-23" }],
+    );
+    // Schema-valid and still rejected: the date is outside the phase.
+    assert.equal(phases.length, 0);
+    assert.ok(warnings.length > 0);
   });
 });

@@ -41,7 +41,7 @@ Add `--with-correction` to exercise step 13, the intake-correction path.
 | 6 | 🧍 tap Approve in the Telegram DM |
 | 7 | poll `GET /v1/signup/status` until it leaves `pending` |
 | 8 | 🧍 hold the interview through to CONFIRM |
-| 9 | `POST /v1/trips/:id/plan`, then `POST /v1/plans/:planId/approve` |
+| 9 | `POST /v1/trips/:id/plan`, then `POST /v1/plans/:planId/approve` — the organizer is the only approver; the operator DM this fires is fire-and-forget and the run never waits on it |
 | 10 | poll `GET /v1/trips/:id` while the worker provisions |
 | 12 | smoke-check the provisioned site |
 | 13 | `POST /v1/trips/:id/intake/correct` (opt-in) |

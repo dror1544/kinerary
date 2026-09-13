@@ -31,35 +31,32 @@ Never use `--clone` or profile export/import for this template: they can carry p
 
 ## Doubling as the shared trip-companion host
 
-`config.overlay.yaml.tpl` ships `gateway.multiplex_profiles: false` by
-default, and getting this wrong doesn't fail loudly — it silently starts a
-second connection for a bot token something else already holds. Read this
-whole section before changing it, not just the config comment.
+`config.overlay.yaml.tpl` ships `gateway.multiplex_profiles: true`, which is
+only correct **together with a `GATEWAY_RELAY_URL` env stamp**. The two travel
+together; either alone is a misconfiguration, and getting it wrong doesn't fail
+loudly — it silently starts a second connection for a bot token something else
+already holds (Telegram answers that with a 409).
 
-**An allowlist alone does not make this safe.** In the installed Hermes
-source (`hermes_cli/profiles.py`'s `profiles_to_serve`), turning on
-`multiplex_profiles` unconditionally adds this Hermes install's `default`
-profile to the served set *before* `multiplex_profile_allowlist` is even
-consulted — the allowlist can add or remove named profiles, but it cannot
-exclude `default`. If `default` on this install has its own live bot token
-(it usually does — `default` is normally someone's personal assistant
-profile, not an empty placeholder), turning this on will make this gateway
-try to start that bot's adapter a second time, colliding with whatever
-already-running gateway currently holds it.
+**The full operational knowledge lives in the
+`hermes-multiplex-relay` skill** (`.agents/skills/hermes-multiplex-relay/`):
+allowlist semantics, why the `default` profile cannot be excluded, the cron
+duplication the relay does *not* fix, and copy-paste commands that verify the
+whole thing against a live install. Read it before touching any of these
+settings; it is deliberately the single durable copy, because config comments
+do not survive `hermes config set`.
 
-Before setting `multiplex_profiles: true`, confirm one of:
-- `default` on this specific Hermes install has no enabled platforms (check
-  its `config.yaml` **and** its `.env` — a bare `TELEGRAM_BOT_TOKEN` there
-  auto-enables Telegram even with no `platforms:` block saying so), or
-- this profile has been promoted to actually **be** `default` (so the
-  unconditional inclusion is itself, which Hermes's own
-  `_start_secondary_profile_adapters` already skips), or
-- per-trip companion profiles get their own dedicated gateway instead of
-  being hosted here at all (see `profile-templates/familytrip-companion/`'s
-  "Register with trip-intake" section for the tradeoff).
+The three things most likely to bite, in short:
 
-Only once that's confirmed: turn it on, set `gateway.multiplex_profile_allowlist`
-to an explicit list of companion profile names (never leave it unset — unset
-means "every profile this install has," not just these), add one
-`gateway.profile_routes` entry per allowlisted profile, and restart this
-gateway.
+- **`multiplex_profile_allowlist: []` serves NOTHING** (only `default`).
+  *Absent* is what serves every profile on the install. Set it explicitly,
+  always, and add companion profiles one at a time.
+- **`default` is always served and there is no deny list.** It is harmless
+  under relay-exclusive mode — its Telegram adapter is swept off — but only if
+  it has no enabled cron jobs, which the relay does not touch.
+- **`GATEWAY_RELAY_URL` as an env var ≠ `gateway.relay_url` in config.yaml.**
+  Only the env form disables directly-connected adapters. The config form keeps
+  them running beside the relay.
+
+`gateway.profile_routes` is no longer the routing input: the connector stamps
+`source.profile` per inbound chat and the gateway serves that turn from that
+profile. The static route table is vestigial under the relay.
