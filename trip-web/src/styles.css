@@ -280,6 +280,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   padding: clamp(18px, 3vw, 26px);
   background: linear-gradient(135deg, rgba(95,211,196,.16), rgba(255,255,255,.96));
 }
+.day-heading-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.journey-settings { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: var(--kit-radius); color: var(--kit-teal); }
+.journey-settings:hover { background: rgba(95,211,196,.14); }
+.journey-settings:focus-visible { outline: 2px solid var(--kit-teal); outline-offset: 2px; }
 .editor-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
 .editor-heading h3 { margin: 7px 0 0; font: 800 24px/1.15 var(--kit-font-display); }
 .editor-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
@@ -988,8 +992,6 @@ textarea { min-height: 132px; resize: vertical; }
 .trivia-answers { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
 @media(max-width:480px) { .trivia-answers { grid-template-columns: 1fr; } }
 
-.journey-tools { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-block: 12px; }
-.journey-tools a { color: var(--kit-teal); text-decoration: underline; text-underline-offset: 3px; }
 
 .star-rating { border: 0; padding: 0; margin: 0 0 12px; min-width: 0; }
 .star-rating legend { padding: 0; margin-bottom: 8px; font-weight: 700; }

@@ -1227,6 +1227,10 @@ app.get('/api/config/versions/:version', authRequired, (req, res) => {
   res.json({ version: row.version, created_at: row.created_at, hash: row.hash, content });
 });
 
+require('./site-icons').registerSiteIcons(app, {
+  tripDir: TRIP_DIR, siteDir: SITE_DIR, getLogo: () => TRIP_CONFIG.meta?.logo,
+});
+
 app.get('/api/trip/logo', (_req, res) => {
   const logoFile = TRIP_CONFIG.meta?.logo;
   if (!logoFile) return res.status(404).end();

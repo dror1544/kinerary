@@ -959,9 +959,9 @@ export function JourneyView({
       </aside>
       <section ref={daySpineRef} className="day-spine">
         <div className="day-heading">
-          <span className="panel-label">{activePhase?.title || "Journey"}</span>
-          <div className="journey-tools">
-          {isOrganizer&&<a href="#plan-tools">{copy(lang,"Day titles, swaps and original plan","כותרות ימים, החלפות והמסלול המקורי")}</a>}
+          <div className="day-heading-top">
+            <span className="panel-label">{activePhase?.title || "Journey"}</span>
+            {isOrganizer && <a className="journey-settings" href="#plan-tools" aria-label={copy(lang, "Plan settings", "הגדרות מסלול")}><Settings size={20} aria-hidden="true" /></a>}
           </div>
           <h2>{(lang === "he" ? day?.label_he || day?.label_en : day?.label_en || day?.label_he) || copy(lang,"Daily itinerary","מסלול יומי")}</h2>
           {day?.lodging_context?.name ? <p>{copy(lang,"Tonight:","הלילה:")} {text(day.lodging_context.name, lang)}</p> : null}
