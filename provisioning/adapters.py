@@ -207,6 +207,15 @@ class ProxmoxLxcAdapter:
                 # site are written. Confirmed live 2026-08-28 on CT101, the
                 # first container this adapter ever created.
                 "--unprivileged", "0",
+                # A trip site comes back when the Proxmox host does. Before
+                # 2026-09-13 no trip container had onboot set: a host reboot
+                # brought back TrueNAS and the control plane and left every
+                # family's site down until someone started it by hand. Order 3
+                # starts it after TrueNAS (1), which serves the NFS mp0 above,
+                # and the control-plane VM (2). scripts/trip-autostart.py
+                # turns it off for a trip that should stay down.
+                "--onboot", "1",
+                "--startup", "order=3",
                 "--ostype", "debian",
                 "--tags", "sites",
             ]

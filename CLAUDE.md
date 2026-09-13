@@ -157,6 +157,19 @@ enough to make the next trip of that name install without a companion.
 It refuses a trip past `ready_private` (real people have used it) and a profile
 another trip's open binding still names. There is no `--force`.
 
+`--keep-container` tears the trip down but keeps its site running on the LAN as a
+reference: public hostname removed, container renamed `ref-<slug>`, its NFS data
+moved to `ref-<slug>`, deploy dir kept as `trips/ref-<slug>`. The renames are not
+cosmetic — a new trip that takes the freed slug would otherwise adopt the kept
+container by name, wipe its data on first provision, and reuse its IP.
+
+### Trip containers start on boot
+
+Every trip container is created with `--onboot 1 --startup order=3`, after TrueNAS
+(order 1, which serves their NFS mount) and the control-plane VM (order 2). Turn it
+off for one trip with `scripts/trip-autostart.py --trip <slug> --off`
+(`--on` restores it; no flag shows it).
+
 ### The control-plane DB suites destroy the database they are given
 
 ```bash
