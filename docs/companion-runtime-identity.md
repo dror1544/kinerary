@@ -279,7 +279,7 @@ The only difference this makes to them is that `/switch` to a
 never-bound-but-provisioned trip starts activating the companion instead of
 reporting it pending — and it reports it honestly in the meantime.
 
-Migration 0050 (the organizer links) is independent of everything here: a new
+Migration 0052 (the organizer links) is independent of everything here: a new
 table keyed by Telegram digest, touching neither `trips` nor
 `telegram_chat_bindings`. Deploying it now makes this work no harder.
 
@@ -292,3 +292,10 @@ and been renamed afterwards, `applyMigrations` would have re-run it under the
 new name against a table that already existed. Whoever writes the migration in
 this document should check the applied set on the target database first, not
 just the highest number in their own branch.
+
+**Hit again, and handled the other way (2026-09-13).** To follow sprint 5's
+sequence the file was renumbered once more, `0050` → `0052`, this time *after*
+the dev database had applied it. So the migration was made safe to re-run —
+`IF NOT EXISTS` on the table and indexes, `ON CONFLICT DO NOTHING` on the
+backfill — and a test runs it twice. That database keeps a harmless
+`0050_telegram_organizer_links.sql` row naming a file that no longer exists.

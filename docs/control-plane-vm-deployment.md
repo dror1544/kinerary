@@ -425,8 +425,11 @@ so the Mac stops depending on a coding-session preference.
 Not done. Gates, in order:
 
 1. The VM's branch must carry every migration the Mac's database has applied —
-   today the Mac has `0050_telegram_organizer_links.sql`, the VM's branch does
-   not.
+   today the Mac has `0050_telegram_organizer_links.sql`, which PR #47 renamed
+   `0052_telegram_organizer_links.sql`. The VM's branch needs the 0052 file.
+   The Mac's leftover `0050_…` row names a file that no longer exists and is not
+   a gap to close: the renamed file is safe to re-run, and does exactly that on
+   the Mac.
 2. No interview mid-turn (`intake_sessions.awaiting = 'machine'`).
 3. Stop the Mac's relay, sidecar, trip-intake gateway and compose stack — only
    one `getUpdates` loop may own `@Kinerary_bot`.

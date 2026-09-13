@@ -1,6 +1,6 @@
 # The Trip Bot's command surface, its menu, and a mini app
 
-**Status: §3, §4, §5 and §9 are BUILT (2026-09-10). §6 and §8 are not.**
+**Status: §3, §4, §5 and §9 are BUILT (2026-09-10). §6 is kept for later; §8 was dropped (2026-09-13).**
 Written 2026-09-10 from Dror's request: the bot should answer a small set of
 typed commands — list my trips, switch to one, start a new interview, get the
 group-linking line, get the site URL — and those commands should appear in
@@ -12,13 +12,14 @@ What shipped, and where it lives:
 
 | § | | Where |
 |---|---|---|
-| 3 | Telegram → user identity | migration 0050, `organizer-trips.ts`, written in `startSession` |
+| 3 | Telegram → user identity | migration 0052, `organizer-trips.ts`, written in `startSession` |
 | 4 | `/trips` | `listOrganizerTrips`, `renderTripList` |
 | 5 | `/switch` (alias `/select`) | `switchChatToTrip`, buttons + exact-match argument |
 | 9 | the ⌘ menu | `relay/command-menu.ts`, published at relay boot |
 
-Still not built: `/interview` (§6) and `/url` (§8). `/group` (§7) already
-worked and is now merely discoverable.
+Kept for later, by Dror's decision (2026-09-13): `/interview` (§6). Dropped:
+`/url` (§8), because `/help` already gives the site address. `/group` (§7)
+already worked and is now merely discoverable.
 
 **§3 was built differently from the proposal below, and §3 records why** — the
 `user_identities` route it recommended turned out to be blocked by that
@@ -119,7 +120,7 @@ AND digest = $2` and then take `rows[0]`, and each would silently start
 picking an arbitrary account. That is a worse failure than the one being
 fixed, and an authentication-shaped one.
 
-So `telegram_organizer_links` (migration 0050) is its own append-only,
+So `telegram_organizer_links` (migration 0052) is its own append-only,
 many-`user_id`s-per-digest table, and `user_identities` is untouched. It is a
 read model for routing, never a credential and never an authentication path —
 Telegram SSO stays retired.
@@ -136,8 +137,15 @@ digest is the stable key, and `/trips` lists every trip reachable through
 **any** `user_id` sharing it. Account consolidation remains a separate,
 larger question and was deliberately not attempted here.
 
-`/interview` (§6) still needs the decisions in its own section. `/url` (§8)
-needs none of this — it routes on chat id alone.
+**Renumbered 0050 → 0052 (2026-09-13)**, to follow sprint 5's migration
+sequence instead of sitting in the 0050 gap it leaves open. The dev control
+plane had already applied the file as `0050_…`, and the runner keys on the
+filename, so that database runs it again under the new name. The table, both
+indexes and the backfill are therefore written to be safe to re-run, and a test
+runs the file twice.
+
+`/interview` (§6) is kept for later, and would need the decisions in its own
+section.
 
 ## 4. `/trips` — what am I organizing? — BUILT (2026-09-10)
 
@@ -218,7 +226,10 @@ itself carries authority — signup approval, enrollment.
 during an interview would appear to do nothing. Refuse it with a sentence
 saying why, rather than silently succeeding into an invisible state.
 
-## 6. `/interview` — start a new trip from the DM
+## 6. `/interview` — start a new trip from the DM — KEPT FOR LATER (2026-09-13)
+
+**Deferred by Dror's decision.** Nothing below is scheduled; it is kept so the
+design and the two decisions at the end of this section are not lost.
 
 The requirement is already recorded as a Sprint 5 known gap: *"The companion
 profile for an existing organizer must also be able to re-enter interview mode
@@ -259,32 +270,21 @@ send the copyable line as its own message
 in a group redeems it and triggers the arrival introduction. Router-owned
 rather than agent-owned because the token is a credential.
 
-So there is no feature to build here, only exposure — it appears in §8's menu
+So there is no feature to build here, only exposure — it appears in §9's menu
 like everything else. Worth keeping when it does: the command form exists
 because **Telegram privacy mode** means a non-admin bot in a group receives
 only commands, replies and mentions. A bare token pasted as text would not
 arrive at all, and the case that breaks is the recovery case ("post it again
 now that I'm an admin"). Do not "simplify" this to a bare token.
 
-## 8. `/url` — where is my site?
+## 8. `/url` — DROPPED (2026-09-13)
 
-The smallest of the five and the only one buildable today: it routes on chat
-id alone, so it needs neither §3's identity work nor an argument.
-
-The URL lives in `trips.companion_intro` (migration 0044), which is also what
-the group introduction is composed from, and 0034 derives `private_url` from
-the succeeded provisioning job. Three states, three different true answers:
-
-- **not bound** — the existing `unbound` copy;
-- **bound, not yet provisioned** — the existing `companionPending` copy, which
-  already says the honest thing;
-- **provisioned** — the URL.
-
-**Do not include the shared password by default.** `companion_intro` carries
-it, `groupIntroText` already takes an explicit `includePassword` flag, and
-migration 0044 states plainly that these facts are never served to a client.
-A `/url` in a group typed by anyone should return the address, not the
-credential — the credential went out once, in the pinned arrival message.
+Not needed, by Dror's decision: `/help` already answers it. In any chat bound
+to a trip, the router's help text (`companionHelpText`) includes the trip
+site's address, read from `trips.companion_intro` — and only the address. The
+shared password is not in it, which was the one requirement this section
+existed to protect: a command anyone in a group can type returns the address,
+never the credential.
 
 ## 9. The graphical menu — BUILT (2026-09-10)
 
@@ -310,9 +310,8 @@ router's own `/help` and `/name` menu from integration (db3f0fe):
 Groups get a menu of their own rather than none: leaving a group's menu alone
 is what kept sixty stale Hermes commands in a live family group on 2026-09-13.
 `/done` is not offered; it means something only mid-interview. This design
-first offered `/interview` and `/url` too — those wait on the commands
-themselves (§6, §8), since a menu entry for a command the router cannot answer
-is the dead end this section exists to avoid.
+first offered `/interview` and `/url` too: `/interview` is kept for later (§6),
+and `/url` was dropped because `/help` gives the site address (§8).
 
 `/start` is deliberately absent — Telegram surfaces its own Start button, and
 a menu entry for a command that is useless without a token is a dead end.
@@ -379,13 +378,14 @@ section are in the same document.
 
 Collected so they are not lost in the prose. None of these should be guessed:
 
-1. **Telegram identity linkage** (§3) — write the `user_identities` row at
-   enrollment redemption, and key the trip list on the Telegram digest across
-   every `user_id` sharing it? Or consolidate accounts instead?
-2. **Approval for trip #2** (§6) — does an already-approved organizer starting
-   another trip re-enter the super-admin gate? Unowned in the plan today.
-3. **Draft creation without a destination** (§6) — placeholder, or ask one
-   question first?
+1. **Telegram identity linkage** (§3) — *resolved*: built as its own table
+   (migration 0052) rather than a `user_identities` row. Account consolidation
+   remains a separate question.
+2. **Approval for trip #2** (§6, kept for later) — does an already-approved
+   organizer starting another trip re-enter the super-admin gate? Unowned in
+   the plan today.
+3. **Draft creation without a destination** (§6, kept for later) — placeholder,
+   or ask one question first?
 4. **Mini app auth** (§10) — does `initData` fall under the retired Telegram
    web auth decision, or outside it?
 
@@ -404,7 +404,7 @@ leak through:
 - `/switch` closes the prior binding with a reason and leaves it readable,
   rather than overwriting it (migration 0029's whole point);
 - `/switch` during a live interview is refused, not silently applied;
-- `/url` in a group returns the address and **not** the shared password;
+- `/help` in a group gives the site address and **not** the shared password;
 - every command's reply renders in the organizer's language, driven from
   `intake-copy.ts` rather than `DEFAULT_STRINGS`;
 - `setMyCommands` failing at boot leaves the commands working.

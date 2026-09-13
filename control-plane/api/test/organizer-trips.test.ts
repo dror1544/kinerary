@@ -469,7 +469,7 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
       // Erase the links and re-run the migration's OWN backfill statement, so
       // this tests the shipped SQL rather than a paraphrase of it.
       await pool.query("DELETE FROM control_plane.telegram_organizer_links");
-      const sql = await readFile(`${migrationsDir}/0050_telegram_organizer_links.sql`, "utf8");
+      const sql = await readFile(`${migrationsDir}/0052_telegram_organizer_links.sql`, "utf8");
       const backfill = sql.slice(sql.lastIndexOf("INSERT INTO control_plane.telegram_organizer_links"));
       await pool.query(backfill);
 
@@ -483,6 +483,22 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
         [digestTelegramId(ORGANIZER_CHAT)],
       );
       assert.equal(count.rows[0]?.c, "2");
+    });
+  });
+
+  test("the migration re-runs harmlessly, because a database that applied it as 0050 runs it again as 0052", async () => {
+    // applyMigrations keys on the FILENAME. The dev control plane recorded
+    // 0050_telegram_organizer_links.sql before the file was renumbered to follow
+    // sprint 5's sequence, so it will execute this file a second time. That
+    // must be a no-op: no error, no duplicated links.
+    await withFixture(async ({ pool }) => {
+      const sql = await readFile(`${migrationsDir}/0052_telegram_organizer_links.sql`, "utf8");
+      const count = async () =>
+        (await pool.query<{ n: number }>("SELECT count(*)::int AS n FROM control_plane.telegram_organizer_links")).rows[0]?.n;
+      const before = await count();
+      await pool.query(sql);
+      await pool.query(sql);
+      assert.equal(await count(), before);
     });
   });
 

@@ -1,3 +1,10 @@
+-- RENUMBERED 0050 -> 0052 (2026-09-13), to follow integration/sprint-5-plus's
+-- sequence rather than sit in the 0050 gap it leaves open. The dev control
+-- plane had already applied this file as 0050_telegram_organizer_links.sql, and
+-- applyMigrations keys on the FILENAME, so that database runs it again under
+-- this name. Everything below is therefore safe to re-run: IF NOT EXISTS on the
+-- table and both indexes, ON CONFLICT DO NOTHING on the backfill.
+--
 -- Lets the bot answer "which trips are mine?" — the link from a verified
 -- Telegram sender to the control-plane users they have been PROVEN to own.
 --
@@ -40,7 +47,7 @@
 -- possessing a Telegram id proves you are that Telegram id, which is what
 -- Telegram's own connection already told us.
 
-CREATE TABLE control_plane.telegram_organizer_links (
+CREATE TABLE IF NOT EXISTS control_plane.telegram_organizer_links (
   id                       text        NOT NULL,
   user_id                  text        NOT NULL REFERENCES control_plane.users(id),
   -- 'sha256:<hex>', identical in construction to identity.ts's
@@ -63,11 +70,11 @@ CREATE TABLE control_plane.telegram_organizer_links (
 -- The pair is the row. A repeat redemption from the same chat by the same
 -- owner is the normal case, so writers use ON CONFLICT DO NOTHING against
 -- this rather than reading first.
-CREATE UNIQUE INDEX telegram_organizer_links_pair_idx
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_organizer_links_pair_idx
   ON control_plane.telegram_organizer_links (telegram_subject_digest, user_id);
 
 -- The only read path: every user_id this Telegram person owns.
-CREATE INDEX telegram_organizer_links_digest_idx
+CREATE INDEX IF NOT EXISTS telegram_organizer_links_digest_idx
   ON control_plane.telegram_organizer_links (telegram_subject_digest);
 
 -- Backfill from interviews that already happened.

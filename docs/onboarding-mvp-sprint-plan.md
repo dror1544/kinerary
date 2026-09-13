@@ -884,9 +884,11 @@ contexts and test groups without creating a per-trip Telegram bot.
 > `docs/trip-bot-command-surface.md` designs the organizer command surface
 > Dror asked for — `/trips`, `/switch`, `/interview`, `/group`, `/url` — plus
 > Telegram's own command menu. `/trips`, `/switch` (alias `/select`) and the
-> menu shipped; `/interview` and `/url` did not; `/group` already worked. It
-> also built a **prerequisite this box never named**: the router could not
-> resolve a Telegram sender to a `user_id` at all. That is migration 0050's
+> menu shipped; `/group` already worked; `/interview` is kept for later and
+> `/url` was dropped, since `/help` already gives the site address (Dror,
+> 2026-09-13). It also built a **prerequisite this box never named**: the
+> router could not resolve a Telegram sender to a `user_id` at all. That is
+> migration 0052's
 > `telegram_organizer_links` — its own many-`user_id`s-per-person table, not a
 > row in `user_identities`, whose unique constraint allows only one.
 >

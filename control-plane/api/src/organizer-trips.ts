@@ -18,7 +18,7 @@
  *   - Identity is the Telegram sender id from the update Telegram delivered on
  *     the bot's own authenticated connection — never a body field.
  *   - The set of trips a command may touch is derived server-side from that
- *     identity, through telegram_organizer_links (migration 0050) joined to
+ *     identity, through telegram_organizer_links (migration 0052) joined to
  *     active memberships. An argument or a tapped button SELECTS WITHIN that
  *     set; it can never widen it.
  *   - Refusals are uniform. "That trip isn't yours" and "no such trip" are the
