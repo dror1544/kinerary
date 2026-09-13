@@ -36,9 +36,13 @@ import {
   migrateChatBinding,
   companionIntroFacts,
   resolveTripPerson,
+  renderTripList,
+  resolveChatLanguage,
+  tripDisplayName,
 } from "../chat-router.js";
+import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
-import { coerceLanguage, uiString } from "../intake-copy.js";
+import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import { companionHelpText, groupBindingCommand, groupIntroText } from "../companion-intro.js";
 import {
   extractGroupBindingToken,
@@ -94,6 +98,20 @@ export type DispatchDecision =
     }
   /** The organizer typed /done or /summary — show the recap, whatever else is going on. */
   | { kind: "show_summary"; chatId: string; view: SessionView }
+  /**
+   * A tapped button the ROUTER has already acted on, with the sentence saying
+   * what happened.
+   *
+   * Distinct from `reply` because a callback query must also be answered, or
+   * Telegram leaves the button spinning on the organizer's phone for as long
+   * as it takes them to give up on it.
+   */
+  | {
+      kind: "callback_reply";
+      chatId: string;
+      callbackQueryId: string;
+      text: string;
+    }
   /** A tapped inline button that belongs to the interview flow. */
   | {
       kind: "interview_callback";
@@ -302,7 +320,7 @@ export async function dispatchUpdate(
   botIdentity: BotIdentity = {},
   options: DispatchOptions = {},
 ): Promise<DispatchDecision> {
-  if (update.callback_query) return dispatchCallback(db, update);
+  if (update.callback_query) return dispatchCallback(db, update, log);
 
   // Added to a group. If that group is already bound to a trip, this is the
   // companion's arrival and it introduces itself; if it is not, saying so is
@@ -493,11 +511,73 @@ export async function dispatchUpdate(
     };
   }
 
+  // "Which trips are mine, and which one is this chat on?" — the two questions
+  // a shared bot otherwise gives an organizer no way to ask. See
+  // organizer-trips.ts for why the answer is derived from the sender's
+  // verified Telegram id rather than from anything typed.
+  if (
+    parsed.kind === "command" &&
+    (parsed.name === "trips" || parsed.name === "switch" || parsed.name === "select")
+  ) {
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+
+    // DM only, both commands. For /trips because the list would expose trips
+    // the rest of the room has no claim to; for /switch because a group's
+    // binding belongs to the family, not to whoever typed — on a shared bot,
+    // one member could otherwise move the room to another organizer's trip.
+    if (message.chat?.type !== "private" || !senderId) {
+      return {
+        kind: "reply",
+        reply: {
+          chatId,
+          text: uiString(parsed.name === "trips" ? "tripsInGroup" : "switchInGroup", language),
+        },
+      };
+    }
+
+    const trips = await listOrganizerTrips(db, senderId, chatId);
+
+    // `/switch <something>` is the only path that takes an argument. Without
+    // one, /switch and /trips are the same thing: the list, with a button per
+    // row. That is deliberate — buttons remove the guessing a typed name
+    // invites. They are NOT signed, by decision (2026-09-13): a payload only
+    // names a row, and the callback branch re-authorizes every tap from the
+    // tapper's verified id, exactly as if they had typed the name.
+    const target = parsed.name === "trips" ? null : resolveTripArgument(trips, parsed.argument);
+    if (!target) {
+      if (parsed.name !== "trips" && parsed.argument) {
+        // They named something, and it is not one of theirs. Same sentence a
+        // non-existent trip gets.
+        log(structuredLog("info", "trip_bot.switch_refused", { reason: "NO_MATCH" }));
+        return { kind: "reply", reply: { chatId, text: uiString("switchRefused", language) } };
+      }
+      const rendered = renderTripList(trips, language);
+      return {
+        kind: "reply",
+        reply: { chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined },
+      };
+    }
+
+    return {
+      kind: "reply",
+      reply: { chatId, text: await applySwitch(db, senderId, chatId, target, language, log) },
+    };
+  }
+
   if (parsed.kind === "command" && (parsed.name === "done" || parsed.name === "summary")) {
     const route = await resolveChatRoute(db, chatId);
     if (route.kind === "interview") {
       const result = await setFinishRequestedForChat(db, chatId, true);
       if (result.ok) return { kind: "show_summary", chatId, view: result.view };
+    }
+    // The ⌘ menu offers /done in EVERY private chat — Telegram cannot scope a
+    // menu by route — so a companion DM receives it too. Letting it fall to the
+    // catch-all below would answer "/done isn't one of my commands": the bot
+    // disowning an entry in its own menu.
+    if (route.kind === "companion") {
+      const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+      return { kind: "reply", reply: { chatId, text: uiString("doneNoInterview", language) } };
     }
   }
 
@@ -641,12 +721,132 @@ export async function dispatchUpdate(
  * interview; it can only claim an option within whatever session its own chat
  * already owns.
  */
-async function dispatchCallback(db: pg.Pool, update: TelegramUpdate): Promise<DispatchDecision> {
+/**
+ * Resolves `/switch <text>` to one of the organizer's OWN trips, or to nothing.
+ *
+ * EXACT matches only, against the trips already derived from the sender's
+ * verified identity. Fuzzy or prefix matching is what turns "switch me to
+ * japan" into a silent move to the wrong japan-2026-something, and a routing
+ * mistake here is invisible — the next answer is simply about a different
+ * trip. When two of the organizer's trips answer to the same name the argument
+ * is ambiguous, so it resolves to nothing and they get the tappable list,
+ * where the rows are distinguishable.
+ *
+ * Never widens the set it is given. That is the property that matters; the
+ * matching rules are just how a row inside it gets picked.
+ */
+function resolveTripArgument(
+  trips: readonly OrganizerTrip[],
+  argument: string | null,
+): OrganizerTrip | null {
+  if (!argument) return null;
+  const needle = argument.trim().toLowerCase();
+  if (!needle) return null;
+
+  const matches = trips.filter(
+    (trip) =>
+      trip.slug.toLowerCase() === needle ||
+      tripDisplayName(trip).toLowerCase() === needle ||
+      trip.tripId === argument.trim(),
+  );
+  return matches.length === 1 ? (matches[0] ?? null) : null;
+}
+
+/**
+ * Performs the switch and returns the sentence to send.
+ *
+ * The refusal branches all answer with copy that says what to do next, because
+ * the states they describe are ones the organizer can act on: finish the
+ * interview, or look at the list. `NOT_YOURS` deliberately reads the same as a
+ * trip that does not exist.
+ */
+async function applySwitch(
+  db: pg.Pool,
+  senderId: string,
+  chatId: string,
+  target: OrganizerTrip,
+  language: Language,
+  log: (line: string) => void,
+): Promise<string> {
+  const outcome = await switchChatToTrip(db, senderId, chatId, target.tripId);
+  const name = tripDisplayName(target);
+
+  switch (outcome.kind) {
+    case "unchanged":
+      return `${uiString("switchUnchanged", language)} ${name}.`;
+    case "refused":
+      log(structuredLog("info", "trip_bot.switch_refused", { reason: outcome.reason }));
+      return uiString(
+        outcome.reason === "IN_INTERVIEW"
+          ? "switchInInterview"
+          : outcome.reason === "NOT_PRIVATE_CHAT"
+            ? "switchInGroup"
+            : "switchRefused",
+        language,
+      );
+    case "switched": {
+      log(structuredLog("info", "trip_bot.switched", {
+        trip_id: outcome.tripId,
+        had_previous: outcome.previousTripId !== null,
+        has_companion: outcome.hermesProfile !== null,
+      }));
+      const lines = [`${uiString("switchDone", language)} ${name}.`];
+      // Said at the moment of switching rather than left for the organizer to
+      // discover by asking a question and being told the assistant is pending.
+      // A trip can be provisioned perfectly and still have no companion
+      // reachable from a chat that has never had one (migration 0043).
+      if (!outcome.hermesProfile) lines.push("", uiString("switchNoCompanion", language));
+      return lines.join("\n");
+    }
+  }
+}
+
+async function dispatchCallback(
+  db: pg.Pool,
+  update: TelegramUpdate,
+  log: (line: string) => void,
+): Promise<DispatchDecision> {
   const callback = update.callback_query;
   if (!callback?.data) return { kind: "ignore", reason: "NO_CALLBACK_DATA" };
 
   const chatId = callback.message?.chat?.id;
   const parsed = parseCallbackData(callback.data);
+
+  // Handled BEFORE the interview block below, which would otherwise swallow a
+  // trip-switch tap as a stale interview button — the chat performing a switch
+  // has no live interview by definition.
+  //
+  // Identity is `callback.from.id` — the person who TAPPED — not the chat id.
+  // They are the same in a DM, and taking the tapper is the form that stays
+  // correct if that ever stops being true. The same provenance
+  // `processApprovalCallback` already relies on.
+  if (parsed.kind === "switch" && chatId !== undefined && chatId !== null) {
+    const fromId = callback.from?.id;
+    if (fromId === undefined || fromId === null) return { kind: "ignore", reason: "NO_CALLBACK_SENDER" };
+    const senderId = String(fromId);
+    const language = await resolveChatLanguage(db, String(chatId), callback.from?.language_code);
+
+    // Re-derived server-side. The payload said WHICH ROW was tapped; whether
+    // that row is reachable by this sender is decided here, from their
+    // verified id, exactly as if they had typed the name.
+    const trips = await listOrganizerTrips(db, senderId, String(chatId));
+    const target = trips.find((trip) => trip.tripId === parsed.tripId);
+    if (!target) {
+      log(structuredLog("info", "trip_bot.switch_refused", { reason: "NOT_YOURS" }));
+      return {
+        kind: "callback_reply",
+        chatId: String(chatId),
+        callbackQueryId: callback.id,
+        text: uiString("switchRefused", language),
+      };
+    }
+    return {
+      kind: "callback_reply",
+      chatId: String(chatId),
+      callbackQueryId: callback.id,
+      text: await applySwitch(db, senderId, String(chatId), target, language, log),
+    };
+  }
 
   if (parsed.kind !== "unknown" && chatId !== undefined && chatId !== null) {
     const route = await resolveChatRoute(db, String(chatId));

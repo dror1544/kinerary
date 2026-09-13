@@ -2,6 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
+import { isPrivateChatId } from "./identity.js";
+import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
 import {
   coerceLanguage,
   DEFAULT_LANGUAGE,
@@ -1672,7 +1674,9 @@ const TELEGRAM_CHAT_ID_HINT_PATTERN = /^\d{1,20}$/;
 // owner; conducting it in a group would put that behind whoever else is in
 // the room. Group chats bind to a trip's COMPANION instead (0019), after the
 // signed organizer action Sprint 5 requires.
-const TELEGRAM_PRIVATE_CHAT_ID_PATTERN = /^\d{1,20}$/;
+// The predicate itself lives in identity.ts, beside digestTelegramId — three
+// modules were carrying their own copy of it.
+
 
 /**
  * Exchanges a valid enrollment token for a session, atomically:
@@ -1753,7 +1757,7 @@ export async function startSession(
     // unbound (fail closed). Written NULL when the caller is not the
     // router — the HTTP/MCP path has no verified chat id to offer.
     const chatId =
-      verifiedTelegramChatId && TELEGRAM_PRIVATE_CHAT_ID_PATTERN.test(verifiedTelegramChatId)
+      verifiedTelegramChatId && isPrivateChatId(verifiedTelegramChatId)
         ? verifiedTelegramChatId
         : null;
 
@@ -1775,6 +1779,20 @@ export async function startSession(
        VALUES ($1, $2, $3, $4, $5, 'interviewing', '{}'::jsonb, $6, $7, $8)`,
       [sessionId, enrollment.tripId, enrollment.userId, enrollment.enrollmentId, digest, chatId, language, interpretPathDefault()],
     );
+
+    // The one moment both halves of "this Telegram person is this user" are
+    // proven together: the enrollment names the user it was ISSUED to, and
+    // `chatId` was read by the router off its own authenticated Telegram
+    // connection. Written in the SAME transaction for the same reason the
+    // binding above is — a link recorded for a session that then failed to
+    // commit would claim an ownership nothing else agrees with.
+    //
+    // This is what lets /trips and /switch exist at all; see
+    // organizer-trips.ts. It is NOT an authentication path and grants no web
+    // session — Telegram SSO stays retired (/v1/auth/telegram answers 410).
+    if (chatId) {
+      await linkTelegramOrganizerInTx(client, chatId, enrollment.userId);
+    }
 
     await client.query("COMMIT");
 

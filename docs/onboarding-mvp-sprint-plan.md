@@ -879,6 +879,17 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Half B (two live Hermes profiles, no private-memory leakage) tests an
 > upstream property and belongs as a one-time live verification, not a suite.
 >
+> **`/select` is BUILT, under the name `/switch`** — c3ac940, PR #47
+> (`feat/trip-bot-trip-commands`).
+> `docs/trip-bot-command-surface.md` designs the organizer command surface
+> Dror asked for — `/trips`, `/switch`, `/interview`, `/group`, `/url` — plus
+> Telegram's own command menu. `/trips`, `/switch` (alias `/select`) and the
+> menu shipped; `/interview` and `/url` did not; `/group` already worked. It
+> also built a **prerequisite this box never named**: the router could not
+> resolve a Telegram sender to a `user_id` at all. That is migration 0050's
+> `telegram_organizer_links` — its own many-`user_id`s-per-person table, not a
+> row in `user_identities`, whose unique constraint allows only one.
+>
 > **Deferred with a reason:** the richer router-issued
 > organizer/trip/channel/role/lifecycle capability. What ships stamps a
 > *profile name*. Whether that suffices for the exit gate is undecided — see
@@ -1223,9 +1234,14 @@ Build:
 - Create provider-neutral messaging bindings and the shared Trip Bot router.
   Bind `provider + bot identity + chat ID` to exactly one trip only after a
   signed organizer action and permission verification.
-- Implement private `/select` over owned trips with signed callbacks. Private
+- Implement private `/select` over owned trips with callback buttons. Private
   selection is independent from group routing, and reviewed reassignment
-  preserves binding history.
+  preserves binding history. *(Amended 2026-09-13, Dror's decision — this said
+  "signed callbacks". A switch button's payload only names a row: the tap is
+  re-authorized from the tapper's verified Telegram id against their own trips,
+  so a forged payload selects nothing a typed `/switch <slug>` could not, and a
+  signature would protect nothing. Signed, expiring actions remain the rule
+  wherever the payload itself carries authority — signup approval, enrollment.)*
 - Keep intake, organizer-private and group-chat sessions/policies separate.
   Add the private owner-only Super Bot for redacted alerts and narrow
   plan/approve/execute operations. Dedicated-bot support remains optional.
@@ -1827,7 +1843,7 @@ implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
 deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
 authoritative.
 
-Three connection points between the SPA and the control plane are **open
+Four connection points between the SPA and the control plane are **open
 future decisions**. They are recorded here so they are not lost; each is
 revisited in a dedicated post-MVP web track *unless* the note below says a
 coming sprint is the right place to start it:
@@ -1856,6 +1872,18 @@ coming sprint is the right place to start it:
    intake flow is a smaller addition there than as its own track. What starts
    the intake (the SPA vs. the Telegram router) and where the organizer's
    verified chat id is captured are the sub-decisions.
+4. **A Telegram Mini App over the same console** *(raised 2026-09-10)*. A mini
+   app managing trips is the SPA's pages in a Telegram webview over
+   `portal.ts`'s existing organizer-scoped read model — which is why it is
+   recorded here rather than as its own thing. It is a **discussion, not a
+   plan**, and it has one blocking question ahead of any estimate: a mini app
+   authenticates by verifying `initData`, which is Telegram-derived web
+   authentication, and this deployment retired exactly that
+   (`/v1/auth/telegram` → 410, and Telegram SSO is permanently ruled out). The
+   retired path was a *per-trip site* widget and the structural objection may
+   not carry over to one bot and one control-plane origin — but that is a
+   ruling for Dror, not an inference. Discussion and the remaining open
+   questions: `docs/trip-bot-command-surface.md` §10.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 

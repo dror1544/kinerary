@@ -167,6 +167,23 @@ describe("dispatchUpdate — the branch table", () => {
     });
   });
 
+  test("/done in a companion chat is answered, not disowned — the menu offers it there", { skip: SKIP }, async () => {
+    // Telegram cannot scope the ⌘ menu by route, so /done is offered in every
+    // private chat — including one whose interview is long over. Left to the
+    // catch-all, it would be answered "/done isn't one of my commands": the bot
+    // contradicting its own menu.
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000558", "companion-japan");
+      for (const command of ["/done", "/summary"]) {
+        const decision = await dispatchUpdate(fix.pool, msg("700000558", command));
+        assert.equal(decision.kind, "reply", `${command} must be answered by the router`);
+        if (decision.kind !== "reply") return;
+        assert.doesNotMatch(decision.reply.text, /isn't one of my commands/);
+        assert.match(decision.reply.text, /no interview running/);
+      }
+    });
+  });
+
   test("the group is told in its own language, and only the organizer is told about /group", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       await bindCompanion(fix, "-1002000999", "companion-japan");

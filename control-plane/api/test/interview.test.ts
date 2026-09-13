@@ -559,6 +559,7 @@ async function teardownFixture(fix: TestFixture) {
   await pool.query("DELETE FROM control_plane.interview_enrollments WHERE trip_id = $1", [draftTripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [draftTripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [draftTripId]);
+  await pool.query("DELETE FROM control_plane.telegram_organizer_links WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.users WHERE id = $1", [ownerId]);
 }

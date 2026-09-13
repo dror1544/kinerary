@@ -76,10 +76,12 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claim that
-      // number (telegram_organizer_links, plan_reviews), and a duplicate
-      // number with different content is the collision worth avoiding. A gap
-      // is not: the runner applies whatever it has not recorded, in name order.
+      // 0050 is THIS branch's claim on that number, and it is already applied
+      // to the dev control plane under this exact name (2026-09-10). The other
+      // claimant, 0050_plan_reviews.sql, exists only as an uncommitted file in
+      // the live-plan-enrichment-worker worktree and is applied nowhere, so it
+      // is the one that renumbers when it lands.
+      "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
@@ -137,10 +139,12 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claim that
-      // number (telegram_organizer_links, plan_reviews), and a duplicate
-      // number with different content is the collision worth avoiding. A gap
-      // is not: the runner applies whatever it has not recorded, in name order.
+      // 0050 is THIS branch's claim on that number, and it is already applied
+      // to the dev control plane under this exact name (2026-09-10). The other
+      // claimant, 0050_plan_reviews.sql, exists only as an uncommitted file in
+      // the live-plan-enrichment-worker worktree and is applied nowhere, so it
+      // is the one that renumbers when it lands.
+      "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);
   } finally {

@@ -38,6 +38,7 @@ import { sayForChat,
 import { agentTextIsInLanguage } from "./internal-leak.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
+import { publishCommandMenu } from "./command-menu.js";
 import { startTripBotPoller } from "./poller.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
 
@@ -155,6 +156,13 @@ async function serveRuntime(path: string): Promise<Runtime> {
       hint: "group gating falls back to trip names only; @mentions unrecognised",
     }));
   }
+
+  // Publish the ⌘ menu here — once, at boot, beside the other call that asks
+  // Telegram about ourselves — rather than per message. Awaited so the log
+  // lines stay in order, and deliberately not guarded: publishCommandMenu owns
+  // its own failure and never throws, because an undiscoverable menu must not
+  // cost the deployment a relay.
+  await publishCommandMenu(telegram, log);
 
   // Same bot as signup? Then this loop owns the approval callbacks too.
   let approvals: { config: SignupConfig } | undefined;
