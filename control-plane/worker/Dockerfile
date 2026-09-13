@@ -19,7 +19,13 @@ WORKDIR /app
 # production design — fetch the pinned source_revision from the git remote
 # with a read-only deploy key, no bind mount — is tracked with the Sprint 4.7
 # deferred compute/data/secret adapter abstractions (see the sprint plan).
-RUN apk add --no-cache openssh-client bash git
+# openssl: kinerary-deploy/setup-mcp.sh generates the per-trip MCP_API_KEY with
+# `openssl rand -hex 32` (line ~196). Absent from the Alpine base, so the MCP
+# bridge died with "openssl: command not found" — non-fatal by design, which is
+# why it went unnoticed until a companion was installed and had no trip-mcp to
+# read the trip through. The organizer got an assistant that knew which trip it
+# belonged to and nothing about the trip. Found live 2026-09-06.
+RUN apk add --no-cache openssh-client bash git openssl
 COPY control-plane/worker/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY control-plane/worker/control_plane_worker ./control_plane_worker

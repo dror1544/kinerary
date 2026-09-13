@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import { INTAKE_SCHEMA_VERSION } from "./interview.js";
+import { issueApproval } from "./plan-approval.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -376,3 +377,35 @@ export async function listAvailableReleases(db: pg.Pool): Promise<ReleaseView[]>
 }
 
 export const INTAKE_SCHEMA_VERSION_CURRENT = INTAKE_SCHEMA_VERSION;
+
+/**
+ * CONFIRMING THE INTAKE IS THE APPROVAL.
+ *
+ * The organizer tapping "אישור" on the recap has approved their trip. Sending
+ * them to a web app afterwards to approve the same thing again is a second
+ * decision about the first one, and it is the reason a finished interview sat
+ * with no plan and no job: the interview ended, and provisioning waited for a
+ * button in a SPA that is not deployed.
+ *
+ * Deliberately the SAME two calls the route makes — `generatePlan` then
+ * `issueApproval` — rather than a second path into provisioning. The identity
+ * question the route answers with a login is already answered here: the confirm
+ * arrived on the organizer's own bound chat, which is how every other write in
+ * this interview is authorised.
+ *
+ * Failure is a value. A trip whose plan could not be created is still a
+ * confirmed intake, and the organizer has been told their site is being built —
+ * so this reports rather than throws, and the caller decides what to say.
+ */
+export async function provisionOnConfirm(
+  db: pg.Pool,
+  tripId: string,
+  userId: string,
+  approvalTtlSeconds = 3600,
+): Promise<{ ok: true; planId: string } | { ok: false; stage: "plan" | "approve"; reason: string }> {
+  const plan = await generatePlan(db, tripId, generateId("corr"));
+  if (!plan.ok) return { ok: false, stage: "plan", reason: plan.reason };
+  const approved = await issueApproval(db, plan.planId, `user:${userId}`, approvalTtlSeconds);
+  if (!approved.ok) return { ok: false, stage: "approve", reason: approved.reason };
+  return { ok: true, planId: plan.planId };
+}

@@ -31,7 +31,13 @@ def safe_failure_message(exc: BaseException) -> str:
     return f"{type(exc).__name__}: operation failed, details suppressed"
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from main() so the defaults are testable.
+
+    Several of these flags decide whether a provisioning job touches real
+    infrastructure, and two of them changed from off to on — that is worth a
+    test that reads the default rather than a comment claiming it.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     inventory = subparsers.add_parser("inventory", help="read Proxmox inventory without allocating resources")
@@ -55,14 +61,47 @@ def main(argv: list[str] | None = None) -> int:
                            help="path to kinerary repo (REPO_ROOT / PROVISIONER_REPO_ROOT)")
     provision.add_argument("--vmid-map", default=os.environ.get("PROVISIONER_VMID_MAP"),
                            help='JSON dict of slug→vmid e.g. {"japan-2025":"201"} (PROVISIONER_VMID_MAP)')
+    # Both of these default ON. They used to default off, which meant every
+    # trip onboarded through the pipeline landed with a live site, no companion
+    # profile and no MCP bridge — a "no bridge" row in bring-up.sh's status
+    # table was almost never an operator forgetting, it was the default. The
+    # pipeline already knew how to do both; nothing turned them on.
+    #
+    # The templates dir defaults to the one inside --repo-root rather than to a
+    # literal path, so "on by default" needs no new configuration on any
+    # deployment that already sets a repo root. Resolved after parsing, since
+    # repo_root itself may come from the environment.
     provision.add_argument("--companion-templates-dir", default=os.environ.get("PROVISIONER_COMPANION_TEMPLATES_DIR"),
-                           help="path to profile-templates/familytrip-companion — omit to skip companion-profile "
-                                "creation entirely (PROVISIONER_COMPANION_TEMPLATES_DIR)")
-    provision.add_argument("--enable-mcp-bridge", action="store_true",
-                           default=os.environ.get("PROVISIONER_MCP_BRIDGE_ENABLED") == "1",
+                           help="path to profile-templates/familytrip-companion. Defaults to the copy inside "
+                                "--repo-root; pass --no-companion-profile to skip companion-profile creation "
+                                "entirely (PROVISIONER_COMPANION_TEMPLATES_DIR)")
+    # Host-side companion materialization. Present because the Hermes install a
+    # profile must be created in is macOS-native and serves those profiles from
+    # the host, so a containerised worker cannot do it locally. Provisioning /
+    # install time ONLY — nothing about an already-provisioned trip, its
+    # routing, its binding or the Hermes runtime touches this. Expected to be
+    # replaced wholesale by the K3s orchestrator path; the adapter contract is
+    # what is durable, not the transport.
+    provision.add_argument("--companion-ssh-host", default=os.environ.get("PROVISIONER_COMPANION_SSH_HOST"),
+                           help="host to materialize companion profiles on, over a forced-command SSH key "
+                                "(PROVISIONER_COMPANION_SSH_HOST). Unset keeps the local render_profile.py path.")
+    provision.add_argument("--companion-ssh-user", default=os.environ.get("PROVISIONER_COMPANION_SSH_USER"),
+                           help="user for --companion-ssh-host (PROVISIONER_COMPANION_SSH_USER)")
+    provision.add_argument("--companion-ssh-key", default=os.environ.get("PROVISIONER_COMPANION_SSH_KEY"),
+                           help="private key for --companion-ssh-host (PROVISIONER_COMPANION_SSH_KEY)")
+    provision.add_argument("--companion-ssh-known-hosts", default=os.environ.get("PROVISIONER_COMPANION_SSH_KNOWN_HOSTS"),
+                           help="known_hosts file; without one the first connection is accept-new "
+                                "(PROVISIONER_COMPANION_SSH_KNOWN_HOSTS)")
+    provision.add_argument("--no-companion-profile", action="store_true",
+                           default=os.environ.get("PROVISIONER_COMPANION_PROFILE_ENABLED") == "0",
+                           help="skip companion-profile creation, restoring the pre-2026-09 behaviour of deploying "
+                                "the site alone (PROVISIONER_COMPANION_PROFILE_ENABLED=0)")
+    provision.add_argument("--enable-mcp-bridge", action=argparse.BooleanOptionalAction,
+                           default=os.environ.get("PROVISIONER_MCP_BRIDGE_ENABLED", "1") != "0",
                            help="wire each new companion profile to its trip-mcp bridge via setup-mcp.sh — a real "
-                                "SSH/Proxmox/hermes-CLI action, requires --companion-templates-dir "
-                                "(PROVISIONER_MCP_BRIDGE_ENABLED=1)")
+                                "SSH/Proxmox/hermes-CLI action. On by default; requires a companion templates dir, "
+                                "since wiring trip-mcp for a profile that was never created makes no sense "
+                                "(PROVISIONER_MCP_BRIDGE_ENABLED=0 to disable)")
     provision.add_argument("--enable-compute", action="store_true",
                            default=os.environ.get("PROVISIONER_COMPUTE_ENABLED") == "1",
                            help="create a fresh LXC (+ NPM proxy host + Cloudflare tunnel DNS) for any slug missing "
@@ -75,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
     provision.add_argument("--poll-seconds", type=float, default=10.0)
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
     check.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command in {"run", "check-database", "provision"} and not args.database_url_file:
@@ -89,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("--vmid-map must be a JSON object of slug→vmid")
             from .companion_profile import NullCompanionProfileAdapter, RenderProfileAdapter
             from .compute import LxcProvisionAdapter, NullComputeAdapter
-            from .mcp_bridge import NullMcpBridgeAdapter, ShellMcpBridgeAdapter
+            from .mcp_bridge import NullMcpBridgeAdapter, ShellMcpBridgeAdapter, SshMcpBridgeAdapter
             from .provisioner import ProvisionerWorker, ShellDeployAdapter
             from .runtime import read_secret_file
             db_url = read_secret_file(args.database_url_file)
@@ -149,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                     # member/organizer signup flow is the actual fix; this is a
                     # stopgap so a provisioned trip is reachable.
                     seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
+                    control_plane_exchange_key=os.environ.get("CONTROL_PLANE_EXCHANGE_KEY", ""),
                     nfs_host_base=os.environ.get("PROVISIONER_NFS_HOST_BASE", "/mnt/pve/truenas-nfs"),
                     nfs_mount_base=os.environ.get("PROVISIONER_NFS_MOUNT_BASE", "/nfs"),
                 )
@@ -160,12 +205,61 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root=args.repo_root,
                 compute=compute_adapter,
             )
-            # Both default OFF: an unconfigured deployment gets exactly the
-            # old behavior (deploy the site, skip the companion profile).
-            # --enable-mcp-bridge additionally requires a templates dir,
-            # since wiring trip-mcp for a profile that was never created
-            # makes no sense.
-            if args.companion_templates_dir:
+            # Both default ON, so a trip onboarded through the pipeline is
+            # born complete: site, companion profile, MCP bridge. The bridge
+            # still requires a templates dir, since wiring trip-mcp for a
+            # profile that was never created makes no sense — that dependency
+            # is the reason the two were ever coupled, and it survives.
+            #
+            # An explicit opt-out (--no-companion-profile) restores the old
+            # behaviour; so does a repo root the templates are not under, which
+            # is why the resolution below is quiet rather than fatal. A
+            # provisioning job that cannot find templates should still deploy a
+            # site, exactly as it did before.
+            companion_templates_dir = args.companion_templates_dir
+            if not companion_templates_dir and args.repo_root:
+                candidate = os.path.join(args.repo_root, "profile-templates", "familytrip-companion")
+                if os.path.isdir(candidate):
+                    companion_templates_dir = candidate
+            if args.no_companion_profile:
+                companion_templates_dir = None
+            args.companion_templates_dir = companion_templates_dir
+
+            # Host-side wins when configured: a worker that CAN reach a host
+            # with the real Hermes install should not fall back to a local
+            # render that cannot work from inside a container.
+            ssh_configured = bool(
+                args.companion_ssh_host and args.companion_ssh_user and args.companion_ssh_key
+            )
+            if ssh_configured and not args.no_companion_profile:
+                from .companion_profile import SshCompanionProfileAdapter
+                companion_adapter = SshCompanionProfileAdapter(
+                    host=args.companion_ssh_host,
+                    user=args.companion_ssh_user,
+                    key_path=args.companion_ssh_key,
+                    known_hosts=args.companion_ssh_known_hosts,
+                )
+                # Loudly, at startup. The whole point is not to discover a
+                # missing capability one organizer's trip at a time.
+                companion_adapter.preflight()
+                print(
+                    f"companion adapter: ssh -> {args.companion_ssh_user}@{args.companion_ssh_host}"
+                    " (provisioning only; forced-command key)",
+                    flush=True,
+                )
+                # The bridge goes where the companion went: node and Hermes are
+                # on that host, not in this container (setup-mcp.sh here died
+                # on "can't execute 'node'" every provision until 2026-09-11).
+                mcp_bridge_adapter = (
+                    SshMcpBridgeAdapter(
+                        host=args.companion_ssh_host,
+                        user=args.companion_ssh_user,
+                        key_path=args.companion_ssh_key,
+                        known_hosts=args.companion_ssh_known_hosts,
+                    )
+                    if args.enable_mcp_bridge else NullMcpBridgeAdapter()
+                )
+            elif args.companion_templates_dir:
                 companion_adapter = RenderProfileAdapter(templates_dir=args.companion_templates_dir)
                 mcp_bridge_adapter = (
                     ShellMcpBridgeAdapter(deploy_root=args.deploy_root, vmid_map=vmid_map)
@@ -241,6 +335,15 @@ def main(argv: list[str] | None = None) -> int:
                 # Same checkout the deploy adapter tars from; the worker uses it
                 # to materialize the promoted release's source_revision.
                 repo_root=args.repo_root,
+                # Operator's chat id for the provisioning-outcome DM. Same chat
+                # as the control-plane API's approval notification, so the two
+                # halves of one run land in one place. Unset simply enqueues no
+                # operator rows.
+                operator_chat_id=os.environ.get("CONTROL_PLANE_OPERATOR_CHAT_ID", ""),
+                # The same value the compute adapter bakes into the new site's
+                # .env, read from one place so the password the organizer is
+                # told and the password the site accepts cannot drift apart.
+                seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
             )
             import signal, time as _time
             stopping = False

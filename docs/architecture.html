@@ -416,7 +416,10 @@
           digest. A later edit is a new version, never a mutation.</li>
         <li><strong>Plan &amp; approve</strong> — <code>generatePlan</code> pairs the
           latest intake with an eligible release and creates a job; an expiring approval
-          token unlocks it for the worker.</li>
+          token unlocks it for the worker. The trip's own organizer approves — there is no
+          second operations approval. The operator is sent a Telegram DM when an approval
+          lands (trip, organizer, plan id, digest, status), enqueued inside the approval's
+          own transaction. It is observability: provisioning never waits on it.</li>
         <li><strong>Provision</strong> — the worker runs <code>transform_intake</code> +
           <code>enrich_config</code> + <code>derive_bookings</code>, writes the config and
           sidecars, and calls <code>deploy.sh</code> to create the container, register the
@@ -517,6 +520,16 @@
         → active → completed → sealed</code>. Correcting an intake is only allowed from a
         subset of these; a live re-provision currently needs a manual hop back to
         <code>intake_confirmed</code> — see the open items.
+      </p>
+      <p>
+        Two cautions about that list. <code>activation_approved</code> and
+        <code>active</code> are <strong>declared but unbuilt</strong>: nothing writes them,
+        and whether they survive at all is an open product question — see
+        <code>docs/activation-scope.md</code>. And the chain above is documentation, not
+        enforcement: <code>lifecycle.ts</code>'s <code>canTransitionTrip</code> has no
+        production callers, while eight separate writers move trips between states. The
+        declared table also disagrees with what the code actually does in three places.
+        Recorded as debt in the sprint plan; not refactored.
       </p>
     </div>
   </section>

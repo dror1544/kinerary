@@ -10,6 +10,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -50,7 +51,7 @@ describe('POST /extract empty-result guard', () => {
   // without a real Hermes call.
   const mockHermes = join(HERE, 'fixtures', 'mock-hermes-empty.sh');
 
-  before(async () => { await startTestMcp({ HERMES_EXTRACT_PROFILE: 'anything', HERMES_BIN: mockHermes, MCP_PORT: '3106' }); }); // 3095-3105 already claimed by other test files
+  before(async () => { await startTestMcp({ HERMES_EXTRACT_PROFILE: 'anything', HERMES_BIN: mockHermes, MCP_PORT: String(PORTS.mcpExtract) }); });
   after(() => stopTestMcp());
 
   test('treats a nameless extraction result as a failure, not a success', async () => {

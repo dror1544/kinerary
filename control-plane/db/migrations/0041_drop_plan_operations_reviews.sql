@@ -1,0 +1,24 @@
+-- Provisioning converges on a single organizer-driven approval.
+--
+-- plan_operations_reviews (migration 0020) modelled a second, operations-side
+-- approval gate: the organizer requested provisioning, and a separately
+-- configured provisioning admin had to approve the exact plan digest, with a
+-- SEPARATION_OF_DUTIES_REQUIRED check refusing self-approval.
+--
+-- That gate was never a security boundary. Nothing in the worker read this
+-- table: job-queue.ts and provisioner.py both gate solely on a digest-matched,
+-- unexpired plan_approvals row, so the organizer route
+-- (POST /v1/plans/:planId/approve) already satisfied the worker while leaving
+-- the review row 'pending' forever. Two paths, one of which was advisory.
+--
+-- Dror's decision (2026-09-05): the trip's own organizer is authorized to
+-- approve provisioning. The operator is now NOTIFIED instead — an
+-- operator_provisioning_* row on notification_outbox, sent by the existing
+-- outbox dispatcher. Observability, not a gate: provisioning does not depend
+-- on that DM being received, acknowledged, or answered.
+--
+-- Dropped rather than left orphaned, by the same decision: a table whose name
+-- still asserts a gate nobody enforces is an invitation to reintroduce one.
+-- The approval history that matters is unaffected — plan_approvals holds every
+-- issued approval, its actor and its consumption.
+DROP TABLE IF EXISTS control_plane.plan_operations_reviews;

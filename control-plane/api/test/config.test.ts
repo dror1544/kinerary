@@ -126,3 +126,71 @@ test("the telegram messaging adapter needs super_admin_chat_id_secret_ref", asyn
   // which never sends anything and so never needs a destination.
   assert.doesNotThrow(() => validateArchitectureProfile(raw));
 });
+
+test("the relay block binds its secrets through secret_ref, like every other secret", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  assert.doesNotThrow(() => validateArchitectureProfile(raw));
+  assert.equal(validateArchitectureProfile(raw).relay?.port, 4312);
+
+  // A LIST, so a rotation can overlap: the gateway may still be presenting a
+  // token signed with the previous secret when this side restarts.
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    relay: {
+      ...raw.relay,
+      gateway_secret_refs: [
+        "env://CONTROL_PLANE_RELAY_GATEWAY_SECRET",
+        "env://CONTROL_PLANE_RELAY_GATEWAY_SECRET_PREVIOUS",
+      ],
+    },
+  }));
+  // An empty list would serve a connector that accepts no upgrade token at
+  // all while looking perfectly healthy.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, gateway_secret_refs: [] },
+  }));
+  // A raw secret where a reference belongs is exactly what this indirection
+  // exists to prevent — it would put the gateway secret in the profile itself.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, gateway_secret_refs: ["s3cr3t-value"] },
+  }));
+});
+
+test("the relay socket cannot be bound to a public interface", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // The connector holds the bot token and sends as the trip bot. Anything that
+  // can reach this port can talk to the gateway side of that.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, bind_host: "0.0.0.0" },
+  }));
+  assert.doesNotThrow(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, bind_host: "::1" },
+  }));
+});
+
+test("the relay port cannot collide with the api or worker port", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  // All three default into the same 431x range; a collision surfaces as
+  // EADDRINUSE on whichever service loses the race at boot.
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, port: raw.public_api.port },
+  }));
+  assert.throws(() => validateArchitectureProfile({
+    ...raw,
+    relay: { ...raw.relay, port: raw.worker.health_port },
+  }));
+});
+
+test("the relay block is optional — an api-only deployment omits it", async () => {
+  const raw = JSON.parse(await readFile(examplePath, "utf8"));
+  const { relay: _relay, ...withoutRelay } = raw;
+  // Absence keeps the bot dark, which is a supported state rather than a
+  // broken one.
+  assert.doesNotThrow(() => validateArchitectureProfile(withoutRelay));
+  assert.equal(validateArchitectureProfile(withoutRelay).relay, undefined);
+});

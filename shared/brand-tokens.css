@@ -1,0 +1,33 @@
+:root {
+  --kit-ink: #10263a;
+  --kit-ink-soft: #405363;
+  --kit-muted: #71818d;
+  --kit-teal: #0e8f86;
+  --kit-teal-light: #5fd3c4;
+  --kit-coral: #f26b3a;
+  --kit-sun: #f2d178;
+  --kit-paper: #faf8f5;
+  --kit-surface: #ffffff;
+  --kit-line: rgba(16, 38, 58, 0.13);
+  --kit-shadow: 0 16px 42px rgba(16, 38, 58, 0.12);
+  --kit-radius: 8px;
+  --kit-radius-lg: 18px;
+  --kit-font-body: "DM Sans", "Heebo", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --kit-font-display: "Manrope", "Assistant", system-ui, sans-serif;
+  --kit-space-1: 4px;
+  --kit-space-2: 8px;
+  --kit-space-3: 12px;
+  --kit-space-4: 16px;
+  --kit-space-5: 24px;
+  --kit-space-6: 32px;
+  --kit-space-7: 48px;
+  --kit-focus: 0 0 0 3px rgba(14, 143, 134, 0.32);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

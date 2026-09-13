@@ -5,8 +5,9 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { resolvePendingVenueLinks } from "../src/venue-links.js";
 import type { VenueUrlSearch } from "../src/itinerary-extract.js";
+import { testDatabaseUrl } from "./support/test-database.js";
 
-const databaseUrl = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 

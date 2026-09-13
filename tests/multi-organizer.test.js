@@ -7,6 +7,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -17,7 +18,7 @@ const HERE         = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, 'fixtures');
 const SERVER_JS    = join(HERE, '..', 'server', 'server.js');
 const SERVER_DIR   = join(HERE, '..', 'server');
-const PORT         = 3096;
+const PORT         = PORTS.multiOrganizer;
 
 function bootOnce(port, env) {
   return new Promise((resolve, reject) => {

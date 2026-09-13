@@ -416,6 +416,41 @@ class DayLinkCarryTests(unittest.TestCase):
         self.assertNotIn("maps", item)
         self.assertNotIn("url", item)
 
+    def test_a_check_in_line_gets_its_hotels_links(self) -> None:
+        # 2026-09-13: every hotel had maps and Waze links on its card and a pin
+        # on the map, and no check-in line on the plan carried either. Only
+        # venues were matched; the hotel never was.
+        cfg = self._cfg([{"time": None, "text": {
+            "he": "צ'ק-אין במלון OMO3 Asakusa by Hoshino Resorts",
+            "en": "Check in at OMO3 Asakusa by Hoshino Resorts",
+        }}])
+        cfg["phases"][0]["accommodation"] = {"name": "OMO3 Asakusa by Hoshino Resorts"}
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO}), pause=0)
+        item = out["phases"][0]["days"][0]["items"][0]
+        acc = out["phases"][0]["accommodation"]
+        self.assertEqual(acc["maps"], item["maps"], "the check-in line links where the hotel card links")
+        self.assertEqual(acc["waze"], item["waze"])
+        self.assertIn("OMO3%20Asakusa", item["maps"])
+
+    def test_a_phase_with_a_hotel_and_no_venues_still_links_its_check_in(self) -> None:
+        # Hakone and the closing Tokyo leg had no venues at all, and the carry
+        # returned before it looked at a single item.
+        cfg = self._cfg([{"time": None, "text": {
+            "he": "צ'ק-אין במלון Hakone Ashinoko Hanaori", "en": "Check in at Hakone Ashinoko Hanaori",
+        }}])
+        del cfg["phases"][0]["venues"]
+        cfg["phases"][0]["accommodation"] = {"name": "Hakone Ashinoko Hanaori"}
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO}), pause=0)
+        item = out["phases"][0]["days"][0]["items"][0]
+        self.assertIn("Hakone%20Ashinoko%20Hanaori", item["maps"])
+        self.assertIn("waze.com/ul?q=Hakone%20Ashinoko%20Hanaori", item["waze"])
+
+    def test_a_line_that_names_neither_hotel_nor_venue_stays_bare(self) -> None:
+        cfg = self._cfg([{"time": "09:00", "text": {"he": "בוקר חופשי", "en": "Free morning"}}])
+        cfg["phases"][0]["accommodation"] = {"name": "OMO3 Asakusa by Hoshino Resorts"}
+        out = enrich_config(cfg, "Japan", http=FakeHttp({"q=Tokyo": NOMINATIM_TOKYO}), pause=0)
+        self.assertNotIn("maps", out["phases"][0]["days"][0]["items"][0])
+
     def test_a_link_already_on_the_item_is_not_overwritten(self) -> None:
         item = self._enriched_items([{
             "time": "10:00", "text": {"he": "Tokyo Skytree", "en": "Tokyo Skytree"},

@@ -7,8 +7,14 @@ serialized as trip.config.json for the Kinerary trip site.
 Intake question IDs (INTAKE_SCHEMA_VERSION = 2):
   trip_type      choice: family / group_of_families / couple / other
   destination    text: free-form location
-  group_size     choice: 2 / 3_to_5 / 6_to_10 / more_than_10 / other
-  trip_duration  choice: weekend / week / two_weeks / month_or_more / other
+  group_size     choice: 2 / 3_to_5 / 6_to_10 / more_than_10 / other — LEGACY.
+                 Read only when no `travelers` roster is present; the headcount
+                 stat is otherwise counted off that roster (see
+                 _resolve_group_size), which is exact where this is a range.
+  trip_duration  choice: weekend / week / two_weeks / month_or_more / other —
+                 LEGACY, and only a fallback for an intake with no usable date
+                 pair. Both date questions are required, so duration is
+                 normally the difference between them.
   trip_interests text: optional free-form interests
   departure_date text: optional "YYYY-MM-DD" — precise departure, preferred
                  over the trip_duration placeholder logic when present
@@ -50,6 +56,11 @@ release serve both schema versions (see migration 0018).
   bot_tone       choice: warm/playful/dry
   bot_proactive  multi_choice: which unprompted messages it may send
   bot_limits     structured (array): [{he, en}] standing instructions
+  planning_help  text: optional. What the organizer wants help planning AFTER
+                 setup. Not acted on here — projected into
+                 agent.standing_instructions[] so the trip companion picks it
+                 up on its first turn rather than the ask being lost between
+                 the two agents. Additive-optional; no schema bump.
 
 Everything the v2 questions write into `agent.standing_instructions[]` carries
 `visibility: "organizer"` — see _instruction() for why that is blanket rather
@@ -71,7 +82,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 # Required question IDs that must be present in the intake data.
-REQUIRED_QUESTIONS = frozenset({"trip_type", "destination", "group_size", "trip_duration"})
+# `group_size` and `trip_duration` are deliberately NOT here: both are derived
+# from questions the interview already requires — the traveler roster and the
+# two date questions — rather than asked for separately (capture ledger, Step 3
+# #3 and #4). Intakes confirmed before that change still carry both, and both
+# resolvers still read them when present.
+REQUIRED_QUESTIONS = frozenset({"trip_type", "destination"})
 
 _TRIP_TYPE_LABELS: dict[str, str] = {
     "family": "Family",
@@ -112,12 +128,30 @@ def _resolve_trip_type(answer: Mapping[str, Any]) -> str:
     return str(answer.get("other_text") or "Trip")
 
 
-def _resolve_group_size(answer: Mapping[str, Any]) -> str:
-    """Returns a short stat number for the group size: the option label for a
+def _resolve_group_size(data: Mapping[str, Any]) -> str:
+    """Returns a short stat number for the group size, for the Hero strip.
+
+    The roster wins when there is one. Asking "how many people?" as its own
+    question was confusing to a real organizer (capture ledger, Step 3 #3) and
+    it asks for something the interview already collects precisely: `travelers`
+    is a required question listing each person. A count off that roster is both
+    exact and impossible to contradict, where the separate question could
+    disagree with the names actually given.
+
+    A stored `group_size` answer is still honoured beneath it, because intakes
+    confirmed before this change carry one and nothing rewrites a confirmed
+    version. That path keeps its original behaviour: the option label for a
     choice answer, or the leading digit run from 'other' free text (e.g. "17"
     out of "17 total; 7 for some parts of the trip") rather than the whole
-    organizer sentence — the Hero stat strip shows a number, not a quote.
+    organizer sentence — the Hero strip shows a number, not a quote.
     """
+    travelers = _structured_list(data, "travelers")
+    if travelers:
+        return str(len(travelers))
+
+    answer = data.get("group_size")
+    if not answer:
+        return "0"
     if answer.get("kind") == "choice":
         return _GROUP_SIZE_LABELS.get(answer.get("option_id", ""), str(answer.get("option_id", "")))
     text = str(answer.get("other_text") or "")
@@ -195,7 +229,12 @@ def _resolve_dates(data: Mapping[str, Any], today: date) -> tuple[date, date, in
         )
 
     departure_date = today + timedelta(days=90)
-    total_days = _resolve_duration_days(data["trip_duration"])
+    # `trip_duration` is a fallback for an intake that has no usable dates, and
+    # is no longer a question every intake carries — both date questions are
+    # required, so duration is normally derived above rather than asked for
+    # (capture ledger, Step 3 #4). Absent it, _resolve_duration_days's own
+    # default stands.
+    total_days = _resolve_duration_days(data.get("trip_duration") or {})
     return departure_date, departure_date + timedelta(days=total_days), total_days
 
 
@@ -325,7 +364,26 @@ def derive_trip_slug(data: Mapping[str, Any], today: date | None = None) -> str:
         destination = destination[:40].rstrip("-")
     if not destination:
         # A destination written entirely in non-latin script slugifies to
-        # nothing; the year still distinguishes it and the caller de-duplicates.
+        # nothing. Before falling back to a generic word, try the phase names:
+        # a trip whose destination is "יפן" usually still has a phase called
+        # "Tokyo", and "tokyo-2026" is a URL the family recognises where
+        # "trip-2026" is one they cannot tell from anyone else's (capture
+        # ledger, General #4). Phases are checked in order and the first one
+        # that slugifies to anything wins.
+        for phase in _structured_list(data, "phases"):
+            if not isinstance(phase, Mapping):
+                continue
+            for key in ("name_en", "name"):
+                candidate = _slug_words(str(phase.get(key) or ""))
+                if candidate:
+                    destination = candidate[:40].rstrip("-")
+                    break
+            if destination:
+                break
+
+    if not destination:
+        # Nothing latin anywhere in the intake; the year still distinguishes
+        # it and the caller de-duplicates.
         destination = "trip"
 
     return f"{destination}-{departure_date.year}"
@@ -450,6 +508,55 @@ _PROACTIVE_VALUES: dict[str, Any] = {
 }
 
 _AGENT_GENDERS = frozenset({"male", "female", "neutral"})
+
+
+# An organizer whose group writes in two languages types both names into the
+# one field they are given — "בוטסאן / botsan" is a real answer from japan-2026.
+# Splitting them matters beyond tidiness: `name` and `name_en` are what a
+# bilingual group's wake-words are built from, and a field holding BOTH names at
+# once matches neither when someone types just one of them.
+_BILINGUAL_SEPARATORS = ("/", "|", "־", "-", ",")
+
+
+def _is_hebrew(text: str) -> bool:
+    """True when the string carries Hebrew letters. Script detection, not a
+    language guess — the Hebrew block is unambiguous."""
+    return any("\u0590" <= ch <= "\u05ff" for ch in text)
+
+
+def _is_latin(text: str) -> bool:
+    return any(("a" <= ch <= "z") or ("A" <= ch <= "Z") for ch in text)
+
+
+def split_bilingual_name(raw: str) -> tuple[str, str]:
+    """Splits a single free-text assistant name into (name, name_en).
+
+    Returns the same string twice when there is only one name to find — a
+    Hebrew-only or Latin-only answer is not a pair, and inventing a
+    transliteration for the missing half would put a name in front of the
+    group that the organizer never chose.
+
+    Only splits when the two sides are in DIFFERENT scripts. That is what makes
+    it safe on a name that merely contains a separator: "Jean-Luc" is one Latin
+    name on both sides of its hyphen, so it stays whole.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", ""
+
+    for sep in _BILINGUAL_SEPARATORS:
+        if sep not in text:
+            continue
+        parts = [part.strip() for part in text.split(sep) if part.strip()]
+        if len(parts) != 2:
+            continue
+        first, second = parts
+        if _is_hebrew(first) and _is_latin(second) and not _is_hebrew(second):
+            return first, second
+        if _is_latin(first) and not _is_hebrew(first) and _is_hebrew(second):
+            return second, first
+
+    return text, text
 _AGENT_TONES = frozenset({"warm", "playful", "dry"})
 
 
@@ -525,6 +632,102 @@ def _apply_dietary(
     return instructions
 
 
+def _normalize_identity(value: Any) -> str:
+    """Casefolded, whitespace-collapsed form used to compare stated names.
+
+    Internal whitespace is collapsed rather than merely stripped so "ניר
+    סולומון" and "ניר  סולומון" are the same needle. A name is typed by a
+    person, once, into a chat.
+    """
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any]) -> set[str]:
+    """Every way an organizer might write THIS participant's own name.
+
+    `aliases` carries the raw intake traveler entry for the same person, and
+    is not optional decoration: `_build_participants` SLUGIFIES `family`
+    ("סולומון" becomes "solomon") and drops `family_en` altogether, so by the
+    time a participant exists the roster no longer holds the household label
+    in the form the organizer actually typed. Matching the transformed
+    participant alone finds "ניר solomon" and misses "ניר סולומון" — which is
+    the same bug in a second dimension, found while fixing the first.
+
+    Deliberately excludes the bare family/household label: "סולומון" names a
+    household of five, not a person, and matching it would pick whichever of
+    them the roster happened to list first — precisely the silent
+    wrong-person failure `_resolve_organizers` exists to avoid.
+    """
+    sources = (participant, *aliases)
+    names = {_normalize_identity(src.get("name")) for src in sources}
+    names |= {_normalize_identity(src.get("name_en")) for src in sources}
+    families = {_normalize_identity(src.get("family")) for src in sources}
+    families |= {_normalize_identity(src.get("family_en")) for src in sources}
+    names.discard("")
+    families.discard("")
+
+    forms = set(names)
+    forms.add(_normalize_identity(participant.get("username")))
+    # Every given-name form against every household form, which covers the
+    # mixed-script rosters that happen in practice — a Hebrew given name whose
+    # household label was only ever transliterated, or the reverse.
+    forms |= {f"{n} {f}" for n in names for f in families}
+    # The GIVEN NAME on its own, taken as the first token of any multi-part
+    # name. Run 14, live: the organizer answered "ניר" and matched nothing,
+    # while "Nir" would have matched — not because English is privileged, but
+    # because `name_en` happens to hold only the given name while `name` holds
+    # the full one. The organizer answered with their own first name, in the
+    # language the entire interview was conducted in, and the companion was
+    # never built.
+    #
+    # Safe to add precisely because ambiguity already fails closed: two
+    # travellers sharing a given name resolve to nobody rather than to whoever
+    # the roster lists first, which is the guarantee `_resolve_organizers`
+    # exists to keep. This widens what can match, never what happens when more
+    # than one does.
+    forms |= {n.split(" ", 1)[0] for n in names if " " in n}
+    forms.discard("")
+    return forms
+
+
+#: A self-reference someone puts in front of their own name: "I'm Nir", "אני
+#: ניר", "it's me, Nir". Only ever stripped from the START of the answer.
+_SELF_REFERENCE = re.compile(
+    r"^(?:it'?s\s+me|i\s+am|i'?m|me|myself|זה\s+אני|זאת\s+אני|אני)(?=[\s,:(]|$)[\s,:]*",
+    re.IGNORECASE,
+)
+#: What separates a name from what someone says about themselves after it:
+#: "ניר, אבא של המשפחה", "Nir - the dad", "Nir (the dad)". A hyphen counts
+#: only with spaces around it, so "Anne-Marie" stays one name.
+_AFTER_NAME = re.compile(r"\s*[,;(—–]\s*|\s+-\s+")
+
+
+def _stated_name_candidates(answer: str) -> list[str]:
+    """The answer as typed, then the NAME at the front of it.
+
+    2026-09-11, the first automated full cycle: "which of the travellers are
+    you?" is answered in a sentence — "ניר, אבא של המשפחה", "I'm Nir", "me
+    (Nir)" — and matching the whole sentence found nobody, so the trip
+    provisioned with no companion. This reads the leading name out of such an
+    answer and NOTHING else: never a name buried later ("Nir's wife" is not
+    Nir), and never a word from the description. The candidate still has to
+    match exactly one traveller; see `_resolve_organizers`.
+    """
+    full = _normalize_identity(answer)
+    if not full:
+        return []
+    candidates = [full]
+    rest = _SELF_REFERENCE.sub("", full, count=1)
+    parts = _AFTER_NAME.split(rest, maxsplit=1)
+    head = parts[0].strip(" )")
+    if head:
+        candidates.append(head)
+    elif len(parts) > 1:
+        # "me (Nir)": the self-reference WAS the head, so the name is next.
+        candidates.append(_AFTER_NAME.split(parts[1], maxsplit=1)[0].strip(" )"))
+    return list(dict.fromkeys(c for c in candidates if c))
+
+
 def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, Any]]) -> list[str]:
     """Matches the organizer_identity answer to a participant username.
 
@@ -533,20 +736,54 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     yields a config that cannot deploy at all; and a username that happens to
     belong to *someone else* silently hands them the organizer's private
     channel. No organizer block is the recoverable failure of the three.
+
+    An AMBIGUOUS answer is treated the same way as no answer, for the same
+    reason: two participants matching "שי" means the roster cannot tell which
+    of them is speaking, and picking the first is the wrong-person failure
+    with extra steps.
     """
     answer = data.get("organizer_identity")
-    stated = _text_value(answer).strip() if isinstance(answer, Mapping) else ""
-    if not stated:
+    candidates = _stated_name_candidates(_text_value(answer)) if isinstance(answer, Mapping) else []
+    if not candidates:
         return []
-    needle = stated.casefold()
+
+    # The raw roster, keyed by every given-name form it carries, so a
+    # participant can be matched back to the entry the organizer actually
+    # typed — the one that still holds the household label unslugified.
+    raw_by_name: dict[str, Mapping[str, Any]] = {}
+    travelers = data.get("travelers")
+    entries = travelers.get("data") if isinstance(travelers, Mapping) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        for key in ("name", "name_en"):
+            form = _normalize_identity(entry.get(key))
+            if form:
+                raw_by_name.setdefault(form, entry)
+
+    forms_by_username: dict[str, set[str]] = {}
     for participant in participants:
-        candidates = {
-            str(participant.get("name", "")).strip().casefold(),
-            str(participant.get("name_en", "")).strip().casefold(),
-            str(participant.get("username", "")).strip().casefold(),
-        }
-        if needle in candidates and needle:
-            return [participant["username"]]
+        username = participant.get("username")
+        if not username:
+            continue
+        aliases = [
+            raw for raw in (
+                raw_by_name.get(_normalize_identity(participant.get("name"))),
+                raw_by_name.get(_normalize_identity(participant.get("name_en"))),
+            ) if raw is not None
+        ]
+        forms_by_username.setdefault(username, set()).update(_identity_forms(participant, *aliases))
+
+    # The answer as typed first, then the name at the front of it. The first
+    # reading that names exactly ONE traveller wins; a reading that names two
+    # ends the search — a looser read must never break a tie a stricter one
+    # could not.
+    for needle in candidates:
+        matched = [u for u, forms in forms_by_username.items() if needle in forms]
+        if len(matched) == 1:
+            return matched
+        if len(matched) > 1:
+            return []
     return []
 
 
@@ -567,10 +804,11 @@ def _derive_agent(
     if organizers:
         agent["organizers"] = organizers
 
-    name = _text_value(data["bot_name"]).strip() if isinstance(data.get("bot_name"), Mapping) else ""
+    raw_name = _text_value(data["bot_name"]).strip() if isinstance(data.get("bot_name"), Mapping) else ""
+    name, name_en = split_bilingual_name(raw_name)
     if name:
         agent["name"] = name
-        agent["name_en"] = name
+        agent["name_en"] = name_en
         gender = _text_value(data["bot_gender"]) if isinstance(data.get("bot_gender"), Mapping) else ""
         # Hebrew conjugates by gender, so the assistant cannot build a sentence
         # without one. 'neutral' (gender-avoidant phrasing) is the honest
@@ -606,6 +844,24 @@ def _derive_agent(
         he, en = raw.get("he"), raw.get("en")
         if isinstance(he, str) and he.strip() and isinstance(en, str) and en.strip():
             instructions.append(_instruction({"he": he.strip(), "en": en.strip()}))
+    # What the organizer asked for help with, handed to the companion.
+    #
+    # The interview collects STRUCTURE; an organizer who says "we haven't
+    # worked out Kyoto yet" is describing work that happens after the site
+    # exists. Carrying it as a standing instruction is what stops that ask
+    # being lost between the two agents — the companion reads it on its first
+    # turn instead of the organizer having to say it twice.
+    #
+    # Organizer-only like every instruction here (see _instruction): it is the
+    # organizer's own words about what they have not sorted out, which is not
+    # something to publish to the whole family.
+    planning_help = _text_value(data.get("planning_help", {})).strip()
+    if planning_help:
+        instructions.append(_instruction({
+            "en": f"The organizer asked for help with this after setup: {planning_help}",
+            "he": f"המארגן ביקש עזרה בזה אחרי ההקמה: {planning_help}",
+        }))
+
     if instructions:
         agent["standing_instructions"] = instructions
 
@@ -684,7 +940,17 @@ def _plain(value: Any) -> str:
 
 def _bilingual_text(obj: Any) -> dict[str, str] | None:
     """Normalise a {he,en} pair: strip markup, mirror the present side onto the
-    missing one, and return None when both sides are empty."""
+    missing one, and return None when both sides are empty.
+
+    A PLAIN STRING is accepted and mirrored onto both sides. The document
+    extractor emits venue names that way (`{"name": "Tokyo Skytree"}`), and
+    requiring the pair meant every such venue was read as nameless and dropped
+    — on the 2026-09-09 run, all six of them. One language is not a reason to
+    discard a place; it is a reason to show the same name on both sides.
+    """
+    if isinstance(obj, str):
+        text = _plain(obj)
+        return {"he": text, "en": text} if text else None
     if not isinstance(obj, Mapping):
         return None
     he, en = _plain(obj.get("he")), _plain(obj.get("en"))
@@ -739,6 +1005,22 @@ def _normalise_days(
 
 
 _HTTP_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _planned_as_venues(raw_planned: Any) -> list[dict[str, Any]]:
+    """Turn a phases[].planned intake payload — plain place-name strings the
+    interview proposed from a document but that were never booked — into the
+    same shape `_normalise_venues` expects, so a place like "Tokyo Skytree"
+    reaches the site's phase page the same way a `venues[]` entry from
+    `extract_itinerary` does, just without a url/area."""
+    if not isinstance(raw_planned, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in raw_planned:
+        name = _plain(raw)
+        if name:
+            out.append({"name": {"he": name, "en": name}})
+    return out
 
 
 def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
@@ -803,7 +1085,8 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
             "end": _parse_iso_date(raw.get("end")),
             "accommodation": raw.get("accommodation"),
             "days": raw.get("days") if isinstance(raw.get("days"), list) else [],
-            "venues": raw.get("venues") if isinstance(raw.get("venues"), list) else [],
+            "venues": (raw.get("venues") if isinstance(raw.get("venues"), list) else [])
+            + _planned_as_venues(raw.get("planned")),
         })
 
     merged: list[dict[str, Any]] = []
@@ -969,9 +1252,25 @@ def _derive_budget(
     return budget
 
 
+SUPPORTED_LANGUAGES = ("en", "he")
+
+
+def _resolve_language(language: str | None) -> str:
+    """The trip's language, or English when there is nothing usable.
+
+    Fails safe in the same direction as `shared/needs-schema.js`: an
+    unrecognised value resolves to the conservative option rather than
+    propagating. A language code nothing can render reaches the site as broken
+    text in every string at once.
+    """
+    candidate = (language or "").strip().lower()
+    return candidate if candidate in SUPPORTED_LANGUAGES else "en"
+
+
 def transform_intake(
     data: Mapping[str, Any],
     today: date | None = None,
+    language: str | None = None,
 ) -> dict[str, Any]:
     """Convert intake answers into a trip.config.json dict.
 
@@ -979,6 +1278,15 @@ def transform_intake(
     The departure date is set to 90 days from *today* (or the supplied
     reference date); this is a placeholder the organizer refines later via
     the intake correction path.
+
+    `language` is the language the INTERVIEW was held in, carried on the intake
+    version. It is not a preference anyone is asked for: it was established by
+    the organizer's first message and every message after it. Until 2026-09-07
+    it was not carried at all and this function hardcoded English, so an
+    interview conducted entirely in Hebrew produced a trip whose companion
+    greeted the family in English — with a Hebrew assistant name embedded in
+    the English sentence. Absent still means English, because every intake
+    version written before this carries nothing.
     """
     missing = REQUIRED_QUESTIONS - set(data.keys())
     if missing:
@@ -987,7 +1295,7 @@ def transform_intake(
     today = today or date.today()
     destination = _text_value(data["destination"]).strip() or "Unknown Destination"
     trip_type_label = _resolve_trip_type(data["trip_type"])
-    group_size_label = _resolve_group_size(data["group_size"])
+    group_size_label = _resolve_group_size(data)
 
     departure_date, return_date, total_days = _resolve_dates(data, today)
 
@@ -1023,6 +1331,19 @@ def transform_intake(
 
     phases = _derive_phases(_structured_list(data, "phases"))
 
+    # A day-by-day from the dated anchors, for every phase that does not
+    # already have one. Extracted days WIN: `extract_itinerary`'s pass over an
+    # uploaded document is richer than anything derivable from a list of
+    # bookings, so this fills empty phases rather than competing for the slot.
+    # It exists because that extraction is unreachable from the chat-scoped
+    # interview, so in practice the slot is always empty — but the precedence
+    # is written the right way round so it stays correct when that is fixed.
+    anchor_days = derive_days_from_anchors({"phases": phases}, data)
+    for phase in phases:
+        derived = anchor_days.get(str(phase.get("id")))
+        if derived and not phase.get("days"):
+            phase["days"] = derived
+
     # Only a count, never the organizer's free text — same reasoning as above.
     travel_anchors = _structured_list(data, "travel_anchors")
     if travel_anchors:
@@ -1043,7 +1364,7 @@ def transform_intake(
             "title": title,
             "title_en": title,
             "brand": brand,
-            "defaultLang": "en",
+            "defaultLang": _resolve_language(language),
             "departure": departure_iso,
             "returnDate": return_date.strftime("%Y-%m-%d"),
             "totalDays": total_days,
@@ -1215,6 +1536,123 @@ def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
     return None
 
 
+_ANCHOR_TIME_RE = re.compile(r"\bat\s+([0-2]?\d:[0-5]\d)\b", re.IGNORECASE)
+_CLOCK_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """One reading of a `travel_anchors` entry, whichever shape it arrived in.
+
+    Two shapes reach here. The agent path writes free text —
+    ``{type, detail: "Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00"}`` — and
+    the interpret path writes the question's own example shape (interview.ts
+    `travel_anchors.dataExample`) — ``{type, name, date: "2026-09-20",
+    confirmation}``, optionally ``time``. Reading only ``detail`` turned every
+    anchor of the second shape into an undated "Activity" on the first phase,
+    which is how four ticketed Italy attractions reached no day on 2026-09-11.
+
+    Structured fields win where present; the free text fills what they leave
+    out. Both callers read through here so they cannot disagree about what an
+    anchor says.
+    """
+    anchor_type = str(raw.get("type") or "").strip().lower()
+    detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
+    name = str(raw.get("name") or raw.get("title") or "").strip()
+    stated_date = str(raw.get("date") or raw.get("date_from") or raw.get("start") or "").strip()
+    when = (
+        _parse_iso_date(stated_date)
+        or _extract_anchor_date(stated_date)
+        or _extract_anchor_date(detail)
+        or _extract_anchor_date(name)
+    )
+    stated_time = str(raw.get("time") or "").strip()
+    time_match = _ANCHOR_TIME_RE.search(f"{name} {detail}")
+    clock = stated_time if _CLOCK_RE.match(stated_time) else (time_match.group(1) if time_match else None)
+    # The date and time are represented structurally, so strip them from the
+    # label rather than printing "at 10:00" beside a 10:00 slot.
+    label = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", name or detail))
+    label = label.strip(" \u2014-—,;:").strip()
+    return {"type": anchor_type, "detail": detail, "name": name, "when": when,
+            "time": clock, "label": label}
+
+
+#: Anchor types that describe WHERE you sleep or WHAT a quote costs, not
+#: something that happens at a time on a day. Hotels already own the phase's
+#: `accommodation`; a proposal is a whole-trip figure.
+_NON_ITINERARY_ANCHORS = {"hotel", "car", "proposal"}
+
+
+def derive_days_from_anchors(
+    config: Mapping[str, Any], data: Mapping[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """A day-by-day built from the anchors, deterministically. No model.
+
+    `phases[].days[]` had exactly one producer — `extract_itinerary`, an LLM
+    pass over an uploaded document — and it is unreachable from the chat-scoped
+    interview (no `_for_chat` twin), so no control-plane trip has ever had one.
+    Meanwhile the organizer's plan was already sitting in `travel_anchors`,
+    dated, timed and structured:
+
+        activity | Tokyo Skytree e-ticket — 20 Sep 2026 at 10:00
+        activity | TeamLab Planets — 20 Sep 2026 at 18:00
+        activity | Sagano Romantic Train, one-way — 25 Sep 2026 at 14:02
+
+    Nothing about turning that into days needs a model. The date parsing and
+    the date→phase mapping are the same ones `derive_bookings` has been using
+    correctly all along; this reuses them rather than adding a second parser
+    that can disagree with the first.
+
+    Returns {phase_id: days[]}. Only anchors that are events are used —
+    a hotel is the phase's `accommodation`, not a thing you do at 10:00.
+
+    DELIBERATELY NOT a replacement for document extraction. This can only
+    surface what the organizer stated as a discrete dated item; a PDF's prose
+    itinerary is richer and still wants `extract_itinerary`. When both exist
+    the extracted days win (see the caller) — this fills the gap, it does not
+    compete for the slot.
+    """
+    phases = list(config.get("phases") or [])
+    by_phase: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        anchor = _read_anchor(raw)
+        if anchor["type"] in _NON_ITINERARY_ANCHORS:
+            continue
+        when = anchor["when"]
+        if not when:
+            continue  # undated: it is a booking, not a moment in the plan
+        phase_id = _phase_id_for_date(phases, when)
+        if not phase_id:
+            continue  # outside every phase — the Bookings tab still shows it
+        label = anchor["label"]
+        if not label:
+            continue
+        day = by_phase.setdefault(phase_id, {}).setdefault(when.isoformat(), [])
+        day.append({"time": anchor["time"], "text": {"he": label, "en": label}})
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for phase_id, days in by_phase.items():
+        rendered = []
+        for iso, items in sorted(days.items()):
+            # Timed items first in clock order, undated-within-the-day last —
+            # "some time that day" reads correctly at the bottom, not at 00:00.
+            items.sort(key=lambda i: (i["time"] is None, i["time"] or ""))
+            rendered.append({"date": iso, "items": items})
+        out[phase_id] = rendered
+    return out
+
+
+def _same_place(a: str, b: str) -> bool:
+    """Whether two booking names name the same place: "Hotel Artemide" and
+    "Hotel Artemide, Rome" do; "OMO3 Asakusa" and "Park Hyatt Tokyo" do not."""
+    def norm(text: str) -> str:
+        return " ".join(re.sub(r"[^\w\s]", " ", text.casefold()).split())
+    x, y = norm(a), norm(b)
+    return bool(x and y) and (x in y or y in x)
+
+
 def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Build bookings.json rows from an already-transformed config plus the raw
     intake answers.
@@ -1238,6 +1676,7 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
     phases = list(config.get("phases") or [])
     fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
     bookings: list[dict[str, Any]] = []
+    hotel_row: dict[str, dict[str, Any]] = {}
 
     for phase in phases:
         accommodation = phase.get("accommodation")
@@ -1264,19 +1703,35 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             ),
             "seed_key": f"hotel_{phase.get('id')}",
         })
+        hotel_row[str(phase.get("id"))] = bookings[-1]
 
     for raw in _structured_list(data, "travel_anchors"):
         if not isinstance(raw, dict):
             continue
-        detail = str(raw.get("detail") or raw.get("note") or raw.get("text") or "").strip()
-        anchor_type = str(raw.get("type") or "").strip().lower()
-        if not detail and not anchor_type:
+        anchor = _read_anchor(raw)
+        detail, anchor_type = anchor["detail"], anchor["type"]
+        if not detail and not anchor_type and not anchor["name"]:
             continue
         # A "proposal" is a whole-trip quote, not a dated item — any date inside
         # it is a range endpoint, so don't pin it to a single day or phase.
-        when = None if anchor_type == "proposal" else _extract_anchor_date(detail)
-        name = _shorten_phase_name(detail, max_length=60) if detail else ""
+        when = None if anchor_type == "proposal" else anchor["when"]
+        name = _shorten_phase_name(anchor["name"] or detail, max_length=60) if (anchor["name"] or detail) else ""
         phase_id = _phase_id_for_date(phases, when) if when else None
+        # The same hotel often arrives twice — as the phase's accommodation and
+        # as a dated anchor holding the booking number. One row, carrying the
+        # number; a different hotel in the same phase is a split stay and keeps
+        # its own.
+        own = hotel_row.get(phase_id or "")
+        if own and _ANCHOR_TYPE_MAP.get(anchor_type) == "hotel" and _same_place(own["name"], name):
+            own["confirmation"] = own["confirmation"] or raw.get("confirmation")
+            continue
+        # A free-text anchor keeps the key it has always had, so re-provisioning
+        # an existing trip stays idempotent. A structured one has no `detail`;
+        # hashing the type alone gave every "activity" the SAME key, and the
+        # site's INSERT OR IGNORE kept one of them.
+        identity = detail or "|".join(
+            str(part) for part in (anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "")
+        )
         bookings.append({
             "phase": phase_id or fallback_phase,
             "type": _ANCHOR_TYPE_MAP.get(anchor_type, "other"),
@@ -1290,9 +1745,7 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             # If the anchor names a venue the itinerary already links, reuse
             # that link rather than leaving the row with a bare 📍.
             "location_url": _config_venue_link(f"{name} {detail}", phases),
-            "seed_key": "anchor_" + hashlib.sha1(
-                (detail or anchor_type).encode("utf-8")
-            ).hexdigest()[:10],
+            "seed_key": "anchor_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10],
         })
 
     return bookings

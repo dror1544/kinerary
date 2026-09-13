@@ -29,6 +29,11 @@ export interface SignupConfig {
   messagingAdapter: string;
   /** Seconds the user must wait after the most recent rejection before re-requesting. */
   signupRateLimitCooldownSeconds: number;
+  /**
+   * Grant the trip at signup instead of asking an operator to approve it.
+   * Default false — see the comment at the branch in `startSignup`.
+   */
+  autoApprove?: boolean;
 }
 
 export type SignupStatus = "awaiting_approval" | "approved" | "declined" | "not_found";
@@ -59,6 +64,43 @@ export type CallbackResult =
  * plain FK to them.  Partial unique indexes on the table enforce "at most one
  * pending" and "at most one approved" per user without touching history rows.
  */
+/**
+ * What approving a signup actually DOES: the trip exists, the user owns it, and
+ * the request records which trip it produced. One statement short of any of
+ * those and the signup is half-granted, so all three stay in the caller's
+ * transaction.
+ *
+ * Shared by the operator's approve tap and by `autoApprove`, deliberately: an
+ * auto-approved signup must be indistinguishable afterwards from a tapped one,
+ * because everything downstream — membership lookups, `getSignupStatus`,
+ * enrollment's owner check — reads these rows and nothing else. A second path
+ * that wrote them slightly differently is exactly the bug worth not having.
+ */
+async function grantApproved(
+  client: pg.PoolClient,
+  requestId: string,
+  userId: string,
+): Promise<string> {
+  const tripId = generateId("trip");
+  // slug must match ^[a-z0-9]+(-[a-z0-9]+)*$ — underscores → dashes
+  const slug = `draft-${requestId.replace(/_/g, "-")}`;
+  await client.query(
+    "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
+    [tripId, slug],
+  );
+  await client.query(
+    "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
+    [generateId("memb"), tripId, userId],
+  );
+  await client.query(
+    `UPDATE control_plane.signup_approval_requests
+     SET state = 'approved', trip_id = $1, decided_at = now(), updated_at = now()
+     WHERE id = $2`,
+    [tripId, requestId],
+  );
+  return tripId;
+}
+
 export async function startSignup(
   db: pg.Pool,
   identity: VerifiedTelegramIdentity,
@@ -180,6 +222,23 @@ export async function startSignup(
        VALUES ($1, $2, 'pending', $3)`,
       [requestId, userId, approveToken.expiresAt],
     );
+
+    // NO OPERATOR IN THE LOOP. The request is created and granted in the same
+    // transaction, so it is never observably pending and there is nothing for
+    // anyone to tap. No outbox row either: that row exists to be delivered and
+    // retried, and a decision already made is not a message.
+    //
+    // Off unless a deployment asks for it. This is the front-door admission
+    // gate — with it open, anything that can reach POST /v1/signup owns a trip
+    // — so it follows CONTROL_PLANE_ALLOW_UNSEALED_RELEASE's rule: the safe
+    // value must hold for a caller that passes nothing.
+    if (config.autoApprove) {
+      const tripId = await grantApproved(client, requestId, userId);
+      await client.query("COMMIT");
+      log(structuredLog("info", "signup.auto_approved", { request_id: requestId, trip_id: tripId }));
+      return { status: "approved", tripId, requestId };
+    }
+
     const outboxId = generateId("notf");
     await client.query(
       `INSERT INTO control_plane.notification_outbox(id, signup_request_id, notification_type, adapter, state)
@@ -272,23 +331,7 @@ export async function processApprovalCallback(
     }
 
     if (action === "approve") {
-      const tripId = generateId("trip");
-      // slug must match ^[a-z0-9]+(-[a-z0-9]+)*$ — underscores → dashes
-      const slug = `draft-${requestId.replace(/_/g, "-")}`;
-      await client.query(
-        "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
-        [tripId, slug],
-      );
-      await client.query(
-        "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
-        [generateId("memb"), tripId, req.user_id],
-      );
-      await client.query(
-        `UPDATE control_plane.signup_approval_requests
-         SET state = 'approved', trip_id = $1, decided_at = now(), updated_at = now()
-         WHERE id = $2`,
-        [tripId, requestId],
-      );
+      const tripId = await grantApproved(client, requestId, req.user_id);
       await client.query("COMMIT");
       return { outcome: "approved", tripId };
     } else {

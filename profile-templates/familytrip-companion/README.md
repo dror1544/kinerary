@@ -7,6 +7,7 @@ Reusable policy:
 - use the live trip site as operational source of truth;
 - update the same plan layer the site renders and verify both persisted and visible state;
 - keep group answers concise, practical, and privacy-safe;
+- speak about yourself in the grammatical gender the handoff assigns, never one inferred from the assistant's own name;
 - never expose organizer-private instructions or participant needs;
 - learn candidate facts from chat, but require organizer approval before durable/public writes;
 - use observed Telegram group identity and current membership, never guessed IDs;
@@ -35,6 +36,28 @@ hermes profile create <name> --no-skills --description "Trip companion for <trip
 Then copy the rendered `SOUL.md`, `profile.yaml`, `references/`, and `skills/` into the fresh profile. Deliberately merge `config.overlay.yaml`; do not blindly replace the generated config. Configure site and messaging secrets through secure Hermes configuration, verify, and only then start the gateway.
 
 The optional `--install-profile NAME` switch creates a fresh profile and copies the neutral overlay. It refuses to overwrite an existing profile and never writes tokens or starts a gateway.
+
+## Required deployment bindings (not in the rendered bundle)
+
+Two values are provider bindings, so `handoff.schema.json` deliberately keeps
+them in the control plane rather than copying them into the profile payload.
+The rendered bundle therefore cannot carry them, and a profile is not finished
+until they are set in its own `.env`:
+
+- **The trip connection.** `setup-mcp.sh` registers the MCP server and writes
+  `MCP_<NAME>_API_KEY`. The server's name must match `site_connection_name`
+  (default `trip-mcp`) — SOUL.md and `references/sources.md` tell the assistant
+  to read through exactly that name, so a mismatch sends it scraping the public
+  site instead. On japan-2026 it did: the bundle said `trip-site`, the server
+  was `trip-mcp`, and the assistant fell back to fetching the URL and running
+  code against it.
+- **`TELEGRAM_HOME_CHANNEL`** — set it to the ORGANIZER'S DM, not the group.
+  Unset, the gateway posts a "No home channel is set ... type /sethome" notice
+  into whichever chat speaks first. It fires only on a session with no history,
+  so with `session_reset` enabled it returns after every reset: an operations
+  prompt in a family chat, on a schedule. It is also where cron output goes,
+  and SOUL.md requires an organizer opt-in before anything proactive reaches
+  the group.
 
 ## Register with trip-intake
 

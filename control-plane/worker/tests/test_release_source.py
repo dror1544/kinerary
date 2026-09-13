@@ -112,3 +112,35 @@ class ReleaseSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GitOwnershipTests(unittest.TestCase):
+    """On the Proxmox VM the worker runs as root against /repo, a bind mount
+    owned by the operator's uid. git refuses such a repository ("detected
+    dubious ownership") and every release verification failed on it. The
+    exception must name exactly the repository the worker was handed — never a
+    wildcard, which would trust every directory on the host."""
+
+    def _argv(self, repo_root: str) -> list[str]:
+        from unittest import mock
+        from control_plane_worker import release_source
+        seen: dict = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, b"abc123\n", b"")
+
+        with mock.patch.object(release_source.subprocess, "run", fake_run):
+            release_source._git(repo_root, "rev-parse", "HEAD")
+        return seen["argv"]
+
+    def test_trusts_exactly_the_repo_it_was_given(self) -> None:
+        argv = self._argv("/repo")
+        self.assertIn("safe.directory=/repo", argv)
+        self.assertFalse(any(a == "safe.directory=*" for a in argv), argv)
+
+    def test_the_exception_precedes_the_subcommand(self) -> None:
+        argv = self._argv("/repo")
+        # `git -c k=v` only applies when it comes before the subcommand.
+        self.assertLess(argv.index("safe.directory=/repo"), argv.index("rev-parse"))
+        self.assertEqual(argv[argv.index("safe.directory=/repo") - 1], "-c")

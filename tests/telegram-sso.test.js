@@ -4,6 +4,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { PORTS } from './helpers/ports.js';
 import { createHmac, createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn } from 'child_process';
@@ -16,7 +17,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(HERE, 'fixtures');
 const SERVER_JS = join(HERE, '..', 'server', 'server.js');
 const SERVER_DIR = join(HERE, '..', 'server');
-const PORT = 3095;
+const PORT = PORTS.telegramSso;
 const BOT_TOKEN = 'test-bot-token';
 const CHAT_ID = '-100-test-chat';
 
@@ -206,7 +207,7 @@ describe('Telegram Login SSO', () => {
 // Telegram IDs are collected. Confirms trip.config.json stays the live source
 // of truth across a restart, not just at the very first boot of a fresh DB.
 describe('telegram_id syncs from config on every boot, not just fresh-DB seed', () => {
-  const PORT2 = 3100; // 3095-3099 are already claimed by other test files
+  const PORT2 = PORTS.telegramSsoConfigResync;
   let apiServer2;
   let apiBaseUrl2;
   let dataDir2;
@@ -307,7 +308,7 @@ describe('telegram_id syncs from config on every boot, not just fresh-DB seed', 
 // the one Telegram setting that can't be known at deploy time — this route
 // is how it gets bound once the organizer actually creates the group.
 describe('POST /api/agent/telegram-group', () => {
-  const PORT3 = 3102; // 3095-3101 already claimed by other test files
+  const PORT3 = PORTS.telegramSsoGroupBind;
   let apiServer3, apiBaseUrl3, tripServer3, dataDir3, tripDir3, envFile3, membership3;
 
   before(async () => {

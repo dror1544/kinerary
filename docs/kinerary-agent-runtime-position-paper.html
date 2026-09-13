@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kinerary — נייר עמדה: Companion & Agent Runtime Architecture</title>
+<style>
+:root{--bg:#f5f2ec;--paper:#fffdf9;--ink:#20242b;--muted:#626a75;--line:#ddd7cb;--accent:#08766c;--blue:#315978;--soft:#e6f2ef;--warn:#9b641b;--warnbg:#fbf1df;--risk:#943e3e;--riskbg:#f8e8e8;--good:#2e754d;--goodbg:#e7f3eb;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Noto Sans Hebrew",sans-serif;line-height:1.72}.wrap{max-width:1160px;margin:auto;padding:0 24px}header{padding:62px 0 38px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#fbfaf6,var(--bg))}.eyebrow{font:600 12px var(--mono);letter-spacing:.08em;color:var(--accent)}h1{font-size:clamp(36px,5vw,57px);line-height:1.08;letter-spacing:-.035em;margin:.45rem 0 1rem}h2{font-size:30px;line-height:1.25;margin:0 0 16px}h3{font-size:20px;margin:27px 0 8px}p{max-width:86ch}.lede{font-size:19px;color:var(--muted);max-width:80ch}.meta{display:flex;gap:10px 24px;flex-wrap:wrap;font:13px var(--mono);color:var(--muted);margin-top:20px}main{padding:34px 0 62px}section{margin:0 0 58px}.toc,.card,.figure,.callout{background:var(--paper);border:1px solid var(--line);border-radius:13px}.toc{padding:20px 24px;margin-bottom:48px}.toc ol{columns:2;gap:38px;margin:10px 0 0;padding-right:22px}.toc a{color:var(--ink);text-decoration:none}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.card{padding:18px 20px}.card h3{margin:0 0 7px;font-size:18px}.card p{margin:.4rem 0;color:var(--muted)}.tag{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--soft);color:var(--accent);font:12px var(--mono);margin-left:5px}.figure{padding:22px;overflow:auto;direction:ltr;text-align:left}pre{font:13px/1.58 var(--mono);margin:0;white-space:pre}code{font-family:var(--mono);font-size:.9em;background:#eef0f2;padding:.12em .35em;border-radius:5px}.callout{padding:18px 20px;border-right:4px solid var(--accent);margin:18px 0}.callout.warn{background:var(--warnbg);border-right-color:var(--warn)}.callout.risk{background:var(--riskbg);border-right-color:var(--risk)}.callout.good{background:var(--goodbg);border-right-color:var(--good)}.decision{font-size:22px;font-weight:700;line-height:1.45}table{width:100%;border-collapse:collapse;background:var(--paper);border:1px solid var(--line)}th,td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top;text-align:right}th{background:#f2efe8;font-size:13px}tr:last-child td{border-bottom:0}.phase{display:grid;grid-template-columns:135px 1fr;gap:18px;margin:12px 0;padding:16px 0;border-bottom:1px solid var(--line)}.phase:last-child{border-bottom:0}.phase-no{font:700 13px var(--mono);color:var(--accent);padding-top:4px}.small{font-size:13px;color:var(--muted)}ul,ol{padding-right:22px}footer{padding:28px 0 48px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}@media(max-width:820px){.grid,.grid2{grid-template-columns:1fr}.toc ol{columns:1}.phase{grid-template-columns:1fr}}@media print{body{background:#fff}.card,.figure,.callout,table{break-inside:avoid}}
+</style></head>
+<body>
+<header><div class="wrap">
+<div class="eyebrow">POSITION PAPER · PRODUCT VISION / COMPANION / AI RUNTIME · 2026-09-05</div>
+<h1>ה־Companion הוא המוצר; ה־Agent Runtime הוא מנוע שניתן להחליף</h1>
+<p class="lede">נייר עמדה מעודכן ל־Kinerary: כיצד לשמר ולהעמיק את חזון “החבר לטיול” — אתר חי ו־AI companion שמכיר את המטיילים, לומד העדפות וחוויות, מבין את הקבוצה ומלווה אותה לאורך כל מחזור חיי הטיול — תוך הפרדת Hermes, LangGraph, Pi וספקי המודלים מהליבה המוצרית.</p>
+<div class="meta"><span>סטטוס: המלצה מעודכנת</span><span>בסיס: מסמכי המוצר + main + PRs שנבדקו</span><span>עיקרון: relationship & memory belong to Kinerary</span></div>
+</div></header>
+<main><div class="wrap">
+<nav class="toc"><strong>תוכן</strong><ol>
+<li><a href="#vision">חזון המוצר</a></li><li><a href="#guardrail">מה אסור לאבד</a></li><li><a href="#evidence">מה למדנו מהקוד וה־PRים</a></li><li><a href="#target">ארכיטקטורת יעד</a></li><li><a href="#memory">Context & Memory Fabric</a></li><li><a href="#flows">זרימות מרכזיות</a></li><li><a href="#runtime">תפקידי Hermes / LangGraph / Pi</a></li><li><a href="#models">מודלים ו־OpenRouter</a></li><li><a href="#site">האתר החי</a></li><li><a href="#value">ערך למוצר</a></li><li><a href="#refactor">Refactoring</a></li><li><a href="#timing">תזמון</a></li><li><a href="#risks">סיכונים</a></li><li><a href="#roadmap">Roadmap</a></li><li><a href="#decision">המלצה</a></li>
+</ol></nav>
+
+<section id="vision"><h2>1. חזון המוצר — נקודת המוצא</h2>
+<div class="callout good"><div class="decision">Kinerary אינו workflow automation לטיולים ואינו chatbot לתיירות. הוא Companion מתמשך: חבר לטיול שמכיר את האנשים, מבין את הקבוצה, חי את הטיול, לומד מהחוויות ומעצים אותן לאורך זמן.</div></div>
+<p>האתר וה־AI הם שני surfaces של אותה intelligence. לפני הטיול Kinerary לומד ומכין; בזמן הטיול הוא מבין “מה קורה עכשיו”, מכוון, מזהיר, מציע, מתאים את התוכנית ומשתתף בחוויה בלי להשתלט עליה; לאחר הטיול הוא משמר זיכרונות ולמידה שמעשירים את הטיול הבא.</p>
+<div class="figure"><pre>
+BEFORE TRIP          PREPARATION             LIVE TRIP              AFTER TRIP          NEXT TRIP
+    |                     |                      |                       |                   |
+ learn people  --->  build shared context ---> observe + assist ---> learn experience ---> know them better
+    |                     |                      |                       |                   |
+ preferences          constraints            location / energy      memories             better defaults
+ relationships        bookings               live changes           learned prefs        better suggestions
+ expectations         itinerary              proactive help         shared history       stronger relationship
+</pre></div>
+<p>ה־moat המצטבר הוא לא prompt ולא harness. הוא ההיכרות המתמשכת עם המטיילים והקבוצה, ההיסטוריה המשותפת, והיכולת לתרגם אותה להחלטות רלוונטיות בזמן אמת.</p></section>
+
+<section id="guardrail"><h2>2. מה אסור להפסיד בדרך</h2>
+<div class="grid">
+<div class="card"><span class="tag">Relationship</span><h3>רציפות בין טיולים</h3><p>המערכת צריכה לדעת לא רק “מהו הטיול”, אלא “איך האנשים האלה אוהבים לטייל”.</p></div>
+<div class="card"><span class="tag">Social</span><h3>הבנת הקבוצה</h3><p>העדפות אישיות, העדפות משותפות, התנגשויות, קצב, ילדים/מבוגרים ודינמיקה קבוצתית.</p></div>
+<div class="card"><span class="tag">Live</span><h3>מודעות למצב הנוכחי</h3><p>זמן, מיקום, מזג אוויר, עייפות, מה כבר קרה, anchors קרובים ושינויים חיים.</p></div>
+<div class="card"><span class="tag">Learning</span><h3>Experience feedback loop</h3><p>לא רק מה אמרו שאוהבים — גם מה בחרו, דחו, האריכו, צילמו וביקשו שוב.</p></div>
+<div class="card"><span class="tag">Proactive</span><h3>יוזמה מדודה</h3><p>לדעת מתי להציע “צאו עכשיו” או “יש חלופה טובה יותר”, וגם מתי לא להפריע.</p></div>
+<div class="card"><span class="tag">Trust</span><h3>פרטיות והקשר</h3><p>להשתמש במידע רגיש כדי לעזור בלי לחשוף אותו לאנשים הלא נכונים.</p></div>
+</div></section>
+
+<section id="evidence"><h2>3. התאמה למסמכי הפרויקט ול־PRים</h2>
+<p>מסמכי FamilyTrip מגדירים את הסוכן כ־contextual family-trip companion, לא concierge גנרי: הוא אמור להכיר itinerary, participants, preferences, reservations, current location והקשר שיחת הקבוצה, ולדבר כמו אדם שכבר נמצא בתוך הטיול. המסמכים גם קובעים שההפרדה בין family group לבין organizer-private context היא גבול מוצרי ואבטחתי.</p>
+<table><tr><th>Evidence</th><th>משמעות</th></tr>
+<tr><td>FamilyTrip handoff: companion חם בקבוצה, operator/planner בפרטי.</td><td>Persona, privacy ו־capabilities תלויי context; לא memory אחד גלובלי.</td></tr>
+<tr><td>Planning rules: current time/location, hard anchors, human buffers, active plan, live corrections.</td><td>ה־companion צריך Situation Model חי, לא רק conversation history.</td></tr>
+<tr><td>PR של Sprint 5 חשף session/context leakage, tool fallback ו־chat identity ambiguity.</td><td>זיכרון וזהות אינם יכולים להישאר סמנטיקה פנימית של harness.</td></tr>
+<tr><td>Interviewer lifecycle design נע לכיוון ephemeral execution + deterministic orchestration.</td><td>LangGraph מתאים ל־workflow lifecycle, אך אינו תחליף ל־longitudinal companion.</td></tr>
+<tr><td>Modern trip SPA מתקדם כ־product surface עצמאי.</td><td>האתר יכול להפוך ל־living surface של אותה intelligence, לא רק תצוגת itinerary.</td></tr></table>
+</section>
+
+<section id="target"><h2>4. ארכיטקטורת היעד</h2>
+<div class="figure"><pre>
+                              K I N E R A R Y
++--------------------------------------------------------------------------------+
+| PRODUCT AUTHORITY                                                              |
+| identity | trips | membership | active plan | bookings | documents | audit     |
++--------------------------------------+-----------------------------------------+
+                                       |
++--------------------------------------v-----------------------------------------+
+| CONTEXT & MEMORY FABRIC                                                       |
+| traveler memory | group memory | trip memory | experience | situation | trust |
++--------------------------------------+-----------------------------------------+
+                                       |
++--------------------------------------v-----------------------------------------+
+| COMPANION INTELLIGENCE                                                         |
+| understand people | reason about now | decide relevance | personalize | learn  |
++--------------------------+-----------------------------+-------------------------+
+                           |                             |
+                  reactive interaction            proactive reasoning
+                           |                             |
+                 +---------v-----------------------------v---------+
+                 |          AGENT / WORKFLOW EXECUTION             |
+                 | Hermes adapter | Pi adapter | LangGraph         |
+                 +-------------------------+------------------------+
+                                           |
+                                  Capability Gateway
+                                           |
+                    +----------------------+----------------------+
+                    |                      |                      |
+                 Kinerary APIs         external tools         Model Gateway
+                                                               |
+                                                     OpenAI / Anthropic /
+                                                     OpenRouter / future
+</pre></div>
+<div class="callout"><b>היפוך חשוב:</b> ה־runtime אינו “המוח של Kinerary”. הוא מנוע execution. ההיכרות, הזיכרון, ה־trust model וה־trip intelligence הם נכסי Kinerary.</div></section>
+
+<section id="memory"><h2>5. Context & Memory Fabric — הנכס המרכזי</h2>
+<p>אין לאחסן “memory” כערימה אחת של embeddings או transcript. סוגי ידע שונים דורשים authority, retention, confidence ו־visibility שונים.</p>
+<table><tr><th>סוג</th><th>דוגמה</th><th>אמינות / lifecycle</th></tr>
+<tr><td>Canonical facts</td><td>תאריך לידה/גיל רלוונטי, מגבלת ניידות מאושרת, dietary restriction</td><td>מפורש; שינוי מבוקר</td></tr>
+<tr><td>Explicit preferences</td><td>“אנחנו אוהבים בקרים רגועים”</td><td>גבוהה; נשמרת בין טיולים לפי scope</td></tr>
+<tr><td>Learned preferences</td><td>נראה שהקבוצה מעדיפה שווקים על מוזיאונים</td><td>confidence + evidence + decay/revalidation</td></tr>
+<tr><td>Experience memory</td><td>המשפחה נהנתה במיוחד מפעילות מסוימת</td><td>נלמד מהתנהגות/feedback; ניתן לתיקון</td></tr>
+<tr><td>Conversation memory</td><td>מה דובר לאחרונה</td><td>קצר/בינוני; summary/compaction</td></tr>
+<tr><td>Situation state</td><td>כרגע במלון; עייפים; ארוחה בעוד 90 דקות</td><td>ephemeral; TTL/freshness</td></tr>
+</table>
+<h3>Memory scopes</h3>
+<div class="figure"><pre>
+PERSONAL PRIVATE        ORGANIZER PRIVATE        SHARED TRIP          INFERRED
+user <-> Kinerary       organizer operations     group-visible        AI-learned
+       |                        |                      |                    |
+       +------------------------+---------- policy / trust ---------------+
+                                                |
+                                         Companion Context
+</pre></div>
+<p>מידע פרטי יכול להשפיע על המלצה בלי להפוך להסבר פומבי. למשל מגבלת הליכה פרטית יכולה לגרום לבחירת מסלול רגוע יותר בלי שה־companion יחשוף בקבוצה מי ביקש זאת.</p></section>
+
+<section id="flows"><h2>6. זרימות מרכזיות</h2>
+<h3>6.1 לולאת הלמידה המוצרית</h3>
+<div class="figure"><pre>
+UNDERSTAND PEOPLE
+       |
+       v
+RECOMMEND / PLAN
+       |
+       v
+REAL EXPERIENCE
+       |
+       v
+OBSERVE SIGNALS
+explicit feedback | choices | skips | duration | photos | conversation
+       |
+       v
+UPDATE EVIDENCE / CONFIDENCE
+       |
+       +------------------------------> UNDERSTAND BETTER
+</pre></div>
+<h3>6.2 Companion בזמן אמת</h3>
+<div class="figure"><pre>
+world events + current time/location + active plan + bookings
+                         +
+traveler preferences + group dynamics + recent experience
+                         |
+                         v
+                 Situation Model
+                         |
+                         v
+                Relevance Decision
+                   /           \
+               stay quiet      intervene
+                                  |
+                     helpful, concise suggestion
+</pre></div>
+<h3>6.3 Interview / onboarding</h3>
+<div class="figure"><pre>
+Organizer -> verified routing -> LangGraph workflow
+                               |
+                  deterministic missing-field logic
+                               |
+                       LLM conversation
+                               |
+                      interrupt / resume
+                               |
+                    explicit CONFIRM
+                               |
+                canonical Kinerary intake
+                               |
+                    provisioning job
+</pre></div>
+<h3>6.4 Tool / document access</h3>
+<div class="figure"><pre>
+Companion / Workflow
+        |
+        v
+Capability request + verified AgentContext
+        |
+        v
+Kinerary Capability Gateway
+        |
+ actor / trip / role / ownership / idempotency
+        |
+        v
+Booking / Document / Active Plan service
+</pre></div></section>
+
+<section id="runtime"><h2>7. התפקיד הנכון של Hermes, LangGraph ו־Pi</h2>
+<table><tr><th>טכנולוגיה</th><th>התפקיד המתאים</th><th>לא להפוך אותה ל־</th></tr>
+<tr><td>Hermes</td><td>always-on conversational agent runtime, channels, tools, existing companion execution.</td><td>source of truth לזיכרון, membership או trip authority.</td></tr>
+<tr><td>LangGraph</td><td>durable multi-step workflows, interviewer, approvals, pause/resume, recovery, long-running actions.</td><td>ה־relationship model או כל שיחת companion.</td></tr>
+<tr><td>Pi</td><td>lightweight replaceable agent loop/runtime כאשר נדרשת שליטה ופשטות.</td><td>סיבה לבנות מחדש persistence/orchestration שכבר קיימים.</td></tr>
+</table>
+<p>אין צורך לבחור מנצח יחיד. אותו מוצר יכול להשתמש ב־Hermes ל־companion chat, ב־LangGraph ל־booking/onboarding workflow וב־Pi לניסויים או workloads קלים — כל עוד כולם צורכים אותו Context/Memory/Capability contract.</p></section>
+
+<section id="models"><h2>8. Model Gateway — OpenAI, Anthropic, OpenRouter</h2>
+<p>בחירת מודל צריכה להיות לפי capability של משימה, לא לפי harness. מודל ללא native tool calling עדיין יכול לשמש extraction, summarization, classification, preference inference או structured decision; node deterministic מבצע את הפעולה.</p>
+<div class="figure"><pre>
+task
+ |
+ +-- needs tools? ------------> tool-capable model
+ +-- structured extraction? --> structured-output model
+ +-- deep judge/reasoning? ---> strong reasoning model
+ +-- cheap summarization? ----> low-cost model
+ +-- conversation? -----------> tone/latency optimized model
+</pre></div>
+<p>Fallback חייב להיות capability-aware ו־fail-closed: אין downgrade שקט ממודל tool-capable למודל שאינו מסוגל לבצע את החוזה.</p></section>
+
+<section id="site"><h2>9. האתר החי כחלק מה־Companion</h2>
+<div class="callout good"><b>האתר אינו static itinerary שה־AI יכול לערוך.</b> הוא living trip surface שמציג את אותו state וה־intelligence שה־companion משתמש בהם.</div>
+<div class="figure"><pre>
+                          Kinerary Intelligence
+                                  |
+              +-------------------+-------------------+
+              |                   |                   |
+              v                   v                   v
+             Chat              Living Site        Notifications
+        ask / discuss       now / today / next     proactive nudges
+        private/group       live plan changes      material changes
+        shared moments      bookings / photos      reminders
+                            recommendations         experience prompts
+</pre></div>
+<p>ה־site יכול בעתיד להציג “עכשיו”, “הבא”, שינויים מהתוכנית המקורית, המלצות מותאמות, זיכרונות ותמונות, ולתת ל־companion feedback signals — תוך שמירה על מקור אמת משותף.</p></section>
+
+<section id="value"><h2>10. הערך למוצר, לארכיטקטורה וליציבות</h2>
+<div class="grid">
+<div class="card"><h3>Product moat</h3><p>היכרות מצטברת עם אנשים וקבוצות משתפרת מטיול לטיול ואינה תלויה בספק AI.</p></div>
+<div class="card"><h3>Better live experience</h3><p>המלצות נובעות מהמצב האמיתי ומהאנשים הספציפיים, לא מרשימות תיירות גנריות.</p></div>
+<div class="card"><h3>Trust</h3><p>private/shared/inferred scopes מאפשרים personalization בלי disclosure לא רצוי.</p></div>
+<div class="card"><h3>Runtime portability</h3><p>Hermes Cloud, self-hosted Hermes, Pi או LangGraph deployment הם החלטות תפעוליות.</p></div>
+<div class="card"><h3>Resilience</h3><p>agent crash אינו מוחק relationship memory או business state.</p></div>
+<div class="card"><h3>Cost control</h3><p>model routing לפי node/capability מאפשר להשתמש במודל חזק רק במקום שמוסיף ערך.</p></div>
+</div></section>
+
+<section id="refactor"><h2>11. משמעות ה־refactoring</h2>
+<p>השלב הראשון אינו <code>Hermes → LangGraph</code>. הוא extraction של נכסי המוצר מה־harness.</p>
+<div class="figure"><pre>
+             EXTRACT FROM HARNESS
+                    |
+      +-------------+-------------+
+      |             |             |
+   identity       memory       capabilities
+      |             |             |
+      +-------------+-------------+
+                    |
+             OWNED BY KINERARY
+                    |
+         +----------+----------+
+         |          |          |
+       Hermes    LangGraph     Pi
+</pre></div>
+<p>מומלץ להגדיר ארבעה contracts:</p>
+<table><tr><th>Contract</th><th>אחריות</th></tr>
+<tr><td><code>AgentContext</code></td><td>user/trip/channel/role/capabilities; נוצר ומאומת בשרת.</td></tr>
+<tr><td><code>MemoryContext</code></td><td>facts, preferences, learned evidence, group context, visibility, freshness.</td></tr>
+<tr><td><code>CapabilityContext</code></td><td>אילו reads/writes/tools מותרים באותו execution.</td></tr>
+<tr><td><code>ExecutionContext</code></td><td>execution/thread identity, lifecycle, tracing, resume/cancel/idempotency.</td></tr></table>
+<p>מעליהם ניתן להגדיר <code>AgentRuntime</code> כ־adapter. המטרה בשלב הראשון: <b>zero product behavior change</b>.</p></section>
+
+<section id="timing"><h2>12. מתי נכון לבצע</h2>
+<div class="callout risk"><b>לא לבצע rewrite בזמן שה־onboarding E2E עדיין מתייצב.</b> צריך baseline עובד כדי לדעת אם migration שיפר או שבר.</div>
+<p><b>כן לבצע עכשיו את ה־seams:</b> כאשר מוסיפים קוד חדש, לא להוסיף עוד Hermes-specific identity/memory semantics. לקבע execution identity, capability boundary ו־memory ownership לפני שהם מתפזרים.</p>
+<p><b>LangGraph pilot:</b> אחרי ש־Sprint 5 contracts יציבים ונעשה live-run נוסף, ובמקביל יש contract אמין מ־confirmed intake ל־provisioning job. אין צורך לחכות למעבר k3s.</p></section>
+
+<section id="risks"><h2>13. סיכונים</h2>
+<table><tr><th>סיכון</th><th>Mitigation</th></tr>
+<tr><td>הפיכת המוצר ל־workflow engine</td><td>Companion intelligence ו־memory הם שכבה נפרדת; graph רק במקום שבו lifecycle מצדיק אותו.</td></tr>
+<tr><td>Memory fragmentation</td><td>Kinerary-owned schema/API; harness memory אינו canonical.</td></tr>
+<tr><td>False learning</td><td>evidence + confidence + provenance + decay + user correction; לא להסיק preference קבוע מאירוע יחיד.</td></tr>
+<tr><td>Privacy leakage</td><td>memory scopes ו־policy-aware retrieval; private fact יכול להשפיע בלי להיחשף.</td></tr>
+<tr><td>Context overload / cost</td><td>retrieve only relevant memory; summaries; freshness; avoid dumping history into every prompt.</td></tr>
+<tr><td>Duplicate side effects</td><td>idempotent mutation APIs ו־operation keys.</td></tr>
+<tr><td>Framework lock-in</td><td>domain state ו־memory contracts אינם LangGraph/Hermes objects.</td></tr>
+<tr><td>Proactive annoyance</td><td>relevance threshold, quiet hours/context, rate limits, explicit preference for intervention level.</td></tr>
+<tr><td>Capability fallback</td><td>model selection fail-closed; never silently route tool task to incapable model.</td></tr></table></section>
+
+<section id="roadmap"><h2>14. Roadmap מדורג</h2>
+<div class="phase"><div class="phase-no">PHASE 0 — NOW</div><div><b>ייצוב onboarding.</b> לסיים/לאמת את Sprint 5 וה־live findings. לשמור baseline עובד.</div></div>
+<div class="phase"><div class="phase-no">PHASE 1</div><div><b>Companion Contracts.</b> AgentContext, MemoryContext, CapabilityContext, ExecutionContext. Hermes נשאר runtime יחיד; zero behavior change.</div></div>
+<div class="phase"><div class="phase-no">PHASE 2</div><div><b>Memory ownership.</b> להגדיר canonical/explicit/learned/experience/situation memory, scopes, provenance ו־retrieval API. להתחיל רק במה שה־MVP באמת צורך.</div></div>
+<div class="phase"><div class="phase-no">PHASE 3</div><div><b>Capability Gateway.</b> trip-scoped reads/writes, documents, active plan, audit ו־idempotency מחוץ ל־harness.</div></div>
+<div class="phase"><div class="phase-no">PHASE 4 — PILOT</div><div><b>LangGraph interviewer.</b> deterministic lifecycle + conversational nodes + interrupt/resume + abandonment/judge. test/shadow לפני cutover.</div></div>
+<div class="phase"><div class="phase-no">PHASE 5</div><div><b>Companion learning loop.</b> להתחיל signals מפורשים ופשוטים: likes/dislikes, skipped item reason, organizer correction, repeated preference. לא לבנות “AI psychology engine”.</div></div>
+<div class="phase"><div class="phase-no">PHASE 6</div><div><b>Proactive intelligence.</b> situation model + relevance policy + bounded notifications. למדוד usefulness מול annoyance.</div></div>
+<div class="phase"><div class="phase-no">PHASE 7</div><div><b>Runtime/model choice by workload.</b> Hermes/Pi/LangGraph ו־OpenAI/Anthropic/OpenRouter לפי reliability, capability, latency ועלות.</div></div>
+<div class="phase"><div class="phase-no">PHASE 8 — FUTURE</div><div><b>Cross-trip relationship.</b> traveler/group memory שממשיך לטיול הבא תחת consent ו־privacy controls. זהו ה־moat ארוך הטווח, לא prerequisite ל־onboarding MVP.</div></div></section>
+
+<section id="decision"><h2>15. המלצה סופית</h2>
+<div class="callout good"><div class="decision">להמשיך את ה־MVP בלי migration disruptive, אבל לשנות כבר עכשיו את כיוון הגבולות: Kinerary צריך להיות הבעלים של relationship, context, memory, trust ו־capabilities. Hermes/LangGraph/Pi מבצעים עבודה עבור ה־Companion — הם אינם ה־Companion.</div></div>
+<p>כך לא מאבדים את החזון בדרך ליציבות. להפך: ההפרדה הופכת את חזון “החבר לטיול” לנכס מוצרי מפורש ועמיד. ככל שה־runtime והמודלים יתחלפו, Kinerary ימשיך להכיר את האנשים, להבין את הטיול וללמוד מהחוויות שלהם.</p></section>
+
+<section><h2>מקורות פרויקט שנלקחו בחשבון</h2><ul>
+<li><code>docs/FamilyTrip-Agent-Handoff.md</code></li>
+<li><code>docs/kinerary-trip-platform-handoff.md</code></li>
+<li><code>docs/k3s-home-deployment-architecture.html</code></li>
+<li><code>docs/k3s-home-deployment-sprint-plan.md</code></li>
+<li><code>docs/onboarding-mvp-sprint-plan.md</code></li>
+<li>PR/Sprint 5 interview/relay work and interviewer lifecycle design reviewed in the prior architecture pass.</li>
+<li>Modern trip SPA PR reviewed in the prior architecture pass.</li>
+</ul><p class="small">המסמך הוא נייר עמדה; הוא אינו משנה קוד או deployment.</p></section>
+</div></main><footer><div class="wrap">Kinerary · Companion & Agent Runtime Architecture · 2026-09-05</div></footer>
+</body></html>

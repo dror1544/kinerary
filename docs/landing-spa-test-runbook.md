@@ -40,11 +40,16 @@ a disposable migrated PostgreSQL database. Never aim it at production.
 
 ## Browser acceptance
 
-Use two Google identities (organizer and operations admin) plus one participant
-invitation. Prove the complete flow: landing CTA, organizer sign-in, draft,
-Telegram interview and confirmation, provisioning request, separate admin
-approval, ready state, iframe launch without a second login, invite redemption,
-and correct participant runtime access.
+Use one Google identity (the organizer) plus one participant invitation — the
+second, operations-admin identity is no longer part of the flow. Prove the
+complete flow: landing CTA, organizer sign-in, draft, Telegram interview and
+confirmation, plan creation, the organizer reviewing and approving that plan
+themselves, ready state, iframe launch without a second login, invite
+redemption, and correct participant runtime access.
+
+The operator receives a Telegram DM when the approval lands. It is
+observability, not a step: do not wait for it, and a run in which it never
+arrives is still a passing run.
 
 Also verify refresh/direct navigation for every SPA route; iframe behavior on
 mobile; SSE reconnect; a large upload and streamed download; a rejected and a

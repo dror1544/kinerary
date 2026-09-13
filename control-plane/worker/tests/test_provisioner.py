@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import unittest
 from typing import Any
@@ -16,10 +17,20 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
-from control_plane_worker.provisioner import DeployAdapter, ProvisionerWorker
+from control_plane_worker.provisioner import (
+    BindingRefused,
+    DeployAdapter,
+    ProvisionerWorker,
+    bind_chat_to_trip,
+    attach_profile_to_orphan_bindings,
+)
 from control_plane_worker.release_source import ReleaseSourceError
 
-DB_URL = os.environ.get("CONTROL_PLANE_TEST_DATABASE_URL")
+from tests.support.test_database import test_database_url
+
+# Refuses a database whose name does not mark it as scratch — these tests
+# write into whatever they are given. See tests/support/test_database.py.
+DB_URL = test_database_url()
 SKIP = not DB_URL
 
 
@@ -175,6 +186,7 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
             cur.execute("DELETE FROM control_plane.jobs WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.plans WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.intake_versions WHERE trip_id = %s", (trip_id,))
+            cur.execute("DELETE FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.releases WHERE id = %s", (fix["release_id"],))
@@ -253,6 +265,16 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["lifecycle_state"], "ready_private")
 
+    def test_happy_path_registers_a_ready_runtime_route(self) -> None:
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT route_ref, state FROM control_plane.runtime_routes WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertRegex(row["route_ref"], r"^route_[A-Za-z0-9]{8,64}$")
+        self.assertEqual(row["state"], "ready")
+
     def test_happy_path_consumes_approval(self) -> None:
         self.worker.run_once()
         row = self.conn.execute(
@@ -318,6 +340,24 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.worker.run_once()
         sidecars = self.fake_deploy.deployed[0]["sidecars"]
         self.assertEqual([], sidecars["trivia_questions.json"])
+        identity = sidecars["control-plane.identity.json"]
+        self.assertEqual(self.fix["trip_id"], identity["tripId"])
+        self.assertIsNone(identity["owner"], "an unresolved organizer must not be guessed")
+
+    def test_owner_identity_is_bound_to_the_resolved_local_organizer(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "travelers": {"kind": "structured", "schema_version": 2,
+                          "data": [{"name": "Alice", "name_en": "Alice", "age": 35}]},
+            "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Alice"},
+        })
+        self.worker.run_once()
+        deployed = self.fake_deploy.deployed[0]
+        identity = deployed["sidecars"]["control-plane.identity.json"]
+        self.assertEqual(self.fix["user_id"], identity["owner"]["userId"])
+        self.assertIn(identity["owner"]["username"], deployed["config"]["agent"]["organizers"])
+        self.assertNotIn("control_plane_user_id", json.dumps(deployed["config"]))
 
     def test_bookings_sidecar_is_derived_from_phases_and_anchors(self) -> None:
         teardown_fixture(self.conn, self.fix)
@@ -540,6 +580,10 @@ class ChatIdRecipientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            # A4: a binding is opened whenever an organizer chat id is known,
+            # companion or not, so these fixtures now leave one behind.
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
 
@@ -628,6 +672,20 @@ COMPANION_INTAKE = {
 }
 
 
+# The same intake, answered the way run 13's organizer actually answered it:
+# a full name, given + family. COMPANION_INTAKE above says "Noa" — a bare first
+# name, the one form that already resolved — so it could not have caught this.
+FULL_NAME_ORGANIZER_INTAKE = {
+    **COMPANION_INTAKE,
+    "travelers": {"kind": "structured", "schema_version": 1, "data": [
+        {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+        {"name": "נעה", "name_en": "Noa", "age": 25, "family": "סולומון", "family_en": "Solomon"},
+    ]},
+    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "ניר סולומון"},
+    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["נעה"]}},
+}
+
+
 class FakeCompanionProfileAdapter:
     def __init__(self) -> None:
         self.installed: list[dict] = []
@@ -665,7 +723,10 @@ class CompanionProfileTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
         self.identity_id = f"idnt_{rnd()}"
-        self.chat_id = "800000" + rnd(3)
+        # DIGITS. A Telegram private chat id is a number, and both the schema
+        # and the writer of trip_person_links refuse anything else — a group id
+        # is not a person. The old fixture was hex, which no chat id ever is.
+        self.chat_id = "8" + str(secrets.randbelow(10**9)).zfill(9)
         with self.conn.transaction():
             self.conn.execute(
                 """INSERT INTO control_plane.user_identities
@@ -677,6 +738,7 @@ class CompanionProfileTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.rollback()
         with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
             self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
         teardown_fixture(self.conn, self.fix)
@@ -702,6 +764,96 @@ class CompanionProfileTests(unittest.TestCase):
         self.assertEqual(row["trip_id"], self.fix["trip_id"])
         self.assertEqual(row["hermes_profile"], handoff["profile"]["name"])
 
+    def test_the_group_introduction_facts_are_kept_on_the_trip(self) -> None:
+        """The GROUP arrival message is composed days later, out of this column.
+
+        Every line of it is a fact — the assistant's name, the site, the shared
+        login and who to use it as — and the dispatcher refuses to invent any of
+        them: with no `assistant_name` stored it falls through to a bare "this
+        group is connected to the trip" and pins nothing.
+
+        So "the column is non-null" is not the property worth asserting. It held
+        valid JSON all along. What it did not hold, until 2026-09-12, was
+        anything the message is made of: the write was handed `notif_payload`
+        (the site-ready line, `private_url` alone) where it meant `intro_facts`.
+        Every trip provisioned since migration 0044 got an uncomposable
+        introduction, and the first group to notice was a live family's.
+        """
+        deploy = FakeDeployAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=deploy, worker_id="test-companion-intro",
+            companion=FakeCompanionProfileAdapter(),
+        )
+        worker.run_once()
+
+        intro = self.conn.execute(
+            "SELECT companion_intro FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()["companion_intro"]
+
+        self.assertEqual(intro["assistant_name"], "Tal")
+        self.assertEqual(
+            intro["private_url"], f"https://{deploy.deployed[0]['slug']}.test.example"
+        )
+        self.assertIn("trip_title", intro)
+        self.assertIn("language", intro)
+        # Who to log in AS — the seed password is shared, so the username is
+        # the only thing telling two travellers apart.
+        self.assertEqual(
+            sorted(p["name"] for p in intro["login_usernames"]),
+            ["Eitan", "Noa"],
+        )
+
+    def test_the_organizer_is_recorded_as_a_person_not_only_as_a_route(self) -> None:
+        """The chat binding says WHERE a message routes. This says WHO sent it.
+
+        Both facts exist in the same transaction — `_resolve_organizers` has
+        already turned the organizer_identity answer into a participant, and the
+        chat about to be bound is that organizer's own interview chat — and
+        until 2026-09-12 only the first was written. A companion could route a
+        message perfectly and still have nothing to call the person who sent it,
+        which is fine in a DM (the only private chat bound is the organizer's)
+        and useless in a family group, where every sender is anonymous.
+        """
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-person-link",
+            companion=FakeCompanionProfileAdapter(),
+        )
+        worker.run_once()
+
+        row = self.conn.execute(
+            "SELECT telegram_user_id, participant_username, display_name, role, verified_via "
+            "FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "the organizer's chat was bound but nobody was recorded as owning it")
+        self.assertEqual(row["telegram_user_id"], self.chat_id)
+        # COMPANION_INTAKE's organizer_identity is "Noa", which _resolve_organizers
+        # matches to the traveller of that name — the same resolution that writes
+        # agent.organizers, now reaching the router as well.
+        self.assertEqual(row["participant_username"], "noa")
+        self.assertEqual(row["display_name"], "Noa")
+        self.assertEqual((row["role"], row["verified_via"]), ("organizer", "interview_chat"))
+
+    def test_a_group_chat_id_is_never_recorded_as_a_person(self) -> None:
+        """A group id is not a person — the one mistake this table must refuse.
+
+        Nothing calls it that way today, which is precisely when a guard is
+        worth having: the next writer is a family member binding themselves,
+        and "whoever spoke in the group" is the shape that would be reached for.
+        """
+        from control_plane_worker.provisioner import link_organizer_person
+
+        self.conn.rollback()
+        self.assertFalse(
+            link_organizer_person(self.conn, self.fix["trip_id"], "-1002000777", "noa", "Noa")
+        )
+        row = self.conn.execute(
+            "SELECT 1 FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNone(row)
+
     def test_no_binding_written_when_the_companion_adapter_declines(self) -> None:
         class DecliningAdapter:
             def install(self, handoff: dict) -> str | None:
@@ -712,21 +864,45 @@ class CompanionProfileTests(unittest.TestCase):
             companion=DecliningAdapter(),
         )
         worker.run_once()
+        # A4 inverted this assertion deliberately. It used to demand NO
+        # binding when the companion declined — the coupling that, on
+        # 2026-09-06, let one failed component take routing down with it. The
+        # binding is now opened with a NULL profile: the chat belongs to this
+        # trip either way, and the companion can be retried without first
+        # reconstructing routing.
         row = self.conn.execute(
-            "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+            "SELECT hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
             (self.fix["trip_id"],),
         ).fetchone()
-        self.assertIsNone(row)
+        self.assertIsNotNone(row, "routing should not wait on the assistant")
+        self.assertIsNone(row["hermes_profile"], "bound, but with no assistant behind it")
+        # And the binding must NOT be mistaken for health.
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (state["reachability"], state["unreachable_reason"]),
+            ("unreachable", "COMPANION_TEMPLATES_ABSENT"),
+        )
 
-    def test_default_null_adapter_skips_companion_profile_without_error(self) -> None:
+    def test_default_null_adapter_binds_the_chat_but_claims_no_health(self) -> None:
         worker = ProvisionerWorker(db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-companion-default")
         result = worker.run_once()
         self.assertTrue(result)
         row = self.conn.execute(
-            "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+            "SELECT hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
             (self.fix["trip_id"],),
         ).fetchone()
-        self.assertIsNone(row)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["hermes_profile"])
+        state = self.conn.execute(
+            "SELECT reachability FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(state["reachability"], "unreachable")
 
     def test_mcp_bridge_is_called_with_the_slug_and_installed_profile_name(self) -> None:
         companion = FakeCompanionProfileAdapter()
@@ -775,6 +951,66 @@ class CompanionProfileTests(unittest.TestCase):
             "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual(job_state["state"], "succeeded")
+
+    def test_a_chat_already_serving_another_trip_is_not_taken(self) -> None:
+        """The provisioner must not retarget a chat that is in force for another
+        trip, and must not fail the provision over it either.
+
+        Before this, the binding write was `ON CONFLICT (chat_id) DO UPDATE`
+        inside a broad `except Exception: logger.warning` — so the group got
+        silently moved to the new trip AND nothing said so. Now the provision
+        still succeeds (a companion install is a best-effort side effect and
+        must not roll back a deployed trip), the existing binding survives
+        untouched, and the new trip is left with no open binding, which is the
+        durable, queryable evidence that it is unroutable.
+        """
+        other = setup_fixture(self.conn)
+        try:
+            with self.conn.transaction():
+                self.conn.execute(
+                    """INSERT INTO control_plane.telegram_chat_bindings
+                         (id, chat_id, trip_id, hermes_profile)
+                       VALUES (%s, %s, %s, %s)""",
+                    (f"tcb_{rnd()}", self.chat_id, other["trip_id"], "companion-incumbent"),
+                )
+
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-binding-refused",
+                companion=FakeCompanionProfileAdapter(),
+            )
+            self.assertTrue(worker.run_once(), "the provision itself still succeeds")
+
+            job_state = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(job_state["state"], "succeeded")
+
+            # The incumbent binding is untouched — not closed, not retargeted.
+            open_rows = self.conn.execute(
+                """SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings
+                   WHERE chat_id = %s AND closed_at IS NULL""",
+                (self.chat_id,),
+            ).fetchall()
+            self.assertEqual(len(open_rows), 1)
+            self.assertEqual(open_rows[0]["trip_id"], other["trip_id"])
+            self.assertEqual(open_rows[0]["hermes_profile"], "companion-incumbent")
+
+            # And the new trip is detectably unroutable rather than silently so.
+            self.assertIsNone(
+                self.conn.execute(
+                    """SELECT 1 FROM control_plane.telegram_chat_bindings
+                       WHERE trip_id = %s AND closed_at IS NULL""",
+                    (self.fix["trip_id"],),
+                ).fetchone()
+            )
+        finally:
+            self.conn.rollback()
+            with self.conn.transaction():
+                self.conn.execute(
+                    "DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s",
+                    (other["trip_id"],),
+                )
+            teardown_fixture(self.conn, other)
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
@@ -841,8 +1077,17 @@ class SlugPromotionTests(unittest.TestCase):
 
             slugs = {self._slug_of(taken["trip_id"]), self._slug_of(second["trip_id"])}
             self.assertEqual(len(slugs), 2, f"slugs collided: {slugs}")
-            # Both derive from the same Japan intake, so one takes the suffix.
-            self.assertTrue(any(s.endswith("-2") for s in slugs), slugs)
+            # Both derive from the same Japan intake, so at least one takes a
+            # numeric suffix. Which number is NOT asserted: this database is
+            # shared with real trips, and the first real provisioning run
+            # (2026-09-06) took `japan-2026-2`, after which this test demanded
+            # a suffix that was no longer available and failed on data rather
+            # than behaviour. The property is "collisions are suffixed", not
+            # "the suffix is 2".
+            self.assertTrue(
+                any(re.fullmatch(r"japan-2026-\d+", s) for s in slugs),
+                f"expected a numeric-suffixed slug among {slugs}",
+            )
         finally:
             teardown_fixture(self.conn, second)
             teardown_fixture(self.conn, taken)
@@ -1089,3 +1334,665 @@ class ShellDeployAdapterSidecarTests(unittest.TestCase):
                 self.assertEqual([{"seed_key": "hotel_tokyo"}], json.load(fh))
             with open(os.path.join(trip_dir, "trivia_questions.json"), encoding="utf-8") as fh:
                 self.assertEqual([], json.load(fh))
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ChatBindingLifecycleTests(unittest.TestCase):
+    """A reassignment must CLOSE the old binding rather than overwrite it, and
+    must never silently retarget a chat that is actively serving another trip.
+
+    Before migration 0029 the provisioner did `ON CONFLICT (chat_id) DO UPDATE
+    SET trip_id = ...`, so a chat bound to trip A became bound to trip B with
+    no trace it had ever meant anything else — the exact behaviour the sprint
+    plan forbids.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix_a = setup_fixture(self.conn)
+        self.fix_b = setup_fixture(self.conn)
+        self.chat_id = "800900" + rnd(3)
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute(
+                "DELETE FROM control_plane.telegram_chat_bindings WHERE chat_id = %s",
+                (self.chat_id,),
+            )
+        teardown_fixture(self.conn, self.fix_a)
+        teardown_fixture(self.conn, self.fix_b)
+
+    def _rows(self) -> list[dict[str, Any]]:
+        return self.conn.execute(
+            """SELECT trip_id, hermes_profile, closed_at, closed_reason
+               FROM control_plane.telegram_chat_bindings
+               WHERE chat_id = %s
+               ORDER BY created_at, closed_at NULLS LAST""",
+            (self.chat_id,),
+        ).fetchall()
+
+    def _open_row(self) -> dict[str, Any] | None:
+        return self.conn.execute(
+            """SELECT trip_id, hermes_profile FROM control_plane.telegram_chat_bindings
+               WHERE chat_id = %s AND closed_at IS NULL""",
+            (self.chat_id,),
+        ).fetchone()
+
+    def test_first_binding_opens(self) -> None:
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        self.assertEqual(outcome, "created")
+        row = self._open_row()
+        self.assertEqual(row["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(row["hermes_profile"], "companion-a")
+
+    def test_reprovisioning_the_same_trip_is_a_no_op(self) -> None:
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        self.assertEqual(outcome, "unchanged")
+        # No history churn from simply re-provisioning an unchanged trip.
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_a_changed_profile_on_the_same_trip_still_leaves_a_trail(self) -> None:
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a-v2")
+        self.assertEqual(outcome, "profile_rebound")
+
+        rows = self._rows()
+        self.assertEqual(len(rows), 2, "the old row is closed, not overwritten")
+        closed = [r for r in rows if r["closed_at"] is not None]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["hermes_profile"], "companion-a")
+        self.assertEqual(closed[0]["closed_reason"], "profile_rebound")
+        self.assertEqual(self._open_row()["hermes_profile"], "companion-a-v2")
+
+    def test_retargeting_to_another_trip_is_refused(self) -> None:
+        # The case the plan calls out: this chat is actively serving trip A.
+        # A provisioning job for trip B has no signed organizer action, so it
+        # must not take the chat.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        with self.assertRaises(BindingRefused) as caught:
+            bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+        self.assertEqual(caught.exception.existing_trip_id, self.fix_a["trip_id"])
+        self.assertEqual(caught.exception.requested_trip_id, self.fix_b["trip_id"])
+
+        # And the existing binding is untouched — the refusal must not be a
+        # partial write that leaves the chat pointing nowhere.
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(self._open_row()["hermes_profile"], "companion-a")
+
+    def test_a_closed_binding_frees_the_chat_for_another_trip(self) -> None:
+        # Reassignment is not forbidden, only silent reassignment. Once the old
+        # binding is deliberately closed, the chat is available again — and the
+        # history of what it used to serve survives.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.conn.transaction():
+            self.conn.execute(
+                """UPDATE control_plane.telegram_chat_bindings
+                   SET closed_at = now(), closed_reason = 'organizer_reassigned'
+                   WHERE chat_id = %s AND closed_at IS NULL""",
+                (self.chat_id,),
+            )
+
+        outcome = bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+        self.assertEqual(outcome, "created")
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+
+        history = [r for r in self._rows() if r["closed_at"] is not None]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(history[0]["closed_reason"], "organizer_reassigned")
+
+    def test_only_one_binding_per_chat_can_be_open(self) -> None:
+        # Migration 0029's partial unique index is the backstop under a race
+        # the FOR UPDATE lock would normally serialise.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            with self.conn.transaction():
+                self.conn.execute(
+                    """INSERT INTO control_plane.telegram_chat_bindings
+                         (id, chat_id, trip_id, hermes_profile)
+                       VALUES (%s, %s, %s, %s)""",
+                    (f"tcb_{rnd()}", self.chat_id, self.fix_b["trip_id"], "companion-b"),
+                )
+
+    def test_closed_at_and_closed_reason_cannot_disagree(self) -> None:
+        # A half-closed row would be read as open by one filter and closed by
+        # another — the constraint keeps "closed" a single fact.
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            with self.conn.transaction():
+                self.conn.execute(
+                    """UPDATE control_plane.telegram_chat_bindings
+                       SET closed_at = now()
+                       WHERE chat_id = %s""",
+                    (self.chat_id,),
+                )
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OperatorNotificationTests(unittest.TestCase):
+    """The operator's own copy of a provisioning outcome.
+
+    Observability, never a gate: these rows are written in the same transaction
+    as the outcome they report, are addressed to the operator rather than the
+    organizer, and are simply absent when no operator chat id is configured.
+    """
+
+    OPERATOR_CHAT = "operator-chat-9"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn)
+
+    def tearDown(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+
+    def _worker(self, *, operator_chat_id, fail=False):
+        return ProvisionerWorker(
+            db_url=DB_URL,
+            deploy=FakeDeployAdapter(fail=fail, error_code="FAKE_DEPLOY_FAILURE"),
+            worker_id="test-provisioner-operator",
+            operator_chat_id=operator_chat_id,
+        )
+
+    def _rows(self, notification_type):
+        self.conn.rollback()
+        return self.conn.execute(
+            "SELECT recipient, payload, state FROM control_plane.notification_outbox "
+            "WHERE trip_id = %s AND notification_type = %s",
+            (self.fix["trip_id"], notification_type),
+        ).fetchall()
+
+    def test_success_writes_an_operator_copy_alongside_the_organizer_one(self) -> None:
+        self._worker(operator_chat_id=self.OPERATOR_CHAT).run_once()
+
+        operator = self._rows("operator_provisioning_complete")
+        self.assertEqual(len(operator), 1)
+        self.assertEqual(operator[0]["recipient"], self.OPERATOR_CHAT)
+        self.assertEqual(operator[0]["state"], "pending")
+        self.assertIn("private_url", operator[0]["payload"])
+        self.assertEqual(operator[0]["payload"]["trip_id"], self.fix["trip_id"])
+
+        # The organizer's row is untouched and still addressed elsewhere.
+        organizer = self._rows("provisioning_complete")
+        self.assertEqual(len(organizer), 1)
+        self.assertNotEqual(organizer[0]["recipient"], self.OPERATOR_CHAT)
+
+    def test_no_operator_chat_id_writes_no_operator_row(self) -> None:
+        self._worker(operator_chat_id=None).run_once()
+        self.assertEqual(self._rows("operator_provisioning_complete"), [])
+        # The organizer still gets theirs — the two are independent.
+        self.assertEqual(len(self._rows("provisioning_complete")), 1)
+
+    def test_empty_operator_chat_id_is_treated_as_unset(self) -> None:
+        # __main__ passes os.environ.get(..., "") — an unset env var must not
+        # produce a row addressed to the empty string.
+        self._worker(operator_chat_id="").run_once()
+        self.assertEqual(self._rows("operator_provisioning_complete"), [])
+
+    def test_exhausted_failure_writes_an_operator_copy_with_the_error_code(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.jobs SET attempt = max_attempts - 1 WHERE id = %s",
+            (self.fix["job_id"],),
+        )
+        self.conn.commit()
+
+        self._worker(operator_chat_id=self.OPERATOR_CHAT, fail=True).run_once()
+
+        operator = self._rows("operator_provisioning_failed")
+        self.assertEqual(len(operator), 1)
+        self.assertEqual(operator[0]["recipient"], self.OPERATOR_CHAT)
+        self.assertEqual(operator[0]["payload"]["safe_error_code"], "FAKE_DEPLOY_FAILURE")
+
+    def test_retriable_failure_writes_no_operator_row(self) -> None:
+        # Still has retries left, so it is not an outcome worth reporting yet.
+        self._worker(operator_chat_id=self.OPERATOR_CHAT, fail=True).run_once()
+        self.assertEqual(self._rows("operator_provisioning_failed"), [])
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OrganizerFullNameReachesCompanionTests(unittest.TestCase):
+    """Proves the A1 fix carries all the way to companion invocation.
+
+    The unit tests in test_transformer.py prove `_resolve_organizers` returns
+    a username. That is necessary and not sufficient: what broke on
+    2026-09-06 was the chain BEHIND it — no organizer, so `_derive_agent`
+    writes no `agent.organizers`, so `build_companion_handoff` returns None,
+    so `install()` is never called and no chat binding is written. This
+    asserts the call actually happens, which is the only thing that makes the
+    trip reachable.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self.identity_id = f"idnt_{rnd()}"
+        self.chat_id = "810000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (self.identity_id, self.fix["user_id"], sha256(self.chat_id), self.chat_id),
+            )
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
+        teardown_fixture(self.conn, self.fix)
+
+    def test_a_full_name_answer_reaches_install_and_binds_the_chat(self) -> None:
+        companion = FakeCompanionProfileAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-fullname",
+            companion=companion,
+        )
+        worker.run_once()
+
+        self.assertEqual(
+            len(companion.installed), 1,
+            "the companion was never invoked — organizer resolution stopped the chain again",
+        )
+        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "ניר")
+
+        row = self.conn.execute(
+            "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "provisioned but unroutable — no open chat binding")
+        self.assertEqual(row["chat_id"], self.chat_id)
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ReachabilityTests(unittest.TestCase):
+    """A2: a trip that cannot be reached must say so, and say why.
+
+    The failure this exists to end: on 2026-09-06 a provisioning run reported
+    success at every level the system records — job 'succeeded', lifecycle
+    'ready_private', site answering 200 — while the organizer messaging the
+    bot got "I don't have a trip for this chat". Nothing disagreed with
+    "ready", because nothing recorded reachability. The whole run emitted one
+    log line.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def _reachability(self, trip_id: str) -> tuple[str, str | None]:
+        row = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (trip_id,),
+        ).fetchone()
+        return row["reachability"], row["unreachable_reason"]
+
+    def _with_chat(self, fix: dict) -> str:
+        chat_id = "820000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (f"idnt_{rnd()}", fix["user_id"], sha256(chat_id), chat_id),
+            )
+        return chat_id
+
+    def _cleanup(self, fix: dict) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (fix["trip_id"],))
+            self.conn.execute(
+                "DELETE FROM control_plane.user_identities WHERE user_id = %s AND provider = 'telegram'",
+                (fix["user_id"],),
+            )
+        teardown_fixture(self.conn, fix)
+
+    def test_a_trip_starts_unknown_rather_than_healthy(self) -> None:
+        # The fail-safe default. A trip nobody has checked must not claim to
+        # be reachable, and 'unknown' is distinguishable from 'unreachable' —
+        # one means nobody asked, the other means we asked and the answer was
+        # no.
+        fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
+        try:
+            self.assertEqual(self._reachability(fix["trip_id"]), ("unknown", None))
+        finally:
+            self._cleanup(fix)
+
+    def test_a_bound_companion_records_reachable_with_no_reason(self) -> None:
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        chat_id = self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-ok",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            self.assertEqual(self._reachability(fix["trip_id"]), ("reachable", None))
+            row = self.conn.execute(
+                "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+                "WHERE trip_id = %s AND closed_at IS NULL", (fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(row["chat_id"], chat_id)
+        finally:
+            self._cleanup(fix)
+
+    def test_an_unresolved_organizer_is_named_as_the_reason(self) -> None:
+        # The 2026-09-06 failure exactly: assistant answers present, so there
+        # IS a companion to build, but organizer_identity resolves to nobody.
+        intake = {
+            **FULL_NAME_ORGANIZER_INTAKE,
+            "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Someone Not On This Trip"},
+        }
+        fix = setup_fixture(self.conn, intake=intake)
+        self._with_chat(fix)
+        try:
+            companion = FakeCompanionProfileAdapter()
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-org",
+                companion=companion,
+            ).run_once()
+            self.assertEqual(companion.installed, [], "no organizer, so nothing to install")
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "ORGANIZER_UNRESOLVED"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_a_failing_companion_install_is_named_as_the_reason(self) -> None:
+        # How B1 (no hermes/node in the worker image) presents.
+        class ExplodingAdapter:
+            def install(self, handoff: dict) -> str | None:
+                raise RuntimeError("render_profile.py exited 127: hermes: not found")
+
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-b1",
+                companion=ExplodingAdapter(),
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "COMPANION_INSTALL_FAILED"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_no_companion_adapter_is_named_rather_than_passed_over(self) -> None:
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self._with_chat(fix)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-null",
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "COMPANION_TEMPLATES_ABSENT"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_a_companion_with_nobody_to_bind_to_is_named(self) -> None:
+        # No telegram identity for the owner: a companion exists and cannot be
+        # reached. A different retry from every other reason here — nothing is
+        # broken, an organizer chat id is simply not known yet.
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-nochat",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "NO_ORGANIZER_CHAT"),
+            )
+        finally:
+            self._cleanup(fix)
+
+    def test_the_database_refuses_an_unreachable_trip_with_no_reason(self) -> None:
+        # The invariant, enforced where it cannot be forgotten: "unreachable"
+        # without a reason is the silent failure this whole change exists to
+        # end, and "reachable, but here is why it is not" is incoherent.
+        fix = setup_fixture(self.conn, intake=COMPANION_INTAKE)
+        try:
+            for reachability, reason in (("unreachable", None), ("reachable", "BINDING_FAILED")):
+                with self.subTest(reachability=reachability, reason=reason):
+                    with self.assertRaises(psycopg.errors.CheckViolation):
+                        with self.conn.transaction():
+                            self.conn.execute(
+                                "UPDATE control_plane.trips SET reachability = %s, unreachable_reason = %s WHERE id = %s",
+                                (reachability, reason, fix["trip_id"]),
+                            )
+        finally:
+            self._cleanup(fix)
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
+    """An organizer with no Telegram identity is still reachable.
+
+    The password signup stopgap creates no telegram `user_identities` row, and
+    the deep-link path deliberately does NOT write the verified chat into
+    `trips.notification_chat_id_hint` (that column is for UNVERIFIED hints).
+    So on 2026-09-06 a trip whose entire interview happened in chat 391627336
+    finished provisioning with "no organizer chat id", an installed companion
+    nobody was bound to, and reachability NO_ORGANIZER_CHAT.
+
+    The chat was never unknown. It was in `intake_sessions.telegram_chat_id`,
+    verified, the whole time.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
+        self.chat_id = "830000" + rnd(3)
+        # An interview conducted in a known, verified chat — and an owner with
+        # NO telegram identity, which is what the password stopgap produces.
+        # `enrollment_id` is required but nothing here reads it; the session
+        # exists only to carry the chat the interview happened in.
+        self.session_id = f"sess_{rnd()}"
+        self.enrollment_id = f"ienr_{rnd()}"
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.interview_enrollments
+                     (id, trip_id, user_id, token_digest, state, expires_at, consumed_at)
+                   VALUES (%s, %s, %s, %s, 'consumed', now() + interval '1 day', now())""",
+                (self.enrollment_id, self.fix["trip_id"], self.fix["user_id"], sha256(rnd(32))),
+            )
+            self.conn.execute(
+                """INSERT INTO control_plane.intake_sessions
+                     (id, trip_id, user_id, enrollment_id, state, telegram_chat_id)
+                   VALUES (%s, %s, %s, %s, 'confirmed', %s)""",
+                (self.session_id, self.fix["trip_id"], self.fix["user_id"],
+                 self.enrollment_id, self.chat_id),
+            )
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.intake_sessions WHERE id = %s", (self.session_id,))
+            self.conn.execute("DELETE FROM control_plane.interview_enrollments WHERE id = %s", (self.enrollment_id,))
+            self.conn.execute(
+                "DELETE FROM control_plane.user_identities WHERE user_id = %s", (self.fix["user_id"],),
+            )
+        teardown_fixture(self.conn, self.fix)
+
+    def test_the_interview_chat_binds_the_companion(self) -> None:
+        companion = FakeCompanionProfileAdapter()
+        ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-interview-chat",
+            companion=companion,
+        ).run_once()
+
+        row = self.conn.execute(
+            "SELECT chat_id, hermes_profile FROM control_plane.telegram_chat_bindings "
+            "WHERE trip_id = %s AND closed_at IS NULL",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row, "the interview's own chat should have bound the companion")
+        self.assertEqual(row["chat_id"], self.chat_id)
+        self.assertIsNotNone(row["hermes_profile"])
+
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual((state["reachability"], state["unreachable_reason"]), ("reachable", None))
+
+    def test_a_verified_telegram_identity_still_wins(self) -> None:
+        # Provenance order, not convenience: an identity on the account is a
+        # stronger claim about WHO the organizer is than the chat a link was
+        # opened in, so it must not be displaced by this fix.
+        identity_chat = "840000" + rnd(3)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (f"idnt_{rnd()}", self.fix["user_id"], sha256(identity_chat), identity_chat),
+            )
+        try:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-identity-wins",
+                companion=FakeCompanionProfileAdapter(),
+            ).run_once()
+            row = self.conn.execute(
+                "SELECT chat_id FROM control_plane.telegram_chat_bindings "
+                "WHERE trip_id = %s AND closed_at IS NULL",
+                (self.fix["trip_id"],),
+            ).fetchone()
+            self.assertEqual(row["chat_id"], identity_chat)
+        finally:
+            pass  # tearDown removes the identity; see its comment.
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class OrphanBindingAdoptionTests(unittest.TestCase):
+    """A chat bound before the companion existed must not wait forever."""
+
+    def setUp(self) -> None:
+        self.conn = psycopg.connect(DB_URL, autocommit=True)
+        self.trip_id = f"trip_{secrets.token_hex(16)}"
+        self.other_trip_id = f"trip_{secrets.token_hex(16)}"
+        with self.conn.cursor() as cur:
+            for tid in (self.trip_id, self.other_trip_id):
+                cur.execute(
+                    "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES (%s, %s, 'ready_private')",
+                    (tid, tid.replace("_", "-")),
+                )
+
+    def tearDown(self) -> None:
+        with self.conn.cursor() as cur:
+            for tid in (self.trip_id, self.other_trip_id):
+                cur.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (tid,))
+                cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (tid,))
+        self.conn.close()
+
+    def _bind(self, chat_id: str, trip_id: str, profile: str | None) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)"
+                " VALUES (%s, %s, %s, %s)",
+                (f"tcb_{secrets.token_hex(16)}", chat_id, trip_id, profile),
+            )
+
+    def _profile_of(self, chat_id: str) -> str | None:
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT hermes_profile FROM control_plane.telegram_chat_bindings"
+                " WHERE chat_id = %s AND closed_at IS NULL",
+                (chat_id,),
+            )
+            row = cur.fetchone()
+            return row["hermes_profile"] if row else None
+
+    def test_a_group_bound_before_the_companion_gets_it_afterwards(self) -> None:
+        # 2026-09-07, live: the organizer bound their family group with a token
+        # while the companion did not yet exist, so the row stored NULL. The
+        # companion arrived twenty minutes later on a retry and bound only the
+        # organizer's DM. The group answered "I'm still finishing your
+        # assistant" permanently, because nothing was going to finish it there.
+        self._bind("-1004305582269", self.trip_id, None)
+        adopted = attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan")
+        self.assertEqual(adopted, 1)
+        self.assertEqual(self._profile_of("-1004305582269"), "companion-japan")
+
+    def test_a_binding_that_already_has_a_profile_is_left_alone(self) -> None:
+        # Pointing at another profile is a decision, not a gap.
+        self._bind("391627336", self.trip_id, "companion-existing")
+        attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-new")
+        self.assertEqual(self._profile_of("391627336"), "companion-existing")
+
+    def test_another_trip_s_orphan_is_not_adopted(self) -> None:
+        # The one that would be a real leak: handing this trip's companion to a
+        # chat belonging to somebody else's trip.
+        self._bind("-100999", self.other_trip_id, None)
+        adopted = attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan")
+        self.assertEqual(adopted, 0)
+        self.assertIsNone(self._profile_of("-100999"))
+
+    def test_a_closed_binding_is_not_revived(self) -> None:
+        self._bind("-100888", self.trip_id, None)
+        with self.conn.cursor() as cur:
+            # closed_reason travels with closed_at — "closed" is a single fact,
+            # and telegram_chat_bindings_closed_reason_ck enforces it (see
+            # test_closed_at_and_closed_reason_cannot_disagree, which asserts
+            # that a bare closed_at is rejected). Closing the row illegally here
+            # raised CheckViolation before this test could assert anything.
+            cur.execute(
+                "UPDATE control_plane.telegram_chat_bindings "
+                "SET closed_at = now(), closed_reason = 'profile_rebound' WHERE chat_id = %s",
+                ("-100888",),
+            )
+        self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 0)
+
+    def test_every_waiting_chat_is_adopted_at_once(self) -> None:
+        for chat in ("-100111", "-100222", "391627336"):
+            self._bind(chat, self.trip_id, None)
+        self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 3)

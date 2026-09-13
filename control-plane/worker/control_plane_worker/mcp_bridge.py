@@ -7,6 +7,21 @@ ShellDeployAdapter already relies on (provisioner.py's _private_url), so no
 new per-trip state is required — the two adapters just need to agree on
 deploy_root/vmid_map.
 
+GATED OFF BY DEFAULT, and that default is what most deployments actually run.
+This adapter is used only when --enable-mcp-bridge AND --companion-templates-dir
+are both passed; otherwise a NullMcpBridgeAdapter takes its place. The local
+compose worker passes neither, so a trip onboarded there gets a live site and
+no bridge — its companion answers with no access to trip data, which reads as
+a confidently wrong assistant rather than an obviously broken one.
+
+That failure is easy to mistake for a configuration leak. It cost an evening
+on 2026-09-02: japan-2026's bridge was in fact correctly configured and had
+simply died in a power outage, while a stale shared trip-mcp pointed at another
+trip made it look like cross-trip contamination. kinerary-deploy/bring-up.sh
+now reports the two states separately — "no bridge" (this step never ran) vs a
+dead process it can restart — and names this flag as the usual cause of the
+former.
+
 This is a separate, independently-gated step from CompanionProfileAdapter:
 installing the profile bundle (SOUL.md/skills/references) is a local
 filesystem operation, while this step does real SSH-to-Proxmox and
@@ -30,9 +45,43 @@ trip's trip.env instead of minting one.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from typing import Mapping, Protocol
+
+from .companion_profile import forced_command_argv
+
+
+#: Ports below this belong to hand-provisioned trips and the legacy shared
+#: bridge (3001, 3011, 3013). Auto-provisioned trips start above all of them.
+MCP_PORT_BASE = 3000
+
+
+def mcp_port_for_vmid(vmid: str) -> int | None:
+    """The port this trip's bridge listens on — a function of its container,
+    so it is the same on every re-provision and different for every trip.
+
+    Until 2026-09-10 nothing passed `--port` at all, so setup-mcp.sh took its
+    3001 default for EVERY trip. Each new trip's bridge therefore killed the
+    previous trip's and took its port, and the profile config left behind
+    still named it — which is the shape of a companion answering confidently
+    out of another family's data. It never actually landed because the kill
+    that would have done it was itself broken (BusyBox lsof, same script), so
+    this closes a live hole rather than a theoretical one.
+
+    Derived from the vmid because it is already unique per trip, already in
+    topology.yaml, and needs no new registry to drift out of sync. Returns
+    None for anything that would not produce a sane port, so the caller skips
+    the bridge rather than guessing a number that might belong to someone.
+    """
+    if not vmid or not vmid.isdigit():
+        return None
+    port = MCP_PORT_BASE + int(vmid)
+    if not (3100 <= port <= 3999):
+        return None
+    return port
 
 
 class McpBridgeAdapter(Protocol):
@@ -52,6 +101,66 @@ class NullMcpBridgeAdapter:
         return False
 
 
+class SshMcpBridgeAdapter:
+    """Wires a trip's trip-mcp bridge on the host that runs its companion.
+
+    The bridge is `node mcp.js` plus a `hermes mcp add` into the companion's
+    profile, so it can only be set up where node and Hermes are. With companions
+    installed over SSH (SshCompanionProfileAdapter), that is NOT the worker's
+    container: `ShellMcpBridgeAdapter` ran setup-mcp.sh in there, which failed
+    with "env: can't execute 'node'" on every provision and shipped every
+    companion without its trip tools — found by the first automated full cycle,
+    2026-09-11.
+
+    Same key, same forced command as the companion install. The request carries
+    only the slug and the profile name; the host derives the site address,
+    container and port from its own topology.yaml (scripts/companion-install-host.sh).
+    """
+
+    _SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+    _PROFILE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key_path: str,
+        *,
+        port: int = 22,
+        known_hosts: str | None = None,
+        # setup-mcp.sh starts the bridge, registers it and runs `hermes mcp
+        # test` over a live connection: ~6 minutes end to end (see
+        # ShellMcpBridgeAdapter's note on the 180s that killed it every run).
+        timeout: int = 900,
+    ) -> None:
+        self._host, self._user, self._key_path = host, user, key_path
+        self._port, self._known_hosts, self._timeout = port, known_hosts, timeout
+
+    def setup(self, slug: str, profile_name: str) -> bool:
+        # Checked here too so a bad value fails in the worker's own log, not as
+        # an opaque refusal from the other side of an SSH connection.
+        if not self._SLUG.fullmatch(slug or "") or not self._PROFILE.fullmatch(profile_name or ""):
+            raise RuntimeError(f"refusing to request a bridge for {slug!r}/{profile_name!r}")
+        payload = json.dumps({
+            "record_type": "trip_mcp_bridge_request",
+            "schema_version": 1,
+            "slug": slug,
+            "profile": {"name": profile_name},
+        })
+        result = subprocess.run(
+            forced_command_argv(self._host, self._user, self._key_path, self._port, self._known_hosts),
+            input=payload, capture_output=True, text=True, timeout=self._timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"trip-mcp bridge over ssh exited {result.returncode}: {(result.stderr or result.stdout)[-500:]}"
+            )
+        line = (result.stdout or "").strip().splitlines()[-1] if (result.stdout or "").strip() else ""
+        if line != f"WIRED {profile_name}":
+            raise RuntimeError(f"unrecognized bridge result: {line[:200]!r}")
+        return True
+
+
 class ShellMcpBridgeAdapter:
     """Calls kinerary-deploy/setup-mcp.sh via subprocess, mirroring
     ShellDeployAdapter's subprocess pattern in provisioner.py."""
@@ -60,7 +169,14 @@ class ShellMcpBridgeAdapter:
         self,
         deploy_root: str,
         vmid_map: Mapping[str, str],
-        timeout: int = 180,
+        # setup-mcp.sh does not just write config: it starts the bridge,
+        # registers it, patches the transport and then RUNS `hermes mcp test`,
+        # which enumerates every tool over a live connection. Timed end to end
+        # on 2026-09-10 that is ~6 minutes. At 180s it was killed every single
+        # run — `setup-mcp.sh exited -15`, SIGTERM, reported as a bridge
+        # failure when nothing had failed except the clock. Four provisions in
+        # a row lost their MCP wiring to it.
+        timeout: int = 900,
     ) -> None:
         self._deploy_root = deploy_root
         self._vmid_map = vmid_map
@@ -80,9 +196,16 @@ class ShellMcpBridgeAdapter:
         if not vmid:
             return False
 
+        port = mcp_port_for_vmid(vmid)
+        if port is None:
+            return False
+
         setup_mcp_sh = os.path.join(self._deploy_root, "setup-mcp.sh")
         result = subprocess.run(
-            [setup_mcp_sh, profile_name, local_url, "--vmid", vmid, "--trip-dir", trip_dir],
+            [
+                setup_mcp_sh, profile_name, local_url,
+                "--vmid", vmid, "--trip-dir", trip_dir, "--port", str(port),
+            ],
             capture_output=True,
             text=True,
             timeout=self._timeout,

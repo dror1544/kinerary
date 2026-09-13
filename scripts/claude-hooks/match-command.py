@@ -49,7 +49,11 @@ DEPLOY = re.compile(
     r'|' + CMDPOS + r'(?:sudo\s+)?docker[ -]compose\b[^\n;&|]*\bup\b'
     r'|' + CMDPOS + r'(?:sudo\s+)?docker\s+restart\b'
     r'|\bforce-recreate\b'
-    r'|' + CMDPOS + r'(?:sudo\s+)?systemctl\s+restart\s+trip-server\b')
+    r'|' + CMDPOS + r'(?:sudo\s+)?systemctl\s+restart\s+trip-server\b'
+    # Tearing a trip down (container, DNS, proxy host, profile) is at least as
+    # live as deploying one. Only --execute: its dry run is read-only, and a
+    # prompt that fires on read-only commands teaches people to click through.
+    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b')
 
 raw = strip_heredocs(sys.stdin.read())
 

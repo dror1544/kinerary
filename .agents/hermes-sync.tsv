@@ -13,3 +13,10 @@
 # Columns, tab-separated:  <repo path>  <profile>  <path within the profile>
 
 .agents/skills/trip-intake-interviewer/SOUL.md	trip-intake	SOUL.md
+# The interviewer's skill library. Nested under skills/kinerary/ rather than
+# skills/travel/, so NEITHER auto-discovery nor the profile-only-skill warning
+# could see it, and interview-stack-deploy only ships SOUL.md — which is how
+# kinerary-intake-quality and kinerary-interview-api-notes came to exist only
+# in the profile, and how a QUESTIONS.md edit sat undeployed on 2026-09-06
+# while the SOUL.md change that POINTS AT IT went live. One entry, whole tree.
+.agents/skills/trip-intake-interviewer/skills/kinerary	trip-intake	skills/kinerary

@@ -149,6 +149,31 @@ export async function verifyEnrollmentToken(
  * Returns the enrollment row or null if it is no longer valid (expired,
  * consumed, revoked, or not found). The caller is responsible for ROLLBACK.
  */
+/**
+ * Which trip a token authorizes, without consuming it.
+ *
+ * `startFromDeepLink` needs this to tell two situations apart before deciding
+ * whether an existing session on the chat means anything: a fresh, valid link
+ * for the SAME trip as an in-progress interview (genuinely "already in this
+ * interview" — refuse, leave the token unconsumed) versus a fresh, valid link
+ * for a DIFFERENT trip while a stale, unconfirmed session from an earlier,
+ * abandoned attempt still occupies the chat. Read-only and unlocked: it is
+ * advisory, and `consumeEnrollmentInTx` still re-validates everything
+ * atomically when the token is actually used a moment later.
+ */
+export async function peekEnrollmentTripId(db: pg.Pool, rawToken: string): Promise<string | null> {
+  const digest = tokenDigest(rawToken);
+  const row = await db.query<{ trip_id: string; state: string; expires_at: Date }>(
+    `SELECT trip_id, state, expires_at FROM control_plane.interview_enrollments WHERE token_digest = $1`,
+    [digest],
+  );
+  const [enrollment] = row.rows;
+  if (!enrollment) return null;
+  if (enrollment.state !== "issued") return null;
+  if (enrollment.expires_at.getTime() < Date.now()) return null;
+  return enrollment.trip_id;
+}
+
 export async function consumeEnrollmentInTx(
   client: pg.PoolClient,
   rawToken: string,

@@ -10,7 +10,7 @@
     "default_language": "he",
     "timezone": "Europe/Athens",
     "canonical_site_url": "https://trip.example.test/",
-    "site_connection_name": "trip-site",
+    "site_connection_name": "trip-mcp",
     "date_start": "2027-06-10",
     "date_end": "2027-06-18"
   },

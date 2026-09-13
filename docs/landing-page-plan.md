@@ -16,8 +16,10 @@ the runtime UI and data owner; it is not merged into React.
   organizer-auth routes.
 - One account may own multiple trips. The dashboard is organizer-only; a
   participant redeemed from an invitation receives runtime access only.
-- Provisioning requires a separately configured operations administrator. A
-  requester cannot approve their own plan.
+- Provisioning is approved by the trip's own organizer. There is no second
+  operations approval: the operator is NOTIFIED when an approval lands (a
+  Telegram DM carrying trip, organizer, plan id, digest and status), and
+  provisioning never waits on that DM being received or answered.
 - Trip sites open at `/trips/:id/app` in an iframe from one configurable,
   isolated runtime origin. Per-trip provider hostnames are never accepted from
   browser input or returned by public APIs.
@@ -26,8 +28,8 @@ the runtime UI and data owner; it is not merged into React.
 
 Public routes are `/`, `/sign-in`, and `/join`. Authenticated organizer routes
 are `/trips`, `/trips/new`, `/trips/:id`, `/trips/:id/setup`, and the embedded
-`/trips/:id/app`. `/ops/provisioning` additionally requires the independently
-configured provisioning-admin Google subject digest.
+`/trips/:id/app`. There is no operations route; the provisioning-admin
+allowlist it required was removed with the operations-review gate.
 
 The landing route, product routes, and not-found route are lazy bundles. Nginx
 serves Vite's fingerprinted assets immutably, serves `index.html` without a
@@ -45,9 +47,10 @@ control-plane API on the same organizer origin.
    bot exchange binds the verified chat to that trip's interview session and
    does not create a Telegram login identity. Draft fields prefill intake.
 4. Confirmation creates the immutable normalized intake. The organizer then
-   requests an immutable plan in the operations-review queue.
-5. An operations admin reviews release, digest, and bounded resource intent.
-   Approval queues exactly that digest; rejection returns a bounded reason.
+   creates an immutable plan.
+5. The organizer reviews release, digest, and bounded resource intent on their
+   own trip page. Approval queues exactly that digest; rejection supersedes the
+   plan, cancels its job, and returns the trip to `intake_confirmed`.
 6. The worker provisions the existing runtime and publishes an opaque route
    reference. The private URL remains in the job result and is resolvable only
    by the runtime gateway through the internal API.

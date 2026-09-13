@@ -17,6 +17,7 @@
  * `{ ok: false }` — the interviewer proceeds without `days[]`, never blocked.
  */
 import { execFile } from "node:child_process";
+import { modelRunnerFromEnv, type StructuredModelRunner } from "./model-runner.js";
 
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || "";
@@ -218,6 +219,100 @@ export function normaliseExtractedItinerary(
   return { phases: out, warnings };
 }
 
+/**
+ * The same shape `buildExtractPrompt`'s last lines ask for, as a schema an
+ * adapter can enforce — the Codex CLI's `--output-schema`, OpenRouter's
+ * structured outputs.
+ *
+ * It does NOT replace `normaliseExtractedItinerary`. A schema constrains the
+ * shape; it cannot know that a date has to fall inside its phase's range, that
+ * `<` in a label is an XSS sink because the site renders config `days` text as
+ * raw HTML, or that a booking-docket URL must be dropped. Those are the
+ * invariants, they stay in reviewed code, and a provider that enforces this
+ * schema only means the normaliser has less to throw away.
+ *
+ * Kept deliberately loose on `time` (a string or null rather than a pattern):
+ * a model that cannot satisfy a regex tends to omit the field or fail the call
+ * outright, and "HH:MM or null" is something the normaliser checks anyway.
+ *
+ * Written to OpenAI's STRICT structured-output rules, because that is the
+ * validator the Codex adapter's `--output-schema` runs it through and it
+ * rejects anything else outright (observed 2026-09-08: "'required' is required
+ * to be supplied and to be an array including every key in properties"). Two
+ * consequences worth knowing before editing this:
+ *
+ *   - every key in `properties` must appear in `required`;
+ *   - so an OPTIONAL field is expressed as nullable, never as an absent one.
+ *
+ * `label`, `url` and `area` are optional in the TypeScript types above and
+ * nullable here. `normaliseExtractedItinerary` already drops a value it cannot
+ * use, so a null arrives as an omission.
+ */
+const bilingualSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["he", "en"],
+  properties: { he: { type: "string" }, en: { type: "string" } },
+};
+
+const nullableBilingual = { anyOf: [bilingualSchema, { type: "null" }] };
+
+export const EXTRACT_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["phases"],
+  properties: {
+    phases: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "days", "venues"],
+        properties: {
+          name: { type: "string" },
+          days: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["date", "label", "items"],
+              properties: {
+                date: { type: "string" },
+                label: nullableBilingual,
+                items: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["time", "text"],
+                    properties: {
+                      time: { type: ["string", "null"] },
+                      text: bilingualSchema,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          venues: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["name", "url", "area"],
+              properties: {
+                name: bilingualSchema,
+                url: { type: ["string", "null"] },
+                area: { type: ["string", "null"] },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
 export function buildExtractPrompt(args: ExtractItineraryArgs): string {
   const phaseLines = args.phases
     .map((p) => `- ${p.name}: ${p.start || "?"} to ${p.end || "?"}`)
@@ -373,18 +468,106 @@ async function resolveVenueLinks(phases: ExtractedPhase[], destination: string):
   return { deferred: [] };
 }
 
-export async function extractItinerary(args: ExtractItineraryArgs): Promise<ExtractItineraryResult> {
-  if (!HERMES_EXTRACT_PROFILE) return { ok: false, reason: "EXTRACT_NOT_CONFIGURED" };
+/**
+ * `extract`, as one task on the shared runner.
+ *
+ * When a runner is configured for it (MiniMax on OpenRouter by default —
+ * `EXTRACT_RUNNER=openrouter`), extraction goes straight to the model and the
+ * Hermes profile's seven-deep fallback chain goes away with it. Unset, this is
+ * exactly the CLI path that has always run, so nothing about the current
+ * acceptance path moves until the environment says so.
+ */
+/**
+ * Fold an extraction's days and venues back into the `phases` answer.
+ *
+ * The interviewer has always done this by hand — read `extract_itinerary`'s
+ * result, merge it into what it captured, re-submit `phases`. The router on the
+ * interpret path has no interviewer to do it, which is why a document with a
+ * day-by-day produced phases with names and dates and nothing in them.
+ *
+ * Matched on `phaseIndex`, never on name: two "Tokyo" stops are the ordinary
+ * case for a trip that returns to its arrival city, and a name match would give
+ * the second one's days to the first.
+ *
+ * Existing days WIN. A re-run must never quietly replace an itinerary somebody
+ * has already corrected, and the same document extracted twice is the common
+ * way that would happen.
+ */
+export function foldExtractedIntoPhases(
+  phases: readonly unknown[],
+  extracted: readonly ExtractedPhase[],
+): { phases: unknown[]; daysAdded: number; venuesAdded: number } {
+  const out = phases.map((phase) => (phase && typeof phase === "object" ? { ...(phase as Record<string, unknown>) } : phase));
+  let daysAdded = 0;
+  let venuesAdded = 0;
+
+  for (const found of extracted) {
+    const target = out[found.phaseIndex];
+    if (!target || typeof target !== "object") continue;
+    const phase = target as Record<string, unknown>;
+
+    if (found.days.length && !(Array.isArray(phase.days) && phase.days.length)) {
+      phase.days = found.days;
+      daysAdded += found.days.length;
+    }
+    // Venues merge by name rather than replacing: `planned` places named in the
+    // conversation and venues named in the document are both real, and the
+    // document's carry a URL the conversation's do not.
+    if (found.venues.length) {
+      const existing = Array.isArray(phase.venues) ? [...phase.venues] : [];
+      const seen = new Set(existing.map((v) => JSON.stringify((v as { name?: unknown })?.name ?? "").toLowerCase()));
+      for (const venue of found.venues) {
+        const key = JSON.stringify(venue.name).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        existing.push(venue);
+        venuesAdded += 1;
+      }
+      phase.venues = existing;
+    }
+  }
+  return { phases: out, daysAdded, venuesAdded };
+}
+
+export async function extractItinerary(
+  args: ExtractItineraryArgs,
+  runner: StructuredModelRunner | undefined = modelRunnerFromEnv(),
+): Promise<ExtractItineraryResult> {
   if (!args.documentText || !args.documentText.trim()) {
     return { ok: false, reason: "EXTRACTION_FAILED", detail: "no document text" };
   }
-  let stdout: string;
-  try {
-    stdout = await runExtract(buildExtractPrompt(args));
-  } catch (e) {
-    return { ok: false, reason: "EXTRACTION_FAILED", detail: String((e as Error)?.message ?? e).slice(0, 200) };
+
+  const prompt = buildExtractPrompt(args);
+  let parsed: unknown = null;
+
+  if (runner) {
+    // `parse` is identity here rather than a validator: `normaliseExtractedItinerary`
+    // below is the real gate, and it is the one the tests exercise. Splitting
+    // the checking across both would give the invariants two homes.
+    const result = await runner.run<unknown>({
+      task: "extract",
+      prompt,
+      parse: (raw) => (raw && typeof raw === "object" ? raw : null),
+      schema: EXTRACT_OUTPUT_SCHEMA,
+      timeoutMs: EXTRACT_TIMEOUT_MS,
+    });
+    if (result.ok) parsed = result.value;
+    else if (result.reason !== "NOT_CONFIGURED") {
+      return { ok: false, reason: "EXTRACTION_FAILED", detail: `${result.reason}${result.detail ? `: ${result.detail}` : ""}`.slice(0, 200) };
+    }
   }
-  const parsed = firstJsonObject(stdout);
+
+  if (parsed === null) {
+    if (!HERMES_EXTRACT_PROFILE) return { ok: false, reason: "EXTRACT_NOT_CONFIGURED" };
+    let stdout: string;
+    try {
+      stdout = await runExtract(prompt);
+    } catch (e) {
+      return { ok: false, reason: "EXTRACTION_FAILED", detail: String((e as Error)?.message ?? e).slice(0, 200) };
+    }
+    parsed = firstJsonObject(stdout);
+  }
+
   if (!parsed) return { ok: false, reason: "EXTRACTION_FAILED", detail: "no JSON object in model output" };
   const { phases, warnings } = normaliseExtractedItinerary(parsed, args.phases);
   // A venue's official/ticket link comes from the document when it prints one;
