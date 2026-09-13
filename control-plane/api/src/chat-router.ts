@@ -168,6 +168,32 @@ export async function companionIntroFacts(
 }
 
 /**
+ * `companion_intro.login_usernames`, validated the way a group message needs
+ * it — one real {name, username} pair per entry, or null.
+ *
+ * Split out because `companionIntroFacts` is read at four call sites in
+ * dispatch.ts and this parsing was done at none of them: every real group
+ * message (a bot joining directly, or a `/group` token redeemed) fell back to
+ * "log in with your name and the password", the exact confusion migration
+ * 0051's per-username login lines exist to prevent — even though the data was
+ * sitting right there in the same JSON column. Reported live, 2026-09-14.
+ */
+export function companionIntroLoginUsernames(
+  facts: Record<string, unknown> | null | undefined,
+): { name: string; username: string }[] | null {
+  const value = facts?.login_usernames;
+  if (!Array.isArray(value)) return null;
+  const people = value.flatMap((entry) => {
+    const name = (entry as { name?: unknown })?.name;
+    const username = (entry as { username?: unknown })?.username;
+    return typeof name === "string" && typeof username === "string" && name && username
+      ? [{ name, username }]
+      : [];
+  });
+  return people.length > 0 ? people : null;
+}
+
+/**
  * Who this Telegram sender is ON THIS TRIP, when we know.
  *
  * The chat binding says which companion serves a chat; this says whose voice
