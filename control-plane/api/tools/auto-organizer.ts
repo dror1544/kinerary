@@ -23,6 +23,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 import pg from "pg";
 import { getSessionForChat, type IntakeQuestion, type SessionView } from "../src/interview.js";
+import { suggestionTapData } from "./organizer-suggestions.js";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -239,13 +240,21 @@ const BUTTON_PATIENCE = 30; // × ~2s: a rendered question has its buttons long 
  * The 2026-09-11 run treated a button that had simply not been sent yet as a
  * missing answer and stalled the manual scenario at its very first question.
  */
-async function answer(q: IntakeQuestion, s: Scenario): Promise<boolean> {
+async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["suggestions"]): Promise<boolean> {
   const notYet = () => {
     const n = (waitedFor.get(q.id) ?? 0) + 1;
     waitedFor.set(q.id, n);
     if (n > BUTTON_PATIENCE) throw new Stalled(`${q.id} is the next question but its buttons never arrived`);
     return false;
   };
+  // An unsure reading from a document becomes a Yes/No suggestion rather than
+  // an outright accept (2026-09-13) — see organizer-suggestions.ts.
+  const suggested = suggestionTapData(q, suggestions);
+  if (suggested) {
+    if (!(await tap(suggested))) return notYet();
+    asked.add(q.id);
+    return true;
+  }
   if (q.type === "choice") {
     const option = s.choice[q.id] ?? q.options?.[0]?.id;
     if (!option) throw new Stalled(`${q.id} has no options to choose from`);
@@ -327,7 +336,7 @@ async function main(): Promise<number> {
 
     const q = v.nextQuestion ?? v.pendingAsk;
     if (q) {
-      if (!(await answer(q, s))) { await sleep(2000); await drain(); continue; }
+      if (!(await answer(q, s, v.suggestions))) { await sleep(2000); await drain(); continue; }
       await settle(before, `answering ${q.id}`);
       continue;
     }
