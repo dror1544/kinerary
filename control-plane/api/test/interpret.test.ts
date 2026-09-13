@@ -1091,7 +1091,11 @@ describe("structured questions name their fields", () => {
     const prompt = buildExtractIntakePrompt({ documentText: "X", outstanding: ["phases"], language: "he" });
     assert.match(prompt, /use exactly these FIELD NAMES/);
     assert.match(prompt, /never copy them/);
-    assert.ok(prompt.includes('"name": "Tokyo"'), "the field names themselves are in the prompt");
+    // The example itself, whatever its values: they were Tokyo until the
+    // example stopped being the e2e japan fixture (2026-09-13).
+    const example = INTAKE_QUESTIONS.find((q) => q.id === "phases")!.dataExample!;
+    assert.ok(prompt.includes(example), "the field names themselves are in the prompt");
+    assert.ok(prompt.includes('"name":'));
   });
 });
 

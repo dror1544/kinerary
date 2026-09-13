@@ -371,7 +371,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // correction arriving later is a plain re-submit of this question.
     prompt: "Who's coming? List each person's name, age, and family/household group. If the names aren't in Latin script, transliterate them YOURSELF and submit that as each person's English spelling — then show the organizer the spellings you chose so they can correct any you got wrong. Never ask them to write the names out a second time.",
     dataShape: "array",
-    dataExample: "[{\"name\": \"דנה אלול\", \"name_en\": \"Dana Elul\", \"age\": 12, \"family\": \"Elul\"}]",
+    dataExample: "[{\"name\": \"נועה ברק\", \"name_en\": \"Noa Barak\", \"age\": 12, \"family\": \"Barak\"}]",
     required: true,
     checkComplete: (data) =>
       hasNamedTraveler(data)
@@ -407,7 +407,13 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // belongs; `_derive_phases` folds it into that phase's `venues[]`
     // (`_planned_as_venues`, transformer.py) so enrichment geocodes it the
     // same as a venue `extract_itinerary` found, just without a url.
-    dataExample: "[{\"name\": \"Tokyo\", \"name_en\": \"Tokyo\", \"start\": \"2026-09-19\", \"end\": \"2026-09-23\", \"accommodation\": {\"name\": \"OMO3 Asakusa\", \"confirmation\": \"ABC123\"}, \"planned\": [\"Tokyo Skytree\", \"TeamLab Planets\"]}]",
+    //
+    // The VALUES match no trip and no test fixture, on purpose. Until
+    // 2026-09-13 this example was Tokyo 19–23 Sep, OMO3 Asakusa, Skytree and
+    // TeamLab — the e2e japan fixture itself — so that fixture could never
+    // show a document had actually been read. Two stops, one with no
+    // confirmation, because a stay named without a code is the common case.
+    dataExample: "[{\"name\": \"Reykjavik\", \"name_en\": \"Reykjavik\", \"start\": \"2027-03-04\", \"end\": \"2027-03-07\", \"accommodation\": {\"name\": \"Hotel Borg\", \"confirmation\": \"HB-2217\"}, \"planned\": [\"Hallgrimskirkja\"]}, {\"name\": \"Vik\", \"name_en\": \"Vik\", \"start\": \"2027-03-07\", \"end\": \"2027-03-09\", \"accommodation\": {\"name\": \"Hotel Kria\"}}]",
     required: true,
   },
   {
@@ -415,7 +421,11 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
     dataShape: "array",
-    dataExample: "[{\"type\": \"flight|hotel|car\", \"name\": \"LY075 TLV-HND\", \"date\": \"2026-09-19\", \"confirmation\": \"ABC123\"}]",
+    // One real `type`, not "flight|hotel|car": a list of alternatives shown as
+    // a value is a value a model can copy. The transformer reads any type
+    // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
+    // an optional HH:MM `time` puts a booked visit at its hour.
+    dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
   },
   {
@@ -570,7 +580,10 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     type: "structured",
     prompt: "Anything it should keep in mind about these people, or stay away from? One entry per thing, each as {he, en}.",
     dataShape: "array",
-    dataExample: "[\"never mention the surprise party\", \"Noam is shy about photos\"]",
+    // {he, en} objects, as the prompt says and the transformer requires: it
+    // drops any entry that is not both (transformer.py, bot_limits), so the
+    // plain strings this example used to show were answers that vanished.
+    dataExample: "[{\"he\": \"לא להזכיר את מסיבת ההפתעה\", \"en\": \"Never mention the surprise party\"}]",
     required: false,
   },
   // Additive-optional, like phases[].days — no INTAKE_SCHEMA_VERSION bump. A v2
