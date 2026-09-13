@@ -49,7 +49,7 @@ right now and have been for days:
 python -m hermes_cli.main --profile kinerarytest    gateway run --replace
 python -m hermes_cli.main --profile familytrip      gateway run --replace
 python -m hermes_cli.main --profile elulhome        gateway run --replace
-python -m hermes_cli.main --profile shiranusa2026   gateway run --replace
+python -m hermes_cli.main --profile <a-past-trip>   gateway run --replace
 python -m hermes_cli.main --profile trip-intake     gateway run --replace --external-supervisor
 python -m hermes_cli.main                           gateway run --replace --external-supervisor
 ```

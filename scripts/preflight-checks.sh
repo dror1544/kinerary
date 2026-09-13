@@ -17,6 +17,15 @@
 # Exit 0 = clean, 1 = at least one BLOCK. Warnings never affect the exit code.
 set -uo pipefail
 
+# git exports GIT_DIR (and in a worktree GIT_WORK_TREE) to the hooks it runs.
+# With GIT_DIR set, `git -C scripts rev-parse --show-toplevel` answers
+# scripts/ rather than the checkout, so under `git commit` this ran from the
+# wrong directory: every Hermes profile skill looked uncaptured, and the drift
+# check compared nothing and could never block. Dropping them lets git find
+# the repo from the path, as it does by hand. GIT_INDEX_FILE stays: a partial
+# commit stages into a temporary index, and --staged must read that one.
+unset GIT_DIR GIT_WORK_TREE
+
 REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)" || {
   echo "preflight: not inside a git repository" >&2; exit 0; }
 cd "$REPO_ROOT" || exit 0
