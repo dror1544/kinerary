@@ -18,7 +18,10 @@ import {
   renderConfirmPrompt,
   renderDocumentOffer,
   renderQuestion,
+  renderSuggestion,
   resolveChatRoute,
+  suggestionNoCallbackData,
+  suggestionYesCallbackData,
   startFromDeepLink,
 } from "../src/chat-router.js";
 import { testDatabaseUrl } from "./support/test-database.js";
@@ -635,5 +638,35 @@ describe("resolveChatRoute — closed bindings", () => {
         "the binding in force, not the one it replaced",
       );
     });
+  });
+});
+
+describe("a document's unsure answer, asked as a question", () => {
+  test("yes and no round-trip, and every question id fits", () => {
+    for (const question of INTAKE_QUESTIONS) {
+      assert.deepEqual(parseCallbackData(suggestionYesCallbackData(question.id)), { kind: "suggestion_yes", questionId: question.id });
+      assert.deepEqual(parseCallbackData(suggestionNoCallbackData(question.id)), { kind: "suggestion_no", questionId: question.id });
+      assert.ok(callbackDataFits(suggestionYesCallbackData(question.id)));
+    }
+  });
+
+  test("the question, what the document said, and Yes / No", () => {
+    const phases = findQuestion("phases")!;
+    const rendered = renderSuggestion(phases, "Rome (1–4 May)", "he");
+    assert.ok(rendered.text.startsWith(askText(phases, "he")));
+    assert.ok(rendered.text.includes(uiString("suggestionIntro", "he")));
+    assert.ok(rendered.text.endsWith("Rome (1–4 May)"));
+    assert.deepEqual(rendered.replyMarkup?.inline_keyboard.flat().map((b) => b.callback_data), ["y:phases", "x:phases"]);
+  });
+
+  test("an optional question keeps its way out", () => {
+    const optional = INTAKE_QUESTIONS.find((q) => !q.required)!;
+    const data = renderSuggestion(optional, "x", "en").replyMarkup?.inline_keyboard.flat().map((b) => b.callback_data) ?? [];
+    assert.ok(data.includes(`k:${optional.id}`));
+  });
+
+  test("a very long reading is cut, not sent past Telegram's limit", () => {
+    const rendered = renderSuggestion(findQuestion("phases")!, "x".repeat(10_000), "en");
+    assert.ok(rendered.text.length < 4096);
   });
 });

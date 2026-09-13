@@ -17,7 +17,7 @@ import {
   verifySignature,
   verifyUpgradeToken,
 } from "../src/relay/protocol.js";
-import { displayName, mapChatType, normalizeUpdate, type TelegramUpdate } from "../src/relay/normalize.js";
+import { displayName, mapChatType, normalizeUpdate, toWireEvent, type TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Upgrade-token auth: cross-language conformance ───────────────────────────
@@ -245,6 +245,48 @@ describe("mapChatType", () => {
     // Guessing `dm` for something that is not one is the dangerous direction.
     assert.equal(mapChatType("something_new", false), "group");
     assert.equal(mapChatType(undefined, false), "group");
+  });
+});
+
+describe("toWireEvent — a reply thread is not a forum topic", () => {
+  // Telegram sets message_thread_id on a plain reply in a supergroup too — the
+  // id of the message the reply chain started from. Read as a topic, every
+  // reply to a different bot message became its own session, and the companion
+  // answered each one with no memory of the conversation (2026-09-13).
+  test("a reply in a supergroup without topics stays in the group's conversation", () => {
+    const event = toWireEvent(
+      {
+        message_id: 80,
+        chat: { id: -1001234567890, type: "supergroup", title: "Family trip" },
+        from: { id: 77, first_name: "Dana" },
+        text: "build the plan",
+        message_thread_id: 75,
+        reply_to_message: { message_id: 75 },
+      },
+      "-1001234567890",
+      "build the plan",
+      "trip1",
+    );
+    assert.equal(event.source.chat_type, "group");
+    assert.equal(event.source.thread_id, null);
+  });
+
+  test("a message in a real forum topic keeps its topic", () => {
+    const event = toWireEvent(
+      {
+        message_id: 81,
+        chat: { id: -1001234567890, type: "supergroup", title: "Family trip" },
+        from: { id: 77, first_name: "Dana" },
+        text: "hotels?",
+        message_thread_id: 12,
+        is_topic_message: true,
+      },
+      "-1001234567890",
+      "hotels?",
+      "trip1",
+    );
+    assert.equal(event.source.chat_type, "forum");
+    assert.equal(event.source.thread_id, "12");
   });
 });
 

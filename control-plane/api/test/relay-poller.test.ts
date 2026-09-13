@@ -19,9 +19,11 @@ import {
   claimFloor,
   finalizeMultiChoiceForChat,
   getSessionForChat,
+  saveSuggestionsForChat,
   submitAnswerForChat,
   toggleMultiChoiceForChat,
 } from "../src/interview.js";
+import { submitArgsFor } from "../src/interpret.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
@@ -77,7 +79,16 @@ class FakeTelegram implements TelegramClient {
   }
   /** Lets a test act at the exact moment the router edits a message. */
   onEdit: (() => Promise<void>) | null = null;
-  async editMessageText(): Promise<SendResult> {
+  /** Edits in order: what a message was turned into, and the buttons it kept. */
+  readonly edited: { text: string; buttonData: string[] }[] = [];
+  async editMessageText(params?: {
+    text?: string;
+    replyMarkup?: { inline_keyboard: { text: string; callback_data: string }[][] };
+  }): Promise<SendResult> {
+    this.edited.push({
+      text: params?.text ?? "",
+      buttonData: (params?.replyMarkup?.inline_keyboard ?? []).flat().map((b) => b.callback_data),
+    });
     if (this.onEdit) await this.onEdit();
     return { ok: true };
   }
@@ -816,5 +827,85 @@ describe("combining a burst of messages into one turn", () => {
     const combined = combineBurst([ev("older"), ev("newest", ["zzz"])]);
     assert.equal(combined?.source.chat_id, "391627336");
     assert.equal(combined?.message_type, "document");
+  });
+});
+
+describe("a document's unsure reading is asked about, not lost", () => {
+  const text = (value: string) => {
+    const args = submitArgsFor({ kind: "text", text: value });
+    return { optionId: args.optionId, ...(args.otherText !== undefined ? { otherText: args.otherText } : {}) };
+  };
+  const destination = INTAKE_QUESTIONS.find((q) => q.id === "destination")!;
+
+  /** An interview whose document suggested a destination, walked up to that question. */
+  async function toDestination(fix: Fixture, chatId: string): Promise<void> {
+    await beginInterview(fix, chatId);
+    await saveSuggestionsForChat(fix.pool, chatId, { destination: text("Japan") });
+    await turn(fix, tap(chatId, answerCallbackData("trip_type", "family")));
+  }
+
+  test("the question arrives with the reading, and Yes records it", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100401";
+      await toDestination(fix, chatId);
+      const asked = fix.telegram.lastSent;
+      assert.ok(asked?.text.startsWith(askText(destination)), `the question itself leads — got: ${asked?.text}`);
+      assert.ok(asked?.text.includes("Japan"), "and the reading is shown");
+      assert.deepEqual(asked?.buttonData, ["y:destination", "x:destination"]);
+
+      await turn(fix, tap(chatId, "y:destination"));
+      const store = await answersForChat(fix.pool, chatId);
+      assert.ok(JSON.stringify(store?.answers.destination).includes("Japan"), "Yes wrote the answer");
+      const after = await getSessionForChat(fix.pool, chatId);
+      assert.ok(after.ok);
+      assert.equal(after.ok && after.view.suggestions.destination, undefined, "nothing is left to ask about it");
+      assert.notEqual(after.ok && after.view.nextQuestion?.id, "destination", "and the interview moved on");
+      assert.ok(fix.telegram.edited.at(-1)?.text.includes("✅"), "the tapped message says what was recorded");
+    });
+  });
+
+  test("No turns the same message into the plain question, and sends nothing on top of it", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100402";
+      await toDestination(fix, chatId);
+      const sentBefore = fix.telegram.sent.length;
+
+      await turn(fix, tap(chatId, "x:destination"));
+
+      assert.equal(fix.telegram.edited.at(-1)?.text, askText(destination));
+      assert.equal(fix.telegram.sent.length, sentBefore);
+      const after = await getSessionForChat(fix.pool, chatId);
+      assert.equal(after.ok && after.view.nextQuestion?.id, "destination", "still the question to answer");
+      assert.equal(after.ok && after.view.suggestions.destination, undefined);
+      const store = await answersForChat(fix.pool, chatId);
+      assert.equal(store?.answers.destination, undefined, "and nothing was recorded");
+    });
+  });
+
+  test("answering it any other way drops the reading, and a stale Yes records nothing", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100403";
+      await toDestination(fix, chatId);
+      const typed = text("Italy");
+      await submitAnswerForChat(fix.pool, chatId, "destination", typed.optionId, typed.otherText);
+      const after = await getSessionForChat(fix.pool, chatId);
+      assert.equal(after.ok && after.view.suggestions.destination, undefined);
+
+      await turn(fix, tap(chatId, "y:destination"));
+      const store = await answersForChat(fix.pool, chatId);
+      assert.ok(JSON.stringify(store?.answers.destination).includes("Italy"), "the typed answer stands");
+      assert.equal(fix.telegram.answered.length, 2, "the stale tap is still acknowledged");
+    });
+  });
+
+  test("a reading that no longer validates is not offered — the question is asked plainly", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100404";
+      await beginInterview(fix, chatId);
+      await saveSuggestionsForChat(fix.pool, chatId, { trip_type: { optionId: "not_an_option" } });
+      await turn(fix, tap(chatId, "c:nodoc"));
+      const asked = fix.telegram.lastSent;
+      assert.ok(asked?.buttonData.length && asked.buttonData.every((d) => d.startsWith("a:trip_type:")), `got: ${asked?.buttonData}`);
+    });
   });
 });

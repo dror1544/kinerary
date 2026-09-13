@@ -268,11 +268,13 @@ interview link when a marker is missing.
 ### The control plane on the Proxmox VM
 
 VM 110 `kinerary-cp` runs the whole stack under Compose, Hermes included —
-runbook: `docs/control-plane-vm-deployment.md`. While the Mac stack is live it
-runs on `@Tripinterviewer_bot`, never `@Kinerary_bot`, with provisioning off and
-`PROVISIONER_VMID_MAP={}`. On the VM restart the relay with
-`control-plane/deployment/vm-relay-restart.sh`, not `scripts/relay-restart.sh`
-(that one restarts the Mac's), and point `scripts/e2e-full-cycle.py` at it with
+runbook: `docs/control-plane-vm-deployment.md`. Since 2026-09-13 the VM's relay
+owns `@Kinerary_bot` and the Mac's relay runs on `@Tripinterviewer_bot` — swapped,
+never shared, because Telegram gives each update to one `getUpdates` loop. The VM
+keeps provisioning off outside a test run and `PROVISIONER_VMID_MAP={}`. On the
+VM restart the relay with `control-plane/deployment/vm-relay-restart.sh`, not
+`scripts/relay-restart.sh` (that one restarts the Mac's), and point
+`scripts/e2e-full-cycle.py` at it with
 `KINERARY_COMPOSE_PROJECT` / `KINERARY_RELAY_CONTAINER` / `KINERARY_RELAY_RESTART`
 — it refuses `--auto` on a non-Mac stack without them.
 

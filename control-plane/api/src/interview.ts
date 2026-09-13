@@ -1205,6 +1205,8 @@ export interface SessionView {
    * their last tap selected or deselected.
    */
   selections: Record<string, string[]>;
+  /** Document answers waiting on "is this right?", by question id. */
+  suggestions: Record<string, SuggestedAnswer>;
 }
 
 function currentSelections(answers: AnswerStore): Record<string, string[]> {
@@ -1333,6 +1335,48 @@ export interface InterviewUiState {
   openingDone?: boolean;
   /** A phase entered whose entry action the router has not performed yet. */
   pendingEntry?: InterviewPhase;
+  /**
+   * Answers a document gave that the gate would have accepted but for the
+   * model's confidence, keyed by question — see `ProposalDecisions.suggested`.
+   *
+   * Nothing here is an answer. When the router reaches the question it asks it
+   * WITH this, as "is this right?", and only a tap on Yes writes it, through the
+   * same write path as any other answer. Answering or skipping the question any
+   * other way drops it.
+   */
+  suggestions?: Record<string, SuggestedAnswer>;
+}
+
+/** A suggested answer, in the shape `submitAnswerForChat` takes. */
+export interface SuggestedAnswer {
+  optionId: string | null;
+  otherText?: string;
+  structuredData?: unknown;
+  optionIds?: string[];
+}
+
+function parseSuggestions(raw: unknown): Record<string, SuggestedAnswer> | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const out: Record<string, SuggestedAnswer> = {};
+  for (const [questionId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(questionId) || typeof value !== "object" || value === null) continue;
+    const v = value as Record<string, unknown>;
+    if (v.optionId !== null && typeof v.optionId !== "string") continue;
+    out[questionId] = {
+      optionId: v.optionId as string | null,
+      ...(typeof v.otherText === "string" ? { otherText: v.otherText } : {}),
+      ...(v.structuredData !== undefined ? { structuredData: v.structuredData } : {}),
+      ...(Array.isArray(v.optionIds) ? { optionIds: v.optionIds.filter((id): id is string => typeof id === "string") } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function withoutSuggestion(ui: InterviewUiState, questionId: string): InterviewUiState {
+  if (!ui.suggestions?.[questionId]) return ui;
+  const { [questionId]: _dropped, ...rest } = ui.suggestions;
+  const { suggestions: _all, ...others } = ui;
+  return Object.keys(rest).length > 0 ? { ...others, suggestions: rest } : others;
 }
 
 function parseUiState(raw: unknown): InterviewUiState {
@@ -1361,6 +1405,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(record.opening_done === true ? { openingDone: true } : {}),
     ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
     ...(typeof record.multi_pending === "string" ? { multiPending: record.multi_pending } : {}),
+    ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
   };
 }
@@ -1378,6 +1423,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.openingDone ? { opening_done: true } : {}),
     ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
     ...(ui.multiPending ? { multi_pending: ui.multiPending } : {}),
+    ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
   });
 }
@@ -1810,6 +1856,7 @@ export async function startSession(
       pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
+      suggestions: {},
     };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
@@ -2390,6 +2437,7 @@ function buildSessionView(
       pendingEntry: null,
       pendingSay: null,
       pendingAskText: null,
+      suggestions: {},
     };
   }
   // The phase is the authority; `state` is its projection. Deriving it here the
@@ -2418,6 +2466,7 @@ function buildSessionView(
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
+    suggestions: ui.suggestions ?? {},
   };
 }
 
@@ -3153,11 +3202,45 @@ export async function skipQuestionForChat(
   if (!question || question.required) return { ok: false, reason: "NOT_FOUND" };
   return updateUiStateForChat(db, chatId, (ui) => {
     const { multiPending, ...rest } = ui;
-    return {
+    return withoutSuggestion({
       ...(multiPending === questionId ? rest : ui),
       skipped: [...new Set([...(ui.skipped ?? []), questionId])],
-    };
+    }, questionId);
   });
+}
+
+/** Keeps a document's unsure answers for the router to ask about. Merges. */
+export async function saveSuggestionsForChat(
+  db: pg.Pool,
+  chatId: string,
+  suggestions: Record<string, SuggestedAnswer>,
+): Promise<GetSessionResult> {
+  return updateUiStateForChat(db, chatId, (ui) => ({ ...ui, suggestions: { ...(ui.suggestions ?? {}), ...suggestions } }));
+}
+
+/** "No": the question is asked plainly from here on. */
+export async function dismissSuggestionForChat(db: pg.Pool, chatId: string, questionId: string): Promise<GetSessionResult> {
+  return updateUiStateForChat(db, chatId, (ui) => withoutSuggestion(ui, questionId));
+}
+
+/**
+ * A suggestion as the answer it would record, or null if it no longer
+ * validates — a question whose options changed since it was stored is asked
+ * plainly rather than offered something it would refuse.
+ */
+export function suggestionAnswer(questionId: string, suggestion: SuggestedAnswer): IntakeAnswer | null {
+  const validated = validateAnswer(
+    questionId, suggestion.optionId, suggestion.otherText, INTAKE_QUESTIONS,
+    suggestion.structuredData, suggestion.optionIds,
+  );
+  return validated.ok ? validated.answer : null;
+}
+
+/** How a suggestion reads to the organizer: the recap's own rendering of it. */
+export function suggestionLabel(questionId: string, suggestion: SuggestedAnswer, language: Language = DEFAULT_LANGUAGE): string | null {
+  const answer = suggestionAnswer(questionId, suggestion);
+  if (!answer) return null;
+  return buildRecap({ [questionId]: answer }, INTAKE_QUESTIONS, language)[0]?.answerLabel ?? null;
 }
 
 /**
@@ -3324,11 +3407,13 @@ async function submitAnswerVia(
     const stored = parseUiState(session.ui_state);
     // Ticking keeps the question current; anything else is a finished answer,
     // and a finished answer on the question being ticked ends the ticking.
-    const ui: InterviewUiState = ticking
+    // Any answer to a question, a tick included, is the organizer answering it
+    // themselves — a suggestion for it has nothing left to ask.
+    const ui: InterviewUiState = withoutSuggestion(ticking
       ? { ...stored, multiPending: questionId }
       : stored.multiPending === undefined
         ? stored
-        : (({ multiPending: _drop, ...rest }) => rest)(stored);
+        : (({ multiPending: _drop, ...rest }) => rest)(stored), questionId);
     const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
 
     await client.query(

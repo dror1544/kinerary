@@ -5,7 +5,7 @@
  * Deterministic checks live in test/extract-intake-prompt.test.ts.
  *
  *   node tools/extract-intake-eval.mjs --modules <dir> [--label name] [--runs 2] [--concurrency 3]
- *        [--only a,b] [--docs <dir with japan/ and multi/>] [--scenarios <module.mjs>]
+ *        [--only a,b] [--docs <dir with japan/ and multi/>] [--scenarios <module.mjs>] [--today YYYY-MM-DD]
  *
  * <dir> holds COMPILED interpret.js, interview.js, model-runner.js and
  * document-text.js — so the same scenarios run against two builds (the deployed
@@ -19,6 +19,11 @@
  * documents (make_documents.py output). `--scenarios` loads more from a module
  * whose default export is `(helpers) => ({ name: scenario })` — the place for
  * scenarios built on private documents, which must never be committed.
+ *
+ * A build whose gate returns `suggested` (answers refused for confidence alone,
+ * which the router asks about with Yes/No) is scored twice: as the gate left
+ * it, and as if the organizer tapped Yes on every suggestion — `failedIfYes`.
+ * `--today` pins the date a weekday's year is counted from.
  *
  * Output: one JSON line per run (scenario names, check results, rejection
  * reasons — never document text or model output verbatim), then a summary.
@@ -39,6 +44,7 @@ const concurrency = Number(opt("concurrency", "3"));
 const only = opt("only", "") ? new Set(opt("only", "").split(",")) : null;
 const docsRoot = opt("docs", "");
 const scenariosModule = opt("scenarios", "");
+const today = opt("today", "") ? new Date(`${opt("today", "")}T00:00:00Z`) : undefined;
 
 const mod = (name) => import(pathToFileURL(join(modules, name)).href);
 const { extractIntakeFromDocument, applyProposals } = await mod("interpret.js");
@@ -356,6 +362,7 @@ async function work(job) {
   }
   const result = await extractIntakeFromDocument(runner, {
     documentText: source.text, outstanding, language: job.scenario.language, timeoutMs: 240_000,
+    ...(today ? { today } : {}),
   });
   if (!result.ok) {
     // The runner's own detail: for a fixture it is model output about fixture
@@ -371,6 +378,11 @@ async function work(job) {
   });
   const got = Object.fromEntries(decisions.accepted.map((a) => [a.questionId, a.proposal.value]));
   const checks = [...invariants(got, source.text), ...job.scenario.checks(got, result.payload, source.text)];
+  const suggested = decisions.suggested ?? [];
+  const gotIfYes = { ...got, ...Object.fromEntries(suggested.map((x) => [x.questionId, x.proposal.value])) };
+  const checksIfYes = suggested.length
+    ? [...invariants(gotIfYes, source.text), ...job.scenario.checks(gotIfYes, result.payload, source.text)]
+    : checks;
   const line = {
     label, scenario: job.name, run: job.run, ok: true, ms: Date.now() - started, attempts: result.attempts,
     ...(source.read ? { read: source.read } : {}),
@@ -378,7 +390,9 @@ async function work(job) {
     proposed: result.payload.proposals.length, accepted: decisions.accepted.map((a) => a.questionId),
     rejected: decisions.rejected.map((r) => `${r.questionId}:${r.reason}`),
     unclear: result.payload.unclear.map((u) => u.questionId),
+    suggested: suggested.map((x) => x.questionId),
     failed: checks.filter((x) => !x.pass && x.kind !== "info").map((x) => `${x.kind}: ${x.name}`),
+    failedIfYes: checksIfYes.filter((x) => !x.pass && x.kind !== "info").map((x) => `${x.kind}: ${x.name}`),
     info: checks.filter((x) => x.kind === "info").map((x) => `${x.pass ? "yes" : "no"}: ${x.name}`),
     checks: checks.filter((x) => x.kind !== "info").length,
   };
@@ -392,7 +406,8 @@ await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => {
 }));
 
 const sum = { label, runs: results.length, failedRuns: 0, malformed: 0, evidenceRejects: 0, echoRejects: 0, lowConfidence: 0,
-  unsupported: 0, lost: 0, datetime: 0, checks: 0 };
+  unsupported: 0, lost: 0, datetime: 0, checks: 0,
+  suggested: 0, unsupportedIfYes: 0, lostIfYes: 0, datetimeIfYes: 0 };
 for (const r of results) {
   if (!r.ok) { sum.failedRuns++; continue; }
   sum.malformed += r.malformed;
@@ -400,6 +415,8 @@ for (const r of results) {
   sum.echoRejects += r.rejected.filter((x) => x.endsWith("EXAMPLE_ECHO")).length;
   sum.lowConfidence += r.rejected.filter((x) => x.endsWith("LOW_CONFIDENCE")).length;
   for (const f of r.failed) sum[f.split(":")[0]]++;
+  sum.suggested += (r.suggested ?? []).length;
+  for (const f of r.failedIfYes ?? r.failed) sum[`${f.split(":")[0]}IfYes`]++;
   sum.checks += r.checks;
 }
 console.log(JSON.stringify({ summary: sum }));

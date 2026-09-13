@@ -192,7 +192,7 @@ describe("interpret path — idempotency", { skip: SKIP ? "no CONTROL_PLANE_TEST
       await markInterpretationCommitted(
         pool,
         id,
-        storedOutcomes({ accepted: [{ questionId: "trip_type", answer: { kind: "choice", option_id: "family", schema_version: 3, other_text: null }, proposal: PROPOSAL }], rejected: [], askAnyway: [] }, 0),
+        storedOutcomes({ accepted: [{ questionId: "trip_type", answer: { kind: "choice", option_id: "family", schema_version: 3, other_text: null }, proposal: PROPOSAL }], rejected: [], askAnyway: [], suggested: [] }, 0),
       );
 
       const again = await claimInterpretation(pool, { sessionId: a.sessionId, chatId: a.chatId, ...burst });
