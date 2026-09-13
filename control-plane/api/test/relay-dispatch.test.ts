@@ -234,6 +234,73 @@ describe("dispatchUpdate — the branch table", () => {
     });
   });
 
+  test("/name renames the assistant — and the router hears the new name", { skip: SKIP }, async () => {
+    // 2026-09-13: a family renamed their assistant in the group, it agreed, and
+    // every message that used the new name was dropped as NOT_ADDRESSED — the
+    // router only listens for `trips.assistant_names`, and nothing could change
+    // them after provisioning.
+    await withFixture(async (fix) => {
+      const group = "-1002000444";
+      await bindCompanion(fix, group, "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET assistant_names = $2, companion_intro = $3::jsonb WHERE id = $1",
+        [fix.tripId, ["סולומון"], JSON.stringify({ assistant_name: "סולומון", language: "he" })],
+      );
+
+      const renamed = await dispatchUpdate(fix.pool, msg(group, "/name סולו / Solo", "supergroup"));
+      assert.equal(renamed.kind, "reply");
+      assert.equal(renamed.kind === "reply" && /סולו/.test(renamed.reply.text), true);
+
+      const { rows } = await fix.pool.query(
+        "SELECT assistant_names, companion_intro->>'assistant_name' AS intro FROM control_plane.trips WHERE id = $1",
+        [fix.tripId],
+      );
+      assert.deepEqual(rows[0].assistant_names, ["סולו", "Solo"]);
+      assert.equal(rows[0].intro, "סולו", "the next group welcome uses the new name too");
+
+      const byNewName = await dispatchUpdate(fix.pool, msg(group, "סולו, מה התוכנית מחר?", "supergroup"));
+      assert.equal(byNewName.kind, "to_gateway", "the new name now reaches the companion");
+      const byOldName = await dispatchUpdate(fix.pool, msg(group, "משפחת סולומון יוצאת מחר", "supergroup"));
+      assert.equal(byOldName.kind, "ignore", "a rename replaces — the old name no longer wakes it");
+    });
+  });
+
+  test("/name alone says what the assistant answers to, and how to change it", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000611", "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET assistant_names = $2, companion_intro = $3::jsonb WHERE id = $1",
+        [fix.tripId, ["Rio"], JSON.stringify({ assistant_name: "Rio", language: "en" })],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg("700000611", "/name"));
+      assert.equal(decision.kind, "reply");
+      if (decision.kind !== "reply") return;
+      assert.match(decision.reply.text, /Rio/);
+      assert.match(decision.reply.text, /\/name/);
+    });
+  });
+
+  test("a name nobody could type is refused, and the names stay as they were", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000612", "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET assistant_names = $2, companion_intro = $3::jsonb WHERE id = $1",
+        [fix.tripId, ["Rio"], JSON.stringify({ assistant_name: "Rio", language: "en" })],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg("700000612", "/name @someone_else"));
+      assert.equal(decision.kind === "reply" && /won't work/.test(decision.reply.text), true);
+      const { rows } = await fix.pool.query("SELECT assistant_names FROM control_plane.trips WHERE id = $1", [fix.tripId]);
+      assert.deepEqual(rows[0].assistant_names, ["Rio"]);
+    });
+  });
+
+  test("/name in a chat with no trip renames nothing", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const decision = await dispatchUpdate(fix.pool, msg("700000613", "/name Rio"));
+      assert.equal(decision.kind === "reply" && decision.reply.text, DEFAULT_STRINGS.unbound);
+    });
+  });
+
   test("an unknown chat is refused, never routed", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const decision = await dispatchUpdate(fix.pool, msg("700000444", "hello?"));

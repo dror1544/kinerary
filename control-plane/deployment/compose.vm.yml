@@ -261,6 +261,31 @@ services:
   # line under mcp_servers.interview). CONTROL_PLANE_INTERVIEW_AGENT_KEY is the
   # api<->sidecar pair; one name on both sides so a half-set pair cannot exist.
   # Both VM-only, in vm.env.
+  # Companion control — the one narrow way a trip's companion reaches the
+  # control plane: renaming itself, so the router hears the new name
+  # (companion-mcp.ts). Loopback only, host network like the relay, and
+  # authenticated with the relay's own gateway-token format, verified against
+  # the relay's gateway secret — a companion can only act on the trip its
+  # profile serves, and no new secret exists for it.
+  companion-mcp:
+    image: kinerary-cp/api:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    command: ["node", "dist/companion-mcp.js"]
+    network_mode: host
+    environment:
+      CONTROL_PLANE_ARCHITECTURE_PROFILE: /run/config/architecture.json
+      COMPANION_MCP_PORT: "4313"
+    secrets:
+      - source: control_plane_database_url_host
+        target: control_plane_database_url
+      - relay_gateway_secret
+    configs:
+      - source: architecture_profile
+        target: /run/config/architecture.json
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   interview-mcp:
     image: kinerary-cp/agent-runtime:${KINERARY_REV:?set KINERARY_REV in vm.env}
     command: ["node", "dist/interview-mcp.js"]

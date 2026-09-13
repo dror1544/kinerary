@@ -49,6 +49,16 @@ mcp_servers:
   $SITE_CONNECTION_NAME:
     transport: sse
     url: "SET_VIA_SECURE_CONFIG"
+  # The companion's one line to the control plane (companion-mcp.ts): renaming
+  # itself so the router hears the new name. The doubled dollar below is the
+  # template's escape: the rendered file carries a single-dollar reference to
+  # COMPANION_CONTROL_TOKEN, which Hermes expands from the profile's .env, where
+  # the installer writes it at enrollment.
+  trip-control:
+    transport: sse
+    url: http://127.0.0.1:4313/sse
+    headers:
+      Authorization: "Bearer $${COMPANION_CONTROL_TOKEN}"
 agent:
   max_turns: 30
   # No shell, ever. A trip companion answers about a trip; it has never had a

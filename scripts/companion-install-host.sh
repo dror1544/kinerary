@@ -250,12 +250,26 @@ PY
   umask 077
   touch "$env_file"
   /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" <<'PY'
-import sys
+import base64, hashlib, hmac, sys
 env_path, url, gid, secret = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+
+def control_token(gateway_id, key):
+    # The relay's own gateway-token format (protocol.ts makeUpgradeToken):
+    # base64url("<id>:<exp>:<hmac-sha256 hex of '<id>:<exp>'>"), exp 0 = no
+    # expiry. companion-mcp verifies it with the relay's verifyUpgradeToken, so
+    # this is the relay credential the companion already holds, in the one
+    # shape a static MCP header can carry — not a new secret.
+    signed = f"{gateway_id}:0"
+    sig = hmac.new(key.encode(), signed.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{signed}:{sig}".encode()).decode().rstrip("=")
 managed = {
     "GATEWAY_RELAY_URL": url,
     "GATEWAY_RELAY_ID": gid,
     "GATEWAY_RELAY_SECRET": secret,
+    # The companion's `trip-control` MCP connection (companion-mcp.ts): the one
+    # way it can rename itself so the router hears the new name.
+    "COMPANION_CONTROL_TOKEN": control_token(gid, secret),
 }
 with open(env_path) as fh:
     lines = fh.read().splitlines()
