@@ -540,8 +540,10 @@ export async function dispatchUpdate(
 
     // `/switch <something>` is the only path that takes an argument. Without
     // one, /switch and /trips are the same thing: the list, with a button per
-    // row. That is deliberate — it is also the shape the sprint plan asked for
-    // ("signed callbacks"), and it removes the guessing a typed name invites.
+    // row. That is deliberate — buttons remove the guessing a typed name
+    // invites. They are NOT signed, by decision (2026-09-13): a payload only
+    // names a row, and the callback branch re-authorizes every tap from the
+    // tapper's verified id, exactly as if they had typed the name.
     const target = parsed.name === "trips" ? null : resolveTripArgument(trips, parsed.argument);
     if (!target) {
       if (parsed.name !== "trips" && parsed.argument) {
@@ -568,6 +570,14 @@ export async function dispatchUpdate(
     if (route.kind === "interview") {
       const result = await setFinishRequestedForChat(db, chatId, true);
       if (result.ok) return { kind: "show_summary", chatId, view: result.view };
+    }
+    // The ⌘ menu offers /done in EVERY private chat — Telegram cannot scope a
+    // menu by route — so a companion DM receives it too. Letting it fall to the
+    // catch-all below would answer "/done isn't one of my commands": the bot
+    // disowning an entry in its own menu.
+    if (route.kind === "companion") {
+      const language = await resolveChatLanguage(db, chatId, message.from?.language_code);
+      return { kind: "reply", reply: { chatId, text: uiString("doneNoInterview", language) } };
     }
   }
 

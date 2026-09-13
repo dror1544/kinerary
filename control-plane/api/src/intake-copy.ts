@@ -436,6 +436,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     cmdSwitch: "Point this chat at a different trip",
     cmdGroup: "Connect me to your family group",
     cmdDone: "Show me everything you have so far",
+    doneNoInterview: "That one is for while we're planning a trip — there's no interview running in this chat.",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -508,6 +509,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     cmdSwitch: "חיבור הצ׳אט הזה לטיול אחר",
     cmdGroup: "חיבור שלי לקבוצה המשפחתית",
     cmdDone: "הצגת כל מה שנאסף עד עכשיו",
+    doneNoInterview: "זו פקודה לזמן תכנון הטיול — אין כרגע ריאיון פתוח בצ'אט הזה.",
   },
 };
 

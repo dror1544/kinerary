@@ -879,8 +879,8 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Half B (two live Hermes profiles, no private-memory leakage) tests an
 > upstream property and belongs as a one-time live verification, not a suite.
 >
-> **`/select` is BUILT, under the name `/switch`** — on
-> `feat/trip-bot-trip-commands` (c3ac940), not yet merged here.
+> **`/select` is BUILT, under the name `/switch`** — c3ac940, PR #47
+> (`feat/trip-bot-trip-commands`).
 > `docs/trip-bot-command-surface.md` designs the organizer command surface
 > Dror asked for — `/trips`, `/switch`, `/interview`, `/group`, `/url` — plus
 > Telegram's own command menu. `/trips`, `/switch` (alias `/select`) and the
@@ -1234,9 +1234,14 @@ Build:
 - Create provider-neutral messaging bindings and the shared Trip Bot router.
   Bind `provider + bot identity + chat ID` to exactly one trip only after a
   signed organizer action and permission verification.
-- Implement private `/select` over owned trips with signed callbacks. Private
+- Implement private `/select` over owned trips with callback buttons. Private
   selection is independent from group routing, and reviewed reassignment
-  preserves binding history.
+  preserves binding history. *(Amended 2026-09-13, Dror's decision — this said
+  "signed callbacks". A switch button's payload only names a row: the tap is
+  re-authorized from the tapper's verified Telegram id against their own trips,
+  so a forged payload selects nothing a typed `/switch <slug>` could not, and a
+  signature would protect nothing. Signed, expiring actions remain the rule
+  wherever the payload itself carries authority — signup approval, enrollment.)*
 - Keep intake, organizer-private and group-chat sessions/policies separate.
   Add the private owner-only Super Bot for redacted alerts and narrow
   plan/approve/execute operations. Dedicated-bot support remains optional.

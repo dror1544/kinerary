@@ -76,11 +76,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is THIS branch's claim on that number. Sprint-5 left the gap
-      // because two unmerged branches claim it — telegram_organizer_links
-      // (here) and plan_reviews — so whichever lands second renumbers. This
-      // one is already applied to the dev control plane under this exact
-      // name, which is the cost of renumbering it now rather than the other.
+      // 0050 is THIS branch's claim on that number, and it is already applied
+      // to the dev control plane under this exact name (2026-09-10). The other
+      // claimant, 0050_plan_reviews.sql, exists only as an uncommitted file in
+      // the live-plan-enrichment-worker worktree and is applied nowhere, so it
+      // is the one that renumbers when it lands.
       "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);
@@ -139,11 +139,11 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is THIS branch's claim on that number. Sprint-5 left the gap
-      // because two unmerged branches claim it — telegram_organizer_links
-      // (here) and plan_reviews — so whichever lands second renumbers. This
-      // one is already applied to the dev control plane under this exact
-      // name, which is the cost of renumbering it now rather than the other.
+      // 0050 is THIS branch's claim on that number, and it is already applied
+      // to the dev control plane under this exact name (2026-09-10). The other
+      // claimant, 0050_plan_reviews.sql, exists only as an uncommitted file in
+      // the live-plan-enrichment-worker worktree and is applied nowhere, so it
+      // is the one that renumbers when it lands.
       "0050_telegram_organizer_links.sql",
       "0051_trip_person_links.sql",
     ]);

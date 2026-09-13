@@ -175,7 +175,7 @@ The sprint plan already scopes this: *"Implement private `/select` over owned
 trips with signed callbacks. Private selection is independent from group
 routing, and reviewed reassignment preserves binding history."*
 ([onboarding-mvp-sprint-plan.md](onboarding-mvp-sprint-plan.md), Sprint 5's
-Build list).
+Build list, as first written — see "Not signed" below for the amendment).
 It is listed under "Not built". `/switch` is the same feature under the name
 Dror actually reaches for; build one of them, alias the other.
 
@@ -196,13 +196,23 @@ chat bound to another trip; `/switch` is the reviewed path that may, and only
 between trips the verified sender owns.
 
 **Argument shape.** Free-text matching against trip titles invites the wrong
-trip being selected by a near-match. Prefer the sprint plan's signed callbacks:
-`/switch` with no argument renders the `/trips` list as inline buttons, and the
-callback carries an opaque id. `callbackDataFits`
+trip being selected by a near-match. Prefer buttons: `/switch` with no
+argument renders the `/trips` list as inline buttons, and the callback carries
+the trip id. `callbackDataFits`
 ([chat-router.ts:430](../control-plane/api/src/chat-router.ts#L430)) already
 guards Telegram's 64-byte limit, and migration 0014's ref-expansion pattern
 already exists for payloads that do not fit. A typed `/switch <slug>` can stay
 as an exact-match-only convenience.
+
+**Not signed, by decision (2026-09-13).** The plan and
+`control-plane-implementation-guide.md` asked for signed, expiring callbacks,
+and the buttons carry a plain `s:<trip_id>`. That was a contradiction, and it
+was resolved by amending the requirement rather than the code: the payload only
+names a row, and the callback branch re-authorizes every tap from
+`callback.from.id` against that sender's own trips. A forged payload therefore
+selects nothing a typed `/switch <slug>` could not, and a signature would
+protect nothing. Signed, expiring actions remain the rule wherever the payload
+itself carries authority — signup approval, enrollment.
 
 **A live interview outranks a binding** (`resolveChatRoute`), so `/switch`
 during an interview would appear to do nothing. Refuse it with a sentence
@@ -278,8 +288,9 @@ credential — the credential went out once, in the pinned arrival message.
 
 ## 9. The graphical menu — BUILT (2026-09-10)
 
-Nothing in the tree calls `setMyCommands` or `setChatMenuButton` — grep finds
-zero hits. This is entirely new, and it is small.
+Built as `relay/command-menu.ts`. Before it, nothing in the tree called
+`setMyCommands`; `setChatMenuButton` is still uncalled — it is the mini app's
+hook (§10), not the command list's.
 
 **Where it goes.** Once, at relay boot, right after the `getMe` call that
 already resolves `BotIdentity` — not per message. Telegram rate-limits these
@@ -287,13 +298,17 @@ and the command list only changes when the code does.
 
 **Scoped, not global.** The commands are not the same everywhere, and a menu
 offering `/switch` in a family group advertises something that will be
-refused:
+refused. What shipped:
 
 | Scope | Commands |
 |---|---|
-| `all_private_chats` | `/trips`, `/switch`, `/interview`, `/group`, `/url`, `/done` |
-| `all_group_chats` | `/url` |
-| `default` | `/url` |
+| `all_private_chats` — once unlabelled, once per language in `LANGUAGES` | `/trips`, `/switch`, `/group`, `/done` |
+| groups, and the unscoped default | nothing — left as they are |
+
+This design first offered `/interview` and `/url` privately and `/url` in groups
+and by default. Those wait on the commands themselves (§6, §8); a menu entry
+for a command the router cannot answer is the dead end this section exists to
+avoid.
 
 `/start` is deliberately absent — Telegram surfaces its own Start button, and
 a menu entry for a command that is useless without a token is a dead end.
