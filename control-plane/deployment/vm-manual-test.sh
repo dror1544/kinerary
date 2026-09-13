@@ -8,7 +8,7 @@
 #   /opt/kinerary/control-plane/deployment/vm-manual-test.sh --scenario japan   # a fixture, with documents
 #
 # The same runner the automated cycle uses, minus the automated organizer: it
-# signs a new organizer up, prints a t.me link to @Tripinterviewer_bot, and waits
+# signs a new organizer up, prints a t.me link to the VM's bot, and waits
 # while YOU do the interview and confirm. Then it verifies what confirming built —
 # the provisioning job, the site and its content, the companion, its trip-mcp —
 # and leaves the trip running so you can open the site and talk to the companion.
@@ -55,8 +55,12 @@ echo "── Preconditions ──"
 curl -sf http://127.0.0.1:4310/readyz | grep -q '"status":"ready"' && ok "control plane ready" || fail "control plane not ready: ${C[*]} ps"
 
 bot="$("${C[@]}" logs relay 2>&1 | grep -o '"username":"[A-Za-z_]*"' | tail -1 | cut -d'"' -f4)"
-[ "$bot" = "Tripinterviewer_bot" ] && ok "relay is on @$bot (the VM's test bot)" \
-  || fail "relay reports @${bot:-unknown} — this test must run on @Tripinterviewer_bot, never @Kinerary_bot"
+# Since 2026-09-13 the VM owns @Kinerary_bot and the Mac runs on
+# @Tripinterviewer_bot. Telegram gives each update to one getUpdates loop, so
+# a relay on the other stack's bot steals its messages. KINERARY_VM_BOT overrides.
+EXPECT_BOT="${KINERARY_VM_BOT:-Kinerary_bot}"
+[ "$bot" = "$EXPECT_BOT" ] && ok "relay is on @$bot (the VM's bot)" \
+  || fail "relay reports @${bot:-unknown} — the VM's bot is @$EXPECT_BOT; the other one belongs to the Mac"
 
 creds="$(sudo -u hermes -i hermes auth list </dev/null 2>/dev/null | grep -cE 'openai-codex|anthropic|openrouter|ollama' || true)"
 [ "${creds:-0}" -gt 0 ] && ok "Hermes has provider credentials ($creds entr$( [ "$creds" = 1 ] && echo y || echo ies))" \
@@ -107,5 +111,5 @@ echo "── What is left running for you ──"
 echo "  trip:      $trip"
 slug="${trip##* }"
 case "$slug" in draft-*|retired-*|'') ;; *) echo "  site:      https://$slug.ara-united.store" ;; esac
-echo "  companion: message @Tripinterviewer_bot from the chat you did the interview in"
+echo "  companion: message @$EXPECT_BOT from the chat you did the interview in"
 echo "  remove it: $DIR/vm-teardown-trip.sh --trip ${trip%% *} --execute"

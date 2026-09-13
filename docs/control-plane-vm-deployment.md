@@ -135,7 +135,7 @@ Values never go in this file or in logs. Where each lives:
 | Credential | Where | Notes |
 |---|---|---|
 | Postgres password, DB URLs | `.local-secrets/` | `control_plane_database_url_host` = same URL via `127.0.0.1:5433`, for the relay |
-| Bot token | `.local-secrets/telegram_creds` | **`@Tripinterviewer_bot`** until cutover — see below. Also mounted as `trip_bot_creds` (one bot, two roles) |
+| Bot token | `.local-secrets/telegram_creds` | **`@Kinerary_bot`** since 2026-09-13; the Mac's relay moved to `@Tripinterviewer_bot` — see below. Also mounted as `trip_bot_creds` (one bot, two roles) |
 | Signup: approval key, webhook secret, super-admin chat id | `.local-secrets/` | the relay mounts these too: its bot is also the signup bot, so it subsumes the approval poller |
 | Relay↔gateway secret | `.local-secrets/relay_gateway_secret` | same value in `trip-intake/.env` |
 | Chat-routing key, interview MCP key, interview agent key | `vm.env` | **VM-only**, generated on the VM, not shared with the Mac |
@@ -155,9 +155,11 @@ instance logs in for itself.
 These exist because both stacks share Telegram, Proxmox, NPM, Cloudflare and
 the RPi4:
 
-1. **The VM never polls `@Kinerary_bot`.** Telegram gives each update to one
-   `getUpdates` caller; a second loop steals live interview messages. The VM
-   runs on `@Tripinterviewer_bot`, the retired pre-shared-bot interviewer.
+1. **One bot per stack, never shared.** Telegram gives each update to one
+   `getUpdates` caller; a second loop steals live interview messages. Since
+   2026-09-13 the VM owns `@Kinerary_bot` and the Mac runs on
+   `@Tripinterviewer_bot` (until then it was the other way round). To swap,
+   stop one relay before the other starts on its token.
 2. **Provisioning is off** (`PROVISIONER_COMPUTE_ENABLED=` in `vm.env`). IP
    allocation scans only *this* deploy root's topology files
    (`compute.py _ips_already_claimed`), so the VM cannot see trips the Mac
@@ -337,7 +339,7 @@ ssh -i ~/.ssh/id_ed25519_kinerary_cp debian@192.168.0.45
 ```
 
 It refuses unless the control plane is ready, the relay is on
-`@Tripinterviewer_bot`, Hermes has a credential, no job is in flight and a
+`@Kinerary_bot` (`KINERARY_VM_BOT` overrides), Hermes has a credential, no job is in flight and a
 sealed release is available. Then it switches provisioning on — and back off on
 every exit, Ctrl-C included — signs a new organizer up, prints a `t.me` link,
 waits while you do the interview and confirm, and verifies the build, the site
