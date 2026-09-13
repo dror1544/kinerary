@@ -2,7 +2,7 @@
 name: trip-kml-export
 description: Export trip places to KML (hotels, attractions, restaurants, or all) and send the file to the group or organizer.
 version: 1.0.0
-author: Nahum / Hermes
+author: Kinerary / Hermes
 license: MIT
 metadata:
   hermes:
