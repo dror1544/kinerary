@@ -506,11 +506,23 @@ export function multiDoneCallbackData(questionId: string): string {
   return `n:${questionId}`;
 }
 
+/** `y:<questionId>` — "yes, that's right" to what a document suggested. */
+export function suggestionYesCallbackData(questionId: string): string {
+  return `y:${questionId}`;
+}
+
+/** `x:<questionId>` — "no": drop the suggestion and ask the question plainly. */
+export function suggestionNoCallbackData(questionId: string): string {
+  return `x:${questionId}`;
+}
+
 export type ParsedCallback =
   | { kind: "answer"; questionId: string; optionId: string }
   | { kind: "toggle"; questionId: string; optionId: string }
   | { kind: "multi_done"; questionId: string }
   | { kind: "skip"; questionId: string }
+  | { kind: "suggestion_yes"; questionId: string }
+  | { kind: "suggestion_no"; questionId: string }
   | { kind: "confirm" }
   | { kind: "keep_planning" }
   | { kind: "finish" }
@@ -538,11 +550,12 @@ export function parseCallbackData(data: string): ParsedCallback {
       : { kind: "toggle", questionId: pair[2], optionId: pair[3] };
   }
 
-  const single = /^([kn]):([A-Za-z0-9_]{1,64})$/.exec(data);
+  const single = /^([knyx]):([A-Za-z0-9_]{1,64})$/.exec(data);
   if (single?.[2]) {
-    return single[1] === "k"
-      ? { kind: "skip", questionId: single[2] }
-      : { kind: "multi_done", questionId: single[2] };
+    const questionId = single[2];
+    if (single[1] === "k") return { kind: "skip", questionId };
+    if (single[1] === "n") return { kind: "multi_done", questionId };
+    return single[1] === "y" ? { kind: "suggestion_yes", questionId } : { kind: "suggestion_no", questionId };
   }
 
   return { kind: "unknown" };
@@ -623,6 +636,38 @@ export function renderQuestion(
   // spec, examples and all, and it was being read out to organizers verbatim.
   const text = agentText?.trim() || askText(question, language);
   return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
+}
+
+/** Telegram's limit is 4096; the question and the buttons' copy need room too. */
+const SUGGESTION_LABEL_MAX = 3000;
+
+/**
+ * A question asked WITH the answer a document suggested for it.
+ *
+ * The document said it and the model was unsure it read it right, so the
+ * organizer is shown the reading and decides: Yes records it, No asks the
+ * question plainly. Typing an answer instead also works — it is recorded like
+ * any typed answer, which drops the suggestion.
+ */
+export function renderSuggestion(
+  question: IntakeQuestion,
+  label: string,
+  language: Language = DEFAULT_LANGUAGE,
+  agentText?: string | null,
+): RenderedQuestion {
+  const shown = label.length > SUGGESTION_LABEL_MAX ? `${label.slice(0, SUGGESTION_LABEL_MAX)}…` : label;
+  const rows: InlineButton[][] = [[
+    { text: uiString("suggestionYes", language), callback_data: suggestionYesCallbackData(question.id) },
+    { text: uiString("suggestionNo", language), callback_data: suggestionNoCallbackData(question.id) },
+  ]];
+  if (!question.required) {
+    rows.push([
+      { text: uiString("skip", language), callback_data: skipCallbackData(question.id) },
+      { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
+    ]);
+  }
+  const ask = agentText?.trim() || askText(question, language);
+  return { text: `${ask}\n\n${uiString("suggestionIntro", language)}\n${shown}`, replyMarkup: { inline_keyboard: rows } };
 }
 
 /**

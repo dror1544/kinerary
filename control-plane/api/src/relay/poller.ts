@@ -25,6 +25,7 @@ import {
   renderConfirmPrompt,
   renderEssentialsDone,
   renderQuestion,
+  renderSuggestion,
   type InlineKeyboard,
   type RenderedQuestion,
 } from "../chat-router.js";
@@ -73,6 +74,10 @@ import {
   setFinishRequestedForChat,
   skipQuestionForChat,
   toggleMultiChoiceForChat,
+  saveSuggestionsForChat,
+  dismissSuggestionForChat,
+  suggestionLabel,
+  type SuggestedAnswer,
 } from "../interview.js";
 import {
   applyProposals,
@@ -620,6 +625,81 @@ async function applyInterviewCallback(
     return;
   }
 
+  if (parsed.kind === "suggestion_yes" || parsed.kind === "suggestion_no") {
+    const question = findQuestion(parsed.questionId);
+    const before = await getSessionForChat(deps.db, decision.chatId);
+    const suggestion = before.ok ? before.view.suggestions[parsed.questionId] : undefined;
+    if (!question || !before.ok || !suggestion) {
+      // Answered some other way since — typed, or from a later document. The
+      // buttons are stale; what the organizer needs is whatever comes next.
+      await ack();
+      if (before.ok) await respond({ ...before.view, awaiting: "machine" });
+      return;
+    }
+    const language = before.view.language;
+
+    if (parsed.kind === "suggestion_yes") {
+      const label = suggestionLabel(parsed.questionId, suggestion, language);
+      const result = await submitAnswerForChat(
+        deps.db, decision.chatId, parsed.questionId,
+        suggestion.optionId, suggestion.otherText, suggestion.structuredData, suggestion.optionIds,
+      );
+      if (!result.ok) {
+        log(structuredLog("warn", "trip_bot.suggestion_rejected", {
+          session_id: decision.sessionId,
+          question_id: parsed.questionId,
+          safe_error_code: result.reason,
+        }));
+        // Refused now, so it would be refused again: ask the question plainly.
+        const plain = await dismissSuggestionForChat(deps.db, decision.chatId, parsed.questionId);
+        await ack("I couldn't record that — try again.");
+        if (plain.ok) {
+          const rendered = renderQuestion(question, selectedOptionIds(plain.view, question.id), language);
+          await deps.telegram.sendMessage({ chatId: decision.chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined });
+        }
+        return;
+      }
+      await ack();
+      log(structuredLog("info", "trip_bot.suggestion_confirmed", { session_id: decision.sessionId, question_id: parsed.questionId }));
+      if (decision.messageId) {
+        await deps.telegram.editMessageText({
+          chatId: decision.chatId,
+          messageId: decision.messageId,
+          text: `${askText(question, language)}\n\n✅ ${(label ?? "").slice(0, 3000)}`,
+          replyMarkup: undefined,
+        });
+      }
+      await respond({ ...result.view, awaiting: "machine" });
+      return;
+    }
+
+    const declined = await dismissSuggestionForChat(deps.db, decision.chatId, parsed.questionId);
+    if (!declined.ok) {
+      await ack("I couldn't do that — try again.");
+      return;
+    }
+    await ack();
+    log(structuredLog("info", "trip_bot.suggestion_declined", { session_id: decision.sessionId, question_id: parsed.questionId }));
+    // THE SAME MESSAGE becomes the plain question. It is already the last
+    // prompt (`q:<id>`), so sending it anew would be deduped into silence —
+    // and replacing it in place is also what reads right: the question stays,
+    // the reading they said no to goes.
+    const rendered = renderQuestion(question, selectedOptionIds(declined.view, question.id), language);
+    if (decision.messageId) {
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: rendered.text,
+        replyMarkup: rendered.replyMarkup ?? undefined,
+      });
+    } else {
+      await deps.telegram.sendMessage({ chatId: decision.chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined });
+    }
+    // The question is on their screen: the turn is theirs.
+    await claimFloor(deps.db, decision.chatId);
+    return;
+  }
+
   if (parsed.kind === "no_document") {
     // Nothing to record — the offer was a courtesy, and declining it just
     // starts the questions. It does end the opening PHASE, though: without a
@@ -974,6 +1054,20 @@ async function runDocumentPath(
   }
 }
 
+/**
+ * A question as the router draws it: with the answer a document suggested for
+ * it when there is one that still validates, plainly otherwise. Every place the
+ * router asks a question goes through here, so a suggestion is never shown by
+ * one path and silently skipped by another.
+ */
+function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: string | null): RenderedQuestion {
+  const suggestion = view.suggestions[question.id];
+  const label = suggestion ? suggestionLabel(question.id, suggestion, view.language) : null;
+  return label
+    ? renderSuggestion(question, label, view.language, phrasing)
+    : renderQuestion(question, selectedOptionIds(view, question.id), view.language, phrasing);
+}
+
 /** The read itself — everything that must happen before the router speaks. */
 async function readDocumentInto(
   deps: TripBotPollerDeps,
@@ -1034,6 +1128,23 @@ async function readDocumentInto(
     }
   }
 
+  // UNSURE READINGS, kept to be asked about instead of lost. The gate refused
+  // them for confidence alone; the organizer decides with one tap when the
+  // question comes up. Only for questions this read did not just answer.
+  const suggestions: Record<string, SuggestedAnswer> = {};
+  for (const unsureRead of decisions.suggested) {
+    if (recorded.includes(unsureRead.questionId)) continue;
+    const args = submitArgsFor(unsureRead.proposal.value);
+    suggestions[unsureRead.questionId] = {
+      optionId: args.optionId,
+      ...(args.otherText !== undefined ? { otherText: args.otherText } : {}),
+      ...(args.structuredData !== undefined ? { structuredData: args.structuredData } : {}),
+      ...(args.optionIds ? { optionIds: [...args.optionIds] } : {}),
+    };
+  }
+  const unsure = Object.keys(suggestions);
+  if (unsure.length > 0) await saveSuggestionsForChat(deps.db, burst.chatId, suggestions);
+
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
     // PROPOSED vs ACCEPTED, and MALFORMED alongside both — the interpret log
@@ -1057,11 +1168,13 @@ async function readDocumentInto(
     // the organizer was asked for every stop and date their document had
     // already given, and nothing in the log said it was `phases` that fell.
     rejected_questions: decisions.rejected.map((r) => `${r.questionId}:${r.reason}`),
+    suggested: unsure,
     ms: result.ms,
   }));
 
   if (recorded.length === 0) {
-    await say(uiString("documentNothing", language));
+    // "Found nothing" would be untrue when it found things it was unsure of.
+    await say(uiString(unsure.length > 0 ? "documentUnsure" : "documentNothing", language));
     await ask();
     return;
   }
@@ -1093,6 +1206,15 @@ async function readDocumentInto(
     if (unique.length > 0) {
       const shown = unique.slice(0, 12).join(", ");
       lines.push(`• ${uiString("documentPlanned", language)}: ${shown}${unique.length > 12 ? ` +${unique.length - 12}` : ""}`);
+    }
+
+    if (unsure.length > 0) {
+      const checking = buildRecap(
+        Object.fromEntries(decisions.suggested.filter((x) => unsure.includes(x.questionId)).map((x) => [x.questionId, x.answer])),
+        INTAKE_QUESTIONS,
+        language,
+      ).map((entry) => entry.prompt);
+      if (checking.length > 0) lines.push(`• ${uiString("documentWillCheck", language)}: ${checking.join(", ")}`);
     }
 
     if (lines.length > 0) {
@@ -1596,7 +1718,7 @@ export async function recoverStalledInterviews(
         question_id: question.id,
       }));
 
-      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      const rendered = renderStep(question, view);
       await deps.telegram.sendMessage({
         chatId,
         text: `${uiString("resumed", view.language)}\n\n${rendered.text}`,
@@ -1969,7 +2091,7 @@ async function restateExpectation(
   const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
   let rendered: RenderedQuestion;
   if (question) {
-    rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+    rendered = renderStep(question, view);
   } else if (view.state === "awaiting_confirmation") {
     rendered = renderConfirmPrompt(
       `${uiString("recapHeader", view.language)}\n\n`
@@ -2095,7 +2217,7 @@ async function sendNextStep(
       const back = await getSessionForChat(deps.db, chatId);
       const question = (back.ok ? back.view.nextQuestion : null) ?? missing[0]!;
       if (!(await takeFloor(chatId, view, deps))) return false;
-      const rendered = renderQuestion(question, selectedOptionIds(view, question.id), view.language);
+      const rendered = renderStep(question, view);
       await deps.telegram.sendMessage({
         chatId,
         text: `${uiString("beforeWeFinish", view.language)}\n\n${rendered.text}`,
@@ -2310,12 +2432,7 @@ async function sendNextStep(
       }));
     }
     const phrasing = wrongLanguage ? null : agentPhrasing;
-    const rendered = renderQuestion(
-      question,
-      selectedOptionIds(view, question.id),
-      view.language,
-      phrasing,
-    );
+    const rendered = renderStep(question, view, phrasing);
     text = rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
     if (view.pendingAsk?.id === question.id) await clearPendingAskForChat(deps.db, chatId);

@@ -359,6 +359,15 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
+    // A reading the model was unsure of, put to the organizer instead of lost.
+    // Asked when its question comes up; see renderSuggestion.
+    suggestionIntro: "From your document — is this right?",
+    suggestionYes: "✅ Yes, that's right",
+    suggestionNo: "✏️ No",
+    /** Instead of documentNothing, when nothing was certain but something was found. */
+    documentUnsure: "I read it and found a few things I'm not sure I read right — I'll check each one with you as we go.",
+    /** Beside what was taken, naming what will be checked. */
+    documentWillCheck: "Not sure I read these right — I'll check them with you",
     // Said only when a day-by-day actually landed. An extraction nobody can
     // see reads as a document that was not understood — the same reason the
     // planned places are listed rather than hidden inside a phase name.
@@ -444,6 +453,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
+    suggestionIntro: "מהמסמך שלכם — זה נכון?",
+    suggestionYes: "✅ כן, נכון",
+    suggestionNo: "✏️ לא",
+    documentUnsure: "קראתי, ומצאתי כמה דברים שאני לא בטוח שקראתי נכון — אבדוק איתכם כל אחד מהם בהמשך.",
+    documentWillCheck: "לא בטוח שקראתי נכון — אבדוק איתכם",
     documentDays: "הוספתי גם את התוכנית היומית מהמסמך לכל עצירה — תראו אותה באתר של הטיול, ותמיד אפשר לשנות.",
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",

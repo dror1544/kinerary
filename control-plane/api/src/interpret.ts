@@ -27,6 +27,7 @@ import {
   type IntakeQuestion,
 } from "./interview.js";
 import type { RunnerFailure, StructuredModelRunner } from "./model-runner.js";
+import { yearlessDateHints } from "./yearless-dates.js";
 
 // ── The proposal ─────────────────────────────────────────────────────────────
 
@@ -508,6 +509,27 @@ export interface ProposalDecisions {
   /** Questions to ask next: the model's `unclear`, plus everything rejected.
    *  A rejected proposal never becomes a silent gap. */
   askAnyway: string[];
+  /**
+   * Answers refused for LOW_CONFIDENCE and for nothing else: the evidence is in
+   * the source, no value came from an example, and the answer validates.
+   *
+   * Still refused — they are in `rejected` and their questions in `askAnyway`,
+   * so nothing is written without the organizer. What changes is what the
+   * question is asked WITH. On 2026-09-13 the confidence floor was the largest
+   * single source of lost facts in every evaluation: 33 correct answers dropped
+   * in 32 document runs, a parking pass and a hotel stay among them, and one
+   * run of a 20-file burst lost nearly everything to it. Each came back as a
+   * blank question about something the document had already said. A caller
+   * that can ask "is this right?" turns that into one tap.
+   */
+  suggested: SuggestedProposal[];
+}
+
+/** An answer the gate would have accepted but for the model's confidence. */
+export interface SuggestedProposal {
+  questionId: string;
+  answer: IntakeAnswer;
+  proposal: ProposedAnswer;
 }
 
 export interface ApplyProposalsContext {
@@ -712,8 +734,45 @@ export function applyProposals(
 
   const accepted: AcceptedProposal[] = [];
   const rejected: RejectedProposal[] = [];
+  const suggested: SuggestedProposal[] = [];
   const reject = (proposal: ProposedAnswer, reason: RejectReason, detail?: string) =>
     rejected.push({ questionId: proposal.questionId, reason, detail, proposal });
+
+  /** Several structured parts for one question, as one proposal. */
+  const mergedProposal = (ordered: ProposedAnswer[]): ProposedAnswer => {
+    const primary = ordered[0]!;
+    return {
+      questionId: primary.questionId,
+      value: { kind: "structured", data: mergeStructuredParts(ordered.map((p) => (p.value as { data: unknown }).data)) },
+      // As sure as its least sure part: every part was checked on its own,
+      // and the answer is only as good as the weakest slice of it.
+      confidence: Math.min(...ordered.map((p) => p.confidence)),
+      evidence: [...new Set(ordered.flatMap((p) => p.evidence.split("\n")))].join("\n"),
+      sourceMessageId: primary.sourceMessageId,
+    };
+  };
+
+  /**
+   * What a proposal refused for LOW_CONFIDENCE would have become: every other
+   * check the gate makes, applied in full. Parts for one structured question
+   * are merged exactly as accepted parts are; if the merge does not validate,
+   * the most confident part alone is tried.
+   */
+  const suggestFrom = (parts: readonly ProposedAnswer[]) => {
+    const usable = parts.filter((p) =>
+      evidenceAppears(p.evidence, ctx.sourceText)
+      && exampleEchoes(questions.find((q) => q.id === p.questionId)?.dataExample, p.value, ctx.sourceText).length === 0);
+    if (usable.length === 0) return;
+    const ordered = [...usable].sort((a, b) => b.confidence - a.confidence);
+    const candidates = ordered.length > 1 ? [mergedProposal(ordered), ordered[0]!] : [ordered[0]!];
+    for (const candidate of candidates) {
+      const validated = validateProposed(candidate, questions);
+      if (validated.ok) {
+        suggested.push({ questionId: candidate.questionId, answer: validated.answer, proposal: candidate });
+        return;
+      }
+    }
+  };
 
   const isStructured = (p: ProposedAnswer) => p.value.kind === "structured";
 
@@ -749,26 +808,23 @@ export function applyProposals(
 
   const decideStructured = (parts: ProposedAnswer[]) => {
     const passing: ProposedAnswer[] = [];
+    const unsure: ProposedAnswer[] = [];
     for (const p of parts) {
       const refused = ownMerits(p);
-      if (refused) reject(p, refused.reason, refused.detail);
-      else passing.push(p);
+      if (refused) {
+        reject(p, refused.reason, refused.detail);
+        if (refused.reason === "LOW_CONFIDENCE") unsure.push(p);
+      } else passing.push(p);
     }
-    if (passing.length === 0) return;
+    // Only when nothing for this question passed: a suggestion never competes
+    // with an answer the gate accepted.
+    if (passing.length === 0) return suggestFrom(unsure);
     // Stable, so a tie keeps document order — the same rule as `winner`.
     const ordered = [...passing].sort((a, b) => b.confidence - a.confidence);
     const primary = ordered[0]!;
 
     if (ordered.length > 1) {
-      const merged: ProposedAnswer = {
-        questionId: primary.questionId,
-        value: { kind: "structured", data: mergeStructuredParts(ordered.map((p) => (p.value as { data: unknown }).data)) },
-        // As sure as its least sure part: every part was checked on its own,
-        // and the answer is only as good as the weakest slice of it.
-        confidence: Math.min(...ordered.map((p) => p.confidence)),
-        evidence: [...new Set(ordered.flatMap((p) => p.evidence.split("\n")))].join("\n"),
-        sourceMessageId: primary.sourceMessageId,
-      };
+      const merged = mergedProposal(ordered);
       const validated = validateProposed(merged, questions);
       if (validated.ok) {
         accepted.push({ questionId: primary.questionId, answer: validated.answer, proposal: merged, mergedFrom: ordered.length });
@@ -799,6 +855,7 @@ export function applyProposals(
     if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
     if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
+      suggestFrom([proposal]);
       return reject(proposal, "LOW_CONFIDENCE");
     }
     if (!evidenceAppears(proposal.evidence, ctx.sourceText)) return reject(proposal, "EVIDENCE_NOT_IN_SOURCE");
@@ -818,7 +875,7 @@ export function applyProposals(
   for (const r of rejected) if (outstanding.has(r.questionId) && !answered.has(r.questionId)) ask.add(r.questionId);
   for (const a of accepted) ask.delete(a.questionId);
 
-  return { accepted, rejected, askAnyway: [...ask] };
+  return { accepted, rejected, askAnyway: [...ask], suggested };
 }
 
 export interface SubmitArgs {
@@ -1003,9 +1060,12 @@ export function buildExtractIntakePrompt(args: {
   outstanding: readonly string[];
   language: string;
   questions?: readonly IntakeQuestion[];
+  /** What "this year" is when a weekday settles a date's year. Tests pin it. */
+  today?: Date;
 }): string {
   const all = args.questions ?? INTAKE_QUESTIONS;
   const asked = all.filter((q) => args.outstanding.includes(q.id));
+  const weekdayDates = yearlessDateHints(args.documentText, args.today ?? new Date());
   return [
     `Someone planning a trip has uploaded a document — a booking confirmation, a`,
     `flight itinerary, tickets, or a plan they wrote. They write in ${languageName(args.language)}.`,
@@ -1095,7 +1155,9 @@ export function buildExtractIntakePrompt(args: {
     `  rental does not set the trip's dates.`,
     `- A date without a year takes its year from the whole-trip dates only when`,
     `  exactly one reading fits (a trip over New Year crosses into the next`,
-    `  year). Never take a year from today or from a quote or reference number.`,
+    `  year), or from the list of weekday dates just before the document when`,
+    `  that date is on it. Never take a year from today or from a quote or`,
+    `  reference number.`,
     `  A date that could be read two ways ("03/04") is left out, not guessed.`,
     `- Do not add a stop, a transfer or dates the document does not describe.`,
     `- A party size with no names ("4 adults", "מבוגרים 4") does not answer`,
@@ -1121,6 +1183,19 @@ export function buildExtractIntakePrompt(args: {
     ``,
     `No commentary.`,
     ``,
+    // Worked out in code, not by the model — see yearless-dates.ts. Outside the
+    // markers, because it is not the document and must not be quoted as it.
+    ...(weekdayDates.length > 0
+      ? [
+        `Weekday dates with no year. The document prints each of these with a`,
+        `weekday and no year; the year given is the only one, from this year to two`,
+        `years ahead, in which that date falls on that weekday. Use it for that`,
+        `date. These lines are not part of the document — "evidence" still quotes`,
+        `the document itself.`,
+        ...weekdayDates.map((d) => `- ${JSON.stringify(d.quote)} is ${d.iso}`),
+        ``,
+      ]
+      : []),
     `Document (everything between the two marker lines):`,
     `<<<DOCUMENT`,
     args.documentText,
@@ -1141,6 +1216,7 @@ export async function extractIntakeFromDocument(
     language: string;
     questions?: readonly IntakeQuestion[];
     timeoutMs?: number;
+    today?: Date;
   },
 ): Promise<InterpretResult> {
   const once = () => runner.run<InterpretPayload>({

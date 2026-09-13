@@ -270,3 +270,23 @@ describe("the e2e japan document through the gate", () => {
     assert.ok(decisions.accepted.some((a) => a.questionId === "phases"));
   });
 });
+
+describe("weekday dates with no year", () => {
+  const outstanding = INTAKE_QUESTIONS.map((q) => q.id);
+  const today = new Date(Date.UTC(2026, 4, 23));
+
+  test("the prompt gives the year each one takes, outside the document markers", () => {
+    const prompt = buildExtractIntakePrompt({
+      documentText: "Hotel Solmar\nCHECK-IN\n23\nJULY\nThursday\nCHECK-OUT\n25\nJULY\nSaturday",
+      outstanding, language: "he", today,
+    });
+    assert.ok(prompt.includes('- "23 JULY Thursday" is 2026-07-23'), "check-in");
+    assert.ok(prompt.includes('- "25 JULY Saturday" is 2026-07-25'), "check-out");
+    assert.ok(prompt.indexOf("2026-07-23") < prompt.indexOf("<<<DOCUMENT"), "before the document, not inside it");
+  });
+
+  test("no list at all when the document has no such date", () => {
+    const prompt = buildExtractIntakePrompt({ documentText: "Tokyo Sep 19 - Sep 23 2026", outstanding, language: "he", today });
+    assert.equal(prompt.includes("Weekday dates with no year"), false);
+  });
+});

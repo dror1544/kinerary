@@ -1252,3 +1252,71 @@ describe("buildRecap never shows [object Object]", () => {
     }
   });
 });
+
+describe("an answer below the confidence floor becomes a suggestion", () => {
+  const low = DEFAULT_MIN_CONFIDENCE - 0.2;
+
+  test("still refused and still asked — but carried with the answer it would have been", () => {
+    const { accepted, rejected, askAnyway, suggested } = applyProposals([proposal({ confidence: low })], CTX);
+    assert.equal(accepted.length, 0);
+    assert.equal(rejected[0]?.reason, "LOW_CONFIDENCE");
+    assert.ok(askAnyway.includes("destination"));
+    assert.deepEqual(suggested.map((s) => [s.questionId, s.answer.kind]), [["destination", "text"]]);
+  });
+
+  test("evidence that is not in the source is never suggested", () => {
+    const { rejected, suggested } = applyProposals([proposal({ confidence: low, evidence: "Italy" })], CTX);
+    assert.equal(rejected[0]?.reason, "LOW_CONFIDENCE");
+    assert.deepEqual(suggested, []);
+  });
+
+  test("an answer that does not validate is never suggested", () => {
+    const { suggested } = applyProposals([proposal({ confidence: low, value: { kind: "text", text: "x".repeat(200) } })], CTX);
+    assert.deepEqual(suggested, []);
+  });
+
+  test("an answered question, or one not being asked, is never suggested", () => {
+    assert.deepEqual(applyProposals([proposal({ confidence: low })], { ...CTX, outstanding: ["trip_type"], answered: ["destination"] }).suggested, []);
+    assert.deepEqual(applyProposals([proposal({ confidence: low })], { ...CTX, outstanding: ["trip_type"] }).suggested, []);
+  });
+
+  test("a confident answer is accepted, not suggested", () => {
+    const { accepted, suggested } = applyProposals([proposal()], CTX);
+    assert.equal(accepted.length, 1);
+    assert.deepEqual(suggested, []);
+  });
+
+  const STOPS = {
+    sourceText: "Rome 1 May - 4 May 2027\nFlorence 4 May - 7 May 2027",
+    outstanding: ["phases"],
+    answered: [] as string[],
+    questions: INTAKE_QUESTIONS,
+  };
+  const stop = (name: string, start: string, end: string, confidence: number, evidence: string): ProposedAnswer => ({
+    questionId: "phases",
+    value: { kind: "structured", data: [{ name, start, end }] },
+    confidence,
+    evidence,
+    sourceMessageId: "doc",
+  });
+
+  test("unsure parts of one structured answer merge into one suggestion", () => {
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", low, "Rome 1 May - 4 May 2027"),
+      stop("Florence", "2027-05-04", "2027-05-07", low - 0.1, "Florence 4 May - 7 May 2027"),
+    ], STOPS);
+    assert.equal(accepted.length, 0);
+    assert.equal(suggested.length, 1);
+    const data = suggested[0]?.answer.kind === "structured" ? (suggested[0].answer.data as { name: string }[]) : [];
+    assert.deepEqual(data.map((d) => d.name), ["Rome", "Florence"]);
+  });
+
+  test("when any part of a structured answer was accepted, the unsure part is not offered beside it", () => {
+    const { accepted, suggested } = applyProposals([
+      stop("Rome", "2027-05-01", "2027-05-04", 0.9, "Rome 1 May - 4 May 2027"),
+      stop("Florence", "2027-05-04", "2027-05-07", low, "Florence 4 May - 7 May 2027"),
+    ], STOPS);
+    assert.equal(accepted.length, 1);
+    assert.deepEqual(suggested, []);
+  });
+});
