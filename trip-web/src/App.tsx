@@ -713,7 +713,7 @@ function TodayView({
               <span>{item.name}</span>
               <small>{item.next_action}</small>
             </article>
-          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>{copy(lang,"Core confirmations look complete.","האישורים העיקריים נראים מלאים.")}</span><small>{copy(lang,"Budget remains in its own module.","התקציב מוצג במסך נפרד.")}</small></article>}
+          )) : <article className="readiness-row good"><CheckCircle2 size={18} /><span>{copy(lang,"Core confirmations look complete.","האישורים העיקריים נראים מלאים.")}</span><small><a href="#budget">{copy(lang,"Budget remains in its own module.","התקציב מוצג במסך נפרד.")}</a></small></article>}
         </div>
       </section>
     </section>
