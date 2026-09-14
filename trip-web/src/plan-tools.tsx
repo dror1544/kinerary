@@ -14,6 +14,8 @@ import {
   type Lang,
 } from "./parity-ui";
 
+const RESTORE_PATH = "/api/itinerary/restore-original";
+
 export function PlanTools({
   itinerary,
   config,
@@ -86,8 +88,12 @@ export function PlanTools({
   );
   const operation = useAction(
     lang,
-    ["itinerary", "today", "config", "revisions"],
-    (op: string) => api(`/api/phase-plan/${op}`, { method: "POST" }),
+    ["itinerary", "today", "config", "revisions", "original"],
+    (path: string) =>
+      api(path, {
+        method: "POST",
+        headers: path === RESTORE_PATH && itinerary?.revision ? { "If-Match": itinerary.revision } : undefined,
+      }),
     () => setConfirmed(false),
   );
   const persistedDays = itinerary?.days.filter((d) => d.phase_id === phase) || [];
@@ -224,13 +230,13 @@ export function PlanTools({
         <ActionState action={action} lang={lang} />
       </Section>
       <Section
-        title={tr(lang, "Import, enrich and export", "ייבוא, העשרה וייצוא")}
+        title={tr(lang, "Save, restore and import", "שמירה, שחזור וייבוא")}
       >
         <p>
           {tr(
             lang,
-            "These actions change the shared trip plan. Import reads existing booking notes; export saves the dated plan as the trip’s configured schedule.",
-            "פעולות אלה משנות את המסלול המשותף. ייבוא קורא הערות מהזמנות קיימות; ייצוא שומר את המסלול המתוארך כלוח הזמנים של הטיול.",
+            "These actions change the shared trip plan. Save writes the current plan to the trip file and makes it the restore point; restore replaces the live plan with the last saved one, and the change stays in revision history.",
+            "פעולות אלה משנות את המסלול המשותף. שמירה כותבת את המסלול הנוכחי לקובץ הטיול והופכת אותו לנקודת השחזור; שחזור מחליף את המסלול החי במסלול השמור האחרון, והשינוי נשמר בהיסטוריית הגרסאות.",
           )}
         </p>
         <label>
@@ -247,22 +253,10 @@ export function PlanTools({
         </label>
         <div className="parity-actions">
           {[
-            [
-              "promote-config-days",
-              "Import original schedule",
-              "ייבוא המסלול המקורי",
-            ],
-            [
-              "import-from-bookings",
-              "Import booking notes",
-              "ייבוא הערות מהזמנות",
-            ],
-            ["enrich-pending", "Enrich pending items", "העשרת פריטים ממתינים"],
-            [
-              "export-to-config",
-              "Save as configured schedule",
-              "שמירה כלוח הזמנים של הטיול",
-            ],
+            ["/api/phase-plan/export-to-config", "Save plan as restore point", "שמירת המסלול כנקודת שחזור"],
+            [RESTORE_PATH, "Restore saved plan", "שחזור המסלול השמור"],
+            ["/api/phase-plan/import-from-bookings", "Import booking notes", "ייבוא הערות מהזמנות"],
+            ["/api/phase-plan/enrich-pending", "Enrich pending items", "העשרת פריטים ממתינים"],
           ].map(([op, en, he]) => (
             <button
               key={op}
@@ -275,7 +269,7 @@ export function PlanTools({
         </div>
         <ActionState action={operation} lang={lang} />
       </Section>
-      <Section title={tr(lang, "Compare with original", "השוואה למקור")}>
+      <Section title={tr(lang, "Compare with saved plan", "השוואה למסלול השמור")}>
         <QueryState query={original} lang={lang} />
         {original.data && (
           <>

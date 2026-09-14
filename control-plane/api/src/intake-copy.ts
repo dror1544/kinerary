@@ -161,6 +161,17 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
     },
     recap: { en: "Who that applies to", he: "למי זה נוגע" },
   },
+  dietary_visibility: {
+    ask: {
+      en: "Should everyone on the trip know about these food needs and allergies, or only you? Sharing is recommended — it keeps everyone safe.",
+      he: "שכולם בטיול יידעו על מגבלות האכילה והאלרגיות האלה, או רק אתה? מומלץ לשתף — ככה כולם שומרים.",
+    },
+    recap: { en: "Food needs shared with", he: "מגבלות האכילה משותפות עם" },
+    options: {
+      group: { en: "Everyone on the trip", he: "כל מי שבטיול" },
+      organizer: { en: "Only me (the organizer)", he: "רק איתי (המארגן)" },
+    },
+  },
   organizer_identity: {
     ask: {
       en: "Which of the travellers are you? This opens your private organizer channel with the assistant.",

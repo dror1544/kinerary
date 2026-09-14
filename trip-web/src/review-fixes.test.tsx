@@ -22,9 +22,21 @@ it('clearing the day releases the editing state and shared actions', () => {
   render(<QueryClientProvider client={c}><PlanTools lang="en" config={config} itinerary={itinerary} /></QueryClientProvider>);
   fireEvent.click(screen.getByRole('checkbox'));
   fireEvent.change(screen.getByLabelText('Day'), { target: { value: '2027-03-11' } });
-  expect(screen.getByRole('button', { name: 'Import original schedule' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Restore saved plan' })).toBeDisabled();
   fireEvent.change(screen.getByLabelText('Day'), { target: { value: '' } });
-  expect(screen.getByRole('button', { name: 'Import original schedule' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Restore saved plan' })).toBeEnabled();
+});
+
+it('restore sends the revision it was shown, so a newer plan is not overwritten', async () => {
+  const fetcher = vi.fn(async (url: string) => response(url.endsWith('/original') ? { days: [], items: [] } : []));
+  vi.stubGlobal('fetch', fetcher);
+  render(<QueryClientProvider client={client()}><PlanTools lang="en" config={config} itinerary={{ ...itinerary, revision: 'r-live' }} /></QueryClientProvider>);
+  fireEvent.click(screen.getByRole('checkbox'));
+  fireEvent.click(screen.getByRole('button', { name: 'Restore saved plan' }));
+  await waitFor(() => expect(fetcher.mock.calls.some(([url]) => url === '/api/itinerary/restore-original')).toBe(true));
+  const [, init] = fetcher.mock.calls.find(([url]) => url === '/api/itinerary/restore-original') as unknown as [string, RequestInit];
+  expect(init.method).toBe('POST');
+  expect(new Headers(init.headers).get('If-Match')).toBe('r-live');
 });
 
 it.each(['Save day title', 'Swap these days'])('%s sends the captured revision after background data changes', async button => {

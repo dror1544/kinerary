@@ -49,6 +49,8 @@ release serve both schema versions (see migration 0018).
   dietary_scope  structured (object): option id -> "everyone" | [names]. Named
                  people get participants[].needs[] entries; anything group-wide
                  or unattributable becomes a standing instruction instead
+  dietary_visibility choice: group/organizer — who may see those needs;
+                 unanswered means group
   organizer_identity text: matched to a participant username for
                  agent.organizers; no match means no organizers key at all
   bot_name       text: assistant's display name; absent = no persona written
@@ -63,8 +65,8 @@ release serve both schema versions (see migration 0018).
                  the two agents. Additive-optional; no schema bump.
 
 Everything the v2 questions write into `agent.standing_instructions[]` carries
-`visibility: "organizer"` — see _instruction() for why that is blanket rather
-than per-field.
+`visibility: "organizer"` — see _instruction() — except dietary entries, which
+carry the organizer's own `dietary_visibility` choice, as participant needs do.
 
 Hero `meta.brand`/`meta.title` are derived from destination + trip type + the
 departure year (e.g. "USA 2026"), not a fixed value — the site renders
@@ -560,19 +562,27 @@ def split_bilingual_name(raw: str) -> tuple[str, str]:
 _AGENT_TONES = frozenset({"warm", "playful", "dry"})
 
 
-def _instruction(text: dict[str, str]) -> dict[str, Any]:
+def _instruction(text: dict[str, str], visibility: str = "organizer") -> dict[str, Any]:
     """Wraps bilingual text as a standing instruction.
 
-    Every instruction this transformer writes is organizer-only, without
-    exception. shared/agent-schema.js makes that the blanket default so nobody
-    has to judge, field by field, which instructions look harmless enough to
-    publish — and the two failure modes are wildly lopsided: an over-hidden
-    instruction is a slightly less chatty bot, an over-shared one puts a
-    private fact about a named family member on an endpoint every logged-in
-    member (children included) can read. The bot still reads and acts on
-    organizer-only material, so nothing is actually lost by staying silent.
+    Organizer-only unless the caller carries the organizer's own sharing
+    choice (dietary). Nobody judges field by field which instructions look
+    harmless enough to publish: an over-hidden one is a slightly less chatty
+    bot, an over-shared one puts a private fact on an endpoint every logged-in
+    member (children included) can read. The bot acts on organizer-only
+    material either way.
     """
-    return {"visibility": "organizer", "text": text}
+    return {"visibility": visibility, "text": text}
+
+
+def _dietary_visibility(data: Mapping[str, Any]) -> str:
+    """The organizer's sharing choice for dietary and allergy needs; unanswered means shared."""
+    answer = data.get("dietary_visibility")
+    if not isinstance(answer, Mapping):
+        return "group"
+    choice = _text_value(answer)
+    # An unrecognized answer fails safe, like shared/needs-schema.js.
+    return choice if choice in ("group", "organizer") else "organizer"
 
 
 def _apply_dietary(
@@ -591,6 +601,7 @@ def _apply_dietary(
     if not selected:
         return []
 
+    visibility = _dietary_visibility(data)
     scope = _structured_dict(data, "dietary_scope")
     by_name: dict[str, dict[str, Any]] = {}
     for p in participants:
@@ -619,13 +630,14 @@ def _apply_dietary(
             instructions.append(_instruction({
                 "he": f"{prefix_he}: {text['he']}",
                 "en": f"{prefix_en}: {text['en']}",
-            }))
+            }, visibility))
             continue
 
         for participant in matched:
             participant.setdefault("needs", []).append({
                 "type": need_type,
                 "severity": severity,
+                "visibility": visibility,
                 "text": dict(text),
             })
 

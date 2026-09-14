@@ -241,8 +241,7 @@ function schema(db) {
       BEFORE DELETE ON itinerary_plan_items
       BEGIN SELECT RAISE(ABORT, 'itinerary plan items are immutable'); END;
   `);
-  // Set once the compatibility tables actually carry the config items, and
-  // never cleared. See legacyOwnsConfig().
+  // Set once importPlanOnce() has made phase_plan_* the plan; never cleared.
   try { db.exec('ALTER TABLE trip_itinerary_state ADD COLUMN legacy_owns_config INTEGER NOT NULL DEFAULT 0'); } catch {}
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
 }
@@ -583,10 +582,8 @@ function requireFields(body, fields) {
   return null;
 }
 
-function cloneWith(db, author, note, transform) {
-  const state = getState(db);
-  const rows = getVersionRows(db, state.active_version_id);
-  const nextRows = {
+function toWritableRows(rows) {
+  return {
     days: rows.days.map((day) => ({
       ...day,
       lodging_context: writeJson(day.lodging_context),
@@ -594,6 +591,12 @@ function cloneWith(db, author, note, transform) {
     })),
     items: rows.items.map((item) => ({ ...item, extra_links: writeJson(item.extra_links) })),
   };
+}
+
+function cloneWith(db, author, note, transform) {
+  const state = getState(db);
+  const rows = getVersionRows(db, state.active_version_id);
+  const nextRows = toWritableRows(rows);
   transform(nextRows);
   const cfg = {
     version: rows.version.source_config_version,
@@ -677,53 +680,39 @@ function applyItemEnrichment(db, legacy, fields) {
   });
 }
 
-// Classic treats phase_plan_* as an overlay that supersedes the config
-// schedule as soon as it is non-empty (see renderDays() in site/app.js), so a
-// single added item is indistinguishable from a complete plan by row count
-// alone. What actually moves the config schedule INTO those tables is either
-// promote-config-days or a Modern write projecting back through
-// updateLegacyFromActive() — both of which stamp config_ref. Once that has
-// happened the overlay really is the whole plan, so this is sticky and is
-// recorded rather than re-derived: a promoted item the organizer later deletes
-// must stay deleted, and after the fact that looks exactly like an item that
-// was never promoted. Same reason phase_plan_import_log exists.
-function legacyOwnsConfig(db) {
-  if (getState(db)?.legacy_owns_config) return true;
-  const carries = db.prepare(
+// Imports the schedule into phase_plan_* once, so those tables are the plan's only source.
+function importPlanOnce(db, promoteFromConfig) {
+  const state = getState(db);
+  if (!state || state.legacy_owns_config) return false;
+  const promoted = db.prepare(
     "SELECT 1 FROM phase_plan_items WHERE config_ref IS NOT NULL AND config_ref <> '' LIMIT 1"
   ).get();
-  if (!carries) return false;
+  if (!promoted) {
+    // A trip that already has writes keeps what it shows now, not a re-read of a config it drifted from.
+    if (db.prepare('SELECT 1 FROM phase_plan_items LIMIT 1').get()) updateLegacyFromActive(db);
+    else promoteFromConfig();
+  }
   db.prepare('UPDATE trip_itinerary_state SET legacy_owns_config = 1 WHERE id = 1').run();
   return true;
 }
 
-// Keeps the config-imported schedule the itinerary already holds while the
-// overlay only carries the organizer's additions, so a first Classic edit adds
-// to the plan instead of replacing it.
-function carryConfigRowsForward(current, rows) {
-  if (!current) return;
-  const haveItem = new Set(rows.items.map((item) => item.item_uid));
-  const haveDay = new Set(rows.days.map((day) => `${day.phase_id}|${day.date}`));
-  for (const item of current.items) {
-    if (haveItem.has(item.item_uid)) continue;
-    if (!CONFIG_REF_RE.test(String(item.source_ref || ''))) continue;
-    rows.items.push({ ...item, extra_links: writeJson(item.extra_links) });
-    haveItem.add(item.item_uid);
-  }
-  for (const day of current.days) {
-    const key = `${day.phase_id}|${day.date}`;
-    if (haveDay.has(key)) continue;
-    // Only days a carried item still lands on — a day left empty must not
-    // come back with it.
-    if (!rows.items.some((item) => item.phase_id === day.phase_id && item.date === day.date)) continue;
-    rows.days.push({
-      ...day,
-      lodging_context: writeJson(day.lodging_context),
-      pickup_context: writeJson(day.pickup_context),
-      sort_order: rows.days.length,
+// The saved plan is what Compare shows and what Restore brings back.
+function setRestorePoint(db, author) {
+  const state = getState(db);
+  const rows = getVersionRows(db, state.active_version_id);
+  let id;
+  db.transaction(() => {
+    id = createVersion(db, {
+      kind: 'original',
+      parent: state.original_version_id,
+      author,
+      note: 'Saved plan to trip.config.json',
+      configVersionInfo: configVersion(db, null),
+      rows: toWritableRows(rows),
     });
-    haveDay.add(key);
-  }
+    db.prepare("UPDATE trip_itinerary_state SET original_version_id = ?, updated_at = datetime('now') WHERE id = 1").run(id);
+  })();
+  return id;
 }
 
 function syncFromLegacy(db, raw, author = 'legacy-api') {
@@ -731,7 +720,6 @@ function syncFromLegacy(db, raw, author = 'legacy-api') {
   if (!state) return null;
   const rows = rowsFromLegacyPlan(db);
   const current = getVersionRows(db, state.active_version_id);
-  if (!legacyOwnsConfig(db)) carryConfigRowsForward(current, rows);
   if (!rows.items.length && !rows.days.length) return state.active_version_id;
   const comparable = (value) => ({
     days: value.days.map(({ phase_id, date, label_he, label_en, lodging_context, pickup_context, sort_order }) => ({
@@ -1211,6 +1199,17 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
     res.json({ revision: nextId });
   });
 
+  app.post('/api/itinerary/restore-original', organizerOrAgentRequired, itineraryRevisionMatches, (req, res) => {
+    const saved = getVersionRows(db, getState(db).original_version_id);
+    // Adopt Classic-written rows first: the projection below only deletes rows it can identify.
+    updateLegacyFromActive(db);
+    const nextId = cloneWith(db, req.user.username, 'Restored the saved plan', (rows) => {
+      Object.assign(rows, toWritableRows(saved));
+    });
+    updateLegacyFromActive(db);
+    res.json({ revision: nextId });
+  });
+
   app.post('/api/agent/daily-message', organizerOrAgentRequired, (req, res) => {
     const { date, he, en } = req.body || {};
     if (date !== localClock(config).date) return res.status(409).json({ error: 'message_date_must_match_today' });
@@ -1343,6 +1342,8 @@ function create(options) {
     syncFromLegacy: (author) => syncFromLegacy(db, raw, author),
     applyItemEnrichment: (legacy, fields) => applyItemEnrichment(db, legacy, fields),
     updateLegacyFromActive: () => updateLegacyFromActive(db),
+    importPlanOnce: (promoteFromConfig) => importPlanOnce(db, promoteFromConfig),
+    setRestorePoint: (author) => setRestorePoint(db, author),
     uiSettings: () => uiSettings(db),
   };
 }

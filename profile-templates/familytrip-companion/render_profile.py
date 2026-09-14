@@ -14,6 +14,15 @@ GENDER_RULE={
  'female':'You are {name}, and you speak about yourself in the **feminine**. In Hebrew: «אני בודקת», «שמחה לעזור», «הייתי שם» — never the masculine forms.',
  'neutral':'You are {name}, and you avoid gendering yourself. Hebrew has no neuter, so reach for phrasings that do not force a choice — «אבדוק» rather than «אני בודק/בודקת», a noun where a participle would commit you. Do not alternate between masculine and feminine forms: that reads as a mistake rather than as neutrality, and do not write «בודק/ת» either.',
 }
+# `tone` is required and validated exactly like `gender`, but until now it
+# only reached references/group-context.json as inert JSON — nothing in the
+# prompt told the assistant to actually speak that way, so every companion
+# read the same as "warm" regardless of what was chosen.
+TONE_RULE={
+ 'warm':'Speak warmly: encouraging and personable, a little emotionally present — "that sounds like a great plan" rather than a flat confirmation. Still concise; the warmth is in the word choice, not the length.',
+ 'playful':'Speak playfully: light and upbeat, comfortable with a bit of humor or an emoji where it fits naturally. Stay useful first — playful is the seasoning, not the answer.',
+ 'dry':'Speak dryly: understated and efficient, mostly just the facts. Skip enthusiasm and filler ("Great question!", "Happy to help!"); a flash of dry wit is fine, gushing is not.',
+}
 def bad(m): raise ValueError(m)
 def scan(v,path='$'):
  if isinstance(v,dict):
@@ -43,7 +52,7 @@ def render(d,out):
  validate(d)
  if out.exists() and any(out.iterdir()): bad(f'output is not empty: {out}')
  out.mkdir(parents=True,exist_ok=True); t=d['trip']; a=d['assistant']; o=d['organizer']
- v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ASSISTANT_GENDER_RULE':GENDER_RULE[a['gender']].replace('{name}',a['name']),'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-mcp'}
+ v={'PROFILE_NAME':d['profile']['name'],'PROFILE_DESCRIPTION_JSON':json.dumps(d['profile'].get('description') or f"Trip companion for {t['title']}",ensure_ascii=False),'TRIP_TITLE':t['title'],'SITE_URL':t['canonical_site_url'],'TIMEZONE':t['timezone'],'ASSISTANT_NAME':a['name'],'ASSISTANT_GENDER_RULE':GENDER_RULE[a['gender']].replace('{name}',a['name']),'ASSISTANT_TONE_RULE':TONE_RULE[a['tone']],'ORGANIZER_NAME':o['display_name'],'ORGANIZER_REF':o['person_ref'],'SITE_CONNECTION_NAME':t.get('site_connection_name') or 'trip-mcp'}
  for src,dst in [('SOUL.md.tpl','SOUL.md'),('profile.yaml.tpl','profile.yaml'),('config.overlay.yaml.tpl','config.overlay.yaml')]: (out/dst).write_text(tpl(ROOT/'templates'/src,v))
  (out/'references').mkdir(); (out/'references/sources.md').write_text(tpl(ROOT/'templates/references/sources.md.tpl',v)); shutil.copytree(ROOT/'templates/skills',out/'skills')
  group={'schema_version':1,'trip':{k:t[k] for k in ('id','title','default_language','timezone')},'assistant':a,'preferences':d['interview'].get('group_safe',{})}
