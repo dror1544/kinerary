@@ -361,10 +361,10 @@ them; the code, tool descriptions and agent handoff all do.
 
 | | **Original plan** | **Active plan** | Bookings |
 |---|---|---|---|
-| Where | `trip.config.json` → `phases[].days` | `phase_plan_items` + `phase_plan_days` | `bookings` table |
-| What | the schedule as authored, before the trip moved | the live schedule: original plan promoted in, plus AI enrichment and the organizer's own edits | reservations: supplier, confirmation, cost, passengers |
-| Written by | hand, at trip setup | `add/update/delete_plan_item`, `swap_plan_days`, `set_plan_day_label` | `add_booking`, `update_booking` |
-| Shown | organizer only, collapsed, as a comparison | **what everyone sees** | booking cards |
+| Where | `trip.config.json` → `phases[].days`, plus its saved copy (`/api/itinerary/original`) | `phase_plan_items` + `phase_plan_days` | `bookings` table |
+| What | the schedule as authored, then whatever plan was last saved back | the live schedule: imported once at first boot, plus AI enrichment and the organizer's own edits | reservations: supplier, confirmation, cost, passengers |
+| Written by | trip setup; `POST /api/phase-plan/export-to-config` (plan tools → *Save plan as restore point*) | `add/update/delete_plan_item`, `swap_plan_days`, `set_plan_day_label` | `add_booking`, `update_booking` |
+| Shown | organizer only, as *Compare with saved plan*; *Restore saved plan* brings it back | **what everyone sees** | booking cards |
 
 **Every itinerary change edits the active plan.** A new route for today,
 moving or swapping two days, fixing tomorrow — all of it. The original plan is
@@ -373,10 +373,12 @@ a read-only reference; nothing edits it in response to a change request.
 nothing the family sees. That mismatch is why `swap_plan_days` exists as one
 atomic operation rather than a batch of per-item date edits.
 
-`renderDays()` flips a phase from original to active on its **first** active
-item — not per day. So a phase whose active plan is empty must be seeded
-wholesale (`POST /api/phase-plan/promote-config-days`) rather than one item at
-a time, or participants lose the rest of that phase's schedule.
+The site imports `phases[].days` into the active plan **once**, on first boot
+(`importPlanOnce()` in `server/living-journey.js`), so the active plan is the
+only plan anything reads — the site, `get_phase_plan`, and exports alike.
+Editing `trip.config.json` afterwards changes nothing the family sees. To keep a
+copy, save the live plan back (`export-to-config`); that save is also what
+`POST /api/itinerary/restore-original` restores.
 
 Two ways to use it, same server either way:
 - **A local always-on agent** (Hermes, OpenClaw, your own) on your own

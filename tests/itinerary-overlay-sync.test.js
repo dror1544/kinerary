@@ -18,7 +18,8 @@
  *      was not in it.
  *
  * The fixture's `ny` phase carries three config items on a single day, which
- * is the shape both bugs need.
+ * is the shape both bugs need. Since importPlanOnce(), A cannot recur: the
+ * config day is in the plan tables from boot (see plan-single-source.test.js).
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';

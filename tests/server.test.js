@@ -794,11 +794,12 @@ describe('Phase plan items', () => {
     assert.equal(res.status, 401);
   });
 
-  test('GET /api/phases/ny/plan — 200 empty array for family member', async () => {
+  test('GET /api/phases/ny/plan — 200 with the boot-imported config day for family member', async () => {
     const res = await api('/api/phases/ny/plan', { token: bobToken });
     assert.equal(res.status, 200);
     const data = await res.json();
-    assert.ok(Array.isArray(data) && data.length === 0);
+    assert.ok(Array.isArray(data));
+    assert.equal(data.filter(i => i.config_ref).length, 3);
   });
 
   test('GET /api/phases/invalid/plan — 400 unknown phase', async () => {
@@ -1144,8 +1145,7 @@ describe('Phase plan items — validation and phase scoping', () => {
   });
 });
 
-// phases[].days[] is read-only config and can never be enriched; this copies it
-// into the editable layer so an existing schedule stops being a dead end.
+// Boot runs this import once (importPlanOnce); calling the route again only backfills links.
 describe('Promote config days into plan items', () => {
   let bobToken;
   before(async () => {
@@ -1158,14 +1158,10 @@ describe('Promote config days into plan items', () => {
     assert.equal(res.status, 403);
   });
 
-  test('promotes the fixture day, stripping markup and keeping the map href', async () => {
-    const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
-    assert.equal(res.status, 200);
-    const { created } = await res.json();
-    assert.equal(created, 3, 'the ny fixture day has 3 items');
-
+  test('boot imports the fixture day, stripping markup and keeping the map href', async () => {
     const rows = (await (await api('/api/phases/ny/plan', { token })).json())
       .filter(i => i.config_ref);
+    assert.equal(rows.length, 3, 'the ny fixture day has 3 items');
 
     const park = rows.find(i => (i.text_en || '').includes('Central Park'));
     assert.ok(park, 'the Central Park item should have been promoted');
@@ -1180,12 +1176,9 @@ describe('Promote config days into plan items', () => {
     assert.ok(early, 'the ranged-time item should have been promoted');
     assert.equal(early.time, null, 'a range is not a storable time');
     assert.match(early.text_he, /06:30/, 'the original range must survive in the text');
-
-    assert.ok(rows.every(i => i.enrichment_status === 'pending'),
-      'promoted items should queue for enrichment');
   });
 
-  test('promoting twice does not duplicate the schedule', async () => {
+  test('promoting after the boot import creates nothing', async () => {
     const before = (await (await api('/api/phases/ny/plan', { token })).json())
       .filter(i => i.config_ref).length;
     const res = await api('/api/phase-plan/promote-config-days', { method: 'POST', token });
@@ -1279,8 +1272,7 @@ describe('Promote config days into plan items', () => {
   });
 });
 
-// API-only by design — no button reaches this, because it rewrites the trip's
-// source-of-truth config file.
+// Plan tools reaches this behind a confirmation; it rewrites trip.config.json and sets the restore point.
 describe('Export the plan back into trip.config.json', () => {
   let bobToken;
   before(async () => {

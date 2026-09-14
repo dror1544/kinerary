@@ -38,6 +38,8 @@ export const PORTS = {
   currencyRates:            3107,
   scheduleReviewServer:     3109,
   itineraryOverlaySync:     3113,
+  planSingleSource:         3119,
+  planSingleSourceBoot:     3120,
   itineraryPlanLayerServer: 3118,  // moved off 3107 (currencyRates)
   configDayLinksServer:     3114,  // moved off 3110 (scheduleReviewMockHermes)
 

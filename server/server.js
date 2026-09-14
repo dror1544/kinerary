@@ -3113,12 +3113,12 @@ function stripTags(html) {
     .trim();
 }
 
-app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, res) => {
+function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   const created = [];
   const skipped = [];
   // No enrichment worker (HERMES_URL unset) → 'none', not a permanent
   // "Finding links…"; link enrichment for a provisioned trip ran at setup.
-  const enrichSeed = HERMES_URL ? 'pending' : 'none';
+  const enrichSeed = HERMES_URL && queueEnrichment ? 'pending' : 'none';
   const insert = db.prepare(
     'INSERT OR IGNORE INTO phase_plan_items ' +
     '(phase_id,date,time,time_sort,text_he,text_en,location_url,waze_url,ticket_url,extra_links,booking_id,status,sort_order,created_by,enrichment_status,config_ref) ' +
@@ -3203,22 +3203,25 @@ app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, 
           mapsHref, wazeHref, ticketHref,
           linksJson,
           findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
-          di * 1000 + ii, req.user.username, enrichSeed, ref
+          di * 1000 + ii, createdBy, enrichSeed, ref
         );
         if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phase.id, config_ref: ref });
         else skipped.push({ config_ref: ref, reason: 'already promoted' });
       });
     });
   }
-  kickEnrichmentSoon();
+  if (queueEnrichment) kickEnrichmentSoon();
   journey.syncFromLegacy('legacy-promote-config-days');
+  return { created, skipped };
+}
+
+app.post('/api/phase-plan/promote-config-days', organizerOrAgentRequired, (req, res) => {
+  const { created, skipped } = promoteConfigDays(req.user.username);
   res.json({ created: created.length, skipped: skipped.length, items: created });
 });
 
 // ── Export the enriched plan back into trip.config.json ──────────────────────
-// Deliberately API-only: no button anywhere. This rewrites the trip's source of
-// truth — the file that --sync-config pushes and that people hand-edit — so it
-// should be a considered act, not something reachable by a stray tap on a phone.
+// Plan tools reaches this behind a confirmation; the exported plan becomes the restore point.
 // Writes through persistConfigChange(), which snapshots into
 // trip_config_versions, so an export is revertible.
 //
@@ -3294,8 +3297,9 @@ app.post('/api/phase-plan/export-to-config', organizerOrAgentRequired, (req, res
 
   if (!phases.length) return res.status(400).json({ error: 'no dated plan items to export' });
   persistConfigChange();
+  const restorePoint = journey.setRestorePoint(req.user.username);
   const version = db.prepare('SELECT version FROM trip_config_versions ORDER BY version DESC LIMIT 1').get()?.version;
-  res.json({ exported: phases, config_version: version ?? null });
+  res.json({ exported: phases, config_version: version ?? null, restore_point: restorePoint });
 });
 
 // One-off migration for a trip whose plan was typed into booking notes before
@@ -3843,4 +3847,8 @@ app.use((err, _req, res, _next) => {
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || undefined;
+// After every helper promoteConfigDays needs is initialised, and before any request is served.
+// No enrichment queued: a deploy must not fire model calls at every existing item (see enrich-pending).
+journey.importPlanOnce(() => promoteConfigDays('config', { queueEnrichment: false }));
+
 app.listen(PORT, HOST, () => console.log(`Trip server running on ${HOST || '*'}:${PORT}`));
