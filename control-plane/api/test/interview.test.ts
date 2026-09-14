@@ -322,7 +322,7 @@ describe("validateAnswer (unit)", () => {
     // success. The first automated full cycle did exactly what the UI invites:
     // tapped "finish" at the first optional question.
     for (const id of [
-      "trip_pace", "dietary", "dietary_scope",
+      "trip_pace", "dietary", "dietary_scope", "dietary_visibility",
       "bot_proactive", "bot_limits",
     ]) {
       const q = INTAKE_QUESTIONS.find((q) => q.id === id)!;
@@ -854,6 +854,10 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
         !none.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
         "nothing applies to anyone, so there is nobody to ask about",
       );
+      assert.ok(
+        !none.view.optionalRemaining.some((q) => q.id === "dietary_visibility"),
+        "and nothing to share or keep private",
+      );
 
       // Ticking a real restriction is what makes the follow-up mean something.
       const real = await submitAnswer(
@@ -864,6 +868,10 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
       assert.ok(
         real.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
         "with restrictions recorded, whose they are is a real question",
+      );
+      assert.ok(
+        real.view.optionalRemaining.some((q) => q.id === "dietary_visibility"),
+        "and so is who may know about them",
       );
     } finally {
       await teardownFixture(fix);

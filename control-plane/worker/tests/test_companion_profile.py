@@ -104,11 +104,30 @@ class BuildCompanionHandoffTests(unittest.TestCase):
         self.assertEqual(needs[0]["person_ref"], "participant:noa")
         self.assertEqual(needs[0]["type"], "dietary")
         self.assertEqual(needs[0]["severity"], "firm")
-        # Organizer-only by default — matches transformer.py's _instruction()
-        # policy, not a guess made in this module.
+        # This fixture's need carries no visibility, so it fails safe.
         self.assertEqual(needs[0]["visibility"], "organizer")
         self.assertEqual(needs[0]["status"], "confirmed")
         self.assertEqual(needs[0]["text"], {"he": "צמחונית", "en": "Vegetarian"})
+
+    def test_needs_carry_the_organizers_sharing_choice(self) -> None:
+        def handoff_visibility(value):
+            need = {"type": "allergy", "severity": "critical", "text": {"he": "אגוזים", "en": "Nut allergy"}}
+            if value is not None:
+                need["visibility"] = value
+            participants = [{**FULL_CONFIG["participants"][0], "needs": [need]}, FULL_CONFIG["participants"][1]]
+            result = build_companion_handoff(
+                trip_id="trip_abc", slug="tokyo-2026", config={**FULL_CONFIG, "participants": participants},
+                intake_version_id="intk_abc", intake_schema_version=2,
+                intake_digest="sha256:" + "a" * 64, confirmed_at="2026-01-01T00:00:00+00:00",
+                canonical_site_url="https://tokyo-2026.example",
+            )
+            assert result is not None
+            return result["interview"]["participant_needs"][0]["visibility"]
+
+        self.assertEqual(handoff_visibility("group"), "group")
+        self.assertEqual(handoff_visibility("organizer"), "organizer")
+        self.assertEqual(handoff_visibility("porcupine"), "organizer")
+        self.assertEqual(handoff_visibility(None), "organizer")
 
     def test_never_emits_a_secret_shaped_key(self) -> None:
         # profile-templates' render_profile.py already scans for this, but a

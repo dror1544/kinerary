@@ -764,7 +764,7 @@ class SchemaV2Tests(unittest.TestCase):
             dietary_scope=_structured({"vegetarian": ["Noa"]}),
         )
         self.assertEqual(self._needs(config, "noa"), [
-            {"type": "dietary", "severity": "firm", "text": {"he": "צמחוני/ת", "en": "Vegetarian"}},
+            {"type": "dietary", "severity": "firm", "visibility": "group", "text": {"he": "צמחוני/ת", "en": "Vegetarian"}},
         ])
         # Scoped to one person means exactly one person.
         self.assertEqual(self._needs(config, "eitan"), [])
@@ -824,7 +824,7 @@ class SchemaV2Tests(unittest.TestCase):
 
     # ── visibility ────────────────────────────────────────────────────────────
 
-    def test_every_standing_instruction_is_organizer_only(self) -> None:
+    def test_only_dietary_instructions_follow_the_sharing_choice(self) -> None:
         config = self._config(
             trip_pace=_choice("easygoing"),
             dietary=_multi("kosher"),
@@ -833,8 +833,36 @@ class SchemaV2Tests(unittest.TestCase):
         )
         instructions = config["agent"]["standing_instructions"]
         self.assertEqual(len(instructions), 3)
-        for entry in instructions:
-            self.assertEqual(entry["visibility"], "organizer", entry)
+        by_text = {i["text"]["en"]: i["visibility"] for i in instructions}
+        self.assertEqual([v for t, v in by_text.items() if "kosher" in t.lower()], ["group"],
+                         "unanswered, a dietary instruction is shared")
+        self.assertEqual({v for t, v in by_text.items() if "kosher" not in t.lower()}, {"organizer"},
+                         "pace and limits are the organizer's own words and stay private")
+
+    def test_allergies_are_shared_by_default(self) -> None:
+        config = self._config(
+            dietary=_multi("nut_allergy"),
+            dietary_scope=_structured({"nut_allergy": ["Eitan"]}),
+        )
+        need = self._needs(config, "eitan")[0]
+        self.assertEqual((need["type"], need["severity"], need["visibility"]), ("allergy", "critical", "group"))
+
+    def test_the_organizer_can_keep_dietary_needs_to_themselves(self) -> None:
+        config = self._config(
+            dietary=_multi("vegetarian", "gluten_free"),
+            dietary_scope=_structured({"vegetarian": ["Noa"]}),
+            dietary_visibility=_choice("organizer"),
+        )
+        self.assertEqual(self._needs(config, "noa")[0]["visibility"], "organizer")
+        self.assertEqual({i["visibility"] for i in config["agent"]["standing_instructions"]}, {"organizer"})
+
+    def test_an_unrecognized_sharing_choice_fails_safe(self) -> None:
+        config = self._config(
+            dietary=_multi("nut_allergy"),
+            dietary_scope=_structured({"nut_allergy": ["Eitan"]}),
+            dietary_visibility=_choice("porcupine"),
+        )
+        self.assertEqual(self._needs(config, "eitan")[0]["visibility"], "organizer")
 
     # ── pace ──────────────────────────────────────────────────────────────────
 

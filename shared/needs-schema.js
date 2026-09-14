@@ -7,9 +7,10 @@ const NEED_TYPES = ['allergy', 'medical', 'dietary', 'mobility', 'other'];
 const NEED_SEVERITIES = ['critical', 'firm', 'preference'];
 const VISIBILITIES = ['group', 'organizer'];
 
-// medical/allergy needs default to organizer-only since /api/config has no
-// auth at all and /api/config/versions/:version is authRequired but not
-// organizer-scoped (every family member, including kids, is authed there).
+// medical/allergy needs default to organizer-only since /api/config and
+// /api/config/versions/:version are authRequired but not organizer-scoped
+// (every family member, including kids, is authed there). A need written by the
+// interview carries the organizer's explicit choice instead of this default.
 //
 // An *unrecognized* type also defaults to organizer-only. Without that clause
 // a one-character typo — "medicl", or "Medical" with the wrong case — falls

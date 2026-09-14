@@ -78,10 +78,8 @@ def build_companion_handoff(
                 "person_ref": f"participant:{username}",
                 "type": need.get("type", "other"),
                 "severity": need.get("severity", "preference"),
-                # Organizer-only by default — matches transformer.py's
-                # _instruction() policy and shared/needs-schema.js's default
-                # for named-person needs, not a guess made here.
-                "visibility": "organizer",
+                # The organizer's choice, stamped by the transformer; missing or unrecognized fails safe.
+                "visibility": need.get("visibility") if need.get("visibility") in ("group", "organizer") else "organizer",
                 "status": "confirmed",
                 "source_answer_ref": f"dietary:{username}:{idx}",
                 "text": dict(need.get("text") or {"he": "", "en": ""}),

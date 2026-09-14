@@ -491,6 +491,22 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     },
   },
   {
+    // The organizer decides; unanswered means shared (see transformer.py _dietary_visibility).
+    id: "dietary_visibility",
+    type: "choice",
+    prompt: "Should everyone on the trip know about these food needs and allergies, or only you? On a family trip sharing is the default — it keeps everyone safe.",
+    options: [
+      { id: "group", label: "Share with everyone on the trip" },
+      { id: "organizer", label: "Only me (the organizer)" },
+    ],
+    required: false,
+    applies: (answers) => {
+      const dietary = answers.dietary;
+      if (!dietary || dietary.kind !== "multi_choice") return false;
+      return dietary.option_ids.some((id) => id !== EXCLUSIVE_OPTION_ID);
+    },
+  },
+  {
     // REQUIRED as of 2026-09-11. Optional, it was the one skippable question
     // whose absence costs the whole assistant: `build_companion_handoff` will
     // not guess who gets the organizer's private channel, so an organizer who
