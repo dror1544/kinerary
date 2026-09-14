@@ -26,6 +26,16 @@ class Tests(unittest.TestCase):
    self.assertIn(expected,soul,gender); self.assertNotIn(forbidden,soul,gender)
    self.assertIn('assigned, never inferred',soul,gender)
    self.assertIn(d['assistant']['name'],soul.split('assigned, never inferred')[1][:400],gender)
+ def test_soul_states_the_assigned_tone(self):
+  # The bug this covers: tone reached group-context.json and nothing else, so
+  # every companion spoke the same regardless of what was chosen. Asserted per
+  # value, not once, because a hardcoded sentence would pass a single check.
+  for tone,expected,forbidden in [('warm','Speak warmly','Speak playfully'),('playful','Speak playfully','Speak dryly'),('dry','Speak dryly','Speak warmly')]:
+   d=json.loads((ROOT/'example.handoff.json').read_text()); d['assistant']['tone']=tone
+   td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+   soul=(o/'SOUL.md').read_text()
+   self.assertIn(expected,soul,tone); self.assertNotIn(forbidden,soul,tone)
+   self.assertIn('tone is set too, not defaulted',soul,tone)
  def test_profile_description_is_yaml_safe(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['profile']['description']='A trip: "quoted"'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr); self.assertIn('description: "A trip: \\"quoted\\""',(o/'profile.yaml').read_text())
 if __name__=='__main__': unittest.main()
