@@ -698,6 +698,22 @@ class TransformerTests(unittest.TestCase):
         self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
         self.assertIn("Family Trip 2026", config["meta"]["title"])
 
+    def test_a_destination_leading_with_its_country_is_named_by_it(self) -> None:
+        # 2026-09-14, automated manual run: "Portugal — Lisbon and Porto" was titled "Family Trip 2026" and got no currency.
+        for destination, country, brand in [
+            ("Portugal — Lisbon and Porto", "Portugal", "PORTUGAL 2026"),
+            ("Japan: Tokyo, Kyoto", "Japan", "JAPAN 2026"),
+        ]:
+            with self.subTest(destination=destination):
+                config = transform_intake({**JAPAN_INTAKE, "destination": _text(destination)}, today=date(2026, 8, 20))
+                self.assertEqual(config["meta"]["brand"], brand)
+                self.assertTrue(config["meta"]["title"].startswith(brand.title()))
+                self.assertIn(country, config["travel_info"]["countries"])
+
+    def test_cities_joined_by_and_with_no_leading_country_still_use_the_trip_type(self) -> None:
+        config = transform_intake({**JAPAN_INTAKE, "destination": _text("Lisbon and Porto")}, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
+
     def test_single_word_destination_becomes_the_brand_directly(self) -> None:
         intake = {**JAPAN_INTAKE, "destination": _text("USA")}
         config = transform_intake(intake, today=date(2026, 8, 20))

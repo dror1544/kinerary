@@ -313,10 +313,19 @@ def _lookup_known_currency(destination: str) -> dict[str, str] | None:
     isn't unconditionally broken for every control-plane-provisioned trip
     until that enrichment pass exists for real.
     """
-    return _KNOWN_COUNTRY_CURRENCY.get(destination.strip().lower())
+    return (_KNOWN_COUNTRY_CURRENCY.get(destination.strip().lower())
+            or _KNOWN_COUNTRY_CURRENCY.get(_destination_head(destination).lower()))
 
 
 _MULTI_PLACE_RE = re.compile(r",|&| and |/")
+# Only a heading separator: commas and "and" join places, they do not introduce details.
+_DESTINATION_HEAD_RE = re.compile(r"[—–:]| - ")
+
+
+def _destination_head(destination: str) -> str:
+    """The place a destination leads with — "Portugal" from "Portugal — Lisbon and Porto" — or the whole text."""
+    head = _DESTINATION_HEAD_RE.split(destination, maxsplit=1)[0].strip()
+    return head or destination.strip()
 
 
 def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -> tuple[str, str]:
@@ -327,11 +336,13 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     destination that reads as multiple places (joined with a comma, "&", "/",
     or "and"), or is just long, falls back to the trip type as a thematic
     subject instead ("Family Trip 2026"), since a list of cities makes an
-    unreadable brand.
+    unreadable brand. A destination that leads with one place before a dash
+    or colon ("Portugal — Lisbon and Porto") is judged by that place alone.
     """
-    is_multi_place = bool(_MULTI_PLACE_RE.search(destination))
-    short_destination = _shorten_phase_name(destination, max_length=20)
-    if not is_multi_place and short_destination == destination.strip() and short_destination:
+    place = _destination_head(destination)
+    is_multi_place = bool(_MULTI_PLACE_RE.search(place))
+    short_destination = _shorten_phase_name(place, max_length=20)
+    if not is_multi_place and short_destination == place and short_destination:
         subject = short_destination
     else:
         subject = trip_type_label if "trip" in trip_type_label.lower() else f"{trip_type_label} Trip"
