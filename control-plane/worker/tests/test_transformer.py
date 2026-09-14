@@ -794,6 +794,33 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(need["type"], "allergy")
         self.assertEqual(need["severity"], "critical")
 
+    def test_a_first_name_scopes_a_need_to_a_traveller_listed_by_full_name(self) -> None:
+        # 2026-09-14, automated multi run: the scope said "Omri", the roster "Omri Levi", and the need went group-wide.
+        config = self._config(
+            travelers=_structured([
+                {"name": "Omri Levi", "age": 10, "family": "Levi"},
+                {"name": "Yael Levi", "age": 8, "family": "Levi"},
+            ]),
+            dietary=_multi("vegetarian"),
+            dietary_scope=_structured({"vegetarian": ["Omri"]}),
+        )
+        omri = next(p for p in config["participants"] if p["name"] == "Omri Levi")
+        self.assertEqual([n["text"]["en"] for n in omri.get("needs", [])], ["Vegetarian"])
+        self.assertNotIn("standing_instructions", config.get("agent") or {})
+
+    def test_a_first_name_two_travellers_share_stays_group_wide(self) -> None:
+        config = self._config(
+            travelers=_structured([
+                {"name": "Dana Levi", "age": 40, "family": "Levi"},
+                {"name": "Dana Cohen", "age": 38, "family": "Cohen"},
+            ]),
+            dietary=_multi("nut_allergy"),
+            dietary_scope=_structured({"nut_allergy": ["Dana"]}),
+        )
+        for participant in config["participants"]:
+            self.assertNotIn("needs", participant, "an ambiguous name must not pick one of them")
+        self.assertEqual(len(config["agent"]["standing_instructions"]), 1)
+
     def test_unscoped_restriction_survives_as_a_group_instruction(self) -> None:
         # Ticked but never scoped, and scoped to someone not on the roster:
         # both are unattributable, and both must still reach the assistant

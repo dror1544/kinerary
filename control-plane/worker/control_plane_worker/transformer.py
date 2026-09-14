@@ -603,11 +603,8 @@ def _apply_dietary(
 
     visibility = _dietary_visibility(data)
     scope = _structured_dict(data, "dietary_scope")
-    by_name: dict[str, dict[str, Any]] = {}
-    for p in participants:
-        for key in (p.get("name"), p.get("name_en"), p.get("username")):
-            if isinstance(key, str) and key.strip():
-                by_name.setdefault(key.strip().casefold(), p)
+    # The same forms organizer_identity accepts, first name included; a name two travellers share matches nobody.
+    forms = [(p, _identity_forms(p)) for p in participants]
 
     instructions: list[dict[str, Any]] = []
     for option_id in selected:
@@ -618,7 +615,12 @@ def _apply_dietary(
         who = scope.get(option_id)
 
         names = who if isinstance(who, list) else []
-        matched = [p for name in names if (p := by_name.get(str(name).strip().casefold()))]
+        matched: list[dict[str, Any]] = []
+        for name in names:
+            needle = _normalize_identity(name)
+            hits = [p for p, person_forms in forms if needle in person_forms]
+            if len(hits) == 1 and hits[0] not in matched:
+                matched.append(hits[0])
 
         # Everything that isn't a resolvable list of people becomes a
         # group-wide instruction: an explicit "everyone", and equally an
