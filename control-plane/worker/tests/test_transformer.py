@@ -698,6 +698,22 @@ class TransformerTests(unittest.TestCase):
         self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
         self.assertIn("Family Trip 2026", config["meta"]["title"])
 
+    def test_a_destination_leading_with_its_country_is_named_by_it(self) -> None:
+        # 2026-09-14, automated manual run: "Portugal — Lisbon and Porto" was titled "Family Trip 2026" and got no currency.
+        for destination, country, brand in [
+            ("Portugal — Lisbon and Porto", "Portugal", "PORTUGAL 2026"),
+            ("Japan: Tokyo, Kyoto", "Japan", "JAPAN 2026"),
+        ]:
+            with self.subTest(destination=destination):
+                config = transform_intake({**JAPAN_INTAKE, "destination": _text(destination)}, today=date(2026, 8, 20))
+                self.assertEqual(config["meta"]["brand"], brand)
+                self.assertTrue(config["meta"]["title"].startswith(brand.title()))
+                self.assertIn(country, config["travel_info"]["countries"])
+
+    def test_cities_joined_by_and_with_no_leading_country_still_use_the_trip_type(self) -> None:
+        config = transform_intake({**JAPAN_INTAKE, "destination": _text("Lisbon and Porto")}, today=date(2026, 8, 20))
+        self.assertEqual(config["meta"]["brand"], "FAMILY TRIP 2026")
+
     def test_single_word_destination_becomes_the_brand_directly(self) -> None:
         intake = {**JAPAN_INTAKE, "destination": _text("USA")}
         config = transform_intake(intake, today=date(2026, 8, 20))
@@ -793,6 +809,33 @@ class SchemaV2Tests(unittest.TestCase):
         need = self._needs(config, "eitan")[0]
         self.assertEqual(need["type"], "allergy")
         self.assertEqual(need["severity"], "critical")
+
+    def test_a_first_name_scopes_a_need_to_a_traveller_listed_by_full_name(self) -> None:
+        # 2026-09-14, automated multi run: the scope said "Omri", the roster "Omri Levi", and the need went group-wide.
+        config = self._config(
+            travelers=_structured([
+                {"name": "Omri Levi", "age": 10, "family": "Levi"},
+                {"name": "Yael Levi", "age": 8, "family": "Levi"},
+            ]),
+            dietary=_multi("vegetarian"),
+            dietary_scope=_structured({"vegetarian": ["Omri"]}),
+        )
+        omri = next(p for p in config["participants"] if p["name"] == "Omri Levi")
+        self.assertEqual([n["text"]["en"] for n in omri.get("needs", [])], ["Vegetarian"])
+        self.assertNotIn("standing_instructions", config.get("agent") or {})
+
+    def test_a_first_name_two_travellers_share_stays_group_wide(self) -> None:
+        config = self._config(
+            travelers=_structured([
+                {"name": "Dana Levi", "age": 40, "family": "Levi"},
+                {"name": "Dana Cohen", "age": 38, "family": "Cohen"},
+            ]),
+            dietary=_multi("nut_allergy"),
+            dietary_scope=_structured({"nut_allergy": ["Dana"]}),
+        )
+        for participant in config["participants"]:
+            self.assertNotIn("needs", participant, "an ambiguous name must not pick one of them")
+        self.assertEqual(len(config["agent"]["standing_instructions"]), 1)
 
     def test_unscoped_restriction_survives_as_a_group_instruction(self) -> None:
         # Ticked but never scoped, and scoped to someone not on the roster:
