@@ -10,19 +10,21 @@
  * show /name, the one command that renames the assistant.
  *
  * SCOPED. Groups get a menu too, not only private chats: leaving a group's
- * menu alone is exactly what kept Hermes's list there. /group appears only
- * outside groups — it mints a binding token in the organizer's DM, and a group
- * has nothing to bind.
+ * menu alone is exactly what kept Hermes's list there. /group, /trips and
+ * /switch appear only outside groups — /group mints a binding token in the
+ * organizer's DM, /trips would list trips the rest of the room has no claim
+ * to, and a group's binding is the family's, not one member's to /switch.
  *
  * `/start` is deliberately absent. Telegram surfaces its own Start button, and
  * a menu entry for a command that does nothing without a token is a dead end.
+ * `/done` is absent too: it means something only mid-interview.
  *
  * LOCALISED, like the replies. Telegram prefers a language's own list over the
  * unlabelled default, so `en` and `he` are published explicitly too — which
  * also overwrites any language-specific list a previous owner left behind.
  *
- * Shares its name and signature with PR #47's module of the same name, which
- * adds /trips and /switch to private chats; the two menus merge by union.
+ * /trips and /switch arrived from PR #47, whose menu this one absorbed by
+ * union — same module, same signature, their commands added to the private list.
  */
 import { structuredLog } from "../redaction.js";
 import type { TelegramClient } from "./telegram-api.js";
@@ -35,8 +37,20 @@ export interface CommandMenu {
 }
 
 const DESCRIPTIONS = {
-  en: { help: "What I can do", name: "Show or change my name", group: "Connect me to your family group" },
-  he: { help: "מה אני יודע לעשות", name: "להציג או לשנות את השם שלי", group: "לחבר אותי לקבוצה המשפחתית" },
+  en: {
+    help: "What I can do",
+    name: "Show or change my name",
+    group: "Connect me to your family group",
+    trips: "Your trips, and which one this chat is on",
+    switch: "Point this chat at a different trip",
+  },
+  he: {
+    help: "מה אני יודע לעשות",
+    name: "להציג או לשנות את השם שלי",
+    group: "לחבר אותי לקבוצה המשפחתית",
+    trips: "הטיולים שלך, ולאיזה מהם הצ׳אט הזה מחובר",
+    switch: "חיבור הצ׳אט הזה לטיול אחר",
+  },
 } as const;
 
 /** Every menu the router publishes: three scopes, for the default, en and he. */
@@ -48,7 +62,12 @@ export function routerCommandMenus(): CommandMenu[] {
       { command: "help", description: text.help },
       { command: "name", description: text.name },
     ];
-    const privateChat = [...everywhere, { command: "group", description: text.group }];
+    const privateChat = [
+      ...everywhere,
+      { command: "group", description: text.group },
+      { command: "trips", description: text.trips },
+      { command: "switch", description: text.switch },
+    ];
     menus.push(
       { scope: "default", languageCode, commands: privateChat },
       { scope: "all_private_chats", languageCode, commands: privateChat },
