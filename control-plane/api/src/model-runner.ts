@@ -648,6 +648,18 @@ export const DEFAULT_INTERPRET_MODEL = "minimax/minimax-m3";
 export const CODEX_LUNA_MODEL = "gpt-5.6-luna";
 
 /**
+ * The plan-review model. MiniMax M3 for the same reason `extract` uses it:
+ * the prompt is a whole leg of an itinerary plus the source document, so
+ * context length is what the task is bounded by, not cleverness.
+ *
+ * Pinned separately from `extract` even though the default is the same value.
+ * They move independently — a review that reasons about whether a day is too
+ * full is a different job from reading a PDF — and sharing an id is not the
+ * same as sharing a decision.
+ */
+export const DEFAULT_PLAN_REVIEW_MODEL = "minimax/minimax-m3";
+
+/**
  * Never route through `openrouter/auto`. It picks a model per request, which
  * is the fallback problem wearing a different hat: two runs of the same
  * interview could be served by two different models with no signal that
@@ -668,9 +680,17 @@ export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto",
  * a settled deployment story it has not earned yet.
  *
  *   OPENROUTER_API_KEY / OPENROUTER_API_KEY_FILE
- *   INTERPRET_RUNNER=openrouter|claude|hermes   INTERPRET_MODEL=<id|profile>
- *   EXTRACT_RUNNER=openrouter|hermes            EXTRACT_MODEL=<id|profile>
- *   INTERPRET_TIMEOUT_MS / EXTRACT_TIMEOUT_MS
+ *   INTERPRET_RUNNER=openrouter|claude|codex|hermes   INTERPRET_MODEL=<id|profile>
+ *   EXTRACT_RUNNER=openrouter|claude|codex|hermes     EXTRACT_MODEL=<id|profile>
+ *   PLAN_REVIEW_RUNNER=…                              PLAN_REVIEW_MODEL=<id|profile>
+ *   INTERPRET_TIMEOUT_MS / EXTRACT_TIMEOUT_MS / PLAN_REVIEW_TIMEOUT_MS
+ *
+ * `plan_review` unset is the normal state today and is a DOWNGRADE, not an
+ * error: the post-deploy plan review still runs its deterministic half and
+ * records why the model did not contribute on the review row — `NO_RUNNER`
+ * when nothing at all is configured, `NOT_CONFIGURED` when the other tasks
+ * are and this one is not. A half-strength pass is then visible rather than
+ * looking like a plan with nothing wrong in it.
  */
 export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): StructuredModelRunner | undefined {
   const key = openRouterKey(env);
@@ -691,26 +711,27 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
     return undefined;
   };
 
-  const interpretKind = (env.INTERPRET_RUNNER || "").trim().toLowerCase();
-  if (interpretKind) {
-    const interpretModel =
-      (env.INTERPRET_MODEL || "").trim() ||
-      (interpretKind === "openrouter" ? DEFAULT_INTERPRET_MODEL : interpretKind === "codex" ? CODEX_LUNA_MODEL : "");
-    if (interpretModel) {
-      const runner = build(interpretKind, interpretModel, Number(env.INTERPRET_TIMEOUT_MS || DEFAULT_TIMEOUT_MS), "interpret");
-      if (runner) byTask.interpret = runner;
-    }
-  }
+  // One entry per task, rather than a copy of the same eight lines per task.
+  // `<PREFIX>_RUNNER` / `<PREFIX>_MODEL` / `<PREFIX>_TIMEOUT_MS` is the naming
+  // the first two tasks already had; keeping it as a table is what stops the
+  // third from acquiring a slightly different spelling.
+  const tasks: readonly { task: string; prefix: string; openRouterModel: string; timeoutMs: number }[] = [
+    { task: "interpret", prefix: "INTERPRET", openRouterModel: DEFAULT_INTERPRET_MODEL, timeoutMs: DEFAULT_TIMEOUT_MS },
+    { task: "extract", prefix: "EXTRACT", openRouterModel: DEFAULT_EXTRACT_MODEL, timeoutMs: 90_000 },
+    // A review reads a whole leg plus the uploaded document, so it gets the
+    // long-context budget rather than interpret's.
+    { task: "plan_review", prefix: "PLAN_REVIEW", openRouterModel: DEFAULT_PLAN_REVIEW_MODEL, timeoutMs: 90_000 },
+  ];
 
-  const extractKind = (env.EXTRACT_RUNNER || "").trim().toLowerCase();
-  if (extractKind) {
-    const extractModel =
-      (env.EXTRACT_MODEL || "").trim() ||
-      (extractKind === "openrouter" ? DEFAULT_EXTRACT_MODEL : extractKind === "codex" ? CODEX_LUNA_MODEL : "");
-    if (extractModel) {
-      const runner = build(extractKind, extractModel, Number(env.EXTRACT_TIMEOUT_MS || 90_000), "extract");
-      if (runner) byTask.extract = runner;
-    }
+  for (const entry of tasks) {
+    const kind = (env[`${entry.prefix}_RUNNER`] || "").trim().toLowerCase();
+    if (!kind) continue;
+    const model =
+      (env[`${entry.prefix}_MODEL`] || "").trim() ||
+      (kind === "openrouter" ? entry.openRouterModel : kind === "codex" ? CODEX_LUNA_MODEL : "");
+    if (!model) continue;
+    const runner = build(kind, model, Number(env[`${entry.prefix}_TIMEOUT_MS`] || entry.timeoutMs), entry.task);
+    if (runner) byTask[entry.task] = runner;
   }
 
   return Object.keys(byTask).length > 0 ? composeRunners(byTask) : undefined;
