@@ -200,6 +200,7 @@ describe("parseOutboundAction", () => {
       chat_id: "1",
       content: "hi",
       reply_to: undefined,
+      expectsReply: false,
     });
     assert.deepEqual(parseOutboundAction({ op: "typing", chat_id: "1" }), { op: "typing", chat_id: "1" });
     assert.deepEqual(parseOutboundAction({ op: "edit", chat_id: "1", message_id: "9", content: "x" }), {
@@ -214,6 +215,28 @@ describe("parseOutboundAction", () => {
     // The contract's versioning is additive: a newer gateway may send an op we
     // predate. Answering success:false keeps its per-request future resolving.
     assert.equal(parseOutboundAction({ op: "send_media", chat_id: "1", source_url: "x" }), null);
+  });
+
+  test("reads metadata.expects_reply, failing closed on anything but a literal true", () => {
+    const base = { op: "send", chat_id: "1", content: "hi" };
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: { expects_reply: true } }) as { expectsReply: boolean })
+        .expectsReply,
+      true,
+    );
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: { expects_reply: "yes" } }) as { expectsReply: boolean })
+        .expectsReply,
+      false,
+    );
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: null }) as { expectsReply: boolean }).expectsReply,
+      false,
+    );
+    assert.equal(
+      (parseOutboundAction(base) as { expectsReply: boolean }).expectsReply,
+      false,
+    );
   });
 
   test("rejects actions missing required fields", () => {

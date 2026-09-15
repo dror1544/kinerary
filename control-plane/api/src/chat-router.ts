@@ -353,6 +353,72 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
   return { kind: "unbound" };
 }
 
+// ── Companion reply capture ──────────────────────────────────────────────────
+
+/**
+ * How long a companion send's "I expect a reply" signal stays open. Long
+ * enough that a family reads a question and one of them answers without
+ * racing a deadline; short enough that ordinary group chatter minutes later
+ * is never mistaken for the answer.
+ */
+export const EXPECTS_REPLY_WINDOW_SECONDS = 150;
+
+/**
+ * Opens or clears the one-shot "the assistant's last message in this chat
+ * expects a reply" window on its open companion binding.
+ *
+ * Called on every companion-route send: `expects: false` clears whatever a
+ * PREVIOUS send opened, so a non-question message from the agent cancels a
+ * pending capture rather than leaving it to expire on its own. A no-op for
+ * any chat_id with no open binding — a DM has none, and neither does a
+ * closed group.
+ */
+export async function setCompanionExpectsReply(
+  db: pg.Pool,
+  chatId: string,
+  expects: boolean,
+  ttlSeconds: number = EXPECTS_REPLY_WINDOW_SECONDS,
+): Promise<void> {
+  await db.query(
+    `UPDATE control_plane.telegram_chat_bindings
+        SET awaiting_reply_since = CASE WHEN $2 THEN now() ELSE NULL END,
+            awaiting_reply_floor_seconds = CASE WHEN $2 THEN $3::integer ELSE NULL END
+      WHERE chat_id = $1 AND closed_at IS NULL`,
+    [chatId, expects, ttlSeconds],
+  );
+}
+
+/**
+ * Claims this chat's open reply-capture window, if one is open, unexpired,
+ * and the trip hasn't opted out — and clears it in the same statement
+ * either way it resolves. Meant to be called exactly once per inbound
+ * message, unconditionally, for every companion-route event: the first
+ * message after a question consumes the window regardless of its own
+ * content, so a second message minutes later — even inside the TTL — finds
+ * nothing left to claim. That is what makes this "the very next message,
+ * whoever sends it, one shot".
+ *
+ * Atomic UPDATE ... RETURNING, same shape as interview.ts's claimFloor():
+ * whether this returns true IS the row transitioning, so two concurrent
+ * reads of the same chat cannot both report a capture.
+ */
+export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE control_plane.telegram_chat_bindings b
+        SET awaiting_reply_since = NULL,
+            awaiting_reply_floor_seconds = NULL
+       FROM control_plane.trips t
+      WHERE b.chat_id = $1
+        AND b.closed_at IS NULL
+        AND b.trip_id = t.id
+        AND b.awaiting_reply_since IS NOT NULL
+        AND t.companion_reply_capture_enabled
+        AND b.awaiting_reply_since >= now() - make_interval(secs => COALESCE(b.awaiting_reply_floor_seconds, $2))`,
+    [chatId, EXPECTS_REPLY_WINDOW_SECONDS],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 // ── /start deep link ─────────────────────────────────────────────────────────
 
 export type StartLinkOutcome =

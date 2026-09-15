@@ -204,6 +204,14 @@ export interface SendAction {
   content: string;
   reply_to?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * True when this send is a question the assistant wants answered — the one
+   * bit of `metadata` this connector reads (migration 0053's reply-capture
+   * gate). Required rather than optional: "absent" and "explicitly false"
+   * mean the same thing to every consumer, so there is nothing a third state
+   * would distinguish.
+   */
+  expectsReply: boolean;
 }
 
 export interface EditAction {
@@ -237,6 +245,19 @@ export interface OutboundResult {
 }
 
 /**
+ * Reads `metadata.expects_reply`, failing closed on anything but a literal
+ * `true` — wrong type, absent, or non-object metadata all mean "no capture",
+ * same as the field being unset.
+ */
+function readsExpectsReply(metadata: unknown): boolean {
+  return (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    (metadata as Record<string, unknown>).expects_reply === true
+  );
+}
+
+/**
  * Narrows a decoded frame to a known outbound action.
  *
  * An unrecognised op returns null rather than throwing: the contract's
@@ -259,6 +280,7 @@ export function parseOutboundAction(raw: unknown): OutboundAction | null {
             chat_id: chatId,
             content: action.content,
             reply_to: typeof action.reply_to === "string" ? action.reply_to : undefined,
+            expectsReply: readsExpectsReply(action.metadata),
           }
         : null;
     case "edit":
