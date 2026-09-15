@@ -307,6 +307,39 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # later correction cannot produce a replacement plan for the trip.
         self.assertEqual(row["status"], "executed")
 
+    def test_happy_path_stores_the_deployed_plan_for_the_review_pass(self) -> None:
+        # The post-deploy plan review (control-plane/api/src/plan-review.ts)
+        # runs on its own loop, long after this job, and needs the config that
+        # was actually deployed. This function is the only place it exists.
+        self.worker.run_once()
+        row = self.conn.execute(
+            "SELECT plan_snapshot, plan_snapshot_at FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row["plan_snapshot_at"])
+        self.assertEqual(
+            row["plan_snapshot"]["meta"]["title"],
+            self.fake_deploy.deployed[0]["config"]["meta"]["title"],
+        )
+
+    def test_a_worker_newer_than_the_schema_still_finishes_the_deploy(self) -> None:
+        # The exact failure this guard is for: a worker that knows about
+        # plan_snapshot talking to a database that has not run migration 0050.
+        # The snapshot is lost, which costs a review; the job must still be
+        # marked succeeded, which is only true because the write happens
+        # outside the transaction that succeeds it.
+        self.conn.execute("ALTER TABLE control_plane.trips DROP COLUMN plan_snapshot")
+        self.conn.commit()
+        try:
+            self.worker.run_once()
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s", (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual("succeeded", row["state"])
+        finally:
+            self.conn.execute("ALTER TABLE control_plane.trips ADD COLUMN plan_snapshot jsonb")
+            self.conn.commit()
+
     def test_happy_path_calls_deploy_adapter_with_slug_and_config(self) -> None:
         self.worker.run_once()
         self.assertEqual(len(self.fake_deploy.deployed), 1)

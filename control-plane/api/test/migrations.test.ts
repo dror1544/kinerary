@@ -76,11 +76,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claimed
-      // that number (telegram_organizer_links, now 0052, and plan_reviews), and
-      // a duplicate number with different content is the collision worth
-      // avoiding. A gap is not: the runner applies whatever it has not
-      // recorded, in name order.
+      "0050_plan_reviews.sql",
       "0051_trip_person_links.sql",
       "0052_telegram_organizer_links.sql",
       "0053_companion_reply_capture.sql",
@@ -140,11 +136,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0047_agent_spoke_on_turn.sql",
       "0048_interview_interpretations.sql",
       "0049_interview_session_expiry.sql",
-      // 0050 is deliberately absent here: two unmerged branches each claimed
-      // that number (telegram_organizer_links, now 0052, and plan_reviews), and
-      // a duplicate number with different content is the collision worth
-      // avoiding. A gap is not: the runner applies whatever it has not
-      // recorded, in name order.
+      "0050_plan_reviews.sql",
       "0051_trip_person_links.sql",
       "0052_telegram_organizer_links.sql",
       "0053_companion_reply_capture.sql",

@@ -511,7 +511,8 @@ out of 4.5).
 
 As of 2026-08-30 every item below is `built` except one low-visual residual
 (`follow-on`): **prose anchor extraction**. The `separate build` (site
-live-plan enrichment worker) stays out of 4.5.
+live-plan enrichment worker) stayed out of 4.5 and was built separately on
+2026-09-12 — see its row.
 
 | Item | Tag | Notes |
 |---|---|---|
@@ -528,7 +529,34 @@ live-plan enrichment worker) stays out of 4.5.
 | Phase narrative blurb | `built` | `transformer._phase_note_text` writes a readable blurb ("4 nights in Tokyo, 6 Sep–10 Sep. Staying at …. 3 days planned") with any trimmed name context as a trailing clause, replacing the raw concat. |
 | Persist the raw uploaded document | `built` | Migration 0024 adds `intake_sessions.source_document` + `intake_versions.source_document` (jsonb `{filename,text,savedAt}`). `POST /v1/interview/:id/source-document` stages it; `extract_itinerary` forwards the document after extracting (best-effort); `confirmIntake` copies session → version. Sibling column — outside the `data` canonical-safety CHECK and the digest. |
 | Structured budget | `built` | Optional `budget_detail` structured question → `transformer._derive_budget` projects `config.budget` (`party_size` / `phases` / `phase_labels` / `seed_items`), the shape `server.js` seeds `budget_items` from. Categories validated to the site's set; `amount 0 + estimate` → a "fill-in" row; `seed_key` stable for idempotent re-seed. No `INTAKE_SCHEMA_VERSION` bump (additive-optional). |
-| Site live-plan enrichment worker | `separate build` | The trip site already has the DB hooks — `phase_plan_items` / `phase_plan_days` with `enrichment_status` (`none/pending/done/failed`), `review_status`, `config_ref` dedup, day-headline correction trail. A worker that calls a model post-deploy to detect ticketing needs, re-enrich, and feed the in-app review queue is its own sprint, not 4.5. |
+| Site live-plan enrichment worker | `separate build` — **BUILT (2026-09-12)** | The post-deploy judge, and the queue its proposals wait in. `control-plane/api/src/plan-review.ts` reads the deployed `trip.config.json` plus the confirmed intake and the uploaded document, and files PROPOSALS — never edits to a live trip. Deterministic half (no model, runs everywhere): the arrival with no landing on it (timed from a `travel_anchors` flight, asked for when there is none), the check-in that was never written down (by hotel name, deliberately with no time and a question for the hour), the transfer between two legs that nothing describes, a blank day, a day out of clock order, a place on `venues[]` that no day mentions, a venue link the day line never got, a ticketing question for a venue with no URL, a day too full or too long for the `trip_pace` they answered (budget tightened by a young child or a `constraints` note, both quoted), and a hop between two districts with no time to make it. Model half (task `plan_review` through `model-runner.ts`, `PLAN_REVIEW_RUNNER`/`PLAN_REVIEW_MODEL`): day headlines, orderings and additions, each through `interpret.ts`'s own gate — `evidenceAppears`, `exampleEchoes`, plus a refusal of any URL and of any place the trip does not already name. Storage: migration 0050 (`plan_reviews`, `plan_review_proposals`, `trips.plan_snapshot`), keyed by the proposal's content fingerprint so a re-review dedups, with an organizer's accept/dismiss sticky across passes. The provisioner stores the config it shipped (`_record_plan_snapshot`, best-effort); `runPendingPlanReviews` on a 5-minute loop in `server.ts` does the rest. **Not yet built**: nothing applies an accepted patch, and nothing surfaces the queue to the organizer — no route, no companion tool. The trip site's own `phase_plan_items`/`phase_plan_days` hooks this row names are still unused by it. |
+
+> **Ship rules-only for now — decided 2026-09-15, after a live comparison against
+> today's per-item `/enrich`.** Full test: `docs/test-reports/plan-review-vs-enrich-comparison-2026-09-15.md`.
+> Both were run against the same `kinerary-extract` Hermes profile on the Mac mini
+> only (no VM). Headline finding: the **deterministic half alone** produced 33
+> real, evidence-backed proposals on the `japan-2025` fixture for zero model
+> calls — arrival, check-in, ordering, unscheduled venues, pace fit, all of it
+> arithmetic over data the trip already has. The **model half added nothing**
+> beyond that on the same run (4 phase calls, `rejected: 0`, `modelUsed: false`)
+> — not proven worthless, just not proven worth its cost yet; a fixture with a
+> gap only a model could catch (e.g. a document naming something the config
+> doesn't) would be needed to tell "rules already cover everything" apart from
+> "the model underperforms this task," and that has not been run.
+>
+> So: this row ships with `PLAN_REVIEW_RUNNER` **left unset in every deployment
+> config** — which the code already degrades to cleanly (`modelSkipped: NO_RUNNER`,
+> never a silent downgrade) — until a harder fixture justifies turning the model
+> half on. `/enrich` itself is unchanged and keeps doing its own job (today's
+> fallback, `gpt-5.6-luna-900k` via `openai-codex` since `kinerary-extract`'s
+> primary OpenRouter id is broken — same finding as the 2026-09-13 report —
+> returned three verified-live links on this run, a real improvement over that
+> report's OpenRouter result of 4-of-6 dead). One thing worth carrying back into
+> `/enrich`, separately from this row: its only guard on model output today is
+> "starts with `http(s)`", where this module's gate (no invented place, no
+> model-supplied URL, every claim needs a quotable source) is strictly
+> stronger — the dead-link finding in the 09-13 report is exactly the failure
+> mode that gate exists to prevent.
 
 #### §4.5-i. Itinerary-from-document spec (`this step`)
 

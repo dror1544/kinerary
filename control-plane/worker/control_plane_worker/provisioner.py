@@ -712,6 +712,16 @@ class ProvisionerWorker:
                 slug=slug, config=config, intake_version_id=intake_version_id,
             )
 
+            # Hand the deployed plan to the post-deploy review pass
+            # (control-plane/api/src/plan-review.ts). Deliberately AFTER
+            # _complete and in its own transaction: this worker can be newer
+            # than the schema it is talking to, and an UPDATE naming a column
+            # that migration 0050 has not added yet would abort the
+            # transaction that marks the job succeeded — turning a finished
+            # deploy into a failed one over a nice-to-have. Same posture as
+            # the enrichment call above: never fatal.
+            self._record_plan_snapshot(conn, trip_id, config)
+
             logger.info(
                 "provisioner.job_succeeded",
                 extra={"job_id": job_id, "trip_id": trip_id, "attempt": attempt},
@@ -937,6 +947,43 @@ class ProvisionerWorker:
                 "confirmed_at": row["confirmed_at"].isoformat(),
                 "schema_version": row["schema_version"],
             }
+
+    def _record_plan_snapshot(
+        self, conn: psycopg.Connection, trip_id: str, config: Mapping[str, Any],
+    ) -> None:
+        """Store the trip.config.json this deploy actually shipped.
+
+        The post-deploy plan review needs three things at once — the built
+        config, the confirmed intake and the uploaded document — and until now
+        the only place all three existed together was ``_work_claimed_job``,
+        mid-deploy. The other two are already stored; this is the one that was
+        not, because it is derivable and re-deriving it means running the
+        transformer, which only exists on this side.
+
+        Never served to a client. Same rule, and the same reason, as the trip
+        site's ``sanitizeConfig()``: no raw trip.config.json value reaches a
+        reader. The review is read back as findings, never as config.
+
+        Best-effort by construction — a snapshot that does not land costs a
+        review, not a deploy, so every failure is swallowed with a warning.
+        The column may simply not exist yet on a database this worker is newer
+        than.
+        """
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE control_plane.trips "
+                        "SET plan_snapshot = %s::jsonb, plan_snapshot_at = now(), updated_at = now() "
+                        "WHERE id = %s",
+                        (json.dumps(config), trip_id),
+                    )
+        except Exception:
+            logger.warning(
+                "provisioner.plan_snapshot_failed",
+                extra={"trip_id": trip_id},
+                exc_info=True,
+            )
 
     def _complete(
         self,
