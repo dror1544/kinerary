@@ -9,9 +9,10 @@ uses. You are handed raw notes — verbal, half-formed, out of order, sometimes
 in Hebrew or mixed languages — and you produce triaged rows.
 
 Target: the Status ledger in `docs/signup-test-execution-capture (Manual).md`.
-Raw notes are archived alongside it (`docs/signup-test-run1-raw-notes.md` is
-the precedent); the ledger holds only the triaged result and is the source of
-truth for done vs planned.
+Raw notes are archived in `docs/test-reports/`
+(`docs/test-reports/signup-test-run1-raw-notes.md` is the precedent); the
+ledger holds only the triaged result and is the source of truth for done vs
+planned.
 
 ## Per issue
 

@@ -919,7 +919,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > remaining piece of this sprint.
 >
 > **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
-> runs in one day (`docs/signup-test-run1..6-raw-notes.md`) reached a confirmed
+> runs in one day (`docs/test-reports/signup-test-run1..6-raw-notes.md`) reached a confirmed
 > intake twice, and one of those needed two manual database unblocks. The
 > analysis is `docs/interview-design-review.md`: these are not six unrelated
 > defects but four missing pieces of the contract between the router and the
