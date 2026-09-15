@@ -131,7 +131,7 @@ export interface ConnectorOptions {
   /**
    * Records whether the assistant's last companion (group) send expects a
    * reply, so the router's addressing gate can auto-capture the very next
-   * message in that chat for one turn (migration 0048). `expects` mirrors
+   * message in that chat for one turn (migration 0053). `expects` mirrors
    * `SendAction.expectsReply`.
    *
    * Never called on an interview chat — that branch above returns before

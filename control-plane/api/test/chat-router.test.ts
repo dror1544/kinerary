@@ -596,7 +596,7 @@ describe("resolveChatRoute — closed bindings", () => {
   });
 });
 
-describe("companion reply-capture window (migration 0048)", () => {
+describe("companion reply-capture window (migration 0053)", () => {
   async function bindCompanion(fix: Fixture, chatId: string): Promise<void> {
     await fix.pool.query(
       "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, $2, $3, $4)",

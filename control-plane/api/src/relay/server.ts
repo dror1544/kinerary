@@ -244,7 +244,7 @@ async function main(): Promise<void> {
             const said = await sayForChat(runtime.db!, chatId, text);
             return said.ok;
           },
-          // Migration 0048: lets a companion send that's a question open the
+          // Migration 0053: lets a companion send that's a question open the
           // one-shot reply-capture window on its chat's binding.
           setExpectsReply: async (chatId: string, expects: boolean) => {
             await setCompanionExpectsReply(runtime.db!, chatId, expects);

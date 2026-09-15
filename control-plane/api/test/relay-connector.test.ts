@@ -371,7 +371,7 @@ describe("RelayConnector — outbound actions", () => {
   });
 });
 
-describe("RelayConnector — reply-expected capture (migration 0048)", () => {
+describe("RelayConnector — reply-expected capture (migration 0053)", () => {
   async function roundTrip(
     h: Harness,
     action: Record<string, unknown>,

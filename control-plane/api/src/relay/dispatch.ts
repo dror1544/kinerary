@@ -515,7 +515,7 @@ export async function dispatchUpdate(
         : Boolean(repliedTo.is_bot)
       : false;
 
-    // Migration 0048: the assistant's own last message here may have asked a
+    // Migration 0053: the assistant's own last message here may have asked a
     // question it wants answered, in which case the VERY NEXT message in this
     // chat is addressed to it, whoever sends it — no @mention/name/reply-to
     // needed. Attempted unconditionally, ahead of the ordinary gate below: the

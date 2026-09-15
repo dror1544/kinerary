@@ -206,7 +206,7 @@ export interface SendAction {
   metadata?: Record<string, unknown>;
   /**
    * True when this send is a question the assistant wants answered — the one
-   * bit of `metadata` this connector reads (migration 0048's reply-capture
+   * bit of `metadata` this connector reads (migration 0053's reply-capture
    * gate). Required rather than optional: "absent" and "explicitly false"
    * mean the same thing to every consumer, so there is nothing a third state
    * would distinguish.

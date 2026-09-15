@@ -22,7 +22,7 @@ ALTER TABLE control_plane.trips
   ADD COLUMN IF NOT EXISTS companion_reply_capture_enabled boolean NOT NULL DEFAULT true;
 
 COMMENT ON COLUMN control_plane.trips.companion_reply_capture_enabled IS
-  'Per-trip opt-out for the group-chat reply-capture gate (migration 0048). Read server-side only; no endpoint may serve it raw.';
+  'Per-trip opt-out for the group-chat reply-capture gate (migration 0053). Read server-side only; no endpoint may serve it raw.';
 
 -- The capture window itself, per open companion binding. NULL means "no open
 -- window" — the overwhelmingly common case. A timestamp rather than a

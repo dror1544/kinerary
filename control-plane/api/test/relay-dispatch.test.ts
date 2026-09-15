@@ -550,7 +550,7 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
   });
 });
 
-describe("companion reply-capture through dispatchUpdate (migration 0048)", { skip: SKIP }, () => {
+describe("companion reply-capture through dispatchUpdate (migration 0053)", { skip: SKIP }, () => {
   test("an open window lets the very next unaddressed group message through, once", async () => {
     await withFixture(async (fix) => {
       const chatId = "-1002001000";
