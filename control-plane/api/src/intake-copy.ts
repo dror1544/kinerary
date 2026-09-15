@@ -374,6 +374,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     /** Places the document means to visit but has not booked. */
     documentPlanned: "Places from the document",
     documentNothing: "I read it, but I couldn't find anything about the trip in it. No harm — I'll just ask.",
+    documentNothingNew: "I read it — everything in it matches what I already have, so there's nothing new to add. Carrying on:",
     // A reading the model was unsure of, put to the organizer instead of lost.
     // Asked when its question comes up; see renderSuggestion.
     suggestionIntro: "From your document — is this right?",
@@ -398,6 +399,38 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // refuse: someone who sent it was being helpful, and being told "no" with
     // no reason by a bot holding their other documents is unsettling.
     documentIdentity: "That looks like a passport or ID — I've left it unread. I don't need identity documents to set up the trip, so there's no reason for me to hold one. Booking confirmations, tickets and plans are the useful ones.",
+    // Said when part of a document could not be read — pages that are scans,
+    // or a file long enough that reading stopped. What was read is used; what
+    // was not must not be passed off as read, because the organizer would
+    // reasonably assume anything missing from the recap was not in the file.
+    documentPartial: "I could only read part of that — some of it is a scan, or it runs longer than I can take in one go. I've used what I could read; if something from it is missing below, tell me or send that part separately.",
+    // Said after the day-by-day, when the documents together ran past what one
+    // itinerary read takes. Not `documentPartial`: every file WAS read, so "some
+    // of it is a scan" is untrue, and said a second time after the recap it
+    // reads as the same problem twice.
+    itineraryPartial: "The day-by-day plan I added covers only part of your documents — together they run longer than I can plan from in one go. Check the days on the trip's site; for anything missing, send that document on its own.",
+    // Said when every file in a burst is one already read. Re-sending "in case
+    // it didn't arrive" is ordinary, and "I couldn't find anything" would be a
+    // false thing to say about a document that has already answered questions.
+    documentAlreadyRead: "I already have that one — I read it earlier, so nothing new to add from it. Carrying on:",
+    // Two documents disagree and neither is obviously newer — upload order is
+    // not evidence. The organizer decides; the value already held stays until
+    // they do, so an unanswered question never costs them anything.
+    documentConflict: "Two of your documents disagree about {what} for {entry}. I have {held}, but \"{document}\" says {incoming}. Which is right?",
+    documentConflictKeep: "Keep {held}",
+    documentConflictReplace: "Use {incoming}",
+    documentConflictKept: "Kept as it was.",
+    documentConflictReplaced: "Updated.",
+    documentConflictStale: "That one's already been settled.",
+    // What a disputed field is called in the question. A field with no label
+    // here is named generically rather than by its internal key.
+    "conflictField.start": "the start date",
+    "conflictField.end": "the end date",
+    "conflictField.date": "the date",
+    "conflictField.confirmation": "the confirmation number",
+    "conflictField.accommodation.name": "the hotel",
+    "conflictField.accommodation.confirmation": "the hotel's confirmation number",
+    "conflictField.default": "the details",
     // The three messages of an interview that can end.
     //
     // All three exist to answer the question someone actually has, which is
@@ -426,6 +459,27 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // for a button that does not exist.
     expiredWriteAfter:
       "This conversation has closed, so I can't add that to your trip. Opening a fresh interview link will pick things up again — the same kind of link that started us off. Ask whoever set your trip up for a new one, and everything you've already told me will still be there.",
+    // A document after the trip is confirmed. Nothing it says changes the trip
+    // until the organizer approves — so every message says what WOULD change,
+    // and that nothing has yet.
+    correctionReading: "Got it — I'm reading this against your trip. I'll show you anything it would change before anything changes.",
+    correctionProposal: "{document} would update your trip:\n{changes}\n\nNothing changes until you approve.",
+    correctionConflict:
+      "{document} disagrees with your trip about {what} for {entry}: your trip has {held}, the document says {incoming}.\n\nUpdate the trip to the document's version?",
+    correctionApprove: "Approve",
+    correctionReject: "Keep as it is",
+    correctionApplied: "Done — your trip is updated. The site will refresh with it shortly.",
+    correctionAppliedSiteLater: "Done — your trip is updated. The site will show it the next time it's rebuilt.",
+    correctionRejected: "Okay — nothing changed.",
+    correctionStale:
+      "Your trip changed after I read that document, so I haven't applied it. Send the document again and I'll check it against the trip as it is now — it won't take long.",
+    correctionNotNow: "Your site is being built right now, so the trip can't change this minute. Tap Approve again in a little while.",
+    correctionFailed: "I couldn't apply that change, so nothing was changed.",
+    correctionNothingNew: "I've read it — everything in it is already in your trip, so there's nothing to change.",
+    correctionAlreadyDecided: "That one has already been decided.",
+    "correctionChange.added": "• {question}: add {entry}",
+    "correctionChange.filled": "• {question}: {entry} — add {what}",
+    "correctionChange.answered": "• {question}: {value}",
   },
   he: {
     skip: "⤼ דלג על זו",
@@ -476,6 +530,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentCorrect: "אם משהו מזה לא נכון פשוט תגידו לי ואתקן — אין לחץ, גם אחר כך אפשר. בינתיים נמשיך:",
     documentPlanned: "מקומות מהמסמך",
     documentNothing: "קראתי, אבל לא מצאתי שם מידע על הטיול. לא נורא — פשוט אשאל.",
+    documentNothingNew: "קראתי — כל מה שבמסמך כבר נמצא אצלי, כך שאין מה להוסיף. ממשיכים:",
     suggestionIntro: "מהמסמך שלכם — זה נכון?",
     suggestionYes: "✅ כן, נכון",
     suggestionNo: "✏️ לא",
@@ -485,6 +540,22 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentExtractFailed: "קראתי, אבל לא הצלחתי להבין את זה כרגע — זה עליי, לא על הקובץ. אשאל במקום, ואפשר לשלוח שוב מאוחר יותר.",
     documentUnreadable: "לא הצלחתי לקרוא את הקובץ — יכול להיות שזו סריקה או תמונה ולא מסמך טקסט. אפשר לשלוח קובץ אחר אם יש, או שנמשיך ואשאל במקום.",
     documentIdentity: "זה נראה כמו דרכון או תעודת זהות — לא קראתי אותו. אני לא צריך מסמכי זיהוי כדי להקים את הטיול, אז אין סיבה שאחזיק אחד כזה. אישורי הזמנה, כרטיסים ותוכניות — אלה המועילים.",
+    documentPartial: "הצלחתי לקרוא רק חלק מזה — חלק מהקובץ סרוק, או שהוא ארוך מכדי לקרוא בבת אחת. השתמשתי במה שהצלחתי לקרוא; אם משהו ממנו חסר למטה, ספרו לי או שלחו את החלק הזה בנפרד.",
+    itineraryPartial: "התוכנית היומית שהוספתי מכסה רק חלק מהמסמכים — יחד הם ארוכים מכדי שאתכנן מהם בבת אחת. בדקו את הימים באתר הטיול; אם משהו חסר, שלחו את המסמך הזה לבד.",
+    documentAlreadyRead: "את זה כבר יש לי — קראתי אותו קודם, כך שאין ממנו משהו חדש להוסיף. ממשיכים:",
+    documentConflict: "שני מסמכים שלכם לא מסכימים לגבי {what} של {entry}. אצלי רשום {held}, אבל ב-\"{document}\" כתוב {incoming}. מה נכון?",
+    documentConflictKeep: "להשאיר {held}",
+    documentConflictReplace: "להחליף ל-{incoming}",
+    documentConflictKept: "נשאר כמו שהיה.",
+    documentConflictReplaced: "עודכן.",
+    documentConflictStale: "זה כבר הוכרע.",
+    "conflictField.start": "תאריך ההתחלה",
+    "conflictField.end": "תאריך הסיום",
+    "conflictField.date": "התאריך",
+    "conflictField.confirmation": "מספר האישור",
+    "conflictField.accommodation.name": "המלון",
+    "conflictField.accommodation.confirmation": "מספר האישור של המלון",
+    "conflictField.default": "הפרטים",
     expiringSoon:
       "אם לא אשמע מכם, אסגור את השיחה בעוד כ-10 דקות — שום דבר לא הולך לאיבוד, כל מה שסיפרתם שמור. שלחו משהו ונמשיך.",
     didNotFollow: "סליחה — לא הבנתי בדיוק. הנה מה שאני מחכה לו:",
@@ -493,6 +564,24 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     expired: "סגרתי את השיחה בינתיים — כל מה שסיפרתם שמור, שום דבר לא הלך לאיבוד. כדי להמשיך צריך קישור ראיון חדש; בקשו ממי שהקים לכם את הטיול ונמשיך בדיוק מאיפה שעצרנו.",
     expiredWriteAfter:
       "השיחה הזו נסגרה, אז אני לא יכול להוסיף את זה לטיול. קישור הפעלה חדש לראיון יחזיר אותנו לאן שהיינו — אותו סוג קישור שפתח לנו את השיחה. בקשו קישור חדש ממי שהקים לכם את הטיול, וכל מה שכבר סיפרתם עדיין יהיה שם.",
+    correctionReading: "קיבלתי — אני קורא את זה מול הטיול שלכם. כל מה שזה ישנה אראה לכם לפני שמשהו משתנה.",
+    correctionProposal: "{document} יעדכן את הטיול שלכם:\n{changes}\n\nשום דבר לא משתנה עד שתאשרו.",
+    correctionConflict:
+      "{document} לא מסכים עם הטיול לגבי {what} של {entry}: בטיול כתוב {held}, ובמסמך {incoming}.\n\nלעדכן את הטיול לפי המסמך?",
+    correctionApprove: "לאשר",
+    correctionReject: "להשאיר כמו שזה",
+    correctionApplied: "בוצע — הטיול עודכן. האתר יתעדכן בהתאם בקרוב.",
+    correctionAppliedSiteLater: "בוצע — הטיול עודכן. האתר יציג את זה בבנייה הבאה שלו.",
+    correctionRejected: "בסדר — שום דבר לא השתנה.",
+    correctionStale:
+      "הטיול השתנה אחרי שקראתי את המסמך, אז לא החלתי את השינוי. שלחו את המסמך שוב ואבדוק אותו מול הטיול כמו שהוא עכשיו — זה לא ייקח הרבה.",
+    correctionNotNow: "האתר שלכם נבנה ממש עכשיו, אז אי אפשר לשנות את הטיול כרגע. לחצו שוב על אישור בעוד כמה דקות.",
+    correctionFailed: "לא הצלחתי להחיל את השינוי, אז שום דבר לא השתנה.",
+    correctionNothingNew: "קראתי — כל מה שבמסמך כבר נמצא בטיול, כך שאין מה לשנות.",
+    correctionAlreadyDecided: "על זה כבר הוחלט.",
+    "correctionChange.added": "• {question}: להוסיף את {entry}",
+    "correctionChange.filled": "• {question}: {entry} — להוסיף {what}",
+    "correctionChange.answered": "• {question}: {value}",
   },
 };
 

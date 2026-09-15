@@ -287,6 +287,7 @@ if [ ! -f {app_dir}/.env ]; then
   cat > {app_dir}/.env <<ENVEOF
 TRIP_DIR={app_dir}/trips/{trip_slug}
 DATA_DIR={spec.nfs_mount_path}/server-data
+TRIP_DOCUMENTS_DIR={spec.nfs_mount_path}/documents
 PORT=3000
 TRIP_DESIGN_VARIANT=modern
 JWT_SECRET=${{JWT_SECRET}}

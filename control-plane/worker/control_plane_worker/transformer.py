@@ -1653,7 +1653,11 @@ def _same_place(a: str, b: str) -> bool:
     return bool(x and y) and (x in y or y in x)
 
 
-def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
+def derive_bookings(
+    config: Mapping[str, Any],
+    data: Mapping[str, Any],
+    documents: Any = None,
+) -> list[dict[str, Any]]:
     """Build bookings.json rows from an already-transformed config plus the raw
     intake answers.
 
@@ -1667,6 +1671,10 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
 
     Every row carries a deterministic `seed_key` so re-provisioning the same
     intake is idempotent against the site's `INSERT OR IGNORE ... seed_key`.
+
+    `documents` (a `document_handoff.DocumentLinks`) adds `conf_file` — the
+    published source document — to a row whose provenance names one. Without it
+    no row carries the key at all, exactly as before.
 
     `bookings.phase` is `TEXT NOT NULL` on the site, so an anchor that maps to
     no phase (undated, or a whole-trip proposal) is parked on the first phase
@@ -1704,8 +1712,11 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             "seed_key": f"hotel_{phase.get('id')}",
         })
         hotel_row[str(phase.get("id"))] = bookings[-1]
+        stay_file = documents.for_phase(str(phase.get("id"))) if documents is not None else None
+        if stay_file:
+            bookings[-1]["conf_file"] = stay_file
 
-    for raw in _structured_list(data, "travel_anchors"):
+    for index, raw in enumerate(_structured_list(data, "travel_anchors")):
         if not isinstance(raw, dict):
             continue
         anchor = _read_anchor(raw)
@@ -1722,8 +1733,12 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
         # number; a different hotel in the same phase is a split stay and keeps
         # its own.
         own = hotel_row.get(phase_id or "")
+        anchor_file = documents.for_anchor(index) if documents is not None else None
         if own and _ANCHOR_TYPE_MAP.get(anchor_type) == "hotel" and _same_place(own["name"], name):
             own["confirmation"] = own["confirmation"] or raw.get("confirmation")
+            # The voucher behind the anchor is the voucher behind the stay.
+            if anchor_file and not own.get("conf_file"):
+                own["conf_file"] = anchor_file
             continue
         # A free-text anchor keeps the key it has always had, so re-provisioning
         # an existing trip stays idempotent. A structured one has no `detail`;
@@ -1747,5 +1762,7 @@ def derive_bookings(config: Mapping[str, Any], data: Mapping[str, Any]) -> list[
             "location_url": _config_venue_link(f"{name} {detail}", phases),
             "seed_key": "anchor_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10],
         })
+        if anchor_file:
+            bookings[-1]["conf_file"] = anchor_file
 
     return bookings

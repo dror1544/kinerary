@@ -81,6 +81,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       // number with different content is the collision worth avoiding. A gap
       // is not: the runner applies whatever it has not recorded, in name order.
       "0051_trip_person_links.sql",
+      "0052_document_registry.sql",
+      "0053_answer_provenance.sql",
+      "0054_model_task_settings.sql",
+      "0055_document_corrections.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -142,6 +146,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       // number with different content is the collision worth avoiding. A gap
       // is not: the runner applies whatever it has not recorded, in name order.
       "0051_trip_person_links.sql",
+      "0052_document_registry.sql",
+      "0053_answer_provenance.sql",
+      "0054_model_task_settings.sql",
+      "0055_document_corrections.sql",
     ]);
   } finally {
     await reset(client);

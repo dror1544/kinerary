@@ -209,6 +209,9 @@ process**, which is where the interview's model calls are made:
 INTERPRET_PATH_DEFAULT=1
 INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5
 EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5
+# Document reading, per task (benchmarked 2026-09-13 — docs/document-intake-operations.md):
+EXTRACT_INTAKE_RUNNER=codex      EXTRACT_INTAKE_MODEL=gpt-5.6-luna
+EXTRACT_ITINERARY_RUNNER=codex   EXTRACT_ITINERARY_MODEL=gpt-5.6-luna
 ```
 
 **Unset is not an error, it is a downgrade.** With no flag, new sessions are

@@ -50,6 +50,7 @@ class FakeDeployAdapter:
         first_provision: bool = False,
         sidecars: dict[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Any = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -58,6 +59,7 @@ class FakeDeployAdapter:
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
             "sidecars": sidecars or {}, "source_dir": source_dir,
+            "documents": list(documents or []),
         })
         return f"https://{slug}.test.example"
 
@@ -381,6 +383,90 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         # Default fixture intake has no phases and no anchors.
         self.worker.run_once()
         self.assertNotIn("bookings.json", self.fake_deploy.deployed[0]["sidecars"])
+        self.assertEqual([], self.fake_deploy.deployed[0]["documents"])
+        self.assertNotIn("documents.json", self.fake_deploy.deployed[0]["sidecars"])
+
+    def _seed_voucher(self, store: str, *, storage_trip: str | None = None) -> tuple[str, str]:
+        """A stored voucher for the fixture trip, and the manifest that names it."""
+        trip_id = self.fix["trip_id"]
+        content = b"%PDF-1.4 Gracery voucher"
+        hexdigest = hashlib.sha256(content).hexdigest()
+        document_id = f"doc_{rnd()}"
+        key_trip = storage_trip or trip_id
+        os.makedirs(os.path.join(store, key_trip), exist_ok=True)
+        with open(os.path.join(store, key_trip, f"{hexdigest}.pdf"), "wb") as fh:
+            fh.write(content)
+        manifest = {
+            "documents": [{
+                "documentId": document_id, "digest": f"sha256:{hexdigest}", "filename": "Gracery voucher.pdf",
+                "byteSize": len(content), "mime": "application/pdf", "stored": True,
+            }],
+            "sources": [{
+                "questionId": "phases", "index": 0, "documentId": document_id,
+                "disposition": "filled", "paths": ["accommodation"],
+            }],
+        }
+        with self.conn.transaction():
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO control_plane.trip_documents
+                         (id, trip_id, content_digest, byte_size, mime, storage_key, ingest_state, stored_at)
+                       VALUES (%s, %s, %s, %s, 'application/pdf', %s, 'stored', now())""",
+                    (document_id, trip_id, f"sha256:{hexdigest}", len(content), f"{key_trip}/{hexdigest}.pdf"),
+                )
+                cur.execute(
+                    "UPDATE control_plane.intake_versions SET source_document = %s::jsonb WHERE id = %s",
+                    (json.dumps(manifest), self.fix["intake_id"]),
+                )
+        return document_id, f"{hexdigest}.pdf"
+
+    def _with_a_stay(self) -> None:
+        teardown_fixture(self.conn, self.fix)
+        self.fix = setup_fixture(self.conn, intake={
+            **JAPAN_INTAKE,
+            "phases": {"kind": "structured", "schema_version": 3, "data": [
+                {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23",
+                 "accommodation": {"name": "Hotel Gracery Shinjuku", "confirmation": "GR-4471"}},
+            ]},
+        })
+
+    def test_source_documents_are_published_and_linked_to_what_they_support(self) -> None:
+        import tempfile
+        self._with_a_stay()
+        with tempfile.TemporaryDirectory() as store:
+            _, file_name = self._seed_voucher(store)
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", document_store_dir=store,
+            )
+            worker.run_once()
+
+        deployed = self.fake_deploy.deployed[0]
+        self.assertEqual([file_name], [doc.file_name for doc in deployed["documents"]])
+        tokyo = next(p for p in deployed["config"]["phases"] if p["id"] == "tokyo")
+        self.assertEqual(file_name, tokyo["accommodation"]["pdf"], "the hotel card opens its voucher")
+        hotel = next(b for b in deployed["sidecars"]["bookings.json"] if b["type"] == "hotel")
+        self.assertEqual(file_name, hotel["conf_file"])
+        sidecar = deployed["sidecars"]["documents.json"]
+        self.assertEqual("Gracery voucher.pdf", sidecar[0]["filename"])
+        self.assertIn({"kind": "booking", "seed_key": "hotel_tokyo"}, sidecar[0]["links"])
+        self.assertIn({"kind": "phase", "id": "tokyo"}, sidecar[0]["links"])
+
+    def test_a_storage_key_naming_another_trip_is_never_published(self) -> None:
+        import tempfile
+        self._with_a_stay()
+        with tempfile.TemporaryDirectory() as store:
+            # The row is this trip's, but its key points into another trip's
+            # directory — a corrupt or tampered row. It must not be followed.
+            self._seed_voucher(store, storage_trip=f"trip_{rnd()}")
+            worker = ProvisionerWorker(
+                db_url=DB_URL, deploy=self.fake_deploy, worker_id="test-provisioner", document_store_dir=store,
+            )
+            worker.run_once()
+
+        deployed = self.fake_deploy.deployed[0]
+        self.assertEqual([], deployed["documents"])
+        self.assertNotIn("pdf", next(p for p in deployed["config"]["phases"] if p["id"] == "tokyo")["accommodation"])
+        self.assertNotIn("documents.json", deployed["sidecars"])
 
     def test_enrich_hook_receives_the_config_and_destination(self) -> None:
         seen: dict[str, Any] = {}
@@ -1334,6 +1420,86 @@ class ShellDeployAdapterSidecarTests(unittest.TestCase):
                 self.assertEqual([{"seed_key": "hotel_tokyo"}], json.load(fh))
             with open(os.path.join(trip_dir, "trivia_questions.json"), encoding="utf-8") as fh:
                 self.assertEqual([], json.load(fh))
+
+
+class ShellDeployAdapterDocumentPlacementTests(unittest.TestCase):
+    """An original goes to the trip's own NFS directory as a hard link — one
+    physical copy shared with the control plane's store — and beside the config
+    only when the trip's NFS directory cannot take it."""
+
+    def _document(self, store_dir: str, text: bytes = b"Hotel Artemide - confirmation HTL-99117"):
+        import hashlib
+
+        from control_plane_worker.document_handoff import TripDocumentFile
+
+        digest = hashlib.sha256(text).hexdigest()
+        source = os.path.join(store_dir, f"{digest}.txt")
+        with open(source, "wb") as fh:
+            fh.write(text)
+        return TripDocumentFile(
+            document_id="doc_" + "a" * 32, file_name=f"{digest}.txt", source_path=source,
+            content_digest=f"sha256:{digest}", filename="Artemide.txt", mime="text/plain",
+        )
+
+    def _deploy(self, adapter, documents) -> None:
+        from unittest import mock
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("control_plane_worker.provisioner.subprocess.run", return_value=completed), \
+             mock.patch.object(ShellDeployAdapter, "_private_url", return_value="https://italy-2026.example"):
+            adapter.deploy("italy-2026", {"meta": {"title": "Italy"}}, documents=documents)
+
+    def test_hard_linked_into_the_trip_nfs_directory_with_no_second_copy(self) -> None:
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(nfs, ".kinerary-document-store", "trip_" + "b" * 32)
+            os.makedirs(deploy_root)
+            os.makedirs(os.path.join(nfs, "italy-2026"))
+            os.makedirs(store)
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            published = os.path.join(nfs, "italy-2026", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(published))
+            self.assertEqual(os.stat(published).st_ino, os.stat(document.source_path).st_ino, "one physical copy")
+            self.assertFalse(
+                os.path.exists(os.path.join(deploy_root, "trips", "italy-2026", "documents", document.file_name)),
+                "no second copy travels with the deploy",
+            )
+
+    def test_falls_back_beside_the_config_when_the_trip_nfs_directory_is_not_visible(self) -> None:
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(root, "store")
+            os.makedirs(deploy_root)
+            os.makedirs(nfs)  # the export, but no italy-2026 directory in it
+            os.makedirs(store)
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            beside_config = os.path.join(deploy_root, "trips", "italy-2026", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(beside_config))
+            self.assertFalse(os.path.exists(os.path.join(nfs, "italy-2026")), "never a look-alike trip directory")
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
