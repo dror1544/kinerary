@@ -1,0 +1,59 @@
+{
+  "//": [
+    "Which control planes this monitor can read, and how to reach each one.",
+    "",
+    "Copy this file to ONE of these (first hit wins), and edit:",
+    "  $KINERARY_FLEET_CONFIG",
+    "  <hermes profile>/fleet-stacks.json        <- beside the skill, not inside it",
+    "  ~/.config/kinerary/fleet-stacks.json",
+    "",
+    "It is kept OUT of the skill directory on purpose: install-hermes-skill.sh",
+    "diffs the skill, so a real deployment's config living inside it would show",
+    "up forever as drift against the repo.",
+    "",
+    "Every stack needs a label and reachability. 'production': true marks the",
+    "one that describes real travellers; the agent is told never to merge its",
+    "numbers with anything else. 'default_stack' is what tools read when no",
+    "stack is named.",
+    "",
+    "Three ways to reach a database, in increasing distance:",
+    "  url        psql connects directly (managed Postgres, or a published port)",
+    "  container  the database is in a container on this machine",
+    "  ssh        ... and that machine is reached over SSH first",
+    "Anything stranger: 'argv' takes a literal command line, where {sep} is the",
+    "field separator and {pgoptions} the read-only connection options.",
+    "",
+    "Binaries are found on PATH, with FLEET_SSH_BIN / FLEET_DOCKER_BIN /",
+    "FLEET_PSQL_BIN as overrides. Nothing here hardcodes a path."
+  ],
+
+  "default_stack": "prod",
+
+  "stacks": {
+    "prod": {
+      "label": "production — control plane VM",
+      "production": true,
+      "container": "kinerary-cp-postgres-1",
+      "database": { "user": "kinerary_control_plane", "name": "kinerary_control_plane" },
+      "ssh": {
+        "target": "<user>@<control-plane-vm>",
+        "key": "~/.ssh/<key for that user>",
+        "sudo": true,
+        "connect_timeout": 10
+      }
+    },
+
+    "local": {
+      "label": "local development stack (NOT production)",
+      "production": false,
+      "container": "kinerary-control-plane-local-postgres-1",
+      "database": { "user": "kinerary_control_plane", "name": "kinerary_control_plane" }
+    },
+
+    "example-managed-postgres": {
+      "label": "staging on managed Postgres",
+      "production": false,
+      "url": "postgres://reader:secret@db.example.internal:5432/kinerary"
+    }
+  }
+}
