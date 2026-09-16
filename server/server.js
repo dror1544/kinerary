@@ -1737,7 +1737,14 @@ app.get('/api/album-share/:phase', async (req, res) => {
   }
 });
 
-app.post('/api/upload', upload.array('files'), async (req, res) => {
+// authRequired comes BEFORE the multer middleware, not merely somewhere in the
+// chain. This route used to have no auth at all: anyone who knew a trip's
+// hostname could push files into that family's Immich library with the site's
+// own API key, and multer read up to 200 MB per file into memory before the
+// handler ran. Checking auth after multer would still refuse the request, but
+// only after an anonymous body had been read — tests/server.test.js pins the
+// order with a truncated upload that multer would choke on.
+app.post('/api/upload', authRequired, upload.array('files'), async (req, res) => {
   if (!IMMICH_URL || !IMMICH_KEY) {
     return res.status(503).json({ error: 'Immich not configured on server — set IMMICH_URL and IMMICH_API_KEY in .env' });
   }
