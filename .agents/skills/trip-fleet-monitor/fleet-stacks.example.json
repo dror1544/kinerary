@@ -24,19 +24,22 @@
     "field separator and {pgoptions} the read-only connection options.",
     "",
     "Binaries are found on PATH, with FLEET_SSH_BIN / FLEET_DOCKER_BIN /",
-    "FLEET_PSQL_BIN as overrides. Nothing here hardcodes a path."
+    "FLEET_PSQL_BIN as overrides. Nothing here hardcodes a path.",
+    "",
+    "Every <angle-bracket> value is a placeholder. Real hosts, container names",
+    "and key names belong in the private deployment config, never in this repo."
   ],
 
   "default_stack": "prod",
 
   "stacks": {
     "prod": {
-      "label": "production — control plane VM",
+      "label": "production",
       "production": true,
-      "container": "kinerary-cp-postgres-1",
+      "container": "<control-plane postgres container>",
       "database": { "user": "kinerary_control_plane", "name": "kinerary_control_plane" },
       "ssh": {
-        "target": "<user>@<control-plane-vm>",
+        "target": "<user>@<control-plane host>",
         "key": "~/.ssh/<key for that user>",
         "sudo": true,
         "connect_timeout": 10
@@ -46,7 +49,7 @@
     "local": {
       "label": "local development stack (NOT production)",
       "production": false,
-      "container": "kinerary-control-plane-local-postgres-1",
+      "container": "<development postgres container>",
       "database": { "user": "kinerary_control_plane", "name": "kinerary_control_plane" }
     },
 

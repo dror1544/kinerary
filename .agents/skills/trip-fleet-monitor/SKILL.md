@@ -32,8 +32,8 @@ build step, nothing that breaks when a git worktree is deleted.
 Nothing in the code knows a hostname, container, database user, SSH key or
 binary path. Those live in `fleet-stacks.json`; see
 [`fleet-stacks.example.json`](fleet-stacks.example.json) for the annotated
-schema. Moving the VM, renaming a container or adding a staging environment is
-an edit to that file.
+schema. Moving the control plane to another host, renaming a container or
+adding a staging environment is an edit to that file.
 
 | stack field | meaning |
 |---|---|
@@ -130,16 +130,16 @@ so preflight blocks a commit while the two differ.
 
 ## Why classification is the core of it
 
-Production on 2026-09-16 held 48 trips: 38 `retired-*` teardowns, 7
-`draft-sreq-*` trips that were never built, and **one** real customer trip. All
-32 failed notifications in the table belonged to retired trips. A monitor that
-counts rows without classifying them reports a fleet on fire, forever. The class
-lives in one SQL expression that every tool shares.
+A control plane that has been tested against is mostly test history:
+`retired-*` teardowns and `draft-sreq-*` signups that were never built far
+outnumber real trips, and nearly every failed notification belongs to a retired
+trip. A monitor that counts rows without classifying them reports a fleet on
+fire, forever. The class lives in one SQL expression that every tool shares.
 
 `prospect` is deliberately **not** noise. Those are real people, and the stage
 separates the harmless from the broken: `draft` is someone who has not started,
 but `intake_confirmed` with no build job means a person answered every question
-and nothing built their trip — two had been sitting that way for five days.
+and nothing built their trip — a state that can sit unnoticed for days.
 Naming that class carelessly is not cosmetic: the first version called it
 `unnamed_draft`, "signups that never reached an interview", which would have
 taught the agent to ignore the one state most worth reporting.
@@ -168,9 +168,9 @@ stack: a query that used to fail quietly now fails the tool.
 
 Traveller and organizer **names**, and raw Telegram **chat ids**. The SOUL
 forbids repeating names, but a rule in a prompt is not a boundary: that same
-first report named the organizer — misspelled, and with the wrong gender —
-because `trip_detail` handed the name over. People are now reported as roles
-and counts. What the tool never returns, the agent cannot leak.
+first report named the organizer, because `trip_detail` handed the name over.
+People are now reported as roles and counts. What the tool never returns, the
+agent cannot leak.
 
 ## Schema facts that produced wrong answers
 
@@ -179,13 +179,13 @@ and counts. What the tool never returns, the agent cannot leak.
   `interview_agent_turns.chat_id`. `chat_id < 0` is a type error; a group is
   `chat_id LIKE '-%'`.
 - **A confirmed session keeps `phase = recap` and `awaiting = machine`
-  forever.** All 33 confirmed sessions in production read that way. It is what
+  forever.** Every confirmed session reads that way. It is what
   a finished interview looks like; the monitor once reported it as "a summary
   the system has owed the organizer for 16 hours". `awaiting` means something
   only while `state = 'interviewing'`.
 - **`jobs.updated_at` is not the completion time.** It marks the claim, landing
   2–8 seconds after `created_at`, while `last_heartbeat_at` sits minutes later.
   Measuring build duration from `updated_at` reports every build as 0 minutes.
-  `job_steps` was empty in production, so it is no help either.
-- **`funnel_events` is empty**, so funnel statistics come from the timestamps on
-  trips, sessions and jobs.
+  `job_steps` may be empty, so it is no help either.
+- **`funnel_events` may be empty**, so funnel statistics come from the
+  timestamps on trips, sessions and jobs.
