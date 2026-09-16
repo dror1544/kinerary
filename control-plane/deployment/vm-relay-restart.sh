@@ -70,8 +70,11 @@ since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export TELEGRAM_API_ROOT="$TELEGRAM_ROOT"
 compose up -d --force-recreate --no-deps relay >/dev/null 2>&1 || die "compose could not recreate the relay"
 
+# relay.ready is logged only once polling has started, and the relay first
+# waits (RELAY_GATEWAY_WAIT_SECONDS, default 40) for the live trips' companions
+# to reconnect — so allow for that wait on top of the ~20s it takes to start.
 ready=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "${KINERARY_RELAY_READY_SECONDS:-90}"); do
   if compose logs --since "$since" relay 2>/dev/null | grep -q '"event":"relay.ready"'; then ready=1; break; fi
   sleep 1
 done
