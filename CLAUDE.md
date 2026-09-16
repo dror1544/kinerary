@@ -207,9 +207,17 @@ process**, which is where the interview's model calls are made:
 
 ```
 INTERPRET_PATH_DEFAULT=1
-INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5
-EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5
+INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5   INTERPRET_EFFORT=medium
+EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5     EXTRACT_EFFORT=medium
+ITINERARY_EXTRACT_TIMEOUT_MS=120000
 ```
+
+**Set the effort.** Unset, a nested `claude -p` takes its effort from the
+settings in the relay's HOME — on the Mac, a personal `effortLevel: xhigh`, at
+which a 4-page PDF's day-by-day plan took 143s against a 60s limit and never
+arrived (2026-09-16). Set, the call also ignores personal settings, hooks and
+connectors. The VM takes `medium` from `CLAUDE_CONFIG_DIR` instead and is
+unaffected until it sets these too.
 
 **Unset is not an error, it is a downgrade.** With no flag, new sessions are
 created on the agent path — which is a supported path, so nothing warns. With
