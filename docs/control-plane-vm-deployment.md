@@ -75,17 +75,11 @@ curl -s http://127.0.0.1:4310/readyz
 
 Images are built on the VM and pinned by revision in `vm.env`
 (`KINERARY_REV`, `HERMES_REV`) — no dev `dist/` overlays, unlike
-`compose.local.yml`:
-
-```bash
-cd /opt/kinerary && git pull --ff-only && REV=$(git rev-parse --short HEAD)
-sudo docker build -f control-plane/api/Dockerfile -t kinerary-cp/api:$REV .
-sudo docker build -f control-plane/worker/Dockerfile -t kinerary-cp/worker:$REV .
-sudo docker build -f control-plane/deployment/agent-runtime.Dockerfile \
-  --build-arg BASE=kinerary-cp/api:$REV -t kinerary-cp/agent-runtime:$REV .
-sudo sed -i "s/^KINERARY_REV=.*/KINERARY_REV=$REV/" /opt/kinerary-deploy/vm.env
-$C up -d --wait
-```
+`compose.local.yml`. **Change the version only with `kinerary-cp-release`**
+(see [Upgrades and rollback](#upgrades-and-rollback)): it builds the images,
+takes a dump and a snapshot first, records where it came from, and knows the
+way back. The checkout is a detached HEAD at the running revision, tagged
+`deployed/<rev>`.
 
 `agent-runtime` is the api image plus the `claude` and `codex` CLIs the relay
 (interpret) and sidecar (extract) shell out to through `model-runner.ts`,
@@ -271,6 +265,127 @@ The Cloudflare/NPM/LXC and bridge steps were then proven by the first VM
 provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
 the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
 byte-identical to before the run.
+
+## Upgrades and rollback
+
+One VM, a snapshot before every upgrade, three ways back. A second standby VM
+was considered and rejected (2026-09-16): the host has ~6 GB free and this VM
+holds 10 GB with ballooning off, every trip container calls this VM's IP for
+its AI features (`HERMES_URL=http://<this VM>:<3000+vmid>`), and single-use
+OAuth refresh tokens cannot live on two machines.
+
+```bash
+sudo kinerary-cp-release status                       # what runs, history, snapshots, pool, requests
+sudo kinerary-cp-release plan main                    # commits, new migrations, rollback verdict
+sudo kinerary-cp-release upgrade main --dry-run       # every guard for real; changes nothing
+sudo kinerary-cp-release upgrade main
+sudo kinerary-cp-release rollback [--restore-db] [--dry-run]
+sudo kinerary-cp-release verify
+sudo kinerary-cp-release prune --dry-run
+```
+
+**An upgrade**, in order:
+1. **Prepare.** Build the images in a throwaway worktree, before the snapshot,
+   so builds don't grow it. Validate the target's `compose.vm.yml` against this
+   VM's env and secrets. Check storage.
+2. **Guards.** No provisioning job in flight, no interview mid-turn, and the
+   Proxmox snapshot preflight.
+3. **Safety point.** `pg_dump` with per-table counts, then a snapshot of this
+   VM.
+4. **Switch.** Checkout, then `vm.env`, then `migrate`. If migrate fails, the
+   checkout and `vm.env` go back and no container was touched. Then api,
+   worker and the sidecars; then the relay through `vm-relay-restart.sh`; and
+   Hermes only if its revision changed.
+5. **Verify.** readyz, migrations, image tags, relay bot/polling/no 409,
+   trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
+   companion connection and trip-mcp bridge. Dror gets the result on Telegram.
+
+**What trips notice.** Websites: nothing. The bot pauses for the relay
+restart. Since the relay waits for the live trips' companions to reconnect
+before polling (`RELAY_GATEWAY_WAIT_SECONDS`, default 40), messages sent in the
+window wait at Telegram rather than getting "try again". Companions and site AI
+features restart only when `HERMES_REV` changes.
+
+**Three ways back:**
+
+| | When | Cost |
+|---|---|---|
+| `rollback` | every migration since is `-- rollback: compatible` | ~1 min bot pause, no data lost |
+| `rollback --restore-db` | a migration is breaking, or data went wrong | DB writes since the dump; **refused** if a trip reached `provisioning` or later, a job ran, or a Hermes profile appeared since |
+| `control-plane/deployment/vm-restore-snapshot.sh` (from the Mac) | Docker, OS or Hermes image damage | everything on the VM since the snapshot; refused on the same condition |
+
+Every new migration declares `-- rollback: compatible — <why>` or
+`-- rollback: breaking — <what>`, enforced by
+`control-plane/api/test/migration-rollback.test.ts`. The tool treats an
+undeclared one as breaking.
+
+A code-only rollback keeps the newer database, and old code tolerates it only
+because the migrations said so. It also means **the newest `available` site
+release may be newer than the rolled-back worker**; the tool warns when that
+is the case.
+
+### Snapshots: never on NFS, never stuck, never filling the pool
+
+The only failed snapshot-class task on this host was the 2026-09-13 vzdump
+into an NFS share. Nothing here uses vzdump, vmstate or NFS. Snapshots are
+thin volumes in the VM's own thin pool, and dumps go to `/var/backups/kinerary-cp` on
+this VM's own ext4. The tool refuses to write a backup anywhere that is not a
+local filesystem.
+
+`proxmox-snapshot-runner.sh` is streamed over ssh to the Proxmox host and runs
+there. A snapshot of a running VM freezes the guest's filesystems first, and a
+guest cannot thaw itself. So the 120 s limit, the thaw, the unlock (only once
+no task holds the VM) and the removal of a half-made snapshot all happen on
+the host, and the upgrade stops before switching anything.
+
+A snapshot is refused when any of these hold:
+- a disk isn't on `lvmthin`;
+- the VM is locked;
+- any vzdump, snapshot, clone or migrate task is running on the node;
+- the guest agent does not answer, or the guest is already frozen;
+- the guest has a network filesystem mounted;
+- the shared pool (other guests live there too) is at ≥ 70% data or ≥ 50%
+  of its metadata volume;
+- the VG has < 10 G for metadata autoextend;
+- the pool could not absorb every snapshot of the VM (hand-made ones
+  included) diverging completely, plus 50 G.
+
+| Limit | Value |
+|---|---|
+| release snapshots (`pre-*`) | ≤ 2; an upgrade keeps the newest and adds one; `prune` deletes those older than 14 days, never the newest; hand-made snapshots are never touched |
+| backup dirs | newest 10 and ≤ 5 GB; refuse with < 10 GB free on `/` |
+| images | `prune` keeps the last 5 history revisions and the running one; Hermes images are never pruned |
+| build cache | `docker builder prune --keep-storage 5GB` |
+
+### Whole-VM restore credentials
+
+`vm-restore-snapshot.sh` reads the live `auth.json` files through the guest
+agent into memory, rolls back, boots the VM with its network link **down**,
+stops Hermes, writes the live credentials back, and only then brings the link
+up. A snapshot holds old single-use refresh tokens, and one refresh with them
+locks the account. It then restarts every trip's bridge and companion (a
+reboot does not) and runs `verify`.
+
+### trip-monitor manages releases too
+
+`.agents/skills/control-plane-release/` gives the `trip-monitor` Hermes profile
+status, plan and dry-run, plus **request**. It never gets **approve**.
+
+- **The gate.** Its key is authorized only as the `cprelease` user with a
+  forced command (`kinerary-cp-release-gate`). That wrapper passes validated
+  tokens to `kinerary-cp-release gate` through one sudoers line.
+- **The code.** A request sends Dror a one-time code through the trip bot
+  (sendMessage only; the relay keeps getUpdates). The agent only forwards what
+  Dror types. The VM checks a salted digest, locks after 3 wrong codes, expires
+  after 10 minutes, and runs exactly the frozen action under
+  `systemd-run --unit kinerary-cp-release-r-N`.
+- **Refused through the gate:** `--force-live`, `--keep-db`,
+  `--restore-hermes`, non-`main` commits, `install` and the whole-VM restore.
+- **Audit.** `/var/log/kinerary/release-gate.log` records every call and never
+  a code.
+- **No shell for trip-monitor.** Its `disabled_toolsets` must include
+  `terminal` and `code_execution`; otherwise it could reach the VM with the
+  fleet key (`debian`, which has sudo) and skip the gate.
 
 ## Boot order on the Proxmox host
 

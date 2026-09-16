@@ -19,11 +19,11 @@ ssh -i ~/.ssh/id_ed25519_kinerary_cp debian@192.168.0.45
 - **Nothing else is provisioning.** The Mac and the VM share Proxmox, NPM,
   Cloudflare and the RPi4 tunnel, and both derive the same slug from the same
   answers. Don't finish an interview on the Mac during a VM run.
-- **The VM runs the commit you mean.** `grep KINERARY_REV /opt/kinerary-deploy/vm.env`.
-  To deploy one, follow "Running it" in the VM runbook: pull, build `api`,
-  `worker` and `agent-runtime` at the rev, set `KINERARY_REV`, then
-  `up -d --wait api worker interview-mcp companion-mcp`, and restart the relay
-  with `control-plane/deployment/vm-relay-restart.sh`. It refuses mid-interview.
+- **The VM runs the commit you mean.** `sudo kinerary-cp-release status`.
+  To deploy one: `sudo kinerary-cp-release upgrade <rev> --dry-run`, then
+  without `--dry-run` — it builds, dumps, snapshots, switches, restarts the
+  relay (refusing mid-interview) and verifies, and `rollback` is the way back
+  (VM runbook: "Upgrades and rollback").
 - **Preconditions pass:** `/opt/kinerary/control-plane/deployment/vm-manual-test.sh --check`.
   That checks the control plane is ready, the relay is on `@Kinerary_bot`,
   Hermes has provider credentials, no job is in flight, and a sealed release
