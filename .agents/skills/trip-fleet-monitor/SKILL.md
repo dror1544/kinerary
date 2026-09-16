@@ -61,7 +61,9 @@ servers with a filtered environment in which `PATH` may be absent.
 What deliberately stays in code is the part that is about Kinerary rather than
 about where it runs: the lifecycle stages, the trip classes and the definition
 of "broken". A deployment that renames slug prefixes can still override
-`trip_class_sql`.
+`trip_class_sql` — **per stack**: an override on one stack never classifies
+another's trips. It once did, and a development override that called every trip
+scaffolding would have hidden production's alerts.
 
 ## Tools
 
@@ -73,7 +75,7 @@ of "broken". A deployment that renames slug prefixes can still override
 | `failures` | failed/stuck jobs, failed notifications, unreachable trips in a window — each tagged with trip class |
 | `stalled_interviews` | interviews idle beyond a threshold, and what they wait on |
 | `statistics` | funnel, completion rate, build success rate, median interview and build durations |
-| `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible |
+| `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible. Byte-stable while nothing changes: each incident says when it started (UTC), never how long ago, and rows are sorted |
 | `stacks` | which stacks exist, which is production, where config came from, live connectivity |
 
 Every tool also runs from a shell, which is how the schedules avoid paying for a
@@ -163,6 +165,22 @@ rejects anything with `ERROR:` on stderr — for a stack that supplies its own
 `argv`. A broken query reports `Tool failed`; "(none)" only ever means the query
 ran and found nothing. After changing any query, run every tool against every
 stack: a query that used to fail quietly now fails the tool.
+
+The same rule holds one level up. The daily digest once ran `alerts` with
+`|| true` and printed "Nothing needs attention" when the check had failed. Now a
+section that cannot be read says so, the rest of the digest still runs, and the
+script exits non-zero — which Hermes delivers as a failed watchdog with the
+digest attached. Empty alerts mean healthy only when the check succeeded.
+
+## Watchdog output must not change unless the fleet did
+
+Hermes runs `kinerary_fleet_alerts.sh` as a monitor script and compares a hash
+of its exact output bytes: unchanged output suppresses the model run, any change
+wakes it. So `alerts` never prints a value computed from `now()` — an elapsed
+"idle 7h" re-ran the model every hour for one unchanged stalled interview, and
+"waiting 5d" every day for a stuck trip — and every alerts query has an
+`ORDER BY`. Durations belong in `stalled_interviews` and `trip_detail`, which
+nothing hashes.
 
 ## What the tools never return
 

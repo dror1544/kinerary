@@ -253,7 +253,12 @@ function buildArgv(name) {
  *
  * The prefixes themselves are product conventions, not deployment settings, so
  * they live here; a deployment that renames them can override the expression
- * with `trip_class_sql` in its config.
+ * with `trip_class_sql` on THAT stack in its config.
+ *
+ * Per stack, never global. This used to take the first `trip_class_sql` found in
+ * any stack and apply it everywhere, so a development override that called every
+ * trip scaffolding also classified production — and `alerts` only looks at live
+ * and prospect trips, so real problems vanished from the watchdog.
  */
 const DEFAULT_TRIP_CLASS_SQL = `
   CASE
@@ -263,10 +268,7 @@ const DEFAULT_TRIP_CLASS_SQL = `
     ELSE 'live'
   END`;
 
-const TRIP_CLASS_SQL = (() => {
-  const configured = CONFIG.stacks && Object.values(CONFIG.stacks).find((s) => s.trip_class_sql);
-  return configured?.trip_class_sql ?? DEFAULT_TRIP_CLASS_SQL;
-})();
+const tripClassSql = (stack) => CONFIG.stacks[stack]?.trip_class_sql ?? DEFAULT_TRIP_CLASS_SQL;
 
 /** Run one read-only script against a stack and return rows as string arrays. */
 function runSql(stackName, sql) {
@@ -330,14 +332,14 @@ const header = (stack) => `Stack: ${stackLabel(stack)}${isProduction(stack) ? " 
 
 async function fleetOverview({ stack = CONFIG.defaultStack }) {
   const [stages, jobs, notifications, stalled, unreachable, stuck] = await Promise.all([
-    runSql(stack, `SELECT ${TRIP_CLASS_SQL}, t.lifecycle_state, count(*)
+    runSql(stack, `SELECT ${tripClassSql(stack)}, t.lifecycle_state, count(*)
                      FROM control_plane.trips t GROUP BY 1,2 ORDER BY 1,2;`),
     runSql(stack, `SELECT j.job_type, j.state, count(*) FROM control_plane.jobs j GROUP BY 1,2 ORDER BY 1,2;`),
-    runSql(stack, `SELECT ${TRIP_CLASS_SQL}, n.kind, n.state, count(*)
+    runSql(stack, `SELECT ${tripClassSql(stack)}, n.kind, n.state, count(*)
                      FROM control_plane.notification_outbox n
                      JOIN control_plane.trips t ON t.id = n.trip_id
                     WHERE n.state = 'failed' GROUP BY 1,2,3 ORDER BY 4 DESC;`),
-    runSql(stack, `SELECT ${TRIP_CLASS_SQL}, count(*),
+    runSql(stack, `SELECT ${tripClassSql(stack)}, count(*),
                           round(max(extract(epoch from (now() - s.updated_at)) / 3600))
                      FROM control_plane.intake_sessions s
                      JOIN control_plane.trips t ON t.id = s.trip_id
@@ -349,7 +351,7 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
     // Confirmed (or approved) with no job row at all. Nothing else here would
     // report it: such a trip is not failed and not unreachable — it simply
     // never started, so it appears healthy in every other view.
-    runSql(stack, `SELECT t.slug, ${TRIP_CLASS_SQL}, t.lifecycle_state,
+    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, t.lifecycle_state,
                           round(extract(epoch from (now() - t.updated_at)) / 86400) || 'd'
                      FROM control_plane.trips t
                     WHERE t.lifecycle_state IN ('intake_confirmed','provisioning_approved')
@@ -393,16 +395,16 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
 async function listTrips({ stack = CONFIG.defaultStack, filter = "live", limit = 40 }) {
   const n = clamp(limit, 1, 200, 40);
   const where = {
-    live: `${TRIP_CLASS_SQL} = 'live'`,
+    live: `${tripClassSql(stack)} = 'live'`,
     all: "true",
-    active: `${TRIP_CLASS_SQL} IN ('live','prospect') AND t.lifecycle_state NOT IN ('ready_private','ready_public')`,
+    active: `${tripClassSql(stack)} IN ('live','prospect') AND t.lifecycle_state NOT IN ('ready_private','ready_public')`,
     unreachable: "t.reachability = 'unreachable'",
     ready: "t.lifecycle_state IN ('ready_private','ready_public')",
   }[filter];
   if (!where) throw new Error(`filter must be one of: live, all, active, unreachable, ready`);
 
   const rows = await runSql(stack, `
-    SELECT t.id, t.slug, ${TRIP_CLASS_SQL}, t.lifecycle_state,
+    SELECT t.id, t.slug, ${tripClassSql(stack)}, t.lifecycle_state,
            coalesce(t.reachability, '-'), coalesce(t.unreachable_reason, ''),
            to_char(t.created_at, 'YYYY-MM-DD HH24:MI'),
            round(extract(epoch from (now() - t.updated_at)) / 3600) || 'h'
@@ -419,7 +421,7 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
   const match = `(t.id = '${ref}' OR t.slug = '${ref}')`;
 
   const [head, session, jobs, steps, notifications, bindings, people] = await Promise.all([
-    runSql(stack, `SELECT t.id, t.slug, ${TRIP_CLASS_SQL}, t.lifecycle_state, coalesce(t.reachability,'-'),
+    runSql(stack, `SELECT t.id, t.slug, ${tripClassSql(stack)}, t.lifecycle_state, coalesce(t.reachability,'-'),
                           coalesce(t.unreachable_reason,'-'), coalesce(t.title,'-'), coalesce(t.destination_label,'-'),
                           coalesce(to_char(t.start_date,'YYYY-MM-DD'),'-'), coalesce(to_char(t.end_date,'YYYY-MM-DD'),'-'),
                           to_char(t.created_at,'YYYY-MM-DD HH24:MI')
@@ -503,18 +505,18 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
 async function failures({ stack = CONFIG.defaultStack, days = 7 }) {
   const d = clamp(days, 1, 180, 7);
   const [jobs, notifications, unreachable] = await Promise.all([
-    runSql(stack, `SELECT t.slug, ${TRIP_CLASS_SQL}, j.job_type, j.state, coalesce(j.safe_error_code,'-'),
+    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, j.job_type, j.state, coalesce(j.safe_error_code,'-'),
                           j.attempt || '/' || j.max_attempts, to_char(j.updated_at,'MM-DD HH24:MI')
                      FROM control_plane.jobs j JOIN control_plane.trips t ON t.id = j.trip_id
                     WHERE j.state NOT IN ('succeeded','completed')
                       AND j.updated_at > now() - interval '${d} days'
                     ORDER BY j.updated_at DESC;`),
-    runSql(stack, `SELECT t.slug, ${TRIP_CLASS_SQL}, coalesce(n.kind, n.notification_type), n.state,
+    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, coalesce(n.kind, n.notification_type), n.state,
                           n.attempt || '/' || n.max_attempts, to_char(n.updated_at,'MM-DD HH24:MI')
                      FROM control_plane.notification_outbox n JOIN control_plane.trips t ON t.id = n.trip_id
                     WHERE n.state = 'failed' AND n.updated_at > now() - interval '${d} days'
                     ORDER BY n.updated_at DESC LIMIT 40;`),
-    runSql(stack, `SELECT t.slug, ${TRIP_CLASS_SQL}, coalesce(t.unreachable_reason,'-'),
+    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, coalesce(t.unreachable_reason,'-'),
                           coalesce(to_char(t.reachability_checked_at,'MM-DD HH24:MI'),'-')
                      FROM control_plane.trips t WHERE t.reachability = 'unreachable' ORDER BY t.updated_at DESC;`),
   ]);
@@ -538,7 +540,7 @@ async function failures({ stack = CONFIG.defaultStack, days = 7 }) {
 async function stalledInterviews({ stack = CONFIG.defaultStack, hours = 6 }) {
   const h = clamp(hours, 1, 2000, 6);
   const rows = await runSql(stack, `
-    SELECT t.slug, ${TRIP_CLASS_SQL}, coalesce(s.phase,'-'), coalesce(s.awaiting,'-'), coalesce(s.language,'-'),
+    SELECT t.slug, ${tripClassSql(stack)}, coalesce(s.phase,'-'), coalesce(s.awaiting,'-'), coalesce(s.language,'-'),
            round(extract(epoch from (now() - s.updated_at))/3600) || 'h',
            CASE WHEN s.expires_at IS NULL THEN '-'
                 WHEN s.expires_at < now() THEN 'EXPIRED'
@@ -585,7 +587,7 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
              coalesce(round(percentile_cont(0.5) WITHIN GROUP (
                ORDER BY extract(epoch from (s.updated_at - s.created_at))/60))::text, 'n/a')
         FROM control_plane.intake_sessions s WHERE s.state = 'confirmed' AND s.created_at > ${since};`),
-    runSql(stack, `SELECT ${TRIP_CLASS_SQL}, count(*)::text FROM control_plane.trips t
+    runSql(stack, `SELECT ${tripClassSql(stack)}, count(*)::text FROM control_plane.trips t
                     WHERE t.created_at > ${since} GROUP BY 1 ORDER BY 1;`),
   ]);
 
@@ -623,42 +625,62 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
  * something a shell script greps for. Only `live` and `prospect` trips are
  * considered — a retired trip's failures are the expected debris of a teardown,
  * and alerting on them would train the reader to ignore the channel.
+ *
+ * THE SAME INCIDENTS PRODUCE THE SAME BYTES. Hermes runs this as a monitor
+ * script and hashes its exact output: unchanged output suppresses the model run,
+ * any change wakes it. This used to print elapsed time ("idle 7h", "waiting
+ * 5d"), so one unchanged stalled interview re-ran the model every hour and a
+ * stuck trip every day. So: no value computed from now() is ever printed — each
+ * incident says when it STARTED, in UTC — and every query has an ORDER BY, so row
+ * order cannot change the hash either. How long something has been going on
+ * is `stalled_interviews` and `trip_detail`, which nothing hashes.
  */
 async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
   const h = clamp(hours, 1, 240, 1);
-  const real = `${TRIP_CLASS_SQL} IN ('live','prospect')`;
+  const real = `${tripClassSql(stack)} IN ('live','prospect')`;
 
   const [unreachable, jobs, notifications, stuck, awaiting, companionless] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
-                    WHERE t.reachability = 'unreachable' AND ${real};`),
+                    WHERE t.reachability = 'unreachable' AND ${real}
+                    ORDER BY t.slug;`),
     runSql(stack, `SELECT t.slug, j.job_type, coalesce(j.safe_error_code,'-'), j.attempt || '/' || j.max_attempts
                      FROM control_plane.jobs j JOIN control_plane.trips t ON t.id = j.trip_id
-                    WHERE j.state = 'failed' AND ${real};`),
+                    WHERE j.state = 'failed' AND ${real}
+                    ORDER BY t.slug, j.id;`),
     runSql(stack, `SELECT t.slug, coalesce(n.kind, n.notification_type), n.attempt || '/' || n.max_attempts
                      FROM control_plane.notification_outbox n JOIN control_plane.trips t ON t.id = n.trip_id
-                    WHERE n.state = 'failed' AND ${real};`),
+                    WHERE n.state = 'failed' AND ${real}
+                    ORDER BY t.slug, n.id;`),
+    // When the organizer confirmed — a fixed moment — not how long ago that was.
     runSql(stack, `SELECT t.slug, t.lifecycle_state,
-                          round(extract(epoch from (now() - t.updated_at)) / 86400) || 'd'
+                          coalesce(to_char((SELECT max(v.confirmed_at) FROM control_plane.intake_versions v
+                                             WHERE v.trip_id = t.id) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC',
+                                   'at an unrecorded time')
                      FROM control_plane.trips t
                     WHERE t.lifecycle_state IN ('intake_confirmed','provisioning_approved')
                       AND ${real}
-                      AND NOT EXISTS (SELECT 1 FROM control_plane.jobs j WHERE j.trip_id = t.id);`),
+                      AND NOT EXISTS (SELECT 1 FROM control_plane.jobs j WHERE j.trip_id = t.id)
+                    ORDER BY t.slug;`),
+    // Since when the interview has been waiting on us (awaiting_since is set
+    // whenever the turn passes to the machine), not for how many hours.
     runSql(stack, `SELECT t.slug, coalesce(s.phase,'-'),
-                          round(extract(epoch from (now() - s.updated_at)) / 3600) || 'h'
+                          to_char(s.awaiting_since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
                      FROM control_plane.intake_sessions s JOIN control_plane.trips t ON t.id = s.trip_id
                     WHERE s.state = 'interviewing' AND s.awaiting = 'machine'
-                      AND s.updated_at < now() - interval '${h} hours' AND ${real};`),
+                      AND s.awaiting_since < now() - interval '${h} hours' AND ${real}
+                    ORDER BY t.slug, s.id;`),
     // Built, but the organizer has no open private chat — a site with no
     // assistant behind it. This is exactly how the 2026-09-15 trip failed.
     // chat_id is TEXT: this check was written as `b.chat_id > 0`, a type error
     // that — before ON_ERROR_STOP — returned no rows, so it could never fire.
     runSql(stack, `SELECT t.slug
                      FROM control_plane.trips t
-                    WHERE t.lifecycle_state = 'ready_private' AND ${TRIP_CLASS_SQL} = 'live'
+                    WHERE t.lifecycle_state = 'ready_private' AND ${tripClassSql(stack)} = 'live'
                       AND NOT EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings b
                                        WHERE b.trip_id = t.id AND b.closed_at IS NULL
-                                         AND b.chat_id NOT LIKE '-%');`),
+                                         AND b.chat_id NOT LIKE '-%')
+                    ORDER BY t.slug;`),
   ]);
 
   const sections = [];
@@ -668,8 +690,8 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
   add("UNREACHABLE", unreachable, (r) => `${r[0]} — ${r[1]}`);
   add("BUILT WITHOUT AN ORGANIZER CHAT", companionless, (r) => `${r[0]} — site is up, no private chat bound`);
   add("FAILED JOBS", jobs, (r) => `${r[0]} — ${r[1]} ${r[2]} (attempt ${r[3]})`);
-  add("CONFIRMED BUT NEVER BUILT", stuck, (r) => `${r[0]} — ${r[1]}, waiting ${r[2]}`);
-  add("INTERVIEW WAITING ON US", awaiting, (r) => `${r[0]} — phase ${r[1]}, idle ${r[2]}`);
+  add("CONFIRMED BUT NEVER BUILT", stuck, (r) => `${r[0]} — ${r[1]}, confirmed ${r[2]}`);
+  add("INTERVIEW WAITING ON US", awaiting, (r) => `${r[0]} — phase ${r[1]}, waiting on us since ${r[2]}`);
   add("UNDELIVERED NOTIFICATIONS", notifications, (r) => `${r[0]} — ${r[1]} (attempt ${r[2]})`);
 
   if (sections.length === 0) return "";
