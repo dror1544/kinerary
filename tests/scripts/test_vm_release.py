@@ -19,6 +19,7 @@ dry-run and the rehearsal on a cloned VM (docs/control-plane-vm-deployment.md).
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -298,11 +299,12 @@ class History(unittest.TestCase):
                            "backup_dir": "/b/x", "snapshot": "pre-3a9f1c2-1"}, path)
         rows = vr.read_history(path)
         self.assertEqual([r["action"] for r in rows], ["baseline", "upgrade"])
-        self.assertEqual(vr.last_good_upgrade(rows)["from_rev"], "aa61f6e")
+        self.assertEqual(vr.recovery_point(rows, "3a9f1c2")["from_rev"], "aa61f6e")
         vr.append_history({"utc": "t2", "action": "upgrade", "from_rev": "3a9f1c2", "to_rev": "bbbbbbb", "result": "snapshot-failed"}, path)
-        self.assertEqual(vr.last_good_upgrade(vr.read_history(path))["to_rev"], "3a9f1c2")
+        self.assertEqual(vr.recovery_point(vr.read_history(path), "3a9f1c2")["to_rev"], "3a9f1c2",
+                         "a snapshot that failed switched nothing, so the upgrade before it still describes the VM")
         vr.append_history({"utc": "t3", "action": "rollback", "from_rev": "3a9f1c2", "to_rev": "aa61f6e", "result": "ok"}, path)
-        self.assertIsNone(vr.last_good_upgrade(vr.read_history(path)))
+        self.assertIsNone(vr.recovery_point(vr.read_history(path), "aa61f6e"))
 
 
 class RestoreScriptArguments(unittest.TestCase):
@@ -345,6 +347,134 @@ class RestoreScriptArguments(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, args)
             self.assertIn(message, proc.stderr, args)
             self.assertNotIn("SSH-CALLED", proc.stdout, args)
+
+
+class RecoveryPoint(unittest.TestCase):
+    """A partly failed upgrade must keep its way back: the dump, the snapshot and
+    the version it came from. Only `ok` and `verify-failed` used to count, so a
+    migrate that succeeded before a service failed to start left rollback
+    refusing, and --restore-db unable to find the dump it had recorded."""
+
+    def rows(self, *results_and_revs):
+        rows = [{"utc": "t0", "action": "baseline", "from_rev": "", "to_rev": "aaaaaaa", "result": "ok",
+                 "backup_dir": "", "snapshot": "", "hermes_from": "", "hermes_to": ""}]
+        for index, (action, frm, to, result) in enumerate(results_and_revs, start=1):
+            rows.append({"utc": f"t{index}", "action": action, "from_rev": frm, "to_rev": to, "result": result,
+                         "backup_dir": f"/backups/{index}", "snapshot": f"pre-{to}-{index}", "hermes_from": "", "hermes_to": ""})
+        return rows
+
+    def test_a_clean_upgrade_is_the_way_back(self):
+        point = vr.recovery_point(self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "ok")), "bbbbbbb")
+        self.assertEqual((point["from_rev"], point["backup_dir"]), ("aaaaaaa", "/backups/1"))
+
+    def test_an_upgrade_that_failed_after_switching_keeps_its_dump(self):
+        for result in ("switch-failed", "verify-failed", "switching"):
+            rows = self.rows(("upgrade", "aaaaaaa", "bbbbbbb", result))
+            point = vr.recovery_point(rows, "bbbbbbb")
+            self.assertIsNotNone(point, result)
+            self.assertEqual(point["backup_dir"], "/backups/1", result)
+            named = vr.recovery_point(rows, "bbbbbbb", to="aaaaaaa")
+            self.assertEqual(named["backup_dir"], "/backups/1", f"{result} with --to")
+
+    def test_a_failed_migrate_leaves_the_old_version_running_with_the_dump_to_restore(self):
+        # Migrations can commit one by one before the failing one; the checkout
+        # and vm.env went back, so the VM runs the old version on a newer schema.
+        point = vr.recovery_point(self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "migrate-failed")), "aaaaaaa")
+        self.assertEqual((point["result"], point["from_rev"], point["backup_dir"]), ("migrate-failed", "aaaaaaa", "/backups/1"))
+
+    def test_a_crash_mid_switch_is_recoverable_from_the_row_written_before_it(self):
+        rows = self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "switching"))
+        self.assertEqual(vr.recovery_point(rows, "bbbbbbb")["from_rev"], "aaaaaaa")
+
+    def test_the_final_row_supersedes_the_switching_row(self):
+        rows = self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "switching"), ("upgrade", "aaaaaaa", "bbbbbbb", "ok"))
+        self.assertEqual(vr.recovery_point(rows, "bbbbbbb")["result"], "ok")
+
+    def test_nothing_to_recover(self):
+        self.assertIsNone(vr.recovery_point(self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "snapshot-failed")), "aaaaaaa"))
+        rolled_back = self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "ok"), ("rollback", "bbbbbbb", "aaaaaaa", "ok"))
+        self.assertIsNone(vr.recovery_point(rolled_back, "aaaaaaa"), "a rollback consumed that upgrade")
+        self.assertIsNone(vr.recovery_point(self.rows(("upgrade", "aaaaaaa", "bbbbbbb", "ok")), "ccccccc"),
+                          "the recorded upgrade does not describe what is running")
+
+
+class DatabasePruning(unittest.TestCase):
+    def test_the_newest_replaced_database_is_kept_and_scratch_copies_go(self):
+        names = [
+            "kinerary_control_plane",
+            "kinerary_control_plane_pre_rollback_20260901t100000z",
+            "kinerary_control_plane_pre_rollback_20260915t100000z",
+            "kinerary_control_plane_verify_20260916t090000z",
+            "kinerary_control_plane_restore_20260916t090500z",
+            "postgres",
+        ]
+        self.assertEqual(sorted(vr.databases_to_prune(names)), [
+            "kinerary_control_plane_pre_rollback_20260901t100000z",
+            "kinerary_control_plane_restore_20260916t090500z",
+            "kinerary_control_plane_verify_20260916t090000z",
+        ])
+
+    def test_the_live_database_can_never_be_dropped(self):
+        stub = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+        with self.assertRaises(vr.Refused):
+            stub.drop_database("kinerary_control_plane")
+        with self.assertRaises(vr.Refused):
+            stub.drop_database("postgres")
+
+
+class RestoreOrchestration(unittest.TestCase):
+    """--restore-db: the live database is only replaced by a copy that already
+    restored cleanly and matched the dump, and any failure brings the services
+    back on the untouched database."""
+
+    class Stub(vr.ControlPlane):
+        def __init__(self, fail_at=None):
+            super().__init__(vr.Report(io.StringIO(), color=False))
+            self.calls = []
+            self.fail_at = fail_at
+
+        def _step(self, name, result=None):
+            self.calls.append(name)
+            if self.fail_at == name:
+                raise vr.Refused(f"{name} failed")
+            return result
+
+        def prepare_restored_database(self, dump_dir, stamp):
+            return self._step("prepare", "scratch_db")
+
+        def stop_database_clients(self):
+            self._step("stop")
+
+        def take_backup(self, label, include_hermes):
+            return self._step("backup", Path("/b"))
+
+        def swap_in_database(self, scratch, stamp):
+            return self._step("swap", "aside_db")
+
+        def drop_database(self, name):
+            self.calls.append(f"drop:{name}")
+
+        def start_database_clients(self):
+            self.calls.append("start")
+
+    def test_a_restore_that_fails_changes_nothing(self):
+        stub = self.Stub(fail_at="prepare")
+        with self.assertRaises(vr.Refused):
+            vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        self.assertEqual(stub.calls, ["prepare"], "services were never stopped")
+
+    def test_a_failed_swap_brings_the_services_back(self):
+        for failing in ("stop", "backup", "swap"):
+            stub = self.Stub(fail_at=failing)
+            with self.assertRaises(vr.Refused):
+                vr.restore_database_for_rollback(stub, Path("/d"), "label")
+            self.assertIn("drop:scratch_db", stub.calls, failing)
+            self.assertEqual(stub.calls[-1], "start", failing)
+
+    def test_success_replaces_the_database_after_an_exact_pre_rollback_backup(self):
+        stub = self.Stub()
+        vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        self.assertEqual(stub.calls, ["prepare", "stop", "backup", "swap"])
 
 
 class GateWrapper(unittest.TestCase):

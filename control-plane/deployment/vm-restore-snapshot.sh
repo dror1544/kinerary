@@ -29,6 +29,12 @@
 # It refuses a snapshot older than a trip that was built since (container, DNS,
 # proxy host and companion would outlive a database that no longer knows them).
 # There is no --force: tear that trip down first.
+#
+# A check that could not run is not a check that passed. When the guest agent,
+# the database or the profile list cannot be read, whether trips were built
+# since is UNKNOWN and the restore is refused — unless --accept-unverified is
+# given AND the snapshot name is typed at the terminal. That is the path for a
+# VM too broken to answer, which is when a whole-VM restore is most needed.
 set -uo pipefail
 case "${1:-}" in -h|--help) sed -n '2,31p' "$0"; exit 0 ;; esac
 
@@ -57,12 +63,14 @@ BUILT="'provisioning','ready_private','activation_approved','active','completed'
 MODE=list
 SNAP=""
 DRY_RUN=0
+ACCEPT_UNVERIFIED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) MODE=list ;;
     --snapshot) SNAP="${2:?--snapshot needs a name}"; MODE=plan; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --execute) MODE=execute ;;
+    --accept-unverified) ACCEPT_UNVERIFIED=1 ;;
     -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -84,19 +92,37 @@ PROBLEMS=0
 pve() { ssh -i "$PVE_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "$PVE_USER@$PVE" "$@"; }
 
 # Run a command inside the VM through the guest agent; print its stdout.
-# Exit status is the command's, or 125 when the agent did not answer.
-guest() {
-  local timeout="$1"; shift
-  local joined="" arg
-  for arg in "$@"; do joined="$joined $(printf '%q' "$arg")"; done
-  pve "qm guest exec $VMID --timeout $timeout --$joined" 2>/dev/null | python3 -c '
+#
+# `qm guest exec` exits 0 whenever it could ASK the agent — the command's own
+# result is only in the JSON it prints ({"exited":1,"exitcode":N,...}). So the
+# exit status here is read from that JSON: the command's exit code, or 125 when
+# the agent did not answer, the command did not finish, or no JSON came back.
+# Trusting ssh's status instead reported failed credential writes as written.
+guest_result() {
+  python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except ValueError:
     sys.exit(125)
+if not d.get("exited"):
+    sys.exit(125)
 sys.stdout.write(d.get("out-data", ""))
-sys.exit(d.get("exitcode", 125) if d.get("exited", 1) else 125)'
+code = d.get("exitcode")
+sys.exit(code if isinstance(code, int) else 125)'
+}
+guest() {
+  local timeout="$1"; shift
+  local joined="" arg
+  for arg in "$@"; do joined="$joined $(printf '%q' "$arg")"; done
+  pve "qm guest exec $VMID --timeout $timeout --$joined" 2>/dev/null | guest_result
+}
+# The same, with this script's stdin forwarded to the command in the VM.
+guest_stdin() {
+  local timeout="$1"; shift
+  local joined="" arg
+  for arg in "$@"; do joined="$joined $(printf '%q' "$arg")"; done
+  pve "qm guest exec $VMID --timeout $timeout --pass-stdin 1 --$joined" 2>/dev/null | guest_result
 }
 
 agent_up() { pve "timeout 10 qm agent $VMID ping" >/dev/null 2>&1; }
@@ -121,28 +147,46 @@ done
 printf '%s\n' "$PRE" | grep '^pool\.' | sed 's/^pool\./  · pool /'
 
 GUEST_ANSWERS=0
+VERIFIED=0
 if agent_up; then
   GUEST_ANSWERS=1
-  q() { guest 60 docker exec "$PG" psql -U kinerary_control_plane -d kinerary_control_plane -At -c "$1"; }
-  built="$(q "SELECT string_agg(slug || ' (' || lifecycle_state || ')', ', ') FROM control_plane.trips WHERE updated_at > '$SINCE' AND lifecycle_state IN ($BUILT)")"
-  jobs="$(q "SELECT count(*) FROM control_plane.jobs WHERE created_at > '$SINCE'")"
-  profiles="$(guest 60 sh -c "for d in /opt/hermes-data/profiles/*/; do b=\$(stat -c %W \"\$d\"); [ \"\$b\" -gt $SNAPTIME ] && basename \"\$d\"; done; true" | tr '\n' ' ')"
-  lost="$(q "SELECT (SELECT count(*) FROM control_plane.trips WHERE created_at > '$SINCE') || ' trips, ' || (SELECT count(*) FROM control_plane.intake_sessions WHERE created_at > '$SINCE') || ' interview sessions, ' || (SELECT count(*) FROM control_plane.telegram_chat_bindings WHERE created_at > '$SINCE') || ' chat bindings'")"
-  if [ -n "$built" ] || [ "${jobs:-0}" != "0" ] || [ -n "${profiles// /}" ]; then
-    bad "trips were built since the snapshot — built: ${built:-none}; jobs: ${jobs:-?}; new companion profiles: ${profiles:-none}. Tear them down first (vm-teardown-trip.sh), or use kinerary-cp-release rollback"
+  VERIFIED=1
+  q() { guest 60 docker exec "$PG" psql -U kinerary_control_plane -d kinerary_control_plane -At -v ON_ERROR_STOP=1 -c "$1"; }
+  # Each read must succeed on its own: an empty answer from a query that failed
+  # is not "none", and a job count that is not a number is not zero.
+  built="$(q "SELECT string_agg(slug || ' (' || lifecycle_state || ')', ', ') FROM control_plane.trips WHERE updated_at > '$SINCE' AND lifecycle_state IN ($BUILT)")" || VERIFIED=0
+  jobs="$(q "SELECT count(*) FROM control_plane.jobs WHERE created_at > '$SINCE'")" || VERIFIED=0
+  case "$jobs" in ''|*[!0-9]*) VERIFIED=0 ;; esac
+  profiles="$(guest 60 sh -c "for d in /opt/hermes-data/profiles/*/; do b=\$(stat -c %W \"\$d\") || exit 3; [ \"\$b\" -gt $SNAPTIME ] && basename \"\$d\"; done; exit 0")" || VERIFIED=0
+  profiles="$(printf '%s' "$profiles" | tr '\n' ' ')"
+  lost="$(q "SELECT (SELECT count(*) FROM control_plane.trips WHERE created_at > '$SINCE') || ' trips, ' || (SELECT count(*) FROM control_plane.intake_sessions WHERE created_at > '$SINCE') || ' interview sessions, ' || (SELECT count(*) FROM control_plane.telegram_chat_bindings WHERE created_at > '$SINCE') || ' chat bindings'")" || lost="unknown"
+  if [ "$VERIFIED" -eq 0 ]; then
+    note "the database or the Hermes profile list inside the VM could not be read — whether trips were built since the snapshot is UNKNOWN"
+  elif [ -n "$built" ] || [ "$jobs" != "0" ] || [ -n "${profiles// /}" ]; then
+    bad "trips were built since the snapshot — built: ${built:-none}; jobs: $jobs; new companion profiles: ${profiles:-none}. Tear them down first (vm-teardown-trip.sh), or use kinerary-cp-release rollback"
   else
     ok "no trip was built since the snapshot"
   fi
   note "discarded with the restore: ${lost:-unknown}, plus every companion conversation and deploy-root change since $SINCE"
-  auth_present="$(guest 30 sh -c 'test -s /opt/hermes-data/auth.json && echo hermes; test -s /opt/agent-auth/codex/auth.json && echo codex; true' | tr '\n' ' ')"
-  ok "live credentials to carry across: ${auth_present:-none found}"
+  if auth_present="$(guest 30 sh -c 'test -s /opt/hermes-data/auth.json && echo hermes; test -s /opt/agent-auth/codex/auth.json && echo codex; exit 0')"; then
+    ok "live credentials to carry across: $(printf '%s' "$auth_present" | tr '\n' ' ')"
+  else
+    note "could not see which live credentials exist"
+  fi
 else
   note "the VM's guest agent does not answer — nothing inside it can be checked, and its live credentials cannot be carried across"
 fi
+if [ "$VERIFIED" -eq 0 ]; then
+  if [ "$ACCEPT_UNVERIFIED" -eq 1 ]; then
+    note "--accept-unverified: a restore that could not be checked needs the snapshot name typed to go ahead"
+  else
+    bad "this restore cannot be verified, so it is refused. If the VM is too broken to answer, rerun with --accept-unverified and type the snapshot name when asked"
+  fi
+fi
 echo
 echo "  → shut VM $VMID down, qm rollback $VMID $SNAP"
-echo "  → start it with its network link down; stop Hermes; write the live credentials back"
-echo "  → bring the link up; start Hermes; restart the relay and interview sidecar"
+echo "  → start it with its network link down; stop Hermes, the relay and the interview sidecar; write the live credentials back and check them"
+echo "  → bring the link up; start each of those only if its credential came back"
 echo "  → restart every trip's trip-mcp bridge and companion; kinerary-cp-release verify"
 echo "  downtime: the bot, every companion and site AI features, for ~3-5 minutes"
 
@@ -152,19 +196,24 @@ if [ "$MODE" != execute ]; then
   exit $(( PROBLEMS > 0 ))
 fi
 [ "$PROBLEMS" -eq 0 ] || die "$PROBLEMS problem(s) above — nothing was changed"
-if [ "$GUEST_ANSWERS" -eq 0 ]; then
-  printf '\nThe VM could not be checked. Type the snapshot name to restore it anyway: '
-  read -r typed </dev/tty
+if [ "$VERIFIED" -eq 0 ]; then
+  printf '\nThis restore could not be verified. Type the snapshot name to restore it anyway: '
+  typed=""
+  read -r typed </dev/tty 2>/dev/null || true
   [ "$typed" = "$SNAP" ] || die "not confirmed — nothing was changed"
 fi
 
 echo
 echo "── Restoring ──"
+# Credential text lives only in these two variables. It is never echoed — the
+# status below is built from yes/no, never from a parameter expansion of them.
 HERMES_AUTH=""; CODEX_AUTH=""
 if [ "$GUEST_ANSWERS" -eq 1 ]; then
-  HERMES_AUTH="$(guest 30 sh -c 'test -s /opt/hermes-data/auth.json && base64 -w0 /opt/hermes-data/auth.json; true')"
-  CODEX_AUTH="$(guest 30 sh -c 'test -s /opt/agent-auth/codex/auth.json && base64 -w0 /opt/agent-auth/codex/auth.json; true')"
-  ok "read live credentials into memory: hermes ${HERMES_AUTH:+yes}${HERMES_AUTH:-no}, codex ${CODEX_AUTH:+yes}${CODEX_AUTH:-no}"
+  HERMES_AUTH="$(guest 30 sh -c 'test -s /opt/hermes-data/auth.json || exit 0; base64 -w0 /opt/hermes-data/auth.json')" || HERMES_AUTH=""
+  CODEX_AUTH="$(guest 30 sh -c 'test -s /opt/agent-auth/codex/auth.json || exit 0; base64 -w0 /opt/agent-auth/codex/auth.json')" || CODEX_AUTH=""
+  have_hermes=no; [ -n "$HERMES_AUTH" ] && have_hermes=yes
+  have_codex=no; [ -n "$CODEX_AUTH" ] && have_codex=yes
+  ok "read live credentials into memory: hermes $have_hermes, codex $have_codex"
 fi
 
 NET0="$(pve "qm config $VMID" | awk -F': ' '$1 == "net0" { print $2 }')"
@@ -181,38 +230,70 @@ for _ in $(seq 1 60); do agent_up && break; sleep 3; done
 agent_up || die "the guest agent did not come back within 3 minutes — the VM is up with its link DOWN; console: qm terminal $VMID"
 ok "VM booted from the snapshot, network link down"
 
-guest 120 docker stop hermes >/dev/null || note "docker stop hermes did not succeed"
-restore_file() {  # restore_file <path> <base64>
-  local path="$1" data="$2"
-  printf '%s' "$data" | pve "qm guest exec $VMID --timeout 30 --pass-stdin 1 -- sh -c 'f=$path; base64 -d > \$f.carried && chown --reference=\$(dirname \$f) \$f.carried && chmod 600 \$f.carried && mv \$f.carried \$f'" >/dev/null 2>&1
+# Everything that holds a rotating credential stays down until its credential is
+# back: Hermes (its providers' OAuth) and the relay and interview sidecar (the
+# interview's codex login). The link is still down, so nothing has refreshed yet.
+guest 120 docker stop hermes kinerary-cp-relay-1 kinerary-cp-interview-mcp-1 >/dev/null \
+  || die "could not stop Hermes, the relay and the interview sidecar — the VM is up with its network link DOWN, so nothing can refresh a token. Console: qm terminal $VMID"
+ok "Hermes, the relay and the interview sidecar are stopped"
+
+restore_file() {  # restore_file <path> <base64> — succeeds only if the VM then holds exactly these bytes
+  local path="$1" data="$2" want got
+  want="$(printf '%s' "$data" | python3 -c 'import base64, hashlib, sys; print(hashlib.sha256(base64.b64decode(sys.stdin.read())).hexdigest())')" || return 1
+  printf '%s' "$data" | guest_stdin 30 sh -c "f=$path; base64 -d > \"\$f.carried\" && chown --reference=\"\$(dirname \"\$f\")\" \"\$f.carried\" && chmod 600 \"\$f.carried\" && mv \"\$f.carried\" \"\$f\"" >/dev/null || return 1
+  got="$(guest 30 sha256sum "$path")" || return 1
+  [ "${got%% *}" = "$want" ]
 }
-CARRIED=1
+
+HERMES_OK=0
 if [ -n "$HERMES_AUTH" ]; then
-  restore_file /opt/hermes-data/auth.json "$HERMES_AUTH" && ok "Hermes credentials carried across" || { bad "could not write Hermes credentials back"; CARRIED=0; }
+  if restore_file /opt/hermes-data/auth.json "$HERMES_AUTH"; then
+    ok "Hermes credentials carried across (checked by hash inside the VM)"
+    HERMES_OK=1
+  else
+    bad "could not write Hermes credentials back — Hermes stays stopped"
+  fi
 else
-  CARRIED=0
+  note "no live Hermes credentials to carry across — Hermes stays stopped"
 fi
+# Without a live codex login there is nothing to carry, and nothing stale to guard.
+CODEX_OK=1
 if [ -n "$CODEX_AUTH" ]; then
-  restore_file /opt/agent-auth/codex/auth.json "$CODEX_AUTH" && ok "interview codex login carried across" || bad "could not write the codex login back"
+  if restore_file /opt/agent-auth/codex/auth.json "$CODEX_AUTH"; then
+    ok "interview codex login carried across (checked by hash inside the VM)"
+  else
+    bad "could not write the interview's codex login back — the relay and interview sidecar stay stopped"
+    CODEX_OK=0
+  fi
 fi
 unset HERMES_AUTH CODEX_AUTH
 
 pve "qm set $VMID --net0 '$NET0_BASE'" >/dev/null || die "could not bring the network link back up: qm set $VMID --net0 '$NET0_BASE'"
 ok "network link up"
 sleep 5
-guest 180 docker restart kinerary-cp-relay-1 kinerary-cp-interview-mcp-1 >/dev/null || note "relay/sidecar restart reported a problem"
-if [ "$CARRIED" -eq 1 ]; then
-  guest 180 docker start hermes >/dev/null && ok "Hermes started" || bad "docker start hermes failed"
+if [ "$CODEX_OK" -eq 1 ]; then
+  guest 180 docker start kinerary-cp-relay-1 kinerary-cp-interview-mcp-1 >/dev/null \
+    && ok "relay and interview sidecar started" || bad "starting the relay and interview sidecar failed"
+fi
+if [ "$HERMES_OK" -eq 1 ]; then
+  if guest 180 docker start hermes >/dev/null; then
+    ok "Hermes started"
+    echo
+    echo "── Trip bridges, companions, verify (inside the VM) ──"
+    guest 900 /usr/local/sbin/kinerary-cp-release restart-bridges || bad "restart-bridges reported problems"
+  else
+    bad "docker start hermes failed"
+  fi
+fi
+if [ "$HERMES_OK" -eq 0 ] || [ "$CODEX_OK" -eq 0 ]; then
   echo
-  echo "── Trip bridges, companions, verify (inside the VM) ──"
-  guest 900 /usr/local/sbin/kinerary-cp-release restart-bridges
-else
-  echo
-  note "Hermes stays STOPPED: its live credentials could not be carried, and starting it on the snapshot's would lock the accounts."
-  echo "  Log in again inside the VM, then start it and repair the trips:"
-  echo "    sudo docker exec -it hermes hermes auth add openai-codex   (and the other providers, runbook: Credentials)"
-  echo "    /opt/kinerary/control-plane/deployment/vm-interview-runner.sh login codex"
-  echo "    sudo docker start hermes && sudo kinerary-cp-release restart-bridges"
+  note "Some services stay STOPPED: starting them on the snapshot's credentials would lock the accounts."
+  echo "  Log in again inside the VM, then start what stayed down and repair the trips:"
+  [ "$HERMES_OK" -eq 1 ] || echo "    sudo docker exec -it hermes hermes auth add openai-codex   (and the other providers, runbook: Credentials)"
+  [ "$CODEX_OK" -eq 1 ] || echo "    /opt/kinerary/control-plane/deployment/vm-interview-runner.sh login codex"
+  [ "$CODEX_OK" -eq 1 ] || echo "    sudo docker start kinerary-cp-relay-1 kinerary-cp-interview-mcp-1"
+  [ "$HERMES_OK" -eq 1 ] || echo "    sudo docker start hermes && sudo kinerary-cp-release restart-bridges"
 fi
 echo
 echo "Restored VM $VMID to $SNAP."
+exit $(( PROBLEMS > 0 ))

@@ -90,7 +90,7 @@ SITE_REQUIRED = ("CP_VMID", "CP_EXPECT_BOT", "CP_PROXMOX_SSH_KEY_ON_VM", "CP_PRO
                  "PROXMOX_HOST", "PROXMOX_SSH_USER")
 
 COMPOSE_PROJECT = "kinerary-cp"
-PG_CONTAINER = "kinerary-cp-postgres-1"
+PG_CONTAINER = ENV.get("KINERARY_CP_PG_CONTAINER", "kinerary-cp-postgres-1")
 RELAY_CONTAINER = "kinerary-cp-relay-1"
 HERMES_CONTAINER = "hermes"
 DB_USER = DB_NAME = "kinerary_control_plane"
@@ -122,6 +122,11 @@ MIGRATION_FILE = re.compile(r"^\d+_.+\.sql$")
 
 class Refused(Exception):
     """A guard said no. Nothing was changed by the step that raised it."""
+
+
+class MigrateFailed(Refused):
+    """migrate failed during a switch; the checkout and vm.env were put back, but
+    migrations before the failing one may have committed."""
 
 
 # --------------------------------------------------------------------------- #
@@ -400,16 +405,47 @@ def append_history(row: Dict[str, str], path: Optional[Path] = None) -> None:
         handle.write("\t".join(str(row.get(f, "")).replace("\t", " ").replace("\n", " ") for f in HISTORY_FIELDS) + "\n")
 
 
-def last_good_upgrade(rows: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    """The most recent upgrade that ended ok (or verify-failed — it still switched)."""
+# An upgrade with one of these results changed something that may need undoing,
+# and its row carries the way back: the version it came from, the dump, the
+# snapshot. `switching` is written BEFORE the switch starts, so a run that dies
+# mid-switch still leaves one; the row written when it ends supersedes it.
+SWITCHED_RESULTS = ("ok", "verify-failed", "switch-failed", "switching")
+RECOVERABLE_RESULTS = SWITCHED_RESULTS + ("migrate-failed",)
+
+
+def recovery_point(rows: Sequence[Dict[str, str]], current_rev: str, to: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """The upgrade whose way back applies to what is running now, or None.
+
+    It must describe the running version: a switched upgrade landed on its
+    to_rev; a migrate-failed one was put back on its from_rev, possibly with some
+    of the new migrations committed. `to` picks the upgrade that came from that
+    version. Without `to`, a rollback recorded after the latest upgrade means
+    that upgrade was already undone.
+    """
+    def matches(rev: str, wanted: str) -> bool:
+        return bool(rev) and bool(wanted) and (rev.startswith(wanted) or wanted.startswith(rev))
+
     for row in reversed(rows):
-        if row["action"] == "upgrade" and row["result"] in ("ok", "verify-failed"):
-            return row
-        if row["action"] == "rollback" and row["result"] in ("ok", "verify-failed"):
-            # A rollback consumed the upgrade before it; keep looking further back
-            # only through rows older than the upgrade it undid.
+        if row["action"] == "rollback" and row["result"] in ("ok", "verify-failed") and to is None:
             return None
+        if row["action"] != "upgrade" or row["result"] not in RECOVERABLE_RESULTS:
+            continue
+        running = row["to_rev"] if row["result"] in SWITCHED_RESULTS else row["from_rev"]
+        if not matches(running, current_rev):
+            if to is None:
+                return None
+            continue
+        if to is None or matches(row["from_rev"], to):
+            return row
     return None
+
+
+def databases_to_prune(names: Iterable[str]) -> List[str]:
+    """Scratch databases this tool leaves (verify/restore copies) always go; of the
+    databases a --restore-db replaced, the newest is kept for inspection."""
+    scratch = sorted(n for n in names if re.match(rf"^{DB_NAME}_(verify|restore)_[0-9t]+z$", n))
+    replaced = sorted(n for n in names if re.match(rf"^{DB_NAME}_pre_rollback_[0-9t]+z$", n))
+    return scratch + replaced[:-1]
 
 
 def utcnow() -> dt.datetime:
@@ -674,9 +710,9 @@ class ControlPlane:
     def subject(self, rev: str) -> str:
         return self.git("log", "-1", "--format=%s", rev, check=False)[:90]
 
-    def psql(self, sql: str, check: bool = True) -> str:
-        proc = self.sh.read(["docker", "exec", PG_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-At",
-                             "-v", "ON_ERROR_STOP=1", "-c", sql], timeout=60)
+    def psql(self, sql: str, check: bool = True, db: str = DB_NAME) -> str:
+        proc = self.sh.read(["docker", "exec", PG_CONTAINER, "psql", "-U", DB_USER, "-d", db, "-At",
+                             "-v", "ON_ERROR_STOP=1", "-c", sql], timeout=120)
         if check and proc.returncode != 0:
             raise Refused(f"psql: {proc.stderr.decode(errors='replace').strip()[-300:]}")
         return proc.stdout.decode(errors="replace").strip()
@@ -850,39 +886,138 @@ class ControlPlane:
         except (Refused, ValueError):
             return 0
 
-    def table_counts(self) -> Dict[str, int]:
+    def table_counts(self, db: str = DB_NAME) -> Dict[str, int]:
         tables = self.psql("SELECT table_schema||'.'||table_name FROM information_schema.tables "
                            "WHERE table_type='BASE TABLE' AND (table_schema='control_plane' "
-                           "OR (table_schema='public' AND table_name='control_plane_schema_migrations')) ORDER BY 1")
+                           "OR (table_schema='public' AND table_name='control_plane_schema_migrations')) ORDER BY 1", db=db)
         counts = {}
         for table in tables.splitlines():
             if table:
-                counts[table] = int(self.psql(f"SELECT count(*) FROM {table}"))
+                counts[table] = int(self.psql(f"SELECT count(*) FROM {table}", db=db))
         return counts
+
+    # A dump is only trusted once it has been restored. Every backup is restored
+    # into a scratch database when it is taken, and its row counts are read THERE —
+    # so they describe the dump itself, not the live database a moment later,
+    # which keeps accepting writes. And --restore-db never drops the live
+    # database on a hope: it restores into a new one, checks it, and swaps.
+
+    def dump_database(self, path: Path) -> None:
+        with path.open("wb") as handle:
+            proc = subprocess.run(["docker", "exec", PG_CONTAINER, "pg_dump", "-U", DB_USER, "-d", DB_NAME, "-Fc"],
+                                  stdout=handle, stderr=subprocess.PIPE, timeout=900)
+        if proc.returncode != 0:
+            raise Refused(f"pg_dump failed: {proc.stderr.decode(errors='replace')[-300:]}")
+
+    def drop_database(self, name: str) -> None:
+        if name in (DB_NAME, "postgres", "template0", "template1") or not re.match(rf"^{DB_NAME}_[a-z_]+_[0-9t]+z$", name):
+            raise Refused(f"refusing to drop database {name!r}: only this tool's own copies are ever dropped")
+        self.psql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)', db="postgres")
+
+    def restore_dump_into(self, dump: Path, name: str) -> None:
+        """Restore a dump into a NEW database. pg_restore's exit status is the verdict:
+        one transaction, stop at the first error, and nothing is left behind on failure."""
+        self.drop_database(name)
+        self.psql(f'CREATE DATABASE "{name}" TEMPLATE template0', db="postgres")
+        with dump.open("rb") as handle:
+            proc = subprocess.run(["docker", "exec", "-i", PG_CONTAINER, "pg_restore", "-U", DB_USER, "-d", name,
+                                   "--no-owner", "--exit-on-error", "--single-transaction"],
+                                  stdin=handle, capture_output=True, timeout=1800)
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip()[-400:]
+            self.drop_database(name)
+            raise Refused(f"pg_restore of {dump} failed (exit {proc.returncode}): {detail}")
+
+    def prepare_restored_database(self, dump_dir: Path, stamp: str) -> str:
+        """The dump restored into a new database and proven to match it. The live
+        database is not touched, and services keep running."""
+        scratch = f"{DB_NAME}_restore_{stamp}"
+        if self.dry_run:
+            self.r.step(f"would restore {dump_dir}/db.dump into a new database {scratch} and compare every table's "
+                        "count with db.counts.json — the live database untouched, no downtime")
+            return scratch
+        self.r.step(f"restore {dump_dir.name}/db.dump into {scratch} (the live database is not touched)")
+        self.restore_dump_into(dump_dir / "db.dump", scratch)
+        expected = json.loads((dump_dir / "db.counts.json").read_text())
+        actual = self.table_counts(db=scratch)
+        mismatched = sorted(t for t in set(expected) | set(actual) if expected.get(t) != actual.get(t))
+        if mismatched:
+            self.drop_database(scratch)
+            raise Refused(f"the restored copy does not match the dump's counts for: {', '.join(mismatched)} — nothing was changed")
+        self.r.ok(f"restored copy matches the dump: {len(expected)} tables, every row count equal")
+        return scratch
+
+    def swap_in_database(self, scratch: str, stamp: str) -> str:
+        """Put the restored copy in the live database's place and keep the replaced
+        one as <db>_pre_rollback_<stamp>. Needs its clients stopped."""
+        aside = f"{DB_NAME}_pre_rollback_{stamp}"
+        if self.dry_run:
+            self.r.step(f"would rename {DB_NAME} to {aside} and {scratch} to {DB_NAME}")
+            return aside
+        live = f'"{DB_NAME}"'
+        self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS false", db="postgres")
+        self.psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{DB_NAME}' "
+                  "AND pid <> pg_backend_pid()", db="postgres")
+        try:
+            self.psql(f'ALTER DATABASE {live} RENAME TO "{aside}"', db="postgres")
+        except Refused:
+            self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS true", db="postgres")
+            raise
+        try:
+            self.psql(f'ALTER DATABASE "{scratch}" RENAME TO {live}', db="postgres")
+        except Refused as error:
+            try:
+                self.psql(f'ALTER DATABASE "{aside}" RENAME TO {live}', db="postgres")
+                self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS true", db="postgres")
+            except Refused:
+                raise Refused(f"CRITICAL: the live database is now named {aside} and could not be renamed back. "
+                              f"Rename it by hand: ALTER DATABASE \"{aside}\" RENAME TO {live}; "
+                              f"ALTER DATABASE {live} ALLOW_CONNECTIONS true") from error
+            raise
+        self.psql(f'ALTER DATABASE "{aside}" ALLOW_CONNECTIONS true', db="postgres")
+        self.r.ok(f"database replaced by the restored copy; the replaced one is kept as {aside}")
+        return aside
+
+    def stop_database_clients(self) -> None:
+        self.sh.act(self.compose("stop", "worker", "relay", "interview-mcp", "companion-mcp", "api"),
+                    describe="compose stop worker relay interview-mcp companion-mcp api  (downtime: bot and signups pause)",
+                    timeout=300)
+
+    def start_database_clients(self) -> None:
+        """Bring the stopped clients back on whatever version is checked out now."""
+        self.sh.act(self.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"),
+                    describe="compose up -d --wait api worker interview-mcp companion-mcp", timeout=900, check=False)
+        self.sh.act([str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"], describe="vm-relay-restart.sh",
+                    env={"KINERARY_RELAY_READY_SECONDS": "120"}, timeout=300, check=False)
 
     def take_backup(self, label: str, include_hermes: bool) -> Path:
         stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
         target = BACKUP_DIR / f"{stamp}-{label}"
         if self.dry_run:
             self.r.step(f"would dump the database ({self.db_size_bytes() / 1024 ** 2:.0f} MB live) to {target}/db.dump, "
-                        f"record per-table counts, vm.env and the Hermes profile list"
+                        f"restore it into a scratch database to prove it restores and count its rows there, "
+                        f"record vm.env and the Hermes profile list"
                         + (" and tar hermes-data without auth.json" if include_hermes else ""))
             return target
         BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         target.mkdir(mode=0o700)
-        self.r.step(f"pg_dump → {target}/db.dump")
-        dump_started = iso(utcnow())
-        with (target / "db.dump").open("wb") as handle:
-            proc = subprocess.run(["docker", "exec", PG_CONTAINER, "pg_dump", "-U", DB_USER, "-d", DB_NAME, "-Fc"],
-                                  stdout=handle, stderr=subprocess.PIPE, timeout=900)
-        if proc.returncode != 0:
-            raise Refused(f"pg_dump failed: {proc.stderr.decode(errors='replace')[-300:]}")
-        listing = subprocess.run(["docker", "exec", "-i", PG_CONTAINER, "pg_restore", "--list"],
-                                 stdin=(target / "db.dump").open("rb"), capture_output=True, timeout=300)
-        if listing.returncode != 0 or b"TABLE DATA" not in listing.stdout:
-            raise Refused("the dump does not list its own table data — not trusting it")
-        (target / "db.counts.json").write_text(json.dumps(self.table_counts(), indent=2, sort_keys=True))
-        (target / "taken_at").write_text(dump_started + "\n")
+        try:
+            self.r.step(f"pg_dump → {target}/db.dump")
+            dump_started = iso(utcnow())
+            self.dump_database(target / "db.dump")
+            verify = f"{DB_NAME}_verify_{stamp.lower()}"
+            self.r.step(f"restore the dump into {verify} to prove it restores, and count its rows there")
+            self.restore_dump_into(target / "db.dump", verify)
+            try:
+                counts = self.table_counts(db=verify)
+            finally:
+                self.drop_database(verify)
+            (target / "db.counts.json").write_text(json.dumps(counts, indent=2, sort_keys=True))
+            (target / "taken_at").write_text(dump_started + "\n")
+        except Exception:
+            # A directory without a proven dump must never look like a backup.
+            shutil.rmtree(target, ignore_errors=True)
+            raise
         shutil.copy2(VM_ENV, target / "vm.env")
         profiles = sorted(p.name for p in (HERMES_DATA / "profiles").iterdir() if p.is_dir()) if (HERMES_DATA / "profiles").exists() else []
         (target / "profiles.txt").write_text("\n".join(profiles) + "\n")
@@ -972,7 +1107,8 @@ class ControlPlane:
                 self.r.note(f"these migrations DID commit before the failure: {', '.join(committed)}")
             self.git("checkout", "--quiet", "--detach", previous["full"])
             self.set_vm_env({"KINERARY_REV": previous["KINERARY_REV"], "HERMES_REV": previous["HERMES_REV"]})
-            raise
+            raise MigrateFailed(f"migrate with {short} failed; running {previous['KINERARY_REV']} again"
+                                + (f", with these new migrations committed: {', '.join(committed)}" if committed else ""))
 
         self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", "api", "worker", "interview-mcp", "companion-mcp"),
                     describe="compose up -d --wait api worker interview-mcp companion-mcp  (downtime: none for trips)", timeout=900,
@@ -1242,13 +1378,25 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         r.ok(f"snapshot {snapshot} taken")
 
     r.head("4/5 Switch")
+    record = {"action": "upgrade", "from_rev": versions["KINERARY_REV"], "to_rev": short,
+              "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_rev if hermes_changes else versions["HERMES_REV"],
+              "snapshot": snapshot, "backup_dir": str(backup), "verdict": verdict, "actor": cp.actor}
+    if not cp.dry_run:
+        # Before anything switches: if this process dies mid-switch, the way back
+        # (from_rev, dump, snapshot) is already on record.
+        append_history({**record, "utc": iso(utcnow()), "result": "switching"})
     try:
         cp.switch_to(full, short, hermes_rev if hermes_changes else None, previous, restart_hermes=hermes_changes)
+    except MigrateFailed:
+        if not cp.dry_run:
+            append_history({**record, "utc": iso(utcnow()), "result": "migrate-failed"})
+            r.line(f"The way back from any migrations that committed: kinerary-cp-release rollback --restore-db")
+        raise
     except Refused:
         if not cp.dry_run:
-            append_history({"utc": iso(utcnow()), "action": "upgrade", "from_rev": versions["KINERARY_REV"], "to_rev": short,
-                            "hermes_from": versions["HERMES_REV"], "hermes_to": versions["HERMES_REV"], "snapshot": snapshot,
-                            "backup_dir": str(backup), "verdict": verdict, "result": "switch-failed", "actor": cp.actor})
+            append_history({**record, "utc": iso(utcnow()), "result": "switch-failed"})
+            r.line(f"Switched to {short} but a service did not come up. The way back: kinerary-cp-release rollback"
+                   + ("" if verdict == "compatible" else " --restore-db"))
         raise
 
     r.head("5/5 Verify")
@@ -1259,10 +1407,7 @@ def cmd_upgrade(cp: ControlPlane, rev: str, hermes_rev: Optional[str], force_liv
         r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
     ok = cp.verify()
-    append_history({"utc": iso(utcnow()), "action": "upgrade", "from_rev": versions["KINERARY_REV"], "to_rev": short,
-                    "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_rev if hermes_changes else versions["HERMES_REV"],
-                    "snapshot": snapshot, "backup_dir": str(backup), "verdict": verdict,
-                    "result": "ok" if ok else "verify-failed", "actor": cp.actor})
+    append_history({**record, "utc": iso(utcnow()), "result": "ok" if ok else "verify-failed"})
     back = "kinerary-cp-release rollback" + ("" if verdict == "compatible" else " --restore-db")
     if ok:
         install_tool_files(cp, quiet=True)
@@ -1280,18 +1425,18 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     r.head("1/5 Target" + ("  [DRY RUN — nothing will change]" if cp.dry_run else ""))
     rows = read_history()
     versions = current_versions(cp)
-    upgrade = last_good_upgrade(rows)
+    upgrade = recovery_point(rows, versions["KINERARY_REV"], to=to)
     if to:
         known = {row["from_rev"] for row in rows} | {row["to_rev"] for row in rows}
         target_short = next((k for k in known if k and (k.startswith(to) or to.startswith(k))), None)
         if not target_short:
             raise Refused(f"{to} is not a version this VM has run (see: kinerary-cp-release history)")
-        upgrade = next((row for row in reversed(rows) if row["action"] == "upgrade" and row["from_rev"] == target_short
-                        and row["to_rev"] == versions["KINERARY_REV"] and row["result"] in ("ok", "verify-failed")), None)
     else:
-        if not upgrade or upgrade["to_rev"] != versions["KINERARY_REV"]:
-            raise Refused("the running version was not reached by an upgrade this tool recorded — name one: rollback --to <rev>")
+        if not upgrade:
+            raise Refused("no recorded upgrade describes what is running now — name the version: rollback --to <rev>")
         target_short = upgrade["from_rev"]
+        if upgrade["result"] != "ok":
+            r.note(f"recovering from an upgrade that ended '{upgrade['result']}' ({upgrade['utc']})")
     full = cp.git("rev-parse", "--verify", f"{target_short}^{{commit}}")
     short = full[:7]
     hermes_target = upgrade["hermes_from"] if upgrade and upgrade.get("hermes_from") else versions["HERMES_REV"]
@@ -1353,26 +1498,11 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     cp.refuse_if_failed("nothing was changed")
 
     r.head("4/5 Switch")
-    cp.take_backup(f"{versions['KINERARY_REV']}-before-rollback-to-{short}", include_hermes=False)
+    pre_label = f"{versions['KINERARY_REV']}-before-rollback-to-{short}"
     if restore_db and dump_dir:
-        cp.sh.act(cp.compose("stop", "worker", "relay", "interview-mcp", "companion-mcp", "api"),
-                  describe="compose stop worker relay interview-mcp companion-mcp api  (downtime: bot and signups pause)", timeout=300)
-        cp.sh.act(["docker", "exec", PG_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME, "-v", "ON_ERROR_STOP=1", "-c",
-                   "DROP SCHEMA IF EXISTS control_plane CASCADE; DROP TABLE IF EXISTS public.control_plane_schema_migrations;"],
-                  describe="drop schema control_plane and the migrations table")
-        if not cp.dry_run:
-            with (dump_dir / "db.dump").open("rb") as handle:
-                proc = subprocess.run(["docker", "exec", "-i", PG_CONTAINER, "pg_restore", "-U", DB_USER, "-d", DB_NAME, "--no-owner"],
-                                      stdin=handle, capture_output=True, timeout=1800)
-            r.step(f"pg_restore {dump_dir}/db.dump (exit {proc.returncode})")
-            expected = json.loads((dump_dir / "db.counts.json").read_text())
-            actual = cp.table_counts()
-            mismatched = sorted(t for t in expected if expected[t] != actual.get(t))
-            if mismatched:
-                raise Refused(f"restore does not match the dump's counts for: {', '.join(mismatched)} — stopped before starting services")
-            r.ok(f"restored: all {len(expected)} tables match the dump's row counts")
-        else:
-            r.step(f"would pg_restore {dump_dir}/db.dump and compare every table's count to db.counts.json")
+        restore_database_for_rollback(cp, dump_dir, pre_label)
+    else:
+        cp.take_backup(pre_label, include_hermes=False)
     if restore_hermes and dump_dir and hermes_changes:
         stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
         aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{stamp}")
@@ -1399,6 +1529,32 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     cp.notify(f"Kinerary control plane rolled back {versions['KINERARY_REV']} -> {short} ({cp.actor})"
               f"{' with the database restored' if restore_db else ''}. Verify {'passed' if ok else 'FAILED'}.")
     return 0 if ok else 2
+
+
+def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: str) -> None:
+    """--restore-db without ever betting the live database on the restore.
+
+    1. Restore the dump into a new database and prove it matches (services up).
+    2. Stop the database's clients.
+    3. Back the live database up, now that nothing writes to it — the exact
+       state the rollback discards, itself proven restorable.
+    4. Swap the restored copy in; the replaced database is kept aside.
+    If 2-4 fail, the copy is dropped and the clients come back on the untouched
+    database. Nothing is switched until this returns.
+    """
+    stamp = utcnow().strftime("%Y%m%dt%H%M%Sz")
+    scratch = cp.prepare_restored_database(dump_dir, stamp)
+    try:
+        cp.stop_database_clients()
+        cp.take_backup(pre_label, include_hermes=False)
+        cp.swap_in_database(scratch, stamp)
+    except Refused:
+        try:
+            cp.drop_database(scratch)
+        except Refused:
+            pass
+        cp.start_database_clients()
+        raise
 
 
 def cmd_restart_bridges(cp: ControlPlane) -> int:
@@ -1465,6 +1621,18 @@ def cmd_prune(cp: ControlPlane) -> int:
     flag = "--keep-storage" if "--keep-storage" in help_text else "--max-used-space"
     cp.sh.act(["docker", "builder", "prune", "-f", flag, BUILD_CACHE_KEEP], describe=f"docker builder prune {flag} {BUILD_CACHE_KEEP}", check=False)
     cp.sh.act(cp.git_argv("worktree", "prune"), describe="git worktree prune", check=False)
+    try:
+        names = cp.psql("SELECT datname FROM pg_database ORDER BY 1", db="postgres").splitlines()
+        doomed_databases = databases_to_prune(names)
+        r.ok(f"removing {len(doomed_databases)} database copies (scratch restores, and replaced databases beyond the newest)")
+        for name in doomed_databases:
+            if cp.dry_run:
+                r.step(f"would drop database {name}")
+            else:
+                cp.drop_database(name)
+                r.step(f"dropped database {name}")
+    except Refused as error:
+        r.fail(f"could not prune database copies: {error}")
     for path in (STATE_DIR / "requests").glob("r-*.json") if (STATE_DIR / "requests").exists() else []:
         if now - path.stat().st_mtime > 7 * 86400:
             cp.sh.act(["rm", "-f", str(path)], describe=f"remove old request {path.name}")

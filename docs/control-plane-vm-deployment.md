@@ -290,12 +290,18 @@ sudo kinerary-cp-release prune --dry-run
    VM's env and secrets. Check storage.
 2. **Guards.** No provisioning job in flight, no interview mid-turn, and the
    Proxmox snapshot preflight.
-3. **Safety point.** `pg_dump` with per-table counts, then a snapshot of this
-   VM.
-4. **Switch.** Checkout, then `vm.env`, then `migrate`. If migrate fails, the
-   checkout and `vm.env` go back and no container was touched. Then api,
-   worker and the sidecars; then the relay through `vm-relay-restart.sh`; and
-   Hermes only if its revision changed.
+3. **Safety point.** `pg_dump`, restored at once into a scratch database to
+   prove it restores; the per-table counts are read from that copy, so they
+   describe the dump rather than the live database a moment later. Then a
+   snapshot of this VM.
+4. **Switch.** A `switching` history row first, so a run that dies mid-switch
+   still leaves its way back on record. Checkout, then `vm.env`, then `migrate`.
+   If migrate fails, the checkout and `vm.env` go back, no container was
+   touched, and the row says `migrate-failed` (earlier migrations may have
+   committed: `rollback --restore-db`). Then api, worker and the sidecars; the
+   relay through `vm-relay-restart.sh`; Hermes only if its revision changed. A
+   service that does not come up records `switch-failed`, and `rollback` still
+   finds its dump and snapshot.
 5. **Verify.** readyz, migrations, image tags, relay bot/polling/no 409,
    trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
    companion connection and trip-mcp bridge. Dror gets the result on Telegram.
@@ -312,7 +318,17 @@ features restart only when `HERMES_REV` changes.
 |---|---|---|
 | `rollback` | every migration since is `-- rollback: compatible` | ~1 min bot pause, no data lost |
 | `rollback --restore-db` | a migration is breaking, or data went wrong | DB writes since the dump; **refused** if a trip reached `provisioning` or later, a job ran, or a Hermes profile appeared since |
-| `control-plane/deployment/vm-restore-snapshot.sh` (from the Mac) | Docker, OS or Hermes image damage | everything on the VM since the snapshot; refused on the same condition |
+| `control-plane/deployment/vm-restore-snapshot.sh` (from the Mac) | Docker, OS or Hermes image damage | everything on the VM since the snapshot; refused on the same condition, and refused when that condition cannot be checked unless `--accept-unverified` and the snapshot name is typed |
+
+`--restore-db` never drops the live database on a hope. The dump is restored
+into a new database (one transaction, stopping at the first error — a failing
+`pg_restore` is a failure) while services keep running, and every table's
+count must match the dump's. Only then are the database's clients stopped, the
+live database backed up (the exact state being discarded), and the restored
+copy renamed into place. The replaced database is kept as
+`kinerary_control_plane_pre_rollback_<stamp>`; `prune` drops all but the
+newest. If anything before the swap fails, the copy is dropped and the clients
+come back on the untouched database.
 
 Every new migration declares `-- rollback: compatible — <why>` or
 `-- rollback: breaking — <what>`, enforced by
@@ -360,11 +376,15 @@ A snapshot is refused when any of these hold:
 ### Whole-VM restore credentials
 
 `vm-restore-snapshot.sh` reads the live `auth.json` files through the guest
-agent into memory, rolls back, boots the VM with its network link **down**,
-stops Hermes, writes the live credentials back, and only then brings the link
-up. A snapshot holds old single-use refresh tokens, and one refresh with them
-locks the account. It then restarts every trip's bridge and companion (a
-reboot does not) and runs `verify`.
+agent into memory (their contents are never printed), rolls back, boots the VM
+with its network link **down**, stops Hermes, the relay and the interview
+sidecar, writes the live credentials back, and only then brings the link up. A
+snapshot holds old single-use refresh tokens, and one refresh with them locks
+the account. A write counts only when the guest's own exit code (from `qm guest
+exec`'s JSON, not ssh's status) is 0 and the file's hash inside the VM matches;
+each service starts only if its credential came back — Hermes on its providers'
+file, the relay and sidecar on the interview's codex login. It then restarts
+every trip's bridge and companion (a reboot does not) and runs `verify`.
 
 ### trip-monitor manages releases too
 
