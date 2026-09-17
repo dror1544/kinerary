@@ -222,6 +222,40 @@ intent the container reads on the next boot.
 The fork's only git remote is upstream `NousResearch/hermes-agent`; its local
 commits are on no remote. `/opt/hermes-src` is a history-less snapshot.
 
+### Files sent on Telegram: the hand-off folder
+
+A companion gets a file someone sent as a **local path**. Hermes saves it with
+`tempfile.mkstemp(prefix="relay_media_")`, so under `TMPDIR`. The trip-mcp tools
+that put a file on the site (`upload_booking_confirmation`, `add_photo`,
+`set_participant_avatar`) read "an absolute path on the machine running this MCP
+server", and each trip's `mcp.js` runs on the **host** as `hermes`. So Hermes's
+`TMPDIR` is `/opt/kinerary-inbound`, bind-mounted at that same path, owned by
+uid 10000 (the gateways' user in the container and trip-mcp's on the host),
+mode 0700. Before this, Hermes saved into its container `/tmp`, and no file sent
+on Telegram could reach a site.
+
+The `inbound` service creates the folder with that owner before Hermes starts
+(Hermes waits for it to be healthy), then runs `inbound-sweep.sh` hourly, which
+deletes `relay_media_*` files older than a day. The site keeps what was
+uploaded in the trip's own NFS folder, attached to its booking or album. The
+hand-off copy exists for the turn that used it.
+
+It is deliberately not the NFS: the VM mounts none, a hung mount would freeze
+every companion at once, and the trip folders hold every family's live site
+data inside a container all companions share.
+
+After a deploy, check both sides of the path:
+
+```bash
+$C ps inbound hermes                               # $C as in "Running it"; inbound healthy, hermes up
+sudo stat -c '%U %a %n' /opt/kinerary-inbound      # hermes 700
+sudo docker exec -u hermes hermes sh -c 'echo "$TMPDIR"'   # /opt/kinerary-inbound
+```
+
+`tests/scripts/test_inbound_handoff.py` holds the compose file to the same-path
+rule, and `control-plane/api/test/group-document-to-plan.integration.test.ts`
+takes a PDF from the family group to a booking a family member downloads.
+
 ## Companion host
 
 The worker installs a trip's companion over SSH to a forced command, as on the

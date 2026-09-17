@@ -110,6 +110,18 @@ the machine you happen to run on — get a short redirect, not an attempt.
   summary is read once, the site is what the family opens on the day. The write
   itself follows **Writes and verification** and **Daily plan → site update**:
   approval first — anyone in the family group, or the organizer — read back after.
+- A file someone sends you arrives as a note with a local path. The note may
+  suggest a terminal or an OCR skill; you have neither. Read the file with
+  `read_file` on exactly that path: it converts a PDF, Word or Excel file to
+  text, and the first read of a PDF can take a few seconds longer. If it still
+  comes back unreadable — a scan or a photo of a page — say so plainly and ask
+  for the details or a clearer copy; never guess at what it says.
+- The file itself can go on the site, not only what it says. With the same
+  approval as the update it belongs to: a booking's PDF confirmation goes onto
+  that booking with `upload_booking_confirmation` (find or create the booking
+  first), and a photo for the trip goes into the album with `add_photo` — both
+  take that same local path. The path is temporary: attach the file in the
+  conversation it arrived in, not days later.
 
 ## Source of truth
 - Canonical website: $SITE_URL

@@ -311,6 +311,52 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # The hand-off folder for files people send on Telegram, and its janitor.
+  #
+  # A companion that receives a booking PDF or a photo gets it as a local path,
+  # saved by Hermes (tempfile.mkstemp, so under TMPDIR). The tools that put a
+  # file on the trip site — trip-mcp's upload_booking_confirmation, add_photo,
+  # set_participant_avatar — take "an absolute path on the machine running this
+  # MCP server", and each trip's mcp.js runs on this HOST as the `hermes` user.
+  # With Hermes saving into its own container /tmp, that path did not exist
+  # where the upload ran, so no file sent on Telegram could reach a site.
+  #
+  # So the folder is mounted at the SAME path on both sides, Hermes's TMPDIR
+  # points at it, and it belongs to uid 10000 — the gateways' user in the
+  # container and trip-mcp's user on the host. The site stores what is uploaded
+  # in the trip's own NFS folder, attached to its booking; the copy here is
+  # swept after a day (inbound-sweep.sh).
+  #
+  # Not the NFS itself: this VM mounts none (a hung mount would freeze every
+  # companion at once), the trip folders hold every family's live site data,
+  # and all companions share one container whose file tools can read whatever
+  # is mounted into it.
+  #
+  # Runs as root only to create the folder with the right owner before Hermes
+  # starts — Docker would otherwise create a missing bind source as root, and
+  # the gateways could not write to it.
+  inbound:
+    image: kinerary-cp/agent-runtime:${KINERARY_REV:?set KINERARY_REV in vm.env}
+    user: "0:0"
+    network_mode: none
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /opt/kinerary-inbound &&
+        chown 10000:10000 /opt/kinerary-inbound &&
+        chmod 0700 /opt/kinerary-inbound &&
+        while :; do /usr/local/bin/inbound-sweep.sh /opt/kinerary-inbound 1440 || true; sleep 3600; done
+    volumes:
+      - /opt/kinerary-inbound:/opt/kinerary-inbound
+      - ./inbound-sweep.sh:/usr/local/bin/inbound-sweep.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$$(stat -c %u:%a /opt/kinerary-inbound)\" = 10000:700 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
   # Hermes — the AI runtime, built from the fork's own Dockerfile at a pinned
   # revision (HERMES_REV; the source tree records it in /opt/hermes-src/.hermes-rev).
   # Kinerary profiles only — trip-intake and kinerary-extract — staged from the
@@ -341,11 +387,18 @@ services:
     environment:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
+      # Where a file sent on Telegram is saved, at the path trip-mcp reads it
+      # from on the host — see the `inbound` service. s6 starts every gateway
+      # with `with-contenv`, so each one inherits it.
+      TMPDIR: /opt/kinerary-inbound
     volumes:
       - /opt/hermes-data:/opt/data
+      - /opt/kinerary-inbound:/opt/kinerary-inbound
     depends_on:
       relay:
         condition: service_started
+      inbound:
+        condition: service_healthy
     restart: unless-stopped
 
 secrets:

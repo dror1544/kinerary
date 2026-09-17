@@ -107,6 +107,7 @@ import { digestTelegramId } from "../identity.js";
 import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
+import { PendingAttachments } from "./pending-attachments.js";
 import { askText, DEFAULT_LANGUAGE, optionLabel, uiString, type Language } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
@@ -156,6 +157,12 @@ export interface TripBotPollerDeps {
   interviewerProfile?: string;
   /** Re-host plane for inbound attachments; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * Where a group document that addressed nobody waits for its sender's next
+   * addressed message. Injectable for tests; the poller makes its own, which
+   * lives exactly as long as the poll loop does.
+   */
+  pendingAttachments?: PendingAttachments;
   /**
    * The bounded-call runner behind the interpret path
    * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
@@ -2477,6 +2484,7 @@ export function startTripBotPoller(
   const longPollSeconds = options.longPollSeconds ?? DEFAULT_LONG_POLL_SECONDS;
   const maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   const deliverIntervalMs = options.deliverIntervalMs ?? DEFAULT_DELIVER_INTERVAL_MS;
+  const pendingAttachments = deps.pendingAttachments ?? new PendingAttachments();
 
   let offset = 0;
   let stopped = false;
@@ -2568,6 +2576,7 @@ export function startTripBotPoller(
           const decision = await dispatchUpdate(deps.db, update, strings, log, deps.botIdentity ?? {}, {
             interviewerProfile: deps.interviewerProfile,
             media: deps.media,
+            pendingAttachments,
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the
             // organizer's turn on a socket that is gone.
