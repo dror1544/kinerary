@@ -198,12 +198,35 @@ class RestoreAgainstPostgres(unittest.TestCase):
         leftovers = [p for p in (self.tmp / "backups").glob("*") if p.is_dir() and not (p / "db.counts.json").exists()]
         self.assertEqual(leftovers, [], "a failed backup leaves no directory that looks like a backup")
 
+    def test_an_undone_swap_gives_back_exactly_the_database_that_was_replaced(self):
+        # The window this covers: the database is already swapped, and the code
+        # switch then fails (a missing image, a failed migrate, Ctrl-C). The
+        # clients have been stopped since the pre-rollback backup, so putting
+        # the replaced database back loses nothing.
+        backup = self.cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)
+        self.sql("kinerary_control_plane",
+                 "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_dddddddd', 'newer', 'draft')")
+        before = self.sql("kinerary_control_plane", "SELECT id || ':' || slug FROM control_plane.trips ORDER BY 1")
+        swap = self.cp.swap_in_database(self.cp.prepare_restored_database(backup, "20260917t000400z"), "20260917t000400z")
+        self.assertEqual(self.sql("kinerary_control_plane", "SELECT count(*) FROM control_plane.trips"), "2")
+
+        self.cp.undo_swap(swap)
+        self.assertEqual(self.sql("kinerary_control_plane", "SELECT id || ':' || slug FROM control_plane.trips ORDER BY 1"), before)
+        self.assertEqual(self.sql("kinerary_control_plane",
+                                  "SELECT count(*) FROM pg_trigger WHERE tgname = 'trips_touch'"), "1")
+        self.assertIn("kinerary_control_plane_restore_failed_20260917t000400z", self.databases(),
+                      "the copy that was rolled back to is kept for inspection until prune")
+        self.assertNotIn(swap.aside, self.databases(), "it was renamed back, not copied")
+        # And the database accepts writes again: ALLOW_CONNECTIONS was restored.
+        self.sql("kinerary_control_plane",
+                 "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_eeeeeeee', 'after', 'draft')")
+
     def test_the_swap_replaces_the_live_database_and_keeps_the_old_one(self):
         backup = self.cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)
         self.sql("kinerary_control_plane",
                  "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_dddddddd', 'newer', 'draft')")
         scratch = self.cp.prepare_restored_database(backup, "20260917t000300z")
-        aside = self.cp.swap_in_database(scratch, "20260917t000300z")
+        aside = self.cp.swap_in_database(scratch, "20260917t000300z").aside
         self.assertEqual(self.sql("kinerary_control_plane", "SELECT count(*) FROM control_plane.trips"), "2")
         self.assertEqual(self.sql(aside, "SELECT count(*) FROM control_plane.trips"), "3",
                          "the replaced database is kept, with the writes the restore discarded")

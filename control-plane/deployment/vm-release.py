@@ -59,7 +59,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------- #
 # Where things are. Environment overrides exist for tests and the rehearsal
@@ -440,10 +440,19 @@ def recovery_point(rows: Sequence[Dict[str, str]], current_rev: str, to: Optiona
     return None
 
 
+class Swap(NamedTuple):
+    """A --restore-db that replaced the live database: the copy set aside (the
+    state the rollback discards) and the stamp both copies are named after.
+    It is what makes the swap undoable until the target's services start."""
+    aside: str
+    stamp: str
+
+
 def databases_to_prune(names: Iterable[str]) -> List[str]:
-    """Scratch databases this tool leaves (verify/restore copies) always go; of the
-    databases a --restore-db replaced, the newest is kept for inspection."""
-    scratch = sorted(n for n in names if re.match(rf"^{DB_NAME}_(verify|restore)_[0-9t]+z$", n))
+    """Scratch databases this tool leaves (verify/restore copies, and a restore
+    that was undone) always go; of the databases a --restore-db replaced, the
+    newest is kept for inspection."""
+    scratch = sorted(n for n in names if re.match(rf"^{DB_NAME}_(verify|restore|restore_failed)_[0-9t]+z$", n))
     replaced = sorted(n for n in names if re.match(rf"^{DB_NAME}_pre_rollback_[0-9t]+z$", n))
     return scratch + replaced[:-1]
 
@@ -962,7 +971,7 @@ class ControlPlane:
         aside = f"{DB_NAME}_pre_rollback_{stamp}"
         if self.dry_run:
             self.r.step(f"would rename {DB_NAME} to {aside} and {scratch} to {DB_NAME}")
-            return aside
+            return Swap(aside, stamp)
         live = f'"{DB_NAME}"'
         self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS false", db="postgres")
         self.psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{DB_NAME}' "
@@ -989,7 +998,27 @@ class ControlPlane:
             # The swap itself is done; this only matters to someone inspecting the old copy.
             self.r.note(f"{aside} still refuses connections ({error}); ALTER DATABASE \"{aside}\" ALLOW_CONNECTIONS true")
         self.r.ok(f"database replaced by the restored copy; the replaced one is kept as {aside}")
-        return aside
+        return Swap(aside, stamp)
+
+    def undo_swap(self, swap: Swap) -> None:
+        """Put the database that was replaced back under the live name.
+
+        The clients have been stopped since the pre-rollback backup, so the copy
+        set aside is exactly the live state and this loses nothing. The restored
+        copy is kept as _restore_failed_<stamp> until `prune`.
+        """
+        failed = f"{DB_NAME}_restore_failed_{swap.stamp}"
+        if self.dry_run:
+            self.r.step(f"would rename {DB_NAME} to {failed} and {swap.aside} back to {DB_NAME}")
+            return
+        live = f'"{DB_NAME}"'
+        self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS false", db="postgres")
+        self.psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{DB_NAME}' "
+                  "AND pid <> pg_backend_pid()", db="postgres")
+        self.psql(f'ALTER DATABASE {live} RENAME TO "{failed}"', db="postgres")
+        self.psql(f'ALTER DATABASE "{swap.aside}" RENAME TO {live}', db="postgres")
+        self.psql(f"ALTER DATABASE {live} ALLOW_CONNECTIONS true", db="postgres")
+        self.r.ok(f"the database that was replaced is live again; the copy the rollback restored is kept as {failed}")
 
     def stop_database_clients(self) -> None:
         self.sh.act(self.compose("stop", "worker", "relay", "interview-mcp", "companion-mcp", "api"),
@@ -1102,6 +1131,13 @@ class ControlPlane:
     def switch_to(self, full: str, short: str, hermes_rev: Optional[str], previous: Dict[str, str],
                   *, restart_hermes: bool, force_live_note: bool = True) -> None:
         """Checkout, vm.env, migrate, services, relay, hermes. Reverts on a failed migrate."""
+        self.switch_code(full, short, hermes_rev, previous)
+        self.start_switched(hermes_rev, restart_hermes=restart_hermes)
+
+    def switch_code(self, full: str, short: str, hermes_rev: Optional[str], previous: Dict[str, str]) -> None:
+        """Checkout, vm.env, migrate — nothing that is running is touched yet, and a
+        failed migrate puts the checkout and vm.env back. Everything here is still
+        undoable, which is what lets a failed rollback put its database back too."""
         self.sh.act(self.git_argv("checkout", "--quiet", "--detach", full), describe=f"git checkout --detach {short}")
         self.sh.act(self.git_argv("tag", "-f", f"deployed/{short}", full), describe=f"git tag deployed/{short}")
         updates = {"KINERARY_REV": short}
@@ -1123,6 +1159,10 @@ class ControlPlane:
             raise MigrateFailed(f"migrate with {short} failed; running {previous['KINERARY_REV']} again"
                                 + (f", with these new migrations committed: {', '.join(committed)}" if committed else ""))
 
+    def start_switched(self, hermes_rev: Optional[str], *, restart_hermes: bool) -> None:
+        """The point of no return: the target's containers start. From here a failure
+        rolls forward (verify, then rollback), because putting an older database back
+        under running newer code would strand it."""
         self.sh.act(self.compose("up", "-d", "--wait", "--remove-orphans", "api", "worker", "interview-mcp", "companion-mcp"),
                     describe="compose up -d --wait api worker interview-mcp companion-mcp  (downtime: none for trips)", timeout=900,
                     stream_output=True)
@@ -1274,8 +1314,15 @@ def cmd_status(cp: ControlPlane) -> int:
     ready, body = cp.readyz()
     (r.ok if ready else r.fail)(f"readyz {'ready' if ready else body}")
     r.head("History (latest 5)")
-    for row in read_history()[-5:]:
+    rows = read_history()
+    for row in rows[-5:]:
         r.line(f"  {row['utc']}  {row['action']:<9} {row['from_rev']} → {row['to_rev']}  {row['result']}  {row['actor']}  {row['snapshot']}")
+    if rows and rows[-1]["result"] == "switching":
+        # Written before the switch and superseded when it ends: still there means
+        # the run died mid-switch (killed, or the VM went down under it).
+        r.note(f"the {rows[-1]['action']} of {rows[-1]['utc']} never finished — run `kinerary-cp-release verify`. "
+               "If it was a --restore-db rollback, the database it replaced is the newest "
+               f"{DB_NAME}_pre_rollback_* copy (`prune --dry-run` lists them) and nothing has been dropped.")
     r.head(f"Snapshots of VM {cp.vmid}")
     try:
         now = time.time()
@@ -1512,22 +1559,37 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
 
     r.head("4/5 Switch")
     pre_label = f"{versions['KINERARY_REV']}-before-rollback-to-{short}"
-    if restore_db and dump_dir:
-        restore_database_for_rollback(cp, dump_dir, pre_label)
-    else:
+    record = {"action": "rollback", "from_rev": versions["KINERARY_REV"], "to_rev": short,
+              "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_target, "backup_dir": str(dump_dir or ""),
+              "verdict": "restore-db" if restore_db else ("keep-db" if newer else "no-newer-migrations"), "actor": cp.actor}
+    if not cp.dry_run:
+        # Before anything changes: a run that dies mid-rollback still leaves a row.
+        append_history({**record, "utc": iso(utcnow()), "result": "switching"})
+    swap = restore_database_for_rollback(cp, dump_dir, pre_label) if (restore_db and dump_dir) else None
+    if swap is None:
         cp.take_backup(pre_label, include_hermes=False)
-    if restore_hermes and dump_dir and hermes_changes:
-        stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-        aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{stamp}")
-        cp.sh.act(["docker", "stop", HERMES_CONTAINER], describe="docker stop hermes")
-        cp.sh.act(["mv", str(HERMES_DATA), str(aside)], describe=f"keep current hermes-data at {aside}")
-        cp.sh.act(["install", "-d", "-o", "10000", "-g", "10000", "-m", "0700", str(HERMES_DATA)], describe=f"recreate {HERMES_DATA}")
-        cp.sh.act(["tar", "-C", str(HERMES_DATA), "-xzf", str(dump_dir / "hermes-data.tar.gz")], describe="restore hermes-data from the upgrade's backup")
-        cp.sh.act(["cp", "-p", str(aside / "auth.json"), str(HERMES_DATA / "auth.json")],
-                  describe="carry the CURRENT auth.json across (refresh tokens are single-use)")
-        cp.sh.act(["chown", "-R", "10000:10000", str(HERMES_DATA)], describe="chown hermes-data to the hermes uid")
     previous = {**versions}
-    cp.switch_to(full, short, hermes_target if hermes_changes else None, previous, restart_hermes=hermes_changes or restore_hermes)
+    hermes_rev = hermes_target if hermes_changes else None
+
+    def switch_code() -> None:
+        if restore_hermes and dump_dir and hermes_changes:
+            restore_hermes_data(cp, dump_dir)
+        cp.switch_code(full, short, hermes_rev, previous)
+
+    result = "switch-failed"
+
+    def undone() -> None:
+        nonlocal result
+        result = "undone"
+
+    try:
+        switch_with_undo(cp, swap, switch_code,
+                         lambda: cp.start_switched(hermes_rev, restart_hermes=hermes_changes or restore_hermes),
+                         on_undone=undone)
+    except BaseException:
+        if not cp.dry_run:
+            append_history({**record, "utc": iso(utcnow()), "result": result})
+        raise
 
     r.head("5/5 Verify")
     if cp.dry_run:
@@ -1535,16 +1597,13 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
         r.line(); r.line(f"Dry run complete: {r.failures} problem(s). Nothing was changed.")
         return 1 if r.failures else 0
     ok = cp.verify()
-    append_history({"utc": iso(utcnow()), "action": "rollback", "from_rev": versions["KINERARY_REV"], "to_rev": short,
-                    "hermes_from": versions["HERMES_REV"], "hermes_to": hermes_target, "backup_dir": str(dump_dir or ""),
-                    "verdict": "restore-db" if restore_db else ("keep-db" if newer else "no-newer-migrations"),
-                    "result": "ok" if ok else "verify-failed", "actor": cp.actor})
+    append_history({**record, "utc": iso(utcnow()), "result": "ok" if ok else "verify-failed"})
     cp.notify(f"Kinerary control plane rolled back {versions['KINERARY_REV']} -> {short} ({cp.actor})"
               f"{' with the database restored' if restore_db else ''}. Verify {'passed' if ok else 'FAILED'}.")
     return 0 if ok else 2
 
 
-def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: str) -> None:
+def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: str) -> Swap:
     """--restore-db without ever betting the live database on the restore.
 
     1. Restore the dump into a new database and prove it matches (services up).
@@ -1553,14 +1612,15 @@ def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: s
        state the rollback discards, itself proven restorable.
     4. Swap the restored copy in; the replaced database is kept aside.
     If 2-4 fail, the copy is dropped and the clients come back on the untouched
-    database. Nothing is switched until this returns.
+    database. Nothing is switched until this returns, and what it returns is what
+    undoes the swap if the switch then fails.
     """
     stamp = utcnow().strftime("%Y%m%dt%H%M%Sz")
     scratch = cp.prepare_restored_database(dump_dir, stamp)
     try:
         cp.stop_database_clients()
         cp.take_backup(pre_label, include_hermes=False)
-        cp.swap_in_database(scratch, stamp)
+        return cp.swap_in_database(scratch, stamp)
     except BaseException as failure:
         # Whatever stopped it — a refusal, a pg_dump past its timeout, a full
         # disk, Ctrl-C — the clients this stopped come back before the failure
@@ -1577,6 +1637,65 @@ def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: s
                           f"could not be started again ({type(error).__name__}: {error}). The bot and signups are "
                           f"STOPPED on the untouched database. Start them: {restart} && "
                           f"{DEPLOYMENT_DIR / 'vm-relay-restart.sh'} --force-live") from failure
+        raise
+
+
+def switch_with_undo(cp: ControlPlane, swap: Optional[Swap], switch_code: Callable[[], None],
+                     start_services: Callable[[], None], *, on_undone: Optional[Callable[[], None]] = None) -> None:
+    """Switch to the target, with one point of no return: the moment its services start.
+
+    Before it, a rollback that replaced the database can be undone completely —
+    the replaced database goes back and the previous version comes back up on it,
+    losing nothing, because the clients have been stopped since the pre-rollback
+    backup. After it, the target is running, so an older database underneath it
+    would strand it: that failure rolls forward (`verify`, then `rollback`).
+    """
+    try:
+        switch_code()
+    except BaseException as failure:
+        if swap is None:  # nothing was replaced and no client was stopped
+            raise
+        try:
+            cp.undo_swap(swap)
+        except Exception as error:  # noqa: BLE001 - reported with the failure that caused it
+            raise Refused(
+                f"the rollback failed ({type(failure).__name__}: {failure}) AND the database could not be put back "
+                f"({type(error).__name__}: {error}). The services are stopped. By hand, on {PG_CONTAINER}: "
+                f'ALTER DATABASE "{DB_NAME}" RENAME TO "{DB_NAME}_restore_failed_{swap.stamp}"; '
+                f'ALTER DATABASE "{swap.aside}" RENAME TO "{DB_NAME}"; '
+                f'ALTER DATABASE "{DB_NAME}" ALLOW_CONNECTIONS true') from failure
+        try:
+            cp.start_database_clients()
+        except Exception as error:  # noqa: BLE001 - same
+            restart = shlex.join(cp.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"))
+            raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}); the database was put back, but "
+                          f"the services could not be started ({type(error).__name__}: {error}). The bot and signups "
+                          f"are STOPPED. Start them: {restart} && {DEPLOYMENT_DIR / 'vm-relay-restart.sh'} "
+                          "--force-live") from failure
+        cp.r.note("the rollback was undone: the version and the database from before it are back, and nothing was lost")
+        if on_undone:
+            on_undone()
+        raise
+    start_services()
+
+
+def restore_hermes_data(cp: ControlPlane, dump_dir: Path) -> None:
+    """hermes-data from the upgrade's backup, keeping the CURRENT auth.json (refresh
+    tokens are single-use). The current directory goes back if the restore fails."""
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{stamp}")
+    cp.sh.act(["docker", "stop", HERMES_CONTAINER], describe="docker stop hermes")
+    cp.sh.act(["mv", str(HERMES_DATA), str(aside)], describe=f"keep current hermes-data at {aside}")
+    try:
+        cp.sh.act(["install", "-d", "-o", "10000", "-g", "10000", "-m", "0700", str(HERMES_DATA)], describe=f"recreate {HERMES_DATA}")
+        cp.sh.act(["tar", "-C", str(HERMES_DATA), "-xzf", str(dump_dir / "hermes-data.tar.gz")], describe="restore hermes-data from the upgrade's backup")
+        cp.sh.act(["cp", "-p", str(aside / "auth.json"), str(HERMES_DATA / "auth.json")],
+                  describe="carry the CURRENT auth.json across (refresh tokens are single-use)")
+        cp.sh.act(["chown", "-R", "10000:10000", str(HERMES_DATA)], describe="chown hermes-data to the hermes uid")
+    except BaseException:
+        if not cp.dry_run and aside.is_dir():
+            cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the half-restored hermes-data", check=False)
+            cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe="put the current hermes-data back", check=False)
         raise
 
 

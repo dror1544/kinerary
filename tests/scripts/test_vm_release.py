@@ -406,11 +406,13 @@ class DatabasePruning(unittest.TestCase):
             "kinerary_control_plane_pre_rollback_20260915t100000z",
             "kinerary_control_plane_verify_20260916t090000z",
             "kinerary_control_plane_restore_20260916t090500z",
+            "kinerary_control_plane_restore_failed_20260916t091000z",
             "postgres",
         ]
         self.assertEqual(sorted(vr.databases_to_prune(names)), [
             "kinerary_control_plane_pre_rollback_20260901t100000z",
             "kinerary_control_plane_restore_20260916t090500z",
+            "kinerary_control_plane_restore_failed_20260916t091000z",
             "kinerary_control_plane_verify_20260916t090000z",
         ])
 
@@ -452,7 +454,7 @@ class RestoreOrchestration(unittest.TestCase):
             return self._step("backup", Path("/b"))
 
         def swap_in_database(self, scratch, stamp):
-            return self._step("swap", "aside_db")
+            return self._step("swap", vr.Swap("aside_db", stamp))
 
         def drop_database(self, name):
             self.calls.append(f"drop:{name}")
@@ -507,8 +509,96 @@ class RestoreOrchestration(unittest.TestCase):
 
     def test_success_replaces_the_database_after_an_exact_pre_rollback_backup(self):
         stub = self.Stub()
-        vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        swap = vr.restore_database_for_rollback(stub, Path("/d"), "label")
         self.assertEqual(stub.calls, ["prepare", "stop", "backup", "swap"])
+        self.assertEqual(swap.aside, "aside_db", "the caller needs the replaced database to undo the swap")
+
+
+class RollbackUndo(unittest.TestCase):
+    """A rollback that replaced the database is undoable until the target's
+    services start. The clients have been stopped since the pre-rollback backup,
+    so putting the replaced database back loses nothing — and a half-finished
+    rollback (a missing image, a failed migrate, Ctrl-C) must not leave the bot
+    down on a database the running code does not match."""
+
+    class Stub:
+        def __init__(self, undo_fails=False, start_fails=False):
+            self.calls = []
+            self.r = vr.Report(io.StringIO(), color=False)
+            self.dry_run = False
+            self.undo_fails = undo_fails
+            self.start_fails = start_fails
+
+        def undo_swap(self, swap):
+            self.calls.append(f"undo:{swap.aside}")
+            if self.undo_fails:
+                raise vr.Refused("rename back failed")
+
+        def start_database_clients(self):
+            self.calls.append("start")
+            if self.start_fails:
+                raise subprocess.TimeoutExpired(["docker", "compose"], 900)
+
+        def compose(self, *args):
+            return ["docker", "compose", *args]
+
+    def run_switch(self, stub, swap, switch_error=None, start_error=None):
+        def switch_code():
+            stub.calls.append("switch")
+            if switch_error:
+                raise switch_error
+
+        def start_services():
+            stub.calls.append("services")
+            if start_error:
+                raise start_error
+
+        return vr.switch_with_undo(stub, swap, switch_code, start_services)
+
+    SWAP = vr.Swap(aside="aside_db", stamp="20260917t101500z")
+
+    def test_a_failure_before_the_services_start_puts_the_database_back(self):
+        for error in (vr.Refused("image missing"), vr.MigrateFailed("migrate failed"),
+                      subprocess.TimeoutExpired(["git"], 60), KeyboardInterrupt()):
+            stub = self.Stub()
+            with self.assertRaises(type(error)):
+                self.run_switch(stub, self.SWAP, switch_error=error)
+            self.assertEqual(stub.calls, ["switch", "undo:aside_db", "start"], error)
+
+    def test_a_rollback_that_kept_the_database_has_nothing_to_undo(self):
+        stub = self.Stub()
+        with self.assertRaises(vr.Refused):
+            self.run_switch(stub, None, switch_error=vr.Refused("image missing"))
+        self.assertEqual(stub.calls, ["switch"], "no database was replaced and no client was stopped")
+
+    def test_once_the_services_start_the_target_is_committed(self):
+        stub = self.Stub()
+        with self.assertRaises(vr.Refused):
+            self.run_switch(stub, self.SWAP, start_error=vr.Refused("relay restart failed"))
+        self.assertEqual(stub.calls, ["switch", "services"],
+                         "the target is running: putting the older database back would strand it")
+
+    def test_a_clean_rollback_undoes_nothing(self):
+        stub = self.Stub()
+        self.run_switch(stub, self.SWAP)
+        self.assertEqual(stub.calls, ["switch", "services"])
+
+    def test_an_undo_that_fails_names_both_failures_and_the_way_out(self):
+        stub = self.Stub(undo_fails=True)
+        with self.assertRaises(vr.Refused) as refused:
+            self.run_switch(stub, self.SWAP, switch_error=vr.Refused("migrate failed"))
+        message = str(refused.exception)
+        self.assertIn("migrate failed", message)
+        self.assertIn("aside_db", message)
+        self.assertIn("ALTER DATABASE", message, "the rename to run by hand")
+        self.assertNotIn("start", stub.calls, "clients are not started onto a half-swapped database")
+
+    def test_clients_that_will_not_start_after_an_undo_are_reported(self):
+        stub = self.Stub(start_fails=True)
+        with self.assertRaises(vr.Refused) as refused:
+            self.run_switch(stub, self.SWAP, switch_error=vr.Refused("migrate failed"))
+        self.assertIn("migrate failed", str(refused.exception))
+        self.assertEqual(stub.calls, ["switch", "undo:aside_db", "start"])
 
 
 class GateWrapper(unittest.TestCase):

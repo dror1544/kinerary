@@ -332,6 +332,18 @@ timeout, a full disk, Ctrl-C — the copy is dropped and the clients come back o
 the untouched database before the failure is reported; if they cannot be
 started, the message says so and gives the commands.
 
+**The swap is undoable until the target's containers start.** That is the one
+point of no return in a rollback: before it (a missing image, a failed
+`hermes-data` restore, a failed migrate, Ctrl-C) the replaced database is
+renamed back, the restored copy is kept as
+`kinerary_control_plane_restore_failed_<stamp>` for `prune`, and the previous
+version comes back up on its own database — nothing is lost, because the
+clients have been stopped since the pre-rollback backup. After it the target is
+running, so an older database underneath it would strand it: that failure rolls
+forward, and `verify` says what to fix. A row is written to the history
+*before* the switch starts, so a run that is killed mid-rollback still leaves
+one; `status` points at it and at the database set aside.
+
 Every new migration declares `-- rollback: compatible — <why>` or
 `-- rollback: breaking — <what>`, enforced by
 `control-plane/api/test/migration-rollback.test.ts`. The tool treats an
