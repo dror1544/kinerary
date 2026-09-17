@@ -28,6 +28,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "control-plane" / "deployment" / "vm-release.py"
@@ -161,6 +162,21 @@ class RestoreAgainstPostgres(unittest.TestCase):
         self.assertEqual(self.sql("kinerary_control_plane", "SELECT count(*) FROM control_plane.trips"), before)
         self.assertEqual([d for d in self.databases() if d.startswith("kinerary_control_plane_")], [],
                          "no half-restored scratch database is left behind")
+
+    def test_a_restore_that_times_out_leaves_nothing_behind(self):
+        backup = self.cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)
+        real_run = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if "pg_restore" in argv:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(self.vr.subprocess, "run", run):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.cp.prepare_restored_database(backup, "20260917t000150z")
+        self.assertEqual([d for d in self.databases() if d.startswith("kinerary_control_plane_")], [],
+                         "the database created for the restore is dropped when pg_restore never finishes")
 
     def test_a_restore_whose_counts_differ_from_the_dump_is_refused(self):
         backup = self.cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)

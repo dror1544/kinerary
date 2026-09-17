@@ -327,8 +327,10 @@ count must match the dump's. Only then are the database's clients stopped, the
 live database backed up (the exact state being discarded), and the restored
 copy renamed into place. The replaced database is kept as
 `kinerary_control_plane_pre_rollback_<stamp>`; `prune` drops all but the
-newest. If anything before the swap fails, the copy is dropped and the clients
-come back on the untouched database.
+newest. If anything before the swap fails — a refusal, a command past its
+timeout, a full disk, Ctrl-C — the copy is dropped and the clients come back on
+the untouched database before the failure is reported; if they cannot be
+started, the message says so and gives the commands.
 
 Every new migration declares `-- rollback: compatible — <why>` or
 `-- rollback: breaking — <what>`, enforced by
@@ -375,16 +377,33 @@ A snapshot is refused when any of these hold:
 
 ### Whole-VM restore credentials
 
-`vm-restore-snapshot.sh` reads the live `auth.json` files through the guest
-agent into memory (their contents are never printed), rolls back, boots the VM
-with its network link **down**, stops Hermes, the relay and the interview
-sidecar, writes the live credentials back, and only then brings the link up. A
-snapshot holds old single-use refresh tokens, and one refresh with them locks
-the account. A write counts only when the guest's own exit code (from `qm guest
-exec`'s JSON, not ssh's status) is 0 and the file's hash inside the VM matches;
-each service starts only if its credential came back — Hermes on its providers'
-file, the relay and sidecar on the interview's codex login. It then restarts
-every trip's bridge and companion (a reboot does not) and runs `verify`.
+A snapshot holds old single-use refresh tokens, and one refresh with them locks
+the account. So `vm-restore-snapshot.sh`:
+
+1. stops Hermes, the relay and the interview sidecar on the live VM **before**
+   reading anything — a refresh between the read and the shutdown would make
+   the bytes read stale;
+2. reads the live `auth.json` files through the guest agent into memory (their
+   contents are never printed);
+3. rolls back, boots the VM with its network link **down**, and stops those
+   three again;
+4. writes each live credential back — or removes the snapshot's copy where the
+   live VM had none — and only then brings the link up.
+
+Each credential is *captured*, *absent* or *unknown*, and unknown (the read
+failed) is never treated as absent. Without `--accept-unverified` an unknown
+credential, or services that would not stop, end the restore before the VM is
+touched, with the stopped services started again. With it, the restore goes
+ahead and the services that need that credential stay stopped; a broken Docker
+is a reason to restore, so it cannot be a reason to refuse.
+
+A write counts only when the guest's own exit code (from `qm guest exec`'s
+JSON, not ssh's status) is 0 and the file's hash inside the VM matches. Each
+service starts only if its credential is exactly what the live VM had — Hermes
+on its providers' file, the relay and sidecar on the interview's codex login —
+and the script exits non-zero when anything stayed stopped, with the login
+steps. It then restarts every trip's bridge and companion (a reboot does not)
+and runs `verify`.
 
 ### trip-monitor manages releases too
 

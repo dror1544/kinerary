@@ -919,10 +919,19 @@ class ControlPlane:
         one transaction, stop at the first error, and nothing is left behind on failure."""
         self.drop_database(name)
         self.psql(f'CREATE DATABASE "{name}" TEMPLATE template0', db="postgres")
-        with dump.open("rb") as handle:
-            proc = subprocess.run(["docker", "exec", "-i", PG_CONTAINER, "pg_restore", "-U", DB_USER, "-d", name,
-                                   "--no-owner", "--exit-on-error", "--single-transaction"],
-                                  stdin=handle, capture_output=True, timeout=1800)
+        try:
+            with dump.open("rb") as handle:
+                proc = subprocess.run(["docker", "exec", "-i", PG_CONTAINER, "pg_restore", "-U", DB_USER, "-d", name,
+                                       "--no-owner", "--exit-on-error", "--single-transaction"],
+                                      stdin=handle, capture_output=True, timeout=1800)
+        except BaseException:
+            # A timeout kills the docker client, not pg_restore inside the
+            # container; DROP ... WITH (FORCE) ends its session too.
+            try:
+                self.drop_database(name)
+            except Exception as error:  # noqa: BLE001 - the original failure is the one to report
+                self.r.note(f"could not drop {name} ({error}); `kinerary-cp-release prune` removes it")
+            raise
         if proc.returncode != 0:
             detail = proc.stderr.decode(errors="replace").strip()[-400:]
             self.drop_database(name)
@@ -974,7 +983,11 @@ class ControlPlane:
                               f"Rename it by hand: ALTER DATABASE \"{aside}\" RENAME TO {live}; "
                               f"ALTER DATABASE {live} ALLOW_CONNECTIONS true") from error
             raise
-        self.psql(f'ALTER DATABASE "{aside}" ALLOW_CONNECTIONS true', db="postgres")
+        try:
+            self.psql(f'ALTER DATABASE "{aside}" ALLOW_CONNECTIONS true', db="postgres")
+        except Refused as error:
+            # The swap itself is done; this only matters to someone inspecting the old copy.
+            self.r.note(f"{aside} still refuses connections ({error}); ALTER DATABASE \"{aside}\" ALLOW_CONNECTIONS true")
         self.r.ok(f"database replaced by the restored copy; the replaced one is kept as {aside}")
         return aside
 
@@ -1548,12 +1561,22 @@ def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: s
         cp.stop_database_clients()
         cp.take_backup(pre_label, include_hermes=False)
         cp.swap_in_database(scratch, stamp)
-    except Refused:
+    except BaseException as failure:
+        # Whatever stopped it — a refusal, a pg_dump past its timeout, a full
+        # disk, Ctrl-C — the clients this stopped come back before the failure
+        # goes any further, and nothing in the cleanup may keep them down.
         try:
             cp.drop_database(scratch)
-        except Refused:
-            pass
-        cp.start_database_clients()
+        except Exception as error:  # noqa: BLE001 - a leftover copy is prune's job; the services are not
+            cp.r.note(f"could not drop {scratch} ({error}); `kinerary-cp-release prune` removes it")
+        try:
+            cp.start_database_clients()
+        except Exception as error:  # noqa: BLE001 - reported with the failure that caused it
+            restart = shlex.join(cp.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"))
+            raise Refused(f"--restore-db failed ({type(failure).__name__}: {failure}), and the services it had stopped "
+                          f"could not be started again ({type(error).__name__}: {error}). The bot and signups are "
+                          f"STOPPED on the untouched database. Start them: {restart} && "
+                          f"{DEPLOYMENT_DIR / 'vm-relay-restart.sh'} --force-live") from failure
         raise
 
 
@@ -1983,6 +2006,10 @@ def main(argv: Sequence[str]) -> int:
     except Refused as error:
         report.line()
         report.line(f"STOPPED: {error}")
+        return 1
+    except (subprocess.TimeoutExpired, OSError) as error:
+        report.line()
+        report.line(f"STOPPED: {type(error).__name__}: {error}")
         return 1
 
 

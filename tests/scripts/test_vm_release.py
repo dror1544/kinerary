@@ -428,15 +428,18 @@ class RestoreOrchestration(unittest.TestCase):
     back on the untouched database."""
 
     class Stub(vr.ControlPlane):
-        def __init__(self, fail_at=None):
+        def __init__(self, fail_at=None, error=None, drop_fails=False, start_fails=False):
             super().__init__(vr.Report(io.StringIO(), color=False))
             self.calls = []
             self.fail_at = fail_at
+            self.error = error or vr.Refused(f"{fail_at} failed")
+            self.drop_fails = drop_fails
+            self.start_fails = start_fails
 
         def _step(self, name, result=None):
             self.calls.append(name)
             if self.fail_at == name:
-                raise vr.Refused(f"{name} failed")
+                raise self.error
             return result
 
         def prepare_restored_database(self, dump_dir, stamp):
@@ -453,9 +456,13 @@ class RestoreOrchestration(unittest.TestCase):
 
         def drop_database(self, name):
             self.calls.append(f"drop:{name}")
+            if self.drop_fails:
+                raise subprocess.TimeoutExpired(["psql"], 120)
 
         def start_database_clients(self):
             self.calls.append("start")
+            if self.start_fails:
+                raise subprocess.TimeoutExpired(["docker", "compose", "up"], 900)
 
     def test_a_restore_that_fails_changes_nothing(self):
         stub = self.Stub(fail_at="prepare")
@@ -470,6 +477,33 @@ class RestoreOrchestration(unittest.TestCase):
                 vr.restore_database_for_rollback(stub, Path("/d"), "label")
             self.assertIn("drop:scratch_db", stub.calls, failing)
             self.assertEqual(stub.calls[-1], "start", failing)
+
+    def test_any_failure_after_the_stop_brings_the_services_back(self):
+        # Not only Refused: a pg_dump past its timeout, a full disk, Ctrl-C.
+        errors = (subprocess.TimeoutExpired(["pg_dump"], 900), OSError(28, "No space left on device"), KeyboardInterrupt())
+        for error in errors:
+            for failing in ("stop", "backup", "swap"):
+                stub = self.Stub(fail_at=failing, error=error)
+                with self.assertRaises(type(error)):
+                    vr.restore_database_for_rollback(stub, Path("/d"), "label")
+                self.assertIn("drop:scratch_db", stub.calls, (failing, error))
+                self.assertEqual(stub.calls[-1], "start", (failing, error))
+
+    def test_a_failed_cleanup_does_not_keep_the_services_down(self):
+        stub = self.Stub(fail_at="backup", error=OSError(28, "No space left on device"), drop_fails=True)
+        with self.assertRaises(OSError):
+            vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        self.assertEqual(stub.calls[-1], "start")
+
+    def test_services_that_cannot_be_started_again_are_named(self):
+        stub = self.Stub(fail_at="backup", error=subprocess.TimeoutExpired(["pg_dump"], 900), start_fails=True)
+        with self.assertRaises(vr.Refused) as refused:
+            vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        message = str(refused.exception)
+        self.assertIn("STOPPED", message)
+        self.assertIn("pg_dump", message, "the failure that started it is still reported")
+        self.assertIn("vm-relay-restart.sh", message, "and how to bring the services back by hand")
+        self.assertIsInstance(refused.exception.__cause__, subprocess.TimeoutExpired)
 
     def test_success_replaces_the_database_after_an_exact_pre_rollback_backup(self):
         stub = self.Stub()

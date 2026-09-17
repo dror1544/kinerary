@@ -20,11 +20,16 @@
 # THE CREDENTIALS. Hermes's OAuth logins (/opt/hermes-data/auth.json) and the
 # interview's codex login rotate single-use refresh tokens. The snapshot holds
 # OLD ones; if the restored VM refreshed with them, the provider would see a
-# reused token and lock the account out. So: the live files are read first
-# (into this shell's memory, never onto the Mac's disk), the VM boots from the
-# snapshot with its network link DOWN — nothing can refresh or poll Telegram —
-# Hermes is stopped, the live files are written back, and only then does the
-# link come up.
+# reused token and lock the account out. So: Hermes, the relay and the
+# interview sidecar are stopped FIRST — a refresh after the read would make the
+# bytes read stale — then the live files are read (into this shell's memory,
+# never onto the Mac's disk). The VM boots from the snapshot with its network
+# link DOWN, so nothing can refresh or poll Telegram; those services are
+# stopped again, the live files are written back (or removed, where the live VM
+# had none), and only then does the link come up. A credential that could not
+# be READ is not the same as one that does not exist: the restore stops before
+# changing anything, or with --accept-unverified goes ahead and leaves that
+# credential's services stopped until someone logs in again.
 #
 # It refuses a snapshot older than a trip that was built since (container, DNS,
 # proxy host and companion would outlive a database that no longer knows them).
@@ -36,7 +41,8 @@
 # given AND the snapshot name is typed at the terminal. That is the path for a
 # VM too broken to answer, which is when a whole-VM restore is most needed.
 set -uo pipefail
-case "${1:-}" in -h|--help) sed -n '2,31p' "$0"; exit 0 ;; esac
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 
 # Which VM, which Proxmox host, which key: facts about this deployment, kept in
 # the private kinerary-deploy repo (the kinerary repo is public). No defaults —
@@ -58,6 +64,11 @@ printf '%s' "$PVE$PVE_USER$REFUSE_STORAGE" | grep -Eq '^[A-Za-z0-9._: -]*$' || {
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="$DIR/proxmox-snapshot-runner.sh"
 PG=kinerary-cp-postgres-1
+# Everything that can rotate a credential: Hermes (its providers' OAuth) and the
+# relay and interview sidecar (the interview's codex login, mounted at /codex).
+HOLDERS=(hermes kinerary-cp-relay-1 kinerary-cp-interview-mcp-1)
+HERMES_FILE=/opt/hermes-data/auth.json
+CODEX_FILE=/opt/agent-auth/codex/auth.json
 BUILT="'provisioning','ready_private','activation_approved','active','completed','sealed'"
 
 MODE=list
@@ -71,7 +82,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --execute) MODE=execute ;;
     --accept-unverified) ACCEPT_UNVERIFIED=1 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
@@ -184,8 +195,9 @@ if [ "$VERIFIED" -eq 0 ]; then
   fi
 fi
 echo
+echo "  → stop Hermes, the relay and the interview sidecar, so no credential rotates after it is read; read the live credentials"
 echo "  → shut VM $VMID down, qm rollback $VMID $SNAP"
-echo "  → start it with its network link down; stop Hermes, the relay and the interview sidecar; write the live credentials back and check them"
+echo "  → start it with its network link down; stop those three again; put the live credentials back and check them"
 echo "  → bring the link up; start each of those only if its credential came back"
 echo "  → restart every trip's trip-mcp bridge and companion; kinerary-cp-release verify"
 echo "  downtime: the bot, every companion and site AI features, for ~3-5 minutes"
@@ -205,22 +217,67 @@ fi
 
 echo
 echo "── Restoring ──"
-# Credential text lives only in these two variables. It is never echoed — the
-# status below is built from yes/no, never from a parameter expansion of them.
-HERMES_AUTH=""; CODEX_AUTH=""
-if [ "$GUEST_ANSWERS" -eq 1 ]; then
-  HERMES_AUTH="$(guest 30 sh -c 'test -s /opt/hermes-data/auth.json || exit 0; base64 -w0 /opt/hermes-data/auth.json')" || HERMES_AUTH=""
-  CODEX_AUTH="$(guest 30 sh -c 'test -s /opt/agent-auth/codex/auth.json || exit 0; base64 -w0 /opt/agent-auth/codex/auth.json')" || CODEX_AUTH=""
-  have_hermes=no; [ -n "$HERMES_AUTH" ] && have_hermes=yes
-  have_codex=no; [ -n "$CODEX_AUTH" ] && have_codex=yes
-  ok "read live credentials into memory: hermes $have_hermes, codex $have_codex"
-fi
-
 NET0="$(pve "qm config $VMID" | awk -F': ' '$1 == "net0" { print $2 }')"
-[ -n "$NET0" ] || die "could not read net0 of VM $VMID"
+[ -n "$NET0" ] || die "could not read net0 of VM $VMID — nothing was changed"
 NET0_BASE="$(printf '%s' "$NET0" | sed -E 's/,?link_down=[01]//')"
 
-pve "qm shutdown $VMID --timeout 120 || qm stop $VMID" >/dev/null 2>&1 || die "could not stop VM $VMID"
+# Before the VM is rolled back, the services this stopped come back as they were.
+resume_live() {
+  if guest 180 docker start "${HOLDERS[@]}" >/dev/null && guest 900 /usr/local/sbin/kinerary-cp-release restart-bridges >/dev/null; then
+    echo "  Hermes, the relay and the interview sidecar are running again; bridges restarted." >&2
+  else
+    echo "  Could NOT start them again. Inside the VM: sudo docker start ${HOLDERS[*]} && sudo kinerary-cp-release restart-bridges" >&2
+  fi
+}
+
+# A credential is one of: captured (its bytes, in memory), absent (the live VM
+# has none), or unknown (it could not be read). Only the text of a captured one
+# is kept, in HERMES_AUTH / CODEX_AUTH, and never printed: every message below
+# is built from the state word, never from those variables.
+HERMES_STATE=unknown; CODEX_STATE=unknown; HERMES_AUTH=""; CODEX_AUTH=""
+read_credential() {  # prints "absent", or "b64:" and the file in base64
+  guest 30 sh -c 'test -s "$1" || { echo absent; exit 0; }; printf b64:; base64 -w0 "$1"' sh "$1"
+}
+if [ "$GUEST_ANSWERS" -eq 0 ]; then
+  bad "the guest agent did not answer, so no live credential could be read — Hermes, the relay and the interview sidecar will stay stopped"
+elif ! guest 120 docker stop "${HOLDERS[@]}" >/dev/null; then
+  # A broken Docker is a reason to restore, not a reason to refuse — but a
+  # holder that may still be running could rotate a credential after it is read.
+  if [ "$ACCEPT_UNVERIFIED" -eq 0 ]; then
+    resume_live
+    die "could not stop Hermes, the relay and the interview sidecar before reading their credentials — nothing was rolled back. If Docker in the VM is broken, add --accept-unverified to restore without carrying credentials (those services then stay stopped until you log in again)"
+  fi
+  bad "could not stop Hermes, the relay and the interview sidecar — --accept-unverified: no credential is read (one could still rotate after the read), so all three stay stopped"
+else
+  ok "Hermes, the relay and the interview sidecar are stopped (downtime starts) — no credential can rotate from here"
+  HERMES_AUTH="$(read_credential "$HERMES_FILE")" || HERMES_AUTH=""
+  case "$HERMES_AUTH" in
+    absent) HERMES_STATE=absent; HERMES_AUTH="" ;;
+    b64:?*) HERMES_STATE=captured; HERMES_AUTH="${HERMES_AUTH#b64:}" ;;
+    *) HERMES_STATE=unknown; HERMES_AUTH="" ;;
+  esac
+  CODEX_AUTH="$(read_credential "$CODEX_FILE")" || CODEX_AUTH=""
+  case "$CODEX_AUTH" in
+    absent) CODEX_STATE=absent; CODEX_AUTH="" ;;
+    b64:?*) CODEX_STATE=captured; CODEX_AUTH="${CODEX_AUTH#b64:}" ;;
+    *) CODEX_STATE=unknown; CODEX_AUTH="" ;;
+  esac
+  if [ "$HERMES_STATE" = unknown ] || [ "$CODEX_STATE" = unknown ]; then
+    if [ "$ACCEPT_UNVERIFIED" -eq 0 ]; then
+      unset HERMES_AUTH CODEX_AUTH
+      resume_live
+      die "could not read the live credentials (hermes $HERMES_STATE, codex $CODEX_STATE) — nothing was rolled back. Rerun, or add --accept-unverified to restore anyway and leave the services whose credential could not be read stopped until you log in again"
+    fi
+    bad "could not read the live credentials (hermes $HERMES_STATE, codex $CODEX_STATE) — --accept-unverified: restoring anyway, and what needs them stays stopped"
+  else
+    ok "read live credentials into memory: hermes $HERMES_STATE, codex $CODEX_STATE"
+  fi
+fi
+
+if ! pve "qm shutdown $VMID --timeout 120 || qm stop $VMID" >/dev/null 2>&1; then
+  [ "$GUEST_ANSWERS" -eq 1 ] && resume_live
+  die "could not stop VM $VMID — nothing was rolled back"
+fi
 ok "VM $VMID stopped"
 pve "timeout 300 qm rollback $VMID $SNAP" || die "qm rollback failed — the VM is stopped; inspect with: qm listsnapshot $VMID"
 ok "rolled back to $SNAP"
@@ -245,27 +302,44 @@ restore_file() {  # restore_file <path> <base64> — succeeds only if the VM the
   [ "${got%% *}" = "$want" ]
 }
 
+remove_file() {  # remove_file <path> — succeeds only if the VM then has no such file
+  guest 30 sh -c 'rm -f "$1" && ! test -e "$1"' sh "$1" >/dev/null
+}
+
+# Each service starts only once its credential is exactly what the live VM had:
+# the same bytes, or — where the live VM had none — none. Unknown is neither.
 HERMES_OK=0
-if [ -n "$HERMES_AUTH" ]; then
-  if restore_file /opt/hermes-data/auth.json "$HERMES_AUTH"; then
-    ok "Hermes credentials carried across (checked by hash inside the VM)"
-    HERMES_OK=1
-  else
-    bad "could not write Hermes credentials back — Hermes stays stopped"
-  fi
-else
-  note "no live Hermes credentials to carry across — Hermes stays stopped"
-fi
-# Without a live codex login there is nothing to carry, and nothing stale to guard.
-CODEX_OK=1
-if [ -n "$CODEX_AUTH" ]; then
-  if restore_file /opt/agent-auth/codex/auth.json "$CODEX_AUTH"; then
-    ok "interview codex login carried across (checked by hash inside the VM)"
-  else
-    bad "could not write the interview's codex login back — the relay and interview sidecar stay stopped"
-    CODEX_OK=0
-  fi
-fi
+case "$HERMES_STATE" in
+  captured)
+    if restore_file "$HERMES_FILE" "$HERMES_AUTH"; then
+      ok "Hermes credentials carried across (checked by hash inside the VM)"; HERMES_OK=1
+    else
+      bad "could not write Hermes credentials back — Hermes stays stopped"
+    fi ;;
+  absent)
+    if remove_file "$HERMES_FILE"; then
+      ok "the live VM had no Hermes credentials, so the snapshot's copy is removed"; HERMES_OK=1
+    else
+      bad "could not remove the snapshot's stale Hermes credentials — Hermes stays stopped"
+    fi ;;
+  *) bad "the live Hermes credentials were not read, so the snapshot's copy may be stale — Hermes stays stopped" ;;
+esac
+CODEX_OK=0
+case "$CODEX_STATE" in
+  captured)
+    if restore_file "$CODEX_FILE" "$CODEX_AUTH"; then
+      ok "interview codex login carried across (checked by hash inside the VM)"; CODEX_OK=1
+    else
+      bad "could not write the interview's codex login back — the relay and interview sidecar stay stopped"
+    fi ;;
+  absent)
+    if remove_file "$CODEX_FILE"; then
+      ok "the live VM had no codex login, so the snapshot's copy is removed"; CODEX_OK=1
+    else
+      bad "could not remove the snapshot's stale codex login — the relay and interview sidecar stay stopped"
+    fi ;;
+  *) bad "the live codex login was not read, so the snapshot's copy may be stale — the relay and interview sidecar stay stopped" ;;
+esac
 unset HERMES_AUTH CODEX_AUTH
 
 pve "qm set $VMID --net0 '$NET0_BASE'" >/dev/null || die "could not bring the network link back up: qm set $VMID --net0 '$NET0_BASE'"
