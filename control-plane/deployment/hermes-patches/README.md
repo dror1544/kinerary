@@ -46,8 +46,20 @@ update as complete. The organizer saw a website that had not changed.
 The patch reads the payload from the first of `arguments`, `parameters`,
 `args`, `input` that carries content, keeping `arguments` authoritative when
 more than one is present, and names the key it actually read in parse errors.
-Tests: `TestRegression_PayloadKeyAliases` in `tests/tools/test_tool_search.py`
-(7 of them fail on stock, all pass patched; 42 in that file, 96 across the
-dispatcher suites).
 
-Deployed as `kinerary-cp/hermes:ab0d98414-toolcall-alias`.
+"Carries content" parses a JSON string before judging it, because emptiness
+has more than one spelling: `"{ }"` and `"{\n}"` are as empty as `"{}"`, and a
+first cut of this patch compared the raw string against a literal `"{}"` — so
+a runtime that pretty-prints an empty `arguments` beside a populated
+`parameters` still lost the call, in exactly the way the patch exists to
+prevent. Unparseable is deliberately NOT empty: a mangled payload belongs in
+an error naming the key it was sent under, not silently replaced by an alias.
+
+Tests: `TestRegression_PayloadKeyAliases` in `tests/tools/test_tool_search.py`
+— the alias survives the probe-validator, dispatches end to end, covers
+`args`/`input` and JSON-string payloads, keeps `arguments` winning when both
+carry content, and reads the alias through nine spellings of empty. 7 fail on
+stock Hermes; the empty-spelling cases fail on the first cut; all pass now.
+51 in that file, 105 across the dispatcher suites.
+
+Deployed as `kinerary-cp/hermes:ab0d98414-toolcall-alias2`.

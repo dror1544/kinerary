@@ -1,6 +1,6 @@
 --- a/tools/tool_search.py
 +++ b/tools/tool_search.py
-@@ -1029,6 +1029,35 @@
+@@ -1029,6 +1029,58 @@
          return None
  
  
@@ -15,6 +15,32 @@
 +_PAYLOAD_KEYS: Tuple[str, ...] = ("arguments", "parameters", "args", "input")
 +
 +
++def _carries_payload(value: Any) -> bool:
++    """Whether this value holds arguments, as opposed to an empty stand-in.
++
++    A JSON string is parsed before it is judged, because emptiness has more
++    than one spelling: ``"{ }"`` and ``"{\\n}"`` are as empty as ``"{}"``, and a
++    runtime that pretty-prints an empty object must not thereby make its key
++    look populated — that would hand the call back to the documented key,
++    parse it to ``{}``, and lose it to the validator exactly as before.
++
++    Unparseable is NOT empty. A payload the model meant to send, mangled,
++    belongs in an error naming the key it was sent under; falling through to
++    an alias would hide it.
++    """
++    if isinstance(value, dict):
++        return bool(value)
++    if isinstance(value, str):
++        text = value.strip()
++        if not text:
++            return False
++        try:
++            return bool(json.loads(text))
++        except json.JSONDecodeError:
++            return True
++    return False
++
++
 +def _payload_key(call: Dict[str, Any]) -> str:
 +    """Which key of a ``tool_call`` invocation holds the underlying payload.
 +
@@ -25,10 +51,7 @@
 +    """
 +    present = [k for k in _PAYLOAD_KEYS if call.get(k) is not None]
 +    for key in present:
-+        value = call.get(key)
-+        if isinstance(value, dict) and value:
-+            return key
-+        if isinstance(value, str) and value.strip() not in ("", "{}"):
++        if _carries_payload(call.get(key)):
 +            return key
 +    return present[0] if present else "arguments"
 +
@@ -36,7 +59,7 @@
  def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
      """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
  
-@@ -1044,16 +1073,17 @@
+@@ -1044,16 +1096,17 @@
          return None, {}, "tool_call requires a 'name' argument"
      if name in BRIDGE_TOOL_NAMES:
          return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
@@ -85,7 +108,7 @@
      def test_resolve_underlying_call_rejects_recursion(self):
          """tool_call cannot invoke tool_call itself."""
          from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
-@@ -677,3 +696,136 @@
+@@ -677,3 +696,170 @@
          ))
          assert result.get("ok") is True
          assert result.get("doc") == "abc"
@@ -187,18 +210,52 @@
 +        assert err is None, err
 +        assert args["text_he"] == "documented"
 +
-+    def test_empty_arguments_with_populated_alias_uses_the_alias(self):
-+        """Some runtimes emit both, with the real payload under the alias."""
++    @pytest.mark.parametrize("empty", [
++        {},
++        "",
++        "   ",
++        "{}",
++        "{ }",           # a pretty-printer's empty object is still empty
++        "{\n}",
++        "{\n  \n}",
++        "null",
++        "[]",
++    ])
++    def test_empty_arguments_with_populated_alias_uses_the_alias(self, empty):
++        """Some runtimes emit both, with the real payload under the alias.
++
++        An empty payload is empty however it is spelled: testing the raw string
++        against a literal "{}" let "{ }" and "{\\n}" pass for content, so the
++        documented key won, parsed to {}, and the call was refused as missing
++        every field — the failure this whole patch exists to remove.
++        """
 +        from tools.tool_search import resolve_underlying_call
 +
 +        self._register("mcp_alias_empty_args_op")
 +        _, args, err = resolve_underlying_call({
 +            "name": "mcp_alias_empty_args_op",
-+            "arguments": {},
++            "arguments": empty,
 +            "parameters": {"phase_id": "tokyo4", "text_he": "carried"},
 +        })
-+        assert err is None, err
-+        assert args["text_he"] == "carried"
++        assert err is None, f"{empty!r}: {err}"
++        assert args["text_he"] == "carried", f"{empty!r} was read as content"
++
++    def test_malformed_arguments_keeps_its_own_error(self):
++        """Unparseable is not empty — the model gets the error it earned.
++
++        Silently falling through to an alias would hide a payload the model
++        meant to send under the documented key.
++        """
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_malformed_args_op")
++        _, _, err = resolve_underlying_call({
++            "name": "mcp_alias_malformed_args_op",
++            "arguments": "{not json",
++            "parameters": {"phase_id": "tokyo4", "text_he": "carried"},
++        })
++        assert err is not None
++        assert "arguments" in err
 +
 +    def test_genuinely_empty_call_still_resolves_empty(self):
 +        """A no-argument tool (get_config()) must keep working."""

@@ -227,7 +227,7 @@ every one lives as a patch in `control-plane/deployment/hermes-patches/`, with
 that directory's README carrying the build, test and rollout steps. Re-apply
 them after any refresh of the snapshot — `HERMES_REV` is then `<sha>-<name>`,
 and a bare sha means the patches are gone. Currently carried:
-`0001-tool-call-payload-key-aliases` (`ab0d98414-toolcall-alias`), without
+`0001-tool-call-payload-key-aliases` (`ab0d98414-toolcall-alias2`), without
 which a deferred tool call whose payload the model spelled `parameters` is
 silently never invoked.
 
