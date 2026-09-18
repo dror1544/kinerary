@@ -122,6 +122,37 @@ export async function issueGroupBindingToken(
   return { ok: true, token, expiresAt };
 }
 
+/**
+ * Is this a live token, issued to this person, for this trip?
+ *
+ * Read-only: it never consumes, never binds, and is not a redemption path. It
+ * exists for ONE question — the organizer pasted a group code into their own
+ * DM instead of into the family group, and we have to answer them without
+ * pretending it worked.
+ *
+ * Scoped to the caller's OWN trip and their OWN issued token on purpose. It is
+ * asked in a chat already bound to that trip, and answering only "yours / not
+ * yours" tells whoever asks nothing they did not already have — the same
+ * position the group path takes by giving one flat refusal for every failure.
+ */
+export async function groupBindingTokenIsOwn(
+  db: pg.Pool,
+  token: string,
+  tripId: string,
+  senderTelegramUserId: string,
+): Promise<boolean> {
+  const { rows } = await db.query<{ ok: boolean }>(
+    `SELECT true AS ok
+       FROM control_plane.telegram_group_binding_tokens
+      WHERE token_digest = $1
+        AND trip_id = $2
+        AND issued_to_telegram_user_id = $3
+        AND expires_at > now()`,
+    [tokenDigest(token), tripId, senderTelegramUserId],
+  );
+  return rows.length > 0;
+}
+
 export type GroupBindingRedeemResult =
   | { ok: true; tripId: string; rebound: boolean }
   | {

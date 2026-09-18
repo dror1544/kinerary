@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
@@ -654,7 +655,9 @@ def _normalize_identity(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any]) -> set[str]:
+def _identity_forms(
+    participant: Mapping[str, Any], *aliases: Mapping[str, Any], include_username: bool = True,
+) -> set[str]:
     """Every way an organizer might write THIS participant's own name.
 
     `aliases` carries the raw intake traveler entry for the same person, and
@@ -679,7 +682,10 @@ def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any])
     families.discard("")
 
     forms = set(names)
-    forms.add(_normalize_identity(participant.get("username")))
+    # A username is derived from a name, never typed by anyone, so the
+    # sound-alike fallback leaves it out and compares names only.
+    if include_username:
+        forms.add(_normalize_identity(participant.get("username")))
     # Every given-name form against every household form, which covers the
     # mixed-script rosters that happen in practice — a Hebrew given name whose
     # household label was only ever transliterated, or the reverse.
@@ -700,6 +706,112 @@ def _identity_forms(participant: Mapping[str, Any], *aliases: Mapping[str, Any])
     forms |= {n.split(" ", 1)[0] for n in names if " " in n}
     forms.discard("")
     return forms
+
+
+#: How a name SOUNDS, as consonants, so one name written in Hebrew and in
+#: English letters can be recognised as the same name. 2026-09-15, live: every
+#: roster name was entered in English letters, the organizer answered "which of
+#: the travellers are you?" with their own name in Hebrew, nothing matched, and
+#: the trip provisioned without a companion.
+#:
+#: A FALLBACK, never the first reading: `_resolve_organizers` tries it only when
+#: nothing matched as written, only across alphabets, and a sound-alike that
+#: names two travellers still names nobody. The interview asks with roster
+#: buttons; this is for answers that arrived as text anyway.
+#:
+#: The same rules live in control-plane/api/src/organizer-identity.ts, and both
+#: are held to control-plane/contracts/v1/name-matching-cases.json.
+_HEBREW_SOUNDS: dict[str, tuple[str, ...]] = {
+    "א": ("",), "ע": ("",), "י": ("",), "ו": ("", "b"),
+    "ה": ("k",), "ח": ("k",), "כ": ("k",), "ך": ("k",), "ק": ("k",),
+    "ב": ("b",), "ג": ("g",), "ד": ("d",), "ז": ("z",), "ט": ("t",), "ת": ("t",),
+    "ל": ("l",), "מ": ("m",), "ם": ("m",), "נ": ("n",), "ן": ("n",), "ס": ("s",),
+    "ש": ("S", "s"), "צ": ("C", "z"), "ץ": ("C", "z"), "פ": ("p", "f"), "ף": ("f",), "ר": ("r",),
+}
+_LATIN_DIGRAPHS = {"sh": "S", "ch": "k", "kh": "k", "tz": "C", "ts": "C", "th": "t", "ph": "f"}
+_LATIN_SOUNDS = {
+    **{letter: "" for letter in "aeiouyj"},
+    "b": "b", "v": "b", "w": "b", "c": "k", "k": "k", "q": "k", "h": "k", "x": "ks",
+    **{letter: letter for letter in "dfglmnprstz"},
+}
+#: One consonant ("Noa", "Ella", "Shai") cannot tell people apart; those are
+#: exactly the names the roster buttons are for.
+_MIN_SKELETON_CONSONANTS = 2
+_SKELETON_VARIANT_CAP = 64
+_HEBREW_LETTER = re.compile(r"[\u05d0-\u05ea]")
+_LATIN_LETTER = re.compile(r"[a-z]")
+
+
+def _alphabet(text: str) -> str | None:
+    hebrew, latin = bool(_HEBREW_LETTER.search(text)), bool(_LATIN_LETTER.search(text))
+    if hebrew and not latin:
+        return "he"
+    if latin and not hebrew:
+        return "latin"
+    return None
+
+
+def _collapse_repeats(skeleton: str) -> str:
+    out: list[str] = []
+    for ch in skeleton:
+        if not out or out[-1] != ch:
+            out.append(ch)
+    return "".join(out)
+
+
+def _capped(variants: set[str]) -> set[str]:
+    return variants if len(variants) <= _SKELETON_VARIANT_CAP else set(sorted(variants)[:_SKELETON_VARIANT_CAP])
+
+
+def _hebrew_word_skeletons(word: str) -> set[str]:
+    letters = [ch for ch in word if ch in _HEBREW_SOUNDS]
+    variants = {""}
+    for i, ch in enumerate(letters):
+        # A word-final ה is a vowel ("נועה", "שרה"), not a consonant.
+        sounds = ("",) if ch == "ה" and i == len(letters) - 1 else _HEBREW_SOUNDS[ch]
+        variants = _capped({v + sound for v in variants for sound in sounds})
+    return {_collapse_repeats(v) for v in variants}
+
+
+def _latin_word_skeleton(word: str) -> str:
+    letters = "".join(ch for ch in unicodedata.normalize("NFKD", word) if "a" <= ch <= "z")
+    if len(letters) > 1 and letters.endswith("h"):
+        letters = letters[:-1]  # "Sarah", "Noah": a silent final h
+    out: list[str] = []
+    i = 0
+    while i < len(letters):
+        pair = letters[i:i + 2]
+        if pair in _LATIN_DIGRAPHS:
+            out.append(_LATIN_DIGRAPHS[pair])
+            i += 2
+            continue
+        out.append(_LATIN_SOUNDS.get(letters[i], ""))
+        i += 1
+    return _collapse_repeats("".join(out))
+
+
+def _name_skeletons(name: str) -> set[str]:
+    text = _normalize_identity(name)
+    alphabet = _alphabet(text)
+    if alphabet is None:
+        return set()
+    per_word = [
+        _hebrew_word_skeletons(word) if alphabet == "he" else {_latin_word_skeleton(word)}
+        for word in text.split(" ")
+    ]
+    combos = {""}
+    for options in per_word:
+        combos = _capped({" ".join(part for part in (combo, option) if part) for combo in combos for option in options})
+    return {c for c in combos if len(c.replace(" ", "")) >= _MIN_SKELETON_CONSONANTS}
+
+
+def _names_sound_alike(a: str, b: str) -> bool:
+    """The same name written in the other alphabet — never the same alphabet."""
+    alphabet_a = _alphabet(_normalize_identity(a))
+    alphabet_b = _alphabet(_normalize_identity(b))
+    if alphabet_a is None or alphabet_b is None or alphabet_a == alphabet_b:
+        return False
+    return bool(_name_skeletons(a) & _name_skeletons(b))
 
 
 #: A self-reference someone puts in front of their own name: "I'm Nir", "אני
@@ -774,6 +886,7 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
                 raw_by_name.setdefault(form, entry)
 
     forms_by_username: dict[str, set[str]] = {}
+    names_by_username: dict[str, set[str]] = {}
     for participant in participants:
         username = participant.get("username")
         if not username:
@@ -785,6 +898,8 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
             ) if raw is not None
         ]
         forms_by_username.setdefault(username, set()).update(_identity_forms(participant, *aliases))
+        names_by_username.setdefault(username, set()).update(
+            _identity_forms(participant, *aliases, include_username=False))
 
     # The answer as typed first, then the name at the front of it. The first
     # reading that names exactly ONE traveller wins; a reading that names two
@@ -792,6 +907,20 @@ def _resolve_organizers(data: Mapping[str, Any], participants: list[dict[str, An
     # could not.
     for needle in candidates:
         matched = [u for u, forms in forms_by_username.items() if needle in forms]
+        if len(matched) == 1:
+            return matched
+        if len(matched) > 1:
+            return []
+
+    # Nothing matched as written. The same name in the OTHER alphabet — "ניר"
+    # for a roster that only ever spelled it "Nir" — under the same rule: one
+    # traveller or nobody. Reached only when every stricter reading found no one,
+    # so it can never break a tie those readings refused.
+    for needle in candidates:
+        matched = [
+            u for u, names in names_by_username.items()
+            if any(_names_sound_alike(needle, name) for name in names)
+        ]
         if len(matched) == 1:
             return matched
         if len(matched) > 1:

@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
     worker.add_argument("--poll-seconds", type=float, default=10.0)
     provision = subparsers.add_parser("provision", help="run the provisioner worker loop")
+    provision.add_argument(
+        "--reconcile-companion", metavar="TRIP_ID",
+        help="instead of the loop: give this live trip the companion its provisioning run could not build, "
+             "then exit. Refuses unless its latest confirmed intake names exactly one traveller as organizer; "
+             "safe to repeat (see ProvisionerWorker.reconcile_companion)",
+    )
     provision.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
     provision.add_argument("--deploy-root", default=os.environ.get("PROVISIONER_DEPLOY_ROOT"),
                            help="path to kinerary-deploy directory (PROVISIONER_DEPLOY_ROOT)")
@@ -345,6 +351,9 @@ def main(argv: list[str] | None = None) -> int:
                 # told and the password the site accepts cannot drift apart.
                 seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
             )
+            if args.reconcile_companion:
+                print(json.dumps(worker_obj.reconcile_companion(args.reconcile_companion), sort_keys=True), flush=True)
+                return 0
             import signal, time as _time
             stopping = False
             def _stop(_sig: int, _frame: object) -> None:

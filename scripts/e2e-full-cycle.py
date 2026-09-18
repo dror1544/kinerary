@@ -68,6 +68,8 @@ PG = f"{PROJECT}-postgres-1"
 # VM runs this through control-plane/deployment/vm-e2e.sh, as root.
 DEPLOY_ROOT = Path(os.environ.get("KINERARY_DEPLOY_ROOT") or Path.home() / "kinerary-deploy")
 HERMES_HOME = Path(os.environ.get("KINERARY_HERMES_HOME") or Path.home() / ".hermes")
+# Where a chaos run's report is kept, pass or fail.
+REPORTS = Path(os.environ.get("KINERARY_E2E_REPORTS") or "/tmp/kinerary-e2e-reports")
 
 
 def hermes_cli() -> list[str]:
@@ -308,9 +310,19 @@ class Auto:
                "--token", token, "--chat", chat, "--telegram", self.root]
         if docs:
             cmd += ["--docs", str(docs)]
+        report = None
+        if scenario == "chaos":
+            # Outside the run's work dir on purpose: that goes away with a passing
+            # run, and whether a chaotic interview made SENSE is for a person to read.
+            report = REPORTS / f"chaos-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            cmd += ["--report", str(report)]
         result = subprocess.run(cmd, cwd=REPO / "control-plane/api", env=env)
-        check(result.returncode == 0, "the organizer answered every question and confirmed",
-              "the automated organizer stalled — its transcript is above")
+        if report:
+            note(f"chaos report (kept): {report}")
+        check(result.returncode == 0, "the organizer answered every question and confirmed"
+              + (" — and the interview recovered from every misbehaviour" if report else ""),
+              "the automated organizer stalled or a chaos check failed — its transcript is above")
 
     def end(self) -> None:
         stage("Automated organizer — relay back on real Telegram")
@@ -752,7 +764,7 @@ def stage_mcp(ctx: dict) -> None:
           f"`hermes mcp test trip-mcp` did not list trip tools:\n{blob[-400:]}")
 
 
-TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026",
+TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026", "chaos": "Greece 2027",
               # A placeholder the organizer would have typed on the signup form,
               # deliberately not a destination: naming it would be this script
               # deciding what an `own` run is about. --trip-name replaces it.
@@ -761,9 +773,10 @@ TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", OWN, "all"],
-                    help="a fixture (japan, multi, manual), or 'own' — a person's real trip, "
-                         "checked against the intake they confirm")
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", OWN, "all"],
+                    help="a fixture (japan, multi, manual), 'chaos' — an automated organizer who does "
+                         "not follow the interview (tools/organizer-chaos.ts), or 'own' — a person's real "
+                         "trip, checked against the intake they confirm")
     ap.add_argument("--trip-name", default=None)
     ap.add_argument("--wait-minutes", type=int, default=30,
                     help="how long to wait for the human half of the interview")
@@ -787,7 +800,9 @@ def main() -> int:
                  "control-plane/deployment/vm-teardown-trip.sh")
     if args.scenario == OWN and args.auto:
         ap.error("--scenario own is a person answering about their own trip; the automated "
-                 "organizer can only play a fixture (japan, multi, manual)")
+                 "organizer can only play a fixture (japan, multi, manual, chaos)")
+    if args.scenario == "chaos" and not args.auto:
+        ap.error("--scenario chaos is the automated organizer misbehaving on purpose; it needs --auto")
     if args.scenario == "all" and not args.auto:
         ap.error("--scenario all needs --auto: three interviews back to back are not a thing to ask a person for")
 
