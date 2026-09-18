@@ -672,34 +672,28 @@ class RemoteRunnerCommand(unittest.TestCase):
 
 
 class RollbackUndo(unittest.TestCase):
-    """A rollback that replaced the database is undoable until the target's
-    services start. The clients have been stopped since the pre-rollback backup,
-    so putting the replaced database back loses nothing — and a half-finished
-    rollback (a missing image, a failed migrate, Ctrl-C) must not leave the bot
-    down on a database the running code does not match."""
+    """Everything a rollback changed before its point of no return is undoable.
+
+    The point of no return is the moment the target's services start. Before it,
+    a half-finished rollback (a missing image, a failed migrate, Ctrl-C) must
+    leave nothing behind: not a replaced database with its clients stopped, and
+    not a replaced hermes-data with Hermes stopped.
+    """
 
     class Stub:
-        def __init__(self, undo_fails=False, start_fails=False):
+        def __init__(self):
             self.calls = []
             self.r = vr.Report(io.StringIO(), color=False)
             self.dry_run = False
-            self.undo_fails = undo_fails
-            self.start_fails = start_fails
 
-        def undo_swap(self, swap):
-            self.calls.append(f"undo:{swap.aside}")
-            if self.undo_fails:
-                raise vr.Refused("rename back failed")
+    def entry(self, stub, what, fails=None):
+        def put_back():
+            stub.calls.append(f"undo:{what}")
+            if fails:
+                raise fails
+        return vr.Undo(what, put_back, f"do {what} by hand")
 
-        def start_database_clients(self):
-            self.calls.append("start")
-            if self.start_fails:
-                raise subprocess.TimeoutExpired(["docker", "compose"], 900)
-
-        def compose(self, *args):
-            return ["docker", "compose", *args]
-
-    def run_switch(self, stub, swap, switch_error=None, start_error=None):
+    def run_switch(self, stub, undo, switch_error=None, start_error=None):
         def switch_code():
             stub.calls.append("switch")
             if switch_error:
@@ -710,52 +704,151 @@ class RollbackUndo(unittest.TestCase):
             if start_error:
                 raise start_error
 
-        return vr.switch_with_undo(stub, swap, switch_code, start_services)
+        return vr.switch_with_undo(stub, undo, switch_code, start_services)
 
-    SWAP = vr.Swap(aside="aside_db", stamp="20260917t101500z")
-
-    def test_a_failure_before_the_services_start_puts_the_database_back(self):
+    def test_a_failure_before_the_services_start_undoes_everything_newest_first(self):
         for error in (vr.Refused("image missing"), vr.MigrateFailed("migrate failed"),
                       subprocess.TimeoutExpired(["git"], 60), KeyboardInterrupt()):
             stub = self.Stub()
+            undo = [self.entry(stub, "the database"), self.entry(stub, "Hermes's data")]
             with self.assertRaises(type(error)):
-                self.run_switch(stub, self.SWAP, switch_error=error)
-            self.assertEqual(stub.calls, ["switch", "undo:aside_db", "start"], error)
+                self.run_switch(stub, undo, switch_error=error)
+            self.assertEqual(stub.calls, ["switch", "undo:Hermes's data", "undo:the database"], error)
 
-    def test_a_rollback_that_kept_the_database_has_nothing_to_undo(self):
+    def test_a_rollback_that_changed_nothing_first_has_nothing_to_undo(self):
         stub = self.Stub()
         with self.assertRaises(vr.Refused):
-            self.run_switch(stub, None, switch_error=vr.Refused("image missing"))
-        self.assertEqual(stub.calls, ["switch"], "no database was replaced and no client was stopped")
+            self.run_switch(stub, [], switch_error=vr.Refused("image missing"))
+        self.assertEqual(stub.calls, ["switch"])
 
     def test_once_the_services_start_the_target_is_committed(self):
         stub = self.Stub()
+        undo = [self.entry(stub, "the database")]
         with self.assertRaises(vr.Refused):
-            self.run_switch(stub, self.SWAP, start_error=vr.Refused("relay restart failed"))
+            self.run_switch(stub, undo, start_error=vr.Refused("relay restart failed"))
         self.assertEqual(stub.calls, ["switch", "services"],
                          "the target is running: putting the older database back would strand it")
 
     def test_a_clean_rollback_undoes_nothing(self):
         stub = self.Stub()
-        self.run_switch(stub, self.SWAP)
+        self.run_switch(stub, [self.entry(stub, "the database")])
         self.assertEqual(stub.calls, ["switch", "services"])
 
-    def test_an_undo_that_fails_names_both_failures_and_the_way_out(self):
-        stub = self.Stub(undo_fails=True)
+    def test_an_undo_that_fails_is_reported_and_the_rest_still_run(self):
+        stub = self.Stub()
+        undo = [self.entry(stub, "the database"), self.entry(stub, "Hermes's data", fails=vr.Refused("mv failed"))]
         with self.assertRaises(vr.Refused) as refused:
-            self.run_switch(stub, self.SWAP, switch_error=vr.Refused("migrate failed"))
+            self.run_switch(stub, undo, switch_error=vr.Refused("migrate failed"))
         message = str(refused.exception)
-        self.assertIn("migrate failed", message)
-        self.assertIn("aside_db", message)
-        self.assertIn("ALTER DATABASE", message, "the rename to run by hand")
-        self.assertNotIn("start", stub.calls, "clients are not started onto a half-swapped database")
+        self.assertIn("migrate failed", message, "the failure that started it")
+        self.assertIn("mv failed", message)
+        self.assertIn("do Hermes's data by hand", message, "what to run by hand")
+        self.assertIn("undo:the database", stub.calls, "one step failing does not abandon the others")
 
-    def test_clients_that_will_not_start_after_an_undo_are_reported(self):
-        stub = self.Stub(start_fails=True)
+
+class RollbackPreparation(unittest.TestCase):
+    """What a rollback changes before the switch, and how each of those is put
+    back. --restore-hermes moves the live hermes-data aside and stops Hermes, so
+    a switch that then fails has to move it back and start Hermes again — on a
+    code-only rollback too, where no database was touched at all."""
+
+    class Stub(vr.ControlPlane):
+        def __init__(self):
+            super().__init__(vr.Report(io.StringIO(), color=False))
+            self.calls = []
+            self.sh = self
+            self.dry_run = False
+
+        def act(self, argv, *, describe="", **kwargs):  # stands in for cp.sh
+            self.calls.append(" ".join(str(a) for a in argv))
+            return subprocess.CompletedProcess(list(argv), 0, b"", b"")
+
+        def prepare_restored_database(self, dump_dir, stamp):
+            self.calls.append("prepare")
+            return "scratch_db"
+
+        def stop_database_clients(self):
+            self.calls.append("stop-clients")
+
+        def take_backup(self, label, include_hermes):
+            self.calls.append(f"backup:{label}")
+            return Path("/b")
+
+        def swap_in_database(self, scratch, stamp):
+            self.calls.append("swap")
+            return vr.Swap("aside_db", stamp)
+
+        def undo_swap(self, swap):
+            self.calls.append(f"undo-swap:{swap.aside}")
+
+        def start_database_clients(self):
+            self.calls.append("start-clients")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hermes-data-"))
+        self.saved_hermes_data = vr.HERMES_DATA
+        vr.HERMES_DATA = self.tmp / "hermes-data"
+        vr.HERMES_DATA.mkdir()
+        self.addCleanup(setattr, vr, "HERMES_DATA", self.saved_hermes_data)
+
+    def aside_from(self, calls) -> Path:
+        move = next(c for c in calls if c.startswith(f"mv {vr.HERMES_DATA} "))
+        return Path(move.split(" ")[-1])
+
+    def test_a_code_only_rollback_with_restore_hermes_can_still_be_undone(self):
+        cp = self.Stub()
+        undo = vr.prepare_rollback(cp, restore_db=False, dump_dir=Path("/d"), pre_label="lbl",
+                                   restore_hermes=True, hermes_changes=True)
+        self.assertEqual([entry.what for entry in undo], ["Hermes's data"],
+                         "no database was replaced, but hermes-data was")
+        self.assertIn("backup:lbl", cp.calls)
+        aside = self.aside_from(cp.calls)
+        aside.mkdir()  # the stub recorded the mv instead of doing it
+
+        cp.calls.clear()
+        with self.assertRaises(vr.Refused):
+            vr.switch_with_undo(cp, undo, lambda: (_ for _ in ()).throw(vr.MigrateFailed("migrate failed")), lambda: None)
+        self.assertEqual(
+            [c for c in cp.calls if "hermes" in c.lower()],
+            [f"rm -rf {vr.HERMES_DATA}", f"mv {aside} {vr.HERMES_DATA}",
+             " ".join(cp.compose("up", "-d", "--wait", "hermes"))],
+            "hermes-data goes back and Hermes is started again")
+
+    def test_hermes_is_put_back_before_the_database(self):
+        cp = self.Stub()
+        undo = vr.prepare_rollback(cp, restore_db=True, dump_dir=Path("/d"), pre_label="lbl",
+                                   restore_hermes=True, hermes_changes=True)
+        self.assertEqual([entry.what for entry in undo], ["the database", "Hermes's data"])
+        self.aside_from(cp.calls).mkdir()
+
+        cp.calls.clear()
+        with self.assertRaises(vr.Refused):
+            vr.switch_with_undo(cp, undo, lambda: (_ for _ in ()).throw(vr.Refused("image missing")), lambda: None)
+        ordered = [c for c in cp.calls if c.startswith(("rm -rf", "mv ", "undo-swap", "start-clients"))]
+        self.assertEqual(ordered[0], f"rm -rf {vr.HERMES_DATA}")
+        self.assertEqual(ordered[-2:], ["undo-swap:aside_db", "start-clients"])
+
+    def test_a_plain_rollback_registers_nothing_to_undo(self):
+        cp = self.Stub()
+        undo = vr.prepare_rollback(cp, restore_db=False, dump_dir=None, pre_label="lbl",
+                                   restore_hermes=False, hermes_changes=False)
+        self.assertEqual(undo, [])
+        self.assertEqual(cp.calls, ["backup:lbl"], "only the pre-rollback backup")
+
+    def test_the_hermes_undo_refuses_when_the_copy_it_kept_is_gone(self):
+        cp = self.Stub()
         with self.assertRaises(vr.Refused) as refused:
-            self.run_switch(stub, self.SWAP, switch_error=vr.Refused("migrate failed"))
-        self.assertIn("migrate failed", str(refused.exception))
-        self.assertEqual(stub.calls, ["switch", "undo:aside_db", "start"])
+            vr.undo_hermes_data(cp, self.tmp / "hermes-data.before-rollback-never")
+        self.assertIn("before-rollback-never", str(refused.exception))
+
+    def test_each_step_says_how_to_finish_it_by_hand(self):
+        cp = self.Stub()
+        database = vr.database_undo(cp, vr.Swap("aside_db", "20260918t090000z"))
+        self.assertIn("ALTER DATABASE", database.by_hand)
+        self.assertIn("aside_db", database.by_hand)
+        hermes = vr.hermes_undo(cp, self.tmp / "hermes-data.before-rollback-20260918T090000Z")
+        self.assertIn("mv", hermes.by_hand)
+        self.assertIn("hermes", hermes.by_hand)
 
 
 class GateWrapper(unittest.TestCase):

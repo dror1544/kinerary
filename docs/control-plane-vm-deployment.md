@@ -332,15 +332,26 @@ timeout, a full disk, Ctrl-C — the copy is dropped and the clients come back o
 the untouched database before the failure is reported; if they cannot be
 started, the message says so and gives the commands.
 
-**The swap is undoable until the target's containers start.** That is the one
-point of no return in a rollback: before it (a missing image, a failed
-`hermes-data` restore, a failed migrate, Ctrl-C) the replaced database is
-renamed back, the restored copy is kept as
-`kinerary_control_plane_restore_failed_<stamp>` for `prune`, and the previous
-version comes back up on its own database — nothing is lost, because the
-clients have been stopped since the pre-rollback backup. After it the target is
-running, so an older database underneath it would strand it: that failure rolls
-forward, and `verify` says what to fix. A row is written to the history
+**Everything a rollback changes is undoable until the target's containers
+start.** That is the one point of no return: before it (a missing image, a
+failed migrate, Ctrl-C) each thing it already changed is put back, newest
+first, and the previous version comes back up on it.
+
+- The replaced database is renamed back, the restored copy is kept as
+  `kinerary_control_plane_restore_failed_<stamp>` for `prune`, and the clients
+  start again. Nothing is lost: they have been stopped since the pre-rollback
+  backup.
+- With `--restore-hermes`, the `hermes-data` moved to
+  `hermes-data.before-rollback-<stamp>` goes back and Hermes starts on it.
+  Nothing is lost there either: Hermes has been stopped since the move, and
+  what is discarded came out of a backup that is still on disk. This one
+  applies to a code-only rollback too, where no database was touched.
+
+A step that cannot finish does not stop the others; they are all attempted and
+then reported together, each with the commands to finish it by hand. After the
+containers start the target is running, so an older database or profile
+directory underneath it would strand it: that failure rolls forward, and
+`verify` says what to fix. A row is written to the history
 *before* the switch starts, so a run that is killed mid-rollback still leaves
 one; `status` points at it and at the database set aside.
 

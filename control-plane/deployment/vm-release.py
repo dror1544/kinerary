@@ -468,6 +468,14 @@ def remote_runner_command(mode: str, vmid: str, args: Sequence[str] = (), *,
     return shlex.join(remote)
 
 
+class Undo(NamedTuple):
+    """One thing a rollback changed before its point of no return: what it was,
+    how to put it back, and what to run by hand if putting it back fails."""
+    what: str
+    put_back: Callable[[], None]
+    by_hand: str
+
+
 def databases_to_prune(names: Iterable[str]) -> List[str]:
     """Scratch databases this tool leaves (verify/restore copies, and a restore
     that was undone) always go; of the databases a --restore-db replaced, the
@@ -1623,17 +1631,10 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
     if not cp.dry_run:
         # Before anything changes: a run that dies mid-rollback still leaves a row.
         append_history({**record, "utc": iso(utcnow()), "result": "switching"})
-    swap = restore_database_for_rollback(cp, dump_dir, pre_label) if (restore_db and dump_dir) else None
-    if swap is None:
-        cp.take_backup(pre_label, include_hermes=False)
+    undo = prepare_rollback(cp, restore_db=restore_db, dump_dir=dump_dir, pre_label=pre_label,
+                            restore_hermes=restore_hermes, hermes_changes=hermes_changes)
     previous = {**versions}
     hermes_rev = hermes_target if hermes_changes else None
-
-    def switch_code() -> None:
-        if restore_hermes and dump_dir and hermes_changes:
-            restore_hermes_data(cp, dump_dir)
-        cp.switch_code(full, short, hermes_rev, previous)
-
     result = "switch-failed"
 
     def undone() -> None:
@@ -1641,7 +1642,7 @@ def cmd_rollback(cp: ControlPlane, to: Optional[str], restore_db: bool, keep_db:
         result = "undone"
 
     try:
-        switch_with_undo(cp, swap, switch_code,
+        switch_with_undo(cp, undo, lambda: cp.switch_code(full, short, hermes_rev, previous),
                          lambda: cp.start_switched(hermes_rev, restart_hermes=hermes_changes or restore_hermes),
                          on_undone=undone)
     except BaseException:
@@ -1698,48 +1699,79 @@ def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: s
         raise
 
 
-def switch_with_undo(cp: ControlPlane, swap: Optional[Swap], switch_code: Callable[[], None],
+def switch_with_undo(cp: ControlPlane, undo: Sequence[Undo], switch_code: Callable[[], None],
                      start_services: Callable[[], None], *, on_undone: Optional[Callable[[], None]] = None) -> None:
     """Switch to the target, with one point of no return: the moment its services start.
 
-    Before it, a rollback that replaced the database can be undone completely —
-    the replaced database goes back and the previous version comes back up on it,
-    losing nothing, because the clients have been stopped since the pre-rollback
-    backup. After it, the target is running, so an older database underneath it
-    would strand it: that failure rolls forward (`verify`, then `rollback`).
+    Before it, everything this rollback already changed is put back — each entry
+    in `undo`, newest first — and the previous version comes back up on it. The
+    database loses nothing (its clients have been stopped since the pre-rollback
+    backup) and neither does hermes-data (Hermes has been stopped since it was
+    moved aside). After the services start, the target is running: an older
+    database or profile directory underneath it would strand it, so that failure
+    rolls forward (`verify`, then `rollback`).
     """
     try:
         switch_code()
     except BaseException as failure:
-        if swap is None:  # nothing was replaced and no client was stopped
+        if not undo:  # nothing had been changed yet
             raise
-        try:
-            cp.undo_swap(swap)
-        except Exception as error:  # noqa: BLE001 - reported with the failure that caused it
-            raise Refused(
-                f"the rollback failed ({type(failure).__name__}: {failure}) AND the database could not be put back "
-                f"({type(error).__name__}: {error}). The services are stopped. By hand, on {PG_CONTAINER}: "
-                f'ALTER DATABASE "{DB_NAME}" RENAME TO "{DB_NAME}_restore_failed_{swap.stamp}"; '
-                f'ALTER DATABASE "{swap.aside}" RENAME TO "{DB_NAME}"; '
-                f'ALTER DATABASE "{DB_NAME}" ALLOW_CONNECTIONS true') from failure
-        try:
-            cp.start_database_clients()
-        except Exception as error:  # noqa: BLE001 - same
-            restart = shlex.join(cp.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"))
-            raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}); the database was put back, but "
-                          f"the services could not be started ({type(error).__name__}: {error}). The bot and signups "
-                          f"are STOPPED. Start them: {restart} && {DEPLOYMENT_DIR / 'vm-relay-restart.sh'} "
-                          "--force-live") from failure
-        cp.r.note("the rollback was undone: the version and the database from before it are back, and nothing was lost")
+        problems = []
+        for entry in reversed(list(undo)):
+            try:
+                entry.put_back()
+            except Exception as error:  # noqa: BLE001 - every step is attempted, then all of them reported
+                problems.append(f"{entry.what} ({type(error).__name__}: {error}) — by hand: {entry.by_hand}")
+        if problems:
+            raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}) and undoing it did not finish: "
+                          + "; ".join(problems)) from failure
+        cp.r.note("the rollback was undone: the version, the database and Hermes from before it are back, "
+                  "and nothing was lost")
         if on_undone:
             on_undone()
         raise
     start_services()
 
 
-def restore_hermes_data(cp: ControlPlane, dump_dir: Path) -> None:
+def database_undo(cp: ControlPlane, swap: Swap) -> Undo:
+    def put_back() -> None:
+        cp.undo_swap(swap)
+        cp.start_database_clients()
+
+    restart = shlex.join(cp.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"))
+    return Undo("the database", put_back,
+                f'on {PG_CONTAINER}: ALTER DATABASE "{DB_NAME}" RENAME TO "{DB_NAME}_restore_failed_{swap.stamp}"; '
+                f'ALTER DATABASE "{swap.aside}" RENAME TO "{DB_NAME}"; '
+                f'ALTER DATABASE "{DB_NAME}" ALLOW_CONNECTIONS true — then {restart} '
+                f"&& {DEPLOYMENT_DIR / 'vm-relay-restart.sh'} --force-live")
+
+
+def hermes_undo(cp: ControlPlane, aside: Path) -> Undo:
+    return Undo("Hermes's data", lambda: undo_hermes_data(cp, aside),
+                f"rm -rf {HERMES_DATA} && mv {aside} {HERMES_DATA} && "
+                + shlex.join(cp.compose("up", "-d", "--wait", "hermes")))
+
+
+def prepare_rollback(cp: ControlPlane, *, restore_db: bool, dump_dir: Optional[Path], pre_label: str,
+                     restore_hermes: bool, hermes_changes: bool) -> List[Undo]:
+    """Everything a rollback changes before it switches anything, and how to put
+    each of them back. Returned newest last, which is the order they are undone
+    in reverse."""
+    undo: List[Undo] = []
+    if restore_db and dump_dir:
+        undo.append(database_undo(cp, restore_database_for_rollback(cp, dump_dir, pre_label)))
+    else:
+        cp.take_backup(pre_label, include_hermes=False)
+    if restore_hermes and dump_dir and hermes_changes:
+        undo.append(hermes_undo(cp, restore_hermes_data(cp, dump_dir)))
+    return undo
+
+
+def restore_hermes_data(cp: ControlPlane, dump_dir: Path) -> Path:
     """hermes-data from the upgrade's backup, keeping the CURRENT auth.json (refresh
-    tokens are single-use). The current directory goes back if the restore fails."""
+    tokens are single-use). The current directory goes back if the restore fails,
+    and the path it was kept at is returned so a failed SWITCH can put it back too
+    — Hermes is stopped from here until something starts it again.""" 
     stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
     aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{stamp}")
     cp.sh.act(["docker", "stop", HERMES_CONTAINER], describe="docker stop hermes")
@@ -1755,6 +1787,22 @@ def restore_hermes_data(cp: ControlPlane, dump_dir: Path) -> None:
             cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the half-restored hermes-data", check=False)
             cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe="put the current hermes-data back", check=False)
         raise
+    return aside
+
+
+def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
+    """Put back the hermes-data a rollback replaced, and start Hermes on it.
+
+    Nothing is lost: Hermes has been stopped since the directory was moved aside,
+    so the copy kept there is the live one, and what this removes came out of a
+    backup that is still on disk."""
+    if not cp.dry_run and not aside.is_dir():
+        raise Refused(f"{aside} is gone — hermes-data cannot be put back by this tool; "
+                      f"the backup it was restored from is in the rollback's dump directory")
+    cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the hermes-data this rollback restored")
+    cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe=f"put {aside.name} back as {HERMES_DATA.name}")
+    cp.sh.act(cp.compose("up", "-d", "--wait", "hermes"),
+              describe="compose up -d hermes  (companions and site AI features come back)", timeout=900)
 
 
 def cmd_restart_bridges(cp: ControlPlane) -> int:
