@@ -69,6 +69,23 @@ class BridgeRequest(unittest.TestCase):
         self.calls = self.home / "setup-mcp.calls"
         self._exe(self.deploy / "setup-mcp.sh",
                   f'#!/bin/sh\necho "REPO_ROOT=$REPO_ROOT $*" >> "{self.calls}"\nexit 0\n')
+        # Before printing WIRED the script asks the bridge whether it can reach
+        # the trip (/health). Nothing listens on :3104 in a sandbox, so a
+        # stand-in curl answers for it — healthy by default, and each test that
+        # cares rewrites it. Same shape as the launchctl/hermes stand-ins above.
+        self.health = self.home / "health.json"
+        self.health.write_text('{"ok":true,"site":"reachable"}')
+        # /health is behind the MCP key, so the trip carries one the way a real
+        # one does. The stand-in curl records how it was called — argv and
+        # stdin kept apart, because which of the two the key travels in is the
+        # difference between a secret and a line in `ps`.
+        (self.deploy / "trips/italy-2026/mcp").mkdir(parents=True, exist_ok=True)
+        (self.deploy / "trips/italy-2026/mcp/.env").write_text(
+            "MCP_API_KEY=s3cret-mcp-key\nTRIP_API_KEY=s3cret-trip-key\n")
+        self.curl_argv = self.home / "curl.argv"
+        self.curl_stdin = self.home / "curl.stdin"
+        self._exe(self.bin / "curl",
+                  f'#!/bin/sh\necho "$*" >> "{self.curl_argv}"\ncat >> "{self.curl_stdin}"\ncat "{self.health}"\n')
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -129,3 +146,61 @@ class BridgeRequest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class BridgeReachesTheTrip(BridgeRequest):
+    """A bridge that cannot reach its own trip is not a wired bridge.
+
+    2026-09-18, staging: a freshly provisioned trip's bridge registered 50
+    tools with the gateway and then failed every call with
+    `connect EHOSTUNREACH` on the way to the trip's site. The companion told
+    the organizer "I can't retrieve the trip plan right now" for as long as
+    anyone asked. Every check that existed passed — the port was open, the
+    tools were registered, provisioning reported success — because they all
+    verified the hop between the agent and the bridge, and the broken hop was
+    the one after it.
+    """
+
+    def test_a_bridge_that_cannot_reach_the_trip_is_not_reported_wired(self) -> None:
+        self.health.write_text('{"ok":false,"site":"unreachable","code":"EHOSTUNREACH"}')
+        result = self.send(self.request())
+        self.assertNotEqual(result.returncode, 0, "provisioning must not call this a success")
+        self.assertNotIn("WIRED", result.stdout, f"stdout was {result.stdout!r}")
+
+    def test_the_failure_names_the_verdict_so_it_can_be_acted_on(self) -> None:
+        self.health.write_text('{"ok":false,"site":"unreachable","code":"EHOSTUNREACH"}')
+        result = self.send(self.request())
+        self.assertIn("EHOSTUNREACH", result.stderr)
+        self.assertIn("cannot reach", result.stderr)
+
+    def test_a_silent_bridge_is_a_failure_too(self) -> None:
+        # No answer at all is the shape a dead bridge takes, and "no output"
+        # must never pass a check by default.
+        self.health.write_text("")
+        result = self.send(self.request())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("WIRED", result.stdout)
+
+    def test_a_reachable_bridge_still_wires(self) -> None:
+        result = self.send(self.request())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "WIRED italy2026")
+
+    def test_the_key_reaches_the_bridge_but_never_the_command_line(self) -> None:
+        # `ps` is readable by every user on the box. A key in argv is a key
+        # published to all of them for the life of the call.
+        result = self.send(self.request())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.curl_argv.read_text()
+        stdin = self.curl_stdin.read_text()
+        self.assertNotIn("s3cret-mcp-key", argv, f"the key must not be in argv: {argv!r}")
+        self.assertIn("--config -", argv, "curl must be reading its options from stdin")
+        self.assertIn("X-API-Key: s3cret-mcp-key", stdin, "and the key must actually be sent")
+
+    def test_a_trip_with_no_key_is_a_failure_not_a_skipped_check(self) -> None:
+        # The shape that turns a security fix into a silently absent check:
+        # no key, so nothing to send, so nothing asked, so WIRED anyway.
+        (self.deploy / "trips/italy-2026/mcp/.env").write_text("TRIP_API_KEY=only-this-one\n")
+        result = self.send(self.request())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("WIRED", result.stdout)
+        self.assertIn("MCP_API_KEY", result.stderr)
