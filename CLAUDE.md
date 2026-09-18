@@ -296,6 +296,14 @@ VM restart the relay with `control-plane/deployment/vm-relay-restart.sh`, not
 `KINERARY_COMPOSE_PROJECT` / `KINERARY_RELAY_CONTAINER` / `KINERARY_RELAY_RESTART`
 — it refuses `--auto` on a non-Mac stack without them.
 
+Change the VM's version **only** with `sudo kinerary-cp-release upgrade|rollback`
+(always `--dry-run` first) — never by hand-editing `KINERARY_REV`. It snapshots
+the VM from the Proxmox host (never vzdump, never NFS), dumps the database, and
+records the way back; the `trip-monitor` agent can request the same through a
+gate only Dror's one-time code approves. Every new migration must start with
+`-- rollback: compatible|breaking — <why>`. Runbook: "Upgrades and rollback" in
+`docs/control-plane-vm-deployment.md`.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over
