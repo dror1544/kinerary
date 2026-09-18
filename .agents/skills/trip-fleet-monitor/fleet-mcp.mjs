@@ -277,21 +277,32 @@ const DEFAULT_TRIP_CLASS_SQL = `
 const tripClassSql = (stack) => CONFIG.stacks[stack]?.trip_class_sql ?? DEFAULT_TRIP_CLASS_SQL;
 
 /**
- * An interview that is still going — which `state` alone does NOT say.
+ * An interview that is still going — which neither column says on its own.
  *
- * When a conversation is closed for idleness the control plane sets
- * `expired_at` and leaves `state` at 'interviewing' (migration 0049,
- * `claimExpiredSessions`). Every query here used to filter on state alone, so a
- * conversation closed days ago still counted as live: it inflated the
- * unfinished-interview counts, it sat in `stalled_interviews` for good, and —
- * the one that actually costs something — `alerts` kept reporting "INTERVIEW
- * WAITING ON US" about a session nobody was waiting on, which is how a reader
- * learns to stop reading alerts.
+ * `state` is CHECK-constrained to exactly three values (migration 0008):
+ * 'interviewing', 'awaiting_confirmation', 'confirmed'. Only the last one is
+ * an ending. **A session sitting at `awaiting_confirmation` is as open as one
+ * at `interviewing`** — the recap is on the organizer's screen and the
+ * interview is waiting for them to say yes. That is not a corner case: it is
+ * the single most common way a real interview stalls, and run 7 ended exactly
+ * there with 14 answers and no confirmation.
  *
- * The router draws the same distinction, for the same reason
- * (`resolveChatRoute`): live means not confirmed AND not closed for idleness.
+ * The other half is closure. When a conversation is closed for idleness the
+ * control plane sets `expired_at` and leaves `state` where it stood (migration
+ * 0049, `claimExpiredSessions` — which itself claims on `state <> 'confirmed'`,
+ * so an `awaiting_confirmation` session expires like any other). Every query
+ * here used to filter on state alone, so a conversation closed days ago still
+ * counted as live: it inflated the unfinished-interview counts, it sat in
+ * `stalled_interviews` for good, and — the one that actually costs something —
+ * `alerts` kept reporting "INTERVIEW WAITING ON US" about a session nobody was
+ * waiting on, which is how a reader learns to stop reading alerts.
+ *
+ * Narrowing to `state = 'interviewing'` fixes that by losing the other half:
+ * the organizer parked at the recap becomes invisible to every view here. So
+ * the rule is the one the router itself applies (`resolveChatRoute`,
+ * `interview.ts` throughout): live means not confirmed AND not closed.
  */
-const LIVE_SESSION = "s.state = 'interviewing' AND s.expired_at IS NULL";
+const LIVE_SESSION = "s.state <> 'confirmed' AND s.expired_at IS NULL";
 
 /**
  * The site's address, as the build that succeeded recorded it.
@@ -482,16 +493,18 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
                           to_char(t.created_at,'YYYY-MM-DD HH24:MI'),
                           coalesce(${SITE_URL_SQL}, 'not built yet')
                      FROM control_plane.trips t WHERE ${match};`),
-    // `awaiting` means something only while a session is interviewing. A
-    // confirmed session keeps its last value — all 33 confirmed sessions in
-    // production read recap/machine — and the first real report took that for
-    // "a summary the system owes the organizer, 16 hours late". Finished
-    // sessions say finished.
-    // `expired_at` is reported as a state of its own, because 'interviewing'
-    // outlives the conversation: a session closed for idleness keeps that state
-    // and its last `awaiting` value forever.
+    // `awaiting` means something only while a session is open. A confirmed
+    // session keeps its last value — all 33 confirmed sessions in production
+    // read recap/machine — and the first real report took that for "a summary
+    // the system owes the organizer, 16 hours late". Finished sessions say
+    // finished.
+    // `expired_at` is reported as a state of its own, because `state` outlives
+    // the conversation: a session closed for idleness keeps whatever state it
+    // held, and its last `awaiting` value, forever. That applies to a session
+    // closed at the recap as much as one closed mid-question, so the test is
+    // `<> 'confirmed'` and not `= 'interviewing'`.
     runSql(stack, `SELECT s.id,
-                          CASE WHEN s.state = 'interviewing' AND s.expired_at IS NOT NULL
+                          CASE WHEN s.state <> 'confirmed' AND s.expired_at IS NOT NULL
                                THEN 'closed (idle)' ELSE s.state END,
                           coalesce(s.phase,'-'),
                           CASE WHEN ${LIVE_SESSION} THEN coalesce(s.awaiting,'-') ELSE 'finished' END,

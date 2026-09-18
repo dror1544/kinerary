@@ -82,19 +82,24 @@ In rough order of how much a human should care:
    conversation carries on and quietly gets blunter. Name the reason
    (`NOT_CONFIGURED` means the runner is not configured at all — that one is a
    deployment fault, not a bad day for a provider).
-6. An interview **`awaiting machine`** for more than an hour — **while its
-   state is `interviewing`**. `awaiting person` means we are waiting on the
-   organizer, which is normal for hours or days; `awaiting machine` means the
-   system owes them a reply and has not sent it. A **confirmed** session keeps
-   `recap` and `awaiting machine` forever: that is what a finished interview
-   looks like, not an unsent summary. Never raise it.
+6. An interview **`awaiting machine`** for more than an hour — **while it is
+   still open**. `awaiting person` means we are waiting on the organizer, which
+   is normal for hours or days; `awaiting machine` means the system owes them a
+   reply and has not sent it. A **confirmed** session keeps `recap` and
+   `awaiting machine` forever: that is what a finished interview looks like, not
+   an unsent summary. Never raise it.
 7. Failed notifications for live trips — the person was never told their trip
    was ready.
 
 A conversation that was **closed for idleness** is none of these. It is over —
 the organizer was told so and told they need a fresh link — and the tools leave
-it out of everything that means "still going". It keeps `state = interviewing`
+it out of everything that means "still going". It keeps whatever state it held
 in the database, so if you ever read that state raw, read `expired_at` with it.
+
+The reverse mistake costs more. **`awaiting_confirmation` is an open interview**,
+not a finished one: the recap is on the organizer's screen and they have not
+answered it. It is the most common place a real interview stops for good. Open
+means *not confirmed and not expired* — never "interviewing".
 
 `alerts` returns exactly this set, and returns nothing at all when the fleet is
 healthy. Reach for it whenever someone asks "is anything wrong?".

@@ -226,14 +226,23 @@ all, and the difference decides which questions this tool can answer:
   `messaging_bindings.chat_ref`, `telegram_interview_bindings.chat_id`,
   `interview_agent_turns.chat_id`. `chat_id < 0` is a type error; a group is
   `chat_id LIKE '-%'`.
-- **A closed interview still says `state = 'interviewing'`.** Closing a
-  conversation for idleness sets `expired_at` and touches nothing else
-  (migration 0049), so state alone reports conversations that ended days ago as
-  live. On production this filled `stalled_interviews` with six finished
-  sessions — one of them a real prospect's — and it is exactly the kind of row
-  `alerts` would have repeated forever. Every query about a live interview
-  therefore carries `expired_at IS NULL`, the same definition `resolveChatRoute`
-  uses.
+- **A live interview is `state <> 'confirmed' AND expired_at IS NULL` — both
+  halves.** `state` has exactly three values (migration 0008) and only
+  `confirmed` is an ending, so each half guards a different wrong answer:
+  - Closing a conversation for idleness sets `expired_at` and touches nothing
+    else (migration 0049), so **state alone** reports conversations that ended
+    days ago as live. On production this filled `stalled_interviews` with six
+    finished sessions — one of them a real prospect's — and it is exactly the
+    kind of row `alerts` would have repeated forever.
+  - Narrowing to `state = 'interviewing'` loses the opposite half: an organizer
+    sitting at an unanswered recap is `awaiting_confirmation`, which is **open**.
+    That is where run 7 stopped, with 14 answers and no confirmation, and it is
+    the most common real stall there is.
+
+  It is the same definition `resolveChatRoute` and `interview.ts` use.
+  `claimExpiredSessions` claims on `state <> 'confirmed'` too, so a session can
+  be expired at the recap — which is why the "closed (idle)" label in
+  `trip_detail` tests the same pair.
 - **`completed` is not a job state.** The seven are queued, leased, running,
   waiting, succeeded, failed, cancelled. `failures` excluded 'completed', which
   excluded nothing, so every queued or running build was listed as failed or
@@ -245,7 +254,7 @@ all, and the difference decides which questions this tool can answer:
   forever.** Every confirmed session reads that way. It is what
   a finished interview looks like; the monitor once reported it as "a summary
   the system has owed the organizer for 16 hours". `awaiting` means something
-  only while `state = 'interviewing'`.
+  only while the session is open.
 - **`jobs.updated_at` is not the completion time.** It marks the claim, landing
   2–8 seconds after `created_at`, while `last_heartbeat_at` sits minutes later.
   Measuring build duration from `updated_at` reports every build as 0 minutes.

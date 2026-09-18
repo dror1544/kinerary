@@ -7,9 +7,10 @@ so none of this needs a database.
 
 Three of these tests exist because the monitor once reported something untrue:
 
-- a session closed for idleness keeps `state = 'interviewing'`, so filtering on
-  state alone kept "INTERVIEW WAITING ON US" alive for conversations that had
-  ended;
+- a session closed for idleness keeps the `state` it held, so filtering on state
+  alone kept "INTERVIEW WAITING ON US" alive for conversations that had ended —
+  while filtering on `state = 'interviewing'` loses the opposite half, the
+  organizer parked at an unanswered recap;
 - `NOT IN ('succeeded','completed')` excluded a state that does not exist, so
   every queued or running build was listed as failed or stuck;
 - a query that CRASHES must never render as "(none)", or a failed read looks
@@ -133,13 +134,41 @@ class FleetMcp(unittest.TestCase):
     # -------------------------------------------------- what "live" means ----
     def test_every_live_interview_query_excludes_the_ones_already_closed(self):
         """`state` alone outlives the conversation: closure only sets expired_at."""
+        seen = 0
         for statement in self.all_statements():
-            if "state = 'interviewing'" not in statement:
+            if "s.state <> 'confirmed'" not in statement:
                 continue
+            seen += 1
             self.assertIn(
                 "expired_at IS NULL", statement,
                 "a query treats a session closed for idleness as a live interview:\n" + statement,
             )
+        self.assertGreater(seen, 0, "no query filters on a live session at all — has the predicate moved?")
+
+    def test_an_organizer_parked_at_the_recap_is_still_in_an_open_interview(self):
+        """`awaiting_confirmation` is open: the recap is on their screen, unanswered.
+
+        `intake_sessions.state` has three values (0008) and only 'confirmed' is
+        an ending. Narrowing to 'interviewing' makes the most common real stall
+        invisible — the organizer who was shown the recap and never replied,
+        which is how run 7 ended. Nothing else here would report it.
+        """
+        for statement in self.all_statements():
+            self.assertNotIn(
+                "state = 'interviewing'", statement,
+                "a query calls only 'interviewing' live, so an interview sitting at "
+                "the recap is missing from it:\n" + statement,
+            )
+
+    def test_a_session_closed_at_the_recap_is_reported_closed_not_awaiting(self):
+        """claimExpiredSessions claims on `state <> 'confirmed'`, recap included."""
+        self.tool("trip_detail", {"trip": "japan-2025"})
+        labels = [s for s in self.statements() if "closed (idle)" in s]
+        self.assertEqual(len(labels), 1, "the closed-for-idleness label moved")
+        self.assertIn(
+            "s.state <> 'confirmed' AND s.expired_at IS NOT NULL", labels[0],
+            "an expired session at the recap would still be shown as awaiting_confirmation:\n" + labels[0],
+        )
 
     def test_stuck_jobs_are_named_by_state_not_by_excluding_a_state_that_never_existed(self):
         self.tool("failures")
