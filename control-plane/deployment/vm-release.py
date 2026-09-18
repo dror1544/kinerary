@@ -67,9 +67,14 @@ from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequenc
 # clone; sudo resets the environment, so the agent path always gets these.
 # --------------------------------------------------------------------------- #
 ENV = os.environ
-REPO = Path(ENV.get("KINERARY_CP_REPO", "/opt/kinerary"))
+VM_REPO, VM_DEPLOY_ROOT = "/opt/kinerary", "/opt/kinerary-deploy"
+REPO = Path(ENV.get("KINERARY_CP_REPO", VM_REPO))
 DEPLOYMENT_DIR = REPO / "control-plane" / "deployment"
-DEPLOY_ROOT = Path(ENV.get("KINERARY_CP_DEPLOY_ROOT", "/opt/kinerary-deploy"))
+DEPLOY_ROOT = Path(ENV.get("KINERARY_CP_DEPLOY_ROOT", VM_DEPLOY_ROOT))
+# Pointed at the VM's own checkout and deploy root — as opposed to a rehearsal
+# somewhere else, which owns nothing this tool would need root for and where the
+# filesystem refuses anything it may not touch anyway.
+ON_THE_VM = (REPO, DEPLOY_ROOT) == (Path(VM_REPO), Path(VM_DEPLOY_ROOT))
 PROVISIONING_ENV = DEPLOY_ROOT / "provisioning.env"
 VM_ENV = DEPLOY_ROOT / "vm.env"
 STATE_DIR = Path(ENV.get("KINERARY_CP_STATE_DIR", "/var/lib/kinerary-cp-release"))
@@ -95,7 +100,7 @@ PG_CONTAINER = ENV.get("KINERARY_CP_PG_CONTAINER", "kinerary-cp-postgres-1")
 RELAY_CONTAINER = "kinerary-cp-relay-1"
 HERMES_CONTAINER = "hermes"
 DB_USER = DB_NAME = "kinerary_control_plane"
-READYZ = "http://127.0.0.1:4310/readyz"
+READYZ = ENV.get("KINERARY_CP_READYZ", "http://127.0.0.1:4310/readyz")
 
 # Limits (docs/control-plane-vm-deployment.md, "Upgrades and rollback").
 MIN_ROOT_FREE_GB = 10
@@ -2214,7 +2219,7 @@ def main(argv: Sequence[str]) -> int:
         return None
 
     read_only = command in ("status", "plan", "verify", "history", "snapshots")
-    if os.geteuid() != 0 and not (read_only and command == "history"):
+    if ON_THE_VM and os.geteuid() != 0 and not (read_only and command == "history"):
         print("kinerary-cp-release runs as root (sudo)", file=sys.stderr)
         return 2
     try:
