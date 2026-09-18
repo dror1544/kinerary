@@ -220,7 +220,31 @@ s6 slot started with `hermes -p <profile> gateway start`, which records the
 intent the container reads on the next boot.
 
 The fork's only git remote is upstream `NousResearch/hermes-agent`; its local
-commits are on no remote. `/opt/hermes-src` is a history-less snapshot.
+commits are on no remote. `/opt/hermes-src` is a history-less snapshot, and it
+is kept **pristine**: everything we add to the fork lives as a patch in
+`control-plane/deployment/hermes-patches/`, and the build applies them.
+
+```bash
+control-plane/deployment/build-hermes-image.sh            # build + verify, print the tag
+control-plane/deployment/build-hermes-image.sh --set-rev  # + write HERMES_REV into vm.env
+$C up -d --wait hermes                                    # the deploy — restarts every gateway
+control-plane/deployment/hermes-image-check.sh            # what is RUNNING carries these patches
+```
+
+The script copies the snapshot, applies every patch in order onto the copy
+(refusing anything that does not apply cleanly — an already-patched tree means
+someone edited `/opt/hermes-src` by hand, and the next `git archive` refresh
+would drop it), builds, and then verifies what it built: the manifest must be
+in the image and the fork's own tests for the patched files must pass against
+it. The tag says what is inside — `<base>-p<hash of the patch set>` — so a
+stale image cannot answer to a newer patch set's name, and
+`hermes-image-check.sh` reads that manifest back out of the running container.
+
+Patching by hand and remembering to rebuild is what this replaces. On
+2026-09-18 `compose.vm.yml` was changed to set a variable that only a patch
+makes the runtime read, with nothing in the repo applying that patch: the
+deployment would have looked correct and quietly dropped every file a family
+sent.
 
 ### Files sent on Telegram: the hand-off folder
 
@@ -260,11 +284,12 @@ After a deploy, check both sides of the path:
 $C ps inbound hermes                               # $C as in "Running it"; inbound healthy, hermes up
 sudo stat -c '%U %a %n' /opt/kinerary-inbound      # hermes 700
 sudo docker exec -u hermes hermes sh -c 'echo "$HERMES_RELAY_MEDIA_DIR"'   # /opt/kinerary-inbound
-sudo docker exec hermes grep -c HERMES_RELAY_MEDIA_DIR /opt/hermes/gateway/relay/media.py  # 2 — patch 0002 is in the image
+control-plane/deployment/hermes-image-check.sh     # ✓ the running image carries patch 0002
 ```
 
 `tests/scripts/test_inbound_handoff.py` holds the compose file to the same-path
-rule, and `control-plane/api/test/group-document-to-plan.integration.test.ts`
+rule, `tests/scripts/test_hermes_patches.py` holds the build to applying every
+patch, and `control-plane/api/test/group-document-to-plan.integration.test.ts`
 takes a PDF from the family group to a booking a family member downloads.
 
 ## Companion host
