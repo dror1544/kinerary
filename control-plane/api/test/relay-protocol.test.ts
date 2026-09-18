@@ -392,7 +392,6 @@ describe("normalizeUpdate (DB)", () => {
       const outcome = await normalizeUpdate(
         fix.pool,
         textUpdate("600000777", "when do we land?"),
-        undefined,
         () => false,
       );
       assert.deepEqual(outcome, { kind: "dropped", reason: "COMPANION_PENDING" });
@@ -410,7 +409,6 @@ describe("normalizeUpdate (DB)", () => {
       const outcome = await normalizeUpdate(
         fix.pool,
         textUpdate("600000888", "when do we land?"),
-        undefined,
         (profile) => {
           asked.push(profile);
           return true;

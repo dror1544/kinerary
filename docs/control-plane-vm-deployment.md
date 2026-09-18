@@ -220,7 +220,77 @@ s6 slot started with `hermes -p <profile> gateway start`, which records the
 intent the container reads on the next boot.
 
 The fork's only git remote is upstream `NousResearch/hermes-agent`; its local
-commits are on no remote. `/opt/hermes-src` is a history-less snapshot.
+commits are on no remote. `/opt/hermes-src` is a history-less snapshot, and it
+is kept **pristine**: everything we add to the fork lives as a patch in
+`control-plane/deployment/hermes-patches/`, and the build applies them.
+
+```bash
+control-plane/deployment/build-hermes-image.sh            # build + verify, print the tag
+control-plane/deployment/build-hermes-image.sh --set-rev  # + write HERMES_REV into vm.env
+$C up -d --wait hermes                                    # the deploy — restarts every gateway
+control-plane/deployment/hermes-image-check.sh            # what is RUNNING carries these patches
+```
+
+The script copies the snapshot, applies every patch in order onto the copy
+(refusing anything that does not apply cleanly — an already-patched tree means
+someone edited `/opt/hermes-src` by hand, and the next `git archive` refresh
+would drop it), builds, and then verifies what it built: the manifest must be
+in the image and the fork's own tests for the patched files must pass against
+it. The tag says what is inside — `<base>-p<hash of the patch set>` — so a
+stale image cannot answer to a newer patch set's name, and
+`hermes-image-check.sh` reads that manifest back out of the running container.
+
+Patching by hand and remembering to rebuild is what this replaces. On
+2026-09-18 `compose.vm.yml` was changed to set a variable that only a patch
+makes the runtime read, with nothing in the repo applying that patch: the
+deployment would have looked correct and quietly dropped every file a family
+sent.
+
+### Files sent on Telegram: the hand-off folder
+
+A companion gets a file someone sent as a **local path**. Hermes saves it with
+`tempfile.mkstemp(prefix="relay_media_")`. The trip-mcp tools
+that put a file on the site (`upload_booking_confirmation`, `add_photo`,
+`set_participant_avatar`) read "an absolute path on the machine running this MCP
+server", and each trip's `mcp.js` runs on the **host** as `hermes`. So
+`HERMES_RELAY_MEDIA_DIR` is `/opt/kinerary-inbound`, bind-mounted at that same
+path, owned by uid 10000 (the gateways' user in the container and trip-mcp's on
+the host), mode 0700. Before this, Hermes saved into its container `/tmp`, and
+no file sent on Telegram could reach a site.
+
+That variable is read by Hermes patch `0002-relay-media-dir`, and it replaced a
+plain `TMPDIR` on 2026-09-18. `TMPDIR` worked, and took everything else with
+it: every temporary file the runtime made — model CLIs, document conversion,
+dependencies — landed in a host-persistent folder whose janitor only removes
+`relay_media_*`, so they outlived the container that made them, holding
+whatever a family had sent. **The compose line and `HERMES_REV` move together**:
+an image without patch 0002 ignores the variable and saves into the container's
+own `/tmp`, where the host's trip-mcp cannot open the path — the exact failure
+the folder exists to prevent, and a silent one.
+
+The `inbound` service creates the folder with that owner before Hermes starts
+(Hermes waits for it to be healthy), then runs `inbound-sweep.sh` hourly, which
+deletes `relay_media_*` files older than a day. The site keeps what was
+uploaded in the trip's own NFS folder, attached to its booking or album. The
+hand-off copy exists for the turn that used it.
+
+It is deliberately not the NFS: the VM mounts none, a hung mount would freeze
+every companion at once, and the trip folders hold every family's live site
+data inside a container all companions share.
+
+After a deploy, check both sides of the path:
+
+```bash
+$C ps inbound hermes                               # $C as in "Running it"; inbound healthy, hermes up
+sudo stat -c '%U %a %n' /opt/kinerary-inbound      # hermes 700
+sudo docker exec -u hermes hermes sh -c 'echo "$HERMES_RELAY_MEDIA_DIR"'   # /opt/kinerary-inbound
+control-plane/deployment/hermes-image-check.sh     # ✓ the running image carries patch 0002
+```
+
+`tests/scripts/test_inbound_handoff.py` holds the compose file to the same-path
+rule, `tests/scripts/test_hermes_patches.py` holds the build to applying every
+patch, and `control-plane/api/test/group-document-to-plan.integration.test.ts`
+takes a PDF from the family group to a booking a family member downloads.
 
 ## Companion host
 

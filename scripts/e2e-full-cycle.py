@@ -50,6 +50,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -336,6 +337,50 @@ class Auto:
                     self.proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
+
+
+    # ── The person, once the trip exists: sending files and talking ──────────
+    #
+    # The interview is auto-organizer.ts's job. Everything below is this
+    # script's, because it is about a companion that is already running.
+
+    def control(self, path: str, payload: dict) -> dict:
+        request = urllib.request.Request(
+            f"{self.root}/_control/{path}", method="POST",
+            data=json.dumps(payload).encode(), headers={"content-type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read() or "{}").get("result", {})
+
+    def say(self, chat: str, text: str, from_id: str | None = None) -> None:
+        self.control("message", {"chatId": chat, "text": text,
+                                 **({"fromId": from_id} if from_id else {})})
+
+    def send_document(self, chat: str, document: Path, caption: str | None = None,
+                      from_id: str | None = None) -> None:
+        self.control("document", {
+            "chatId": chat, "filename": document.name, "mime": "application/pdf",
+            "base64": base64.b64encode(document.read_bytes()).decode(),
+            **({"caption": caption} if caption else {}),
+            **({"fromId": from_id} if from_id else {}),
+        })
+
+    def join_group(self, chat: str, from_id: str) -> None:
+        self.control("join", {"chatId": chat, "fromId": from_id})
+
+    def said(self, chat: str, after: int = 0) -> list[dict]:
+        """What the bot has sent to a chat since `after` (a seq from a previous call)."""
+        with urllib.request.urlopen(f"{self.root}/_control/sent?chatId={chat}&after={after}", timeout=15) as response:
+            return json.loads(response.read() or "{}").get("result", {}).get("messages", [])
+
+    def seq_now(self, chat: str) -> int:
+        """Where this chat has got to — take it BEFORE prompting, then wait from it.
+
+        A chat is never empty by the time a document goes in: the router posts
+        and pins a welcome in a new group, and the companion has already spoken
+        in the DM. Waiting from 0 matches that history on the first poll.
+        """
+        return max((m["seq"] for m in self.said(chat)), default=0)
 
 
 def finish_workdir(work: Path, passed: bool) -> None:
@@ -764,6 +809,172 @@ def stage_mcp(ctx: dict) -> None:
           f"`hermes mcp test trip-mcp` did not list trip tools:\n{blob[-400:]}")
 
 
+def site_login(ctx: dict) -> "tuple[str, str]":
+    """A traveller's own session on the trip site: (base url, bearer token).
+
+    The same door stage_served uses — the shared password out of the
+    container's own .env, and a participant from the trip's config.
+    """
+    base = f"http://{ctx['ip']}:8080"
+    env = subprocess.run(
+        ["ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519_proxmox_hermes"), "root@192.168.0.40",
+         f"pct exec {ctx['vmid']} -- cat /opt/kinerary/.env"],
+        capture_output=True, text=True,
+    ).stdout
+    password = next((l.split("=", 1)[1].strip() for l in env.splitlines() if l.startswith("SEED_PASSWORD=")), "")
+    username = next((p.get("username") for p in (ctx["config"].get("participants") or []) if p.get("username")), "")
+    login = subprocess.run(
+        ["curl", "-s", "-m", "15", "-X", "POST", f"{base}/api/auth/login",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps({"username": username, "password": password})],
+        capture_output=True, text=True,
+    ).stdout
+    token = (json.loads(login or "{}") or {}).get("token", "")
+    check(bool(token), f"signed in to the site as '{username}'", f"could not sign in as '{username}'")
+    return base, token
+
+
+def _confirmation_digests(base: str, token: str) -> dict:
+    """sha256 → booking name, for every booking whose confirmation the site serves."""
+    import hashlib
+    bookings = json.loads(subprocess.run(
+        ["curl", "-s", "-m", "15", f"{base}/api/bookings", "-H", f"Authorization: Bearer {token}"],
+        capture_output=True, text=True).stdout or "[]")
+    digests: dict[str, str] = {}
+    for booking in bookings:
+        name = booking.get("conf_file")
+        if not name:
+            continue
+        blob = subprocess.run(
+            ["curl", "-s", "-m", "30", f"{base}/api/bookings/confirmation/{urllib.parse.quote(name)}",
+             "-H", f"Authorization: Bearer {token}"],
+            capture_output=True).stdout
+        digests[hashlib.sha256(blob).hexdigest()] = booking.get("name") or name
+    return digests
+
+
+def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
+    """A booking PDF sent on Telegram ends up on the trip site.
+
+    Two ways, because they fail differently. In a PRIVATE chat every message is
+    for the assistant. In a GROUP a file with no caption addresses nobody, and
+    until 2026-09-17 it was dropped before the assistant saw it — the case a
+    real organizer hit with his trip's itinerary.
+
+    What is asserted is the site, not the chat: a booking whose confirmation a
+    signed-in traveller can download, byte for byte the PDF that was sent.
+    """
+    stage("Files sent on Telegram — a booking PDF from a private chat, and from the group")
+    sys.path.insert(0, str(REPO / "control-plane/api/test/fixtures"))
+    from make_documents import write_pdf  # type: ignore[import-not-found]
+
+    assistant = psql(
+        f"SELECT companion_intro->>'assistant_name' FROM control_plane.trips WHERE id='{ctx['trip_id']}'") or ""
+    check(bool(assistant), f"the trip's assistant has a name ({assistant})",
+          "no assistant name on the trip — nothing to address in a group")
+
+    dm = ctx["chat"]
+    group = f"-100{secrets.randbelow(10**10):010d}"
+    marks = {"dm": f"DM-{secrets.token_hex(3).upper()}", "group": f"GRP-{secrets.token_hex(3).upper()}"}
+
+    # A real confirmation, not a token: the companion is told to match a
+    # document to the itinerary item it belongs to and never to invent a
+    # booking, so a PDF with no hotel and no dates is correctly refused — it
+    # asks for them instead, and the run times out on a question. Each phase
+    # of the trip gets its own, with that phase's dates.
+    phases = [p for p in (ctx["config"].get("phases") or []) if (p.get("dates") or {}).get("start")]
+    stays = {
+        "dm": ("Hotel Baixa House", phases[0] if phases else {}),
+        "group": ("Torel Avantgarde", phases[-1] if len(phases) > 1 else (phases[0] if phases else {})),
+    }
+    pdfs = {}
+    for where, mark in marks.items():
+        hotel, phase = stays[where]
+        dates = phase.get("dates") or {}
+        path = work / f"confirmation-{where}.pdf"
+        write_pdf(path, [
+            f"{hotel} - booking confirmation",
+            f"Confirmation number: {mark}",
+            "Guest: Noa Cohen   Guests: 4",
+            f"City: {(phase.get('title') or {}).get('en') or phase.get('id') or 'Lisbon'}",
+            f"Check-in: {dates.get('start', '')}    Check-out: {dates.get('end', '')}",
+            "Room: Family room, breakfast included",
+        ])
+        pdfs[where] = path
+    note(f"confirmations: {stays['dm'][0]} ({marks['dm']}), {stays['group'][0]} ({marks['group']})")
+
+    def approve_until(what: str, chat: str, deadline_minutes: int, done, since: int) -> None:
+        """Answer whatever the companion asks until the site shows the file.
+
+        It asks before it writes — that is the rule in its SOUL — so a run that
+        never answers proves nothing. Anything it says gets the same yes.
+
+        `since` is where the chat stood before the document went in, so the
+        first thing answered is a reply to THAT document. Starting from 0 would
+        answer the welcome the router pinned, send the approval before the
+        companion had asked anything, and let a run that never demonstrated
+        "it asks before it writes" pass as if it had.
+        """
+        seen, deadline = since, time.time() + deadline_minutes * 60
+        while time.time() < deadline:
+            time.sleep(15)
+            if done():
+                ok(f"{what}: the file is on the site")
+                return
+            fresh = [m for m in auto.said(chat, seen) if m["kind"] == "send"]
+            if fresh:
+                seen = max(m["seq"] for m in fresh)
+                note(f"{what}: {fresh[-1]['text'][:110]}")
+                auto.say(chat, "Yes, go ahead — I approve.", from_id=dm if chat != dm else None)
+        raise Failed(f"{what}: the PDF never reached the site (waited {deadline_minutes} min)")
+
+    base, token = site_login(ctx)
+    before = _confirmation_digests(base, token)
+
+    def landed(where: str):
+        import hashlib
+        digest = hashlib.sha256(pdfs[where].read_bytes()).hexdigest()
+        return lambda: digest in _confirmation_digests(base, token) and digest not in before
+
+    # ── A private chat: the file and what to do with it, in one message ──────
+    since_dm = auto.seq_now(dm)
+    auto.send_document(dm, pdfs["dm"], caption=(
+        f"{assistant}, here is our hotel confirmation. Please add the booking to the trip "
+        "and attach this PDF to it."))
+    approve_until("private chat", dm, 12, landed("dm"), since_dm)
+
+    # ── The family group: bind it, then the file, then the instruction ───────
+    seq_before = auto.seq_now(dm)
+    auto.say(dm, "/group")
+    token_line = ""
+    for _ in range(20):
+        time.sleep(3)
+        for message in auto.said(dm, seq_before):
+            if "KIN-" in message["text"]:
+                token_line = message["text"].strip().splitlines()[-1].strip()
+        if token_line:
+            break
+    check(bool(token_line), "the organizer was given a line to post in the group",
+          "no group-binding token came back from /group")
+
+    auto.join_group(group, dm)
+    time.sleep(2)
+    auto.say(group, token_line, from_id=dm)
+    bound = wait_for("the group to be bound to this trip",
+                     lambda: psql(f"SELECT 1 FROM control_plane.telegram_chat_bindings "
+                                  f"WHERE trip_id='{ctx['trip_id']}' AND chat_id='{group}' AND closed_at IS NULL") == "1",
+                     timeout=120, interval=5)
+    check(bool(bound), "the family group is bound to the trip", "the group never bound")
+
+    # The live case: a file with no caption, then — separately — the ask.
+    since_group = auto.seq_now(group)   # the binding reply and the pinned welcome are behind us
+    auto.send_document(group, pdfs["group"], from_id=dm)
+    time.sleep(5)
+    auto.say(group, (f"{assistant}, please add this hotel booking to the trip and attach "
+                     "the confirmation I just sent."), from_id=dm)
+    approve_until("family group", group, 12, landed("group"), since_group)
+
+
 TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026", "chaos": "Greece 2027",
               # A placeholder the organizer would have typed on the signup form,
               # deliberately not a destination: naming it would be this script
@@ -787,6 +998,9 @@ def main() -> int:
                          "whether the run passed or failed")
     ap.add_argument("--auto", action="store_true",
                     help="play the organizer automatically through a Telegram stand-in instead of a person")
+    ap.add_argument("--documents", action="store_true",
+                    help="after the companion is up, send it a booking PDF in a private chat and in "
+                         "the family group, and check the file lands on the site (needs --auto)")
     ap.add_argument("--stop-after", choices=["confirm"], default=None,
                     help="stop once the intake is confirmed, before the build — for a stack that must "
                          "not provision (the Proxmox VM while the Mac stack is live)")
@@ -870,6 +1084,10 @@ def run_scenario(scenario: str, args: argparse.Namespace, auto: "Auto | None", c
         stage_served(ctx)
         stage_companion(ctx)
         stage_mcp(ctx)
+        if getattr(args, "documents", False):
+            if auto is None:
+                raise Failed("--documents needs --auto: sending a file is a person's action")
+            stage_documents(ctx, auto, work)
         print(f"\n{GREEN}✓ full cycle green ({scenario}){RESET}: site, content, companion and MCP all verified.")
         print(f"  trip:  {ctx['trip_id']}  ({ctx['slug']})")
         print(f"  login: {ctx['email']} / {ctx['password']}")

@@ -57,14 +57,18 @@ import {
 } from "../group-binding.js";
 import { structuredLog } from "../redaction.js";
 import {
+  attachMedia,
   botJoinedGroup,
   describeAttachment,
   migrationOf,
   normalizeUpdate,
   toWireEventWithMedia,
+  type Attachment,
   type MediaDeps,
+  type TelegramMessage,
   type TelegramUpdate,
 } from "./normalize.js";
+import type { HeldAttachment, PendingAttachments } from "./pending-attachments.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
@@ -287,6 +291,12 @@ export interface DispatchOptions {
   interviewerProfile?: string;
   /** Present when the connector runs a media plane; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * Documents sent to a group without addressing the assistant, waiting for
+   * their sender's next addressed message. Must outlive a single update, so
+   * the poller owns it. Absent, such a document is simply dropped.
+   */
+  pendingAttachments?: PendingAttachments;
   /**
    * Whether a trip's companion gateway is connected right now.
    *
@@ -639,7 +649,7 @@ export async function dispatchUpdate(
     }
   }
 
-  const outcome = await normalizeUpdate(db, update, options.media, options.canReachProfile);
+  const outcome = await normalizeUpdate(db, update, options.canReachProfile);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
     // has to actually address the assistant, or the shared bot answers a
@@ -661,7 +671,21 @@ export async function dispatchUpdate(
       botUsername: botIdentity.username,
       isReplyToAssistant,
     });
-    if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
+    const senderId = outcome.event.source.user_id;
+    if (!addressed) {
+      // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
+      // remembered, by reference, for its sender's next addressed message —
+      // "send the file, then say what it is for" is one interaction to the
+      // person doing it. Photos are not: in a family group they are the family
+      // talking, and a photo followed by an unrelated question is the common case.
+      if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
+        options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
+          ...(message.caption ? { caption: message.caption } : {}),
+        });
+        log(structuredLog("info", "trip_bot.attachment_held", { kind: outcome.attachment.kind }));
+      }
+      return { kind: "ignore", reason: "NOT_ADDRESSED" };
+    }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
     // Telegram, where every sender writes their own — so the assistant was
@@ -681,7 +705,15 @@ export async function dispatchUpdate(
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
       }
     }
-    return { kind: "to_gateway", event: outcome.event };
+
+    const attachments = attachmentsForAddressedTurn(message, outcome.attachment, chatId, senderId, options.pendingAttachments);
+    if (attachments.joined > 0) {
+      log(structuredLog("info", "trip_bot.attachments_joined", {
+        held: attachments.held,
+        replied: attachments.replied,
+      }));
+    }
+    return { kind: "to_gateway", event: await attachMedia(outcome.event, attachments.list, options.media) };
   }
 
   switch (outcome.reason) {
@@ -724,6 +756,57 @@ export async function dispatchUpdate(
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/**
+ * The files an addressed message brings to the assistant, oldest first and
+ * each once:
+ *
+ *   1. documents this sender left in this chat, unaddressed, within the window;
+ *   2. the document this message replies to — only when the sender sent it;
+ *   3. whatever this message carries itself.
+ *
+ * Every source is scoped to the sender. Another person's document is never
+ * attached to this request: not from the holding area, and not by replying to
+ * it, since a reply is a gesture at a message, not a claim on someone else's
+ * file. A sender Telegram does not identify brings only their own attachment.
+ */
+function attachmentsForAddressedTurn(
+  message: TelegramMessage,
+  own: Attachment | null,
+  chatId: string,
+  senderId: string | null,
+  pending: PendingAttachments | undefined,
+): { list: HeldAttachment[]; held: number; replied: boolean; joined: number } {
+  const list: HeldAttachment[] = [];
+  const seen = new Set<string>();
+  const add = (attachment: HeldAttachment): boolean => {
+    if (seen.has(attachment.fileId)) return false;
+    seen.add(attachment.fileId);
+    list.push(attachment);
+    return true;
+  };
+
+  let held = 0;
+  let replied = false;
+  if (senderId) {
+    for (const attachment of pending?.take(chatId, senderId) ?? []) {
+      if (add(attachment)) held += 1;
+    }
+    const repliedTo = message.reply_to_message;
+    const repliedAttachment = repliedTo ? describeAttachment(repliedTo) : null;
+    if (
+      repliedAttachment?.kind === "document"
+      && repliedTo?.from?.id !== undefined
+      && String(repliedTo.from.id) === senderId
+    ) {
+      add({ ...repliedAttachment, ...(repliedTo.caption ? { caption: repliedTo.caption } : {}) });
+      replied = true;
+    }
+  }
+  if (own) add({ ...own, ...(message.caption ? { caption: message.caption } : {}) });
+
+  return { list, held, replied, joined: held + (replied ? 1 : 0) };
 }
 
 /**

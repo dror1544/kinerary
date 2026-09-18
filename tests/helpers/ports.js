@@ -85,6 +85,8 @@ export const PORTS = {
   heroHttp:                38196,
   tripEventsHttp:          38198,
   controlPlaneSession:     38296,
+  // control-plane/api/test/group-document-to-plan.integration.test.ts
+  groupDocumentServer:     38294,
 
   // Servers a single describe() spawns with a patched config of its own.
   currencyRatesUsdHome:    38111,
@@ -93,6 +95,7 @@ export const PORTS = {
 
   // ── MCP servers ────────────────────────────────────────────────────────
   controlPlaneSessionMcp:  38295,
+  groupDocumentMcp:        38293,
   mcpExtract:              38106,
   itineraryPlanLayerMcp:   38108,
   mcpDefault:              38117,
