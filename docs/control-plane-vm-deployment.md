@@ -222,6 +222,15 @@ intent the container reads on the next boot.
 The fork's only git remote is upstream `NousResearch/hermes-agent`; its local
 commits are on no remote. `/opt/hermes-src` is a history-less snapshot.
 
+So a change we make to the fork survives only if it is written down here:
+every one lives as a patch in `control-plane/deployment/hermes-patches/`, with
+that directory's README carrying the build, test and rollout steps. Re-apply
+them after any refresh of the snapshot — `HERMES_REV` is then `<sha>-<name>`,
+and a bare sha means the patches are gone. Currently carried:
+`0001-tool-call-payload-key-aliases` (`ab0d98414-toolcall-alias`), without
+which a deferred tool call whose payload the model spelled `parameters` is
+silently never invoked.
+
 ## Companion host
 
 The worker installs a trip's companion over SSH to a forced command, as on the
