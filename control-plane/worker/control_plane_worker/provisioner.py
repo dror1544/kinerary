@@ -1097,26 +1097,18 @@ class ProvisionerWorker:
                     (trip_id,),
                 )
                 owner_row = cur.fetchone()
-                # Preference order is by PROVENANCE, not convenience:
-                #   1. a verified Telegram identity on the owner's account;
-                #   2. the chat the interview was actually conducted in —
-                #      equally verified, because Telegram gave us that id when
-                #      the organizer opened the deep link there (chat_router
-                #      passes it as `verifiedTelegramChatId`, and deliberately
-                #      does NOT write it to the unverified hint column);
-                #   3. the unverified hint from migration 0022, last.
-                #
-                # (2) was missing until 2026-09-06 and is the COMMON case: an
-                # organizer using the password signup stopgap has no Telegram
-                # identity, so a trip whose entire interview happened in a
-                # known chat still ended with "no organizer chat id" and an
-                # unbindable companion. The chat was never unknown — it was in
-                # intake_sessions the whole time.
-                recipient_chat_id = (
+                # Routing and organizer identity require verified provenance:
+                # the owner's Telegram identity or the interview chat captured
+                # by the router from the consumed deep link. The model-supplied
+                # notification hint is only a delivery fallback, never proof
+                # that a chat belongs to this organizer (issue #32).
+                verified_organizer_chat_id = (
                     (owner_row["provider_subject_id"]
-                     or owner_row["interview_chat_id"]
-                     or owner_row["notification_chat_id_hint"])
+                     or owner_row["interview_chat_id"])
                     if owner_row else None
+                )
+                recipient_chat_id = verified_organizer_chat_id or (
+                    owner_row["notification_chat_id_hint"] if owner_row else None
                 )
 
                 # The facts the organizer's introduction is composed from
@@ -1321,18 +1313,18 @@ class ProvisionerWorker:
             )
 
         # ── The chat binding, attempted whatever the companion did ──────────
-        if not recipient_chat_id:
+        if not verified_organizer_chat_id:
             if hermes_profile:
                 # A companion exists and nobody can talk to it. A different
                 # retry from every other reason here: nothing is broken, an
                 # organizer chat id is simply not known yet.
                 _record_reachability(
                     conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
-                    consequence="a companion exists but no organizer chat id is known to bind it to",
+                    consequence="a companion exists but no verified organizer chat id is known to bind it to",
                 )
         else:
             try:
-                outcome = bind_chat_to_trip(conn, recipient_chat_id, trip_id, hermes_profile)
+                outcome = bind_chat_to_trip(conn, verified_organizer_chat_id, trip_id, hermes_profile)
                 # The same chat, as a PERSON. Deliberately here and not in its
                 # own step: the two facts are one fact — this chat is the
                 # organizer's — and separating them is how one of them came to
@@ -1351,7 +1343,7 @@ class ProvisionerWorker:
                     )
                     try:
                         linked = link_organizer_person(
-                            conn, trip_id, recipient_chat_id,
+                            conn, trip_id, verified_organizer_chat_id,
                             organizer_username, organizer_display,
                         )
                         logger.info(
@@ -1388,7 +1380,7 @@ class ProvisionerWorker:
                     # message and nothing that claims an assistant is waiting
                     # for them.
                     self._enqueue_companion_intro(
-                        conn, trip_id, recipient_chat_id, intro_facts,
+                        conn, trip_id, verified_organizer_chat_id, intro_facts,
                     )
                     logger.info("provisioner.companion_profile_bound", extra={
                         "trip_id": trip_id,
