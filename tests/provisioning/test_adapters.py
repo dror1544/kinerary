@@ -109,6 +109,8 @@ class FakeProxmoxSsh:
             return ""
         if command.startswith("rm -rf "):
             return ""
+        if command.startswith("printf %s ") and "TRIP.txt" in command:
+            return ""
         if command.startswith("pct create ") and " && pct start " in command:
             return ""
         if command.startswith("pct start "):

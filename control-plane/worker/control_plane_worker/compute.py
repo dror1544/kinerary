@@ -49,7 +49,9 @@ class ComputeAdapter(Protocol):
     """Creates (or reuses an already-created) compute instance for a trip.
     Returns its vmid as a string."""
 
-    def create_container(self, slug: str, *, first_provision: bool = False) -> str: ...
+    def create_container(
+        self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
+    ) -> str: ...
 
 
 class NullComputeAdapter:
@@ -58,7 +60,9 @@ class NullComputeAdapter:
     creation hasn't been turned on. Matches the pre-Phase-G behavior: a
     clear error rather than a silent no-op."""
 
-    def create_container(self, slug: str, *, first_provision: bool = False) -> str:
+    def create_container(
+        self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
+    ) -> str:
         raise ValueError(
             f"no vmid configured for slug {slug!r}, and automatic container "
             "creation (--enable-compute) is not turned on"
@@ -162,11 +166,13 @@ class LxcProvisionAdapter:
         # tests, not directly.
         self._provisioner_factory = provisioner_factory or self._build_provisioner
 
-    def create_container(self, slug: str, *, first_provision: bool = False) -> str:
+    def create_container(
+        self, slug: str, *, first_provision: bool = False, trip_id: str | None = None,
+    ) -> str:
         topology_path = self._topology_path(slug)
         topology = self._load_topology(topology_path)
         if topology is None:
-            topology = self._build_topology(slug)
+            topology = self._build_topology(slug, trip_id)
             self._write_topology(topology_path, topology, slug)
 
         # Consumed by _build_provisioner below. On a first provision the
@@ -211,7 +217,26 @@ class LxcProvisionAdapter:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         return load_topology(raw)
 
-    def _build_topology(self, slug: str) -> Topology:
+    def _build_topology(self, slug: str, trip_id: str | None = None) -> Topology:
+        """The trip's topology, built ONCE — afterwards the file is the truth.
+
+        The data directory is named by TRIP ID, not by slug. A slug comes from
+        the organizer's answers and is deliberately reusable: teardown frees it
+        (`retired-<slug>-<date>`), so the next family to name their trip the
+        same way would otherwise land on the previous family's directory. That
+        is only survivable today because teardown remembers to rename the
+        directory and a first provision wipes it — two safeguards guarding a
+        name collision that need not exist.
+
+        The MOUNT path inside the container stays the slug, because that is
+        what a person reads in `pct config`, in the site's own env and in its
+        logs. An id in a log line helps nobody.
+
+        Existing trips are untouched: `create_container` only reaches here when
+        the trip has no topology file yet, so every already-provisioned trip
+        keeps whatever directory its topology records — a later upgrade or
+        redeploy reads that file, never this function.
+        """
         ipv4 = self._allocate_ip(slug)
         name = self._lxc_name(slug)
         hostname = f"{slug}.{self._hostname_domain}"
@@ -223,7 +248,7 @@ class LxcProvisionAdapter:
                 cores=self._cores, memory_mb=self._memory_mb, disk_gb=self._disk_gb,
                 bridge=self._bridge, ipv4=f"{ipv4}/24",
                 gateway=self._gateway, nameserver=self._nameserver,
-                nfs_host_dir=f"{self._nfs_host_base}/{slug}",
+                nfs_host_dir=f"{self._nfs_host_base}/{trip_id or slug}",
                 nfs_mount_path=f"{self._nfs_mount_base}/{slug}",
             ),
             # forward_host is the container's IP, deliberately not its LXC name.

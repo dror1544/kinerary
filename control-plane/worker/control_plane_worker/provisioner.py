@@ -68,6 +68,7 @@ class DeployAdapter(Protocol):
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        trip_id: str | None = None,
     ) -> str: ...
 
 
@@ -179,6 +180,7 @@ class ShellDeployAdapter:
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        trip_id: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -187,7 +189,7 @@ class ShellDeployAdapter:
         # only reaches the compute path (a vmid_map trip is a long-lived hand
         # box whose data is never reset here).
         vmid = self._vmid_map.get(slug) or self._compute.create_container(
-            slug, first_provision=first_provision
+            slug, first_provision=first_provision, trip_id=trip_id,
         )
 
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
@@ -701,6 +703,9 @@ class ProvisionerWorker:
                     first_provision=bool(plan_desired.get("first_provision", False)),
                     sidecars=sidecars,
                     source_dir=source_dir,
+                    # Names the trip's data directory on a FIRST provision; an
+                    # existing trip's directory comes from its topology file.
+                    trip_id=trip_id,
                 )
             finally:
                 if source_dir:

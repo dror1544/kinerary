@@ -272,6 +272,56 @@ provisioning run (below): LXC, NPM host, DNS record and ingress rule all gone,
 the trip-mcp bridge stopped on its port, and the RPi4's cloudflared config
 byte-identical to before the run.
 
+## Where a trip's data lives, and what that name means
+
+Each trip has a directory on the TrueNAS share, bind-mounted into its
+container: the site's SQLite database, uploaded photos, booking confirmations.
+It outlives the container by design — a redeploy replaces the code, never the
+family's data.
+
+**New trips are named by trip id** (`/mnt/pve/truenas-nfs/trip_<id>`), while the
+path INSIDE the container keeps the slug (`/nfs/<slug>`), which is what appears
+in `pct config`, in the site's `.env` and in its logs. A `TRIP.txt` in the
+directory names the slug, so the share stays browsable.
+
+The reason is that a slug is not an identity. It comes from the organizer's
+answers, and teardown deliberately frees it (`retired-<slug>-<date>`) so the
+name can be used again. Two safeguards used to stand between a reused slug and
+the previous family's data: teardown renaming the directory, and a first
+provision wiping it. Both are mechanisms that have to work; an id cannot
+collide in the first place.
+
+**An existing trip keeps its directory, forever.** The path is recorded in that
+trip's `topology.yaml` when it is first provisioned, and every later
+provision — an upgrade, a redeploy, a retry — reads that file. Nothing
+recomputes a name for a trip that already has one, and
+`test_a_trip_that_already_has_a_topology_keeps_its_data_dir` is there to keep
+it that way: recomputing would point a running family's site at an empty
+directory, and it would come back with no participants, no photos, and a login
+nobody has.
+
+So **upgrading software on a live site changes nothing about this** — deploys
+send code, and the mount comes from the topology.
+
+### Renaming an existing trip's directory (optional, deliberate)
+
+Only worth doing to retire the old naming; nothing requires it. The trip must
+be down for the move, because the container holds its database open and NFS
+turns deletions-in-use into `.nfs*` placeholders:
+
+```bash
+# on the Proxmox host, with the trip's vmid and its new id-shaped name
+pct stop <vmid>
+mv /mnt/pve/truenas-nfs/<slug> /mnt/pve/truenas-nfs/trip_<id>
+pct set <vmid> --mp0 /mnt/pve/truenas-nfs/trip_<id>,mp=/nfs/<slug>   # mount path unchanged
+pct start <vmid>
+```
+
+Then update `nfs_host_dir` in `~/kinerary-deploy/trips/<slug>/topology.yaml` to
+match, or the next provision will recreate the old directory and serve an empty
+site. Verify before walking away: the site answers, and its bookings and
+participants are still there.
+
 ## Boot order on the Proxmox host
 
 Set 2026-09-13, after a host reboot brought back only the guests with `onboot`
