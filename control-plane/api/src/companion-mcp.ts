@@ -26,6 +26,7 @@
  * point at. No tool takes a trip id, so no argument can reach another family's
  * trip. A profile bound to no trip, or to more than one, is refused.
  */
+import { randomBytes } from "node:crypto";
 import express, { type Request, type Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -86,6 +87,88 @@ export async function renameFromCompanion(
   return { ok: true, names: now };
 }
 
+/* ------------------------------------------------- companion bug reports --- */
+
+export type BugReportInput = {
+  kind: "user-reported" | "companion-observed";
+  summary: string;
+  detail?: string;
+  quote?: string;
+  surface?: string;
+};
+
+export type BugReportResult =
+  | { ok: true; id: string; duplicateOf?: string }
+  | { ok: false; reason: "NO_TRIP" | "AMBIGUOUS_TRIP" | "SUMMARY" | "RATE_LIMITED" };
+
+/** A companion may file this many reports per trip per hour, and no more. */
+export const BUG_REPORT_LIMIT_PER_HOUR = 5;
+
+/**
+ * Records a companion's bug report against the one trip its identity resolves
+ * to. The companion never names the trip — see this file's header.
+ *
+ * Two floods are possible and both are handled here rather than left to the
+ * monitor, because the monitor costs a model call to notice them:
+ *
+ *  - the SAME report again (a companion re-reading its own memory each turn)
+ *    returns the existing row rather than inserting a near-identical one;
+ *  - DIFFERENT reports in a loop hit a per-trip hourly ceiling, which refuses
+ *    with a reason the companion can relay to the family instead of retrying.
+ */
+export async function reportBugFromCompanion(
+  db: pg.Pool,
+  profile: string,
+  input: BugReportInput,
+): Promise<BugReportResult> {
+  const trip = await tripForCompanion(db, profile);
+  if (!trip.ok) return trip;
+
+  const summary = input.summary.trim().replace(/\s+/g, " ");
+  if (summary.length < 10 || summary.length > 300) return { ok: false, reason: "SUMMARY" };
+
+  // Same words, same trip, still recent: hand back what is already filed.
+  const existing = await db.query<{ id: string }>(
+    `SELECT id FROM control_plane.companion_bug_reports
+      WHERE trip_id = $1 AND summary = $2 AND reported_at > now() - interval '24 hours'
+      ORDER BY reported_at DESC LIMIT 1`,
+    [trip.tripId, summary],
+  );
+  if (existing.rowCount) {
+    return { ok: true, id: existing.rows[0]!.id, duplicateOf: existing.rows[0]!.id };
+  }
+
+  const recent = await db.query<{ count: number }>(
+    `SELECT count(*)::int AS count FROM control_plane.companion_bug_reports
+      WHERE trip_id = $1 AND reported_at > now() - interval '1 hour'`,
+    [trip.tripId],
+  );
+  if ((recent.rows[0]?.count ?? 0) >= BUG_REPORT_LIMIT_PER_HOUR) {
+    return { ok: false, reason: "RATE_LIMITED" };
+  }
+
+  const id = `cbr_${randomBytes(16).toString("hex")}`;
+  await db.query(
+    `INSERT INTO control_plane.companion_bug_reports
+       (id, trip_id, hermes_profile, kind, summary, detail, quote, surface)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      id,
+      trip.tripId,
+      profile,
+      input.kind,
+      summary,
+      input.detail?.trim().slice(0, 4000) || null,
+      input.quote?.trim().slice(0, 2000) || null,
+      input.surface?.trim().slice(0, 40) || null,
+    ],
+  );
+  // Never the summary, the detail or the quote: all three are free text a
+  // traveller may have written, and logs are not the place for it.
+  log(structuredLog("info", "companion_mcp.bug_reported", { profile, kind: input.kind, id }));
+  return { ok: true, id };
+}
+
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data) }] };
 }
@@ -115,6 +198,28 @@ export function buildCompanionMcpServer(db: pg.Pool, profile: string): McpServer
         .describe("The new name, or up to three spellings of it. Each 2–40 characters, no @ or markup."),
     },
     async ({ names }) => ok(await renameFromCompanion(db, profile, names)),
+  );
+
+  mcp.tool(
+    "report_bug",
+    "Report something broken in the product to the people who maintain it. Use this when the family hits a " +
+      "real defect — the site shows the wrong thing, a document came back unread, a booking renders blank — " +
+      "not for a question, a preference, or anything you can fix yourself. You are not filing a ticket: a " +
+      "monitoring agent reads these, decides which are real, and escalates. Report once and say you have " +
+      "passed it on; do not promise a fix or a timeline.",
+    {
+      kind: z.enum(["user-reported", "companion-observed"])
+        .describe("'user-reported' if a person said it — put their exact words in `quote`. 'companion-observed' if you noticed it yourself and nobody complained."),
+      summary: z.string().min(10).max(300)
+        .describe("One line stating what is broken. English, even when the group speaks another language — the people who read this work in English."),
+      detail: z.string().max(4000).optional()
+        .describe("What you saw, where, and what it stops the family doing."),
+      quote: z.string().max(2000).optional()
+        .describe("For kind='user-reported': the person's exact words, in their own language. Never paraphrase into this field, and never write your own words here."),
+      surface: z.string().max(40).optional()
+        .describe("Where it showed up: site, companion, booking, plan, document, other."),
+    },
+    async (input) => ok(await reportBugFromCompanion(db, profile, input)),
   );
 
   return mcp;

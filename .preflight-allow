@@ -1,10 +1,51 @@
 # Reviewed exceptions to the preflight blocking checks.
 #
-# Hard rule 3 (no binaries in git) is blanket by design. An entry here is a
-# recorded, reviewed decision — not a silent one-off exemption. Each line needs
-# a reason, and the reason has to be "the test cannot exist without this file",
-# not "it is small" or "it is harmless".
+# The blocking rules are blanket by design. An entry here is a recorded,
+# reviewed decision — not a silent one-off exemption. Each line needs a reason,
+# and the reason has to say why the rule cannot apply, not that breaking it is
+# harmless.
 #
 # Format:  <repo-relative path>  # <reason>
 
+# ── hard rule 3 — no binaries in git ────────────────────────────────────────
 tests/fixtures/sample-confirmation.pdf  # PDF extraction cannot be tested without a real PDF (tests/mcp-extract.test.js:57)
+
+# ── hard rule 6 — this repo never names this deployment ─────────────────────
+#
+# TWO KINDS OF ENTRY BELOW, and the difference is the point.
+#
+# PERMANENT: the rule genuinely cannot apply. These stay.
+# BACKLOG:   the rule applies and the file has not caught up yet. These come
+#            off, one at a time, as each value moves into kinerary-deploy
+#            behind an env var. An entry here is a debt that has been written
+#            down, not a decision that it is fine.
+#
+# The list only shrinks. If you are adding a line, you are either writing a
+# PERMANENT one with a real reason, or you are adding debt — say which.
+
+# ---- PERMANENT ----
+provisioning/adapters.py  # /opt/kinerary is the path INSIDE a trip container the product itself creates — a product convention, not a fact about where the control plane runs
+
+# ---- BACKLOG ----
+# The five VM scripts: each names this VM's containers, /opt paths and deploy
+# root. They are the same shape as kinerary-deploy/bootstrap-monitor.sh was
+# before 2026-09-18 and want the same split — a generic half here, a thin
+# wrapper there. Moving them is mechanical; nothing depends on them staying.
+control-plane/deployment/vm-e2e.sh  # BACKLOG: names kinerary-cp-* containers and /opt paths; split like bootstrap-monitor.sh
+control-plane/deployment/vm-interview-runner.sh  # BACKLOG: names kinerary-cp-* containers and /opt/agent-auth
+control-plane/deployment/vm-manual-test.sh  # BACKLOG: names this VM's address, /opt paths and containers
+control-plane/deployment/vm-relay-restart.sh  # BACKLOG: names kinerary-cp-postgres-1 / kinerary-cp-relay-1 and the deploy root
+control-plane/deployment/vm-teardown-trip.sh  # BACKLOG: names /opt/hermes-data and the deploy root
+
+# The provisioner's DEFAULTS are this house: Proxmox at a fixed address, an
+# ingress host that was decommissioned when ingress moved to CT120, and an SSH
+# key name from one laptop. provisioning.env overrides all of them HERE, which
+# is exactly why nobody notices — a second deployment that forgets one env var
+# gets no error, just somebody else's home lab. The fix is to make them
+# REQUIRED rather than defaulted.
+control-plane/worker/control_plane_worker/compute.py  # BACKLOG: proxmox_host / rpi_host / proxmox_ssh_key default to this deployment; make them required
+control-plane/worker/control_plane_worker/__main__.py  # BACKLOG: same defaults, read from env with this house as the fallback
+provisioning/__main__.py  # BACKLOG: same defaults
+scripts/e2e-full-cycle.py  # BACKLOG: defaults to this deployment's host, key and /opt paths
+scripts/teardown-trip.py  # BACKLOG: defaults to this deployment's Proxmox host and key
+scripts/trip-autostart.py  # BACKLOG: defaults to this deployment's Proxmox host, key and deploy root

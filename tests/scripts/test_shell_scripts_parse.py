@@ -22,9 +22,17 @@ class ParsesUnderSystemBash(unittest.TestCase):
     @unittest.skipUnless(Path(SYSTEM_BASH).exists() or shutil.which("bash"), "no bash")
     def test_every_script_parses(self) -> None:
         bash = SYSTEM_BASH if Path(SYSTEM_BASH).exists() else shutil.which("bash")
-        scripts = sorted(p for p in (REPO / "scripts").rglob("*.sh") if p.is_file())
-        scripts += sorted(p for p in (REPO / ".agents/skills").rglob("*.sh") if p.is_file())
-        self.assertTrue(scripts, "found no shell scripts — the glob is wrong")
+        # control-plane/deployment/ was missing here until 2026-09-18, so every
+        # vm-*.sh — relay restart, teardown, manual test, monitor bootstrap —
+        # went unparsed. Those run on the VM, by hand, usually while something
+        # is already wrong; a syntax error surfacing there is the worst place
+        # for it.
+        roots = ("scripts", ".agents/skills", "control-plane/deployment")
+        scripts: list[Path] = []
+        for root in roots:
+            found = sorted(p for p in (REPO / root).rglob("*.sh") if p.is_file())
+            self.assertTrue(found, f"no shell scripts under {root} — the glob is wrong")
+            scripts += found
         for script in scripts:
             with self.subTest(script=str(script.relative_to(REPO))):
                 result = subprocess.run([bash, "-n", str(script)], capture_output=True, text=True)
