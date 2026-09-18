@@ -19,11 +19,21 @@
  * Exits 0 once the intake is confirmed (which is what starts the build), non-zero
  * with the transcript and the session as it stood when anything stalls.
  */
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import pg from "pg";
 import { getSessionForChat, type IntakeQuestion, type SessionView } from "../src/interview.js";
 import { suggestionTapData } from "./organizer-suggestions.js";
+import {
+  CHAOS_LATE_CORRECTIONS,
+  MAX_TRIES_PER_QUESTION,
+  chaosMove,
+  judgeIntake,
+  replyInOtherLanguage,
+  writtenLanguage,
+  type ChaosCheck,
+  type ChaosMove,
+} from "./organizer-chaos.js";
 
 const arg = (name: string, fallback = "") => {
   const i = process.argv.indexOf(`--${name}`);
@@ -34,8 +44,13 @@ const token = arg("token");
 const chatId = arg("chat", "9000000000001");
 const telegram = arg("telegram", "http://127.0.0.1:4399").replace(/\/+$/, "");
 const docsDir = arg("docs");
-const turnSeconds = Number(arg("turn-seconds", "240"));
-const totalMinutes = Number(arg("minutes", "30"));
+/** The organizer who does not follow — see tools/organizer-chaos.ts. */
+const chaos = scenarioName === "chaos";
+// A chaos run reads documents in the middle of other questions and gets
+// re-asked on purpose, so each turn and the whole run get more time.
+const turnSeconds = Number(arg("turn-seconds", chaos ? "480" : "240"));
+const totalMinutes = Number(arg("minutes", chaos ? "60" : "30"));
+const reportPath = arg("report");
 const databaseUrl = process.env.CONTROL_PLANE_DATABASE_URL;
 
 // ── The scenarios: what this organizer says, by question ─────────────────────
@@ -84,6 +99,26 @@ const SCENARIOS: Record<string, Scenario> = {
     choice: { trip_type: "family", bot_gender: "male", bot_tone: "playful", trip_pace: "balanced" },
     multi: { dietary: ["vegetarian", "lactose_free"] },
   },
+  // The chaos organizer's PROPER answers: what it says after each question's
+  // misbehaviour (tools/organizer-chaos.ts). Consistent with make_documents.py
+  // "chaos", whose documents it uploads out of place rather than at the start.
+  chaos: {
+    language: "he",
+    documents: false,
+    text: {
+      destination: "יוון — אתונה, נקסוס וסנטוריני",
+      departure_date: "12 ביולי 2027",
+      return_date: "July 26, 2027",
+      travelers: "אבי כהן 46, רונית כהן 44, תמר כהן 15, יואב כהן 12 ומיכל כהן 9",
+      phases: "Athens July 12-16, Naxos July 16-21, Santorini July 21-26",
+      bot_name: "הרמס / Hermes",
+      trip_interests: "חופים, עתיקות וגלידה",
+      organizer_identity: "רונית",
+      dietary_scope: "הצמחונות לכולם, והאלרגיה לאגוזים רק ליואב",
+    },
+    choice: { trip_type: "family", bot_gender: "female", bot_tone: "playful", trip_pace: "balanced", dietary_visibility: "group" },
+    multi: { dietary: ["vegetarian", "nut_allergy"] },
+  },
   manual: {
     language: "en",
     documents: false,
@@ -110,6 +145,9 @@ const SCENARIOS: Record<string, Scenario> = {
 interface SentMessage { seq: number; kind: string; messageId: number; text: string; buttons: { text: string; data: string }[] }
 
 let seenSeq = 0;
+/** The language of the organizer's last clearly-worded message — what the interview should now speak. */
+let lastWritten: "he" | "en" | null = null;
+const otherLanguageReplies: string[] = [];
 const transcript: string[] = [];
 const say = (line: string) => { transcript.push(line); console.log(line); };
 
@@ -132,6 +170,9 @@ async function drain(): Promise<SentMessage[]> {
   const all = await botMessages();
   const fresh = all.filter((m) => m.seq > seenSeq);
   for (const m of fresh) {
+    if (m.kind === "send" && lastWritten && replyInOtherLanguage(lastWritten, m.text)) {
+      otherLanguageReplies.push(`after writing ${lastWritten}: ${m.text.replace(/\n/g, " ").slice(0, 120)}`);
+    }
     const buttons = m.buttons.length ? `  [${m.buttons.map((b) => `${b.text}=${b.data}`).join(" | ")}]` : "";
     say(`  BOT${m.kind === "edit" ? " (edit)" : ""}: ${m.text.replace(/\n/g, " ⏎ ").slice(0, 400)}${buttons}`);
     seenSeq = Math.max(seenSeq, m.seq);
@@ -188,7 +229,7 @@ function fingerprint(v: SessionView | null): string {
 class Stalled extends Error {}
 
 /** Waits until the relay has taken our input AND the session has moved on. */
-async function settle(before: string, what: string): Promise<SessionView | null> {
+async function settle(before: string, what: string, repliedSince?: number): Promise<SessionView | null> {
   const deadline = Date.now() + turnSeconds * 1000;
   let v: SessionView | null = null;
   while (Date.now() < deadline) {
@@ -197,13 +238,17 @@ async function settle(before: string, what: string): Promise<SessionView | null>
     const queued = Number((await control("health")).updatesQueued ?? 0);
     v = await view();
     if (queued === 0 && !v && (await confirmed())) return null;
-    if (queued === 0 && v && v.awaiting !== "machine" && fingerprint(v) !== before) {
+    // A misbehaving organizer is often answered with the SAME question again,
+    // which changes nothing on the session — so after chaos a reply is progress.
+    // Only silence is a stall.
+    const replied = repliedSince !== undefined && seenSeq > repliedSince;
+    if (queued === 0 && v && v.awaiting !== "machine" && (fingerprint(v) !== before || replied)) {
       await sleep(1000); // let a follow-up message land before reading the screen
       await drain();
       return await view();
     }
   }
-  throw new Stalled(`no progress within ${turnSeconds}s after ${what} (session: ${fingerprint(v)})`);
+  throw new Stalled(`${repliedSince !== undefined ? "silence" : "no progress"} within ${turnSeconds}s after ${what} (session: ${fingerprint(v)})`);
 }
 
 async function tap(data: string): Promise<boolean> {
@@ -216,6 +261,7 @@ async function tap(data: string): Promise<boolean> {
 
 async function type(text: string, languageCode: string): Promise<void> {
   say(`  YOU: ${text}`);
+  lastWritten = writtenLanguage(text) ?? lastWritten;
   await control("message", { chatId, text, languageCode });
 }
 
@@ -228,6 +274,40 @@ const MIME: Record<string, string> = {
 };
 
 // ── The organizer ────────────────────────────────────────────────────────────
+
+/** What the phone says its language is. The chaos organizer's is English whatever it writes (2026-09-15). */
+let phoneLanguage = "en";
+const tries = new Map<string, number>();
+const movesRun: string[] = [];
+
+/** One misbehaviour, and whatever the interview says back to it. */
+async function perform(move: ChaosMove, where: string, before: string): Promise<void> {
+  const since = seenSeq;
+  say(`  CHAOS (${where}): ${move.why}`);
+  if (move.kind === "type") {
+    await type(move.text, phoneLanguage);
+  } else if (move.kind === "tap") {
+    if (!(await tap(move.data))) {
+      say(`  (no ${move.data} button anywhere to tap — skipped)`);
+      return;
+    }
+  } else {
+    say(`  YOU send file: ${move.file}`);
+    await control("document", {
+      chatId, filename: move.file, mime: MIME[extname(move.file).toLowerCase()] ?? "application/octet-stream",
+      base64: (await readFile(join(docsDir, move.file))).toString("base64"), languageCode: phoneLanguage,
+    });
+  }
+  movesRun.push(`${where}: ${move.why}`);
+  await settle(before, `chaos on ${where} (${move.why})`, since);
+}
+
+/** An optional question the router walked to on its own, read off what it last put on screen. */
+function onScreen(v: SessionView): IntakeQuestion | null {
+  if (v.state !== "interviewing" || !v.lastPrompt?.startsWith("q:")) return null;
+  const id = v.lastPrompt.slice(2).split(":")[0];
+  return v.optionalRemaining.find((q) => q.id === id) ?? null;
+}
 
 const asked = new Set<string>();
 /** How many times each question was found on screen without its buttons yet. */
@@ -274,13 +354,22 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
     await tap(`n:${q.id}`);
   } else {
     const text = s.text[q.id];
+    // The roster as buttons: the chaos organizer taps its own name when offered.
+    if (chaos && text) {
+      const offered = (await botMessages()).flatMap((m) => m.buttons)
+        .filter((b) => b.data.startsWith(`a:${q.id}:`) && b.text.includes(text));
+      if (offered.length > 0 && (await tap(offered[offered.length - 1]!.data))) {
+        asked.add(q.id);
+        return true;
+      }
+    }
     if (!text) {
       // Nothing scripted: an optional question is skipped the way a person
       // would; a required one is a gap in this script, reported, not guessed.
       if (q.required) throw new Stalled(`the scenario has no answer for required question ${q.id} (${q.type})`);
       return (await tap(`k:${q.id}`)) || notYet();
     }
-    await type(text, s.language);
+    await type(text, phoneLanguage);
   }
   asked.add(q.id);
   return true;
@@ -289,13 +378,16 @@ async function answer(q: IntakeQuestion, s: Scenario, suggestions: SessionView["
 async function main(): Promise<number> {
   const s = SCENARIOS[scenarioName];
   if (!s || !token || !databaseUrl) {
-    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual --token T [--docs DIR]");
+    console.error("usage: CONTROL_PLANE_DATABASE_URL=… auto-organizer.ts --scenario japan|multi|manual|chaos --token T [--docs DIR] [--report FILE]");
     return 2;
   }
   const deadline = Date.now() + totalMinutes * 60_000;
+  const lateCorrectionsSent = new Set<string>();
+  let walkedOptional = false;
   say(`== organizer: ${scenarioName} (${s.language}) as chat ${chatId}`);
+  phoneLanguage = chaos ? "en" : s.language;
 
-  await type(`/start ${token}`, s.language);
+  await type(`/start ${token}`, phoneLanguage);
   let v = await settle("none", "/start");
   if (!v) throw new Stalled("/start did not open a session");
 
@@ -306,12 +398,15 @@ async function main(): Promise<number> {
       say(`  YOU send file: ${f}`);
       await control("document", {
         chatId, filename: f, mime: MIME[extname(f).toLowerCase()] ?? "application/octet-stream",
-        base64: (await readFile(join(docsDir, f))).toString("base64"), languageCode: s.language,
+        base64: (await readFile(join(docsDir, f))).toString("base64"), languageCode: phoneLanguage,
       });
     }
     v = await settle(before, `${files.length} document(s)`);
   } else {
-    const before = fingerprint(v);
+    for (let n = 0; chaos && chaosMove("opening", n); n += 1) {
+      await perform(chaosMove("opening", n)!, "opening", fingerprint(await view()));
+    }
+    const before = fingerprint(await view());
     if (!(await tap("c:nodoc"))) throw new Stalled("no document offer to decline");
     // Wait for the first question to arrive, as a person would, before reading
     // the screen — the manual scenario tapped for trip_type before it was sent.
@@ -334,14 +429,41 @@ async function main(): Promise<number> {
     }
     if (v.awaiting === "machine") { await sleep(2000); await drain(); continue; }
 
-    const q = v.nextQuestion ?? v.pendingAsk;
+    const q = v.nextQuestion ?? v.pendingAsk ?? (chaos ? onScreen(v) : null);
     if (q) {
-      if (!(await answer(q, s, v.suggestions))) { await sleep(2000); await drain(); continue; }
-      await settle(before, `answering ${q.id}`);
+      if (chaos) {
+        const n = tries.get(q.id) ?? 0;
+        if (n >= MAX_TRIES_PER_QUESTION) throw new Stalled(`the interview did not recover on ${q.id} after ${n} tries`);
+        tries.set(q.id, n + 1);
+        const move = chaosMove(q.id, n);
+        if (move) { await perform(move, q.id, before); continue; }
+      }
+      const since = seenSeq;
+      if (!(await answer(q, s, v.suggestions))) {
+        if (chaos) tries.set(q.id, Math.max(0, (tries.get(q.id) ?? 1) - 1)); // not answerable yet is not a try
+        await sleep(2000);
+        await drain();
+        continue;
+      }
+      await settle(before, `answering ${q.id}`, chaos ? since : undefined);
+      const late = CHAOS_LATE_CORRECTIONS.find((c) => c.after === q.id && !lateCorrectionsSent.has(c.after));
+      if (chaos && late) {
+        const now = await view();
+        if (now && (now.nextQuestion ?? now.pendingAsk ?? onScreen(now))?.id !== q.id) {
+          lateCorrectionsSent.add(late.after);
+          await perform(late.move, `after ${q.id}`, fingerprint(now));
+        }
+      }
       continue;
     }
     // Required questions done and nothing nominated: the boundary message
-    // offers "a few more" or "that's everything" — finish.
+    // offers "a few more" or "that's everything". The chaos organizer asks for
+    // more once, so the optional questions — dietary, interests — get walked.
+    if (chaos && !walkedOptional && (await tap("c:more"))) {
+      walkedOptional = true;
+      await settle(before, "asking for more questions", seenSeq);
+      continue;
+    }
     if (await tap("c:done")) { await settle(before, "finish"); continue; }
     await sleep(2000);
     await drain();
@@ -356,7 +478,44 @@ async function main(): Promise<number> {
   if (!asked.has("organizer_identity")) say("  organizer_identity: inferred, not asked");
   console.log(JSON.stringify({ event: "organizer.confirmed", scenario: scenarioName, sessionId,
     asked: [...asked], unknownTelegramMethods: unknown }));
-  return 0;
+  if (!chaos) return 0;
+
+  const intake = await pool.query(
+    `SELECT v.data, v.language FROM control_plane.intake_versions v
+       JOIN control_plane.intake_sessions s ON s.trip_id = v.trip_id
+      WHERE s.id = $1 ORDER BY v.version DESC LIMIT 1`,
+    [sessionId],
+  );
+  const row = intake.rows[0] as { data?: Record<string, never>; language?: string | null } | undefined;
+  const verdict = judgeIntake(row?.data ?? {}, row?.language ?? null, lastWritten);
+  const findings = [
+    ...verdict.findings,
+    ...[...tries].filter(([, n]) => n > 2).map(([id, n]) => `${id} took ${n} tries`),
+    otherLanguageReplies.length === 0
+      ? "every reply after a clearly-worded message came in that message's language"
+      : `${otherLanguageReplies.length} replies came in the other language; first: ${otherLanguageReplies[0]}`,
+    unknown.length ? `Telegram methods the stand-in does not model: ${unknown.join(", ")}` : "",
+  ].filter(Boolean);
+  await report(verdict.checks.every((c) => c.ok) ? "PASSED" : "FAILED", verdict.checks, findings);
+  for (const c of verdict.checks) say(`  ${c.ok ? "✓" : "✗"} ${c.name} — ${c.detail}`);
+  for (const f of findings) say(`  • ${f}`);
+  return verdict.checks.every((c) => c.ok) ? 0 : 1;
+}
+
+/** The chaos run's record, kept pass or fail: whether it made sense is for a person to judge. */
+async function report(result: string, checks: ChaosCheck[], findings: string[]): Promise<void> {
+  if (!reportPath) return;
+  const lines = [
+    `# Chaos interview — ${new Date().toISOString()}`, "",
+    `**Result: ${result}**`, "",
+    "## Checks (these decide the result)", ...checks.map((c) => `- ${c.ok ? "✅" : "❌"} ${c.name} — ${c.detail}`), "",
+    "## Findings (for a person to read)", ...findings.map((f) => `- ${f}`), "",
+    "## Misbehaviour tried", ...movesRun.map((m) => `- ${m}`), "",
+    "## Tries per question", ...[...tries].map(([id, n]) => `- ${id}: ${n}`), "",
+    "## Transcript", "```", ...transcript, "```", "",
+  ];
+  await writeFile(reportPath, lines.join("\n"));
+  console.log(`chaos report: ${reportPath}`);
 }
 
 main()
@@ -366,6 +525,12 @@ main()
     const v = await view().catch(() => null);
     console.error(`\nORGANIZER STALLED: ${error instanceof Error ? error.message : String(error)}`);
     console.error(`session: ${fingerprint(v)}`);
+    if (chaos) {
+      await report("FAILED — the interview did not recover", [{
+        name: "the interview recovered and confirmed", ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      }], otherLanguageReplies.map((r) => `reply in the other language: ${r}`)).catch(() => {});
+    }
     await pool.end();
     process.exit(1);
   });

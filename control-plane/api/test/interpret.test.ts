@@ -1320,3 +1320,42 @@ describe("an answer below the confidence floor becomes a suggestion", () => {
     assert.deepEqual(suggested, []);
   });
 });
+
+describe("a later message corrects an answer already given", () => {
+  // 2026-09-16, the chaos run: "Actually my mother Ruth Cohen, 70, is joining us
+  // too" changed nothing, and neither could the stops once a document had filled
+  // them in from a single hotel booking.
+  const roster = (people: unknown[]) => ({ kind: "structured", schema_version: 3, data: people } as never);
+  const joining = (confidence: number) => ([{
+    questionId: "travelers", confidence,
+    value: { kind: "structured", data: [{ name: "Ruth Cohen", age: 70 }] },
+    evidence: "Actually my mother Ruth Cohen, 70, is joining us too",
+  }] as never);
+  const ctx = (extra: Record<string, unknown>) => ({
+    sourceText: "Actually my mother Ruth Cohen, 70, is joining us too",
+    outstanding: ["bot_name"],
+    answered: ["travelers"],
+    answers: { travelers: roster([{ name: "Avi Cohen" }, { name: "Ronit Cohen" }]) },
+    ...extra,
+  }) as never;
+
+  test("a confident correction is accepted, and ADDS to the travellers", () => {
+    const decided = applyProposals(joining(0.9), ctx({ allowCorrections: true }));
+    assert.equal(decided.accepted.length, 1);
+    assert.equal(decided.accepted[0]?.correction, true);
+    const data = (decided.accepted[0]?.answer as { data: { name: string }[] }).data;
+    assert.deepEqual(data.map((p) => p.name), ["Avi Cohen", "Ronit Cohen", "Ruth Cohen"]);
+  });
+
+  test("a hesitant read does not get to overwrite an answer", () => {
+    const decided = applyProposals(joining(0.6), ctx({ allowCorrections: true }));
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "ALREADY_ANSWERED");
+  });
+
+  test("a document still cannot correct what a person answered", () => {
+    const decided = applyProposals(joining(0.95), ctx({}));
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "ALREADY_ANSWERED");
+  });
+});

@@ -9,9 +9,15 @@
  * tell that from success.
  */
 import assert from "node:assert/strict";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 import {
+  CLAUDE_EFFORT_LEVELS,
   DEFAULT_EXTRACT_MODEL,
+  claudeEffort,
+  claudeSpec,
   composeRunners,
   completionText,
   isJsonModeRejection,
@@ -297,5 +303,84 @@ describe("modelRunnerFromEnv", () => {
   test("the key can come from a file", () => {
     assert.equal(openRouterKey({ OPENROUTER_API_KEY_FILE: "/nonexistent" }), "");
     assert.equal(openRouterKey({ OPENROUTER_API_KEY: " sk-y " }), "sk-y");
+  });
+});
+
+/**
+ * Effort for the Claude CLI, per task, from the environment.
+ *
+ * Without it a nested `claude -p` takes its effort from whatever settings the
+ * relay's HOME happens to hold. On the Mac that was a personal coding-session
+ * preference, `effortLevel: xhigh`: on 2026-09-16 a real 4-page PDF's
+ * day-by-day extraction needed 143s against a 60s limit — every attempt timed
+ * out — while the VM, whose config dir says `medium`, needed 53s. The
+ * interview's speed was decided by someone's editor settings.
+ *
+ * A fake CLI echoes its argv, so these check what actually reaches the process.
+ */
+describe("claude effort", () => {
+  async function echoCli(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "kinerary-fake-claude-"));
+    const bin = join(dir, "claude");
+    await writeFile(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ args: process.argv.slice(2) }));\n`);
+    await chmod(bin, 0o755);
+    return bin;
+  }
+  async function argsFor(env: NodeJS.ProcessEnv, task: string): Promise<string[]> {
+    const runner = modelRunnerFromEnv(env);
+    assert.ok(runner);
+    const result = await runner.run({ task, prompt: "PROMPT", parse: identity });
+    assert.ok(result.ok, `the fake CLI did not answer: ${JSON.stringify(result)}`);
+    return (result.value as { args: string[] }).args;
+  }
+
+  test("no effort configured leaves the invocation exactly as it was", () => {
+    // The VM takes its effort from CLAUDE_CONFIG_DIR's settings.json. Ignoring
+    // settings when nobody asked would silently drop that to the CLI default —
+    // the effort at which the VM once mapped answers to the wrong question.
+    assert.deepEqual(claudeSpec("m").args("PROMPT", "m"), ["-p", "PROMPT", "--model", "m"]);
+  });
+
+  test("an explicit effort is passed, and personal settings and connectors are not loaded", () => {
+    assert.deepEqual(claudeSpec("m", 1000, "claude", "medium").args("PROMPT", "m"), [
+      "-p", "PROMPT", "--model", "m", "--effort", "medium", "--setting-sources", "", "--strict-mcp-config",
+    ]);
+  });
+
+  test("each task gets its own effort, from its own variable", async () => {
+    const bin = await echoCli();
+    const env = {
+      CLAUDE_BIN: bin,
+      INTERPRET_RUNNER: "claude", INTERPRET_MODEL: "m", INTERPRET_EFFORT: "high",
+      EXTRACT_RUNNER: "claude", EXTRACT_MODEL: "m", EXTRACT_EFFORT: " Medium ",
+    };
+    const interpret = await argsFor(env, "interpret");
+    assert.equal(interpret[interpret.indexOf("--effort") + 1], "high");
+    const extract = await argsFor(env, "extract");
+    assert.equal(extract[extract.indexOf("--effort") + 1], "medium", "trimmed and lower-cased");
+  });
+
+  test("one task's effort does not leak into the other", async () => {
+    const bin = await echoCli();
+    const args = await argsFor(
+      { CLAUDE_BIN: bin, INTERPRET_RUNNER: "claude", INTERPRET_MODEL: "m", EXTRACT_RUNNER: "claude", EXTRACT_MODEL: "m", INTERPRET_EFFORT: "low" },
+      "extract",
+    );
+    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m"]);
+  });
+
+  test("a misspelt effort refuses to start rather than failing every call", () => {
+    // Passed through, `--effort meduim` makes every call exit non-zero: FAILED,
+    // and the router quietly does less for the whole interview.
+    assert.throws(
+      () => modelRunnerFromEnv({ INTERPRET_RUNNER: "claude", INTERPRET_MODEL: "m", INTERPRET_EFFORT: "meduim" }),
+      /INTERPRET_EFFORT.*low\|medium\|high\|xhigh\|max/,
+    );
+  });
+
+  test("the levels are the CLI's own", () => {
+    assert.deepEqual([...CLAUDE_EFFORT_LEVELS], ["low", "medium", "high", "xhigh", "max"]);
+    assert.equal(claudeEffort("EXTRACT_EFFORT", {}), undefined);
+    assert.equal(claudeEffort("EXTRACT_EFFORT", { EXTRACT_EFFORT: "  " }), undefined);
   });
 });

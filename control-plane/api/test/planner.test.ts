@@ -47,6 +47,12 @@ interface PlannerFixture {
   correlationId: string;
 }
 
+/** An intake whose organizer sounds like two travellers: never approvable. */
+const UNRESOLVED_ORGANIZER = {
+  travelers: { kind: "structured", schema_version: 3, data: [{ name: "Dana" }, { name: "Dina" }] },
+  organizer_identity: { kind: "text", schema_version: 3, text: "דנה" },
+};
+
 async function setupFixture(pool: pg.Pool): Promise<PlannerFixture> {
   const ownerId = generateTestId("user");
   const tripId = generateTestId("trip");
@@ -511,6 +517,60 @@ describe("retryProvision", () => {
         "SELECT status FROM control_plane.plans WHERE id = $1", [first.planId],
       );
       assert.equal(oldPlan.rows[0]?.status, "executed");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a plan is refused while the intake's organizer is not exactly one roster traveller", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    const setData = (data: unknown) => fix.pool.query(
+      "UPDATE control_plane.intake_versions SET data = $1::jsonb WHERE id = $2", [JSON.stringify(data), fix.intakeVersionId],
+    );
+    try {
+      await setData(UNRESOLVED_ORGANIZER);
+      const refused = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(refused.ok, false);
+      if (refused.ok) throw new Error("unreachable");
+      assert.equal(refused.reason, "ORGANIZER_NOT_ON_ROSTER");
+
+      await setData({ ...UNRESOLVED_ORGANIZER, organizer_identity: { kind: "text", schema_version: 3, text: "Dina" } });
+      assert.equal((await generatePlan(fix.pool, fix.tripId, fix.correlationId)).ok, true);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a live trip whose latest intake names no roster traveller is refused before anything is superseded", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const first = await generatePlan(fix.pool, fix.tripId, fix.correlationId);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error("unreachable");
+      await fix.pool.query(
+        "UPDATE control_plane.jobs SET state = 'succeeded', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
+        [first.jobId],
+      );
+      await fix.pool.query("UPDATE control_plane.plans SET status = 'executed' WHERE id = $1", [first.planId]);
+      await fix.pool.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1", [fix.tripId]);
+      await fix.pool.query(
+        "UPDATE control_plane.intake_versions SET data = $1::jsonb WHERE id = $2",
+        [JSON.stringify(UNRESOLVED_ORGANIZER), fix.intakeVersionId],
+      );
+
+      const retry = await retryProvision(fix.pool, fix.tripId, `corr_${randomHex(12)}`);
+      assert.equal(retry.ok, false);
+      if (retry.ok) throw new Error("unreachable");
+      assert.equal(retry.reason, "ORGANIZER_NOT_ON_ROSTER");
+
+      const trip = await fix.pool.query<{ lifecycle_state: string }>(
+        "SELECT lifecycle_state FROM control_plane.trips WHERE id = $1", [fix.tripId],
+      );
+      assert.equal(trip.rows[0]?.lifecycle_state, "ready_private", "the live trip was not reverted");
+      const plans = await fix.pool.query<{ status: string }>(
+        "SELECT status FROM control_plane.plans WHERE trip_id = $1", [fix.tripId],
+      );
+      assert.deepEqual(plans.rows.map((r) => r.status), ["executed"], "and it kept its plan");
     } finally {
       await teardownFixture(fix);
     }
