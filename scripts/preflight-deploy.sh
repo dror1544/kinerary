@@ -309,7 +309,15 @@ E2E_ARGS=(--scenario "$SCENARIO")
 # -u: unbuffered. The stages print through Python while the organizer and the
 # teardown write straight to the same stream; buffered, a scenario's failure
 # line surfaced after the NEXT scenario's output, detached from its cause.
-python3 -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
+#
+# "$PY", not `python3`. This script builds a venv at the top precisely so its
+# Python tools have their dependencies, and then launched the longest-running
+# one of them with whatever PATH happened to offer. On 2026-09-18 that was a
+# stray `.venv-telegram-manager` (3.9.6, python.org framework, CA store never
+# populated): the cycle itself survived on it because everything it touches is
+# local HTTP, and the teardown it spawns died on the first HTTPS call, three
+# scenarios running, leaving three provisioned trips behind.
+"$PY" -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
 if [ "$SCENARIO" = all ]; then walked="every scenario walked"; else walked="the $SCENARIO trip walked"; fi

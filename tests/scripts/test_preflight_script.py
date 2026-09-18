@@ -41,3 +41,35 @@ class OwnVariables(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PythonToolsRunInTheVenv(unittest.TestCase):
+    """The venv this script builds is the one its Python tools run in.
+
+    It installs a 3.12 venv with the worker's requirements, announces it, and
+    then invoked `scripts/e2e-full-cycle.py` with a bare `python3` — so the
+    longest-running tool in the whole preflight took whichever interpreter the
+    caller's PATH offered. On 2026-09-18 that was a stray 3.9.6 venv whose CA
+    store had never been populated. The cycle survived on it (everything it
+    touches is local HTTP); the teardown it spawns did not, and three
+    provisioned trips were left on shared infrastructure behind a
+    CERTIFICATE_VERIFY_FAILED.
+
+    The cycle passes its own interpreter down to the teardown through
+    `sys.executable` (tests/scripts/test_e2e_full_cycle.py), so this line is
+    the one that decides what BOTH of them get.
+    """
+
+    def test_the_e2e_cycle_is_launched_with_the_venv_interpreter(self):
+        # An interpreter immediately in front of the script is what decides
+        # which one it gets. `scripts/e2e-full-cycle.py` also appears inside an
+        # embedded Python snippet here, which imports the module rather than
+        # running it — that line is not a launch and neither passes nor fails.
+        bare = re.findall(
+            r'^.*(?<![\w/"$])python3?\s+(?:-\S+\s+)*scripts/e2e-full-cycle\.py.*$',
+            SCRIPT, re.MULTILINE)
+        self.assertEqual(bare, [], "a bare interpreter takes whatever PATH offers")
+
+        launched = [line.strip() for line in SCRIPT.splitlines()
+                    if "e2e-full-cycle.py" in line and '"$PY"' in line]
+        self.assertTrue(launched, 'the cycle must be launched with "$PY", the venv this script built')

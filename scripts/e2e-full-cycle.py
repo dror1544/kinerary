@@ -1110,7 +1110,21 @@ def stage_teardown(ctx: dict) -> int:
     # KINERARY_TEARDOWN names a twin with the same arguments for a non-Mac stack
     # (the VM: control-plane/deployment/vm-teardown-trip.sh).
     script = os.environ.get("KINERARY_TEARDOWN") or str(REPO / "scripts/teardown-trip.py")
-    result = subprocess.run([script, "--trip", ctx["trip_id"], "--execute"])
+    # NAME THE INTERPRETER. `teardown-trip.py` opens `#!/usr/bin/env python3`,
+    # so running it as a bare script hands it whichever python is first on the
+    # caller's PATH — and on 2026-09-18 that was a stray venv (3.9.6, CA store
+    # never populated). All three scenarios of a full run ended in
+    # CERTIFICATE_VERIFY_FAILED while teardown was still READING Cloudflare,
+    # which left three fully provisioned trips on shared infrastructure.
+    # Nothing was wrong with the teardown; it was handed an interpreter that
+    # cannot speak TLS.
+    #
+    # `sys.executable` is the interpreter running this cycle — the preflight's
+    # own venv, with the dependencies it installed and a trust store that
+    # works. A shell's PATH no longer decides. The `.py` test is deliberate:
+    # the VM's twin is a shell script and must keep being run as itself.
+    argv = [sys.executable, script] if script.endswith(".py") else [script]
+    result = subprocess.run([*argv, "--trip", ctx["trip_id"], "--execute"])
     if result.returncode == 0:
         ok(f"{ctx['trip_id']} torn down")
     else:
