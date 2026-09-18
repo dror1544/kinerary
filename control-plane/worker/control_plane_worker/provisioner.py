@@ -368,11 +368,33 @@ def link_organizer_person(
     return True
 
 
+def _record_trip_companion(
+    conn: psycopg.Connection, trip_id: str, hermes_profile: str
+) -> None:
+    """Writes the companion this trip was built with onto the trip itself.
+
+    Separate from any binding on purpose (migration 0054): routing can be
+    refused, closed or moved, and none of that changes which profile was
+    installed for this trip.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE control_plane.trips
+                SET    hermes_profile = %s, updated_at = now()
+                WHERE  id = %s AND hermes_profile IS DISTINCT FROM %s
+                """,
+                (hermes_profile, trip_id, hermes_profile),
+            )
+
+
 def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
     trip_id: str,
     hermes_profile: str | None,
+    allow_retarget: bool = False,
 ) -> str:
     """Opens the binding that routes `chat_id` to `trip_id`, closing rather
     than overwriting whatever was there before.
@@ -384,7 +406,7 @@ def bind_chat_to_trip(
     retried later without first reconstructing routing.
 
     Returns the outcome as a short string for logging: "created", "unchanged",
-    or "profile_rebound".
+    "profile_rebound" or "retargeted".
 
     Three cases, and the distinction between the last two is the whole point:
 
@@ -393,7 +415,27 @@ def bind_chat_to_trip(
                               no-op (a re-provision of an unchanged trip);
                               a changed profile closes the old row and opens
                               a new one, so even this leaves a trail.
-      a DIFFERENT trip     -> refuse. See BindingRefused.
+      a DIFFERENT trip     -> refuse, unless `allow_retarget`. See below and
+                              BindingRefused.
+
+    `allow_retarget` is the ORGANIZER'S OWN chat finishing a NEW interview, and
+    only that. Dror, 2026-09-18: the newest trip is the one they just spent an
+    interview on, so it is the one their chat should talk to. Before this, a
+    second trip run from one chat got no introduction at all — no assistant
+    name, no login, no group token — because the binding was refused and the
+    introduction rides on the binding. The site link arrived alone and read
+    like the assistant had simply not been built.
+
+    NEWER ONLY, which is the safety rail: a re-provision or a repair of an
+    OLDER trip must never steal the chat back from the trip the organizer moved
+    on to. Compared on `trips.created_at`, so "newest" is a fact about the
+    trips, not about which job happened to run last. A refusal still stands for
+    every other chat — a family group actively using trip A is exactly what
+    BindingRefused exists to protect, and no group binding passes this flag.
+
+    On this branch the displaced trip is NOT stranded: `/trips` and `/switch`
+    exist here, and `trips.hermes_profile` (migration 0054) is what lets a
+    switch back find the companion that serves it.
 
     Runs in one transaction and takes FOR UPDATE on the open row, so two
     provisions racing for the same chat serialise here instead of both
@@ -413,21 +455,29 @@ def bind_chat_to_trip(
             )
             existing = cur.fetchone()
 
+            retargeted = False
             if existing is not None:
                 if existing["trip_id"] != trip_id:
-                    raise BindingRefused(chat_id, existing["trip_id"], trip_id)
-                if existing["hermes_profile"] == hermes_profile:
+                    if not (
+                        allow_retarget
+                        and _trip_is_newer(conn, trip_id, existing["trip_id"])
+                    ):
+                        raise BindingRefused(chat_id, existing["trip_id"], trip_id)
+                    retargeted = True
+                elif existing["hermes_profile"] == hermes_profile:
                     return "unchanged"
 
                 cur.execute(
                     """
                     UPDATE control_plane.telegram_chat_bindings
-                    SET closed_at = now(), closed_reason = 'profile_rebound'
+                    SET closed_at = now(), closed_reason = %s
                     WHERE id = %s
                     """,
-                    (existing["id"],),
+                    (
+                        "retargeted_to_newer_trip" if retargeted else "profile_rebound",
+                        existing["id"],
+                    ),
                 )
-
             cur.execute(
                 """
                 INSERT INTO control_plane.telegram_chat_bindings
@@ -436,7 +486,27 @@ def bind_chat_to_trip(
                 """,
                 (_generate_binding_id(), chat_id, trip_id, hermes_profile),
             )
-            return "created" if existing is None else "profile_rebound"
+            if existing is None:
+                return "created"
+            return "retargeted" if retargeted else "profile_rebound"
+
+
+def _trip_is_newer(
+    conn: psycopg.Connection, trip_id: str, than_trip_id: str
+) -> bool:
+    """Was `trip_id` created after `than_trip_id`?
+
+    The question `allow_retarget` actually turns on. A trip whose row cannot be
+    read is not newer — unknown is not a licence to take someone's chat.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, created_at FROM control_plane.trips WHERE id IN (%s, %s)",
+            (trip_id, than_trip_id),
+        )
+        created = {row["id"]: row["created_at"] for row in cur.fetchall()}
+    mine, theirs = created.get(trip_id), created.get(than_trip_id)
+    return mine is not None and theirs is not None and mine > theirs
 
 
 class _LeaseHeartbeat:
@@ -1260,6 +1330,15 @@ class ProvisionerWorker:
                         consequence="no companion profile adapter is configured for this deployment",
                     )
                 else:
+                    # The trip's own record of its companion, written the
+                    # moment the profile exists and BEFORE any chat is bound
+                    # (migration 0054). Until now this name lived only on a
+                    # binding row, so a trip whose binding was refused — a
+                    # returning organizer's second trip, every time — kept no
+                    # record of the companion sitting installed on the host
+                    # beside it, and `/switch` had nothing to bind to.
+                    _record_trip_companion(conn, trip_id, hermes_profile)
+
                     # Independently gated and independently non-fatal: a
                     # trip-mcp wiring failure must not block the chat binding
                     # below — the organizer should still land in the right
@@ -1332,7 +1411,22 @@ class ProvisionerWorker:
                 )
         else:
             try:
-                outcome = bind_chat_to_trip(conn, recipient_chat_id, trip_id, hermes_profile)
+                # `allow_retarget`: this is the organizer's own chat, at the
+                # end of the interview they just finished. bind_chat_to_trip
+                # still refuses unless THIS trip is the newer one, and no group
+                # binding ever reaches here.
+                outcome = bind_chat_to_trip(
+                    conn, recipient_chat_id, trip_id, hermes_profile,
+                    allow_retarget=True,
+                )
+                if outcome == "retargeted":
+                    # Loud on purpose: another trip just lost this chat. Here
+                    # they can take it back with /switch, and the introduction
+                    # about to be sent says so.
+                    logger.warning("provisioner.organizer_chat_retargeted", extra={
+                        "trip_id": trip_id,
+                        "consequence": "the organizer's chat now talks to this trip; /trips moves back to the previous one",
+                    })
                 # The same chat, as a PERSON. Deliberately here and not in its
                 # own step: the two facts are one fact — this chat is the
                 # organizer's — and separating them is how one of them came to

@@ -28,8 +28,16 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   return derived.length === expected.length && timingSafeEqual(derived, expected);
 }
 
-/** Same digest shape as identity.ts's digestTelegramId — irreversible, lowercased/trimmed so "A@B.com" and "a@b.com " match. */
-function digestEmail(email: string): string {
+/**
+ * Same digest shape as identity.ts's digestTelegramId — irreversible,
+ * lowercased/trimmed so "A@B.com" and "a@b.com " match.
+ *
+ * Exported because the operator's invitation path (organizer-invite.ts) has to
+ * recognise an address this table already knows, and a second implementation of
+ * "how an email becomes a digest" would diverge on exactly the inputs that
+ * matter: a capital letter, or a trailing space pasted out of a message.
+ */
+export function digestEmail(email: string): string {
   return "sha256:" + createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
 }
 

@@ -22,6 +22,7 @@ from control_plane_worker.provisioner import (
     DeployAdapter,
     ProvisionerWorker,
     bind_chat_to_trip,
+    _record_trip_companion,
     attach_profile_to_orphan_bindings,
 )
 from control_plane_worker.release_source import ReleaseSourceError
@@ -1485,6 +1486,74 @@ class ChatBindingLifecycleTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["trip_id"], self.fix_a["trip_id"])
         self.assertEqual(history[0]["closed_reason"], "organizer_reassigned")
+
+    def _make_b_the_newer_trip(self) -> None:
+        """The order the retarget rail turns on: B created after A."""
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute(
+                "UPDATE control_plane.trips SET created_at = now() - interval '1 day' WHERE id = %s",
+                (self.fix_a["trip_id"],),
+            )
+            self.conn.execute(
+                "UPDATE control_plane.trips SET created_at = now() WHERE id = %s",
+                (self.fix_b["trip_id"],),
+            )
+
+    def test_the_organizers_own_chat_follows_them_to_their_next_trip(self) -> None:
+        # The case a second trip always produces: their DM is bound to trip A
+        # when trip B is built, and they have just finished answering an
+        # interview for trip B. Refusing here is what left a returning
+        # organizer with a site link and no introduction at all.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        outcome = bind_chat_to_trip(
+            self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b", allow_retarget=True,
+        )
+        self.assertEqual(outcome, "retargeted")
+
+        open_row = self._open_row()
+        self.assertEqual(open_row["trip_id"], self.fix_b["trip_id"])
+        self.assertEqual(open_row["hermes_profile"], "companion-b")
+
+        # The first trip keeps its history and its reason, so a switch back has
+        # something to read and nothing about trip A is silently erased.
+        closed = [r for r in self._rows() if r["closed_at"] is not None]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(closed[0]["closed_reason"], "retargeted_to_newer_trip")
+
+    def test_an_older_trip_can_never_take_the_chat_back(self) -> None:
+        # A repair or a re-provision of the trip they moved on FROM must not
+        # steal the chat from the trip they moved on TO, even though it reaches
+        # the same call site with the same flag.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+
+        with self.assertRaises(BindingRefused):
+            bind_chat_to_trip(
+                self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a", allow_retarget=True,
+            )
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+
+    def test_without_the_flag_a_second_trip_is_still_refused(self) -> None:
+        # Every other caller — a family group above all — keeps the refusal.
+        self._make_b_the_newer_trip()
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(BindingRefused):
+            bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+
+    def test_a_trip_records_the_companion_it_was_built_with(self) -> None:
+        # Written whatever happens to a binding: a refused binding used to mean
+        # the profile's name existed nowhere in this database, and /switch had
+        # nothing to bind the chat to.
+        _record_trip_companion(self.conn, self.fix_a["trip_id"], "companion-a")
+        row = self.conn.execute(
+            "SELECT hermes_profile FROM control_plane.trips WHERE id = %s",
+            (self.fix_a["trip_id"],),
+        ).fetchone()
+        self.assertEqual(row["hermes_profile"], "companion-a")
 
     def test_only_one_binding_per_chat_can_be_open(self) -> None:
         # Migration 0029's partial unique index is the backstop under a race

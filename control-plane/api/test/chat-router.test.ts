@@ -237,6 +237,44 @@ describe("renderQuestion", () => {
     }
   });
 
+  /**
+   * A second trip is not a first trip, and the opening should not pretend it is.
+   *
+   * Someone who already has a Kinerary site and an assistant on their phone
+   * does not need nine paragraphs explaining what those are. What they do need
+   * is the one promise only a second trip raises — that the trip they already
+   * have is not being replaced by this one — because their private chat is
+   * about to start answering for the new trip, and nothing else in the
+   * conversation would tell them the old one survived.
+   */
+  test("a returning organizer gets the shorter opening, and the promise that matters", () => {
+    for (const language of ["he", "en"] as const) {
+      const first = renderDocumentOffer(language, false).text;
+      const again = renderDocumentOffer(language, true).text;
+
+      assert.notEqual(again, first, `${language}: a returning organizer got the first-timer's opening`);
+      assert.ok(again.length < first.length, `${language}: the returning opening is not shorter`);
+
+      // The promise. Not a string match on a whole sentence: the wording stays
+      // free to improve, the commitment does not.
+      assert.match(again, language === "he" ? /הטיול הקודם שלכם/ : /previous trip/, language);
+      assert.match(again, language === "he" ? /\/trips/ : /\/trips/, language);
+
+      // Still an invitation to send what they already have — the reason the
+      // opening exists at all does not change on a second trip.
+      assert.match(again, language === "he" ? /שלחו לי/ : /Send me/, language);
+
+      // The button is still the only way past it, in their language.
+      const buttons = renderDocumentOffer(language, true).replyMarkup!.inline_keyboard.flat();
+      assert.equal(buttons.length, 1);
+      assert.equal(buttons[0]!.callback_data, "c:nodoc");
+    }
+
+    // And the two languages are real translations of each other, not a
+    // fallback to English for the returning case only.
+    assert.notEqual(renderDocumentOffer("he", true).text, renderDocumentOffer("en", true).text);
+  });
+
   test("the opening does not make the same offer twice", () => {
     // The introduction already says what to send. Appending `documentOffer`
     // after it repeated the whole invitation one paragraph later, which is how
