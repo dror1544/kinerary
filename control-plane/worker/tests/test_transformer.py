@@ -211,6 +211,15 @@ class TransformerTests(unittest.TestCase):
         config = transform_intake(intake)
         self.assertIn("Extended family reunion", config["meta"]["title"])
 
+    def test_other_trip_type_reaches_the_companion_as_context(self) -> None:
+        intake = {**JAPAN_INTAKE, "trip_type": _choice_other("Extended family reunion")}
+        config = transform_intake(intake)
+        instructions = config["agent"]["standing_instructions"]
+        self.assertTrue(any(
+            item["text"]["en"] == "The organizer describes this trip as: Extended family reunion"
+            for item in instructions
+        ))
+
     def test_other_group_size_extracts_the_leading_number(self) -> None:
         # A stat "number" must actually be a number, not the organizer's
         # whole sentence — see _resolve_group_size.

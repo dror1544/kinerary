@@ -39,6 +39,7 @@ import {
   claimDueRouterPrompts,
   claimFloor,
   finalizeMultiChoiceForChat,
+  beginOtherAnswerForChat,
   markAwaitingMachine,
   claimStalledAgentTurns,
   openAgentTurn,
@@ -49,6 +50,7 @@ import {
   isAnswered,
   setLanguageForChat,
   scopeWithChoice,
+  submitPendingOtherForChat,
   type SessionView,
   type IntakeQuestion,
   askForMoreForChat,
@@ -408,6 +410,61 @@ export async function applyDecision(
       // Which reply is honest depends on what is actually pending — see the
       // interview_text doc in dispatch.ts.
       const session = await getSessionForChat(deps.db, decision.chatId);
+      if (session.ok && session.view.otherPending) {
+        // A custom choice is deliberately not treated like an ordinary text
+        // field. The organizer pressed Other because none of the known values
+        // fit, so the interviewer must verify that their words actually answer
+        // THIS question before they can become companion context.
+        if (!deps.modelRunner) {
+          await deps.telegram.sendMessage({
+            chatId: decision.chatId,
+            text: uiString("otherNeedsReview", session.view.language),
+          });
+          return;
+        }
+        const question = session.view.otherPending;
+        const reviewed = await interpretBurst(deps.modelRunner, {
+          sourceText: decision.text,
+          outstanding: [question.id],
+          language: session.view.language,
+          onScreen: question.id,
+        });
+        if (!reviewed.ok) {
+          await deps.telegram.sendMessage({
+            chatId: decision.chatId,
+            text: uiString("otherNeedsReview", session.view.language),
+          });
+          return;
+        }
+        const decisions = applyProposals(reviewed.payload.proposals, {
+          sourceText: decision.text,
+          outstanding: [question.id],
+          answered: [],
+          pendingQuestionId: question.id,
+        });
+        // Preserve exactly what the organizer wrote. The model validates the
+        // meaning; it is not allowed to paraphrase a personal trip descriptor
+        // on the way into the companion's context.
+        const accepted = decisions.accepted.find((entry) =>
+          entry.questionId === question.id
+          && entry.answer.kind === "choice_other"
+          && entry.answer.other_text === decision.text.trim(),
+        );
+        if (!accepted) {
+          await deps.telegram.sendMessage({
+            chatId: decision.chatId,
+            text: uiString("otherDoesntFit", session.view.language),
+          });
+          return;
+        }
+        const result = await submitPendingOtherForChat(deps.db, decision.chatId, decision.text);
+        if (!result.ok) {
+          await deps.telegram.sendMessage({ chatId: decision.chatId, text: "I couldn't record that — try again." });
+          return;
+        }
+        await sendNextStep(result.view, decision.chatId, deps, strings);
+        return;
+      }
       const pending = session.ok ? session.view.nextQuestion : null;
       const isTappable = pending?.type === "choice" || pending?.type === "multi_choice";
       if (!isTappable) {
@@ -677,6 +734,27 @@ async function applyInterviewCallback(
         text: rendered.text,
         replyMarkup: rendered.replyMarkup ?? undefined,
       });
+    }
+    return;
+  }
+
+  if (parsed.kind === "other") {
+    const question = findQuestion(parsed.questionId);
+    const result = await beginOtherAnswerForChat(deps.db, decision.chatId, parsed.questionId);
+    if (!result.ok || !question?.otherPrompt) {
+      await ack("That option is no longer available.");
+      return;
+    }
+    await ack();
+    if (decision.messageId) {
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: uiString("otherPrompt", result.view.language),
+        replyMarkup: undefined,
+      });
+    } else {
+      await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("otherPrompt", result.view.language) });
     }
     return;
   }

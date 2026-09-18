@@ -1488,6 +1488,8 @@ export interface SessionView {
    * itself. See `IntakeQuestion.satisfiedBy`.
    */
   unsettled?: Record<string, string>;
+  /** The choice whose Other button is awaiting literal organizer text. */
+  otherPending: IntakeQuestion | null;
 }
 
 function recordChoices(answers: AnswerStore): Record<string, RosterChoice[]> {
@@ -1563,6 +1565,8 @@ export interface InterviewUiState {
    * either of those IS the finalization.
    */
   multiPending?: string;
+  /** A choice's Other button was tapped; the next typed message is its value. */
+  otherPending?: string;
   /**
    * A document is being READ right now — not queued, being read.
    *
@@ -1714,6 +1718,7 @@ function parseUiState(raw: unknown): InterviewUiState {
     ...(record.opening_done === true ? { openingDone: true } : {}),
     ...(isInterviewPhase(record.pending_entry) ? { pendingEntry: record.pending_entry } : {}),
     ...(typeof record.multi_pending === "string" ? { multiPending: record.multi_pending } : {}),
+    ...(typeof record.other_pending === "string" ? { otherPending: record.other_pending } : {}),
     ...((suggestions) => (suggestions ? { suggestions } : {}))(parseSuggestions(record.suggestions)),
     ...(typeof record.reading_document_since === "string" ? { readingDocumentSince: record.reading_document_since } : {}),
   };
@@ -1732,6 +1737,7 @@ function serializeUiState(ui: InterviewUiState): string {
     ...(ui.openingDone ? { opening_done: true } : {}),
     ...(ui.pendingEntry ? { pending_entry: ui.pendingEntry } : {}),
     ...(ui.multiPending ? { multi_pending: ui.multiPending } : {}),
+    ...(ui.otherPending ? { other_pending: ui.otherPending } : {}),
     ...(ui.suggestions && Object.keys(ui.suggestions).length > 0 ? { suggestions: ui.suggestions } : {}),
     ...(ui.readingDocumentSince ? { reading_document_since: ui.readingDocumentSince } : {}),
   });
@@ -2182,6 +2188,7 @@ export async function startSession(
       pendingSay: null,
       pendingAskText: null,
       suggestions: {},
+      otherPending: null,
     };
     return { ok: true, sessionId, sessionToken: rawSessionToken, view };
   } catch (error) {
@@ -2814,6 +2821,7 @@ function buildSessionView(
       pendingSay: null,
       pendingAskText: null,
       suggestions: {},
+      otherPending: null,
     };
   }
   // The phase is the authority; `state` is its projection. Deriving it here the
@@ -2846,6 +2854,7 @@ function buildSessionView(
     choices: recordChoices(answers),
     subjects: recordSubjects(answers),
     unsettled: unsettledAnswers(answers),
+    otherPending: ui.otherPending ? INTAKE_QUESTIONS.find((q) => q.id === ui.otherPending) ?? null : null,
   };
 }
 
@@ -3703,6 +3712,35 @@ export async function toggleMultiChoiceForChat(
 }
 
 /**
+ * Starts the free-text half of a choice's Other path.
+ *
+ * This is persisted rather than held in the poller: a Telegram update can be
+ * delivered after a process restart, and the next message must still belong to
+ * the tapped question rather than being sent to the interviewer as prose.
+ */
+export async function beginOtherAnswerForChat(
+  db: pg.Pool,
+  chatId: string,
+  questionId: string,
+): Promise<GetSessionResult> {
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.allowsOther || question.type !== "choice") return { ok: false, reason: "NOT_FOUND" };
+  return updateUiStateForChat(db, chatId, (ui) => ({ ...ui, otherPending: questionId }));
+}
+
+/** Records the literal text requested by an Other button, only for that button. */
+export async function submitPendingOtherForChat(
+  db: pg.Pool,
+  chatId: string,
+  text: string,
+): Promise<SubmitAnswerResult> {
+  const current = await getSessionForChat(db, chatId);
+  const questionId = current.ok ? current.view.otherPending?.id : null;
+  if (!questionId) return { ok: false, reason: "NOT_FOUND" };
+  return submitAnswerForChat(db, chatId, questionId, "other", text);
+}
+
+/**
  * `Done` on a multi-select: the set on screen is the answer.
  *
  * Nothing new is recorded — every tick already wrote itself — so this only ends
@@ -3790,11 +3828,14 @@ async function submitAnswerVia(
     // and a finished answer on the question being ticked ends the ticking.
     // Any answer to a question, a tick included, is the organizer answering it
     // themselves — a suggestion for it has nothing left to ask.
+    const withoutOther = stored.otherPending === questionId
+      ? (({ otherPending: _drop, ...rest }) => rest)(stored)
+      : stored;
     const ui: InterviewUiState = withoutSuggestion(ticking
-      ? { ...stored, multiPending: questionId }
-      : stored.multiPending === undefined
-        ? stored
-        : (({ multiPending: _drop, ...rest }) => rest)(stored), questionId);
+      ? { ...withoutOther, multiPending: questionId }
+      : withoutOther.multiPending === undefined
+        ? withoutOther
+        : (({ multiPending: _drop, ...rest }) => rest)(withoutOther), questionId);
     const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
 
     await client.query(
