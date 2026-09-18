@@ -18,7 +18,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { answersForChat, getSessionForChat, queueInboundMessage } from "../src/interview.js";
+import { answersForChat, getSessionForChat, queueInboundMessage, submitAnswerForChat } from "../src/interview.js";
 import { setInterpretPath } from "../src/interpret.js";
 import { fakeRunner } from "../src/model-runner.js";
 import { MediaStore } from "../src/relay/media-store.js";
@@ -166,3 +166,69 @@ describe("an unsure reading from a document is kept, said, and asked about", () 
     });
   });
 });
+
+describe("the day-by-day plan is built behind the interview, not in front of it", () => {
+  // 2026-09-16, live, on the Mac: a 4-page PDF was read in 115s, and then the
+  // organizer waited another 51s for the next question while the day-by-day plan
+  // was extracted — the recap and the question were sent while the read still
+  // held its flag, so both were held back until the second model call finished.
+  // And the relay has one delivery loop: while it sat in that call, nothing else
+  // was read or sent, for any chat.
+  test("the next question is sent, and the loop is free, while the plan is still being built", { skip: SKIP }, async () => {
+    await withTwoChats(async (pool, a) => {
+      const telegram = new Recorder();
+      // Phases already on record, so the day-by-day pass has something to fill.
+      const seeded = await submitAnswerForChat(pool, a, "phases", null, undefined, [{ name: "Lisbon" }]);
+      assert.ok(seeded.ok);
+
+      let started!: () => void;
+      const itineraryStarted = new Promise<void>((resolve) => { started = resolve; });
+      let finish!: () => void;
+      const itineraryReleased = new Promise<void>((resolve) => { finish = resolve; });
+      const logged: string[] = [];
+
+      const store = new MediaStore();
+      const id = store.put({ bytes: Buffer.from(BOOKING), mime: "text/plain", filename: "booking.txt" } as never);
+      assert.ok(id);
+      await queueInboundMessage(pool, a, { message_id: "m1", text: "", media_urls: [`http://127.0.0.1:4312/relay/media/${id}`] } as never);
+      const deps = {
+        db: pool,
+        telegram,
+        connector: { pushInbound: () => true },
+        modelRunner: fakeRunner([JSON.stringify({
+          proposals: [{ questionId: "destination", value: { kind: "text", text: "Lisbon" }, confidence: 0.9, evidence: "Hotel Aurora Lisbon" }],
+          unclear: [],
+        })]),
+        media: { store },
+        extractItinerary: async () => {
+          started();
+          await itineraryReleased;
+          return { ok: false, reason: "EXTRACTION_FAILED" };
+        },
+      } as never;
+
+      const timeout = (ms: number, what: string) =>
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(what)), ms));
+      await Promise.race([
+        flushSettledInboundBursts(deps, (line) => logged.push(line), 0),
+        timeout(5000, "reading the document waited for the day-by-day plan"),
+      ]);
+      await Promise.race([itineraryStarted, timeout(5000, "the day-by-day pass never started")]);
+
+      const recapAt = telegram.sent.findIndex((m) => m.text.startsWith(uiString("documentRead", "en")));
+      assert.ok(recapAt >= 0, `the recap went out — sent: ${JSON.stringify(telegram.sent.map((m) => m.text))}`);
+      assert.ok(
+        telegram.sent.slice(recapAt + 1).some((m) => m.buttonData.some((d) => d.startsWith("a:trip_type:"))),
+        `and the next question after it, before the plan exists — buttons: ${JSON.stringify(telegram.sent.map((m) => m.buttonData))}`,
+      );
+
+      finish();
+      // Let the background pass finish before the pool closes under it.
+      for (let i = 0; i < 100 && !logged.some((l) => l.includes("itinerary_extract")); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(logged.some((l) => l.includes("interview.itinerary_extract_failed")), "the pass still ran to its end");
+    });
+  });
+});
+

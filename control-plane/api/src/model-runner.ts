@@ -115,17 +115,55 @@ export interface CliSpec {
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
 
+/** The Claude CLI's own `--effort` levels. */
+export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type ClaudeEffort = (typeof CLAUDE_EFFORT_LEVELS)[number];
+
+/**
+ * A task's effort from `<TASK>_EFFORT`, or undefined when unset.
+ *
+ * A value that is not a level THROWS. Passed through, `--effort meduim` makes
+ * every call exit non-zero — FAILED — and the router quietly does less for the
+ * whole interview, which is the silent downgrade this configuration keeps
+ * paying for. Refusing to start is the loud version of the same mistake.
+ */
+export function claudeEffort(name: string, env: NodeJS.ProcessEnv = process.env): ClaudeEffort | undefined {
+  const raw = (env[name] || "").trim().toLowerCase();
+  if (!raw) return undefined;
+  if ((CLAUDE_EFFORT_LEVELS as readonly string[]).includes(raw)) return raw as ClaudeEffort;
+  throw new Error(`${name}=${JSON.stringify(env[name])} is not an effort level (${CLAUDE_EFFORT_LEVELS.join("|")})`);
+}
+
 /**
  * The Claude CLI in print mode. `-p` prints one response and exits, which is
  * the whole interaction: no session, no tools, no memory.
+ *
+ * WITH AN EFFORT, the call is also cut loose from every settings file and MCP
+ * server the CLI would otherwise load — `--setting-sources ""` still reaches
+ * the login, so nothing else is needed. Without one it inherits them, as it
+ * always has: that is where its effort comes from, and on the Mac that was a
+ * personal `effortLevel: xhigh` meant for coding sessions. On 2026-09-16 a
+ * 4-page PDF's day-by-day extraction took 143s there against a 60s limit and
+ * failed every time; at `medium` it took 53s, as it does on the VM. Settings
+ * are only dropped when an effort replaces them, because the VM still takes
+ * its `medium` from CLAUDE_CONFIG_DIR's settings.json, and dropping that
+ * unasked would fall back to the CLI's default — the effort at which the VM
+ * once mapped answers to the wrong question (2026-09-11).
  */
-export function claudeSpec(model: string, timeoutMs = DEFAULT_TIMEOUT_MS, bin = "claude"): CliSpec {
+export function claudeSpec(
+  model: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  bin = "claude",
+  effort?: ClaudeEffort,
+): CliSpec {
   return {
     bin,
     model,
     timeoutMs,
     maxAttempts: 2,
-    args: (prompt, m) => ["-p", prompt, "--model", m],
+    args: (prompt, m) => effort
+      ? ["-p", prompt, "--model", m, "--effort", effort, "--setting-sources", "", "--strict-mcp-config"]
+      : ["-p", prompt, "--model", m],
   };
 }
 
@@ -671,6 +709,7 @@ export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto",
  *   INTERPRET_RUNNER=openrouter|claude|hermes   INTERPRET_MODEL=<id|profile>
  *   EXTRACT_RUNNER=openrouter|hermes            EXTRACT_MODEL=<id|profile>
  *   INTERPRET_TIMEOUT_MS / EXTRACT_TIMEOUT_MS
+ *   INTERPRET_EFFORT / EXTRACT_EFFORT=low|medium|high|xhigh|max   (claude only — see claudeSpec)
  */
 export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): StructuredModelRunner | undefined {
   const key = openRouterKey(env);
@@ -686,7 +725,9 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
       return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
     }
     if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
-    if (kind === "claude") return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude") });
+    if (kind === "claude") {
+      return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude", claudeEffort(`${task.toUpperCase()}_EFFORT`, env)) });
+    }
     if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
     return undefined;
   };

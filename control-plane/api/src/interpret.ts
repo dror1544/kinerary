@@ -25,6 +25,7 @@ import {
   validateAnswer,
   type IntakeAnswer,
   type IntakeQuestion,
+  type AnswerStore,
 } from "./interview.js";
 import type { RunnerFailure, StructuredModelRunner } from "./model-runner.js";
 import { yearlessDateHints } from "./yearless-dates.js";
@@ -488,6 +489,8 @@ export type RejectReason =
   | "INCOMPLETE_ANSWER";
 
 export interface AcceptedProposal {
+  /** True when this replaced an answer the organizer had already given. */
+  correction?: boolean;
   questionId: string;
   answer: IntakeAnswer;
   proposal: ProposedAnswer;
@@ -539,6 +542,24 @@ export interface ApplyProposalsContext {
   outstanding: readonly string[];
   /** Question ids that already have an answer. */
   answered: readonly string[];
+  /**
+   * Whether a later message may CORRECT one of those answers.
+   *
+   * 2026-09-16, the chaos run: "Actually my mother Ruth Cohen, 70, is joining us
+   * too" changed nothing, because the travellers question was already answered —
+   * and neither could the stops, once a document had filled them in. A person
+   * correcting themselves is the most ordinary thing in an interview.
+   *
+   * On for what the organizer TYPES, off for what a document says: a booking that
+   * covers one leg of a trip must not quietly replace answers a person gave.
+   */
+  allowCorrections?: boolean;
+  /**
+   * The answers on record, so a correction to a structured one (the travellers,
+   * the stops) is MERGED into it rather than replacing it with just the new part.
+   * Required for corrections; without it a correction still writes, just whole.
+   */
+  answers?: AnswerStore;
   unclear?: readonly UnclearQuestion[];
   questions?: readonly IntakeQuestion[];
   /** Default 0.7. One threshold, not a per-question table, until there is
@@ -567,6 +588,12 @@ export interface ApplyProposalsContext {
   pendingQuestionId?: string | null;
 }
 
+/**
+ * A correction overwrites an answer the organizer already gave, so it asks for
+ * more than a first read does: the gate's ordinary floor lets a volunteered
+ * side-reading in, and a volunteered side-reading must never replace an answer.
+ */
+const CORRECTION_MIN_CONFIDENCE = 0.8;
 export const DEFAULT_MIN_CONFIDENCE = 0.7;
 
 // ── Merging a structured answer the model split ──────────────────────────────
@@ -732,6 +759,17 @@ export function applyProposals(
   const outstanding = new Set(ctx.outstanding);
   const answered = new Set(ctx.answered);
 
+  /**
+   * A correction to a structured answer ADDS to it. "My mother is joining too"
+   * names one traveller and means six, not one; "we're also going to Naxos" adds
+   * a stop. Anything else replaces, which is what a corrected date or name means.
+   */
+  const corrected = (answer: IntakeAnswer, questionId: string): IntakeAnswer => {
+    const existing = ctx.answers?.[questionId];
+    if (answer.kind !== "structured" || existing?.kind !== "structured") return answer;
+    return { ...answer, data: mergeStructuredParts([existing.data, answer.data]) };
+  };
+
   const accepted: AcceptedProposal[] = [];
   const rejected: RejectedProposal[] = [];
   const suggested: SuggestedProposal[] = [];
@@ -793,10 +831,17 @@ export function applyProposals(
   });
 
   // What a proposal must pass on its own merits, before anything is combined.
+  /** An accepted proposal for a question that already has an answer. */
+  const correcting = (p: ProposedAnswer) => Boolean(ctx.allowCorrections) && answered.has(p.questionId);
+
   const ownMerits = (p: ProposedAnswer): { reason: RejectReason; detail?: string } | null => {
     if (RETIRED_QUESTION_IDS.has(p.questionId)) return { reason: "NOT_OUTSTANDING", detail: "retired question" };
-    if (answered.has(p.questionId)) return { reason: "ALREADY_ANSWERED" };
-    if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
+    if (answered.has(p.questionId)) {
+      if (!ctx.allowCorrections) return { reason: "ALREADY_ANSWERED" };
+      if (p.confidence < CORRECTION_MIN_CONFIDENCE) {
+        return { reason: "ALREADY_ANSWERED", detail: "a correction has to be a confident read" };
+      }
+    } else if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
     if (p.confidence < minConfidence && p.questionId !== ctx.pendingQuestionId) {
       return { reason: "LOW_CONFIDENCE" };
     }
@@ -827,7 +872,7 @@ export function applyProposals(
       const merged = mergedProposal(ordered);
       const validated = validateProposed(merged, questions);
       if (validated.ok) {
-        accepted.push({ questionId: primary.questionId, answer: validated.answer, proposal: merged, mergedFrom: ordered.length });
+          accepted.push({ questionId: primary.questionId, answer: corrected(validated.answer, primary.questionId), proposal: merged, mergedFrom: ordered.length, correction: correcting(primary) });
         return;
       }
       // Refused as a whole: fall back to exactly what the gate did before
@@ -838,7 +883,7 @@ export function applyProposals(
 
     const validated = validateProposed(primary, questions);
     if (!validated.ok) return reject(primary, validated.reason, validated.detail);
-    accepted.push({ questionId: primary.questionId, answer: validated.answer, proposal: primary });
+    accepted.push({ questionId: primary.questionId, answer: corrected(validated.answer, primary.questionId), proposal: primary, correction: correcting(primary) });
   };
 
   proposals.forEach((proposal, i) => {
@@ -851,8 +896,12 @@ export function applyProposals(
     }
 
     if (RETIRED_QUESTION_IDS.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING", "retired question");
-    if (answered.has(proposal.questionId)) return reject(proposal, "ALREADY_ANSWERED");
-    if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
+    if (answered.has(proposal.questionId)) {
+      if (!ctx.allowCorrections) return reject(proposal, "ALREADY_ANSWERED");
+      if (proposal.confidence < CORRECTION_MIN_CONFIDENCE) {
+        return reject(proposal, "ALREADY_ANSWERED", "a correction has to be a confident read");
+      }
+    } else if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
     if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
       suggestFrom([proposal]);
@@ -864,7 +913,7 @@ export function applyProposals(
 
     const validated = validateProposed(proposal, questions);
     if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
-    accepted.push({ questionId: proposal.questionId, answer: validated.answer, proposal });
+    accepted.push({ questionId: proposal.questionId, answer: corrected(validated.answer, proposal.questionId), proposal, correction: correcting(proposal) });
   });
 
   // Anything the model was unsure of, and anything we refused, is a question
@@ -958,6 +1007,17 @@ export interface BuildInterpretPromptArgs {
   outstanding: readonly string[];
   language: string;
   /**
+   * Questions that already HAVE an answer, with what that answer says now.
+   *
+   * Without these the model is shown only what is missing, so a message that
+   * corrects something already answered produces no proposal at all — not a
+   * refused one, none. 2026-09-16, live: "the allergy is only my wife's" and a
+   * correction to the travellers both returned zero proposals, and the
+   * organizer watched the interview ignore them. `applyProposals` still decides
+   * whether a proposal for one of these may be written (`allowCorrections`).
+   */
+  correctable?: readonly { id: string; current: string }[];
+  /**
    * The question actually on the organizer's screen, if any.
    *
    * Without it a bare reply is unreadable. Live on 2026-09-08 the organizer was
@@ -1016,6 +1076,16 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
+    ...(args.correctable?.length
+      ? [
+          `Already answered — propose one of these ONLY if this message plainly corrects it`,
+          `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
+          `and a message that merely repeats what they already said is not one either. For a list`,
+          `(the travellers, the stops), propose only what is being ADDED or CHANGED, not the whole list.`,
+          ...args.correctable.map((q) => `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`),
+          ``,
+        ]
+      : []),
     `Return exactly:`,
     `{"proposals":[{"questionId":"...","value":{"kind":"choice","optionId":"..."},`,
     ` "confidence":0.0,"evidence":"...","sourceMessageId":"..."}],`,

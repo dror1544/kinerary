@@ -13,7 +13,7 @@ standard library. A fixture generator that needs `pip install` is a fixture
 generator that gets skipped in CI.
 
 Usage:
-    make_documents.py <scenario> <out-dir>      # japan | multi | (manual: none)
+    make_documents.py <scenario> <out-dir>      # japan | multi | chaos | (manual: none)
 """
 from __future__ import annotations
 
@@ -123,6 +123,31 @@ SCENARIOS: dict[str, dict] = {
         "documents": {},
         "expect_answers": ["destination", "departure_date", "return_date", "phases"],
         "expect_in_phases": ["Lisbon", "Porto"],
+    },
+    # Scenario 4 — the chaos organizer (control-plane/api/tools/organizer-chaos.ts).
+    # Its documents arrive OUT OF PLACE, in the middle of unrelated questions: one
+    # that belongs to the trip, and one that is not about any trip at all.
+    "chaos": {
+        "destination": "Greece",
+        "departure_date": "2027-07-12",
+        "return_date": "2027-07-26",
+        "documents": {
+            "hotel-athens.pdf": [
+                "Plaka Hills Hotel - Reservation",
+                "Athens, Greece",
+                "Guests: 5 (2 adults, 3 children)",
+                "Check-in: 12 Jul 2027    Check-out: 16 Jul 2027",
+                "Confirmation: PH-88213",
+            ],
+            "shopping-list.md": [
+                "# Before the flight",
+                "- sunscreen",
+                "- plug adapters",
+                "- snacks for the ferry",
+            ],
+        },
+        "expect_answers": ["destination", "departure_date", "return_date", "phases"],
+        "expect_in_phases": ["Athens", "Naxos", "Santorini"],
     },
 }
 

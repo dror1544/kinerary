@@ -51,6 +51,7 @@ import {
 import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
+  groupBindingTokenIsOwn,
   issueGroupBindingToken,
   redeemGroupBindingToken,
 } from "../group-binding.js";
@@ -213,6 +214,12 @@ export interface DispatchStrings {
    * a guess to whoever is guessing, in a room the organizer does not control.
    */
   groupTokenRefused: string;
+  /**
+   * Their own live code, pasted in their own chat with the bot instead of in
+   * the family group. Says where it goes, rather than quietly doing something
+   * else with it.
+   */
+  groupTokenBelongsInGroup: string;
   /** Bound, but the trip has no introduction facts stored to greet with. */
   groupBoundNoIntro: string;
 }
@@ -240,6 +247,8 @@ export const DEFAULT_STRINGS: DispatchStrings = {
     "I can only set up a group from your own chat with me, once your trip site is ready.",
   groupTokenRefused:
     "That code didn't work here. Ask the trip organizer to send you a fresh one.",
+  groupTokenBelongsInGroup:
+    "That's your group code — it works in the family group, not here. Add me to the group, make me an admin, and post it there.",
   groupBoundNoIntro: "This group is connected to the trip.",
   unbound:
     "I don't have a trip for this chat yet. Open the link from your Kinerary signup to get started.",
@@ -411,7 +420,13 @@ export async function dispatchUpdate(
           reply: {
             chatId,
             text:
-              outcome.reason === "NO_PAYLOAD"
+              // A payload we could never have issued is a BAD LINK, not a
+              // bare `/start`. Both reach `startFromDeepLink` with no payload
+              // — nothing malformed is allowed near the token lookup — so the
+              // parse result, not the outcome, is what tells them apart.
+              // Without this, `/start <anything>` answered "Welcome to
+              // Kinerary", which reads as though the code was accepted.
+              outcome.reason === "NO_PAYLOAD" && !parsed.malformed
                 ? strings.noPayload
                 : outcome.reason === "NOT_PRIVATE_CHAT"
                   ? strings.notPrivate
@@ -486,6 +501,38 @@ export async function dispatchUpdate(
         },
         { includePassword: options.groupIntroIncludesPassword ?? true },
       ),
+    };
+  }
+
+  // THE SAME CODE, PASTED IN THE WRONG CHAT.
+  //
+  // A group code posted in the organizer's own DM had two ways to go and
+  // neither said anything true. As bare text it was not a command, so it fell
+  // through to routing and reached the COMPANION, which answered it as
+  // conversation — Dror, 2026-09-18: "I gave it invalid token and got a
+  // greeting, it should have said unknown". With `/group` in front it hit the
+  // issuance branch below, whose argument is ignored, and minted a brand new
+  // token — so a wrong code produced a working one and a right code was
+  // silently replaced.
+  //
+  // Checked here: after the group redemption above (which owns the case where
+  // this belongs) and before both routing and issuance.
+  //
+  // `groupBindingTokenIsOwn` reads, never redeems — a DM is not a group and
+  // binding one would rebind the very channel the code arrived on. It asks
+  // only whether the code is this chat's own live one, so the answer carries
+  // nothing the sender did not already hold; everything else gets the same
+  // flat refusal a group would give.
+  const dmToken = message.chat?.type === "private" ? extractGroupBindingToken(text) : null;
+  if (dmToken) {
+    const route = await resolveChatRoute(db, chatId);
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const own = route.kind === "companion" && senderId !== null
+      && await groupBindingTokenIsOwn(db, dmToken, route.tripId, senderId);
+    log(structuredLog("info", "trip_bot.group_token_in_dm", { own }));
+    return {
+      kind: "reply",
+      reply: { chatId, text: own ? strings.groupTokenBelongsInGroup : strings.groupTokenRefused },
     };
   }
 

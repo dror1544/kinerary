@@ -524,7 +524,10 @@ export function registerPortalRoutes(app: FastifyInstance, deps: PortalDependenc
     const member = await membership(deps, tripId, user.id);
     if (!member || member.role !== "owner" || !member.dashboard_access) return reply.code(404).send({ error: "NOT_FOUND" });
     const generated = await generatePlan(deps.db, tripId, opaque("corr", 12));
-    if (!generated.ok) return reply.code(generated.reason === "NO_COMPATIBLE_RELEASE" ? 422 : 409).send({ error: generated.reason });
+    if (!generated.ok) {
+      const status = generated.reason === "NO_COMPATIBLE_RELEASE" || generated.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422 : 409;
+      return reply.code(status).send({ error: generated.reason });
+    }
     await recordFunnelEvent(deps.db, "provisioning_requested", { userId: user.id, tripId });
     return reply.code(201).send({ planId: generated.planId, digest: generated.planDigest, planStatus: "pending_approval" });
   });

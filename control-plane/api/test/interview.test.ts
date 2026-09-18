@@ -1874,3 +1874,160 @@ describe("deriving a timezone from what the organizer said", () => {
     assert.equal(ianaZoneFor("tel aviv"), "Asia/Jerusalem");
   });
 });
+
+describe("the organizer is someone on the roster (DB)", () => {
+  // 2026-09-15, live: a roster spelled only in English letters, an organizer who
+  // answered in Hebrew, and an interview that confirmed anyway — so the trip was
+  // built with no companion. An organizer answer is settled only by exactly one
+  // traveller, and nothing confirms until it is.
+  let pool: pg.Pool;
+
+  before(async () => {
+    if (SKIP) return;
+    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    await runMigrations(pool);
+  });
+
+  after(async () => {
+    if (SKIP) return;
+    await pool?.end();
+  });
+
+  async function begin(fix: TestFixture) {
+    const started = await startSession(fix.pool, await issuedEnrollmentToken(fix));
+    if (!started.ok) throw new Error("unreachable");
+    return started;
+  }
+
+  async function storedOrganizer(p: pg.Pool, sessionId: string): Promise<string | undefined> {
+    const { rows } = await p.query<{ answers: Record<string, { text?: string }> }>(
+      "SELECT answers FROM control_plane.intake_sessions WHERE id = $1",
+      [sessionId],
+    );
+    return rows[0]?.answers.organizer_identity?.text;
+  }
+
+  test("a Hebrew answer for a roster spelled only in English is recorded in the roster's spelling, and confirms", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { sessionToken, sessionId } = await begin(fix);
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
+      await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [
+        { name: "Nir", name_en: "Nir", age: 40, family: "Test" },
+        { name: "Maya", name_en: "Maya", age: 38, family: "Test" },
+      ]);
+      const answered = await submitAnswer(fix.pool, sessionToken, "organizer_identity", "ניר");
+      assert.equal(answered.ok, true);
+      if (!answered.ok) throw new Error("unreachable");
+      assert.equal(await storedOrganizer(fix.pool, sessionId), "Nir", "the roster's own spelling is what is kept");
+      assert.equal(answered.view.unsettled?.organizer_identity, undefined);
+      assert.equal((await confirmIntake(fix.pool, sessionToken)).ok, true);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a name that sounds like two travellers is never assigned, is asked again with the roster, and cannot confirm", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { sessionToken, sessionId } = await begin(fix);
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
+      await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [
+        { name: "Dana", age: 40, family: "Test" },
+        { name: "Dina", age: 38, family: "Test" },
+      ]);
+      const answered = await submitAnswer(fix.pool, sessionToken, "organizer_identity", "דנה");
+      assert.equal(answered.ok, true);
+      if (!answered.ok) throw new Error("unreachable");
+      assert.equal(await storedOrganizer(fix.pool, sessionId), "דנה", "kept as written, so asking again can quote it");
+      assert.equal(answered.view.unsettled?.organizer_identity, "דנה");
+      assert.equal(answered.view.nextQuestion?.id, "organizer_identity", "the question comes back");
+      assert.deepEqual(answered.view.choices?.organizer_identity?.map((c) => c.value), ["Dana", "Dina"]);
+
+      const confirmed = await confirmIntake(fix.pool, sessionToken);
+      assert.equal(confirmed.ok, false);
+      if (confirmed.ok) throw new Error("unreachable");
+      assert.equal(confirmed.reason, "NOT_ALL_REQUIRED_ANSWERED");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("someone who is not on the roster cannot complete the interview; a roster name can", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { sessionToken } = await begin(fix);
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
+      await submitAnswer(fix.pool, sessionToken, "organizer_identity", "Grandma Ruth");
+      const refused = await confirmIntake(fix.pool, sessionToken);
+      assert.equal(refused.ok, false);
+      if (refused.ok) throw new Error("unreachable");
+      assert.equal(refused.reason, "NOT_ALL_REQUIRED_ANSWERED");
+
+      await submitAnswer(fix.pool, sessionToken, "organizer_identity", "Test Traveler");
+      assert.equal((await confirmIntake(fix.pool, sessionToken)).ok, true);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a name given before the roster is settled, in the roster's spelling, once the roster arrives", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const { sessionToken, sessionId } = await begin(fix);
+      const early = await submitAnswer(fix.pool, sessionToken, "organizer_identity", "ניר");
+      assert.equal(early.ok, true);
+      if (!early.ok) throw new Error("unreachable");
+      assert.equal(early.view.unsettled?.organizer_identity, "ניר", "no roster yet to name anyone from");
+
+      await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [
+        { name: "Nir", name_en: "Nir", age: 40 },
+        { name: "Maya", name_en: "Maya", age: 38 },
+      ]);
+      assert.equal(await storedOrganizer(fix.pool, sessionId), "Nir");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+});
+
+describe("the trip's dates are in order (DB)", () => {
+  let pool: pg.Pool;
+
+  before(async () => {
+    if (SKIP) return;
+    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    await runMigrations(pool);
+  });
+
+  after(async () => {
+    if (SKIP) return;
+    await pool?.end();
+  });
+
+  test("a return before the departure is asked again and cannot confirm, until a real one arrives", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const started = await startSession(fix.pool, await issuedEnrollmentToken(fix));
+      if (!started.ok) throw new Error("unreachable");
+      const { sessionToken } = started;
+      await answerAllRequiredQuestions(fix.pool, sessionToken);
+      await submitAnswer(fix.pool, sessionToken, "return_date", "2027-07-01");
+      const reversed = await submitAnswer(fix.pool, sessionToken, "departure_date", "2027-07-12");
+      assert.equal(reversed.ok, true);
+      if (!reversed.ok) throw new Error("unreachable");
+      assert.equal(reversed.view.unsettled?.return_date, "2027-07-01", "the departure arriving second re-opens the return");
+      assert.equal(reversed.view.nextQuestion?.id, "return_date");
+
+      const refused = await confirmIntake(fix.pool, sessionToken);
+      assert.equal(refused.ok, false);
+      if (refused.ok) throw new Error("unreachable");
+      assert.equal(refused.reason, "NOT_ALL_REQUIRED_ANSWERED");
+
+      await submitAnswer(fix.pool, sessionToken, "return_date", "2027-07-26");
+      assert.equal((await confirmIntake(fix.pool, sessionToken)).ok, true);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+});
