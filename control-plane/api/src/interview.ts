@@ -14,6 +14,56 @@ import {
   type Language,
 } from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
+import { listTripDocuments } from "./document-registry.js";
+import { canonical, entryIdentity } from "./answer-merge.js";
+import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
+
+/**
+ * Which documents support which confirmed answers, pinned to the version being
+ * confirmed.
+ *
+ * Provenance rows name an entry by its identity (answer-merge.ts
+ * `entryIdentity`). That is right while an answer is still changing, and wrong
+ * for anything downstream: the provisioning worker is Python, and re-deriving
+ * "the same entry" there would be a second copy of the identity rules, free to
+ * drift from this one. So identity is resolved ONCE, here, against the answers
+ * this version freezes, into a plain index into that answer's list. The version
+ * is immutable, so the index is too.
+ *
+ * A source whose entry no longer resolves to exactly one entry — renamed,
+ * removed, or now indistinguishable from another — is left out rather than
+ * guessed. A missing link reads as "no source shown"; a guessed one would put
+ * one hotel's voucher on another hotel's card.
+ */
+async function confirmedSources(
+  db: Pick<pg.PoolClient, "query">,
+  tripId: string,
+  answers: AnswerStore,
+): Promise<{ questionId: string; index: number | null; documentId: string; disposition: SourceDisposition; paths: string[] }[]> {
+  const strength: Partial<Record<SourceDisposition, number>> = { accepted: 3, filled: 2, unchanged: 1 };
+  const chosen = new Map<string, { questionId: string; index: number | null; documentId: string; disposition: SourceDisposition; paths: string[] }>();
+  for (const row of await listAnswerSources(db, tripId)) {
+    if (!strength[row.disposition]) continue;
+    const answer = answers[row.questionId] as { data?: unknown } | undefined;
+    if (!answer) continue;
+    let index: number | null = null;
+    if (row.entryKey !== "") {
+      const data = Array.isArray(answer.data) ? answer.data : [];
+      const matches = data.flatMap((entry, i) => (entryIdentity(entry) === row.entryKey ? [i] : []));
+      if (matches.length !== 1) continue;
+      index = matches[0]!;
+    }
+    const key = `${row.questionId}|${index ?? ""}|${row.documentId}`;
+    const held = chosen.get(key);
+    // Which fields a document supplied is kept across its rows: a voucher that
+    // FILLED an accommodation is the right source for a hotel card, where the
+    // plan that merely named the stay is not.
+    const paths = [...new Set([...(held?.paths ?? []), ...row.paths])];
+    const disposition = !held || strength[row.disposition]! > strength[held.disposition]! ? row.disposition : held.disposition;
+    chosen.set(key, { questionId: row.questionId, index, documentId: row.documentId, disposition, paths });
+  }
+  return [...chosen.values()];
+}
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -220,6 +270,50 @@ export interface IntakeQuestion {
  * "real" name, which is not something to adjudicate from a control-plane
  * module.
  */
+/**
+ * A date the site can use, or a reason it cannot. `YYYY-MM-DD` and a real day.
+ *
+ * Checked because the transformer reads nothing else: a stop saved with
+ * `start: "2 May"` was accepted here, stored in the canonical intake, and
+ * provisioned with no dates at all — no error anywhere (a document's "Rome 2-6
+ * May" was extracted exactly like that on 2026-09-13).
+ */
+function isoDateProblem(value: unknown, where: string): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const parsed = new Date(`${value}T00:00:00Z`);
+    if (!Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value) return null;
+  }
+  return `${where} must be a date written YYYY-MM-DD (got ${JSON.stringify(value).slice(0, 40)}). ` +
+    "Convert it using the trip's year, or leave the field out — never store the date as it was written.";
+}
+
+/** Every date field of a stop list: each stop's start and end, and each day's date. */
+function phaseDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, stop] of data.entries()) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    const problem = isoDateProblem(s.start, `phases[${i}].start`) ?? isoDateProblem(s.end, `phases[${i}].end`);
+    if (problem) return problem;
+    for (const [j, day] of (Array.isArray(s.days) ? s.days : []).entries()) {
+      const dayProblem = day && typeof day === "object" ? isoDateProblem((day as Record<string, unknown>).date, `phases[${i}].days[${j}].date`) : null;
+      if (dayProblem) return dayProblem;
+    }
+  }
+  return null;
+}
+
+function anchorDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, anchor] of data.entries()) {
+    if (!anchor || typeof anchor !== "object") continue;
+    const problem = isoDateProblem((anchor as Record<string, unknown>).date, `travel_anchors[${i}].date`);
+    if (problem) return problem;
+  }
+  return null;
+}
+
 function hasNamedTraveler(data: unknown): boolean {
   if (!Array.isArray(data)) return false;
   return data.some((entry) => {
@@ -417,11 +511,18 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // confirmation, because a stay named without a code is the common case.
     dataExample: "[{\"name\": \"Reykjavik\", \"name_en\": \"Reykjavik\", \"start\": \"2027-03-04\", \"end\": \"2027-03-07\", \"accommodation\": {\"name\": \"Hotel Borg\", \"confirmation\": \"HB-2217\"}, \"planned\": [\"Hallgrimskirkja\"]}, {\"name\": \"Vik\", \"name_en\": \"Vik\", \"start\": \"2027-03-07\", \"end\": \"2027-03-09\", \"accommodation\": {\"name\": \"Hotel Kria\"}}]",
     required: true,
+    checkComplete: phaseDatesProblem,
   },
   {
     id: "travel_anchors",
     type: "structured",
-    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
+    // Tickets and tours are named because the transformer provisions them
+    // (activity, tour, ticket and reservation map to `attraction`) and the
+    // example shows one. Asked only about "flights, hotels, or cars", a model
+    // left a booked e-ticket, a shuttle voucher and an event parking pass out
+    // of travel_anchors on 2026-09-13 — "no flight, hotel, or car booking
+    // confirmation number" — and their references with them (issue #62).
+    prompt: "Anything already booked — flights, trains, hotels, cars, tickets or tours? List them with confirmation numbers.",
     dataShape: "array",
     // One real `type`, not "flight|hotel|car": a list of alternatives shown as
     // a value is a value a model can copy. The transformer reads any type
@@ -429,6 +530,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // an optional HH:MM `time` puts a booked visit at its hour.
     dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
+    checkComplete: anchorDatesProblem,
   },
   {
     id: "constraints",
@@ -1727,9 +1829,29 @@ export type SubmitAnswerResult =
   | { ok: true; view: SessionView }
   | {
       ok: false;
-      reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER";
+      reason: "NOT_FOUND" | "SESSION_CONFIRMED" | "UNKNOWN_QUESTION" | "UNKNOWN_OPTION" | "OTHER_TEXT_REQUIRED" | "OTHER_NOT_ALLOWED" | "TEXT_TOO_LONG" | "TEXT_REQUIRED" | "CHOICE_REQUIRED" | "DATA_REQUIRED" | "DATA_WRONG_SHAPE" | "OPTIONS_REQUIRED" | "INCOMPLETE_ANSWER"
+        /** The answer changed since the caller read it — see `AnswerPrecondition`. */
+        | "STALE_ANSWER";
       detail?: string;
     };
+
+/**
+ * The answer a write was computed FROM.
+ *
+ * A document read takes minutes, and what it writes is a merge of what it read
+ * into the answer held when it started. Without this, a write that lands after
+ * the organizer corrected that answer by hand — or after another document
+ * landed first — replaces their work with a minutes-old view of it, silently,
+ * under a lock that only guarantees the overwrite is tidy. With it, the write
+ * is refused as STALE_ANSWER and the caller merges again against what is there
+ * now.
+ *
+ * `held` is the stored answer exactly as read (the whole `{kind, …}` record), or
+ * undefined when the question was unanswered.
+ */
+export interface AnswerPrecondition {
+  held: unknown;
+}
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
@@ -3394,11 +3516,13 @@ export async function submitAnswerForChat(
   otherText?: string,
   structuredData?: unknown,
   optionIds?: readonly string[],
+  precondition?: AnswerPrecondition,
 ): Promise<SubmitAnswerResult> {
   const result = await submitAnswerVia(
     db,
     { by: "chat", chatId },
     questionId, optionId, otherText, structuredData, optionIds,
+    false, precondition,
   );
   // A recorded answer is the main thing that can move the interview on — the
   // last required one ends `essentials`, the last optional one ends `optional`.
@@ -3422,6 +3546,7 @@ async function submitAnswerVia(
   optionIds?: readonly string[],
   /** A tick on a multi-select keyboard, not a finished answer. */
   ticking = false,
+  precondition?: AnswerPrecondition,
 ): Promise<SubmitAnswerResult> {
   const client = await db.connect();
   try {
@@ -3430,6 +3555,12 @@ async function submitAnswerVia(
     const session = await lockSession(client, locator);
     if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
     if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
+    // Checked under the row lock, so nothing can change the answer between this
+    // comparison and the write below.
+    if (precondition && canonical(session.answers[questionId]) !== canonical(precondition.held)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "STALE_ANSWER" };
+    }
 
     const validation = validateAnswer(questionId, optionId, otherText, INTAKE_QUESTIONS, structuredData, optionIds);
     if (!validation.ok) {
@@ -3567,13 +3698,36 @@ async function confirmIntakeVia(
     const versionId = generateId("intk");
     const artifactRef = `intake:sessions:${session.id}:v${nextVersion}`;
 
+    // WHICH DOCUMENTS this version was built from, as a manifest of the trip's
+    // registry rather than a copy of their text. The session's own
+    // `source_document` held only the last document read — each upload
+    // overwrote the one before — so a version built from four confirmations
+    // recorded one. The text lives on the extraction rows; this names the
+    // documents so the version can be traced back to them. The agent path
+    // still stages `source_document` itself and has no registry rows, so it
+    // keeps what it staged.
+    const registered = await listTripDocuments(client, session.trip_id);
+    const sourceDocument = registered.length > 0
+      ? {
+          documents: registered.map((doc) => ({
+            documentId: doc.id,
+            digest: doc.contentDigest,
+            filename: doc.filename,
+            byteSize: doc.byteSize,
+            mime: doc.mime,
+            stored: doc.ingestState === "stored",
+          })),
+          sources: await confirmedSources(client, session.trip_id, session.answers),
+        }
+      : session.source_document ?? null;
+
     await client.query(
       `INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data, source_document, language)
        VALUES ($1, $2, $3, $4, $5, now(), $6, $7::jsonb, $8::jsonb, $9)`,
       [
         versionId, session.trip_id, nextVersion, artifactRef, intakeDigest,
         INTAKE_SCHEMA_VERSION, JSON.stringify(session.answers),
-        session.source_document ? JSON.stringify(session.source_document) : null,
+        sourceDocument ? JSON.stringify(sourceDocument) : null,
         // The language the interview was actually held in, copied onto the
         // version because the SESSION does not survive: it is deleted on reset
         // and superseded on correction, while the transformer reads the

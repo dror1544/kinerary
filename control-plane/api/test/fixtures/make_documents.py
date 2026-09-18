@@ -48,6 +48,17 @@ SCENARIOS: dict[str, dict] = {
         "expect_answers": ["destination", "departure_date", "return_date", "phases"],
         "expect_in_phases": ["Tokyo", "Hakone", "Kyoto", "Osaka"],
         "expect_planned": ["Tokyo Skytree", "TeamLab Planets"],
+        # Fact-level labels for tools/extract-eval.ts: each stop with its exact
+        # dates, the references a booking actually carries, and the ones it must
+        # NOT produce. "Quote 2026-4471" is a price quote, not a confirmation.
+        "expect_stops": [
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Hakone", "start": "2026-09-23", "end": "2026-09-24"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+            {"name": "Osaka", "start": "2026-09-27", "end": "2026-09-30"},
+        ],
+        "expect_refs": [],
+        "forbid_refs": ["2026-4471"],
     },
     # Scenario 2 — several documents, several formats, each carrying a
     # DIFFERENT kind of fact. The point is that one trip is assembled from all
@@ -112,6 +123,13 @@ SCENARIOS: dict[str, dict] = {
         # The flight is BOOKED — evidence of booking is a confirmation number —
         # so it belongs in travel_anchors, not in a phase's planned list.
         "expect_anchor_text": ["XR7T2Q", "LY381"],
+        "expect_stops": [
+            {"name": "Rome", "start": "2026-05-02", "end": "2026-05-06"},
+            {"name": "Florence", "start": "2026-05-06", "end": "2026-05-09"},
+            {"name": "Venice", "start": "2026-05-09", "end": "2026-05-12"},
+        ],
+        "expect_refs": ["XR7T2Q", "HTL-99117", "HTL-99118", "HTL-99119", "TK-5521", "TK-5522", "TK-5523", "TK-5524"],
+        "forbid_refs": [],
     },
     # Scenario 3 — no documents at all. Every answer typed. This is the control:
     # if it passes only when a document is uploaded, the interview is not an

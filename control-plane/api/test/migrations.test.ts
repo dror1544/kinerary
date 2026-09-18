@@ -80,6 +80,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0051_trip_person_links.sql",
       "0052_telegram_organizer_links.sql",
       "0053_companion_reply_capture.sql",
+      "0054_document_registry.sql",
+      "0055_answer_provenance.sql",
+      "0056_model_task_settings.sql",
+      "0057_document_corrections.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -140,6 +144,10 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "0051_trip_person_links.sql",
       "0052_telegram_organizer_links.sql",
       "0053_companion_reply_capture.sql",
+      "0054_document_registry.sql",
+      "0055_answer_provenance.sql",
+      "0056_model_task_settings.sql",
+      "0057_document_corrections.sql",
     ]);
   } finally {
     await reset(client);

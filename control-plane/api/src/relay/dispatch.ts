@@ -45,6 +45,8 @@ import {
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
+import { organizerDocumentRoute } from "../document-correction.js";
+import { visionProcessingConfig } from "../document-vision.js";
 import {
   companionHelpText,
   groupBindingCommand,
@@ -70,6 +72,9 @@ import {
   type TelegramUpdate,
 } from "./normalize.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
+import { digestTelegramId } from "../identity.js";
+import type { StructuredModelRunner } from "../model-runner.js";
+import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
 import type { WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
@@ -172,6 +177,27 @@ export type DispatchDecision =
        * long it may take depends on the organizer having sent a file at all.
        */
       hadAttachment: boolean;
+    }
+  /**
+   * A document the organizer sent their companion after the trip was
+   * confirmed. Read and PROPOSED, never written — see document-correction.ts.
+   */
+  | {
+      kind: "document_correction";
+      chatId: string;
+      tripId: string;
+      sessionId: string;
+      language: Language;
+      event: WireMessageEvent;
+    }
+  /** The organizer's Approve / Keep on one of those proposals. */
+  | {
+      kind: "correction_callback";
+      chatId: string;
+      callbackQueryId: string;
+      proposalId: string;
+      choice: "approve" | "reject";
+      fromId: string;
     }
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
@@ -320,6 +346,13 @@ export interface DispatchOptions {
   groupIntroIncludesPassword?: boolean;
   /** How long a group-binding token stays valid. Defaults to a week. */
   groupBindingTtlSeconds?: number;
+  /**
+   * The signup super admin, as the subject digest approvals are checked
+   * against. Absent means nobody may switch models from a chat.
+   */
+  superAdminSubjectDigest?: string;
+  /** The relay's runner. `/model` can switch it only when it is switchable. */
+  modelRunner?: StructuredModelRunner;
 }
 
 export async function dispatchUpdate(
@@ -428,6 +461,27 @@ export async function dispatchUpdate(
           },
         };
     }
+  }
+
+  // `/models` and `/model`: which model serves each task, switched at runtime.
+  //
+  // The super admin only, in their own DM with the bot, identified by the
+  // Telegram sender id Telegram itself delivered — the same digest signup
+  // approvals are checked against, never anything written in the message. For
+  // anyone else, or anywhere else, this branch does not exist: the command falls
+  // through to the answer every other unknown command gets, so asking reveals
+  // nothing about who may switch models or that anyone can.
+  if (
+    parsed.kind === "command"
+    && (parsed.name === "model" || parsed.name === "models")
+    && message.chat?.type === "private"
+    && options.superAdminSubjectDigest
+    && message.from?.id !== undefined
+    && digestTelegramId(String(message.from.id)) === options.superAdminSubjectDigest
+  ) {
+    const runner = isSwitchableRunner(options.modelRunner) ? options.modelRunner : undefined;
+    const text = await handleModelCommand(db, runner, parsed, options.superAdminSubjectDigest, log);
+    return { kind: "reply", reply: { chatId, text } };
   }
 
   // A way to the summary that depends on nothing else working.
@@ -721,6 +775,32 @@ export async function dispatchUpdate(
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
       }
     }
+    // A FILE FROM THE ORGANIZER, AFTER CONFIRMATION, is this relay's to read —
+    // proposed back to them for approval, never handed to the companion to
+    // write onto the site on its own. Only the organizer's own private chat,
+    // from the organizer; a group's or a member's file keeps its route.
+    if (outcome.route.kind === "companion") {
+      const organizer = await organizerDocumentRoute(db, {
+        tripId: outcome.route.tripId,
+        chatId,
+        chatType: message.chat?.type,
+        fromId: message.from?.id === undefined ? undefined : String(message.from.id),
+        mediaKinds: (outcome.event.media ?? []).map((m) => m.kind),
+        hasMedia: (outcome.event.media_urls?.length ?? 0) > 0,
+        hasRunner: Boolean(options.modelRunner),
+        canReadImages: visionProcessingConfig(options.modelRunner) !== null,
+      });
+      if (organizer) {
+        return {
+          kind: "document_correction",
+          chatId,
+          tripId: outcome.route.tripId,
+          sessionId: organizer.sessionId,
+          language: organizer.language,
+          event: outcome.event,
+        };
+      }
+    }
     return { kind: "to_gateway", event: outcome.event };
   }
 
@@ -901,6 +981,20 @@ async function dispatchCallback(
       chatId: String(chatId),
       callbackQueryId: callback.id,
       text: await applySwitch(db, senderId, String(chatId), target, language, log),
+    };
+  }
+
+  // A decision on a document's proposed change to a CONFIRMED trip. Not an
+  // interview callback — the trip is past its interview. Who may decide is
+  // checked where it is applied: the proposal's own chat, and its sender.
+  if (parsed.kind === "correction" && chatId !== undefined && chatId !== null) {
+    return {
+      kind: "correction_callback",
+      chatId: String(chatId),
+      callbackQueryId: callback.id,
+      proposalId: parsed.proposalId,
+      choice: parsed.choice,
+      fromId: callback.from?.id === undefined ? "" : String(callback.from.id),
     };
   }
 
