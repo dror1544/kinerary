@@ -511,10 +511,23 @@ start_gateway_supervised() {
 # /health asks it: the bridge fetches its own trip's config and says whether it
 # arrived. Local to this host, so it needs no key and reveals no address.
 bridge_reaches_trip() {
-  local port="$1" body=""
+  local port="$1" trip_dir="$2" key="" body=""
+  # /health is behind the MCP key like every other route on that server. We are
+  # on the host, beside the trip's own mcp/.env, so the key is simply here —
+  # which is why the endpoint never needed an exemption in the first place.
+  key=$(sed -n 's/^MCP_API_KEY=//p' "$trip_dir/mcp/.env" 2>/dev/null | head -1 | tr -d '"\r')
+  if [ -z "$key" ]; then
+    BRIDGE_HEALTH="no MCP_API_KEY in $trip_dir/mcp/.env"
+    return 1
+  fi
+  # `--config -` so the key arrives on stdin and never on the command line,
+  # where `ps` would show it to every user on the box. Same reason the release
+  # notifier feeds curl its token this way.
+  #
   # Deliberately not `curl -f`: a 503 here carries the verdict we want to read
   # back to the operator, and -f would throw the body away with it.
-  body=$(curl -sS --max-time 15 "http://127.0.0.1:${port}/health" 2>/dev/null || true)
+  body=$(printf 'url = "http://127.0.0.1:%s/health"\nheader = "X-API-Key: %s"\nsilent\nshow-error\nmax-time = 15\n' \
+           "$port" "$key" | curl --config - 2>/dev/null || true)
   case "$body" in
     *'"ok":true'*) return 0 ;;
   esac
@@ -612,7 +625,7 @@ PYTOPO
       # above — a failure here is reported as a failure, not as a WIRED with an
       # asterisk, because a companion that cannot read its own trip is the one
       # state that looks healthy from every other angle.
-      if ! bridge_reaches_trip "$MCP_PORT"; then
+      if ! bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR"; then
         printf 'companion-install-host: trip-mcp on :%s cannot reach %s — /health said: %s\n' \
           "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
         die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"

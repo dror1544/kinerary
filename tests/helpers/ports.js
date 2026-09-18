@@ -103,6 +103,7 @@ export const PORTS = {
   mcpBudget:               38121,
   mcpHealthUnreachable:    38122,
   mcpHealthReachable:      38123,
+  mcpHealthAuth:           38125,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 38103,

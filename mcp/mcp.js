@@ -1126,14 +1126,29 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
  * site. The organizer's companion said "I can't retrieve the trip plan right
  * now" and nothing upstream disagreed with it.
  *
- * Unauthenticated on purpose: a caller who cannot reach the trip site cannot
- * learn anything from this that it does not already know, and provisioning has
- * to be able to ask before it hands anyone a companion. What it returns is
- * therefore deliberately thin — reachable or not, and what the failure was
- * called. Never the address (a LAN address is infrastructure data and does not
- * belong in this repo's output), never a key, never anything about the trip.
+ * BEHIND THE KEY, like every other route here. It shipped unauthenticated for
+ * about an hour on the strength of an argument that reads well and is wrong:
+ * that a caller learns nothing from it worth having. This server is publishable
+ * (mcp/README.md), so an open route here is an open route on the internet, and
+ * every call makes this process fetch a private trip's config on the caller's
+ * behalf — a reachability oracle and a free amplifier, neither of which the
+ * caller pays for. Judging one endpoint harmless on its own merits is the
+ * specific habit that produced several real leaks in this codebase already.
+ *
+ * Nothing needed the exemption. The only caller is companion-install-host.sh,
+ * which runs on the host beside the trip's own mcp/.env and therefore holds
+ * MCP_API_KEY already.
+ *
+ * NOT CACHED, deliberately. A cached "reachable" is precisely the failure this
+ * endpoint exists to catch — a bridge that was fine once and is not fine now.
+ * Freshness is the feature; the key is what makes it affordable.
+ *
+ * What it returns stays deliberately thin — reachable or not, and what the
+ * failure was called. Never the address (a LAN address is infrastructure data
+ * and does not belong in this repo's output), never a key, never anything
+ * about the trip.
  */
-app.get('/health', async (_req, res) => {
+app.get('/health', requireKey, async (_req, res) => {
   try {
     const r = await fetchTrip('/api/config', { headers: h(), signal: AbortSignal.timeout(5000) });
     // A reply of any kind means the hop works. 401 is a key problem, not a

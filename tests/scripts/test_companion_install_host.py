@@ -75,7 +75,17 @@ class BridgeRequest(unittest.TestCase):
         # cares rewrites it. Same shape as the launchctl/hermes stand-ins above.
         self.health = self.home / "health.json"
         self.health.write_text('{"ok":true,"site":"reachable"}')
-        self._exe(self.bin / "curl", f'#!/bin/sh\ncat "{self.health}"\n')
+        # /health is behind the MCP key, so the trip carries one the way a real
+        # one does. The stand-in curl records how it was called — argv and
+        # stdin kept apart, because which of the two the key travels in is the
+        # difference between a secret and a line in `ps`.
+        (self.deploy / "trips/italy-2026/mcp").mkdir(parents=True, exist_ok=True)
+        (self.deploy / "trips/italy-2026/mcp/.env").write_text(
+            "MCP_API_KEY=s3cret-mcp-key\nTRIP_API_KEY=s3cret-trip-key\n")
+        self.curl_argv = self.home / "curl.argv"
+        self.curl_stdin = self.home / "curl.stdin"
+        self._exe(self.bin / "curl",
+                  f'#!/bin/sh\necho "$*" >> "{self.curl_argv}"\ncat >> "{self.curl_stdin}"\ncat "{self.health}"\n')
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -174,3 +184,23 @@ class BridgeReachesTheTrip(BridgeRequest):
         result = self.send(self.request())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "WIRED italy2026")
+
+    def test_the_key_reaches_the_bridge_but_never_the_command_line(self) -> None:
+        # `ps` is readable by every user on the box. A key in argv is a key
+        # published to all of them for the life of the call.
+        result = self.send(self.request())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.curl_argv.read_text()
+        stdin = self.curl_stdin.read_text()
+        self.assertNotIn("s3cret-mcp-key", argv, f"the key must not be in argv: {argv!r}")
+        self.assertIn("--config -", argv, "curl must be reading its options from stdin")
+        self.assertIn("X-API-Key: s3cret-mcp-key", stdin, "and the key must actually be sent")
+
+    def test_a_trip_with_no_key_is_a_failure_not_a_skipped_check(self) -> None:
+        # The shape that turns a security fix into a silently absent check:
+        # no key, so nothing to send, so nothing asked, so WIRED anyway.
+        (self.deploy / "trips/italy-2026/mcp/.env").write_text("TRIP_API_KEY=only-this-one\n")
+        result = self.send(self.request())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("WIRED", result.stdout)
+        self.assertIn("MCP_API_KEY", result.stderr)

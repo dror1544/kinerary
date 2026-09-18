@@ -23,13 +23,47 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { PORTS } from './helpers/ports.js';
-import { startTestMcp, stopTestMcp, mcpApi } from './helpers/mcp.js';
+import { startTestMcp, stopTestMcp, mcpApi, MCP_API_KEY, TRIP_API_KEY } from './helpers/mcp.js';
 
 /** `mcpApi` hands back the raw Response; every assertion here is about the body. */
-async function health() {
-  const res = await mcpApi('/health');
+async function health(apiKey = MCP_API_KEY) {
+  const res = await mcpApi('/health', { apiKey });
   return { status: res.status, body: await res.json() };
 }
+
+describe('GET /health auth', () => {
+  // This server is publishable (mcp/README.md), so an open route here is an
+  // open route on the internet — and every call to this one makes the process
+  // fetch a private trip's config on the caller's behalf. Unauthenticated, that
+  // is a reachability oracle and a free amplifier. It shipped that way for an
+  // hour on the strength of "a caller learns nothing useful from it", which is
+  // the same case-by-case reasoning that produced real leaks in this codebase
+  // before. The only caller holds the key already.
+  before(async () => { await startTestMcp({ MCP_PORT: PORTS.mcpHealthAuth }); });
+  after(() => stopTestMcp());
+
+  test('rejects a request with no key', async () => {
+    const res = await mcpApi('/health');
+    assert.equal(res.status, 401);
+  });
+
+  test('rejects a wrong key', async () => {
+    const res = await mcpApi('/health', { apiKey: 'not-the-key' });
+    assert.equal(res.status, 401);
+  });
+
+  test("rejects the SITE's key — reachability is not the site's business", async () => {
+    // /extract deliberately accepts either key. This is not /extract.
+    const res = await mcpApi('/health', { apiKey: TRIP_API_KEY });
+    assert.equal(res.status, 401);
+  });
+
+  test('refuses before it fetches anything, so an unauthenticated caller cannot make it work', async () => {
+    const before = Date.now();
+    await mcpApi('/health');
+    assert.ok(Date.now() - before < 1000, 'a 401 must not wait on a trip-site round trip');
+  });
+});
 
 describe('GET /health — the bridge cannot reach the trip', () => {
   // The helper's default API_BASE_URL is 127.0.0.1:1, which nothing serves.
