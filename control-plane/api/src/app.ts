@@ -16,6 +16,7 @@ import { isInterpretPath } from "./interpret.js";
 import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
+import { inviteOrganizer, previewInvitation } from "./organizer-invite.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
 import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
@@ -82,6 +83,31 @@ export interface InterviewAgentDependencies {
   apiKey: string;
 }
 
+/**
+ * The operator's own routes: things a person does ABOUT an organizer rather
+ * than as one.
+ *
+ * Its own key, and not the interview agent's, because the two are different
+ * kinds of power. The interview-agent key writes inside a conversation that
+ * already exists and that a person started; this one creates a trip and an
+ * interview link for an address nobody here has ever heard from. Sharing a
+ * credential between them would mean the sidecar that answers interview
+ * questions could also mint invitations.
+ *
+ * Absent by default. A deployment that does not set the key does not have these
+ * routes at all, which is the state every deployment is in until someone
+ * decides otherwise.
+ */
+export interface OperatorDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the operator tool on the control-plane host, nowhere else. */
+  apiKey: string;
+  /** Seconds an issued interview link stays valid — the same TTL the organizer's own request gets. */
+  enrollmentTtlSeconds: number;
+  /** Fallback Telegram handle when the caller does not name one. */
+  botUsername?: string | null;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -100,6 +126,8 @@ export interface AppDependencies {
   portal?: PortalDependencies;
   /** Optional: mount the interviewer agent's chat-addressed interview routes. */
   interviewAgent?: InterviewAgentDependencies;
+  /** Optional: mount the operator's invitation routes. Off unless a key is set. */
+  operator?: OperatorDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -1464,6 +1492,73 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(409).send({ error: "CHAT_ALREADY_BOUND" });
     }
     return reply.code(201).send({ sessionId: started.sessionId, sessionToken: started.sessionToken, tripId: started.view.tripId });
+  });
+
+  // ── The operator's invitations ─────────────────────────────────────────────
+  //
+  // Two routes, and the split is the point: the first only reads. The tool an
+  // operator drives — and the monitoring agent that drives it for them — runs
+  // the preview, shows what would happen, and only then asks for the second.
+  //
+  // Neither route takes a chat id, a token, a password or a trip id. An
+  // invitation is an address and a language, and everything else about it is
+  // derived here from rows this database already holds.
+
+  function operatorAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.operator;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
+  }
+
+  app.post("/internal/operator/invitations/preview", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const email = typeof body.email === "string" ? body.email : "";
+    const preview = await previewInvitation(dependencies.operator.db, email);
+    // A refused preview is still a 200: "you cannot invite this address, and
+    // here is why" is the answer the caller asked for, not a failure of the
+    // call. Only a missing key or a broken request is an error status.
+    return reply.code(200).send(preview.ok
+      ? { ok: true, plan: preview.plan }
+      : { ok: false, reason: preview.reason, detail: preview.detail, plan: preview.plan ?? null });
+  });
+
+  app.post("/internal/operator/invitations", async (request, reply) => {
+    if (!dependencies.operator) return reply.code(503).send({ error: "OPERATOR_NOT_CONFIGURED" });
+    if (!operatorAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+    const deps = dependencies.operator;
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const email = typeof body.email === "string" ? body.email : "";
+    const invitedBy = typeof body.invitedBy === "string" ? body.invitedBy : "";
+    const botUsername = typeof body.botUsername === "string" && body.botUsername.length > 0
+      ? body.botUsername
+      : deps.botUsername ?? "";
+    const result = await inviteOrganizer(
+      deps.db,
+      { email, language: typeof body.language === "string" ? body.language : undefined, botUsername, invitedBy },
+      { enrollmentTtlSeconds: deps.enrollmentTtlSeconds },
+      log,
+    );
+    if (!result.ok) {
+      // 409 for "not now" (a conversation or a build is in the way), 429 for
+      // the rate limit, 400 for a request that was never going to work.
+      const status = result.reason === "INTERVIEW_UNDERWAY" || result.reason === "TRIP_BUILDING" ? 409
+        : result.reason === "RATE_LIMITED" ? 429
+        : result.reason === "LINK_NOT_ISSUED" ? 500
+        : 400;
+      return reply.code(status).send({ error: result.reason, detail: result.detail });
+    }
+    return reply.code(201).send({
+      kind: result.kind,
+      tripId: result.tripId,
+      invitationId: result.invitationId,
+      deepLink: result.deepLink,
+      expiresAt: result.expiresAt.toISOString(),
+      language: result.language,
+      message: result.message,
+    });
   });
 
   if (dependencies.portal) { app.get("/v1/auth/telegram", async (_request, reply) => reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" })); registerPortalRoutes(app, dependencies.portal); }

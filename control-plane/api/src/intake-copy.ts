@@ -326,6 +326,29 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "",
       "So send me whatever you already have, or just type \"Let's start\" and I'll take it from there.",
     ].join("\n"),
+    // The opening for someone who has done this before: they already have a
+    // trip that was built, so every sentence explaining what Kinerary is would
+    // be telling them what they already know. Nine paragraphs of that is how a
+    // returning organizer learns the bot is not really listening.
+    //
+    // What it must say instead is the thing only a second trip raises: their
+    // first trip is not being replaced. The assistant they already talk to in
+    // this chat is about to be joined by another, and without a sentence about
+    // it the reasonable reading of "let's set up your trip" is that the old one
+    // is being overwritten.
+    //
+    // No name, deliberately. The display name on a password signup is the local
+    // part of an email address, so greeting them by it would produce "Welcome
+    // back, dror.elul+kin7" — worse than no name at all.
+    introductionReturning: [
+      "Welcome back 👋 Good to see you again.",
+      "",
+      "Let's set up your next trip, the same way as last time: one conversation, and I'll turn what you already know into a private trip site and a travel assistant for everyone coming.",
+      "",
+      "Your previous trip isn't touched — its site and its assistant stay exactly as they are. While we set this one up, messages here come to me rather than to that assistant; /trips moves between them once this trip is built.",
+      "",
+      "Send me whatever you already have — bookings, tickets, a spreadsheet, an itinerary someone put together — or just type \"Let's start\" and I'll take it from there.",
+    ].join("\n"),
     // Said when the interviewer has gone quiet and the router picks the thread
     // back up. Deliberately says nothing about why: the organizer does not need
     // to hear that something stalled, and "sorry, I had a problem" invites them
@@ -501,6 +524,18 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "המטרה פשוטה: אתם נהנים מהטיול — Kinerary דואג לכל השאר.",
       "",
       "אז שלחו לי מה שכבר יש לכם, או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
+    ].join("\n"),
+    // Plural throughout, like every other Hebrew string here: it addresses the
+    // organizer and whoever is travelling with them, and it avoids guessing a
+    // gender the control plane has never been told.
+    introductionReturning: [
+      "ברוכים השבים 👋 כיף לראות אתכם שוב.",
+      "",
+      "בואו נקים את הטיול הבא שלכם, בדיוק כמו בפעם הקודמת: שיחה אחת, ואהפוך את מה שאתם כבר יודעים לאתר טיול פרטי ולעוזר טיולים לכל מי שנוסע.",
+      "",
+      "הטיול הקודם שלכם לא משתנה — האתר והעוזר שלו נשארים בדיוק כמו שהם. בזמן שנקים את הטיול הזה, הודעות כאן מגיעות אליי ולא לעוזר ההוא; אפשר לעבור ביניהם עם ‎/trips‎ אחרי שהטיול הזה יוקם.",
+      "",
+      "שלחו לי מה שכבר יש לכם — הזמנות, כרטיסים, קובץ אקסל, תוכנית שמישהו הכין — או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
     ].join("\n"),
     resumed: "נמשיך מכאן.",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",

@@ -372,6 +372,15 @@ of `docs/signup-test-execution-capture (Manual).md`.
 `.agents/skills/live-run/` drives the 🤖 steps of `docs/setup-test-plan.md` and
 stops at every 🧍, resumable by step. It never deploys and never tears down.
 
+`.agents/skills/organizer-invites/` hands somebody an interview link without
+their password: `POST /internal/operator/invitations` creates the trip and
+issues the same single-use link their own request would have, and prints a
+message to forward in English or Hebrew. The routes are **unmounted unless
+`CONTROL_PLANE_OPERATOR_KEY` is set**, and a monitoring agent reaches them only
+through a forced-command SSH user (`cpinvite`) that accepts two verbs. It
+refuses an address that is mid-interview or mid-build, and there is no password
+reset anywhere in the control plane — for organizers, no such route exists.
+
 `.agents/skills/interview-stack-deploy/` restarts the four services the Trip
 Bot interview needs (control-plane API, interview MCP sidecar, trip-intake
 gateway, relay) with the checks a 2026-09-05 live run found missing: it reads
