@@ -32,7 +32,11 @@ import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import { issueEnrollment } from "./enrollment.js";
 import { DEFAULT_LANGUAGE, isLanguage, type Language } from "./intake-copy.js";
-import { digestEmail } from "./password-identity.js";
+import {
+  digestEmail,
+  ensureUnknownPasswordCredential,
+  resolveOrCreateEmailAccount,
+} from "./password-identity.js";
 import { structuredLog } from "./redaction.js";
 
 function generateId(prefix: string): string {
@@ -158,11 +162,13 @@ interface OwnedTrip {
 /**
  * Every control-plane user this address is known to be, and every trip they own.
  *
- * Two sources, because an invited person has no password credential and a
- * self-signed-up person has no invitation. One physical organizer holding
- * several user_ids is the normal shape of this data, not a fault — the comment
- * in migration 0052 counts ten for one person — so this returns all of them and
- * the caller works from their trips rather than from a single id.
+ * The canonical account (`user_identities`, provider 'password') is the answer
+ * this is built on: one address, one user, whether it arrived by signup or by
+ * an operator's invitation. The other two sources are kept for rows written
+ * before that was true — an invitation or a credential whose user never got an
+ * identity row — so that a database mid-migration still finds its own trips.
+ * They are a superset of one user, not a licence for several: nothing here
+ * creates a second account for an address any more.
  *
  * Retired trips are left out entirely: a torn-down trip is not a trip somebody
  * has, and treating one as "they already have a trip" would greet a first-time
@@ -178,6 +184,9 @@ async function ownedTrips(db: pg.Pool, emailDigest: string): Promise<OwnedTrip[]
     has_live_session: boolean;
   }>(
     `WITH people AS (
+       SELECT user_id FROM control_plane.user_identities
+         WHERE provider = 'password' AND provider_subject_digest = $1
+       UNION
        SELECT user_id FROM control_plane.password_credentials WHERE email_digest = $1
        UNION
        SELECT user_id FROM control_plane.organizer_invitations WHERE email_digest = $1
@@ -271,7 +280,25 @@ export async function previewInvitation(db: pg.Pool, email: string): Promise<Inv
 /* -------------------------------------------------------------- issuing --- */
 
 /**
- * Create the trip and the account behind it, when there is no draft to reuse.
+ * Create the trip, under the account this address already is.
+ *
+ * `resolveOrCreateEmailAccount` is the whole point: an invitation issued for
+ * someone who has signed up before lands on the account they already log in
+ * with, and an invitation for a stranger creates the same kind of account
+ * their own signup would have. What it never does is mint a SECOND user for an
+ * address, which is what made an invited organizer a different person from the
+ * one who later signed up with the same address.
+ *
+ * The account is a NORMAL one — users row, email identity, and a password
+ * credential derived from random bytes nobody keeps. Not a credential-less
+ * special case: an invited organizer differs from one who signed up for
+ * themselves only in not knowing their own password yet, which password
+ * recovery will fix when the landing page exists. Writing the credential now is
+ * also what stops a stranger who knows the address from signing up first and
+ * inheriting the trip.
+ *
+ * An invitation for an address that already has an account leaves its password
+ * alone — see `ensureUnknownPasswordCredential`.
  *
  * The slug keeps the `draft-` placeholder every unbuilt trip carries: the
  * provisioner only ever rewrites that prefix when it promotes a real name, and
@@ -279,25 +306,13 @@ export async function previewInvitation(db: pg.Pool, email: string): Promise<Inv
  */
 async function createTripFor(
   db: pg.Pool,
-  emailDigest: string,
   email: string,
-  existingUserId: string | null,
 ): Promise<{ tripId: string; userId: string }> {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
-    let userId = existingUserId;
-    if (!userId) {
-      userId = generateId("user");
-      await client.query(
-        "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1, 'active', $2)",
-        [userId, email.split("@")[0]?.slice(0, 120) || "Kinerary organizer"],
-      );
-      // Deliberately no `user_identities` row. That table is UNIQUE on
-      // (provider, digest) and is the authentication path: writing a password
-      // identity with no credential behind it would make this address unable to
-      // ever sign up for itself, and there is no password reset to undo that.
-    }
+    const userId = await resolveOrCreateEmailAccount(client, email);
+    await ensureUnknownPasswordCredential(client, userId, email);
     const tripId = generateId("trip");
     await client.query(
       "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1, $2, 'draft')",
@@ -321,10 +336,20 @@ async function createTripFor(
  * Issue an interview link for somebody else, and write down that it happened.
  *
  * The trip is created in one transaction and the link in another, which is the
- * one seam here, and it heals itself: a link that fails to issue leaves a draft
- * trip with no link, which is exactly what the next invitation for this address
- * recognises as `resume` and re-links. The reverse — a link with no trip —
- * cannot happen.
+ * one seam here, and it heals itself — but only because the trip's owner is
+ * discoverable without the invitation row. A link that fails to issue, or
+ * anything that interrupts this between the trip's commit and the invitation
+ * insert, leaves a draft trip owned by this address's canonical account and no
+ * `organizer_invitations` row; `ownedTrips` finds it through the identity, so
+ * the next invitation for this address calls it `resume` and re-links it.
+ *
+ * That was NOT true while the invited account had no identity row: the only
+ * trace of it was the invitation, so an interrupted `new` invitation stranded
+ * the user and the trip where no later invitation could ever see them, and the
+ * next one built a second account and a second draft. The regression test is
+ * `an interrupted invitation is re-linked, not duplicated`.
+ *
+ * The reverse — a link with no trip — cannot happen.
  */
 export async function inviteOrganizer(
   db: pg.Pool,
@@ -379,13 +404,16 @@ export async function inviteOrganizer(
       [tripId],
     );
   } else {
-    // A returning organizer's new trip is owned by the same user as their most
-    // recent one, so `/trips` lists both under the Telegram identity they have
+    // Both `new` and `returning` land on this address's one account, so a
+    // returning organizer's second trip sits beside their first under the
+    // identity they already log in with and the Telegram identity they have
     // already proven.
-    const previousOwner = preview.plan.existing.length > 0
-      ? (await ownedTrips(db, emailDigest))[0]?.userId ?? null
-      : null;
-    ({ tripId, userId } = await createTripFor(db, emailDigest, request.email, previousOwner));
+    //
+    // This used to pick the owner of their most RECENTLY created trip, which
+    // is not the same question: a person holding both an invited account and a
+    // signed-up one got their next trip on whichever happened to be newer, and
+    // if that was the invited one the trip was invisible to their own login.
+    ({ tripId, userId } = await createTripFor(db, request.email));
   }
 
   const issued = await issueEnrollment(db, userId, tripId, { enrollmentTtlSeconds: config.enrollmentTtlSeconds }, log);

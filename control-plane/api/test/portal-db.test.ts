@@ -32,7 +32,7 @@ const profile = validateArchitectureProfile({
 function portalDeps(db: pg.Pool): PortalDependencies {
   return {
     db,
-    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused" }) },
+    google: { authorizationUrl: () => "https://accounts.example.test", exchange: async () => ({ subject: "unused", displayName: "Unused", emailVerified: false }) },
     runtimeAccounts: { participantExists: async ({ runtimeUsername }) => runtimeUsername !== "missing-user", provisionParticipant: async (input) => {
       runtimeEnrollments.push(input);
       if (failNextEnrollment) { failNextEnrollment = false; throw new Error("simulated runtime reply lost"); }

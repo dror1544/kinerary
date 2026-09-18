@@ -122,11 +122,23 @@ An invitation leaves a row in `organizer_invitations`: the address **as a
 digest**, the user and trip it produced, which kind it was, the language, and
 who asked for it. That is the audit record, kept separately from the act.
 
-No address is ever logged in readable form, and the invited account gets **no
-password credential and no identity row** — deliberately. `user_identities` is
-unique on (provider, digest) and is the authentication path, so a password
-identity with no credential behind it would leave that address unable to ever
-sign up for itself, with no reset to undo it.
+No address is ever logged in readable form, and the invitation is an audit
+record — **not** a second kind of account. The trip belongs to the ordinary
+organizer account for that address: one `user_id` per email, the same one their
+own signup, their later login, or a Google sign-in for the same verified
+address resolves to.
+
+The account is a **normal** one: a user, an email identity, and a password
+credential built from random bytes nobody keeps. Not a special case with a hole
+where the credential should be — which also means nobody can claim an invited
+organizer's trip by signing up with their address first.
+
+So an invited organizer has no password **yet**. They reach their trip on
+Telegram, or by signing in with Google on the same verified address, which
+resolves to this same account. Password recovery — which will let them replace
+the generated credential with one they choose — arrives with the landing page,
+and needs nothing added to the account for it to work. There is still no
+password reset anywhere in the control plane today.
 
 ## The link is printed, never sent
 

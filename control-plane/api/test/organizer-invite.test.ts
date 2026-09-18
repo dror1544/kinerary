@@ -13,9 +13,16 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { digestEmail } from "../src/password-identity.js";
+import {
+  createOrVerifyPasswordIdentity,
+  digestEmail,
+  resolveOrCreateEmailAccount,
+  verifyPasswordLogin,
+} from "../src/password-identity.js";
 import { startSession } from "../src/interview.js";
 import { applyMigrations } from "../src/migrations.js";
+import { getTripForMember } from "../src/signup.js";
+import { listOrganizerTrips } from "../src/organizer-trips.js";
 import {
   INVITATIONS_PER_HOUR,
   invitationText,
@@ -108,21 +115,187 @@ describe("organizer invitations", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE
     assert.deepEqual(enrollment.rows.map((r) => r.state), ["issued"]);
   });
 
-  test("an invited address is never given a credential it did not ask for", async () => {
+  test("an invited organizer gets a structurally normal account", async () => {
     const email = address();
     const result = await invite(pool, email);
     assert.equal(result.ok, true);
     if (!result.ok) return;
 
-    // No password credential, and no identity row either: writing one with no
-    // credential behind it would leave this address unable to ever sign up for
-    // itself, and nothing in this system can reset that.
-    const credentials = await pool.query(
-      "SELECT 1 FROM control_plane.password_credentials WHERE user_id = $1", [result.userId]);
-    assert.equal(credentials.rowCount, 0);
-    const identities = await pool.query(
-      "SELECT 1 FROM control_plane.user_identities WHERE user_id = $1", [result.userId]);
-    assert.equal(identities.rowCount, 0);
+    // Not a credential-less special case: the same three rows an organizer who
+    // signed up for themselves has. What they lack is knowledge of their own
+    // password, which password recovery will give them later.
+    const user = await pool.query<{ status: string }>(
+      "SELECT status FROM control_plane.users WHERE id = $1", [result.userId]);
+    assert.equal(user.rows[0].status, "active");
+
+    const identities = await pool.query<{ provider: string; provider_subject_digest: string }>(
+      "SELECT provider, provider_subject_digest FROM control_plane.user_identities WHERE user_id = $1",
+      [result.userId]);
+    assert.deepEqual(identities.rows, [{ provider: "password", provider_subject_digest: digestEmail(email) }]);
+
+    const credentials = await pool.query<{ email_digest: string; password_hash: string }>(
+      "SELECT email_digest, password_hash FROM control_plane.password_credentials WHERE user_id = $1",
+      [result.userId]);
+    assert.equal(credentials.rowCount, 1);
+    assert.equal(credentials.rows[0].email_digest, digestEmail(email));
+    assert.match(credentials.rows[0].password_hash, /^scrypt:/);
+  });
+
+  test("the password an invited account is given is one nobody can use", async () => {
+    const email = address();
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+
+    for (const guess of ["", "password", "a-real-password", email, "12345678"]) {
+      const login = await verifyPasswordLogin(pool, { email, password: guess });
+      assert.equal(login.ok, false, `logged in with ${JSON.stringify(guess)}`);
+    }
+
+    // And nobody gets to claim the account by signing up over it — which is
+    // what an account with no credential would have allowed, on a trip that by
+    // then holds a real family's interview.
+    const signup = await createOrVerifyPasswordIdentity(pool, { email, password: "let-me-in-please" });
+    assert.equal(signup.ok, false);
+    assert.equal(signup.ok === false && signup.error, "PASSWORD_LOGIN_INVALID_CREDENTIALS");
+
+    // The account is untouched by the attempt: still one user, still one
+    // credential, still theirs.
+    const users = await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
+      [digestEmail(email)]);
+    assert.deepEqual(users.rows.map((r) => r.user_id), [invited.userId]);
+  });
+
+  test("inviting somebody who already has an account never touches their password", async () => {
+    const email = address();
+    const signedUp = await createOrVerifyPasswordIdentity(pool, { email, password: "the-one-they-chose" });
+    assert.equal(signedUp.ok, true);
+    const before = (await pool.query<{ password_hash: string }>(
+      "SELECT password_hash FROM control_plane.password_credentials WHERE email_digest = $1",
+      [digestEmail(email)])).rows[0].password_hash;
+
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+
+    const after = (await pool.query<{ password_hash: string }>(
+      "SELECT password_hash FROM control_plane.password_credentials WHERE email_digest = $1",
+      [digestEmail(email)])).rows[0].password_hash;
+    assert.equal(after, before, "an invitation overwrote a real organizer's password");
+
+    // They can still log in, and the trip they were just invited to is theirs.
+    const login = await verifyPasswordLogin(pool, { email, password: "the-one-they-chose" });
+    assert.equal(login.ok, true);
+    const seen = await getTripForMember(pool, invited.tripId, "password", digestEmail(email));
+    assert.equal(seen?.id, invited.tripId);
+  });
+
+  test("an invited organizer reaches their trip on Telegram, and it is the same account", async () => {
+    const email = address();
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+
+    const token = new URL(invited.deepLink).searchParams.get("start") as string;
+    const chatId = String(100000000 + Math.floor(Math.random() * 1e8));
+    assert.equal((await startSession(pool, token, () => {}, undefined, chatId)).ok, true);
+    await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1", [invited.tripId]);
+
+    const viaTelegram = await listOrganizerTrips(pool, chatId, chatId);
+    assert.ok(viaTelegram.some((t) => t.tripId === invited.tripId), "Telegram lost the trip");
+
+    // One organizer for this address, not two — the regression this whole
+    // change exists for. Whatever authenticates later (recovery, or Google on
+    // the same verified address) resolves to this user and sees this trip.
+    const users = await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
+      [digestEmail(email)]);
+    assert.deepEqual(users.rows.map((r) => r.user_id), [invited.userId]);
+    const seen = await getTripForMember(pool, invited.tripId, "password", digestEmail(email));
+    assert.equal(seen?.id, invited.tripId);
+  });
+
+  test("an invitation for someone who already signed up reuses their account", async () => {
+    const email = address();
+    const signedUp = await createOrVerifyPasswordIdentity(pool, { email, password: "a-real-password" });
+    assert.equal(signedUp.ok, true);
+    const webUserId = (await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
+      [digestEmail(email)])).rows[0].user_id;
+
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+    assert.equal(invited.userId, webUserId);
+
+    const seen = await getTripForMember(pool, invited.tripId, "password", digestEmail(email));
+    assert.equal(seen?.id, invited.tripId, "the invited trip is not visible to the account that owns it");
+  });
+
+  test("a second trip lands on the account they log in with, not the newest one", async () => {
+    // The regression: `previousOwner` was the owner of their most RECENTLY
+    // created trip, which is a different question from "who are they". Someone
+    // holding both an invited account and a signed-up one got their next trip
+    // on whichever was newer — and when that was the invited account, the trip
+    // was invisible to their own login. Both trips must land on the one account
+    // this address is, so that whatever authenticates later sees all of them.
+    const email = address();
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+
+    const token = new URL(invited.deepLink).searchParams.get("start") as string;
+    const chatId = String(100000000 + Math.floor(Math.random() * 1e8));
+    await startSession(pool, token, () => {}, undefined, chatId);
+    await pool.query("UPDATE control_plane.intake_sessions SET state = 'confirmed' WHERE trip_id = $1", [invited.tripId]);
+    await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'ready_private' WHERE id = $1", [invited.tripId]);
+
+    const second = await invite(pool, email);
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.equal(second.kind, "returning");
+    assert.equal(second.userId, invited.userId, "the second trip went to a different account");
+
+    const seen = await getTripForMember(pool, second.tripId, "password", digestEmail(email));
+    assert.equal(seen?.id, second.tripId);
+  });
+
+  test("an interrupted invitation is re-linked, not duplicated", async () => {
+    // inviteOrganizer commits the trip and writes the invitation row in two
+    // steps. Anything that stops it in between — a failed issueEnrollment, a
+    // restart — leaves a draft trip with no invitation row.
+    //
+    // The comment on inviteOrganizer has always claimed the next invitation
+    // recognises that as `resume`. It did not: the invited account existed ONLY
+    // as an organizer_invitations row, so deleting that row hid the user and
+    // the trip from `ownedTrips`, and the next invitation built a second
+    // account and a second draft. The identity row is what makes the claim true.
+    const email = address();
+    const invited = await invite(pool, email);
+    assert.equal(invited.ok, true);
+    if (!invited.ok) return;
+
+    await pool.query("DELETE FROM control_plane.organizer_invitations WHERE id = $1", [invited.invitationId]);
+    await pool.query("UPDATE control_plane.interview_enrollments SET state = 'revoked' WHERE trip_id = $1", [invited.tripId]);
+
+    const preview = await previewInvitation(pool, email);
+    assert.equal(preview.ok && preview.plan.kind, "resume");
+    assert.equal(preview.ok && preview.plan.tripId, invited.tripId);
+
+    const again = await invite(pool, email);
+    assert.equal(again.ok, true);
+    if (!again.ok) return;
+    assert.equal(again.tripId, invited.tripId, "a second trip was created for the same address");
+    assert.equal(again.userId, invited.userId, "a second account was created for the same address");
+
+    const drafts = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n
+         FROM control_plane.trips t
+         JOIN control_plane.trip_memberships m ON m.trip_id = t.id AND m.role = 'owner'
+        WHERE m.user_id = $1 AND t.lifecycle_state = 'draft'`,
+      [invited.userId]);
+    assert.equal(drafts.rows[0].n, 1);
   });
 
   test("the address is recorded only as a digest, and the invitation says who asked", async () => {
@@ -277,6 +450,72 @@ describe("organizer invitations", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE
     // The one thing a returning organizer needs promised: the trip they
     // already have is not being replaced.
     assert.ok(he.includes("נשאר בדיוק כמו שהוא"), he);
+  });
+
+  test("an account another identity can already reach is not claimable by signing up", async () => {
+    // The hazard that comes with resolving one account per address: a person
+    // who has only ever signed in with Google owns an email account here. If
+    // that account had no password credential, `POST /v1/signup` with their
+    // address would set one and hand over every trip they own.
+    //
+    // Two things stop it, and this pins both: Google sign-in writes a
+    // credential nobody knows, and signup refuses an account that carries
+    // another identity even if it somehow has no credential at all.
+    const email = address();
+    const client = await pool.connect();
+    let userId: string;
+    try {
+      await client.query("BEGIN");
+      userId = await resolveOrCreateEmailAccount(client, email, "Signed in with Google");
+      await client.query(
+        "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1, $2, 'google', $3, now())",
+        [`idnt_${Math.random().toString(36).slice(2, 12)}${"0".repeat(20)}`.slice(0, 37), userId,
+          "sha256:" + Math.random().toString(16).slice(2).padEnd(64, "0").slice(0, 64)],
+      );
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+
+    // Deliberately no credential on the account, which is the worst case.
+    const claim = await createOrVerifyPasswordIdentity(pool, { email, password: "i-know-your-address" });
+    assert.equal(claim.ok, false);
+    assert.equal(claim.ok === false && claim.error, "PASSWORD_LOGIN_INVALID_CREDENTIALS");
+
+    const credentials = await pool.query(
+      "SELECT 1 FROM control_plane.password_credentials WHERE email_digest = $1", [digestEmail(email)]);
+    assert.equal(credentials.rowCount, 0, "signup set a password on somebody else's account");
+
+    // The account is still one account, and still theirs.
+    const users = await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
+      [digestEmail(email)]);
+    assert.deepEqual(users.rows.map((r) => r.user_id), [userId]);
+  });
+
+  test("an account with no credential and no other identity can still be signed up for", async () => {
+    // The legitimate half of the same rule: rows written before accounts got a
+    // credential at birth must stay usable, or an organizer invited early is
+    // stranded with no way in at all.
+    const email = address();
+    const client = await pool.connect();
+    let userId: string;
+    try {
+      await client.query("BEGIN");
+      userId = await resolveOrCreateEmailAccount(client, email);
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+
+    const signedUp = await createOrVerifyPasswordIdentity(pool, { email, password: "a-password-they-chose" });
+    assert.equal(signedUp.ok, true);
+    const login = await verifyPasswordLogin(pool, { email, password: "a-password-they-chose" });
+    assert.equal(login.ok, true);
+    const users = await pool.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1",
+      [digestEmail(email)]);
+    assert.deepEqual(users.rows.map((r) => r.user_id), [userId], "signing up made a second account");
   });
 });
 
