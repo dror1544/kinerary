@@ -1,0 +1,30 @@
+{
+  "//": [
+    "Where the fleet monitor is allowed to file issues. Copy to",
+    "~/kinerary-deploy/issue-target.json and fill in. Real values never live in",
+    "this repo — same rule as fleet-stacks.json.",
+    "",
+    "The token is a FINE-GRAINED personal access token, scoped to this one",
+    "repository, with exactly one permission: Issues -> Read and write. It is",
+    "deliberately not the gh CLI's login: that one can push to everything you",
+    "own, and this agent reads messages typed by travellers.",
+    "",
+    "Mint it at: https://github.com/settings/personal-access-tokens/new",
+    "  Repository access -> Only select repositories -> <this repo>",
+    "  Permissions -> Repository -> Issues -> Read and write",
+    "  (leave every other permission at 'No access')",
+    "Then:  umask 077; printf '%s' github_pat_xxx > ~/kinerary-deploy/issue-token"
+  ],
+
+  "repo": "owner/name",
+  "tokenFile": "issue-token",
+
+  "extraLabels": [],
+
+  "//maxPerHour": [
+    "A ceiling, not a target. The monitor runs on a cron; if it ever files this",
+    "many in an hour something is looping, and the tool refuses rather than",
+    "flooding the tracker. Raise it only when you have seen the rate be real."
+  ],
+  "maxPerHour": 6
+}
