@@ -88,6 +88,11 @@ export function stopTestServer() {
   }
 }
 
+/** The running test server's TRIP_DIR — a throwaway copy of the fixtures. */
+export function testTripDir() {
+  return tripDir;
+}
+
 /** Fetch against the test server. Pass `auth: true` to send the cached token. */
 let _token = null;
 export async function api(path, { method = 'GET', body, auth = false, token, apiKey } = {}) {
