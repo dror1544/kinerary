@@ -171,7 +171,19 @@ class ProxmoxLxcAdapter:
         """Public entry point for the first-provision data wipe, for the case
         create() will not run because the container already exists (a failed
         earlier attempt left it and its NFS dir behind). Same guard-railed
-        rm -rf as create()'s own reset; the caller decides when it applies."""
+        rm -rf as create()'s own reset; the caller decides when it applies.
+
+        The container is STOPPED first, and left stopped for the provisioner to
+        start again. That container has the site's SQLite open on the very
+        directory being wiped, and the directory is NFS: deleting a file
+        another host still holds open leaves `.nfs*` placeholders behind and
+        `rm -rf` exits non-zero. On 2026-09-18 that turned every retry of a
+        half-finished first provision into the same failure, forever — the
+        container from attempt one kept the files open for attempt two.
+        """
+        record = self.inspect(spec)
+        if record is not None and record.get("status") == "running":
+            self.ssh.run(f"pct stop {shlex.quote(record['vmid'])}")
         self._reset_trip_data(spec.nfs_host_dir)
 
     def create(self, spec: LxcSpec) -> None:

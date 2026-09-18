@@ -11,7 +11,7 @@ after(stopTestServer);
 
 async function stream() {
   const controller = new AbortController();
-  const response = await fetch('http://localhost:3198/api/events', {
+  const response = await fetch(`http://localhost:${PORTS.tripEventsHttp}/api/events`, {
     headers: { Authorization: `Bearer ${token}` }, signal: controller.signal,
   });
   assert.equal(response.status, 200);

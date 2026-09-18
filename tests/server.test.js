@@ -8,6 +8,7 @@ import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { startTestServer, stopTestServer, api, loginAsAlice } from './helpers/server.js';
+import { PORTS } from './helpers/ports.js';
 
 let token;
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -382,6 +383,57 @@ describe('POST /api/auth/login', () => {
       body: { username: 'nobody', password: '1234' },
     });
     assert.equal(res.status, 401);
+  });
+});
+
+// ── /api/upload — auth gate ───────────────────────────────────────────────────
+// This route accepted files from ANYONE. It had no authRequired, and multer
+// read up to 200 MB per file into memory before the handler ran, which then
+// pushed the files into the family's Immich library with the site's own API
+// key. Nothing in the repo or in any Hermes profile calls it.
+//
+// The test server runs with Immich unset, so a request that gets past auth
+// reaches the handler and is answered 503 — which is exactly what an anonymous
+// request used to receive.
+describe('POST /api/upload — auth', () => {
+  const oneFile = () => {
+    const form = new FormData();
+    form.append('files', new Blob(['not really a photo'], { type: 'image/jpeg' }), 'x.jpg');
+    return form;
+  };
+
+  test('returns 401 without a token', async () => {
+    const res = await api('/api/upload', { method: 'POST', body: oneFile() });
+    assert.equal(res.status, 401);
+  });
+
+  test('returns 401 with a garbage token', async () => {
+    const res = await api('/api/upload', { method: 'POST', body: oneFile(), token: 'garbage.token.here' });
+    assert.equal(res.status, 401);
+  });
+
+  // A 401 alone cannot tell "auth before multer" from "auth after multer": both
+  // refuse in the end, but only one refuses WITHOUT first reading an anonymous
+  // body into memory. A truncated multipart body separates them — multer running
+  // first chokes on it and answers with a parse error, auth running first never
+  // looks. This is what stops a later "fix" from checking auth inside the handler.
+  test('refuses before multer reads the body — a truncated upload gets 401, not a parse error', async () => {
+    const res = await fetch(`http://localhost:${PORTS.serverDefault}/api/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/form-data; boundary=----never-closed' },
+      body: '------never-closed\r\nContent-Disposition: form-data; name="files"; filename="x.jpg"\r\n\r\ntruncated',
+    });
+    assert.equal(res.status, 401);
+  });
+
+  test('a family member gets past auth (503: Immich is not configured here)', async () => {
+    const res = await api('/api/upload', { method: 'POST', body: oneFile(), token });
+    assert.equal(res.status, 503);
+  });
+
+  test('the agent API key gets past auth too', async () => {
+    const res = await api('/api/upload', { method: 'POST', body: oneFile(), apiKey: 'test-hermes-key' });
+    assert.equal(res.status, 503);
   });
 });
 

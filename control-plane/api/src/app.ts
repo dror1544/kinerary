@@ -734,7 +734,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
     if (!result.ok) {
       const status = result.reason === "PLAN_ALREADY_PENDING" ? 409
-        : result.reason === "NO_COMPATIBLE_RELEASE" ? 422
+        : result.reason === "NO_COMPATIBLE_RELEASE" || result.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
         : 409;
       return reply.code(status).send({ error: result.reason });
     }
@@ -784,7 +784,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
 
     if (!result.ok) {
       const status = result.reason === "TRIP_NOT_FOUND" ? 404
-        : result.reason === "NO_COMPATIBLE_RELEASE" ? 422
+        : result.reason === "NO_COMPATIBLE_RELEASE" || result.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
         : 409;
       return reply.code(status).send({ error: result.reason });
     }
@@ -965,7 +965,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     if (!result.ok) {
       const status = result.reason === "TRIP_NOT_FOUND" ? 404
         : result.reason === "INVALID_STATE" ? 409
-        : result.reason === "INVALID_ANSWERS" || result.reason === "UNSAFE_ANSWER_CONTENT" ? 422
+        : result.reason === "INVALID_ANSWERS" || result.reason === "UNSAFE_ANSWER_CONTENT" || result.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422
         : 400;
       return reply.code(status).send(
         result.reason === "UNSAFE_ANSWER_CONTENT"

@@ -24,6 +24,9 @@ class ParsesUnderSystemBash(unittest.TestCase):
         bash = SYSTEM_BASH if Path(SYSTEM_BASH).exists() else shutil.which("bash")
         scripts = sorted(p for p in (REPO / "scripts").rglob("*.sh") if p.is_file())
         scripts += sorted(p for p in (REPO / ".agents/skills").rglob("*.sh") if p.is_file())
+        # The VM, Proxmox-host and forced-command scripts. vm-restore-snapshot.sh
+        # runs on the Mac, and proxmox-snapshot-runner.sh's tests run it here.
+        scripts += sorted(p for p in (REPO / "control-plane/deployment").glob("*.sh") if p.is_file())
         self.assertTrue(scripts, "found no shell scripts — the glob is wrong")
         for script in scripts:
             with self.subTest(script=str(script.relative_to(REPO))):

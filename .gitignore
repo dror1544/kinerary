@@ -32,6 +32,7 @@ scripts/hermes-pipeline/.last-answers.json
 provisioning/__pycache__/
 tests/provisioning/__pycache__/
 tests/scripts/__pycache__/
+control-plane/deployment/__pycache__/
 telegram_manager/__pycache__/
 control-plane/api/dist/
 control-plane/api/releases/

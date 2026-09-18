@@ -30,8 +30,10 @@ import {
   optionLabel,
   uiString,
   type Language,
+  unsettledText,
 } from "./intake-copy.js";
 import type { OrganizerTrip } from "./organizer-trips.js";
+import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
   INTAKE_QUESTIONS,
@@ -46,7 +48,24 @@ import { structuredLog } from "./redaction.js";
 // ── Inbound text ─────────────────────────────────────────────────────────────
 
 export type ParsedInbound =
-  | { kind: "start"; payload: string | null }
+  | {
+      kind: "start";
+      payload: string | null;
+      /**
+       * There WAS a payload and it could not be one of ours.
+       *
+       * Kept separate from `payload: null` because the two deserve opposite
+       * answers: a bare `/start` is someone arriving without their link and is
+       * owed a welcome, while a payload we never issued is a bad link and is
+       * owed a refusal. Collapsing them answered `/start <anything>` with
+       * "Welcome to Kinerary" — found live 2026-09-18 by pasting an invalid
+       * token and being greeted.
+       *
+       * The malformed payload itself is deliberately NOT carried: nothing
+       * reaches the token lookup that cannot be a token.
+       */
+      malformed?: true;
+    }
   | {
       kind: "command";
       name: string;
@@ -98,10 +117,11 @@ export function parseInbound(raw: string): ParsedInbound {
 
   const payload = (rest ?? "").trim();
   if (!payload) return { kind: "start", payload: null };
-  // A payload that cannot be a token we issued is reported as absent rather
-  // than passed down: the caller's "that link isn't valid" reply is the right
-  // answer for both, and this keeps arbitrary text out of the lookup path.
-  if (!START_PAYLOAD_PATTERN.test(payload)) return { kind: "start", payload: null };
+  // A payload that cannot be a token we issued is not passed down — that keeps
+  // arbitrary text out of the lookup path — but it IS reported as malformed
+  // rather than as absent, so the caller can refuse the link instead of
+  // welcoming whoever sent it. See `malformed` above.
+  if (!START_PAYLOAD_PATTERN.test(payload)) return { kind: "start", payload: null, malformed: true };
   return { kind: "start", payload };
 }
 
@@ -723,8 +743,29 @@ export function renderQuestion(
    * stuck, which is what the watchdog will depend on.
    */
   agentText?: string | null,
+  /**
+   * What the record adds to this question: buttons drawn from it (the roster,
+   * for the organizer), and an answer on record that did not settle it, which
+   * the question then quotes back instead of repeating itself.
+   */
+  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; subject?: string } = {},
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
+
+  // A question answered from the record: the roster as buttons. Tapping one
+  // records that traveller's own spelling (see the `answer` tap handler) — the
+  // organizer question takes one name, the dietary scope one per need. Typing
+  // still works; a typed name that matches nobody comes back here with
+  // `unsettled` set.
+  if (question.type === "text" || question.type === "structured") {
+    for (const choice of fromRecord.choices ?? []) {
+      const data = answerCallbackData(question.id, choice.id);
+      if (!callbackDataFits(data)) continue;
+      // An empty label means a word rather than a name — "everyone" — which
+      // belongs in the organizer's language, not the record's.
+      rows.push([{ text: choice.label || uiString("scopeEveryone", language), callback_data: data }]);
+    }
+  }
 
   if (question.type === "choice" || question.type === "multi_choice") {
     const multi = question.type === "multi_choice";
@@ -761,14 +802,28 @@ export function renderQuestion(
       // which: one passes on THIS question, the other ends the questions
       // altogether. "Skip" alone beside "That's everything" read as two ways
       // to do the same thing on the 2026-09-04 run.
-      { text: uiString("skip", language), callback_data: skipCallbackData(question.id) },
+      //
+      // A question that must not be passed over in silence does not offer the
+      // first one: skipping "who is this allergy for?" records nobody, and
+      // nobody means EVERYONE. Its own "everyone" button says that out loud,
+      // so the way out is a choice rather than a default (2026-09-16).
+      ...(question.neverPassedOver
+        ? []
+        : [{ text: uiString("skip", language), callback_data: skipCallbackData(question.id) }]),
       { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
     ]);
   }
 
   // `askText`, never `question.prompt`: the prompt is the interviewer's field
   // spec, examples and all, and it was being read out to organizers verbatim.
-  const text = agentText?.trim() || askText(question, language);
+  // The unsettled note wins over the agent's phrasing: it is the one thing the
+  // organizer needs to know, and a sentence written before the answer landed
+  // cannot know it.
+  const body = fromRecord.unsettled
+    ? unsettledText(question, fromRecord.unsettled, language)
+    : agentText?.trim() || askText(question, language);
+  // One question put once per thing it is about: "gluten-free — who is that for?"
+  const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;
   return { text, replyMarkup: rows.length > 0 ? { inline_keyboard: rows } : null };
 }
 
@@ -882,7 +937,10 @@ export function renderEssentialsDone(language: Language = DEFAULT_LANGUAGE): Ren
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("askMore", language), callback_data: MORE_CALLBACK_DATA },
-        { text: uiString("finish", language), callback_data: FINISH_CALLBACK_DATA },
+        // "Skip", not "Finished": this declines the optional questions. The
+        // organizer has not finished anything at this point, and being offered
+        // an end to an interview they are in the middle of read as a trap.
+        { text: uiString("skipOptional", language), callback_data: FINISH_CALLBACK_DATA },
       ]],
     },
   };

@@ -46,3 +46,62 @@ class WorkDirTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApprovalAnswersThisDocument(unittest.TestCase):
+    """The approval must answer the companion's question about the file.
+
+    `approve_until` polls for what the bot has said and replies "Yes, go ahead"
+    to anything new. It started every wait at sequence 0, and no chat is empty
+    by then — the router posts and pins a welcome in a freshly bound group, and
+    the companion has already spoken in the DM. So the first poll matched
+    history and approved before anything had been asked. The site assertion
+    still passed, which is the problem: the run stopped substantiating the
+    "it asks before it writes" guarantee it exists to prove.
+    """
+
+    def setUp(self) -> None:
+        self.mod = load()
+
+    def _auto(self, messages: list[dict]):
+        auto = self.mod.Auto.__new__(self.mod.Auto)
+        auto.said = lambda chat, after=0: [m for m in messages if m["seq"] > after]
+        return auto
+
+    def test_seq_now_reports_where_the_chat_has_got_to(self) -> None:
+        auto = self._auto([{"seq": 4, "kind": "send"}, {"seq": 9, "kind": "send"},
+                           {"seq": 7, "kind": "send"}])
+        self.assertEqual(auto.seq_now("-100123"), 9)
+
+    def test_seq_now_is_zero_in_a_chat_nobody_has_spoken_in(self) -> None:
+        self.assertEqual(self._auto([]).seq_now("-100123"), 0)
+
+    def test_every_wait_starts_from_a_sequence_taken_before_the_document(self) -> None:
+        import ast
+
+        tree = ast.parse(SCRIPT.read_text())
+        wait = next((n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name == "approve_until"), None)
+        self.assertIsNotNone(wait, "approve_until is gone — has the wait moved?")
+        self.assertIn("since", [a.arg for a in wait.args.args],
+                      "approve_until must be told where the chat stood before the document")
+
+        # `seen` is that argument, not a constant: `seen, deadline = since, ...`
+        seeds = [t for n in ast.walk(wait) if isinstance(n, ast.Assign)
+                 for t in ([n.value] if not isinstance(n.value, ast.Tuple) else n.value.elts)
+                 if any(getattr(x, "id", None) == "seen"
+                        for tgt in n.targets
+                        for x in (tgt.elts if isinstance(tgt, ast.Tuple) else [tgt]))]
+        self.assertTrue(seeds, "nothing initializes `seen`")
+        self.assertTrue(
+            any(isinstance(s, ast.Name) and s.id == "since" for s in seeds),
+            "`seen` must start at `since`; a constant makes the first poll match history",
+        )
+
+        for call in [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "approve_until"]:
+            last = call.args[-1]
+            self.assertIsInstance(
+                last, ast.Name,
+                "pass the sequence captured before the document, not a literal",
+            )

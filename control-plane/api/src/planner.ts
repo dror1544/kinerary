@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
-import { INTAKE_SCHEMA_VERSION } from "./interview.js";
+import { INTAKE_SCHEMA_VERSION, organizerMatch, type AnswerStore } from "./interview.js";
 import { issueApproval } from "./plan-approval.js";
 
 function generateId(prefix: string): string {
@@ -11,9 +11,18 @@ function sha256hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
+/**
+ * Whether an intake carries any answers. NULL and `{}` both mean none — the
+ * worker's `_load_intake_data` refuses either ("has no data"), so neither can
+ * become a trip, and neither is judged by the organizer rule.
+ */
+function hasAnswers(data: AnswerStore | null | undefined): data is AnswerStore {
+  return Boolean(data) && Object.keys(data as object).length > 0;
+}
+
 export type GeneratePlanResult =
   | { ok: true; planId: string; planDigest: string; releaseId: string; jobId: string }
-  | { ok: false; reason: "TRIP_NOT_CONFIRMED" | "NO_INTAKE_VERSION" | "NO_COMPATIBLE_RELEASE" | "PLAN_ALREADY_PENDING" };
+  | { ok: false; reason: "TRIP_NOT_CONFIRMED" | "NO_INTAKE_VERSION" | "NO_COMPATIBLE_RELEASE" | "PLAN_ALREADY_PENDING" | "ORGANIZER_NOT_ON_ROSTER" };
 
 /**
  * Creates a provisioning plan from the trip's latest confirmed intake.
@@ -60,8 +69,8 @@ export async function generatePlan(
     return { ok: false, reason: "TRIP_NOT_CONFIRMED" };
   }
 
-  const intakeRow = await db.query<{ id: string; version: number; digest: string; schema_version: number }>(
-    `SELECT id, version, digest, schema_version
+  const intakeRow = await db.query<{ id: string; version: number; digest: string; schema_version: number; data: AnswerStore | null }>(
+    `SELECT id, version, digest, schema_version, data
      FROM control_plane.intake_versions
      WHERE trip_id = $1
      ORDER BY version DESC LIMIT 1`,
@@ -69,6 +78,20 @@ export async function generatePlan(
   );
   const intake = intakeRow.rows[0];
   if (!intake) return { ok: false, reason: "NO_INTAKE_VERSION" };
+
+  // THE COMPLETION INVARIANT, at the last gate before anything is built: a trip is
+  // approvable only when its organizer is exactly one traveller on its own roster.
+  // The interview already refuses to confirm otherwise (`isAnswered`). This holds
+  // it for every other way an intake arrives — a correction, an import, a future
+  // bug in either — because the alternative is the trip of 2026-09-15: built,
+  // "succeeded", and unreachable, with no companion behind it.
+  //
+  // An intake with no answers at all (a row from before migration 0013) is not
+  // judged here: the worker refuses to build one outright, so it can never become
+  // a trip without an organizer.
+  if (hasAnswers(intake.data) && organizerMatch(intake.data).kind !== "matched") {
+    return { ok: false, reason: "ORGANIZER_NOT_ON_ROSTER" };
+  }
 
   // A real pipeline manifest always carries a non-empty `files` array
   // (buildReleaseManifest throws otherwise). A manifest-less `available` row —
@@ -184,7 +207,8 @@ export type RetryProvisionResult =
         | "TRIP_NOT_CONFIRMED"
         | "NO_INTAKE_VERSION"
         | "NO_COMPATIBLE_RELEASE"
-        | "PLAN_ALREADY_PENDING";
+        | "PLAN_ALREADY_PENDING"
+        | "ORGANIZER_NOT_ON_ROSTER";
     };
 
 // States a re-provision can start from. Everything up to and including a live
@@ -234,6 +258,19 @@ export async function retryProvision(
     if (!RETRYABLE_STATES.has(trip.lifecycle_state)) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_RETRYABLE_STATE" };
+    }
+
+    // Refused BEFORE anything is superseded. generatePlan would refuse this intake
+    // anyway — and by then a live trip would already have lost its plan and been
+    // reverted to intake_confirmed, by a retry that could never succeed.
+    const latestIntake = await client.query<{ data: AnswerStore | null }>(
+      "SELECT data FROM control_plane.intake_versions WHERE trip_id = $1 ORDER BY version DESC LIMIT 1",
+      [tripId],
+    );
+    const latest = latestIntake.rows[0];
+    if (latest && hasAnswers(latest.data) && organizerMatch(latest.data).kind !== "matched") {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "ORGANIZER_NOT_ON_ROSTER" };
     }
 
     // Lock every non-terminal provision job for this trip, THEN decide. The

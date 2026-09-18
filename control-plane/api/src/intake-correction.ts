@@ -6,6 +6,7 @@ import {
   INTAKE_SCHEMA_VERSION,
   RETIRED_QUESTION_IDS,
   computeIntakeDigest,
+  organizerMatch,
   validateAnswer,
   type AnswerStore,
 } from "./interview.js";
@@ -24,7 +25,8 @@ export type CorrectIntakeResult =
         | "NOT_AUTHORIZED"
         | "NO_INTAKE_TO_CORRECT"
         | "INVALID_STATE"
-        | "INVALID_ANSWERS";
+        | "INVALID_ANSWERS"
+        | "ORGANIZER_NOT_ON_ROSTER";
     };
 
 const CORRECTABLE_STATES = new Set([
@@ -100,6 +102,14 @@ export async function correctIntake(
 ): Promise<CorrectIntakeResult> {
   const normalized = normalizeCorrectionAnswers(newAnswers);
   if (!normalized) return { ok: false, reason: "INVALID_ANSWERS" };
+
+  // The same completion rule the interview enforces (`isAnswered`) and the planner
+  // re-checks: a corrected intake names its organizer as exactly one traveller on
+  // its own roster, recorded in the roster's own spelling — or it is refused here,
+  // rather than recorded and discovered at build time as a trip with no companion.
+  const organizer = organizerMatch(normalized);
+  if (organizer.kind !== "matched") return { ok: false, reason: "ORGANIZER_NOT_ON_ROSTER" };
+  normalized.organizer_identity = { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: organizer.name };
 
   // Corrections write the same immutable intake_versions.data record as the
   // initial confirmation path. Reject unsafe content before opening a

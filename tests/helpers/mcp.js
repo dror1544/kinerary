@@ -1,7 +1,58 @@
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { PORTS } from './ports.js';
+import { PORTS, TRIP_BRIDGE_PORT_RANGE } from './ports.js';
+
+/**
+ * Who is listening on this port, as a sentence, or null if we cannot tell.
+ *
+ * Best-effort and never throws: this only ever runs while building a failure
+ * message, and a missing `lsof` must not replace the real error with its own.
+ */
+function portHolder(port) {
+  const probes = [
+    ['lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN']],
+    ['ss', ['-lptnH', `sport = :${port}`]],
+  ];
+  for (const [bin, args] of probes) {
+    try {
+      const out = execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (out) return out.split('\n').slice(0, 3).join('\n       ');
+    } catch {
+      // Not installed, or nothing listening. Try the next probe.
+    }
+  }
+  return null;
+}
+
+/**
+ * Why trip-mcp never came up, said in enough detail to act on.
+ *
+ * "trip-mcp exited with code 1 before becoming ready" was the whole message,
+ * and on 2026-09-18 it cost an hour: the real cause was that a provisioned
+ * trip's own bridge already held the port (`mcp_port_for_vmid` = 3000 + vmid,
+ * and the test suite used to allocate from 3095). Nothing in the error named
+ * a port, so it read as a broken MCP server. Whatever the cause, the port and
+ * whoever holds it are the two facts worth having.
+ */
+function startupFailure(what, port, stderr) {
+  const lines = [`${what} (trip-mcp on port ${port})`];
+  const holder = portHolder(port);
+  if (holder) {
+    lines.push(`  port ${port} is already held by:`, `       ${holder}`);
+  }
+  const { first, last } = TRIP_BRIDGE_PORT_RANGE;
+  if (port >= first && port <= last) {
+    lines.push(
+      `  ${port} is inside ${first}-${last}, where provisioned trips run their own`,
+      `  trip-mcp bridge (3000 + vmid, so this is VMID ${port - 3000}). Test ports`,
+      '  belong above 38000 — see helpers/ports.js.',
+    );
+  }
+  const tail = (stderr || '').trim();
+  if (tail) lines.push('  its stderr:', ...tail.split('\n').slice(-6).map(l => `       ${l}`));
+  return new Error(lines.join('\n'));
+}
 
 const HERE     = dirname(fileURLToPath(import.meta.url));
 const MCP_JS   = join(HERE, '..', '..', 'mcp', 'mcp.js');
@@ -41,6 +92,9 @@ export async function startTestMcp(extraEnv = {}) {
     });
 
     let ready = false;
+    // Kept, not only echoed: EADDRINUSE arrives here, and it is the single
+    // most useful line in the failure it causes.
+    let stderr = '';
     mcpProcess.stdout.on('data', chunk => {
       if (!ready && chunk.toString().includes('listening on')) {
         ready = true;
@@ -49,7 +103,10 @@ export async function startTestMcp(extraEnv = {}) {
       }
     });
     mcpProcess.stderr.on('data', chunk => {
-      if (!ready) process.stderr.write(chunk);
+      if (!ready) {
+        stderr += chunk.toString();
+        process.stderr.write(chunk);
+      }
     });
     mcpProcess.on('error', err => {
       clearTimeout(startupTimer);
@@ -58,12 +115,12 @@ export async function startTestMcp(extraEnv = {}) {
     mcpProcess.on('exit', code => {
       if (!ready) {
         clearTimeout(startupTimer);
-        reject(new Error(`trip-mcp exited with code ${code} before becoming ready`));
+        reject(startupFailure(`exited with code ${code} before becoming ready`, port, stderr));
       }
     });
 
     startupTimer = setTimeout(() => {
-      if (!ready) reject(new Error('Test trip-mcp did not start within 10s'));
+      if (!ready) reject(startupFailure('did not start within 10s', port, stderr));
     }, 10_000);
   });
 }

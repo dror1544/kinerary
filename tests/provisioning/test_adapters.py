@@ -332,10 +332,49 @@ class AdapterTests(unittest.TestCase):
 
         adapter.reset_trip_data(LXC_SPEC)
 
+        # `pct list` is the existence check; this spec's container is not in it.
         self.assertEqual(
-            ["rm -rf /mnt/pve/truenas-nfs/tokyo-2026/server-data /mnt/pve/truenas-nfs/tokyo-2026/media"],
+            ["pct list",
+             "rm -rf /mnt/pve/truenas-nfs/tokyo-2026/server-data /mnt/pve/truenas-nfs/tokyo-2026/media"],
             ssh.commands,
         )
+
+    def test_public_reset_trip_data_stops_a_running_container_before_wiping(self) -> None:
+        # 2026-09-18: a first provision created the container and failed after
+        # it had booted. Every retry then wiped the trip's NFS dir from under a
+        # RUNNING site: the container still held its SQLite open, NFS turned
+        # those into `.nfs*` placeholders, `rm -rf` exited 1 and the job failed
+        # — identically, forever. Stop it first; the provisioner starts it again.
+        ssh = FakeProxmoxSsh(
+            pct_list_output=(
+                "VMID       Status     Lock         Name                \n"
+                "106        running                 trip-tokyo-2026     \n"
+            ),
+        )
+        adapter = ProxmoxLxcAdapter(ssh, reset_data=False)
+
+        adapter.reset_trip_data(LXC_SPEC)
+
+        self.assertEqual(
+            ["pct list",
+             "pct stop 106",
+             "rm -rf /mnt/pve/truenas-nfs/tokyo-2026/server-data /mnt/pve/truenas-nfs/tokyo-2026/media"],
+            ssh.commands,
+            "the container is stopped before its data is deleted",
+        )
+
+    def test_public_reset_trip_data_does_not_stop_a_container_that_is_not_running(self) -> None:
+        ssh = FakeProxmoxSsh(
+            pct_list_output=(
+                "VMID       Status     Lock         Name                \n"
+                "106        stopped                 trip-tokyo-2026     \n"
+            ),
+        )
+        adapter = ProxmoxLxcAdapter(ssh, reset_data=False)
+
+        adapter.reset_trip_data(LXC_SPEC)
+
+        self.assertNotIn("pct stop 106", ssh.commands)
 
     def test_proxmox_delete_stops_and_destroys_when_found(self) -> None:
         ssh = FakeProxmoxSsh()

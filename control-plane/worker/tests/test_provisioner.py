@@ -1464,6 +1464,64 @@ class ChatBindingLifecycleTests(unittest.TestCase):
         self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
         self.assertEqual(self._open_row()["hermes_profile"], "companion-a")
 
+    def _age_trip(self, trip_id: str, hours: int) -> None:
+        """Put a trip's creation that many hours in the past, so "newer" is a
+        fact the test states rather than one it hopes two inserts produced."""
+        with self.conn.transaction():
+            self.conn.execute(
+                "UPDATE control_plane.trips SET created_at = now() - make_interval(hours => %s) WHERE id = %s",
+                (hours, trip_id),
+            )
+
+    def test_the_organizers_own_chat_moves_to_the_trip_they_just_interviewed(self) -> None:
+        # Dror, 2026-09-18: a second trip run from one chat got the site link
+        # and nothing else — no assistant name, no login, no group token —
+        # because the binding was refused and the introduction rides on the
+        # binding. The newest trip is the one they just spent an interview on.
+        self._age_trip(self.fix_a["trip_id"], 3)
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        outcome = bind_chat_to_trip(
+            self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b",
+            allow_retarget=True,
+        )
+        self.assertEqual(outcome, "retargeted")
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+        self.assertEqual(self._open_row()["hermes_profile"], "companion-b")
+
+        # Closed, never overwritten, and it says why: another trip lost this
+        # chat, and on this branch there is no /switch to take it back.
+        closed = [r for r in self._rows() if r["closed_at"] is not None]
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["trip_id"], self.fix_a["trip_id"])
+        self.assertEqual(closed[0]["closed_reason"], "retargeted_to_newer_trip")
+
+    def test_a_retarget_never_runs_backwards(self) -> None:
+        # The safety rail. A repair or a re-provision of an OLDER trip runs
+        # with the same flag, and must not take the chat back from the trip the
+        # organizer has since moved on to.
+        self._age_trip(self.fix_a["trip_id"], 3)
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+
+        with self.assertRaises(BindingRefused) as caught:
+            bind_chat_to_trip(
+                self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a",
+                allow_retarget=True,
+            )
+        self.assertEqual(caught.exception.existing_trip_id, self.fix_b["trip_id"])
+        self.assertEqual(len(self._rows()), 1, "and nothing was written")
+        self.assertEqual(self._open_row()["trip_id"], self.fix_b["trip_id"])
+
+    def test_retargeting_is_off_unless_asked_for(self) -> None:
+        # Everything that is not the organizer's own chat — a family group
+        # bound by token, above all — keeps the refusal. The flag is passed at
+        # exactly one call site.
+        self._age_trip(self.fix_a["trip_id"], 3)
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+        with self.assertRaises(BindingRefused):
+            bind_chat_to_trip(self.conn, self.chat_id, self.fix_b["trip_id"], "companion-b")
+        self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
+
     def test_a_closed_binding_frees_the_chat_for_another_trip(self) -> None:
         # Reassignment is not forbidden, only silent reassignment. Once the old
         # binding is deliberately closed, the chat is available again — and the
@@ -2029,3 +2087,118 @@ class OrphanBindingAdoptionTests(unittest.TestCase):
         for chat in ("-100111", "-100222", "391627336"):
             self._bind(chat, self.trip_id, None)
         self.assertEqual(attach_profile_to_orphan_bindings(self.conn, self.trip_id, "companion-japan"), 3)
+
+
+# The trip of 2026-09-15: an organizer answer that names nobody on the roster.
+UNRESOLVED_ORGANIZER_INTAKE = {
+    **COMPANION_INTAKE,
+    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "Grandma Ruth"},
+}
+
+
+@unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
+class ReconcileCompanionTests(unittest.TestCase):
+    """A live trip provisioned without its companion, repaired after the fact.
+
+    2026-09-15: the organizer answer matched nobody on the roster, so the run
+    built the site, bound the organizer's chat to nothing, and marked the trip
+    unreachable. Once the intake names a real traveller, `reconcile_companion`
+    must give the trip exactly what a normal run would have — and running it
+    again must create nothing a second time.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        run_test_migrations()
+        cls.conn = psycopg.connect(DB_URL, row_factory=dict_row)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def setUp(self) -> None:
+        self.fix = setup_fixture(self.conn, intake=UNRESOLVED_ORGANIZER_INTAKE)
+        self.identity_id = f"idnt_{rnd()}"
+        self.chat_id = "8" + str(secrets.randbelow(10**9)).zfill(9)
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.user_identities
+                     (id, user_id, provider, provider_subject_digest, provider_subject_id, verified_at)
+                   VALUES (%s, %s, 'telegram', %s, %s, now())""",
+                (self.identity_id, self.fix["user_id"], sha256(self.chat_id), self.chat_id),
+            )
+        self.companion = FakeCompanionProfileAdapter()
+        self.worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reconcile", companion=self.companion,
+        )
+        self.worker.run_once()
+
+    def tearDown(self) -> None:
+        self.conn.rollback()
+        with self.conn.transaction():
+            self.conn.execute("DELETE FROM control_plane.trip_person_links WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.telegram_chat_bindings WHERE trip_id = %s", (self.fix["trip_id"],))
+            self.conn.execute("DELETE FROM control_plane.user_identities WHERE id = %s", (self.identity_id,))
+        teardown_fixture(self.conn, self.fix)
+
+    def _correct_organizer(self, text: str) -> None:
+        data = json.dumps({**UNRESOLVED_ORGANIZER_INTAKE, "organizer_identity": {"kind": "text", "schema_version": 1, "text": text}})
+        with self.conn.transaction():
+            self.conn.execute(
+                """INSERT INTO control_plane.intake_versions(id, trip_id, version, artifact_ref, digest, confirmed_at, schema_version, data)
+                   VALUES (%s, %s, 2, 'intake:correction:test:v2', %s, now(), 1, %s::jsonb)""",
+                (f"intk_{rnd()}", self.fix["trip_id"], sha256(data), data),
+            )
+
+    def _state(self) -> dict:
+        self.conn.rollback()
+        trip_id = self.fix["trip_id"]
+
+        def rows(sql: str) -> list[dict]:
+            return self.conn.execute(sql, (trip_id,)).fetchall()
+
+        return {
+            "open_bindings": [r["hermes_profile"] for r in rows(
+                "SELECT hermes_profile FROM control_plane.telegram_chat_bindings WHERE trip_id = %s AND closed_at IS NULL")],
+            "all_bindings": len(rows("SELECT 1 FROM control_plane.telegram_chat_bindings WHERE trip_id = %s")),
+            "introductions": len(rows(
+                "SELECT 1 FROM control_plane.notification_outbox WHERE trip_id = %s AND notification_type = 'companion_ready'")),
+            "site_ready_messages": len(rows(
+                "SELECT 1 FROM control_plane.notification_outbox WHERE trip_id = %s AND notification_type = 'provisioning_complete'")),
+            "organizer_links": len(rows(
+                "SELECT 1 FROM control_plane.trip_person_links WHERE trip_id = %s AND role = 'organizer'")),
+            "reachability": rows("SELECT reachability FROM control_plane.trips WHERE id = %s")[0]["reachability"],
+        }
+
+    def test_the_provisioning_run_left_the_trip_without_a_companion(self) -> None:
+        state = self._state()
+        self.assertEqual(self.companion.installed, [])
+        self.assertEqual(state["open_bindings"], [None], "the chat is routed, with no assistant behind it")
+        self.assertEqual(state["reachability"], "unreachable")
+
+    def test_reconciling_gives_the_live_trip_its_companion_without_saying_trip_ready_again(self) -> None:
+        self._correct_organizer("Noa")
+        result = self.worker.reconcile_companion(self.fix["trip_id"])
+        state = self._state()
+
+        self.assertTrue(result["hermes_profile"])
+        self.assertEqual(len(self.companion.installed), 1)
+        self.assertEqual(state["open_bindings"], [result["hermes_profile"]], "one open binding, now to the companion")
+        self.assertEqual(state["reachability"], "reachable")
+        self.assertEqual(state["introductions"], 1)
+        self.assertEqual(state["site_ready_messages"], 1, "the site-ready message is not sent again")
+        self.assertEqual(state["organizer_links"], 1)
+
+    def test_reconciling_twice_creates_nothing_twice(self) -> None:
+        self._correct_organizer("Noa")
+        self.worker.reconcile_companion(self.fix["trip_id"])
+        first = self._state()
+        self.worker.reconcile_companion(self.fix["trip_id"])
+        self.assertEqual(self._state(), first, "no second binding, introduction, token or organizer link")
+
+    def test_an_intake_that_still_names_nobody_is_refused_and_changes_nothing(self) -> None:
+        before = self._state()
+        with self.assertRaises(ValueError):
+            self.worker.reconcile_companion(self.fix["trip_id"])
+        self.assertEqual(self._state(), before)
+        self.assertEqual(self.companion.installed, [])

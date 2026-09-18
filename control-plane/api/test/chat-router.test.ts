@@ -46,14 +46,20 @@ describe("parseInbound", () => {
     assert.deepEqual(parseInbound("/start@kinerary_bot"), { kind: "start", payload: null });
   });
 
-  test("a payload outside Telegram's deep-link alphabet is treated as absent", () => {
+  test("a payload outside Telegram's deep-link alphabet is withheld, and said to be malformed", () => {
+    // Withheld: nothing that cannot be a token reaches the token lookup.
+    // Malformed: but it is NOT the same as arriving with no link at all. Both
+    // used to report `payload: null` and nothing downstream could tell them
+    // apart, so `/start <anything>` was answered "Welcome to Kinerary" — found
+    // live 2026-09-18 by pasting an invalid token and being greeted, which
+    // reads as though the code was accepted.
     for (const bad of ["/start not a token", "/start ../../etc/passwd", "/start tok;DROP TABLE trips"]) {
-      assert.deepEqual(parseInbound(bad), { kind: "start", payload: null }, bad);
+      assert.deepEqual(parseInbound(bad), { kind: "start", payload: null, malformed: true }, bad);
     }
   });
 
-  test("a payload longer than Telegram's 64-char limit is treated as absent", () => {
-    assert.deepEqual(parseInbound(`/start ${"a".repeat(65)}`), { kind: "start", payload: null });
+  test("a payload longer than Telegram's 64-char limit is malformed, not absent", () => {
+    assert.deepEqual(parseInbound(`/start ${"a".repeat(65)}`), { kind: "start", payload: null, malformed: true });
     const atLimit = "a".repeat(64);
     assert.deepEqual(parseInbound(`/start ${atLimit}`), { kind: "start", payload: atLimit });
   });

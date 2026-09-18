@@ -196,6 +196,16 @@ Nothing outside that file needs to know the rule, which is the point: it was
 already written down in `docs/sprint5-trip-bot-router-design.md` and being
 written down was not enough.
 
+**`--test-timeout` bounds a HANG, not a file.** It was set to 60s in #23 to
+catch a test awaiting something that never settles, when "nothing legitimate
+approaches the bound (slowest observed: ~1.2s)". `node:test` applies the same
+value to the per-FILE subtest, and these files are no longer 1.2s:
+`interview-transcript` is 81s locally and CI runners are slower again. Three
+files were cancelled on CI at 60s — `# fail 0`, `# cancelled 3`, every test in
+them passing. It is 300000 now, which still fails a hung test, just not a
+passing suite. Raise it rather than trim a suite to fit; if a file genuinely
+approaches five minutes, split the file.
+
 ### The interview has no agent — and silently grows one back
 
 The interview is a **deterministic router calling bounded LLM functions**, not
@@ -207,9 +217,17 @@ process**, which is where the interview's model calls are made:
 
 ```
 INTERPRET_PATH_DEFAULT=1
-INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5
-EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5
+INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5   INTERPRET_EFFORT=medium
+EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5     EXTRACT_EFFORT=medium
+ITINERARY_EXTRACT_TIMEOUT_MS=120000
 ```
+
+**Set the effort.** Unset, a nested `claude -p` takes its effort from the
+settings in the relay's HOME — on the Mac, a personal `effortLevel: xhigh`, at
+which a 4-page PDF's day-by-day plan took 143s against a 60s limit and never
+arrived (2026-09-16). Set, the call also ignores personal settings, hooks and
+connectors. The VM takes `medium` from `CLAUDE_CONFIG_DIR` instead and is
+unaffected until it sets these too.
 
 **Unset is not an error, it is a downgrade.** With no flag, new sessions are
 created on the agent path — which is a supported path, so nothing warns. With
@@ -277,6 +295,14 @@ VM restart the relay with `control-plane/deployment/vm-relay-restart.sh`, not
 `scripts/e2e-full-cycle.py` at it with
 `KINERARY_COMPOSE_PROJECT` / `KINERARY_RELAY_CONTAINER` / `KINERARY_RELAY_RESTART`
 — it refuses `--auto` on a non-Mac stack without them.
+
+Change the VM's version **only** with `sudo kinerary-cp-release upgrade|rollback`
+(always `--dry-run` first) — never by hand-editing `KINERARY_REV`. It snapshots
+the VM from the Proxmox host (never vzdump, never NFS), dumps the database, and
+records the way back; the `trip-monitor` agent can request the same through a
+gate only Dror's one-time code approves. Every new migration must start with
+`-- rollback: compatible|breaking — <why>`. Runbook: "Upgrades and rollback" in
+`docs/control-plane-vm-deployment.md`.
 
 ### Restarting a live interview for a test run
 

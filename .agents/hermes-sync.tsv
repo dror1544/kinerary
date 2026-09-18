@@ -20,3 +20,9 @@
 # in the profile, and how a QUESTIONS.md edit sat undeployed on 2026-09-06
 # while the SOUL.md change that POINTS AT IT went live. One entry, whole tree.
 .agents/skills/trip-intake-interviewer/skills/kinerary	trip-intake	skills/kinerary
+# The fleet monitor's SOUL. The skill directory itself (which carries the MCP
+# server the profile runs) is auto-discovered under skills/travel/, but the
+# SOUL is where the domain knowledge lives — stages, trip classes, the rule
+# that only the stack marked production describes real travellers — so it
+# needs its own pairing.
+.agents/skills/trip-fleet-monitor/SOUL.md	trip-monitor	SOUL.md

@@ -9,6 +9,7 @@ import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { MCP_API_KEY, startTestMcp, stopTestMcp, mcpCallTool, TRIP_API_KEY } from './helpers/mcp.js';
+import { PORTS } from './helpers/ports.js';
 
 let apiServer;
 let apiBaseUrl;
@@ -50,7 +51,7 @@ describe('writable budget MCP tools', () => {
     });
     const address = apiServer.address();
     apiBaseUrl = `http://127.0.0.1:${address.port}`;
-    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: '3113', MCP_API_KEY });
+    await startTestMcp({ API_BASE_URL: apiBaseUrl, MCP_PORT: String(PORTS.mcpBudget), MCP_API_KEY });
   });
 
   after(async () => {

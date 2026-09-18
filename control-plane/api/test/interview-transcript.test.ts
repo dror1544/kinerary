@@ -37,6 +37,8 @@ import { askText, uiString, type Language } from "../src/intake-copy.js";
 import {
   INTAKE_QUESTIONS,
   getSessionForChat,
+  isAnswered,
+  INTAKE_QUESTIONS,
   AGENT_FLOOR_SECONDS,
   DOCUMENT_FLOOR_SECONDS,
   hasOpenAgentTurn,
@@ -60,6 +62,7 @@ import {
   flushSettledInboundBursts,
   recoverStalledInterviews,
   renderDueRouterPrompts,
+  sendNextStep,
 } from "../src/relay/poller.js";
 import { detectInternalLeak } from "../src/relay/internal-leak.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -1279,6 +1282,97 @@ describe("the interview is somewhere, not merely computable", () => {
       assert.ok(
         fix.script.last?.buttons.includes("c:confirm"),
         "the organizer actually gets the Confirm button, not a dead end",
+      );
+      fix.script.check();
+    });
+  });
+
+  test("skipping the LAST optional question shows the recap, without being asked", { skip: SKIP }, async () => {
+    // 2026-09-18, twice in live interviews: the organizer skipped the final
+    // optional question and the interview went silent. The tap was answered
+    // from a view built BEFORE it was recorded — still carrying the question
+    // just skipped — so the send deduped it as "already on their screen" and
+    // said nothing, while the session had become confirmable. `/done` produced
+    // the recap at once, which is how we knew it was owed, not missing.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      // Walk the OPTIONAL questions the way an organizer does — skip each one
+      // until none is left. Only optional ones: skipping a required question
+      // wedges the session by design (it is neither answered nor askable).
+      for (let i = 0; i < 12; i += 1) {
+        const view = await getSessionForChat(fix.pool, fix.chat);
+        assert.ok(view.ok);
+        if (view.view.state === "awaiting_confirmation") break;
+        const asked = view.view.optionalRemaining[0];
+        if (!asked) break;
+        await turn(fix, taps(fix, `k:${asked.id}`));
+      }
+
+      const ended = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(ended.ok);
+      assert.equal(
+        ended.view.state, "awaiting_confirmation",
+        `the interview is over (phase ${ended.view.phase}, optional left: `
+        + `${ended.view.optionalRemaining.map((q) => q.id).join(",") || "none"})`,
+      );
+      assert.ok(
+        fix.script.last?.buttons.includes("c:confirm"),
+        `the recap arrives on its own; last message was: ${fix.script.last?.text?.slice(0, 120)}`,
+      );
+      fix.script.check();
+    });
+  });
+
+  test("a session that turns confirmable mid-turn still gets its recap", { skip: SKIP }, async () => {
+    // 2026-09-18, live: the organizer skipped the LAST optional question. The
+    // write scheduled a router prompt, the router read the session, saw
+    // nothing to ask and a state that was not confirmable yet, and handed back
+    // — spending the due flag. A moment later the session was
+    // `awaiting_confirmation` with the recap owed and nobody left to speak.
+    // The interview looked like it had stopped after the final question;
+    // `/done` produced the recap instantly, which is how we know it was never
+    // missing, only unasked-for.
+    //
+    // The stale view is the whole case, so the test hands one over.
+    await withConversation(async (fix) => {
+      await open(fix);
+      await turn(fix, taps(fix, "c:nodoc"));
+      await answerEverythingRequired(fix);
+
+      const before = await getSessionForChat(fix.pool, fix.chat);
+      assert.ok(before.ok);
+      // As it was at that instant: nothing left to ask, not yet confirmable.
+      const stale = {
+        ...before.view,
+        state: "interviewing" as const,
+        nextQuestion: null,
+        pendingAsk: null,
+        optionalRemaining: [],
+        // The organizer is past the essentials-done transition — as they are
+        // when the LAST optional question has just been skipped.
+        pendingEntry: null,
+        offeredMore: true,
+      };
+
+      // The state flips with no prompt scheduled — the flag was already spent.
+      const finished = await setFinishRequestedForChat(fix.pool, fix.chat, true);
+      assert.ok(finished.ok);
+      assert.equal(finished.view.state, "awaiting_confirmation");
+
+      const spoke = await sendNextStep(
+        stale,
+        fix.chat,
+        { db: fix.pool, telegram: fix.script, connector: fix.connector },
+        DEFAULT_STRINGS,
+      );
+
+      assert.equal(spoke, true, "the router speaks rather than going quiet on a stale view");
+      assert.ok(
+        fix.script.last?.buttons.includes("c:confirm"),
+        "and what it says is the recap, with the Confirm button",
       );
       fix.script.check();
     });

@@ -285,12 +285,17 @@ fi
 
 # ── warnings ─────────────────────────────────────────────────────────────────
 if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
-  # A runbook or rule that names a path which no longer exists.
+  # A runbook or rule that names a path which no longer exists. A gitignored
+  # path is a build output or runtime directory (control-plane/api/dist,
+  # server/data): a fresh checkout or worktree never has one, so its absence
+  # says nothing about the doc. `$p/` too, because a directory-only pattern
+  # like `dist/` cannot match a path git has never seen as a directory.
   for doc in CLAUDE.md AGENTS.md README.md FRAMEWORK.md docs/landing-spa-test-runbook.md; do
     [ -f "$doc" ] || continue
     while read -r p; do
       [ -n "$p" ] || continue
-      [ -e "$p" ] || warn "$doc references a path that no longer exists: $p"
+      [ -e "$p" ] || git check-ignore -q "$p" || git check-ignore -q "$p/" \
+        || warn "$doc references a path that no longer exists: $p"
     done < <(grep -oE '`(control-plane|server|mcp|shared|scripts|site|web|provisioning)/[A-Za-z0-9_./-]+`' "$doc" \
              | tr -d '`' | sed 's#/$##' | sort -u)
   done
