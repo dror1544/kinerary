@@ -14,6 +14,7 @@ import {
   consumeExpectsReplyWindow,
   findQuestion,
   KEEP_PLANNING_CALLBACK_DATA,
+  otherCallbackData,
   parseCallbackData,
   parseInbound,
   renderConfirmPrompt,
@@ -82,6 +83,13 @@ describe("callback data", () => {
     });
   });
 
+  test("round-trips an Other tap without treating it as an answer", () => {
+    assert.deepEqual(parseCallbackData(otherCallbackData("trip_type")), {
+      kind: "other",
+      questionId: "trip_type",
+    });
+  });
+
   test("recognises the confirm pair", () => {
     assert.deepEqual(parseCallbackData(CONFIRM_CALLBACK_DATA), { kind: "confirm" });
     assert.deepEqual(parseCallbackData(KEEP_PLANNING_CALLBACK_DATA), { kind: "keep_planning" });
@@ -112,10 +120,19 @@ describe("renderQuestion", () => {
     assert.ok(choiceQuestion, "expected at least one choice question in the intake set");
     const rendered = renderQuestion(choiceQuestion);
     assert.ok(rendered.replyMarkup, "choice question should carry a keyboard");
-    assert.equal(rendered.replyMarkup.inline_keyboard.length, choiceQuestion.options?.length);
+    assert.equal(
+      rendered.replyMarkup.inline_keyboard.length,
+      (choiceQuestion.options?.length ?? 0) + (choiceQuestion.allowsOther ? 1 : 0),
+    );
     for (const row of rendered.replyMarkup.inline_keyboard) {
       assert.equal(row.length, 1, "one option per row");
       assert.ok(callbackDataFits(row[0].callback_data));
+    }
+    if (choiceQuestion.allowsOther) {
+      assert.ok(
+        rendered.replyMarkup.inline_keyboard.flat().some((button) => button.callback_data === otherCallbackData(choiceQuestion.id)),
+        "a choice that allows Other exposes a real Other button",
+      );
     }
   });
 
