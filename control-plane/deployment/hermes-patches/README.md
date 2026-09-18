@@ -6,28 +6,26 @@ live nowhere else: `/opt/hermes-src` on `kinerary-cp` is a history-less
 no remote (`docs/control-plane-vm-deployment.md` → Hermes). A patch that is
 only in the image is one rebuild away from gone.
 
-Each patch applies from the root of the Hermes source tree:
+Adding a patch file here is the whole act of carrying it — nothing else needs
+editing. `control-plane/deployment/build-hermes-image.sh` globs this directory,
+applies every patch in name order onto a **copy** of the snapshot, builds, and
+verifies what it built: the manifest is inside the image and the fork's own
+tests for the patched files pass against it.
 
 ```bash
 ssh debian@192.168.0.45
-cd /opt/hermes-src && sudo patch -p1 --dry-run < <patch>   # check first
-cd /opt/hermes-src && sudo patch -p1 < <patch>
-sudo docker build --build-arg HERMES_GIT_SHA=<rev>-<name> -t kinerary-cp/hermes:<rev>-<name> .
-sudo sed -i "s|^HERMES_REV=.*|HERMES_REV=<rev>-<name>|" /opt/kinerary-deploy/vm.env
+sudo /opt/kinerary/control-plane/deployment/build-hermes-image.sh --set-rev
+$C up -d --wait hermes      # the deploy — every companion gateway restarts
+sudo /opt/kinerary/control-plane/deployment/hermes-image-check.sh
 ```
 
-then bring the container up the way the runbook does (both env files). Every
-companion gateway restarts with it, so do it when no conversation is live.
+`/opt/hermes-src` stays pristine: a tree that is already patched is refused,
+because the next `git archive` refresh would drop hand edits silently. The tag
+is `<base>-p<hash of the patch set>`, so a stale image cannot answer to a newer
+patch set's name, and the check reads the manifest back out of whatever is
+running — the question the compose file cannot answer.
 
-Run the fork's own tests before building — the image has no pytest, so install
-it into the app venv in a throwaway container:
-
-```bash
-sudo docker run --rm --entrypoint sh -v /opt/hermes-src:/src -w /src \
-  kinerary-cp/hermes:<rev> -lc \
-  "VIRTUAL_ENV=/opt/hermes/.venv uv pip install -q pytest pytest-asyncio; \
-   /opt/hermes/.venv/bin/python -m pytest tests/tools/test_tool_search.py -q"
-```
+Do the deploy when no conversation is live.
 
 ## 0001-tool-call-payload-key-aliases
 
@@ -62,4 +60,7 @@ carry content, and reads the alias through nine spellings of empty. 7 fail on
 stock Hermes; the empty-spelling cases fail on the first cut; all pass now.
 51 in that file, 105 across the dispatcher suites.
 
-Deployed as `kinerary-cp/hermes:ab0d98414-toolcall-alias2`.
+The build script and the image check arrive with the branch that adds
+`0002-relay-media-dir`; until that merges, this patch is carried in
+`kinerary-cp/hermes:ab0d98414-toolcall-alias2`, built by hand from a patched
+snapshot — which is the practice the script exists to end.
