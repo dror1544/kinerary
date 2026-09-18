@@ -56,19 +56,24 @@ import {
 import { getAssistantNames, parseAssistantNames, setAssistantNames } from "../assistant-names.js";
 import {
   extractGroupBindingToken,
+  groupBindingTokenIsOwn,
   issueGroupBindingToken,
   redeemGroupBindingToken,
 } from "../group-binding.js";
 import { structuredLog } from "../redaction.js";
 import {
+  attachMedia,
   botJoinedGroup,
   describeAttachment,
   migrationOf,
   normalizeUpdate,
   toWireEventWithMedia,
+  type Attachment,
   type MediaDeps,
+  type TelegramMessage,
   type TelegramUpdate,
 } from "./normalize.js";
+import type { HeldAttachment, PendingAttachments } from "./pending-attachments.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
@@ -228,6 +233,12 @@ export interface DispatchStrings {
    * a guess to whoever is guessing, in a room the organizer does not control.
    */
   groupTokenRefused: string;
+  /**
+   * Their own live code, pasted in their own chat with the bot instead of in
+   * the family group. Says where it goes, rather than quietly doing something
+   * else with it.
+   */
+  groupTokenBelongsInGroup: string;
   /** Bound, but the trip has no introduction facts stored to greet with. */
   groupBoundNoIntro: string;
 }
@@ -255,6 +266,8 @@ export const DEFAULT_STRINGS: DispatchStrings = {
     "I can only set up a group from your own chat with me, once your trip site is ready.",
   groupTokenRefused:
     "That code didn't work here. Ask the trip organizer to send you a fresh one.",
+  groupTokenBelongsInGroup:
+    "That's your group code — it works in the family group, not here. Add me to the group, make me an admin, and post it there.",
   groupBoundNoIntro: "This group is connected to the trip.",
   unbound:
     "I don't have a trip for this chat yet. Open the link from your Kinerary signup to get started.",
@@ -297,6 +310,12 @@ export interface DispatchOptions {
   interviewerProfile?: string;
   /** Present when the connector runs a media plane; absent keeps text-only behaviour. */
   media?: MediaDeps;
+  /**
+   * Documents sent to a group without addressing the assistant, waiting for
+   * their sender's next addressed message. Must outlive a single update, so
+   * the poller owns it. Absent, such a document is simply dropped.
+   */
+  pendingAttachments?: PendingAttachments;
   /**
    * Whether a trip's companion gateway is connected right now.
    *
@@ -420,7 +439,13 @@ export async function dispatchUpdate(
           reply: {
             chatId,
             text:
-              outcome.reason === "NO_PAYLOAD"
+              // A payload we could never have issued is a BAD LINK, not a
+              // bare `/start`. Both reach `startFromDeepLink` with no payload
+              // — nothing malformed is allowed near the token lookup — so the
+              // parse result, not the outcome, is what tells them apart.
+              // Without this, `/start <anything>` answered "Welcome to
+              // Kinerary", which reads as though the code was accepted.
+              outcome.reason === "NO_PAYLOAD" && !parsed.malformed
                 ? strings.noPayload
                 : outcome.reason === "NOT_PRIVATE_CHAT"
                   ? strings.notPrivate
@@ -495,6 +520,38 @@ export async function dispatchUpdate(
         },
         { includePassword: options.groupIntroIncludesPassword ?? true },
       ),
+    };
+  }
+
+  // THE SAME CODE, PASTED IN THE WRONG CHAT.
+  //
+  // A group code posted in the organizer's own DM had two ways to go and
+  // neither said anything true. As bare text it was not a command, so it fell
+  // through to routing and reached the COMPANION, which answered it as
+  // conversation — Dror, 2026-09-18: "I gave it invalid token and got a
+  // greeting, it should have said unknown". With `/group` in front it hit the
+  // issuance branch below, whose argument is ignored, and minted a brand new
+  // token — so a wrong code produced a working one and a right code was
+  // silently replaced.
+  //
+  // Checked here: after the group redemption above (which owns the case where
+  // this belongs) and before both routing and issuance.
+  //
+  // `groupBindingTokenIsOwn` reads, never redeems — a DM is not a group and
+  // binding one would rebind the very channel the code arrived on. It asks
+  // only whether the code is this chat's own live one, so the answer carries
+  // nothing the sender did not already hold; everything else gets the same
+  // flat refusal a group would give.
+  const dmToken = message.chat?.type === "private" ? extractGroupBindingToken(text) : null;
+  if (dmToken) {
+    const route = await resolveChatRoute(db, chatId);
+    const senderId = message.from?.id === undefined ? null : String(message.from.id);
+    const own = route.kind === "companion" && senderId !== null
+      && await groupBindingTokenIsOwn(db, dmToken, route.tripId, senderId);
+    log(structuredLog("info", "trip_bot.group_token_in_dm", { own }));
+    return {
+      kind: "reply",
+      reply: { chatId, text: own ? strings.groupTokenBelongsInGroup : strings.groupTokenRefused },
     };
   }
 
@@ -665,7 +722,7 @@ export async function dispatchUpdate(
     }
   }
 
-  const outcome = await normalizeUpdate(db, update, options.media, options.canReachProfile);
+  const outcome = await normalizeUpdate(db, update, options.canReachProfile);
   if (outcome.kind === "event") {
     // The relevance gate. A DM is addressed by construction; a group message
     // has to actually address the assistant, or the shared bot answers a
@@ -701,7 +758,21 @@ export async function dispatchUpdate(
         botUsername: botIdentity.username,
         isReplyToAssistant,
       });
-    if (!addressed) return { kind: "ignore", reason: "NOT_ADDRESSED" };
+    const senderId = outcome.event.source.user_id;
+    if (!addressed) {
+      // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
+      // remembered, by reference, for its sender's next addressed message —
+      // "send the file, then say what it is for" is one interaction to the
+      // person doing it. Photos are not: in a family group they are the family
+      // talking, and a photo followed by an unrelated question is the common case.
+      if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
+        options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
+          ...(message.caption ? { caption: message.caption } : {}),
+        });
+        log(structuredLog("info", "trip_bot.attachment_held", { kind: outcome.attachment.kind }));
+      }
+      return { kind: "ignore", reason: "NOT_ADDRESSED" };
+    }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
     // Telegram, where every sender writes their own — so the assistant was
@@ -721,7 +792,15 @@ export async function dispatchUpdate(
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
       }
     }
-    return { kind: "to_gateway", event: outcome.event };
+
+    const attachments = attachmentsForAddressedTurn(message, outcome.attachment, chatId, senderId, options.pendingAttachments);
+    if (attachments.joined > 0) {
+      log(structuredLog("info", "trip_bot.attachments_joined", {
+        held: attachments.held,
+        replied: attachments.replied,
+      }));
+    }
+    return { kind: "to_gateway", event: await attachMedia(outcome.event, attachments.list, options.media) };
   }
 
   switch (outcome.reason) {
@@ -764,6 +843,57 @@ export async function dispatchUpdate(
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/**
+ * The files an addressed message brings to the assistant, oldest first and
+ * each once:
+ *
+ *   1. documents this sender left in this chat, unaddressed, within the window;
+ *   2. the document this message replies to — only when the sender sent it;
+ *   3. whatever this message carries itself.
+ *
+ * Every source is scoped to the sender. Another person's document is never
+ * attached to this request: not from the holding area, and not by replying to
+ * it, since a reply is a gesture at a message, not a claim on someone else's
+ * file. A sender Telegram does not identify brings only their own attachment.
+ */
+function attachmentsForAddressedTurn(
+  message: TelegramMessage,
+  own: Attachment | null,
+  chatId: string,
+  senderId: string | null,
+  pending: PendingAttachments | undefined,
+): { list: HeldAttachment[]; held: number; replied: boolean; joined: number } {
+  const list: HeldAttachment[] = [];
+  const seen = new Set<string>();
+  const add = (attachment: HeldAttachment): boolean => {
+    if (seen.has(attachment.fileId)) return false;
+    seen.add(attachment.fileId);
+    list.push(attachment);
+    return true;
+  };
+
+  let held = 0;
+  let replied = false;
+  if (senderId) {
+    for (const attachment of pending?.take(chatId, senderId) ?? []) {
+      if (add(attachment)) held += 1;
+    }
+    const repliedTo = message.reply_to_message;
+    const repliedAttachment = repliedTo ? describeAttachment(repliedTo) : null;
+    if (
+      repliedAttachment?.kind === "document"
+      && repliedTo?.from?.id !== undefined
+      && String(repliedTo.from.id) === senderId
+    ) {
+      add({ ...repliedAttachment, ...(repliedTo.caption ? { caption: repliedTo.caption } : {}) });
+      replied = true;
+    }
+  }
+  if (own) add({ ...own, ...(message.caption ? { caption: message.caption } : {}) });
+
+  return { list, held, replied, joined: held + (replied ? 1 : 0) };
 }
 
 /**

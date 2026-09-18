@@ -1,0 +1,160 @@
+--- a/gateway/relay/media.py
++++ b/gateway/relay/media.py
+@@ -51,6 +51,35 @@
+ 
+ _REQUEST_TIMEOUT_S = 30.0
+ 
++# Where a downloaded attachment is saved, when the deployment needs to say.
++#
++# ``download`` hands the agent a filesystem path, so a deployment whose file
++# tools run outside this process — another user, another container — needs the
++# file to land somewhere both sides can open at the same path. That is one
++# directory's worth of a requirement, and it gets one variable. Pointing
++# ``TMPDIR`` at such a directory instead redirects every other temp file the
++# runtime makes — model CLIs, document conversion, dependencies — into a place
++# chosen for media, and when that place is host-persistent (the reason it was
++# named) they outlive the process, and the container, that made them.
++#
++# Unset, or set to something that is not a usable directory, falls back to the
++# default temp dir: a misconfiguration must not silently drop a family's file.
++_MEDIA_DIR_ENV = "HERMES_RELAY_MEDIA_DIR"
++
++
++def media_dir() -> Optional[str]:
++    """The directory ``download`` saves into, or None for the default temp dir."""
++    raw = (os.environ.get(_MEDIA_DIR_ENV) or "").strip()
++    if not raw:
++        return None
++    if not os.path.isdir(raw):
++        logger.warning(
++            "%s=%s is not a directory; saving relay media to the default temp dir",
++            _MEDIA_DIR_ENV, raw,
++        )
++        return None
++    return raw
++
+ 
+ def media_base_url(relay_dial_url: str) -> str:
+     """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` base.
+@@ -191,7 +220,8 @@
+                     if not ext:
+                         mime = (resp.headers.get("Content-Type") or "").split(";")[0]
+                         ext = mimetypes.guess_extension(mime) or ".bin"
+-                    fd, tmp_path = tempfile.mkstemp(prefix="relay_media_", suffix=ext)
++                    fd, tmp_path = tempfile.mkstemp(
++                        prefix="relay_media_", suffix=ext, dir=media_dir())
+                     with os.fdopen(fd, "wb") as fh:
+                         fh.write(data)
+                     return tmp_path
+@@ -202,4 +232,4 @@
+         return await asyncio.get_running_loop().run_in_executor(None, _get)
+ 
+ 
+-__all__ = ["RelayMediaClient", "media_base_url", "MEDIA_MAX_BYTES"]
++__all__ = ["RelayMediaClient", "media_base_url", "media_dir", "MEDIA_MAX_BYTES"]
+--- a/tests/gateway/relay/test_relay_media.py
++++ b/tests/gateway/relay/test_relay_media.py
+@@ -176,3 +176,103 @@
+     empty = tmp_path / "empty.bin"
+     empty.write_bytes(b"")
+     assert await c.upload(str(empty)) is None
++
++
++# ── Where a downloaded attachment lands ──────────────────────────────────
++#
++# A deployment whose file tools run outside this process — another user, a
++# container — needs the saved file somewhere both sides can see, so it can name
++# one directory for downloaded media. Pointing TMPDIR at that directory instead
++# would send every other temp file in the runtime to a place chosen for this
++# one, and (when that place is host-persistent, which is the reason it was
++# named) leave them there after the process that made them is gone.
++
++
++def _fake_pdf_response(monkeypatch) -> None:
++    import urllib.request
++
++    class _Resp:
++        headers = {"Content-Length": "4", "Content-Type": "application/pdf"}
++
++        def read(self, _n):
++            return b"%PDF"
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *a):
++            return False
++
++    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: _Resp())
++
++
++def _default_temp_dir(monkeypatch, tmp_path: Path) -> Path:
++    """Pin the process default temp dir. TMPDIR would not do: tempfile resolves
++    and caches it once, long before a test could set it."""
++    import tempfile
++
++    default = tmp_path / "default"
++    default.mkdir(exist_ok=True)
++    monkeypatch.setattr(tempfile, "tempdir", str(default))
++    return default
++
++
++def _download(monkeypatch, media_dir: Optional[str]) -> Path:
++    import asyncio
++
++    if media_dir is None:
++        monkeypatch.delenv("HERMES_RELAY_MEDIA_DIR", raising=False)
++    else:
++        monkeypatch.setenv("HERMES_RELAY_MEDIA_DIR", media_dir)
++    client = RelayMediaClient("https://c.example", "gw1", "sec")
++    saved = asyncio.run(client.download("https://c.example/relay/media/abc"))
++    assert saved, "download returned no path"
++    return Path(saved)
++
++
++def test_download_lands_in_the_named_media_dir(monkeypatch, tmp_path: Path):
++    _fake_pdf_response(monkeypatch)
++    default = _default_temp_dir(monkeypatch, tmp_path)
++    shared = tmp_path / "inbound"
++    shared.mkdir()
++
++    saved = _download(monkeypatch, str(shared))
++
++    assert saved.parent == shared, f"saved to {saved}, not the named media dir"
++    assert saved.name.startswith("relay_media_")
++    assert not list(default.iterdir())
++
++
++def test_download_falls_back_to_the_default_temp_dir_when_unset(monkeypatch, tmp_path: Path):
++    _fake_pdf_response(monkeypatch)
++    default = _default_temp_dir(monkeypatch, tmp_path)
++
++    assert _download(monkeypatch, None).parent == default
++
++
++def test_a_media_dir_that_is_not_a_directory_does_not_lose_the_file(monkeypatch, tmp_path: Path):
++    """Misconfiguration degrades to the default temp dir, it does not drop media."""
++    _fake_pdf_response(monkeypatch)
++    default = _default_temp_dir(monkeypatch, tmp_path)
++    not_a_dir = tmp_path / "file.txt"
++    not_a_dir.write_text("not a directory")
++
++    assert _download(monkeypatch, str(not_a_dir)).parent == default
++
++
++def test_the_media_dir_does_not_move_other_temp_files(monkeypatch, tmp_path: Path):
++    """The variable names where MEDIA goes — nothing else in the process."""
++    import os
++    import tempfile
++
++    default = _default_temp_dir(monkeypatch, tmp_path)
++    shared = tmp_path / "inbound"
++    shared.mkdir()
++    monkeypatch.setenv("HERMES_RELAY_MEDIA_DIR", str(shared))
++
++    fd, unrelated = tempfile.mkstemp(prefix="something-else-")
++    os.close(fd)
++
++    assert Path(unrelated).parent == default, (
++        "an unrelated temp file followed the media dir — the redirect is not scoped"
++    )

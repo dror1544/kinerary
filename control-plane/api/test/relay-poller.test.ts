@@ -396,6 +396,35 @@ describe("the itinerary a document describes", () => {
     });
   });
 
+  // Built in the background now, so the organizer can answer — and change the
+  // stops — while it runs. Days filed against a list that has since changed
+  // would land on the wrong phase, or undo the change.
+  test("stops that changed while the plan was being built are not overwritten", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100304";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [{ name: "Tokyo" }, { name: "Kyoto" }]);
+
+      await foldItineraryFromDocument(
+        {
+          db: fix.pool, telegram: fix.telegram, connector: fix.connector,
+          extractItinerary: async () => {
+            await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [{ name: "Osaka" }]);
+            return {
+              ok: true, warnings: [], venueLinksDeferred: [],
+              phases: [{ name: "Tokyo", phaseIndex: 0, days: [dayOn("2026-09-19")], venues: [] }],
+            };
+          },
+        },
+        { chatId, sessionId: "sess_test" },
+        "Day 1: Tokyo.",
+        () => {},
+      );
+
+      assert.deepEqual(await phasesFor(fix, chatId), [{ name: "Osaka" }], "the organizer's change stands");
+    });
+  });
+
   test("an extraction that fails leaves the interview exactly as it was", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const chatId = "700100303";
@@ -946,6 +975,114 @@ describe("a document's unsure reading is asked about, not lost", () => {
       await turn(fix, tap(chatId, "c:nodoc"));
       const asked = fix.telegram.lastSent;
       assert.ok(asked?.buttonData.length && asked.buttonData.every((d) => d.startsWith("a:trip_type:")), `got: ${asked?.buttonData}`);
+    });
+  });
+});
+
+// ── The organizer taps their own name ────────────────────────────────────────
+
+describe("the organizer question is answered from the roster", () => {
+  const ROSTER = [
+    { name: "Nir", name_en: "Nir", age: 40, family: "Test" },
+    { name: "Maya", name_en: "Maya", age: 38, family: "Test" },
+  ];
+  const organizerText = (answers: Record<string, unknown> | undefined) =>
+    (answers?.organizer_identity as { text?: string } | undefined)?.text;
+
+  test("a roster button records that traveller's own spelling", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100301";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "travelers", null, undefined, ROSTER);
+      const view = await getSessionForChat(fix.pool, chatId);
+      const maya = view.ok ? view.view.choices?.organizer_identity?.find((c) => c.value === "Maya") : undefined;
+      assert.ok(maya, "the roster is offered for the organizer question");
+
+      await turn(fix, tap(chatId, answerCallbackData("organizer_identity", maya!.id)));
+
+      const store = await answersForChat(fix.pool, chatId);
+      assert.equal(organizerText(store?.answers), "Maya");
+      assert.equal(fix.telegram.answered.at(-1)?.text, undefined, "a plain acknowledgement, not an error");
+      assert.ok(fix.telegram.edited.some((e) => e.text.endsWith("✅ Maya")), "the tapped name is shown on the question");
+    });
+  });
+
+  test("a button drawn before the roster changed records nobody", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100302";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "travelers", null, undefined, ROSTER);
+      const before = await getSessionForChat(fix.pool, chatId);
+      const stale = before.ok ? before.view.choices?.organizer_identity?.[0] : undefined;
+      assert.ok(stale);
+      // The first position now belongs to someone else.
+      await submitAnswerForChat(fix.pool, chatId, "travelers", null, undefined, [ROSTER[1], ROSTER[0]]);
+
+      await turn(fix, tap(chatId, answerCallbackData("organizer_identity", stale!.id)));
+
+      const store = await answersForChat(fix.pool, chatId);
+      assert.equal(organizerText(store?.answers), undefined, "nobody was recorded");
+      assert.match(fix.telegram.answered.at(-1)?.text ?? "", /list has changed/);
+    });
+  });
+});
+
+// ── Who a dietary need applies to ────────────────────────────────────────────
+
+describe("the dietary scope is tapped, one need at a time", () => {
+  // 2026-09-16, live: asked who a need applies to, the organizer answered "my
+  // wife". It was read at low confidence, refused, then passed over — and an
+  // empty scope means EVERYONE, so one person's allergy was recorded against
+  // the whole family.
+  const ROSTER = [
+    { name: "אלה", name_en: "Ella", age: 44, family: "Test" },
+    { name: "נגה", name_en: "Noga", age: 15, family: "Test" },
+  ];
+
+  test("a tapped name settles the need being asked about, and the next need is still open", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100401";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "travelers", null, undefined, ROSTER);
+      await submitAnswerForChat(fix.pool, chatId, "dietary", null, undefined, undefined, ["gluten_free", "vegan"]);
+
+      const asking = await getSessionForChat(fix.pool, chatId);
+      assert.ok(asking.ok);
+      const first = asking.ok ? asking.view.choices?.dietary_scope : undefined;
+      assert.deepEqual(first?.map((c) => c.value), ["everyone", "אלה", "נגה"]);
+      assert.deepEqual(asking.ok ? asking.view.subjects?.dietary_scope : null,
+        { fromQuestion: "dietary", optionId: "gluten_free" }, "it asks about one need at a time");
+
+      const ella = first!.find((c) => c.value === "אלה")!;
+      await turn(fix, tap(chatId, answerCallbackData("dietary_scope", ella.id)));
+
+      const after = await answersForChat(fix.pool, chatId);
+      assert.deepEqual((after?.answers.dietary_scope as { data?: unknown } | undefined)?.data, { gluten_free: ["אלה"] });
+      const next = await getSessionForChat(fix.pool, chatId);
+      assert.deepEqual(next.ok ? next.view.subjects?.dietary_scope : null,
+        { fromQuestion: "dietary", optionId: "vegan" }, "the second ticked need is still to answer");
+      assert.ok(next.ok && next.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
+        "so the question is still one the interview will ask");
+    });
+  });
+
+  test("tapping everyone for the last need settles the question", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100402";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "travelers", null, undefined, ROSTER);
+      await submitAnswerForChat(fix.pool, chatId, "dietary", null, undefined, undefined, ["vegan"]);
+
+      const asking = await getSessionForChat(fix.pool, chatId);
+      const everyone = (asking.ok ? asking.view.choices?.dietary_scope : undefined)!.find((c) => c.value === "everyone")!;
+      await turn(fix, tap(chatId, answerCallbackData("dietary_scope", everyone.id)));
+
+      const after = await answersForChat(fix.pool, chatId);
+      assert.deepEqual((after?.answers.dietary_scope as { data?: unknown } | undefined)?.data, { vegan: "everyone" });
+      const done = await getSessionForChat(fix.pool, chatId);
+      assert.ok(done.ok && !done.view.optionalRemaining.some((q) => q.id === "dietary_scope"),
+        "every ticked need has an answer, so the question is done");
+      assert.equal(done.ok ? done.view.subjects?.dietary_scope : "missing", undefined);
     });
   });
 });

@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
@@ -210,6 +211,124 @@ export interface IntakeQuestion {
    *     interrupting whatever the agent is doing.
    */
   routerOwned?: boolean;
+  /**
+   * Whether an answer ON RECORD actually settles this question, given the rest
+   * of the record. Absent means any valid answer does, which is every question
+   * but one.
+   *
+   * `organizer_identity` is that one. A name is a valid string whoever it names,
+   * and on 2026-09-15 a Hebrew name against a roster spelled only in English
+   * letters was recorded, confirmed and provisioned — a trip with no companion,
+   * because nobody on the roster was the organizer. An unsettled answer stays
+   * outstanding everywhere "answered" is decided (`isAnswered`), so the router
+   * asks again and `confirmIntake` refuses; the typed text is kept so the
+   * re-ask can quote it.
+   */
+  satisfiedBy?: (answers: AnswerStore) => boolean;
+  /**
+   * The answer this question should hold instead, given the rest of the record,
+   * or null to leave it as it is. Applied after every write, so a typed "ניר"
+   * becomes the roster's own "Nir" the moment the roster can say so — including
+   * when the roster arrives after the name.
+   */
+  canonicalize?: (answers: AnswerStore) => IntakeAnswer | null;
+  /** Buttons for a TEXT or STRUCTURED question, drawn from what is already recorded. */
+  choicesFrom?: (answers: AnswerStore) => RosterChoice[];
+  /**
+   * What this question is about RIGHT NOW, when one question is put once per
+   * thing: "gluten-free — who does that apply to?". Names an option of another
+   * question, which the router renders in the organizer's language.
+   */
+  subjectFrom?: (answers: AnswerStore) => { fromQuestion: string; optionId: string } | null;
+  /**
+   * Never pass this question over in silence.
+   *
+   * An optional question the organizer's reply did not settle is skipped and
+   * not asked again — good pacing for "what do you like doing", wrong for a
+   * question about an allergy. 2026-09-16, live: "who is this for?" was
+   * answered with a relation rather than a name, read at low confidence,
+   * refused, and then passed over — and an empty scope means EVERYONE, so one
+   * person's allergy was recorded against the whole family.
+   */
+  neverPassedOver?: boolean;
+}
+
+/** "Everyone on the trip", as a dietary scope answers it. */
+export const SCOPE_EVERYONE = "everyone";
+
+/** The dietary needs ticked, in question order, without "none of these". */
+export function tickedDietaryNeeds(answers: AnswerStore): string[] {
+  const dietary = answers.dietary;
+  if (dietary?.kind !== "multi_choice") return [];
+  return dietary.option_ids.filter((id) => id !== EXCLUSIVE_OPTION_ID);
+}
+
+function scopeObject(answers: AnswerStore): Record<string, unknown> {
+  const scope = answers.dietary_scope;
+  const data = scope?.kind === "structured" ? scope.data : null;
+  return data && typeof data === "object" && !Array.isArray(data) ? { ...(data as Record<string, unknown>) } : {};
+}
+
+/** The ticked need the scope question is asking about now: the first with nobody attached. */
+export function needAwaitingScope(answers: AnswerStore): string | null {
+  const scope = scopeObject(answers);
+  return tickedDietaryNeeds(answers).find((need) => {
+    const who = scope[need];
+    return !(who === SCOPE_EVERYONE || (Array.isArray(who) && who.length > 0));
+  }) ?? null;
+}
+
+/**
+ * A tapped name — or Everyone — folded into the scope answer, for the need
+ * being asked about. One tap settles one need; a need shared by several people
+ * is still typed, and is now re-asked rather than dropped.
+ */
+export function scopeWithChoice(answers: AnswerStore, value: string): Record<string, unknown> {
+  const need = needAwaitingScope(answers);
+  const scope = scopeObject(answers);
+  if (!need) return scope;
+  return { ...scope, [need]: value === SCOPE_EVERYONE ? SCOPE_EVERYONE : [value] };
+}
+
+/**
+ * Whether the trip ends on or after the day it starts. Only judged once both are
+ * real calendar dates: until then there is nothing to compare, and refusing would
+ * block an interview on a question it has not reached.
+ */
+export function datesInOrder(answers: AnswerStore): boolean {
+  const start = answers.departure_date?.kind === "text" ? answers.departure_date.text.trim() : "";
+  const end = answers.return_date?.kind === "text" ? answers.return_date.text.trim() : "";
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
+  if (!iso.test(start) || !iso.test(end)) return true;
+  return end >= start;
+}
+
+/** The organizer's answer against the roster, as the interview and the build both read it. */
+export function organizerMatch(answers: AnswerStore): OrganizerMatch {
+  const answer = answers.organizer_identity;
+  const travelers = answers.travelers;
+  const text = answer?.kind === "text" ? answer.text : "";
+  return resolveOrganizer(text, travelers?.kind === "structured" ? travelers.data : undefined);
+}
+
+/**
+ * Whether a question is settled — the ONE definition of "answered" that
+ * choosing the next question, the interpreter's outstanding set, phase
+ * advancement and confirmation all use. See `satisfiedBy`.
+ */
+export function isAnswered(question: IntakeQuestion, answers: AnswerStore): boolean {
+  return answers[question.id] !== undefined && (!question.satisfiedBy || question.satisfiedBy(answers));
+}
+
+/** Every question's `canonicalize`, applied to a record about to be stored. */
+function canonicalized(answers: AnswerStore, questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS): AnswerStore {
+  let out = answers;
+  for (const q of questions) {
+    if (!q.canonicalize || out[q.id] === undefined) continue;
+    const next = q.canonicalize(out);
+    if (next) out = { ...out, [q.id]: next };
+  }
+  return out;
 }
 
 /**
@@ -342,6 +461,14 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     prompt: "What day does everyone head home?",
     maxLength: 40,
     required: true,
+    // A return before the departure is not an answer. 2026-09-16, the chaos
+    // run: the organizer gave a return date while no departure was recorded yet
+    // (their first one was an impossible date), so there was nothing to compare
+    // it with; the real departure arrived later, and nothing ever looked at the
+    // two together. The recap read "12 July → 1 July" and the interview
+    // confirmed. Settled here, so whichever of the two arrives second re-opens
+    // the return question, quoting it.
+    satisfiedBy: (answers) => datesInOrder(answers),
   },
   {
     id: "timezone",
@@ -484,6 +611,22 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     dataShape: "object",
     dataExample: "{\"kosher_style\": \"everyone\", \"lactose_free\": [\"Dana\"]}",
     required: false,
+    // Asked once per ticked need, answered by tapping a traveller or Everyone —
+    // so "who is this for?" never has to be matched against a word like "my
+    // wife", and two needs are never given one scope between them.
+    satisfiedBy: (answers) => needAwaitingScope(answers) === null,
+    subjectFrom: (answers) => {
+      const need = needAwaitingScope(answers);
+      return need ? { fromQuestion: "dietary", optionId: need } : null;
+    },
+    choicesFrom: (answers) => {
+      if (needAwaitingScope(answers) === null) return [];
+      const roster = answers.travelers?.kind === "structured" ? answers.travelers.data : undefined;
+      // An empty label is the router's cue to write "Everyone" in the
+      // organizer's own language; a traveller's name is a name in any language.
+      return [{ id: "all", label: "", value: SCOPE_EVERYONE }, ...rosterChoices(roster)];
+    },
+    neverPassedOver: true,
     // "For each thing ticked above" — so there has to be something ticked, and
     // "none of these" is the one tick that means there is not.
     applies: (answers) => {
@@ -527,6 +670,19 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       "Never infer it from anything else — not from who signed up, not from who is listed first.",
     maxLength: 80,
     required: true,
+    // Settled only by exactly ONE traveller on the roster. The interview offers
+    // the roster as buttons, records the roster's own spelling, and asks again —
+    // quoting what was written — when a typed name names nobody or two people.
+    // organizer-identity.ts has the matching rules; the worker applies the same
+    // ones at build time.
+    satisfiedBy: (answers) => organizerMatch(answers).kind === "matched",
+    canonicalize: (answers) => {
+      const match = organizerMatch(answers);
+      const current = answers.organizer_identity;
+      if (match.kind !== "matched" || (current?.kind === "text" && current.text === match.name)) return null;
+      return { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: match.name };
+    },
+    choicesFrom: (answers) => rosterChoices(answers.travelers?.kind === "structured" ? answers.travelers.data : undefined),
   },
   {
     // The assistant's name, voice and tone are REQUIRED as of 2026-09-07, at the
@@ -1001,7 +1157,7 @@ export function partitionQuestions(
   const answered: string[] = [];
   for (const q of questions) {
     if (RETIRED_QUESTION_IDS.has(q.id)) continue;
-    if (answers[q.id] === undefined) outstanding.push(q.id);
+    if (!isAnswered(q, answers)) outstanding.push(q.id);
     else answered.push(q.id);
   }
   return { outstanding, answered };
@@ -1227,6 +1383,44 @@ export interface SessionView {
   suggestions: Record<string, SuggestedAnswer>;
   /** The choice whose Other button is awaiting literal organizer text. */
   otherPending: IntakeQuestion | null;
+  /** Buttons for text questions drawn from the record (the roster, for the organizer), by question id. */
+  choices?: Record<string, RosterChoice[]>;
+  /** What a question is about right now ("gluten-free"), by question id. See `subjectFrom`. */
+  subjects?: Record<string, { fromQuestion: string; optionId: string }>;
+  /**
+   * An answer on record that does not settle its question, by question id, as
+   * written — so asking again can say what did not match rather than repeat
+   * itself. See `IntakeQuestion.satisfiedBy`.
+   */
+  unsettled?: Record<string, string>;
+}
+
+function recordChoices(answers: AnswerStore): Record<string, RosterChoice[]> {
+  const out: Record<string, RosterChoice[]> = {};
+  for (const q of INTAKE_QUESTIONS) {
+    const choices = q.choicesFrom?.(answers) ?? [];
+    if (choices.length > 0) out[q.id] = choices;
+  }
+  return out;
+}
+
+function recordSubjects(answers: AnswerStore): Record<string, { fromQuestion: string; optionId: string }> {
+  const out: Record<string, { fromQuestion: string; optionId: string }> = {};
+  for (const q of INTAKE_QUESTIONS) {
+    const subject = q.subjectFrom?.(answers);
+    if (subject) out[q.id] = subject;
+  }
+  return out;
+}
+
+function unsettledAnswers(answers: AnswerStore): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const q of INTAKE_QUESTIONS) {
+    const answer = answers[q.id];
+    if (!q.satisfiedBy || answer === undefined || q.satisfiedBy(answers)) continue;
+    if (answer.kind === "text") out[q.id] = answer.text;
+  }
+  return out;
 }
 
 function currentSelections(answers: AnswerStore): Record<string, string[]> {
@@ -1489,7 +1683,7 @@ function nextUnansweredQuestion(
 ): IntakeQuestion | null {
   const deferred = new Set(ui.deferred ?? []);
   const unanswered = questions.filter(
-    (q) => q.required && (answers[q.id] === undefined || ui.multiPending === q.id),
+    (q) => q.required && (!isAnswered(q, answers) || ui.multiPending === q.id),
   );
   return unanswered.find((q) => !deferred.has(q.id)) ?? null;
 }
@@ -1502,7 +1696,7 @@ export function deferredRequired(
   answers: AnswerStore,
   questions: readonly IntakeQuestion[] = INTAKE_QUESTIONS,
 ): IntakeQuestion[] {
-  return questions.filter((q) => q.required && answers[q.id] === undefined);
+  return questions.filter((q) => q.required && !isAnswered(q, answers));
 }
 
 /**
@@ -1560,7 +1754,7 @@ function unansweredOptionalQuestions(
     (q) =>
       !q.required &&
       !RETIRED_QUESTION_IDS.has(q.id) &&
-      (answers[q.id] === undefined || ui.multiPending === q.id) &&
+      (!isAnswered(q, answers) || ui.multiPending === q.id) &&
       !isSkipped(ui, q.id) &&
       (q.applies?.(answers) ?? true),
   );
@@ -1660,7 +1854,7 @@ export function nextPhase(
 ): InterviewPhase {
   if (current === "confirmed") return "confirmed";
 
-  const requiredDone = questions.filter((q) => q.required).every((q) => answers[q.id] !== undefined);
+  const requiredDone = questions.filter((q) => q.required).every((q) => isAnswered(q, answers));
 
   if (current === "opening") {
     // The opening exists to offer the document before anyone types a trip they
@@ -1711,7 +1905,7 @@ function deriveSessionState(
   ui: InterviewUiState = {},
 ): SessionState {
   const allRequired = questions.filter((q) => q.required);
-  const allAnswered = allRequired.every((q) => answers[q.id] !== undefined);
+  const allAnswered = allRequired.every((q) => isAnswered(q, answers));
   if (!allAnswered) return "interviewing";
   if (ui.finishRequested) return "awaiting_confirmation";
   return unansweredOptionalQuestions(answers, questions, ui).length === 0
@@ -2508,8 +2702,11 @@ function buildSessionView(
     pendingEntry: ui.pendingEntry ?? null,
     pendingSay: ui.pendingSay ?? null,
     pendingAskText: ui.pendingAskText ?? null,
-    suggestions: ui.suggestions ?? {},
+  suggestions: ui.suggestions ?? {},
     otherPending: ui.otherPending ? INTAKE_QUESTIONS.find((q) => q.id === ui.otherPending) ?? null : null,
+    choices: recordChoices(answers),
+    subjects: recordSubjects(answers),
+    unsettled: unsettledAnswers(answers),
   };
 }
 
@@ -3110,7 +3307,8 @@ export async function nominateQuestionForChat(
   // drawing it, because the organizer would have no way to know they were
   // answering something twice.
   const existing = await answersForChat(db, chatId);
-  if (existing && existing.answers[questionId] !== undefined) {
+  const nominated = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (existing && (nominated ? isAnswered(nominated, existing.answers) : existing.answers[questionId] !== undefined)) {
     return { ok: false, reason: "ALREADY_ANSWERED" };
   }
 
@@ -3243,13 +3441,14 @@ export async function skipQuestionForChat(
   // fail at confirm with NOT_ALL_REQUIRED_ANSWERED, which reads to the
   // organizer as the interview breaking at the last step.
   if (!question || question.required) return { ok: false, reason: "NOT_FOUND" };
-  return updateUiStateForChat(db, chatId, (ui) => {
+  const result = await updateUiStateForChat(db, chatId, (ui) => {
     const { multiPending, ...rest } = ui;
     return withoutSuggestion({
       ...(multiPending === questionId ? rest : ui),
       skipped: [...new Set([...(ui.skipped ?? []), questionId])],
     }, questionId);
   });
+  return result;
 }
 
 /** Keeps a document's unsure answers for the router to ask about. Merges. */
@@ -3475,7 +3674,7 @@ async function submitAnswerVia(
       return { ok: false, reason: validation.reason, ...(validation.detail ? { detail: validation.detail } : {}) };
     }
 
-    const updatedAnswers = { ...session.answers, [questionId]: validation.answer };
+    const updatedAnswers = canonicalized({ ...session.answers, [questionId]: validation.answer });
     const stored = parseUiState(session.ui_state);
     // Ticking keeps the question current; anything else is a finished answer,
     // and a finished answer on the question being ticked ends the ticking.
@@ -3576,7 +3775,9 @@ async function confirmIntakeVia(
 
     // All required questions must be answered.
     const allRequired = INTAKE_QUESTIONS.filter((q) => q.required);
-    const allAnswered = allRequired.every((q) => session.answers[q.id] !== undefined);
+    // `isAnswered`, not presence: an organizer answer that names nobody on the
+    // roster is on record and still not an answer, and must not confirm.
+    const allAnswered = allRequired.every((q) => isAnswered(q, session.answers));
     if (!allAnswered) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "NOT_ALL_REQUIRED_ANSWERED" };

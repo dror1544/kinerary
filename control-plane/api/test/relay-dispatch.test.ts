@@ -352,6 +352,28 @@ describe("dispatchUpdate — the branch table", () => {
     });
   });
 
+  test("a code we could never have issued is refused, not welcomed", { skip: SKIP }, async () => {
+    // Dror, 2026-09-18: "I gave it invalid token and got a greeting, it should
+    // have said unknown". `deadtokenxyz` above is refused because it LOOKS like
+    // a token and misses; anything outside Telegram's payload alphabet never
+    // reaches the lookup at all, and that shortcut was answering with the
+    // welcome meant for someone who arrived with no link — which reads as if
+    // the code had been accepted.
+    await withFixture(async (fix) => {
+      for (const bad of ["/start not a token", "/start ../../etc/passwd", "/start " + "a".repeat(65)]) {
+        const decision = await dispatchUpdate(fix.pool, msg("700000777", bad));
+        assert.equal(
+          decision.kind === "reply" && decision.reply.text,
+          DEFAULT_STRINGS.badLink,
+          `${bad} must be refused as a bad link`,
+        );
+      }
+      // And the real case it was being confused with still gets the welcome.
+      const bare = await dispatchUpdate(fix.pool, msg("700000777", "/start"));
+      assert.equal(bare.kind === "reply" && bare.reply.text, DEFAULT_STRINGS.noPayload);
+    });
+  });
+
   test("a deep link opened in a group is redirected to a DM", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
@@ -699,6 +721,47 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
       assert.match(decision.text, /@Kinerary_bot/);
       assert.match(decision.text, /Dana .+ dana/);
       assert.match(decision.text, /Omri .+ omri/);
+    });
+  });
+
+  test("a group code pasted in the organizer's own chat says where it goes", { skip: SKIP }, async () => {
+    // Dror, 2026-09-18. Pasted as bare text it was not a command, so it fell
+    // through to routing and reached the COMPANION, which answered it as
+    // conversation — "I gave it invalid token and got a greeting, it should
+    // have said unknown". With `/group` in front it hit the issuance branch,
+    // whose argument is ignored, and minted a NEW token: a wrong code produced
+    // a working one, and a right code was silently replaced.
+    await withFixture(async (fix) => {
+      const dm = "700000901";
+      await bindCompanion(fix, dm, "companion-japan");
+      const issued = await issueGroupBindingToken(fix.pool, fix.tripId, "777", { ttlSeconds: 3600 });
+      assert.equal(issued.ok, true);
+      if (!issued.ok) return;
+
+      // Their own live code, both ways it gets typed. Neither mints anything.
+      for (const text of [issued.token, `/group ${issued.token}`]) {
+        const decision = await dispatchUpdate(fix.pool, msg(dm, text));
+        assert.equal(
+          decision.kind === "reply" && decision.reply.text,
+          DEFAULT_STRINGS.groupTokenBelongsInGroup,
+          `${text} must be told where it belongs`,
+        );
+      }
+
+      // A code we never issued is refused, not greeted and not answered by the
+      // assistant — the same flat sentence a group would give.
+      for (const text of ["KIN-ZZZZZZZZ", "/group KIN-ZZZZZZZZ"]) {
+        const decision = await dispatchUpdate(fix.pool, msg(dm, text));
+        assert.equal(
+          decision.kind === "reply" && decision.reply.text,
+          DEFAULT_STRINGS.groupTokenRefused,
+          `${text} must be refused`,
+        );
+      }
+
+      // And a bare /group still issues one — that is what it is for.
+      const bare = await dispatchUpdate(fix.pool, msg(dm, "/group"));
+      assert.equal(bare.kind, "group_intro", "a bare /group still hands over a code");
     });
   });
 

@@ -373,6 +373,7 @@ def bind_chat_to_trip(
     chat_id: str,
     trip_id: str,
     hermes_profile: str | None,
+    allow_retarget: bool = False,
 ) -> str:
     """Opens the binding that routes `chat_id` to `trip_id`, closing rather
     than overwriting whatever was there before.
@@ -393,7 +394,23 @@ def bind_chat_to_trip(
                               no-op (a re-provision of an unchanged trip);
                               a changed profile closes the old row and opens
                               a new one, so even this leaves a trail.
-      a DIFFERENT trip     -> refuse. See BindingRefused.
+      a DIFFERENT trip     -> refuse, unless `allow_retarget`. See below and
+                              BindingRefused.
+
+    `allow_retarget` is the ORGANIZER'S OWN chat finishing a NEW interview, and
+    only that. Dror, 2026-09-18: the newest trip is the one they just spent an
+    interview on, so it is the one their chat should talk to. Before this, a
+    second trip run from one chat got no introduction at all — no assistant
+    name, no login, no group token — because the binding was refused and the
+    introduction rides on the binding. The site link arrived alone and read
+    like the assistant had simply not been built.
+
+    NEWER ONLY, which is the safety rail: a re-provision or a repair of an
+    OLDER trip must never steal the chat back from the trip the organizer moved
+    on to. Compared on `trips.created_at`, so "newest" is a fact about the
+    trips, not about which job happened to run last. A refusal still stands for
+    every other chat — a family group actively using trip A is exactly what
+    BindingRefused exists to protect, and no group binding passes this flag.
 
     Runs in one transaction and takes FOR UPDATE on the open row, so two
     provisions racing for the same chat serialise here instead of both
@@ -413,19 +430,28 @@ def bind_chat_to_trip(
             )
             existing = cur.fetchone()
 
+            retargeted = False
             if existing is not None:
                 if existing["trip_id"] != trip_id:
-                    raise BindingRefused(chat_id, existing["trip_id"], trip_id)
-                if existing["hermes_profile"] == hermes_profile:
+                    if not (
+                        allow_retarget
+                        and _trip_is_newer(conn, trip_id, existing["trip_id"])
+                    ):
+                        raise BindingRefused(chat_id, existing["trip_id"], trip_id)
+                    retargeted = True
+                elif existing["hermes_profile"] == hermes_profile:
                     return "unchanged"
 
                 cur.execute(
                     """
                     UPDATE control_plane.telegram_chat_bindings
-                    SET closed_at = now(), closed_reason = 'profile_rebound'
+                    SET closed_at = now(), closed_reason = %s
                     WHERE id = %s
                     """,
-                    (existing["id"],),
+                    (
+                        "retargeted_to_newer_trip" if retargeted else "profile_rebound",
+                        existing["id"],
+                    ),
                 )
 
             cur.execute(
@@ -436,7 +462,40 @@ def bind_chat_to_trip(
                 """,
                 (_generate_binding_id(), chat_id, trip_id, hermes_profile),
             )
-            return "created" if existing is None else "profile_rebound"
+            if existing is None:
+                return "created"
+            return "retargeted" if retargeted else "profile_rebound"
+
+
+def _bound_trip_id(conn: psycopg.Connection, chat_id: str) -> str | None:
+    """The trip this chat routes to right now, for the record. Read before a
+    retarget, because afterwards nothing remembers what it displaced."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT trip_id FROM control_plane.telegram_chat_bindings "
+            "WHERE chat_id = %s AND closed_at IS NULL",
+            (chat_id,),
+        )
+        row = cur.fetchone()
+    return row["trip_id"] if row else None
+
+
+def _trip_is_newer(
+    conn: psycopg.Connection, trip_id: str, than_trip_id: str
+) -> bool:
+    """Was `trip_id` created after `than_trip_id`?
+
+    The question `allow_retarget` actually turns on. A trip whose row cannot be
+    read is not newer — unknown is not a licence to take someone's chat.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT id, created_at FROM control_plane.trips WHERE id IN (%s, %s)",
+            (trip_id, than_trip_id),
+        )
+        created = {row["id"]: row["created_at"] for row in cur.fetchall()}
+    mine, theirs = created.get(trip_id), created.get(than_trip_id)
+    return mine is not None and theirs is not None and mine > theirs
 
 
 class _LeaseHeartbeat:
@@ -524,6 +583,48 @@ class _LeaseHeartbeat:
                     exc_info=True,
                     extra={"job_id": self._job_id},
                 )
+
+
+def _organizer_chat_ids(cur: Any, trip_id: str) -> tuple[str | None, str | None]:
+    """The chat a trip's organizer is reached in — see the preference order in `_complete`.
+
+    One query for provisioning and for `reconcile_companion`, so a trip repaired
+    later is introduced in exactly the chat a normal run would have chosen.
+    `_fail` keeps its own, keyed by the job rather than the trip.
+    """
+    cur.execute(
+        """
+    SELECT ui.provider_subject_id,
+           s.telegram_chat_id AS interview_chat_id,
+           t.notification_chat_id_hint
+    FROM control_plane.trip_memberships tm
+    JOIN control_plane.trips t ON t.id = tm.trip_id
+    LEFT JOIN control_plane.user_identities ui
+      ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
+    LEFT JOIN LATERAL (
+        SELECT telegram_chat_id
+        FROM control_plane.intake_sessions
+        WHERE trip_id = tm.trip_id AND telegram_chat_id IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+    ) s ON TRUE
+    WHERE tm.trip_id = %s AND tm.role = 'owner' AND tm.status = 'active'
+    LIMIT 1
+    """,
+        (trip_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    # Only these two values have authenticated provenance. The hint may receive
+    # a notification, but must never establish a routing or person identity.
+    verified = row["provider_subject_id"] or row["interview_chat_id"]
+    return verified, verified or row["notification_chat_id_hint"]
+
+
+def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
+    """The delivery recipient, which may use the unverified hint as fallback."""
+    return _organizer_chat_ids(cur, trip_id)[1]
 
 
 class ProvisionerWorker:
@@ -897,6 +998,15 @@ class ProvisionerWorker:
                 (_generate_notif_id(), trip_id, recipient_chat_id, json.dumps(intro_facts)),
             )
 
+    def _companion_intro_queued(self, conn: "psycopg.Connection", trip_id: str) -> bool:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM control_plane.notification_outbox "
+                "WHERE trip_id = %s AND notification_type = 'companion_ready' LIMIT 1",
+                (trip_id,),
+            )
+            return cur.fetchone() is not None
+
     def _load_intake_language(
         self, conn: psycopg.Connection, intake_version_id: str
     ) -> str | None:
@@ -1075,41 +1185,22 @@ class ProvisionerWorker:
                 # when no verified identity is on file; NULL if neither is
                 # present, which the dispatcher treats as unsendable and marks
                 # 'skipped' rather than retrying forever.
-                cur.execute(
-                    """
-                    SELECT ui.provider_subject_id,
-                           s.telegram_chat_id AS interview_chat_id,
-                           t.notification_chat_id_hint
-                    FROM control_plane.trip_memberships tm
-                    JOIN control_plane.trips t ON t.id = tm.trip_id
-                    LEFT JOIN control_plane.user_identities ui
-                      ON ui.user_id = tm.user_id AND ui.provider = 'telegram'
-                    LEFT JOIN LATERAL (
-                        SELECT telegram_chat_id
-                        FROM control_plane.intake_sessions
-                        WHERE trip_id = tm.trip_id AND telegram_chat_id IS NOT NULL
-                        ORDER BY updated_at DESC
-                        LIMIT 1
-                    ) s ON TRUE
-                    WHERE tm.trip_id = %s AND tm.role = 'owner' AND tm.status = 'active'
-                    LIMIT 1
-                    """,
-                    (trip_id,),
-                )
-                owner_row = cur.fetchone()
-                # Routing and organizer identity require verified provenance:
-                # the owner's Telegram identity or the interview chat captured
-                # by the router from the consumed deep link. The model-supplied
-                # notification hint is only a delivery fallback, never proof
-                # that a chat belongs to this organizer (issue #32).
-                verified_organizer_chat_id = (
-                    (owner_row["provider_subject_id"]
-                     or owner_row["interview_chat_id"])
-                    if owner_row else None
-                )
-                recipient_chat_id = verified_organizer_chat_id or (
-                    owner_row["notification_chat_id_hint"] if owner_row else None
-                )
+                # Preference order is by PROVENANCE, not convenience:
+                #   1. a verified Telegram identity on the owner's account;
+                #   2. the chat the interview was actually conducted in —
+                #      equally verified, because Telegram gave us that id when
+                #      the organizer opened the deep link there (chat_router
+                #      passes it as `verifiedTelegramChatId`, and deliberately
+                #      does NOT write it to the unverified hint column);
+                #   3. the unverified hint from migration 0022, last.
+                #
+                # (2) was missing until 2026-09-06 and is the COMMON case: an
+                # organizer using the password signup stopgap has no Telegram
+                # identity, so a trip whose entire interview happened in a
+                # known chat still ended with "no organizer chat id" and an
+                # unbindable companion. The chat was never unknown — it was in
+                # intake_sessions the whole time.
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
 
                 # The facts the organizer's introduction is composed from
                 # (docs/companion-introduction-design.md). Composed API-side,
@@ -1192,6 +1283,109 @@ class ProvisionerWorker:
                     {"private_url": private_url},
                 )
 
+        self._attach_companion(
+            conn, trip_id=trip_id, slug=slug, config=config,
+            intake_version_id=intake_version_id, private_url=private_url,
+            recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+            intro_facts=intro_facts,
+        )
+
+    def reconcile_companion(self, trip_id: str) -> dict[str, Any]:
+        """Gives an already-live trip the companion its provisioning run could not build.
+
+        The companion half of a provisioning run and nothing else: the site is
+        not redeployed, "your trip site is ready" is not sent again, and nothing
+        already in place is made twice — the profile install answers
+        ALREADY_PRESENT, an unchanged binding is left alone, and the introduction
+        (with its group-binding token) is queued at most once per trip.
+
+        2026-09-15: a live trip whose organizer answer matched nobody on the
+        roster provisioned with no companion. Once its intake is corrected, this is
+        the repair; running it again changes nothing.
+
+        Refuses rather than guesses: the trip must be live, and its latest
+        confirmed intake must name exactly one traveller as its organizer. The
+        site keeps the organizer list its own deploy wrote — a site that needs that
+        list changed needs a re-provision, not this.
+        """
+        with psycopg.connect(self._db_url, row_factory=dict_row) as conn:
+            trip = conn.execute(
+                "SELECT slug, lifecycle_state, companion_intro FROM control_plane.trips WHERE id = %s",
+                (trip_id,),
+            ).fetchone()
+            if not trip:
+                raise ValueError(f"trip {trip_id!r} not found")
+            if trip["lifecycle_state"] != "ready_private":
+                raise ValueError(f"trip {trip_id!r} is {trip['lifecycle_state']}, not ready_private")
+            job = conn.execute(
+                "SELECT result->>'private_url' AS private_url FROM control_plane.jobs "
+                "WHERE trip_id = %s AND job_type = 'provision' AND state = 'succeeded' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (trip_id,),
+            ).fetchone()
+            if not job or not job["private_url"]:
+                raise ValueError(f"trip {trip_id!r} has no succeeded provision with a site URL")
+            version = conn.execute(
+                "SELECT id FROM control_plane.intake_versions WHERE trip_id = %s ORDER BY version DESC LIMIT 1",
+                (trip_id,),
+            ).fetchone()
+            if not version:
+                raise ValueError(f"trip {trip_id!r} has no confirmed intake")
+
+            answers = self._load_intake_data(conn, version["id"])
+            config = transform_intake(answers, language=self._load_intake_language(conn, version["id"]))
+            try:
+                config = self._enrich(config, intake_destination(answers))
+            except Exception:  # pragma: no cover - enrich_config self-guards
+                logger.warning("provisioner.enrichment_failed", exc_info=True)
+            if not (config.get("agent") or {}).get("organizers"):
+                raise ValueError(
+                    f"trip {trip_id!r}: the latest confirmed intake names no traveller as organizer — correct it first"
+                )
+
+            with conn.cursor(row_factory=dict_row) as cur:
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
+            hermes_profile = self._attach_companion(
+                conn, trip_id=trip_id, slug=trip["slug"], config=config,
+                intake_version_id=version["id"], private_url=job["private_url"],
+                recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+                intro_facts=dict(trip["companion_intro"] or {}),
+                introduce_once=True,
+            )
+            reach = conn.execute(
+                "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+                (trip_id,),
+            ).fetchone()
+        logger.info("provisioner.companion_reconciled", extra={
+            "trip_id": trip_id, "hermes_profile": hermes_profile, "reachability": reach["reachability"],
+        })
+        return {
+            "trip_id": trip_id,
+            "hermes_profile": hermes_profile,
+            "reachability": reach["reachability"],
+            "unreachable_reason": reach["unreachable_reason"],
+        }
+
+    def _attach_companion(
+        self,
+        conn: psycopg.Connection,
+        *,
+        trip_id: str,
+        slug: str,
+        config: dict[str, Any],
+        intake_version_id: str,
+        private_url: str,
+        recipient_chat_id: str | None,
+        verified_organizer_chat_id: str | None,
+        intro_facts: dict,
+        introduce_once: bool = False,
+    ) -> str | None:
+        """The companion half of provisioning: profile, trip tools, chat binding,
+        organizer link, introduction, reachability. Returns the profile, or None.
+
+        Shared by `_complete` and `reconcile_companion`, so a trip repaired after
+        the fact gets exactly what a trip provisioned in one run gets.
+        """
         # Companion-profile creation and its chat binding are best-effort
         # side effects performed after the transaction above durably commits
         # — the same "commit first, external side effect after" shape as
@@ -1324,7 +1518,27 @@ class ProvisionerWorker:
                 )
         else:
             try:
-                outcome = bind_chat_to_trip(conn, verified_organizer_chat_id, trip_id, hermes_profile)
+                # `allow_retarget`: this is the organizer's own chat, at the end
+                # of the interview they just finished. See bind_chat_to_trip —
+                # it still refuses unless THIS trip is the newer one, and no
+                # group binding ever reaches here.
+                previous_trip_id = _bound_trip_id(conn, verified_organizer_chat_id)
+                outcome = bind_chat_to_trip(
+                    conn, verified_organizer_chat_id, trip_id, hermes_profile,
+                    allow_retarget=True,
+                )
+                if outcome == "retargeted":
+                    # Loud on purpose: another trip just lost this chat, and on
+                    # this branch there is no way back from the chat itself.
+                    # /trips and /switch are PR #47; until that lands, moving
+                    # the binding back is an operator action. Nothing else in
+                    # the system would record that it happened.
+                    logger.warning("provisioner.organizer_chat_retargeted", extra={
+                        "trip_id": trip_id,
+                        "chat_id": verified_organizer_chat_id,
+                        "previous_trip_id": previous_trip_id,
+                        "consequence": "the organizer's chat now talks to this trip; the previous trip is no longer reachable from it",
+                    })
                 # The same chat, as a PERSON. Deliberately here and not in its
                 # own step: the two facts are one fact — this chat is the
                 # organizer's — and separating them is how one of them came to
@@ -1379,9 +1593,12 @@ class ProvisionerWorker:
                     # introduction at all: the organizer gets the site-ready
                     # message and nothing that claims an assistant is waiting
                     # for them.
-                    self._enqueue_companion_intro(
-                        conn, trip_id, verified_organizer_chat_id, intro_facts,
-                    )
+                    # A repair queues it at most once per trip: it carries a
+                    # group-binding token, and a second one is a second token.
+                    if not (introduce_once and self._companion_intro_queued(conn, trip_id)):
+                        self._enqueue_companion_intro(
+                            conn, trip_id, verified_organizer_chat_id, intro_facts,
+                        )
                     logger.info("provisioner.companion_profile_bound", extra={
                         "trip_id": trip_id,
                         "hermes_profile": hermes_profile,
@@ -1423,6 +1640,7 @@ class ProvisionerWorker:
                     conn, trip_id, reachable=False, reason="BINDING_FAILED",
                     consequence="the chat binding write failed; the trip has no routing",
                 )
+        return hermes_profile
 
     def _enqueue_operator_notification(
         self,

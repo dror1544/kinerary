@@ -381,11 +381,90 @@ start_gateway() {
 PLIST
 
   launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
-  if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
-    printf 'companion-install-host: gateway %s started\n' "$name" >&2
-  else
-    printf 'companion-install-host: launchctl bootstrap failed for %s; plist written but NOT RUNNING\n' "$name" >&2
+  # WAIT FOR THE OLD ONE TO ACTUALLY BE GONE before asking whether a new one is
+  # up. `bootout` returns immediately and the gateway takes ~3s to drain, so
+  # "is a gateway running?" answered now describes the process being killed.
+  # That false positive is not hypothetical: on 2026-09-18 this function
+  # reported "started" while reading the PID of the gateway it had just
+  # terminated, the fallback below never ran, and the install ended with
+  # nothing running at all.
+  local waited=0
+  while gateway_pids "$name" >/dev/null && [ "$waited" -lt 20 ]; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  # The error is KEPT, not sent to /dev/null. Three runs on 2026-09-18 ended
+  # with no gateway and nothing in any log saying why, because this command's
+  # own complaint was the only evidence and it was being discarded.
+  local boot_err
+  boot_err="$(launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1)" || true
+
+  # LAUNCHD SAYING YES IS NOT THE GATEWAY RUNNING, and over SSH the two come
+  # apart. `bootstrap` into `gui/$UID` from a forced-command session does not
+  # take: the plist is written, `launchctl list` shows nothing, no launchd log
+  # line is emitted, and the gateway started during the install is torn down
+  # with the session. What made it invisible is that the install had already
+  # printed "started" by then. So: read it back.
+  if gateway_alive "$name"; then
+    printf 'companion-install-host: gateway %s started (launchd)\n' "$name" >&2
+    return 0
   fi
+
+  # DETACHED FALLBACK. Its own session, so the SSH session ending cannot take
+  # it — that is the whole difference from `nohup`, which only covers SIGHUP.
+  # Written to a file rather than inlined: macOS /bin/bash 3.2 is what sshd
+  # runs a forced command with, and it mis-parses quoting inside a command
+  # substitution (the same reason the topology reader below is a file).
+  printf 'companion-install-host: launchctl did not start %s (%s); starting it detached\n' \
+    "$name" "${boot_err:-no error reported}" >&2
+  cat > "$WORK/detach.py" <<'PYDETACH'
+import os, sys
+log, argv = sys.argv[1], sys.argv[2:]
+if os.fork():
+    os._exit(0)
+os.setsid()
+fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+os.dup2(fd, 1)
+os.dup2(fd, 2)
+os.execv(argv[0], argv)
+PYDETACH
+  # `--replace` because a half-started instance may still hold the socket, and
+  # the point here is to end up with exactly one gateway.
+  HERMES_HOME="$home" "$py" "$WORK/detach.py" "$home/logs/gateway.log" \
+    "$py" -m hermes_cli.main --profile "$name" gateway run --replace || true
+
+  if gateway_alive "$name"; then
+    printf 'companion-install-host: gateway %s started (detached)\n' "$name" >&2
+  else
+    printf 'companion-install-host: %s NOT RUNNING — launchctl: %s\n' \
+      "$name" "${boot_err:-no error reported}" >&2
+  fi
+}
+
+# The gateway processes for this profile, if any. `pgrep -f` because the
+# profile name only appears in the arguments.
+gateway_pids() {
+  pgrep -f -- "--profile $1 gateway run" 2>/dev/null
+}
+
+# Is there actually a gateway process for this profile? Waits, because a
+# gateway takes a few seconds to come up and answering too early would send the
+# fallback after a launchd start that was going to work.
+#
+# Only ever asked once the previous gateway has exited — see start_gateway —
+# so a match here is a gateway that is starting, never one that is stopping.
+gateway_alive() {
+  local name="$1" waited=0
+  while [ "$waited" -lt 12 ]; do
+    if gateway_pids "$name" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
 }
 
 # Linux (the Proxmox VM, compose.vm.yml): Hermes runs in a container whose

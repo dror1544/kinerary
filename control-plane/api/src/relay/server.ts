@@ -36,6 +36,7 @@ import { sayForChat,
   getSessionForChat,
 } from "../interview.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
+import { awaitExpectedGateways, expectedGatewayProfiles, gatewayWaitMsFromEnv } from "./gateway-wait.js";
 import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { publishCommandMenu } from "./command-menu.js";
@@ -295,6 +296,32 @@ async function main(): Promise<void> {
 
   let stopPolling: (() => void) | undefined;
   if (runtime.db) {
+    // …and poll only once the companions are back. Every restart (upgrade,
+    // rollback, reboot, runner switch) otherwise answers the messages Telegram
+    // held for live trips with COMPANION_PENDING and consumes them, because
+    // their gateways are still in reconnect backoff. Not polling is the queue.
+    const timeoutMs = gatewayWaitMsFromEnv(process.env);
+    if (timeoutMs > 0) {
+      let expected: string[] = [];
+      try {
+        expected = await expectedGatewayProfiles(runtime.db);
+      } catch {
+        // Never let the wait cost the bot: an unreadable list means no wait.
+        log(structuredLog("warn", "relay.gateways_await_skipped", { safe_error_code: "EXPECTED_GATEWAYS_UNREADABLE" }));
+      }
+      const waited = await awaitExpectedGateways({
+        expected,
+        canReach: (profile) => connector.canReachProfile(profile),
+        timeoutMs,
+      });
+      log(structuredLog(waited.timedOut ? "warn" : "info", "relay.gateways_awaited", {
+        expected: waited.expected,
+        connected: waited.connected,
+        missing: waited.missing,
+        waited_ms: waited.waitedMs,
+      }));
+    }
+
     stopPolling = startTripBotPoller({
       db: runtime.db,
       telegram: runtime.telegram,

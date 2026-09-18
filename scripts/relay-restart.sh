@@ -68,6 +68,12 @@ echo "$envdump" | grep -qx 'INTERPRET_PATH_DEFAULT=1' || die "relay pid $pid run
 for var in INTERPRET_RUNNER EXTRACT_RUNNER; do
   echo "$envdump" | grep -q "^$var=." || die "relay pid $pid has no $var"
 done
+# Unset, a nested `claude -p` takes its effort from ~/.claude/settings.json — on
+# this Mac a personal effortLevel: xhigh, at which a PDF's day-by-day plan took
+# 143s against a 60s limit and never arrived (2026-09-16).
+for var in INTERPRET_EFFORT EXTRACT_EFFORT; do
+  echo "$envdump" | grep -q "^$var=." || die "relay pid $pid has no $var — its model calls inherit your personal Claude settings"
+done
 if [ -n "$TELEGRAM_ROOT" ]; then
   echo "$envdump" | grep -qx "TELEGRAM_API_ROOT=$TELEGRAM_ROOT" || die "relay pid $pid is not pointed at $TELEGRAM_ROOT"
 elif echo "$envdump" | grep -q '^TELEGRAM_API_ROOT='; then

@@ -1,11 +1,14 @@
 """Tests for the intake transformer."""
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from datetime import date
+from pathlib import Path
 
 from control_plane_worker.transformer import (
+    _names_sound_alike,
     _resolve_organizers,
     derive_days_from_anchors,
     derive_bookings,
@@ -1652,6 +1655,24 @@ class ResolveOrganizersTests(unittest.TestCase):
         transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
         self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])
 
+    def test_a_hebrew_answer_finds_a_roster_spelled_only_in_english(self) -> None:
+        """2026-09-15, live: every roster name was entered in English letters
+        (`name` and `name_en` both), the organizer answered with their own name
+        in Hebrew, nothing matched, and the trip provisioned with no companion.
+        """
+        english_only = [
+            {"username": "nir", "name": "Nir", "name_en": "Nir"},
+            {"username": "maya", "name": "Maya", "name_en": "Maya"},
+        ]
+        self.assertEqual(self._resolve("ניר", english_only), ["nir"])
+
+    def test_sound_alike_never_breaks_a_tie_an_exact_reading_refused(self) -> None:
+        twins = [
+            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
+            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+        ]
+        self.assertEqual(self._resolve("Shai", twins), [])
+
 
 class DeriveDaysFromAnchorsTests(unittest.TestCase):
     """A day-by-day built from the dated anchors, with no model involved.
@@ -1770,3 +1791,36 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         cfg = transform_intake(intake)
         items = cfg["phases"][0]["days"][0]["items"]
         self.assertEqual([i["text"]["en"] for i in items], ["From the document"])
+
+
+_NAME_CASES = json.loads(
+    (Path(__file__).resolve().parents[2] / "contracts" / "v1" / "name-matching-cases.json").read_text(encoding="utf-8")
+)
+
+
+class NameMatchingContractTests(unittest.TestCase):
+    """The same cases the interview (api/src/organizer-identity.ts) is held to."""
+
+    def test_alike(self) -> None:
+        for a, b in _NAME_CASES["alike"]:
+            with self.subTest(a=a, b=b):
+                self.assertTrue(_names_sound_alike(a, b))
+                self.assertTrue(_names_sound_alike(b, a))
+
+    def test_not_alike(self) -> None:
+        for a, b in _NAME_CASES["not_alike"]:
+            with self.subTest(a=a, b=b):
+                self.assertFalse(_names_sound_alike(a, b))
+
+    def test_resolve(self) -> None:
+        for case in _NAME_CASES["resolve"]:
+            with self.subTest(why=case["why"]):
+                travelers = _structured(case["roster"])
+                participants = transform_intake(
+                    {**JAPAN_INTAKE, "travelers": travelers}, today=date(2026, 8, 20),
+                )["participants"]
+                resolved = _resolve_organizers(
+                    {"organizer_identity": _text(case["answer"]), "travelers": travelers}, participants,
+                )
+                expected = [] if case["expect"] is None else [participants[case["expect"]]["username"]]
+                self.assertEqual(resolved, expected)
