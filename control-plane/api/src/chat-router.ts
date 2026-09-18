@@ -824,8 +824,25 @@ export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): Rend
  * do, the organizer always has both exits in front of them.
  */
 export function renderEssentialsDone(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+  return renderBoundaryAsk("essentialsDone", language);
+}
+
+/**
+ * The same two exits, over a different sentence.
+ *
+ * Returning to this choice is normal — someone adds a detail, or says
+ * something we read only halfway — and each return needs its own words: a
+ * short re-ask after a detail lands, a confirmation when the reading leaned
+ * one way, a plain question when it did not. What must NOT change is the pair
+ * of buttons underneath, which is why they are built once here.
+ *
+ * Every one of those sentences is now reachable by typing as well as tapping
+ * (`settleBoundary` in relay/poller.ts). The buttons stay because they are
+ * faster, not because they are the syntax.
+ */
+export function renderBoundaryAsk(key: string, language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
   return {
-    text: uiString("essentialsDone", language),
+    text: uiString(key, language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("askMore", language), callback_data: MORE_CALLBACK_DATA },
