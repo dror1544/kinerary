@@ -101,9 +101,12 @@ export const PORTS = {
   mcpDefault:              38117,
   mcpBookingConfirmation:  38116,
   mcpBudget:               38121,
+  mcpHealthUnreachable:    38122,
+  mcpHealthReachable:      38123,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 38103,
+  mcpHealthTripSite:        38124,
   scheduleReviewMockHermes: 38110,
 };
 

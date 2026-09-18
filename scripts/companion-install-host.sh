@@ -498,6 +498,30 @@ start_gateway_supervised() {
 # process, silently. Same discipline as interview-stack-deploy's check for the
 # interviewer's `*_for_chat` tools: grep the gateway's own registration line,
 # because an upstream process being alive proves nothing about what it loaded.
+# CAN THE BRIDGE REACH THE TRIP, not merely "is it listening".
+#
+# `gateway_registered_trip_mcp` below proves the agent can see the tools. That
+# is one hop of two, and on 2026-09-18 the other one was the broken one: a
+# freshly provisioned trip's bridge registered 50 tools and then failed every
+# single call with `connect EHOSTUNREACH` on its way to the trip's own site.
+# The companion told the organizer "I can't retrieve the trip plan right now",
+# politely, indefinitely. Provisioning had reported success, because nothing
+# upstream had ever asked the bridge the question that mattered.
+#
+# /health asks it: the bridge fetches its own trip's config and says whether it
+# arrived. Local to this host, so it needs no key and reveals no address.
+bridge_reaches_trip() {
+  local port="$1" body=""
+  # Deliberately not `curl -f`: a 503 here carries the verdict we want to read
+  # back to the operator, and -f would throw the body away with it.
+  body=$(curl -sS --max-time 15 "http://127.0.0.1:${port}/health" 2>/dev/null || true)
+  case "$body" in
+    *'"ok":true'*) return 0 ;;
+  esac
+  BRIDGE_HEALTH="${body:-no answer from the bridge}"
+  return 1
+}
+
 gateway_registered_trip_mcp() {
   local name="$1" from_line="$2" waited=0
   local log="$HOME/.hermes/profiles/$name/logs/agent.log"
@@ -583,6 +607,16 @@ PYTOPO
     # tools at all, and tried to shell out to reach them.
     start_gateway "$PROFILE_NAME"
     if gateway_registered_trip_mcp "$PROFILE_NAME" "$LOG_FROM"; then
+      # BOTH HOPS, before anyone is handed a companion. The agent can see the
+      # tools; now prove the tools can see the trip. Same stance as the check
+      # above — a failure here is reported as a failure, not as a WIRED with an
+      # asterisk, because a companion that cannot read its own trip is the one
+      # state that looks healthy from every other angle.
+      if ! bridge_reaches_trip "$MCP_PORT"; then
+        printf 'companion-install-host: trip-mcp on :%s cannot reach %s — /health said: %s\n' \
+          "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
+        die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"
+      fi
       printf 'WIRED %s\n' "$PROFILE_NAME"
       exit 0
     fi

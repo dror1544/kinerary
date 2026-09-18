@@ -304,6 +304,44 @@ gate only Dror's one-time code approves. Every new migration must start with
 `-- rollback: compatible|breaking — <why>`. Runbook: "Upgrades and rollback" in
 `docs/control-plane-vm-deployment.md`.
 
+### A Mac-provisioned companion that cannot read its own trip
+
+**Staging only — this cannot happen on the production VM.** The Mac is staging;
+real trips run on VM 110, and Linux has no equivalent of the gate below.
+
+Symptom: the companion answers normally, in character, and says it cannot
+retrieve the trip ("אני לא מצליח לשלוף כרגע את תוכנית הטיול"). Everything that
+is usually checked looks healthy — the bridge is listening, `hermes mcp test`
+passes, the gateway registered its tools — because all of those verify the hop
+between the AGENT and the bridge. The broken hop is the next one:
+
+```
+get_config -> connect EHOSTUNREACH 192.168.0.60:8080 - Local (192.168.0.121:53190)
+```
+
+Cause: macOS grants **Local Network** access per responsible process. The worker
+wires a new trip's bridge over SSH (`companion-install-host.sh` → `setup-mcp.sh`
+→ `node mcp.js`), and a process born from an `sshd` session has no such grant.
+Loopback is not gated, so the bridge serves MCP perfectly while every call
+through it to the trip's LAN address fails. A bridge started by hand from
+Terminal inherits the grant and works — which is why older trips were fine and
+each newly provisioned one was not.
+
+Fix, from **your own Terminal** (the launching context is the whole point):
+
+```bash
+cd ~/kinerary-deploy && ./setup-mcp.sh --restart-only --trip-dir ./trips/<slug>
+```
+
+Provisioning now refuses to call such a bridge wired: `companion-install-host.sh`
+asks `GET /health` on the bridge — "can you reach your trip", not "are you
+listening" — and fails the step when it cannot. That check is platform-neutral
+and also catches a VM bridge that did not survive a reboot.
+
+If unattended Mac companion testing is ever needed, move the bridges to a
+LaunchAgent (`launchctl bootstrap gui/$UID`) so they inherit the logged-in
+user's grant instead of the SSH session's.
+
 ### Restarting a live interview for a test run
 
 Testing the Trip Bot router end to end means starting the interview over

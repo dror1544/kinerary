@@ -1116,6 +1116,37 @@ app.post('/enrich', requireSiteOrAgentKey, express.json({ limit: '256kb' }), asy
   }
 });
 
+/**
+ * CAN THIS BRIDGE REACH THE TRIP IT WAS CONFIGURED FOR?
+ *
+ * Not "am I listening" — that question was always answered yes, and it is the
+ * reason a broken bridge looked healthy for as long as it did. On 2026-09-18 a
+ * newly provisioned trip's bridge served MCP on loopback perfectly while every
+ * call through it died at `connect EHOSTUNREACH` on the way to the trip's own
+ * site. The organizer's companion said "I can't retrieve the trip plan right
+ * now" and nothing upstream disagreed with it.
+ *
+ * Unauthenticated on purpose: a caller who cannot reach the trip site cannot
+ * learn anything from this that it does not already know, and provisioning has
+ * to be able to ask before it hands anyone a companion. What it returns is
+ * therefore deliberately thin — reachable or not, and what the failure was
+ * called. Never the address (a LAN address is infrastructure data and does not
+ * belong in this repo's output), never a key, never anything about the trip.
+ */
+app.get('/health', async (_req, res) => {
+  try {
+    const r = await fetchTrip('/api/config', { headers: h(), signal: AbortSignal.timeout(5000) });
+    // A reply of any kind means the hop works. 401 is a key problem, not a
+    // reachability one, and saying so is the difference between two very
+    // different fixes.
+    if (r.ok) return res.json({ ok: true, site: 'reachable' });
+    return res.status(503).json({ ok: false, site: 'refused', code: `HTTP_${r.status}` });
+  } catch (e) {
+    const code = e?.cause?.code || e?.code || (e?.name === 'TimeoutError' ? 'ETIMEDOUT' : 'UNKNOWN');
+    return res.status(503).json({ ok: false, site: 'unreachable', code });
+  }
+});
+
 app.get('/sse', requireKey, async (req, res) => {
   // Allow more than one client at a time — a persistent always-on agent session
   // alongside short-lived CLI diagnostics shouldn't close each other's session.
