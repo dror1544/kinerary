@@ -53,7 +53,13 @@ DEPLOY = re.compile(
     # Tearing a trip down (container, DNS, proxy host, profile) is at least as
     # live as deploying one. Only --execute: its dry run is read-only, and a
     # prompt that fires on read-only commands teaches people to click through.
-    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b')
+    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
+    # Promoting a release to 'available' ships code. That is the pool
+    # generatePlan() selects from, so from this moment every trip built or
+    # rebuilt runs this tree — while trips already provisioned stay on the
+    # release they were pinned to. The earlier hops (candidate -> verified)
+    # are checkpoints and reach nobody, so only 'available' prompts.
+    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
 
 raw = strip_heredocs(sys.stdin.read())
 
