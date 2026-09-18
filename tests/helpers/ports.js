@@ -42,6 +42,7 @@ export const PORTS = {
   planSingleSourceBoot:     3120,
   itineraryPlanLayerServer: 3118,  // moved off 3107 (currencyRates)
   configDayLinksServer:     3114,  // moved off 3110 (scheduleReviewMockHermes)
+  tripDocuments:            3121,
 
   modernParity:           3298,
   modernEnrichment:        3194,
@@ -57,6 +58,7 @@ export const PORTS = {
   // ── MCP servers ────────────────────────────────────────────────────────
   controlPlaneSessionMcp:  3295,
   mcpExtract:               3106,
+  mcpExtractEmpty:          3122,
   itineraryPlanLayerMcp:    3108,
   mcpDefault:               3117,  // moved off 3098 (configVersionsBoot)
   mcpBookingConfirmation:   3116,  // moved off 3112 (currencyRatesUsdOnly)

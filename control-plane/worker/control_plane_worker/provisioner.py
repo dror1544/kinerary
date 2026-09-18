@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
@@ -38,6 +38,13 @@ from .transformer import (
     derive_trip_slug,
     intake_destination,
     transform_intake,
+)
+from .document_handoff import (
+    TripDocumentFile,
+    build_document_links,
+    documents_manifest,
+    load_trip_documents,
+    publish_document,
 )
 
 # (config, destination) -> config. See ProvisionerWorker.__init__ for why this
@@ -68,6 +75,7 @@ class DeployAdapter(Protocol):
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Sequence[TripDocumentFile] | None = None,
     ) -> str: ...
 
 
@@ -164,12 +172,34 @@ class ShellDeployAdapter:
         repo_root: str | None = None,
         timeout: int = 300,
         compute: ComputeAdapter | None = None,
+        trip_nfs_local_base: str | None = None,
     ) -> None:
         self._deploy_root = deploy_root
         self._vmid_map = vmid_map
         self._repo_root = repo_root or os.environ.get("REPO_ROOT", "")
         self._timeout = timeout
         self._compute = compute or NullComputeAdapter()
+        # The trips' NFS export as THIS process sees it — the directory whose
+        # <slug>/ subdirectories Proxmox mounts into each container. Unset: the
+        # worker cannot reach trip NFS directories, and documents travel with
+        # the deploy instead.
+        self._trip_nfs_local_base = trip_nfs_local_base or os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None
+
+    def _trip_nfs_documents_dir(self, slug: str) -> str | None:
+        """The trip's NFS documents directory as this worker sees it, or None."""
+        if not self._trip_nfs_local_base:
+            return None
+        # The same guard as the NFS reset: a real slug, never a path.
+        if not slug or slug != slug.lower() or not slug.replace("-", "").isalnum() or slug.startswith("-"):
+            return None
+        trip_nfs = os.path.join(self._trip_nfs_local_base, slug)
+        # The compute adapter creates the trip's NFS directory. One this worker
+        # cannot see means it is not looking at the same export, and creating a
+        # look-alike would publish documents the container never mounts.
+        if not os.path.isdir(trip_nfs):
+            logger.warning("provisioner.trip_nfs_dir_not_visible", extra={"slug": slug})
+            return None
+        return os.path.join(trip_nfs, "documents")
 
     def deploy(
         self,
@@ -179,6 +209,7 @@ class ShellDeployAdapter:
         first_provision: bool = False,
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
+        documents: Sequence[TripDocumentFile] | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -202,6 +233,51 @@ class ShellDeployAdapter:
         for name, payload in (sidecars or {}).items():
             with open(os.path.join(trip_dir, name), "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+        # The trip's source documents, under their content-addressed names.
+        #
+        # FIRST CHOICE: the trip's own NFS directory, which the container
+        # already mounts. Hard-linked there from the control plane's store, both
+        # names point at ONE physical copy on the export: no second copy, no
+        # transfer, and the site reads it from its mount (TRIP_DOCUMENTS_DIR).
+        # The container still sees only its own trip's directory; the store
+        # stays outside every trip's mount.
+        #
+        # FALLBACK, per document: beside the config, which deploy.sh carries onto
+        # the container — when this worker cannot see the trip's NFS directory,
+        # or the export refuses the write (root squashing, say). A document that
+        # cannot be published either way is logged and left out, never a failed
+        # deploy.
+        if documents:
+            nfs_documents_dir = self._trip_nfs_documents_dir(slug)
+            documents_dir = os.path.join(trip_dir, "documents")
+            published: dict[str, int] = {}
+            for document in documents:
+                strategy: str | None = None
+                if nfs_documents_dir:
+                    try:
+                        strategy = f"nfs_{publish_document(document, nfs_documents_dir)}"
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_nfs_publish_failed",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                if strategy is None:
+                    try:
+                        strategy = publish_document(document, documents_dir)
+                    except (OSError, ValueError):
+                        logger.warning(
+                            "provisioner.document_not_published",
+                            extra={"slug": slug, "document_id": document.document_id},
+                            exc_info=True,
+                        )
+                        continue
+                published[strategy] = published.get(strategy, 0) + 1
+            logger.info(
+                "provisioner.documents_published",
+                extra={"slug": slug, **{f"documents_{how}": count for how, count in published.items()}},
+            )
 
         deploy_sh = os.path.join(self._deploy_root, "deploy.sh")
         env = {**os.environ}
@@ -557,8 +633,13 @@ class ProvisionerWorker:
         materialize: MaterializeFn | None = None,
         operator_chat_id: str | None = None,
         seed_password: str | None = None,
+        document_store_dir: str | None = None,
     ) -> None:
         self._db_url = db_url
+        # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
+        # the same root the relay writes to). Unset: a trip is provisioned with
+        # no source documents, exactly as before documents were kept at all.
+        self._document_store_dir = document_store_dir or os.environ.get("DOCUMENT_STORE_DIR") or None
         self._deploy = deploy
         # Raw Telegram chat id for the operator's own copy of the provisioning
         # outcome. None (the default, and every existing test) enqueues no
@@ -630,6 +711,9 @@ class ProvisionerWorker:
 
             # Load intake answers from intake_versions.data.
             answers = self._load_intake_data(conn, intake_version_id)
+            # And the documents that version was confirmed with, with which
+            # answer each one supports.
+            manifest = self._load_intake_source_document(conn, intake_version_id)
 
             # Transform to trip.config.json. The language comes from the
             # intake VERSION, not the session — the session does not survive a
@@ -675,9 +759,24 @@ class ProvisionerWorker:
                 "version": 1, "tripId": trip_id, "owner": owner,
             }
 
-            bookings = derive_bookings(config, answers)
+            # The confirmed version's source documents: published beside the
+            # config, the voucher that supplied a stay shown on its hotel card,
+            # a ticket on its booking, and everything each document supports
+            # in documents.json.
+            trip_documents = load_trip_documents(conn, trip_id, manifest, self._document_store_dir)
+            links = build_document_links(
+                config, answers, manifest, {doc.document_id: doc for doc in trip_documents},
+            )
+            for phase in config.get("phases") or []:
+                stay_file = links.for_phase(str(phase.get("id")))
+                if stay_file and isinstance(phase.get("accommodation"), dict):
+                    phase["accommodation"]["pdf"] = stay_file
+
+            bookings = derive_bookings(config, answers, links)
             if bookings:
                 sidecars["bookings.json"] = bookings
+            if trip_documents:
+                sidecars["documents.json"] = documents_manifest(links, bookings)
 
             # The slug assigned at signup approval is a placeholder — the
             # destination and dates were not known yet. Now that the intake
@@ -701,6 +800,7 @@ class ProvisionerWorker:
                     first_provision=bool(plan_desired.get("first_provision", False)),
                     sidecars=sidecars,
                     source_dir=source_dir,
+                    documents=trip_documents,
                 )
             finally:
                 if source_dir:
@@ -929,6 +1029,24 @@ class ProvisionerWorker:
                     "(was it confirmed before migration 0013?)"
                 )
             return data
+
+    def _load_intake_source_document(
+        self, conn: psycopg.Connection, intake_version_id: str
+    ) -> dict[str, Any] | None:
+        """The document manifest an intake version was confirmed with.
+
+        NULL for a version confirmed with no documents, and a plain
+        ``{filename, text}`` for one staged on the agent path — neither names
+        registry documents, and both simply produce no links.
+        """
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT source_document FROM control_plane.intake_versions WHERE id = %s",
+                (intake_version_id,),
+            )
+            row = cur.fetchone()
+        value = (row or {}).get("source_document")
+        return value if isinstance(value, dict) else None
 
     def _load_intake_provenance(self, conn: psycopg.Connection, intake_version_id: str) -> dict[str, Any]:
         """digest/confirmed_at/schema_version for the companion-profile

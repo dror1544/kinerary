@@ -43,9 +43,89 @@ export type RunnerFailure =
   /** The model answered, but `parse` rejected what it said. */
   | "BAD_OUTPUT";
 
+/**
+ * What a call consumed, as far as the provider says. Every field is optional:
+ * providers report different things, and a guessed number is worse than a gap.
+ */
+export interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  /**
+   * USD. `billed` when a per-token provider charged it; `api_equivalent` when a
+   * subscription CLI reports what the call would have cost at API prices — a
+   * quota signal, not money spent.
+   */
+  costUsd?: number;
+  costKind?: "billed" | "api_equivalent";
+}
+
+/** Two calls' usage together — the empty-answer re-ask is two calls. */
+export function addUsage(a: ModelUsage | undefined, b: ModelUsage | undefined): ModelUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const out: ModelUsage = {};
+  for (const key of ["inputTokens", "outputTokens", "totalTokens", "costUsd"] as const) {
+    if (a[key] !== undefined || b[key] !== undefined) out[key] = (a[key] ?? 0) + (b[key] ?? 0);
+  }
+  const kind = a.costKind ?? b.costKind;
+  if (kind) out.costKind = kind;
+  return out;
+}
+
 export type RunnerResult<T> =
-  | { ok: true; value: T; attempts: number; ms: number }
-  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number };
+  | { ok: true; value: T; attempts: number; ms: number; usage?: ModelUsage }
+  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number; usage?: ModelUsage };
+
+/**
+ * A file the model has to LOOK at rather than read as text: a photographed
+ * confirmation, a scanned PDF. The bytes travel to the provider as they are.
+ */
+export interface ModelAttachment {
+  mime: string;
+  bytes: Uint8Array;
+}
+
+/** What an attachment may be. Anything else is refused before a call is made. */
+export const ATTACHMENT_MIMES: ReadonlySet<string> = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
+]);
+
+/**
+ * Runners that can deliver an attachment — as verified, not as advertised.
+ *
+ *  - claude: `--input-format stream-json` with image and document content
+ *    blocks. A synthetic booking PNG and the same page as a PDF each came back
+ *    transcribed exactly, in 9–10 s (2026-09-13, Claude Code 2.1.236,
+ *    claude-sonnet-5, `--tools ""`).
+ *  - openrouter: OpenAI-shaped content parts. Implemented to OpenRouter's
+ *    documented shape and NOT verified live — the machine that built it has no
+ *    key. Whether a model reads images is that model's property; one that cannot
+ *    tends to answer badly rather than refuse, which the reader's own gate has to
+ *    catch.
+ *  - codex: NOT here, by decision pending review. codex-cli 0.153.2 with
+ *    gpt-5.6-luna transcribed a plain JPEG exactly (8 s), but answered "No text
+ *    is visible in the image" for a PNG with a transparent background — a PNG
+ *    claude read correctly (2026-09-13). The first probes used only such PNGs,
+ *    which is why an earlier note here said codex drops images; it does not.
+ *    `-i` takes images, not PDFs. OpenRouter's models failed the same
+ *    transparent PNG, so transparency is a reader concern, not codex's alone.
+ *  - hermes: no attachment path at all.
+ */
+export const ATTACHMENT_RUNNERS: ReadonlySet<string> = new Set(["claude", "openrouter"]);
+
+/** Tasks whose every call carries attachments, so only ATTACHMENT_RUNNERS may serve them. */
+export const ATTACHMENT_TASKS: ReadonlySet<string> = new Set(["read_image"]);
+
+/** Why these attachments cannot be sent, or null when they can. */
+function attachmentProblem(files: readonly ModelAttachment[]): string | null {
+  const bad = files.find((file) => !ATTACHMENT_MIMES.has(file.mime));
+  return bad ? `unsupported attachment type: ${bad.mime.slice(0, 60)}` : null;
+}
+
+function base64Of(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+}
 
 export interface StructuredModelRequest<T> {
   /** Selects the pinned model. "interpret", "extract", … */
@@ -64,10 +144,29 @@ export interface StructuredModelRequest<T> {
    */
   schema?: Record<string, unknown>;
   timeoutMs?: number;
+  /**
+   * Files the model must see. An adapter that cannot deliver them refuses the
+   * call — NOT_CONFIGURED, no model contacted — rather than running the prompt
+   * without them, because a transcription of a file the model never saw is
+   * indistinguishable from a real one.
+   */
+  attachments?: readonly ModelAttachment[];
 }
 
 export interface StructuredModelRunner {
   run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>>;
+  /**
+   * Which provider and model a task is pinned to, or null when the task is not
+   * configured.
+   *
+   * For RECORDING, never for deciding. A stored extraction is keyed by the
+   * configuration that produced it, so a changed model is a new reading rather
+   * than a stale cache hit — and that is the only reason to ask. Nothing outside
+   * this module may branch on the answer: every caller keeps its own parse and
+   * validation gate precisely so that it is correct whichever provider serves
+   * the task, and the choice of provider stays configuration.
+   */
+  describe?(task: string): { provider: string; model: string } | null;
 }
 
 /**
@@ -111,6 +210,24 @@ export interface CliSpec {
   maxAttempts: number;
   /** Where to run it. Defaults to a neutral directory — see `hermeticEnv`. */
   cwd?: string;
+  /** How `describe` names this CLI. Defaults to the binary's own name. */
+  provider?: string;
+  /**
+   * How to read the answer out of stdout, for a CLI whose output is not the
+   * answer itself. Absent: stdout is the answer.
+   */
+  output?: (stdout: string) => { ok: true; text: string; usage?: ModelUsage } | { ok: false; detail: string };
+  /**
+   * How to send attachments, for a CLI that can. Absent: a request carrying any
+   * is refused rather than run without them.
+   */
+  attachments?: {
+    args: (model: string) => string[];
+    /** Written to stdin, which is then closed. */
+    stdin: (prompt: string, files: readonly ModelAttachment[]) => string;
+    /** The model's answer out of stdout — or the failure the CLI reported in it. */
+    answer: (stdout: string) => { ok: true; text: string; usage?: ModelUsage } | { ok: false; detail: string };
+  };
 }
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
@@ -125,7 +242,79 @@ export function claudeSpec(model: string, timeoutMs = DEFAULT_TIMEOUT_MS, bin = 
     model,
     timeoutMs,
     maxAttempts: 2,
-    args: (prompt, m) => ["-p", prompt, "--model", m],
+    // `--tools ""`: a structuring call gets no tools at all. Print mode already
+    // denies anything needing permission, but still offers the read-only ones,
+    // and a document is untrusted input that should not be able to ask for a
+    // file read. Verified to answer normally on 2026-09-13.
+    // `--output-format json`: the answer arrives inside one result object that
+    // also says what the call used, so quota can be measured rather than guessed.
+    args: (prompt, m) => ["-p", prompt, "--model", m, "--tools", "", "--output-format", "json"],
+    output: claudeStreamAnswer,
+    attachments: {
+      args: (m) => [
+        "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+        "--model", m, "--tools", "",
+      ],
+      stdin: claudeStreamMessage,
+      answer: claudeStreamAnswer,
+    },
+  };
+}
+
+/** One user turn for `claude -p --input-format stream-json`: the files, then the prompt. */
+export function claudeStreamMessage(prompt: string, files: readonly ModelAttachment[]): string {
+  const blocks = files.map((file) => ({
+    type: file.mime === "application/pdf" ? "document" : "image",
+    source: { type: "base64", media_type: file.mime, data: base64Of(file.bytes) },
+  }));
+  return `${JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [...blocks, { type: "text", text: prompt }] },
+  })}\n`;
+}
+
+/**
+ * The final `result` object of a `--output-format json` or `stream-json` run,
+ * with what the call used. The token counts include cached input; the cost is
+ * what the CLI reports the call would cost at API prices.
+ */
+export function claudeStreamAnswer(stdout: string): { ok: true; text: string; usage?: ModelUsage } | { ok: false; detail: string } {
+  type StreamResult = {
+    type?: unknown;
+    subtype?: unknown;
+    is_error?: unknown;
+    result?: unknown;
+    total_cost_usd?: unknown;
+    usage?: Record<string, unknown>;
+  };
+  let result: StreamResult | null = null;
+  for (const line of stdout.split("\n")) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line) as StreamResult;
+      if (event.type === "result") result = event;
+    } catch {
+      // A partial or non-JSON line says nothing about the answer.
+    }
+  }
+  if (!result) return { ok: false, detail: "no result event in stream" };
+  if (result.is_error === true || result.subtype !== "success") {
+    return { ok: false, detail: String(result.result ?? result.subtype ?? "error").slice(0, 250) };
+  }
+  const n = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+  const u = result.usage ?? {};
+  const cached = (n(u.cache_creation_input_tokens) ?? 0) + (n(u.cache_read_input_tokens) ?? 0);
+  const usage: ModelUsage = {};
+  if (n(u.input_tokens) !== undefined) usage.inputTokens = n(u.input_tokens)! + cached;
+  if (n(u.output_tokens) !== undefined) usage.outputTokens = n(u.output_tokens)!;
+  if (n(result.total_cost_usd) !== undefined) {
+    usage.costUsd = n(result.total_cost_usd)!;
+    usage.costKind = "api_equivalent";
+  }
+  return {
+    ok: true,
+    text: typeof result.result === "string" ? result.result : "",
+    ...(Object.keys(usage).length ? { usage } : {}),
   };
 }
 
@@ -147,7 +336,7 @@ export function hermesSpec(profile: string, timeoutMs = DEFAULT_TIMEOUT_MS, bin 
   };
 }
 
-type RunOnce = { ok: true; stdout: string } | { ok: false; reason: RunnerFailure; detail: string };
+type RunOnce = { ok: true; stdout: string; usage?: ModelUsage } | { ok: false; reason: RunnerFailure; detail: string };
 
 /**
  * A bounded model call must not depend on WHERE it was spawned from.
@@ -200,7 +389,12 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
       spec.args(prompt, spec.model),
       { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: hermeticEnv() },
       (err, stdout, stderr) => {
-        if (!err) return resolve({ ok: true, stdout: String(stdout) });
+        if (!err) {
+          if (!spec.output) return resolve({ ok: true, stdout: String(stdout) });
+          const answer = spec.output(String(stdout));
+          if (answer.ok) return resolve({ ok: true, stdout: answer.text, ...(answer.usage ? { usage: answer.usage } : {}) });
+          return resolve({ ok: false, reason: isRateLimitText(answer.detail) ? "RATE_LIMITED" : "FAILED", detail: answer.detail });
+        }
         const tail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-250);
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
           return resolve({ ok: false, reason: "FAILED", detail: `${spec.bin} not found` });
@@ -213,6 +407,64 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
       },
     );
   });
+}
+
+/**
+ * A CLI call whose input goes through stdin — how files reach a CLI that takes
+ * them. Same hermetic directory and environment as `runOnce`, same failure
+ * vocabulary.
+ */
+function runWithInput(spec: CliSpec, args: string[], input: string): Promise<RunOnce> {
+  return new Promise((resolve) => {
+    const child = spawn(spec.bin, args, { cwd: spec.cwd ?? tmpdir(), env: hermeticEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    let settled = false;
+    const finish = (result: RunOnce) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ ok: false, reason: "TIMED_OUT", detail: `timed out (${spec.timeoutMs}ms)` });
+    }, spec.timeoutMs);
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (d: string) => {
+      if (out.length < 10 * 1024 * 1024) out += d;
+    });
+    child.stderr?.on("data", (d: string) => {
+      err = (err + d).slice(-8_000);
+    });
+    child.on("error", (e: NodeJS.ErrnoException) => {
+      finish({
+        ok: false,
+        reason: "FAILED",
+        detail: e?.code === "ENOENT" ? `${spec.bin} not found` : String(e?.message ?? e).slice(0, 250),
+      });
+    });
+    child.on("close", (code) => {
+      if (code === 0) return finish({ ok: true, stdout: out });
+      const tail = `${err.trim()} ${out.trim()}`.trim().slice(-250);
+      if (isRateLimitText(tail)) return finish({ ok: false, reason: "RATE_LIMITED", detail: tail });
+      finish({ ok: false, reason: "FAILED", detail: tail || `exit ${code}` });
+    });
+    // A CLI that exits before reading its input breaks the pipe; `close` reports
+    // the exit, so the write error itself has nothing to add.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
+  });
+}
+
+async function runAttached(spec: CliSpec, prompt: string, files: readonly ModelAttachment[]): Promise<RunOnce> {
+  const via = spec.attachments!;
+  const out = await runWithInput(spec, via.args(spec.model), via.stdin(prompt, files));
+  if (!out.ok) return out;
+  const answer = via.answer(out.stdout);
+  if (answer.ok) return { ok: true, stdout: answer.text, ...(answer.usage ? { usage: answer.usage } : {}) };
+  return { ok: false, reason: isRateLimitText(answer.detail) ? "RATE_LIMITED" : "FAILED", detail: answer.detail };
 }
 
 /**
@@ -254,6 +506,66 @@ export interface CodexSpec {
   cwd: string;
 }
 
+/**
+ * Everything a structuring call must not have, switched off on every call.
+ *
+ * `codex exec` loads the whole CODEX_HOME it runs under. On the machine this was
+ * built on that meant a shell (`exec_command`), web access (`web__run`),
+ * `apply_patch`, computer-use MCP tools, image generation, plugins and apps —
+ * all offered to a model reading an untrusted document. Asked to list its tools
+ * it named fourteen, and asked to transcribe a PDF it ran python over the file
+ * on its own (2026-09-13). A read-only sandbox limits writes, not reading files
+ * or reaching the network.
+ *
+ * With these flags the same model lists only `exec`, `wait` and
+ * `request_user_input`, and `exec` refuses ("code-mode host is disabled").
+ * Structured output, image input and extraction were probed unchanged.
+ *
+ * The login's own CODEX_HOME is kept deliberately. A private copy would refresh
+ * the login's token in one place and lock the other copy out.
+ */
+export const CODEX_ISOLATION_ARGS: readonly string[] = [
+  ...[
+    "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host",
+    "apps", "plugins", "remote_plugin", "plugin_sharing",
+    "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser", "computer_use",
+    "hooks", "multi_agent", "image_generation", "view_image", "sleep_tool",
+    "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
+  ].flatMap((feature) => ["--disable", feature]),
+  "-c", "mcp_servers={}",
+  "-c", "plugins={}",
+  "-c", "apps={}",
+  "-c", 'shell_environment_policy.inherit="none"',
+];
+
+/** The feature names CODEX_ISOLATION_ARGS disables. */
+export const CODEX_ISOLATION_FEATURES: readonly string[] = CODEX_ISOLATION_ARGS.flatMap((arg, i, all) =>
+  arg === "--disable" && all[i + 1] ? [all[i + 1]!] : []);
+
+/**
+ * Whether this machine's codex knows every feature the isolation disables —
+ * null when it does, or what is wrong.
+ *
+ * Feature names are version-specific, and codex EXITS on one it does not know
+ * ("Unknown feature flag"). Unchecked, a codex older or newer than the one the
+ * list was written against would fail every structuring call at call time. The
+ * relay asks once at startup instead, and refuses codex bindings loudly if the
+ * answer is not a clean match — never running codex with a shorter list.
+ */
+export function codexIsolationProblem(bin = "codex", timeoutMs = 20_000): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(bin, ["features", "list"], { timeout: timeoutMs, cwd: tmpdir(), env: hermeticEnv(), maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) {
+        resolve(`cannot run "${bin} features list": ${String((err as NodeJS.ErrnoException).code ?? err.message).slice(0, 120)}`);
+        return;
+      }
+      const known = new Set(String(stdout).split("\n").map((line) => line.trim().split(/\s+/)[0]).filter(Boolean));
+      const missing = CODEX_ISOLATION_FEATURES.filter((feature) => !known.has(feature));
+      resolve(missing.length ? `codex does not know isolation feature(s): ${missing.join(", ")}` : null);
+    });
+  });
+}
+
 export function codexSpec(model: string, timeoutMs = DEFAULT_TIMEOUT_MS, over: Partial<CodexSpec> = {}): CodexSpec {
   return { bin: "codex", model, timeoutMs, maxAttempts: 2, cwd: tmpdir(), ...over };
 }
@@ -268,6 +580,7 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
     "--skip-git-repo-check",
     "--ephemeral",
     "--ignore-rules",
+    ...CODEX_ISOLATION_ARGS,
     "-o", answerPath,
   ];
   if (req.schema) {
@@ -282,7 +595,9 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
       // spawn, not execFile: stdin must be closed. Codex waits on it for extra
       // instructions otherwise, and a call that hangs on an empty pipe is worse
       // than one that fails.
-      const child = spawn(spec.bin, args, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
+      // hermeticEnv like the other CLIs: the relay's own environment — bot
+      // tokens, provider keys — is nothing a structuring call should carry.
+      const child = spawn(spec.bin, args, { cwd: spec.cwd, env: hermeticEnv(), stdio: ["ignore", "pipe", "pipe"] });
       let err = "";
       let settled = false;
       const timer = setTimeout(() => {
@@ -320,7 +635,11 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
       if (isRateLimitText(tail)) return { ok: false, reason: "RATE_LIMITED", detail: tail };
       return { ok: false, reason: exited.code === 0 ? "BAD_OUTPUT" : "FAILED", detail: tail || `exit ${exited.code}` };
     }
-    return { ok: true, stdout: answer };
+    // Codex prints "tokens used" and the total after its transcript. It is the
+    // only usage it reports; there is no per-call price on a subscription.
+    const tokens = /tokens used\s*[:\n]?\s*([\d,]+)/i.exec(exited.err)?.[1];
+    const total = tokens ? Number(tokens.replace(/,/g, "")) : NaN;
+    return { ok: true, stdout: answer, ...(Number.isFinite(total) ? { usage: { totalTokens: total } } : {}) };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -328,10 +647,19 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
 
 export function codexRunner(specs: Record<string, CodexSpec>): StructuredModelRunner {
   return {
+    describe(task) {
+      const spec = specs[task];
+      return spec ? { provider: "codex", model: spec.model } : null;
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       const started = Date.now();
       const spec = specs[req.task];
       if (!spec) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
+      // See ATTACHMENT_RUNNERS: codex was seen dropping an attached image, so it
+      // is never handed one.
+      if (req.attachments?.length) {
+        return { ok: false, reason: "NOT_CONFIGURED", detail: "codex cannot take attachments", attempts: 0, ms: 0 };
+      }
       const timeoutMs = req.timeoutMs ?? spec.timeoutMs;
       let attempts = 0;
       let last: { reason: RunnerFailure; detail: string } = { reason: "FAILED", detail: "" };
@@ -339,9 +667,10 @@ export function codexRunner(specs: Record<string, CodexSpec>): StructuredModelRu
         attempts += 1;
         const out = await runCodexOnce({ ...spec, timeoutMs }, req);
         if (out.ok) {
+          const used = out.usage ? { usage: out.usage } : {};
           const parsed = req.parse(firstJsonObject(out.stdout));
-          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started };
-          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started };
+          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started, ...used };
+          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started, ...used };
         }
         last = { reason: out.reason, detail: out.detail };
         if (!worthRetrying(out.reason)) break;
@@ -434,14 +763,31 @@ export function completionText(payload: unknown): string | null {
 
 type Fetcher = typeof fetch;
 
-async function callOpenRouter(spec: HttpSpec, prompt: string, doFetch: Fetcher): Promise<RunOnce> {
+async function callOpenRouter(
+  spec: HttpSpec,
+  prompt: string,
+  doFetch: Fetcher,
+  files: readonly ModelAttachment[] = [],
+): Promise<RunOnce> {
+  // Files as content parts beside the prompt: images as data URLs, a PDF as a
+  // `file` part, which is OpenRouter's documented shape for both.
+  const userContent = files.length === 0
+    ? prompt
+    : [
+        ...files.map((file) => file.mime === "application/pdf"
+          ? { type: "file", file: { filename: "document.pdf", file_data: `data:application/pdf;base64,${base64Of(file.bytes)}` } }
+          : { type: "image_url", image_url: { url: `data:${file.mime};base64,${base64Of(file.bytes)}` } }),
+        { type: "text", text: prompt },
+      ];
   const useJsonMode = spec.jsonMode && !jsonModeRefused.has(spec.model);
   const body: Record<string, unknown> = {
     model: spec.model,
     // Deterministic: this is a structuring task, not a writing one.
     temperature: 0,
-    messages: [{ role: "user", content: prompt }],
+    messages: [{ role: "user", content: userContent }],
     ...(useJsonMode ? { response_format: { type: "json_object" } } : {}),
+    // Token counts and the charged cost come back on the response.
+    usage: { include: true },
     ...(spec.maxOutputTokens ? { max_tokens: spec.maxOutputTokens } : {}),
     // NOTE: deliberately no `models: [...]` fallback array. OpenRouter's own
     // model-fallback is precisely the thing that finished an interview under a
@@ -502,8 +848,25 @@ async function callOpenRouter(spec: HttpSpec, prompt: string, doFetch: Fetcher):
   }
 
   const content = completionText(payload);
-  if (content === null) return { ok: false, reason: "FAILED", detail: "no message content in completion" };
-  return { ok: true, stdout: content };
+  // A completion that carries no message at all is the host failing, not the
+  // model answering: on 2026-09-13 one minimax/minimax-m3 call came back that
+  // way, and the identical request answered normally minutes later. So it is
+  // retried like any upstream error — on the SAME model, never another.
+  if (content === null) {
+    const finish = (payload as { choices?: { finish_reason?: unknown }[] })?.choices?.[0]?.finish_reason;
+    return { ok: false, reason: "UPSTREAM_ERROR", detail: `no message content in completion (finish_reason: ${String(finish ?? "none")})` };
+  }
+  const reported = (payload as { usage?: Record<string, unknown> })?.usage ?? {};
+  const n = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+  const usage: ModelUsage = {};
+  if (n(reported.prompt_tokens) !== undefined) usage.inputTokens = n(reported.prompt_tokens)!;
+  if (n(reported.completion_tokens) !== undefined) usage.outputTokens = n(reported.completion_tokens)!;
+  if (n(reported.total_tokens) !== undefined) usage.totalTokens = n(reported.total_tokens)!;
+  if (n(reported.cost) !== undefined) {
+    usage.costUsd = n(reported.cost)!;
+    usage.costKind = "billed";
+  }
+  return { ok: true, stdout: content, ...(Object.keys(usage).length ? { usage } : {}) };
 }
 
 /**
@@ -516,21 +879,29 @@ async function callOpenRouter(spec: HttpSpec, prompt: string, doFetch: Fetcher):
  */
 export function openRouterRunner(specs: Record<string, HttpSpec>, doFetch: Fetcher = fetch): StructuredModelRunner {
   return {
+    describe(task) {
+      const spec = specs[task];
+      return spec && spec.apiKey ? { provider: "openrouter", model: spec.model } : null;
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       const started = Date.now();
       const spec = specs[req.task];
       if (!spec) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
       if (!spec.apiKey) return { ok: false, reason: "NOT_CONFIGURED", detail: "no api key", attempts: 0, ms: 0 };
+      const files = req.attachments ?? [];
+      const problem = attachmentProblem(files);
+      if (problem) return { ok: false, reason: "FAILED", detail: problem, attempts: 0, ms: 0 };
       const timeoutMs = req.timeoutMs ?? spec.timeoutMs;
       let attempts = 0;
       let last: { reason: RunnerFailure; detail: string } = { reason: "FAILED", detail: "" };
       while (attempts < spec.maxAttempts) {
         attempts += 1;
-        const out = await callOpenRouter({ ...spec, timeoutMs }, req.prompt, doFetch);
+        const out = await callOpenRouter({ ...spec, timeoutMs }, req.prompt, doFetch, files);
         if (out.ok) {
+          const used = out.usage ? { usage: out.usage } : {};
           const parsed = req.parse(firstJsonObject(out.stdout));
-          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started };
-          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started };
+          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started, ...used };
+          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started, ...used };
         }
         last = { reason: out.reason, detail: out.detail };
         if (!worthRetrying(out.reason)) break;
@@ -547,22 +918,36 @@ export function openRouterRunner(specs: Record<string, HttpSpec>, doFetch: Fetch
  */
 export function cliRunner(specs: Record<string, CliSpec>): StructuredModelRunner {
   return {
+    describe(task) {
+      const spec = specs[task];
+      if (!spec) return null;
+      return { provider: spec.provider ?? spec.bin.split("/").pop() ?? spec.bin, model: spec.model };
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       const started = Date.now();
       const spec = specs[req.task];
       if (!spec) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
+      const files = req.attachments ?? [];
+      if (files.length > 0 && !spec.attachments) {
+        return { ok: false, reason: "NOT_CONFIGURED", detail: `${spec.bin} cannot take attachments`, attempts: 0, ms: 0 };
+      }
+      const problem = attachmentProblem(files);
+      if (problem) return { ok: false, reason: "FAILED", detail: problem, attempts: 0, ms: 0 };
       const timeoutMs = req.timeoutMs ?? spec.timeoutMs;
       let attempts = 0;
       let last: { reason: RunnerFailure; detail: string } = { reason: "FAILED", detail: "" };
       while (attempts < spec.maxAttempts) {
         attempts += 1;
-        const out = await runOnce({ ...spec, timeoutMs }, req.prompt);
+        const out = files.length > 0
+          ? await runAttached({ ...spec, timeoutMs }, req.prompt, files)
+          : await runOnce({ ...spec, timeoutMs }, req.prompt);
         if (out.ok) {
+          const used = out.usage ? { usage: out.usage } : {};
           const parsed = req.parse(firstJsonObject(out.stdout));
-          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started };
+          if (parsed !== null) return { ok: true, value: parsed, attempts, ms: Date.now() - started, ...used };
           // Bad output is not retried: the same prompt to the same pinned model
           // is the same coin flip, and the caller has a correct fallback.
-          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started };
+          return { ok: false, reason: "BAD_OUTPUT", detail: out.stdout.slice(0, 250), attempts, ms: Date.now() - started, ...used };
         }
         last = { reason: out.reason, detail: out.detail };
         if (!worthRetrying(out.reason)) break;
@@ -579,6 +964,10 @@ export function cliRunner(specs: Record<string, CliSpec>): StructuredModelRunner
  */
 export function composeRunners(byTask: Record<string, StructuredModelRunner>): StructuredModelRunner {
   return {
+    describe(task) {
+      const runner = byTask[task];
+      return runner?.describe ? runner.describe(task) : null;
+    },
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       const runner = byTask[req.task];
       if (!runner) return { ok: false, reason: "NOT_CONFIGURED", attempts: 0, ms: 0 };
@@ -587,17 +976,42 @@ export function composeRunners(byTask: Record<string, StructuredModelRunner>): S
   };
 }
 
-/** The OpenRouter key: `OPENROUTER_API_KEY`, or a file holding it. */
+/**
+ * The OpenRouter key: `OPENROUTER_API_KEY`, or a file holding it.
+ *
+ * The file may hold the bare key, or be an env file with an
+ * `OPENROUTER_API_KEY=` line — which is where the key already lives: Hermes
+ * keeps it in `~/.hermes/.env`, and the VM mounts `/opt/agent-auth/openrouter.env`.
+ * Pointing `OPENROUTER_API_KEY_FILE` at that file uses the one credential that
+ * exists instead of a second copy of it. Only that line is read; the rest of
+ * the file — other providers' keys, bot tokens — is never returned.
+ */
 export function openRouterKey(env: NodeJS.ProcessEnv = process.env): string {
   const direct = (env.OPENROUTER_API_KEY || "").trim();
   if (direct) return direct;
   const file = (env.OPENROUTER_API_KEY_FILE || "").trim();
   if (!file) return "";
   try {
-    return readFileSync(file, "utf8").trim();
+    return openRouterKeyFromFile(readFileSync(file, "utf8"));
   } catch {
     return "";
   }
+}
+
+/** The key out of a key file's contents: an `OPENROUTER_API_KEY=` line, or a file that is only the key. */
+export function openRouterKeyFromFile(content: string): string {
+  const lines = content.split(/\r?\n/).map((line) => line.trim());
+  const assignment = lines.find((line) => /^(export\s+)?OPENROUTER_API_KEY\s*=/.test(line));
+  if (assignment) {
+    let value = assignment.replace(/^(export\s+)?OPENROUTER_API_KEY\s*=\s*/, "");
+    const quoted = /^(["'])(.*)\1$/.exec(value);
+    value = quoted ? quoted[2]! : value.replace(/\s+#.*$/, "");
+    return value.trim();
+  }
+  const meaningful = lines.filter((line) => line && !line.startsWith("#"));
+  // A bare key file. An env file without the line holds some other secret,
+  // and must never be mistaken for this one.
+  return meaningful.length === 1 && !meaningful[0]!.includes("=") ? meaningful[0]! : "";
 }
 
 /**
@@ -669,6 +1083,80 @@ export const DEFAULT_PLAN_REVIEW_MODEL = "minimax/minimax-m3";
 export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto", "openrouter/auto-beta"]);
 
 /**
+ * Every task a model can be pinned to, and how the environment names it.
+ *
+ * The two document tasks are separate jobs — "what does this document answer"
+ * and "what happens on each day" — and can be pinned to different models. Until
+ * they are, each inherits `EXTRACT_*` whole: runner, model and timeout together.
+ * `extract` stays a task name so anything still asking for it by that name is
+ * served exactly as before.
+ */
+export const MODEL_TASKS: readonly {
+  task: string;
+  prefix: string;
+  inherits?: string;
+  timeoutMs: number;
+  /** OpenRouter's default model for the task, where one has been chosen. */
+  openRouterModel?: string;
+}[] = [
+  { task: "interpret", prefix: "INTERPRET", timeoutMs: DEFAULT_TIMEOUT_MS, openRouterModel: DEFAULT_INTERPRET_MODEL },
+  { task: "extract", prefix: "EXTRACT", timeoutMs: 90_000, openRouterModel: DEFAULT_EXTRACT_MODEL },
+  { task: "plan_review", prefix: "PLAN_REVIEW", timeoutMs: 90_000, openRouterModel: DEFAULT_PLAN_REVIEW_MODEL },
+  { task: "extract_intake", prefix: "EXTRACT_INTAKE", inherits: "EXTRACT", timeoutMs: 90_000, openRouterModel: DEFAULT_EXTRACT_MODEL },
+  { task: "extract_itinerary", prefix: "EXTRACT_ITINERARY", inherits: "EXTRACT", timeoutMs: 90_000, openRouterModel: DEFAULT_EXTRACT_MODEL },
+  // Reading a photo or a scan. Inherits nothing: the deployed EXTRACT_* binding
+  // is codex on most stacks, and codex cannot take the file (ATTACHMENT_RUNNERS).
+  // No OpenRouter default either — no vision model has been measured yet.
+  { task: "read_image", prefix: "VISION", timeoutMs: 90_000 },
+];
+
+/** A task's timeout: its own `<PREFIX>_TIMEOUT_MS`, else what it inherits, else its default. */
+export function taskTimeoutMs(task: string, env: NodeJS.ProcessEnv = process.env): number {
+  const spec = MODEL_TASKS.find((t) => t.task === task);
+  if (!spec) return DEFAULT_TIMEOUT_MS;
+  const own = Number(env[`${spec.prefix}_TIMEOUT_MS`]);
+  if (own > 0) return own;
+  const inherited = spec.inherits ? Number(env[`${spec.inherits}_TIMEOUT_MS`]) : 0;
+  return inherited > 0 ? inherited : spec.timeoutMs;
+}
+
+/**
+ * The runner for one pinned binding of one task, or undefined when that binding
+ * cannot serve a call — an OpenRouter binding with no key, an unknown runner, or
+ * a model that picks models. The one place a binding becomes a runner, whether
+ * it came from the environment or from a super admin's override, so the two can
+ * never disagree about what a binding means.
+ */
+export function runnerForBinding(
+  kind: string,
+  model: string,
+  timeoutMs: number,
+  task: string,
+  env: NodeJS.ProcessEnv = process.env,
+): StructuredModelRunner | undefined {
+  // A model that picks a model is the fallback problem again. Refused here
+  // rather than trusted to configuration, because the failure it produces is
+  // silent — see FORBIDDEN_MODELS.
+  if (FORBIDDEN_MODELS.has(model)) return undefined;
+  // A task that always sends files, on a runner that cannot send them, would
+  // fail every call — so it is not a binding at all.
+  if (ATTACHMENT_TASKS.has(task) && !ATTACHMENT_RUNNERS.has(kind)) return undefined;
+  // Set by the relay when codex could not confirm it knows every isolation
+  // feature (codexIsolationProblem): codex is then no binding at all, rather
+  // than one that fails every call or runs with tools switched on.
+  if (kind === "codex" && env.KINERARY_CODEX_ISOLATION_UNVERIFIED === "1") return undefined;
+  if (kind === "openrouter") {
+    const key = openRouterKey(env);
+    if (!key) return undefined;
+    return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
+  }
+  if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
+  if (kind === "claude") return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude") });
+  if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
+  return undefined;
+}
+
+/**
  * Both task runners, from the environment. Undefined when nothing is
  * configured — the interpret path then falls back to the router's own
  * questions and extraction to its Hermes profile, which are working behaviours
@@ -680,58 +1168,40 @@ export const FORBIDDEN_MODELS: ReadonlySet<string> = new Set(["openrouter/auto",
  * a settled deployment story it has not earned yet.
  *
  *   OPENROUTER_API_KEY / OPENROUTER_API_KEY_FILE
- *   INTERPRET_RUNNER=openrouter|claude|codex|hermes   INTERPRET_MODEL=<id|profile>
- *   EXTRACT_RUNNER=openrouter|claude|codex|hermes     EXTRACT_MODEL=<id|profile>
- *   PLAN_REVIEW_RUNNER=…                              PLAN_REVIEW_MODEL=<id|profile>
- *   INTERPRET_TIMEOUT_MS / EXTRACT_TIMEOUT_MS / PLAN_REVIEW_TIMEOUT_MS
+ *   INTERPRET_RUNNER=openrouter|codex|claude|hermes    INTERPRET_MODEL=<id|profile>
+ *   EXTRACT_RUNNER=openrouter|codex|claude|hermes      EXTRACT_MODEL=<id|profile>
+ *   PLAN_REVIEW_RUNNER=…                               PLAN_REVIEW_MODEL=<id|profile>
+ *   EXTRACT_INTAKE_RUNNER / EXTRACT_INTAKE_MODEL       (optional; else EXTRACT_*)
+ *   EXTRACT_ITINERARY_RUNNER / EXTRACT_ITINERARY_MODEL (optional; else EXTRACT_*)
+ *   VISION_RUNNER=claude|openrouter  VISION_MODEL=<id> (photos and scans; unset = not read)
+ *   <PREFIX>_TIMEOUT_MS
  *
- * `plan_review` unset is the normal state today and is a DOWNGRADE, not an
- * error: the post-deploy plan review still runs its deterministic half and
- * records why the model did not contribute on the review row — `NO_RUNNER`
- * when nothing at all is configured, `NOT_CONFIGURED` when the other tasks
- * are and this one is not. A half-strength pass is then visible rather than
- * looking like a plan with nothing wrong in it.
+ * The two document tasks are separate jobs — "what does this document answer"
+ * and "what happens on each day" — and can be pinned to different models. Until
+ * they are, each inherits `EXTRACT_*` whole: runner, model and timeout together.
+ * A task given its own runner never borrows another runner's model, because a
+ * model id is only meaningful to the runner it was written for.
+ *
+ * `plan_review` unset is a visible downgrade: the post-deploy review still
+ * runs its deterministic half and records why the model did not contribute.
  */
 export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): StructuredModelRunner | undefined {
-  const key = openRouterKey(env);
   const byTask: Record<string, StructuredModelRunner> = {};
+  const build = (kind: string, model: string, timeoutMs: number, task: string) =>
+    runnerForBinding(kind, model, timeoutMs, task, env);
 
-  const build = (kind: string, model: string, timeoutMs: number, task: string): StructuredModelRunner | undefined => {
-    // A model that picks a model is the fallback problem again. Refused here
-    // rather than trusted to configuration, because the failure it produces is
-    // silent — see FORBIDDEN_MODELS.
-    if (FORBIDDEN_MODELS.has(model)) return undefined;
-    if (kind === "openrouter") {
-      if (!key) return undefined;
-      return openRouterRunner({ [task]: openRouterSpec(model, key, timeoutMs) });
-    }
-    if (kind === "codex") return codexRunner({ [task]: codexSpec(model, timeoutMs, { bin: env.CODEX_BIN || "codex" }) });
-    if (kind === "claude") return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude") });
-    if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
-    return undefined;
-  };
-
-  // One entry per task, rather than a copy of the same eight lines per task.
-  // `<PREFIX>_RUNNER` / `<PREFIX>_MODEL` / `<PREFIX>_TIMEOUT_MS` is the naming
-  // the first two tasks already had; keeping it as a table is what stops the
-  // third from acquiring a slightly different spelling.
-  const tasks: readonly { task: string; prefix: string; openRouterModel: string; timeoutMs: number }[] = [
-    { task: "interpret", prefix: "INTERPRET", openRouterModel: DEFAULT_INTERPRET_MODEL, timeoutMs: DEFAULT_TIMEOUT_MS },
-    { task: "extract", prefix: "EXTRACT", openRouterModel: DEFAULT_EXTRACT_MODEL, timeoutMs: 90_000 },
-    // A review reads a whole leg plus the uploaded document, so it gets the
-    // long-context budget rather than interpret's.
-    { task: "plan_review", prefix: "PLAN_REVIEW", openRouterModel: DEFAULT_PLAN_REVIEW_MODEL, timeoutMs: 90_000 },
-  ];
-
-  for (const entry of tasks) {
-    const kind = (env[`${entry.prefix}_RUNNER`] || "").trim().toLowerCase();
-    if (!kind) continue;
+  for (const { task, prefix, inherits, timeoutMs, openRouterModel } of MODEL_TASKS) {
+    const own = (env[`${prefix}_RUNNER`] || "").trim().toLowerCase();
+    // Inherit the whole binding or none of it — see the doc comment above.
+    const source = own ? prefix : inherits && (env[`${inherits}_RUNNER`] || "").trim() ? inherits : null;
+    if (!source) continue;
+    const kind = (env[`${source}_RUNNER`] || "").trim().toLowerCase();
     const model =
-      (env[`${entry.prefix}_MODEL`] || "").trim() ||
-      (kind === "openrouter" ? entry.openRouterModel : kind === "codex" ? CODEX_LUNA_MODEL : "");
+      (env[`${source}_MODEL`] || "").trim() ||
+      (kind === "openrouter" ? openRouterModel ?? "" : kind === "codex" ? CODEX_LUNA_MODEL : "");
     if (!model) continue;
-    const runner = build(kind, model, Number(env[`${entry.prefix}_TIMEOUT_MS`] || entry.timeoutMs), entry.task);
-    if (runner) byTask[entry.task] = runner;
+    const runner = build(kind, model, Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
+    if (runner) byTask[task] = runner;
   }
 
   return Object.keys(byTask).length > 0 ? composeRunners(byTask) : undefined;
@@ -745,6 +1215,7 @@ export function fakeRunner(
   let i = 0;
   return {
     calls,
+    describe: () => ({ provider: "fake", model: "fake" }),
     async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
       calls.push(req as unknown as StructuredModelRequest<unknown>);
       const reply = replies[i++];

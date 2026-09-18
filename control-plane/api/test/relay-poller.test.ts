@@ -828,6 +828,18 @@ describe("combining a burst of messages into one turn", () => {
     assert.equal(combined?.source.chat_id, "391627336");
     assert.equal(combined?.message_type, "document");
   });
+
+  test("each file keeps the id of the message it arrived in", () => {
+    // The combined event carries only the LAST message's id. A document's
+    // delivery record needs its own, or two files sent in two messages look
+    // like one delivery — and a re-sent file cannot be told from a redelivery.
+    const combined = combineBurst([
+      { ...ev("", ["aaa"]), message_id: "11" },
+      { ...ev("", ["bbb"]), message_id: "12" },
+    ]);
+    assert.deepEqual(combined?.media?.map((m) => m.message_id), ["11", "12"]);
+    assert.equal(combined?.message_id, "12");
+  });
 });
 
 describe("a document's unsure reading is asked about, not lost", () => {

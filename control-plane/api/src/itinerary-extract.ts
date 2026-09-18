@@ -34,6 +34,26 @@ export function venueLinkSearchConfigured(): boolean {
   return Boolean(HERMES_SEARCH_PROFILE);
 }
 
+/** The runner task this extraction is pinned to — separately from reading intake answers. */
+export const EXTRACT_ITINERARY_TASK = "extract_itinerary";
+
+/**
+ * How much of a document the day-by-day pass reads.
+ *
+ * It was 20,000 characters, applied with a bare `slice` — no flag, no log, no
+ * word to anyone — so a long plan simply lost its later days and the site showed
+ * a trip that ended early. The limit is real: this pass TRANSCRIBES, its output
+ * grows with its input, and on 2026-09-12 a longer prompt stopped a four-page
+ * itinerary finishing at all. So a budget stays, sized to take a typical
+ * multi-page plan whole, and going past it is now said out loud: the result
+ * carries `ITINERARY_TRUNCATED_WARNING` and the organizer is told part of the
+ * document was read.
+ */
+export const ITINERARY_DOCUMENT_BUDGET_CHARS = 60_000;
+
+/** The prefix of the warning a truncated day-by-day read carries. */
+export const ITINERARY_TRUNCATED_WARNING = "document truncated";
+
 export type PhaseRef = { name: string; start?: string; end?: string };
 type Bi = { he: string; en: string };
 export type ItineraryItem = { time: string | null; text: Bi };
@@ -340,7 +360,7 @@ export function buildExtractPrompt(args: ExtractItineraryArgs): string {
     `No commentary.`,
     ``,
     `Document:`,
-    args.documentText.slice(0, 20000),
+    args.documentText.slice(0, ITINERARY_DOCUMENT_BUDGET_CHARS),
   ]
     .filter((line) => line !== "")
     .join("\n");
@@ -506,9 +526,20 @@ export function foldExtractedIntoPhases(
     if (!target || typeof target !== "object") continue;
     const phase = target as Record<string, unknown>;
 
-    if (found.days.length && !(Array.isArray(phase.days) && phase.days.length)) {
-      phase.days = found.days;
-      daysAdded += found.days.length;
+    // By DATE, not by phase. A phase with one captured day used to count as
+    // done, so a later document could never add the other four days of a
+    // five-day stop. A held day still always wins its own date — it may be one
+    // somebody corrected — and only dates the phase does not have are added.
+    if (found.days.length) {
+      const held = Array.isArray(phase.days) ? (phase.days as { date?: unknown }[]) : [];
+      const dates = new Set(held.map((day) => day?.date));
+      const fresh = found.days.filter((day) => !dates.has(day.date));
+      if (fresh.length) {
+        phase.days = [...held, ...fresh].sort((a, b) =>
+          String((a as { date?: unknown }).date ?? "").localeCompare(String((b as { date?: unknown }).date ?? "")),
+        );
+        daysAdded += fresh.length;
+      }
     }
     // Venues merge by name rather than replacing: `planned` places named in the
     // conversation and venues named in the document are both real, and the
@@ -545,7 +576,7 @@ export async function extractItinerary(
     // below is the real gate, and it is the one the tests exercise. Splitting
     // the checking across both would give the invariants two homes.
     const result = await runner.run<unknown>({
-      task: "extract",
+      task: EXTRACT_ITINERARY_TASK,
       prompt,
       parse: (raw) => (raw && typeof raw === "object" ? raw : null),
       schema: EXTRACT_OUTPUT_SCHEMA,
@@ -570,6 +601,11 @@ export async function extractItinerary(
 
   if (!parsed) return { ok: false, reason: "EXTRACTION_FAILED", detail: "no JSON object in model output" };
   const { phases, warnings } = normaliseExtractedItinerary(parsed, args.phases);
+  if (args.documentText.length > ITINERARY_DOCUMENT_BUDGET_CHARS) {
+    warnings.push(
+      `${ITINERARY_TRUNCATED_WARNING}: read ${ITINERARY_DOCUMENT_BUDGET_CHARS} of ${args.documentText.length} characters`,
+    );
+  }
   // A venue's official/ticket link comes from the document when it prints one;
   // otherwise web-search for it here so the site can show a 🎫 button. If the
   // search is rate-limited, the names come back in `deferred` for the caller to

@@ -8,6 +8,7 @@ import {
   isRateLimited,
   acceptableVenueUrl,
   EXTRACT_OUTPUT_SCHEMA,
+  ITINERARY_DOCUMENT_BUDGET_CHARS,
   type PhaseRef,
 } from "../src/itinerary-extract.js";
 
@@ -45,13 +46,27 @@ describe("foldExtractedIntoPhases", () => {
     assert.deepEqual((folded[2] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-10-01", "2026-10-02"]);
   });
 
-  test("an itinerary already there wins — a re-run never overwrites it", () => {
-    const phases = [{ name: "Tokyo", days: [day("2026-09-19")] }];
-    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
-      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-20"), day("2026-09-21")], venues: [] },
+  test("an itinerary already there wins its dates — a re-run never overwrites a day", () => {
+    const corrected = { date: "2026-09-19", items: [{ time: null, text: { he: "תוקן", en: "Corrected by hand" } }] };
+    const phases = [{ name: "Tokyo", days: [corrected] }];
+    const { phases: folded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-19")], venues: [] },
     ]);
-    assert.equal(daysAdded, 0);
-    assert.deepEqual((folded[0] as { days: { date: string }[] }).days.map((d) => d.date), ["2026-09-19"]);
+    assert.deepEqual((folded[0] as { days: unknown[] }).days, [corrected], "the held day survives a document's version of it");
+  });
+
+  test("a phase with some days gains the dates it does not have", () => {
+    // It used to count as done the moment it had ONE day, so a five-day stop
+    // with a single captured day could never be filled in by a later document.
+    const corrected = { date: "2026-09-19", items: [{ time: null, text: { he: "תוקן", en: "Corrected by hand" } }] };
+    const phases = [{ name: "Tokyo", days: [corrected] }];
+    const { phases: folded, daysAdded } = foldExtractedIntoPhases(phases, [
+      { name: "Tokyo", phaseIndex: 0, days: [day("2026-09-21"), day("2026-09-19"), day("2026-09-20")], venues: [] },
+    ]);
+    assert.equal(daysAdded, 2);
+    const days = (folded[0] as { days: { date: string }[] }).days;
+    assert.deepEqual(days.map((d) => d.date), ["2026-09-19", "2026-09-20", "2026-09-21"]);
+    assert.deepEqual(days[0], corrected);
   });
 
   test("venues merge rather than replace, and a name already there is not doubled", () => {
@@ -296,15 +311,16 @@ describe("buildExtractPrompt", () => {
     assert.match(prompt, /"<name>": "https:/);
   });
 
-  test("truncates a very long document", () => {
+  test("truncates a very long document at the budget", () => {
     const prompt = buildExtractPrompt({
       destination: "Japan",
       phases: PHASES,
-      documentText: "x".repeat(50000),
+      documentText: "x".repeat(ITINERARY_DOCUMENT_BUDGET_CHARS + 30_000),
     });
-    // 20 000-char document cap + a small fixed preamble.
-    assert.ok(prompt.length < 22000, `prompt was ${prompt.length}`);
-    assert.ok(!prompt.includes("x".repeat(20001)));
+    // The document budget + a small fixed preamble. That it is now SAID when
+    // this happens is `itinerary-budget.test.ts`.
+    assert.ok(prompt.length < ITINERARY_DOCUMENT_BUDGET_CHARS + 2_000, `prompt was ${prompt.length}`);
+    assert.ok(!prompt.includes("x".repeat(ITINERARY_DOCUMENT_BUDGET_CHARS + 1)));
   });
 });
 
