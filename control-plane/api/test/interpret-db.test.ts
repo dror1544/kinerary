@@ -34,7 +34,7 @@ import {
   submitAnswerForChat,
   touchSessionDeadline,
 } from "../src/interview.js";
-import { flushSettledInboundBursts } from "../src/relay/poller.js";
+import { flushSettledInboundBursts, OPTIONAL_OFFER_PROMPT } from "../src/relay/poller.js";
 import { uiString } from "../src/intake-copy.js";
 import {
   claimInterpretation,
@@ -120,6 +120,15 @@ const PROPOSAL: ProposedAnswer = {
   evidence: "family trip",
   sourceMessageId: "101",
 };
+
+
+/**
+ * The roster written into a session by the stand-in answers below. A real
+ * (one-person) roster rather than text, because the organizer's "x" is settled
+ * only by someone on it — otherwise the organizer question, not the one a test
+ * is about, would be what the router asks next.
+ */
+const ROSTER_STAND_IN = { kind: "structured", schema_version: 3, data: [{ name: "x" }] };
 
 describe("interpret path — per-session switch", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
   test("off by default, and switching one session leaves the other alone", async () => {
@@ -505,7 +514,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
           `UPDATE control_plane.intake_sessions
               SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
             WHERE telegram_chat_id = $1`,
-          [a.chatId, q.id, JSON.stringify({ kind: "text", schema_version: 3, text: "x" })],
+          [a.chatId, q.id, JSON.stringify(q.id === "travelers" ? ROSTER_STAND_IN : { kind: "text", schema_version: 3, text: "x" })],
         );
       }
       const optionalIds = INTAKE_QUESTIONS.filter((x) => !x.required).map((x) => x.id);
@@ -542,6 +551,186 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
         "and restates what it is actually waiting for",
       );
       assert.ok(reply.buttons >= 2, "with both exits tappable for someone whose words it cannot parse");
+    });
+  });
+
+  test("the boundary is said where it is — above the first optional question, not after the last one", async () => {
+    // 2026-09-16, live: "זה כל מה שבאמת צריך — מכאן זה רשות…" arrived as the LAST
+    // message before the summary, after every optional question had been asked,
+    // and both its buttons led to the summary. On this path the router walks the
+    // optional questions itself, and the announcement only went out once there
+    // was nothing left to walk.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+        await pool.query(
+          `UPDATE control_plane.intake_sessions
+              SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+            WHERE telegram_chat_id = $1`,
+          [a.chatId, q.id, JSON.stringify(q.id === "travelers" ? ROSTER_STAND_IN : { kind: "text", schema_version: 3, text: "x" })],
+        );
+      }
+      // The moment the last required answer lands: the optional phase entered,
+      // its entry not yet announced, the machine owing the next message.
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET language = 'he', state = 'interviewing', awaiting = 'machine', phase = 'optional',
+                ui_state = jsonb_build_object('pending_entry', 'optional')
+          WHERE telegram_chat_id = $1`,
+        [a.chatId],
+      );
+      const { advanceRouterOwnedQuestions } = await import("../src/relay/poller.js");
+      const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+      const telegram = new Recorder();
+      const deps = { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never;
+
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+
+      assert.equal(telegram.sent.length, 1, `one message — sent: ${JSON.stringify(telegram.sent)}`);
+      const first = telegram.sent[0]!;
+      // The boundary is its own message and asks nothing yet: the choice on
+      // screen is whether to have the optional questions at all. Folded above
+      // the first one, the only buttons were that question's — "Skip this one"
+      // and "Finished" — so the answer to "do you want more?" had to be given
+      // by a button claiming the interview was over (Dror, 2026-09-18).
+      assert.equal(first.text, uiString("essentialsDone", "he"), `the announcement stands alone — got: ${first.text}`);
+      assert.equal(first.buttons, 2, "with its own two choices: a few more questions, or skip");
+
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.offeredMore, true, "said once");
+      assert.equal(after.view.pendingEntry, null);
+
+      assert.equal(after.view.lastPrompt, OPTIONAL_OFFER_PROMPT, "and recorded, so everything else can see it");
+
+      // AND NOTHING FOLLOWS IT. Live on 2026-09-18 the offer and the first
+      // optional question arrived together — "the optional question came and
+      // immediately followed by another without waiting my response" — because
+      // the walk reads `offeredMore`, which the offer itself had just set. A
+      // choice nothing waits for is not a choice.
+      await pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting = 'machine' WHERE telegram_chat_id = $1",
+        [a.chatId],
+      );
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(
+        telegram.sent.length, 1,
+        `still just the offer — sent: ${JSON.stringify(telegram.sent)}`,
+      );
+      const waiting = await getSessionForChat(pool, a.chatId);
+      assert.ok(waiting.ok);
+      assert.equal(waiting.view.awaiting, "person", "and the turn is theirs, not a session owing a message");
+
+      // "A few more questions" is what produces one: the offer asks nothing by
+      // itself, and either button is an answer to it.
+      const { askForMoreForChat } = await import("../src/interview.js");
+      const more = await askForMoreForChat(pool, a.chatId);
+      assert.ok(more.ok);
+      await pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting = 'machine' WHERE telegram_chat_id = $1",
+        [a.chatId],
+      );
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(telegram.sent.length, 2, "asking for more asks a question");
+      assert.ok(
+        !telegram.sent[1]!.text.includes(uiString("essentialsDone", "he")),
+        "a question, not the offer again",
+      );
+
+      // And from there the walk runs on its own again: the offer is answered,
+      // so the next optional question needs no second tap.
+      const asked = await getSessionForChat(pool, a.chatId);
+      assert.ok(asked.ok);
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET awaiting = 'machine', ui_state = ui_state || jsonb_build_object('skipped', jsonb_build_array($2::text))
+          WHERE telegram_chat_id = $1`,
+        [a.chatId, asked.view.optionalRemaining[0]!.id],
+      );
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(telegram.sent.length, 3, `the walk carries on — sent: ${JSON.stringify(telegram.sent)}`);
+    });
+  });
+
+  test("what is on screen is recorded before it is sent, so a racing pass cannot send it twice", async () => {
+    // 2026-09-18, live: "I had some duplication". `trip_interests` and
+    // `trip_pace` each went out twice, both pairs straight after a `floor_lost`.
+    //
+    // The floor arbitrates between two would-be speakers, and it worked — one
+    // lost. What went wrong is what the loser did next: a tap's reply retries
+    // when it said nothing, and it read `lastPrompt` to decide whether anybody
+    // else had. That was recorded AFTER the send, so for the whole Telegram
+    // round trip the record said nobody had spoken, and the loser sent the same
+    // question again.
+    //
+    // So the order is the fix, and the order is what this pins: by the time the
+    // message is handed to Telegram, the session already says what is on screen.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET language = 'he', state = 'interviewing', awaiting = 'machine', phase = 'essentials'
+          WHERE telegram_chat_id = $1`,
+        [a.chatId],
+      );
+      const { sendNextStep } = await import("../src/relay/poller.js");
+      const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+
+      const promptsAtSendTime: (string | null)[] = [];
+      const telegram = new Recorder();
+      const watching = Object.assign(Object.create(Object.getPrototypeOf(telegram)), telegram, {
+        sendMessage: async (p: { text: string; replyMarkup?: { inline_keyboard: unknown[][] } }) => {
+          // What a concurrent pass would read at exactly this moment.
+          const mid = await getSessionForChat(pool, a.chatId);
+          promptsAtSendTime.push(mid.ok ? mid.view.lastPrompt ?? null : null);
+          return telegram.sendMessage(p);
+        },
+      });
+      const deps = { db: pool, telegram: watching, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never;
+
+      const before = await getSessionForChat(pool, a.chatId);
+      assert.ok(before.ok);
+      const expected = `q:${before.view.nextQuestion!.id}`;
+
+      assert.equal(await sendNextStep(before.view, a.chatId, deps, DEFAULT_STRINGS), true);
+      assert.deepEqual(promptsAtSendTime, [expected], "named while the floor is still ours, not after Telegram answers");
+
+      // And the loser, running on the view it already had, says nothing.
+      assert.equal(
+        await sendNextStep(before.view, a.chatId, deps, DEFAULT_STRINGS), false,
+        "the second pass is deduped, not sent",
+      );
+      assert.equal(telegram.sent.length, 1, `one message — sent: ${JSON.stringify(telegram.sent)}`);
+    });
+  });
+
+  test("the interview follows the language the organizer writes in, not the phone's", async () => {
+    // 2026-09-15, live: the session took English from the Telegram app, the
+    // organizer wrote every answer in Hebrew, and the interview, the site and the
+    // companion were all English — nothing on this path ever replaced the hint.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await pool.query("UPDATE control_plane.intake_sessions SET language = 'en' WHERE telegram_chat_id = $1", [a.chatId]);
+      const telegram = new Recorder();
+
+      await say(pool, a.chatId, "היי, אנחנו נוסעים ליפן", telegram);
+
+      const view = await getSessionForChat(pool, a.chatId);
+      assert.equal(view.ok && view.view.language, "he", "the session now records Hebrew");
+      const reply = telegram.sent[telegram.sent.length - 1];
+      assert.ok(reply && /[\u05d0-\u05ea]/u.test(reply.text), `and the reply is in Hebrew — got: ${reply?.text}`);
+    });
+  });
+
+  test("a Hebrew interview stays Hebrew when the organizer types a place name", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await pool.query("UPDATE control_plane.intake_sessions SET language = 'he' WHERE telegram_chat_id = $1", [a.chatId]);
+
+      await say(pool, a.chatId, "Tokyo", new Recorder());
+
+      const view = await getSessionForChat(pool, a.chatId);
+      assert.equal(view.ok && view.view.language, "he");
     });
   });
 
@@ -584,7 +773,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
         `UPDATE control_plane.intake_sessions
             SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
           WHERE telegram_chat_id = $1`,
-        [chatId, q.id, JSON.stringify(q.type === "choice"
+        [chatId, q.id, JSON.stringify(q.id === "travelers" ? ROSTER_STAND_IN : q.type === "choice"
           ? { kind: "choice", option_id: q.options![0]!.id, schema_version: 3, other_text: null }
           : { kind: "text", schema_version: 3, text: "x" })],
       );
@@ -676,7 +865,7 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
           `UPDATE control_plane.intake_sessions
               SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
             WHERE telegram_chat_id = $1`,
-          [a.chatId, q.id, JSON.stringify({ kind: "text", schema_version: 3, text: "x" })],
+          [a.chatId, q.id, JSON.stringify(q.id === "travelers" ? ROSTER_STAND_IN : { kind: "text", schema_version: 3, text: "x" })],
         );
       }
       await say(pool, a.chatId, "היי", telegram);

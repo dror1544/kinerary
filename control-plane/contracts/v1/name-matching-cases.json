@@ -1,0 +1,91 @@
+{
+  "_about": [
+    "Which traveller is the organizer, when the name was written in a different alphabet from the roster.",
+    "Read by BOTH sides so they cannot drift: control-plane/api/src/organizer-identity.ts (the interview, which",
+    "records the roster's own spelling or asks again) and control-plane/worker/control_plane_worker/transformer.py",
+    "(the build, which must find the same person). A case added here is enforced in both.",
+    "alike / not_alike: two names, compared by their consonants only, and only across alphabets.",
+    "resolve: a roster (the travelers answer) and what the organizer wrote; expect is the roster index, or null."
+  ],
+  "alike": [
+    ["ניר", "Nir"],
+    ["ניר סולומון", "Nir Solomon"],
+    ["דוד", "David"],
+    ["חיים", "Chaim"],
+    ["חיים", "Haim"],
+    ["שרה", "Sarah"],
+    ["מיכל", "Michal"],
+    ["יעקב", "Yaakov"],
+    ["צבי", "Tzvi"],
+    ["צבי", "Zvi"],
+    ["עמרי", "Omri"],
+    ["יונתן", "Yonatan"],
+    ["איתמר", "Itamar"],
+    ["חנה", "Hanna"],
+    ["Shira", "שירה"]
+  ],
+  "not_alike": [
+    ["ניר", "Omri"],
+    ["נועה", "Noa"],
+    ["אלה", "Ella"],
+    ["Nir", "Nira"],
+    ["ניר", "ניר"],
+    ["סולומון", "Nir"]
+  ],
+  "resolve": [
+    {
+      "why": "every roster name only in English letters, the organizer answered in Hebrew",
+      "roster": [{"name": "Nir", "name_en": "Nir"}, {"name": "Maya", "name_en": "Maya"}, {"name": "Omer", "name_en": "Omer"}],
+      "answer": "ניר",
+      "expect": 0
+    },
+    {
+      "why": "a Hebrew-only roster, answered in English",
+      "roster": [{"name": "עמרי", "family": "לוי"}, {"name": "נועה", "family": "לוי"}],
+      "answer": "Omri",
+      "expect": 0
+    },
+    {
+      "why": "two travellers sound alike, so nobody is picked",
+      "roster": [{"name": "Dana"}, {"name": "Dina"}],
+      "answer": "דנה",
+      "expect": null
+    },
+    {
+      "why": "one consonant is too little to tell people apart",
+      "roster": [{"name": "Noa"}, {"name": "Maya"}],
+      "answer": "נועה",
+      "expect": null
+    },
+    {
+      "why": "a different name in the same alphabet is a different name, not a spelling",
+      "roster": [{"name": "Nir"}],
+      "answer": "Nira",
+      "expect": null
+    },
+    {
+      "why": "an exact match wins before sound-alike is ever tried",
+      "roster": [{"name": "ניר", "name_en": "Nir"}, {"name": "Nora", "name_en": "Nora"}],
+      "answer": "ניר",
+      "expect": 0
+    },
+    {
+      "why": "the name is read from the front of a sentence first",
+      "roster": [{"name": "Nir"}, {"name": "Maya"}],
+      "answer": "אני ניר",
+      "expect": 0
+    },
+    {
+      "why": "a family name names a household, not a person, in any alphabet",
+      "roster": [{"name": "Nir", "family": "Solomon"}, {"name": "Maya", "family": "Solomon"}],
+      "answer": "סולומון",
+      "expect": null
+    },
+    {
+      "why": "a full name across alphabets",
+      "roster": [{"name": "Nir Solomon"}, {"name": "Maya Solomon"}],
+      "answer": "ניר סולומון",
+      "expect": 0
+    }
+  ]
+}
