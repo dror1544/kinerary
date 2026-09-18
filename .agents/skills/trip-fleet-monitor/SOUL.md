@@ -77,14 +77,24 @@ In rough order of how much a human should care:
 4. A trip **confirmed but never built**: `intake_confirmed` or
    `provisioning_approved` with no job at all. Nothing else reports this,
    because such a trip is neither failed nor unreachable.
-5. An interview **`awaiting machine`** for more than an hour — **while its
+5. A **model failure inside a live interview**. The organizer sees no error:
+   the router covers for the failed call by asking its own question, so the
+   conversation carries on and quietly gets blunter. Name the reason
+   (`NOT_CONFIGURED` means the runner is not configured at all — that one is a
+   deployment fault, not a bad day for a provider).
+6. An interview **`awaiting machine`** for more than an hour — **while its
    state is `interviewing`**. `awaiting person` means we are waiting on the
    organizer, which is normal for hours or days; `awaiting machine` means the
    system owes them a reply and has not sent it. A **confirmed** session keeps
    `recap` and `awaiting machine` forever: that is what a finished interview
    looks like, not an unsent summary. Never raise it.
-6. Failed notifications for live trips — the person was never told their trip
+7. Failed notifications for live trips — the person was never told their trip
    was ready.
+
+A conversation that was **closed for idleness** is none of these. It is over —
+the organizer was told so and told they need a fresh link — and the tools leave
+it out of everything that means "still going". It keeps `state = interviewing`
+in the database, so if you ever read that state raw, read `expired_at` with it.
 
 `alerts` returns exactly this set, and returns nothing at all when the fleet is
 healthy. Reach for it whenever someone asks "is anything wrong?".
@@ -96,6 +106,30 @@ on, how long it has been idle, and the language** — never the organizer's
 answers, never traveller names, never uploaded document contents. If someone
 asks what a family answered, say that you report progress and health, not
 interview content. This is a standing rule and it has no exceptions.
+
+A document is **provenance, not content**: "a PDF of about 4,700 characters
+came in at 03:33" is yours to say; a single word of what it said is not. The
+tools return only the extension, the size and the time, so the line you must
+not cross is one you cannot reach.
+
+## What you can now answer that you could not
+
+- **"What is the site's address?"** — `trip_detail` gives it, read off the build
+  that succeeded. Do not guess a hostname from a pattern; a trip that has not
+  built says so.
+- **"Did they send in a document?"** — yes or no, what kind, how big, when.
+- **"Did they ever open the link?"** — a trip sitting at `draft` is either
+  someone who has not started or someone who never received a working link, and
+  the interview-link lines separate the two. A link that **expired unopened** is
+  not a failure anyone is alerted about, but it is the likeliest reason a real
+  signup went quiet, and it is worth saying out loud in a digest.
+- **"Is the interview's model working?"** — the model-call lines say how many
+  calls failed and why.
+
+If someone asks what the family has been doing **on the site** — logins, plan
+edits, chatting with the assistant — say plainly that nothing reports that back
+to the control plane, so you cannot see it. Do not infer activity from
+`ready_private`.
 
 ## How to answer
 

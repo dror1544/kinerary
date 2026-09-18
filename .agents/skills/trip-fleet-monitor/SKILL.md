@@ -69,14 +69,20 @@ scaffolding would have hidden production's alerts.
 
 | tool | answers |
 |---|---|
-| `fleet_overview` | everything at a glance — trips by class and stage, jobs, failed notifications, unfinished interviews, unreachable trips, confirmed-but-never-built |
+| `fleet_overview` | everything at a glance — trips by class and stage, jobs, failed notifications, open interviews, what became of the interview links, unreachable trips, confirmed-but-never-built |
 | `list_trips` | trips with stage, reachability, idle time (`filter`: live, active, all, unreachable, ready) |
-| `trip_detail` | one trip end to end: sessions, jobs, failing steps with error codes, notifications, Telegram bindings, linked people |
-| `failures` | failed/stuck jobs, failed notifications, unreachable trips in a window — each tagged with trip class |
-| `stalled_interviews` | interviews idle beyond a threshold, and what they wait on |
-| `statistics` | funnel, completion rate, build success rate, median interview and build durations |
+| `trip_detail` | one trip end to end: its site URL, sessions with document provenance, every interview link and whether it was opened, how the interview's model calls went, jobs with error codes, notifications, Telegram bindings, linked people |
+| `failures` | failed jobs, jobs in flight over an hour, failed notifications, unreachable trips in a window — each tagged with trip class |
+| `stalled_interviews` | interviews **still open** and idle beyond a threshold, and what they wait on |
+| `statistics` | funnel including how many links were opened, completion rate, model success rate inside the interview, build success rate, median interview and build durations |
 | `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible. Byte-stable while nothing changes: each incident says when it started (UTC), never how long ago, and rows are sorted |
-| `stacks` | which stacks exist, which is production, where config came from, live connectivity |
+| `stacks` | which stacks exist, which is production, where config came from, the schema version each has applied, live connectivity |
+
+`tests/scripts/test_fleet_mcp.py` runs the whole catalogue against a stand-in
+psql and asserts the properties that are easy to lose in an edit: no tool takes
+SQL, no query reads a document's text or the column holding the site password,
+alerts select nothing derived from `now()`, and every live-interview query
+excludes the sessions that have already closed.
 
 Every tool also runs from a shell, which is how the schedules avoid paying for a
 model: `fleet-mcp.mjs --tool alerts [--stack <name>]`. Same handler the agent
@@ -190,12 +196,51 @@ first report named the organizer, because `trip_detail` handed the name over.
 People are now reported as roles and counts. What the tool never returns, the
 agent cannot leak.
 
+## What the monitor can see of a trip's life, and what it deliberately cannot
+
+The database records a trip's **lifecycle** in detail and its **use** barely at
+all, and the difference decides which questions this tool can answer:
+
+- **The site's address** is not a column on `trips`. It is in `jobs.result` on
+  the build that succeeded, which is also where the portal reads it. The same
+  URL sits in `trips.companion_intro` — beside the site's shared login password
+  in plain text, which is why nothing here reads that column.
+- **An uploaded document** shows up as provenance only: one per session (a later
+  upload overwrites the earlier one, and a batch keeps only the first filename),
+  reported as extension, size and time. A filename can carry a family's name, so
+  only the extension is returned, never the name and never the text. Files that
+  could not be read leave no row at all — only a log line.
+- **Interview links** say which of two silences a `draft` trip is in: a link
+  nobody opened, or no link at all.
+- **Model failures inside the interview** are visible only in
+  `interview_interpretations.failure_reason`. The organizer never sees an error
+  — the router quietly asks its own question instead — so a run of these is
+  invisible in the conversation and in every other table.
+- **What anyone does on the built site** is not here. Plan edits, logins and
+  companion chat all live in each trip's own database and in Hermes, and none of
+  it is reported back. "The site is up" is the last thing this monitor knows.
+
 ## Schema facts that produced wrong answers
 
 - **Chat ids are TEXT** — `telegram_chat_bindings.chat_id`,
   `messaging_bindings.chat_ref`, `telegram_interview_bindings.chat_id`,
   `interview_agent_turns.chat_id`. `chat_id < 0` is a type error; a group is
   `chat_id LIKE '-%'`.
+- **A closed interview still says `state = 'interviewing'`.** Closing a
+  conversation for idleness sets `expired_at` and touches nothing else
+  (migration 0049), so state alone reports conversations that ended days ago as
+  live. On production this filled `stalled_interviews` with six finished
+  sessions — one of them a real prospect's — and it is exactly the kind of row
+  `alerts` would have repeated forever. Every query about a live interview
+  therefore carries `expired_at IS NULL`, the same definition `resolveChatRoute`
+  uses.
+- **`completed` is not a job state.** The seven are queued, leased, running,
+  waiting, succeeded, failed, cancelled. `failures` excluded 'completed', which
+  excluded nothing, so every queued or running build was listed as failed or
+  stuck. It now names failed and cancelled outright, plus anything in flight for
+  more than an hour.
+- **Nothing writes `job_steps`.** An empty "unfinished job steps" is the absence
+  of a record, not a clean build, and the section says so.
 - **A confirmed session keeps `phase = recap` and `awaiting = machine`
   forever.** Every confirmed session reads that way. It is what
   a finished interview looks like; the monitor once reported it as "a summary

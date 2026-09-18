@@ -39,7 +39,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "kinerary-fleet";
-const SERVER_VERSION = "2.0.0";
+const SERVER_VERSION = "2.1.0";
 
 /** psql field separator: unit separator, which cannot occur in these columns. */
 const SEP = "\x1f";
@@ -244,8 +244,14 @@ function buildArgv(name) {
  *   retired     torn down deliberately; failures here are expected
  *   scaffolding created by a test harness
  *
- * The slug is promoted at provisioning, so `draft-sreq-…` means only "never
- * built". An earlier version of this file called that class `unnamed_draft` and
+ * The slug is promoted at provisioning, so a slug still carrying the `draft-`
+ * placeholder means only "never built". The test is the placeholder itself
+ * rather than `draft-sreq-` specifically: the control plane mints
+ * `draft-<signup request>` from a signup and `draft-<trip id>` from the portal
+ * and from an operator's invitation, and matching only the first shape would
+ * class the others as live — a never-built trip counted among the real ones,
+ * and alerted on. An earlier version of this file called that class
+ * `unnamed_draft` and
  * described it as "never reached an interview", which was wrong: on 2026-09-16
  * two of them sat at `intake_confirmed`, five days after a person finished
  * answering. That is the opposite of noise, and the wording would have taught
@@ -264,11 +270,44 @@ const DEFAULT_TRIP_CLASS_SQL = `
   CASE
     WHEN t.slug LIKE 'retired-%' THEN 'retired'
     WHEN t.slug LIKE 'cpvm-%' OR t.slug LIKE 'zzcpvm%' THEN 'scaffolding'
-    WHEN t.slug LIKE 'draft-sreq-%' THEN 'prospect'
+    WHEN t.slug LIKE 'draft-%' THEN 'prospect'
     ELSE 'live'
   END`;
 
 const tripClassSql = (stack) => CONFIG.stacks[stack]?.trip_class_sql ?? DEFAULT_TRIP_CLASS_SQL;
+
+/**
+ * An interview that is still going — which `state` alone does NOT say.
+ *
+ * When a conversation is closed for idleness the control plane sets
+ * `expired_at` and leaves `state` at 'interviewing' (migration 0049,
+ * `claimExpiredSessions`). Every query here used to filter on state alone, so a
+ * conversation closed days ago still counted as live: it inflated the
+ * unfinished-interview counts, it sat in `stalled_interviews` for good, and —
+ * the one that actually costs something — `alerts` kept reporting "INTERVIEW
+ * WAITING ON US" about a session nobody was waiting on, which is how a reader
+ * learns to stop reading alerts.
+ *
+ * The router draws the same distinction, for the same reason
+ * (`resolveChatRoute`): live means not confirmed AND not closed for idleness.
+ */
+const LIVE_SESSION = "s.state = 'interviewing' AND s.expired_at IS NULL";
+
+/**
+ * The site's address, as the build that succeeded recorded it.
+ *
+ * It is NOT a column on `trips`. The provisioner writes `{"private_url": …}`
+ * into `jobs.result`, and the portal already reads it from there. That column
+ * carries the canonical-safety CHECK, so it cannot hold a secret — unlike
+ * `trips.companion_intro`, which holds the same URL beside the site's shared
+ * login password in plain text. Read that one and the monitor would be one
+ * `trip_detail` away from printing a live password into Telegram.
+ */
+const SITE_URL_SQL = `
+  (SELECT j.result->>'private_url'
+     FROM control_plane.jobs j
+    WHERE j.trip_id = t.id AND j.state = 'succeeded' AND j.result ? 'private_url'
+    ORDER BY j.created_at DESC LIMIT 1)`;
 
 /** Run one read-only script against a stack and return rows as string arrays. */
 function runSql(stackName, sql) {
@@ -331,7 +370,7 @@ const header = (stack) => `Stack: ${stackLabel(stack)}${isProduction(stack) ? " 
 /* ---------------------------------------------------------------- tools --- */
 
 async function fleetOverview({ stack = CONFIG.defaultStack }) {
-  const [stages, jobs, notifications, stalled, unreachable, stuck] = await Promise.all([
+  const [stages, jobs, notifications, stalled, unreachable, stuck, links] = await Promise.all([
     runSql(stack, `SELECT ${tripClassSql(stack)}, t.lifecycle_state, count(*)
                      FROM control_plane.trips t GROUP BY 1,2 ORDER BY 1,2;`),
     runSql(stack, `SELECT j.job_type, j.state, count(*) FROM control_plane.jobs j GROUP BY 1,2 ORDER BY 1,2;`),
@@ -343,7 +382,7 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
                           round(max(extract(epoch from (now() - s.updated_at)) / 3600))
                      FROM control_plane.intake_sessions s
                      JOIN control_plane.trips t ON t.id = s.trip_id
-                    WHERE s.state = 'interviewing' GROUP BY 1 ORDER BY 1;`),
+                    WHERE ${LIVE_SESSION} GROUP BY 1 ORDER BY 1;`),
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason, '-')
                      FROM control_plane.trips t
                     WHERE t.reachability = 'unreachable' AND t.slug NOT LIKE 'retired-%'
@@ -358,6 +397,19 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
                       AND t.slug NOT LIKE 'retired-%'
                       AND NOT EXISTS (SELECT 1 FROM control_plane.jobs j WHERE j.trip_id = t.id)
                     ORDER BY t.updated_at;`),
+    // What happened to the interview links themselves. A link that was issued
+    // and never opened is invisible everywhere else in this file: the trip sits
+    // at 'draft' looking like someone who has not got round to it, whether they
+    // never received the link at all or tapped it and hit a refusal.
+    runSql(stack, `SELECT ${tripClassSql(stack)},
+                          CASE WHEN e.state = 'consumed' THEN 'opened'
+                               WHEN e.state = 'revoked' THEN 'revoked'
+                               WHEN e.expires_at < now() THEN 'expired unopened'
+                               ELSE 'waiting to be opened' END,
+                          count(*)
+                     FROM control_plane.interview_enrollments e
+                     JOIN control_plane.trips t ON t.id = e.trip_id
+                    GROUP BY 1,2 ORDER BY 1,2;`),
   ]);
 
   const liveStages = stages.filter((r) => r[0] === "live");
@@ -381,8 +433,11 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
     "FAILED NOTIFICATIONS (by trip class — only 'live' deserves attention)",
     asTable(notifications, ["class", "kind", "state", "count"]),
     "",
-    "UNFINISHED INTERVIEWS (by trip class, with the longest idle time in hours)",
+    "UNFINISHED INTERVIEWS (still open — closed-for-idleness sessions are not counted here)",
     asTable(stalled, ["class", "count", "max_idle_hours"]),
+    "",
+    "INTERVIEW LINKS",
+    asTable(links, ["class", "what happened", "count"]),
     "",
     "UNREACHABLE TRIPS (excluding retired)",
     asTable(unreachable, ["slug", "reason"]),
@@ -420,23 +475,41 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
   const ref = safeRef(trip);
   const match = `(t.id = '${ref}' OR t.slug = '${ref}')`;
 
-  const [head, session, jobs, steps, notifications, bindings, people] = await Promise.all([
+  const [head, session, jobs, steps, notifications, bindings, people, enrollments, models] = await Promise.all([
     runSql(stack, `SELECT t.id, t.slug, ${tripClassSql(stack)}, t.lifecycle_state, coalesce(t.reachability,'-'),
                           coalesce(t.unreachable_reason,'-'), coalesce(t.title,'-'), coalesce(t.destination_label,'-'),
                           coalesce(to_char(t.start_date,'YYYY-MM-DD'),'-'), coalesce(to_char(t.end_date,'YYYY-MM-DD'),'-'),
-                          to_char(t.created_at,'YYYY-MM-DD HH24:MI')
+                          to_char(t.created_at,'YYYY-MM-DD HH24:MI'),
+                          coalesce(${SITE_URL_SQL}, 'not built yet')
                      FROM control_plane.trips t WHERE ${match};`),
     // `awaiting` means something only while a session is interviewing. A
     // confirmed session keeps its last value — all 33 confirmed sessions in
     // production read recap/machine — and the first real report took that for
     // "a summary the system owes the organizer, 16 hours late". Finished
     // sessions say finished.
-    runSql(stack, `SELECT s.id, s.state, coalesce(s.phase,'-'),
-                          CASE WHEN s.state = 'interviewing' THEN coalesce(s.awaiting,'-') ELSE 'finished' END,
+    // `expired_at` is reported as a state of its own, because 'interviewing'
+    // outlives the conversation: a session closed for idleness keeps that state
+    // and its last `awaiting` value forever.
+    runSql(stack, `SELECT s.id,
+                          CASE WHEN s.state = 'interviewing' AND s.expired_at IS NOT NULL
+                               THEN 'closed (idle)' ELSE s.state END,
+                          coalesce(s.phase,'-'),
+                          CASE WHEN ${LIVE_SESSION} THEN coalesce(s.awaiting,'-') ELSE 'finished' END,
                           coalesce(s.language,'-'), s.interpret_path, to_char(s.updated_at,'MM-DD HH24:MI'),
-                          CASE WHEN s.state = 'interviewing'
+                          CASE WHEN ${LIVE_SESSION}
                                THEN round(extract(epoch from (now() - s.updated_at))/3600) || 'h idle'
-                               ELSE '-' END
+                               ELSE '-' END,
+                          -- Provenance of an uploaded document, never its content.
+                          -- One document per session: a later upload overwrites
+                          -- the earlier one, and only the first filename of a
+                          -- batch survives. The name itself can carry a family's
+                          -- name, so only the extension is reported; 200000
+                          -- characters exactly means the text was truncated.
+                          CASE WHEN s.source_document IS NULL THEN 'none'
+                               ELSE coalesce(upper(substring(s.source_document->>'filename' from '[^.]*$')), '?')
+                                    || ' ' || coalesce(char_length(s.source_document->>'text')::text, '0') || ' chars'
+                                    || CASE WHEN char_length(s.source_document->>'text') >= 200000 THEN ' (truncated)' ELSE '' END
+                                    || ' at ' || coalesce(left(s.source_document->>'savedAt', 16), '?') END
                      FROM control_plane.intake_sessions s JOIN control_plane.trips t ON t.id = s.trip_id
                     WHERE ${match} ORDER BY s.created_at DESC;`),
     runSql(stack, `SELECT j.id, j.job_type, j.state, j.attempt || '/' || j.max_attempts, coalesce(j.safe_error_code,'-'),
@@ -470,6 +543,29 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
     runSql(stack, `SELECT coalesce(l.role,'-'), coalesce(l.verified_via,'-'), count(*)::text
                      FROM control_plane.trip_person_links l JOIN control_plane.trips t ON t.id = l.trip_id
                     WHERE ${match} GROUP BY 1,2 ORDER BY 1;`),
+    // Was a link ever issued, and did anyone open it? A trip sitting at 'draft'
+    // says nothing about which of those two it is waiting on. The token itself
+    // is stored only as a digest and is not selected here in any form.
+    runSql(stack, `SELECT CASE WHEN e.state = 'consumed' THEN 'opened'
+                               WHEN e.state = 'revoked' THEN 'revoked'
+                               WHEN e.expires_at < now() THEN 'expired unopened'
+                               ELSE 'waiting to be opened' END,
+                          to_char(e.created_at,'MM-DD HH24:MI'),
+                          coalesce(to_char(e.consumed_at,'MM-DD HH24:MI'),'-'),
+                          to_char(e.expires_at,'MM-DD HH24:MI')
+                     FROM control_plane.interview_enrollments e JOIN control_plane.trips t ON t.id = e.trip_id
+                    WHERE ${match} ORDER BY e.created_at DESC LIMIT 10;`),
+    // The only record in this database that a model call failed. The organizer
+    // sees a fallback question rather than an error, so a run of these is
+    // invisible from the conversation and from every other table here.
+    // Reasons come from model-runner.ts: NOT_CONFIGURED, RATE_LIMITED,
+    // TIMED_OUT, UPSTREAM_ERROR, UNAUTHORIZED, BAD_OUTPUT, FAILED.
+    runSql(stack, `SELECT coalesce(i.failure_reason,'succeeded'), count(*)::text,
+                          to_char(max(i.created_at),'MM-DD HH24:MI')
+                     FROM control_plane.interview_interpretations i
+                     JOIN control_plane.intake_sessions s ON s.id = i.session_id
+                     JOIN control_plane.trips t ON t.id = s.trip_id
+                    WHERE ${match} GROUP BY 1 ORDER BY 1;`),
   ]);
 
   if (head.length === 0) return `No trip matching '${ref}' on ${stack}.`;
@@ -481,14 +577,23 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
     `  slug ${h[1]}   class ${h[2]}   stage ${h[3]}`,
     `  reachability ${h[4]}${h[5] === "-" ? "" : ` (${h[5]})`}`,
     `  ${h[6]} — ${h[7]}   ${h[8]} → ${h[9]}   created ${h[10]}`,
+    `  site ${h[11]}`,
     "",
-    "INTERVIEW SESSIONS",
-    asTable(session, ["session", "state", "phase", "awaiting", "lang", "interpret", "updated", "idle"]),
+    "INTERVIEW SESSIONS  (document column is provenance only — never its contents)",
+    asTable(session, ["session", "state", "phase", "awaiting", "lang", "interpret", "updated", "idle", "document"]),
+    "",
+    "INTERVIEW LINKS  (a link nobody opened looks exactly like a person who has not started)",
+    asTable(enrollments, ["what happened", "issued", "opened", "expires"]),
+    "",
+    "MODEL CALLS IN THE INTERVIEW  (failures the organizer never sees as errors)",
+    asTable(models, ["outcome", "count", "last"]),
     "",
     "JOBS",
     asTable(jobs, ["job", "type", "state", "attempt", "error", "created", "took"]),
     "",
-    "UNFINISHED JOB STEPS",
+    // Nothing writes job_steps on this schema, so "(none)" here is not evidence
+    // that the build's steps went well — it is evidence of nothing at all.
+    "UNFINISHED JOB STEPS  (nothing writes job_steps yet — empty means unrecorded, not healthy)",
     asTable(steps, ["step", "state", "error", "updated"]),
     "",
     "NOTIFICATIONS",
@@ -505,10 +610,18 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
 async function failures({ stack = CONFIG.defaultStack, days = 7 }) {
   const d = clamp(days, 1, 180, 7);
   const [jobs, notifications, unreachable] = await Promise.all([
+    // Failed, gave up, or in flight for over an hour. It used to be
+    // `NOT IN ('succeeded','completed')` — and 'completed' is not one of the
+    // seven job states, so the exclusion did nothing and every queued or
+    // running build was listed under FAILED / STUCK while it was working
+    // perfectly. `safe_error_code` is only set once the retries are exhausted,
+    // so a job that is still retrying shows '-' rather than a cause.
     runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, j.job_type, j.state, coalesce(j.safe_error_code,'-'),
                           j.attempt || '/' || j.max_attempts, to_char(j.updated_at,'MM-DD HH24:MI')
                      FROM control_plane.jobs j JOIN control_plane.trips t ON t.id = j.trip_id
-                    WHERE j.state NOT IN ('succeeded','completed')
+                    WHERE (j.state IN ('failed','cancelled')
+                           OR (j.state IN ('queued','leased','running','waiting')
+                               AND j.created_at < now() - interval '1 hour'))
                       AND j.updated_at > now() - interval '${d} days'
                     ORDER BY j.updated_at DESC;`),
     runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, coalesce(n.kind, n.notification_type), n.state,
@@ -546,7 +659,7 @@ async function stalledInterviews({ stack = CONFIG.defaultStack, hours = 6 }) {
                 WHEN s.expires_at < now() THEN 'EXPIRED'
                 ELSE 'expires ' || to_char(s.expires_at,'MM-DD HH24:MI') END
       FROM control_plane.intake_sessions s JOIN control_plane.trips t ON t.id = s.trip_id
-     WHERE s.state = 'interviewing' AND s.updated_at < now() - interval '${h} hours'
+     WHERE ${LIVE_SESSION} AND s.updated_at < now() - interval '${h} hours'
      ORDER BY s.updated_at;`);
 
   return [
@@ -554,6 +667,8 @@ async function stalledInterviews({ stack = CONFIG.defaultStack, hours = 6 }) {
     "",
     "An interview 'awaiting person' is waiting on the organizer — normal for a while, abandoned eventually.",
     "'awaiting machine' for hours is the interesting one: the interview is waiting on US.",
+    "Conversations the control plane has already closed for idleness are not listed: they are over,",
+    "and the organizer was told they need a fresh link to carry on.",
     "",
     asTable(rows, ["slug", "class", "phase", "awaiting", "lang", "idle", "expiry"]),
   ].join("\n");
@@ -563,13 +678,26 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
   const d = clamp(days, 1, 365, 30);
   const since = `now() - interval '${d} days'`;
 
-  const [funnel, builds, durations, classes] = await Promise.all([
+  const [funnel, builds, durations, classes, models] = await Promise.all([
     runSql(stack, `
       SELECT 'trips created', count(*)::text FROM control_plane.trips WHERE created_at > ${since}
+      UNION ALL SELECT 'interview links issued', count(*)::text FROM control_plane.interview_enrollments
+                WHERE created_at > ${since}
+      UNION ALL SELECT 'links opened', count(*)::text FROM control_plane.interview_enrollments
+                WHERE state = 'consumed' AND created_at > ${since}
+      UNION ALL SELECT 'links that expired unopened', count(*)::text FROM control_plane.interview_enrollments
+                WHERE state <> 'consumed' AND expires_at < now() AND created_at > ${since}
       UNION ALL SELECT 'interviews started', count(*)::text FROM control_plane.intake_sessions WHERE created_at > ${since}
+      UNION ALL SELECT 'a document was sent in', count(*)::text FROM control_plane.intake_sessions
+                WHERE source_document IS NOT NULL AND created_at > ${since}
       UNION ALL SELECT 'interviews confirmed', count(*)::text FROM control_plane.intake_sessions
                 WHERE state = 'confirmed' AND updated_at > ${since}
-      UNION ALL SELECT 'still interviewing', count(*)::text FROM control_plane.intake_sessions WHERE state = 'interviewing'
+      -- Not time-limited, and deliberately: this one answers "how many
+      -- conversations are open right now", which a window would distort.
+      UNION ALL SELECT 'open right now', count(*)::text FROM control_plane.intake_sessions s
+                WHERE ${LIVE_SESSION}
+      UNION ALL SELECT 'closed for idleness', count(*)::text FROM control_plane.intake_sessions
+                WHERE expired_at IS NOT NULL AND expired_at > ${since}
       UNION ALL SELECT 'trips reaching ready', count(*)::text FROM control_plane.trips
                 WHERE lifecycle_state IN ('ready_private','ready_public') AND updated_at > ${since};`),
     runSql(stack, `SELECT j.state, count(*)::text FROM control_plane.jobs j
@@ -589,11 +717,21 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
         FROM control_plane.intake_sessions s WHERE s.state = 'confirmed' AND s.created_at > ${since};`),
     runSql(stack, `SELECT ${tripClassSql(stack)}, count(*)::text FROM control_plane.trips t
                     WHERE t.created_at > ${since} GROUP BY 1 ORDER BY 1;`),
+    // How the interview's own model calls are going. A high failure share means
+    // the router is falling back to its own questions — an interview that still
+    // completes, worse, with nothing in the conversation saying so.
+    runSql(stack, `SELECT coalesce(failure_reason,'succeeded'), count(*)::text
+                     FROM control_plane.interview_interpretations
+                    WHERE created_at > ${since} GROUP BY 1 ORDER BY 2 DESC;`),
   ]);
 
   const value = (rows, key) => rows.find((r) => r[0] === key)?.[1] ?? "0";
   const started = Number(value(funnel, "interviews started"));
   const confirmed = Number(value(funnel, "interviews confirmed"));
+  const issued = Number(value(funnel, "interview links issued"));
+  const opened = Number(value(funnel, "links opened"));
+  const modelOk = Number(models.find((r) => r[0] === "succeeded")?.[1] ?? 0);
+  const modelBad = models.filter((r) => r[0] !== "succeeded").reduce((n, r) => n + Number(r[1]), 0);
   const ok = Number(builds.find((r) => r[0] === "succeeded")?.[1] ?? 0);
   const bad = builds.filter((r) => r[0] !== "succeeded").reduce((n, r) => n + Number(r[1]), 0);
   const pct = (a, b) => (b > 0 ? `${Math.round((a / b) * 100)}%` : "n/a");
@@ -603,7 +741,11 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
     "",
     "FUNNEL",
     asTable(funnel, ["step", "count"]),
-    `  interview completion rate: ${pct(confirmed, started)}`,
+    `  links opened: ${pct(opened, issued)}   interview completion rate: ${pct(confirmed, started)}`,
+    "",
+    "INTERVIEW MODEL CALLS  (a failure is invisible to the organizer — the router just asks its own question)",
+    asTable(models, ["outcome", "count"]),
+    `  model success rate: ${pct(modelOk, modelOk + modelBad)}`,
     "",
     "TRIPS CREATED, BY CLASS  (retired/scaffolding are test runs, not customers)",
     asTable(classes, ["class", "count"]),
@@ -639,7 +781,7 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
   const h = clamp(hours, 1, 240, 1);
   const real = `${tripClassSql(stack)} IN ('live','prospect')`;
 
-  const [unreachable, jobs, notifications, stuck, awaiting, companionless] = await Promise.all([
+  const [unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
                     WHERE t.reachability = 'unreachable' AND ${real}
@@ -667,7 +809,7 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
     runSql(stack, `SELECT t.slug, coalesce(s.phase,'-'),
                           to_char(s.awaiting_since AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
                      FROM control_plane.intake_sessions s JOIN control_plane.trips t ON t.id = s.trip_id
-                    WHERE s.state = 'interviewing' AND s.awaiting = 'machine'
+                    WHERE ${LIVE_SESSION} AND s.awaiting = 'machine'
                       AND s.awaiting_since < now() - interval '${h} hours' AND ${real}
                     ORDER BY t.slug, s.id;`),
     // Built, but the organizer has no open private chat — a site with no
@@ -681,6 +823,21 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
                                        WHERE b.trip_id = t.id AND b.closed_at IS NULL
                                          AND b.chat_id NOT LIKE '-%')
                     ORDER BY t.slug;`),
+    // A live interview whose model calls are failing. Nothing else here would
+    // show it: the router covers for a failed call by asking its own question,
+    // so the conversation carries on, the session keeps moving, and the person
+    // gets a blunter interview than they should with no error anywhere.
+    // DISTINCT on (slug, reason) and no count: while the same failure keeps
+    // happening these bytes do not change, so the watchdog stays quiet after
+    // saying it once.
+    runSql(stack, `SELECT DISTINCT t.slug, i.failure_reason
+                     FROM control_plane.interview_interpretations i
+                     JOIN control_plane.intake_sessions s ON s.id = i.session_id
+                     JOIN control_plane.trips t ON t.id = s.trip_id
+                    WHERE i.failure_reason IS NOT NULL
+                      AND i.created_at > now() - interval '${h} hours'
+                      AND ${LIVE_SESSION} AND ${real}
+                    ORDER BY t.slug, i.failure_reason;`),
   ]);
 
   const sections = [];
@@ -692,6 +849,7 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
   add("FAILED JOBS", jobs, (r) => `${r[0]} — ${r[1]} ${r[2]} (attempt ${r[3]})`);
   add("CONFIRMED BUT NEVER BUILT", stuck, (r) => `${r[0]} — ${r[1]}, confirmed ${r[2]}`);
   add("INTERVIEW WAITING ON US", awaiting, (r) => `${r[0]} — phase ${r[1]}, waiting on us since ${r[2]}`);
+  add("MODEL FAILING MID-INTERVIEW", modelFailing, (r) => `${r[0]} — ${r[1]}`);
   add("UNDELIVERED NOTIFICATIONS", notifications, (r) => `${r[0]} — ${r[1]} (attempt ${r[2]})`);
 
   if (sections.length === 0) return "";
@@ -710,15 +868,27 @@ async function stacksTool() {
   ];
   for (const name of Object.keys(CONFIG.stacks)) {
     let reachable;
+    let schema = "";
     try {
       const rows = await runSql(name, "SELECT count(*)::text FROM control_plane.trips;");
       reachable = `reachable — ${rows[0]?.[0] ?? "?"} trips`;
+      // Which migrations this stack has applied. Two stacks running different
+      // code answer the same question differently, and a column this file
+      // queries may simply not exist on the older one — which surfaces as a
+      // failed tool rather than as "that stack is behind" unless it is asked.
+      const version = await runSql(
+        name,
+        "SELECT max(version), count(*)::text FROM public.control_plane_schema_migrations;",
+      );
+      const [latest, applied] = version[0] ?? [];
+      if (latest) schema = `schema ${latest} (${applied} applied)`;
     } catch (error) {
       reachable = `UNREACHABLE — ${error.message.split("\n")[0]}`;
     }
     lines.push(`  ${name}${isProduction(name) ? "  [PRODUCTION]" : "  [not production]"}`);
     lines.push(`    ${stackLabel(name)}`);
     lines.push(`    ${reachable}`);
+    if (schema) lines.push(`    ${schema}`);
   }
   lines.push("", "Only a stack marked [PRODUCTION] describes real travellers. Never merge the numbers.");
   return lines.join("\n");
@@ -736,7 +906,7 @@ const TOOLS = [
   {
     name: "fleet_overview",
     description:
-      "The whole fleet at a glance: trips by stage split into live / prospect / retired / scaffolding, provisioning jobs, failed notifications, unfinished interviews, unreachable trips and trips confirmed but never built. Start here.",
+      "The whole fleet at a glance: trips by stage split into live / prospect / retired / scaffolding, provisioning jobs, failed notifications, open interviews, what happened to the interview links, unreachable trips and trips confirmed but never built. Start here.",
     inputSchema: { type: "object", properties: { stack: STACK_ARG } },
     handler: fleetOverview,
   },
@@ -756,7 +926,7 @@ const TOOLS = [
   {
     name: "trip_detail",
     description:
-      "Everything about one trip by id or slug: stage, reachability and reason, interview sessions with phase/awaiting/idle, jobs and failed steps with error codes, notifications, Telegram bindings (private chat and family group) and linked people.",
+      "Everything about one trip by id or slug: its site URL, stage, reachability and reason, interview sessions with phase/awaiting/idle and whether a document was sent in, what happened to each interview link, how the interview's model calls went, jobs with error codes, notifications, Telegram bindings (private chat and family group) and linked people.",
     inputSchema: {
       type: "object",
       properties: { stack: STACK_ARG, trip: { type: "string", description: "Trip id (trip_…) or slug" } },
@@ -778,14 +948,14 @@ const TOOLS = [
   },
   {
     name: "statistics",
-    description: "Funnel and health numbers over a window: trips created by class, interview completion rate, provisioning success rate, median interview and build durations.",
+    description: "Funnel and health numbers over a window: trips created by class, how many interview links were opened, interview completion rate, model success rate inside the interview, provisioning success rate, median interview and build durations.",
     inputSchema: { type: "object", properties: { stack: STACK_ARG, days: { type: "number", description: "Window in days (default 30)" } } },
     handler: statistics,
   },
   {
     name: "alerts",
     description:
-      "Only what is actionable right now for real (live/prospect) trips: unreachable trips, trips built with no organizer chat, failed jobs, confirmed-but-never-built, interviews waiting on us, undelivered notifications. Returns NOTHING when the fleet is healthy — use it to answer 'is anything wrong?'.",
+      "Only what is actionable right now for real (live/prospect) trips: unreachable trips, trips built with no organizer chat, failed jobs, confirmed-but-never-built, interviews waiting on us, model failures inside a live interview, undelivered notifications. Returns NOTHING when the fleet is healthy — use it to answer 'is anything wrong?'.",
     inputSchema: {
       type: "object",
       properties: { stack: STACK_ARG, hours: { type: "number", description: "How long an interview may wait on us before it counts (default 1h)" } },
@@ -794,7 +964,7 @@ const TOOLS = [
   },
   {
     name: "stacks",
-    description: "Which stacks are configured, which one is production, where the configuration came from, and a live connectivity check for each. Use when a read fails or when unsure which control plane a number came from.",
+    description: "Which stacks are configured, which one is production, where the configuration came from, the schema version each has applied, and a live connectivity check for each. Use when a read fails, when two stacks disagree, or when unsure which control plane a number came from.",
     inputSchema: { type: "object", properties: {} },
     handler: stacksTool,
   },
