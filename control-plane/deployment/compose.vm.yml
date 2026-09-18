@@ -155,7 +155,15 @@ services:
       NPM_SECRET: ${NPM_SECRET:-}
       CLOUDFLARE_ZONE_ID: ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # The relay's store and the trips' NFS directories, through ONE mount of
+      # the export: an original is hard-linked into <slug>/documents, and a
+      # hard link cannot cross mount points. REQUIRED — the worker refuses to
+      # start if the store is not the real volume (marker, writable, mounted).
+      DOCUMENT_STORE_DIR: /srv/kinerary-nfs/.kinerary-document-store
+      DOCUMENT_STORE_REQUIRED: "1"
+      PROVISIONER_TRIP_NFS_LOCAL_BASE: /srv/kinerary-nfs
     volumes:
+      - ${KINERARY_NFS_ROOT:?set KINERARY_NFS_ROOT in vm.env to the VM mount of the trips NFS export}:/srv/kinerary-nfs
       - ${KINERARY_DEPLOY_ROOT_HOST:-/opt/kinerary-deploy}:/deploy-root
       - ${KINERARY_REPO_HOST:-/opt/kinerary}:/repo:ro
       - /root/.ssh/id_ed25519_proxmox_hermes:/root/.ssh/id_ed25519_proxmox_hermes:ro
@@ -204,6 +212,28 @@ services:
       INTERPRET_MODEL: ${INTERPRET_MODEL:-}
       EXTRACT_RUNNER: ${EXTRACT_RUNNER:?EXTRACT_RUNNER must be set}
       EXTRACT_MODEL: ${EXTRACT_MODEL:-}
+      # The two document tasks default to codex gpt-5.6-luna, chosen by the
+      # 2026-09-13 benchmark: as accurate as claude-sonnet-5 on the golden
+      # fixtures (every stop, reference and place, 3 runs each) and on a real
+      # 4-page docket (31/31 checks against claude's 23–25), at ~16 s per document
+      # against ~70 s. Codex runs with its tools disabled; the relay refuses codex
+      # at startup if this codex does not know every isolation flag
+      # (relay.codex_isolation_unverified). Override per task in vm.env.
+      EXTRACT_INTAKE_RUNNER: ${EXTRACT_INTAKE_RUNNER:-codex}
+      EXTRACT_INTAKE_MODEL: ${EXTRACT_INTAKE_MODEL:-gpt-5.6-luna}
+      EXTRACT_ITINERARY_RUNNER: ${EXTRACT_ITINERARY_RUNNER:-codex}
+      EXTRACT_ITINERARY_MODEL: ${EXTRACT_ITINERARY_MODEL:-gpt-5.6-luna}
+      # Photos and scanned PDFs (document-vision.ts). Optional, and unset is the
+      # old behaviour: such a file is answered "could not read it". claude or
+      # openrouter only — codex was verified to drop an attached image.
+      VISION_RUNNER: ${VISION_RUNNER:-}
+      VISION_MODEL: ${VISION_MODEL:-}
+      # Uploaded originals, on the trips' NFS export (see
+      # docs/document-intake-operations.md). REQUIRED: the relay refuses to start
+      # unless this is a mounted, writable volume carrying the store's marker
+      # file, so originals can never land in the container's own filesystem.
+      DOCUMENT_STORE_DIR: /var/lib/kinerary/document-store
+      DOCUMENT_STORE_REQUIRED: "1"
       CODEX_HOME: /codex
       # Empty = api.telegram.org. The e2e runner's automated organizer points it
       # at a loopback Telegram stand-in through vm-relay-restart.sh, and puts it
@@ -226,6 +256,9 @@ services:
     volumes:
       - /opt/agent-auth/codex:/codex
       - /opt/agent-auth/claude-config:/home/node/.claude-config
+      # KINERARY_NFS_ROOT is the VM's mount of the TrueNAS export the trips'
+      # directories live on (Proxmox sees it as /mnt/pve/truenas-nfs).
+      - ${KINERARY_NFS_ROOT:?set KINERARY_NFS_ROOT in vm.env to the VM mount of the trips NFS export}/.kinerary-document-store:/var/lib/kinerary/document-store
     secrets:
       - source: control_plane_database_url_host
         target: control_plane_database_url
