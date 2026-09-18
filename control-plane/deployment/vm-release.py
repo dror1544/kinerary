@@ -1716,21 +1716,32 @@ def switch_with_undo(cp: ControlPlane, undo: Sequence[Undo], switch_code: Callab
     except BaseException as failure:
         if not undo:  # nothing had been changed yet
             raise
-        problems = []
-        for entry in reversed(list(undo)):
-            try:
-                entry.put_back()
-            except Exception as error:  # noqa: BLE001 - every step is attempted, then all of them reported
-                problems.append(f"{entry.what} ({type(error).__name__}: {error}) — by hand: {entry.by_hand}")
-        if problems:
-            raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}) and undoing it did not finish: "
-                          + "; ".join(problems)) from failure
-        cp.r.note("the rollback was undone: the version, the database and Hermes from before it are back, "
-                  "and nothing was lost")
+        run_undo(cp, undo, failure,
+                 "the rollback was undone: the version, the database and Hermes from before it are back, "
+                 "and nothing was lost")
         if on_undone:
             on_undone()
         raise
     start_services()
+
+
+def run_undo(cp: ControlPlane, undo: Sequence[Undo], failure: BaseException, note: str) -> None:
+    """Put back everything in the journal, newest first.
+
+    Every entry is attempted even after one fails, because they are independent
+    and each one left undone is production left broken; the problems are then
+    reported together, each with the commands to finish it by hand.
+    """
+    problems = []
+    for entry in reversed(list(undo)):
+        try:
+            entry.put_back()
+        except Exception as error:  # noqa: BLE001 - collected, not raised, so the rest still run
+            problems.append(f"{entry.what} ({type(error).__name__}: {error}) — by hand: {entry.by_hand}")
+    if problems:
+        raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}) and undoing it did not finish: "
+                      + "; ".join(problems)) from failure
+    cp.r.note(note)
 
 
 def database_undo(cp: ControlPlane, swap: Swap) -> Undo:
@@ -1758,36 +1769,44 @@ def prepare_rollback(cp: ControlPlane, *, restore_db: bool, dump_dir: Optional[P
     each of them back. Returned newest last, which is the order they are undone
     in reverse."""
     undo: List[Undo] = []
-    if restore_db and dump_dir:
-        undo.append(database_undo(cp, restore_database_for_rollback(cp, dump_dir, pre_label)))
-    else:
-        cp.take_backup(pre_label, include_hermes=False)
-    if restore_hermes and dump_dir and hermes_changes:
-        undo.append(hermes_undo(cp, restore_hermes_data(cp, dump_dir)))
+    try:
+        if restore_db and dump_dir:
+            undo.append(database_undo(cp, restore_database_for_rollback(cp, dump_dir, pre_label)))
+        else:
+            cp.take_backup(pre_label, include_hermes=False)
+        if restore_hermes and dump_dir and hermes_changes:
+            # Registered BEFORE anything moves: from the `docker stop` onwards
+            # Hermes is down, and every path out of here has to bring it back.
+            aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{utcnow().strftime('%Y%m%dT%H%M%SZ')}")
+            undo.append(hermes_undo(cp, aside))
+            restore_hermes_data(cp, dump_dir, aside)
+    except BaseException as failure:
+        # A step that fails here is no different from one that fails during the
+        # switch: what this already changed goes back before the failure is
+        # reported. The database is swapped and its clients stopped before
+        # hermes-data is touched, so a tar that fails must not escape past it.
+        if undo:
+            run_undo(cp, undo, failure, "nothing was switched, and what this rollback had already changed is back")
+        raise
     return undo
 
 
-def restore_hermes_data(cp: ControlPlane, dump_dir: Path) -> Path:
+def restore_hermes_data(cp: ControlPlane, dump_dir: Path, aside: Path) -> None:
     """hermes-data from the upgrade's backup, keeping the CURRENT auth.json (refresh
-    tokens are single-use). The current directory goes back if the restore fails,
-    and the path it was kept at is returned so a failed SWITCH can put it back too
-    — Hermes is stopped from here until something starts it again.""" 
-    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-    aside = HERMES_DATA.with_name(f"{HERMES_DATA.name}.before-rollback-{stamp}")
+    tokens are single-use).
+
+    Hermes stops here and stays down until something starts it again, and the
+    live directory is kept at `aside`. Putting either back is `undo_hermes_data`,
+    which the caller registers before calling this — a failure in the middle of
+    it is recovered the same way as a failure after it.
+    """
     cp.sh.act(["docker", "stop", HERMES_CONTAINER], describe="docker stop hermes")
     cp.sh.act(["mv", str(HERMES_DATA), str(aside)], describe=f"keep current hermes-data at {aside}")
-    try:
-        cp.sh.act(["install", "-d", "-o", "10000", "-g", "10000", "-m", "0700", str(HERMES_DATA)], describe=f"recreate {HERMES_DATA}")
-        cp.sh.act(["tar", "-C", str(HERMES_DATA), "-xzf", str(dump_dir / "hermes-data.tar.gz")], describe="restore hermes-data from the upgrade's backup")
-        cp.sh.act(["cp", "-p", str(aside / "auth.json"), str(HERMES_DATA / "auth.json")],
-                  describe="carry the CURRENT auth.json across (refresh tokens are single-use)")
-        cp.sh.act(["chown", "-R", "10000:10000", str(HERMES_DATA)], describe="chown hermes-data to the hermes uid")
-    except BaseException:
-        if not cp.dry_run and aside.is_dir():
-            cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the half-restored hermes-data", check=False)
-            cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe="put the current hermes-data back", check=False)
-        raise
-    return aside
+    cp.sh.act(["install", "-d", "-o", "10000", "-g", "10000", "-m", "0700", str(HERMES_DATA)], describe=f"recreate {HERMES_DATA}")
+    cp.sh.act(["tar", "-C", str(HERMES_DATA), "-xzf", str(dump_dir / "hermes-data.tar.gz")], describe="restore hermes-data from the upgrade's backup")
+    cp.sh.act(["cp", "-p", str(aside / "auth.json"), str(HERMES_DATA / "auth.json")],
+              describe="carry the CURRENT auth.json across (refresh tokens are single-use)")
+    cp.sh.act(["chown", "-R", "10000:10000", str(HERMES_DATA)], describe="chown hermes-data to the hermes uid")
 
 
 def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
@@ -1797,10 +1816,14 @@ def undo_hermes_data(cp: ControlPlane, aside: Path) -> None:
     so the copy kept there is the live one, and what this removes came out of a
     backup that is still on disk."""
     if not cp.dry_run and not aside.is_dir():
-        raise Refused(f"{aside} is gone — hermes-data cannot be put back by this tool; "
-                      f"the backup it was restored from is in the rollback's dump directory")
-    cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the hermes-data this rollback restored")
-    cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe=f"put {aside.name} back as {HERMES_DATA.name}")
+        # Nothing was moved (or it is already back): the live directory is what
+        # it was, and all Hermes needs is to be started again.
+        if not HERMES_DATA.is_dir():
+            raise Refused(f"neither {HERMES_DATA} nor {aside} is there — Hermes cannot be started on a profile "
+                          "directory that is gone; restore it from the rollback's hermes-data.tar.gz")
+    else:
+        cp.sh.act(["rm", "-rf", str(HERMES_DATA)], describe="remove the hermes-data this rollback restored")
+        cp.sh.act(["mv", str(aside), str(HERMES_DATA)], describe=f"put {aside.name} back as {HERMES_DATA.name}")
     cp.sh.act(cp.compose("up", "-d", "--wait", "hermes"),
               describe="compose up -d hermes  (companions and site AI features come back)", timeout=900)
 

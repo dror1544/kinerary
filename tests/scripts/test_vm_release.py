@@ -23,6 +23,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -759,8 +760,19 @@ class RollbackPreparation(unittest.TestCase):
             self.sh = self
             self.dry_run = False
 
+        fail_on = None
+
         def act(self, argv, *, describe="", **kwargs):  # stands in for cp.sh
-            self.calls.append(" ".join(str(a) for a in argv))
+            argv = [str(a) for a in argv]
+            self.calls.append(" ".join(argv))
+            if self.fail_on and self.fail_on in argv:
+                raise vr.Refused(f"{self.fail_on} failed")
+            # The directory moves happen for real, so what the recovery path sees
+            # is what it would see on the VM: hermes-data gone from its place.
+            if argv[0] == "mv":
+                os.replace(argv[1], argv[2])
+            if argv[:2] == ["rm", "-rf"]:
+                shutil.rmtree(argv[2], ignore_errors=True)
             return subprocess.CompletedProcess(list(argv), 0, b"", b"")
 
         def prepare_restored_database(self, dump_dir, stamp):
@@ -803,7 +815,7 @@ class RollbackPreparation(unittest.TestCase):
                          "no database was replaced, but hermes-data was")
         self.assertIn("backup:lbl", cp.calls)
         aside = self.aside_from(cp.calls)
-        aside.mkdir()  # the stub recorded the mv instead of doing it
+        self.assertTrue(aside.is_dir(), "the live hermes-data was kept")
 
         cp.calls.clear()
         with self.assertRaises(vr.Refused):
@@ -819,7 +831,6 @@ class RollbackPreparation(unittest.TestCase):
         undo = vr.prepare_rollback(cp, restore_db=True, dump_dir=Path("/d"), pre_label="lbl",
                                    restore_hermes=True, hermes_changes=True)
         self.assertEqual([entry.what for entry in undo], ["the database", "Hermes's data"])
-        self.aside_from(cp.calls).mkdir()
 
         cp.calls.clear()
         with self.assertRaises(vr.Refused):
@@ -835,11 +846,38 @@ class RollbackPreparation(unittest.TestCase):
         self.assertEqual(undo, [])
         self.assertEqual(cp.calls, ["backup:lbl"], "only the pre-rollback backup")
 
-    def test_the_hermes_undo_refuses_when_the_copy_it_kept_is_gone(self):
+    def test_preparing_hermes_badly_undoes_the_database_swap_it_already_did(self):
+        """The database is swapped and its clients stopped BEFORE hermes-data is
+        touched. A tar that fails there used to escape with the swap in place:
+        the old code stopped, against the restored database, with Hermes down."""
         cp = self.Stub()
+        cp.fail_on = "tar"
+        with self.assertRaises(vr.Refused) as refused:
+            vr.prepare_rollback(cp, restore_db=True, dump_dir=Path("/d"), pre_label="lbl",
+                                restore_hermes=True, hermes_changes=True)
+        self.assertIn("tar failed", str(refused.exception))
+        aside = self.aside_from(cp.calls)
+        self.assertEqual(cp.calls[-5:],
+                         [f"rm -rf {vr.HERMES_DATA}", f"mv {aside} {vr.HERMES_DATA}",
+                          " ".join(cp.compose("up", "-d", "--wait", "hermes")),
+                          "undo-swap:aside_db", "start-clients"],
+                         "hermes-data goes back and Hermes starts, then the database swap is undone")
+        self.assertTrue(vr.HERMES_DATA.is_dir(), "the live hermes-data is where it belongs again")
+
+    def test_the_hermes_undo_starts_hermes_when_there_is_nothing_to_move_back(self):
+        # Registered before the move, so it also covers a stop that never got
+        # as far as moving anything: Hermes is down and must come back.
+        cp = self.Stub()
+        vr.undo_hermes_data(cp, self.tmp / "hermes-data.before-rollback-never")
+        self.assertEqual(cp.calls, [" ".join(cp.compose("up", "-d", "--wait", "hermes"))])
+
+    def test_the_hermes_undo_refuses_when_hermes_data_itself_is_gone(self):
+        cp = self.Stub()
+        shutil.rmtree(vr.HERMES_DATA)
         with self.assertRaises(vr.Refused) as refused:
             vr.undo_hermes_data(cp, self.tmp / "hermes-data.before-rollback-never")
         self.assertIn("before-rollback-never", str(refused.exception))
+        self.assertFalse(cp.calls, "Hermes is not started on a missing profile directory")
 
     def test_each_step_says_how_to_finish_it_by_hand(self):
         cp = self.Stub()
