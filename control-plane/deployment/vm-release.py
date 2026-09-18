@@ -58,6 +58,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -568,6 +569,25 @@ class Requests:
             raise GateRefusal("bad request id")
         return self.directory / f"{request_id}.json"
 
+    @contextmanager
+    def _lock(self, request_id: str):
+        """Serialize a complete read-modify-write for one request."""
+        self._path(request_id)  # validate before using the id in a lock-file name
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.directory / f".{request_id}.lock"
+        with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+
+    @contextmanager
+    def _creation_lock(self):
+        """Protect rate limiting and allocation of the next request id."""
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.directory / ".create.lock"
+        with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
+
     def _all(self) -> List[Dict]:
         if not self.directory.exists():
             return []
@@ -582,12 +602,19 @@ class Requests:
     def _save(self, request: Dict) -> None:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._path(request["id"])
-        tmp = path.with_suffix(".tmp")
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
-            json.dump(request, handle, indent=2)
-        os.replace(tmp, path)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{request['id']}.", suffix=".tmp", dir=self.directory)
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(request, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
-    def get(self, request_id: str) -> Dict:
+    def _get_unlocked(self, request_id: str) -> Dict:
         path = self._path(request_id)
         if not path.exists():
             raise GateRefusal(f"no request {request_id}")
@@ -597,6 +624,10 @@ class Requests:
             self._save(request)
         return request
 
+    def get(self, request_id: str) -> Dict:
+        with self._lock(request_id):
+            return self._get_unlocked(request_id)
+
     def pending(self) -> List[Dict]:
         return [r for r in (self.get(i["id"]) for i in self._all()) if r["status"] == "pending"]
 
@@ -605,59 +636,67 @@ class Requests:
         return hashlib.sha256(f"{salt}:{code}".encode()).hexdigest()
 
     def create(self, action: List[str], summary: str) -> Tuple[Dict, str]:
-        now = self.clock()
-        recent = [r for r in self._all() if now - r.get("created_at", 0) < 3600]
-        if len(recent) >= REQUESTS_PER_HOUR:
-            raise GateRefusal(f"{REQUESTS_PER_HOUR} requests in the last hour — wait before asking again")
-        for older in self.pending():
-            older["status"] = "superseded"
-            self._save(older)
-        numbers = [int(r["id"].split("-")[1]) for r in self._all()]
-        code = f"{secrets.randbelow(10 ** 6):06d}"
-        salt = secrets.token_hex(16)
-        request = {
-            "id": f"r-{(max(numbers) + 1) if numbers else 1}",
-            "action": action,
-            "summary": summary,
-            "created_at": now,
-            "expires_at": now + REQUEST_TTL_SECONDS,
-            "salt": salt,
-            "code_sha256": self._digest(salt, code),
-            "attempts": 0,
-            "status": "pending",
-        }
-        self._save(request)
-        return request, code
+        with self._creation_lock():
+            now = self.clock()
+            recent = [r for r in self._all() if now - r.get("created_at", 0) < 3600]
+            if len(recent) >= REQUESTS_PER_HOUR:
+                raise GateRefusal(f"{REQUESTS_PER_HOUR} requests in the last hour — wait before asking again")
+            for item in self._all():
+                with self._lock(item["id"]):
+                    older = self._get_unlocked(item["id"])
+                    if older["status"] == "pending":
+                        older["status"] = "superseded"
+                        self._save(older)
+            numbers = [int(r["id"].split("-")[1]) for r in self._all()]
+            code = f"{secrets.randbelow(10 ** 6):06d}"
+            salt = secrets.token_hex(16)
+            request = {
+                "id": f"r-{(max(numbers) + 1) if numbers else 1}",
+                "action": action,
+                "summary": summary,
+                "created_at": now,
+                "expires_at": now + REQUEST_TTL_SECONDS,
+                "salt": salt,
+                "code_sha256": self._digest(salt, code),
+                "attempts": 0,
+                "status": "pending",
+            }
+            with self._lock(request["id"]):
+                self._save(request)
+            return request, code
 
     def approve(self, request_id: str, code: str) -> Dict:
-        request = self.get(request_id)
-        if request["status"] != "pending":
-            raise GateRefusal(f"{request_id} is {request['status']}, not pending")
-        if not hmac.compare_digest(self._digest(request["salt"], code), request["code_sha256"]):
-            request["attempts"] += 1
-            if request["attempts"] >= REQUEST_MAX_ATTEMPTS:
-                request["status"] = "locked"
+        with self._lock(request_id):
+            request = self._get_unlocked(request_id)
+            if request["status"] != "pending":
+                raise GateRefusal(f"{request_id} is {request['status']}, not pending")
+            if not hmac.compare_digest(self._digest(request["salt"], code), request["code_sha256"]):
+                request["attempts"] += 1
+                if request["attempts"] >= REQUEST_MAX_ATTEMPTS:
+                    request["status"] = "locked"
+                self._save(request)
+                left = REQUEST_MAX_ATTEMPTS - request["attempts"]
+                raise GateRefusal(f"wrong code for {request_id}" + (f" — {left} tr{'y' if left == 1 else 'ies'} left" if left > 0 else " — request locked"))
+            request["status"] = "approved"
+            request["approved_at"] = self.clock()
             self._save(request)
-            left = REQUEST_MAX_ATTEMPTS - request["attempts"]
-            raise GateRefusal(f"wrong code for {request_id}" + (f" — {left} tr{'y' if left == 1 else 'ies'} left" if left > 0 else " — request locked"))
-        request["status"] = "approved"
-        request["approved_at"] = self.clock()
-        self._save(request)
-        return request
+            return request
 
     def cancel(self, request_id: str) -> Dict:
-        request = self.get(request_id)
-        if request["status"] != "pending":
-            raise GateRefusal(f"{request_id} is {request['status']}, not pending")
-        request["status"] = "cancelled"
-        self._save(request)
-        return request
+        with self._lock(request_id):
+            request = self._get_unlocked(request_id)
+            if request["status"] != "pending":
+                raise GateRefusal(f"{request_id} is {request['status']}, not pending")
+            request["status"] = "cancelled"
+            self._save(request)
+            return request
 
     def mark(self, request_id: str, **fields) -> Dict:
-        request = self.get(request_id)
-        request.update(fields)
-        self._save(request)
-        return request
+        with self._lock(request_id):
+            request = self._get_unlocked(request_id)
+            request.update(fields)
+            self._save(request)
+            return request
 
     @staticmethod
     def public(request: Dict) -> Dict:

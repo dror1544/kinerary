@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -135,6 +136,54 @@ class ApprovalCodes(unittest.TestCase):
         with self.assertRaises(vr.GateRefusal):
             self.requests.approve(request["id"], code)
         self.assertEqual(self.requests.get(request["id"])["status"], "locked")
+
+    def test_parallel_wrong_codes_share_one_attempt_limit(self):
+        request, code = self.requests.create(["upgrade", "3a9f1c2"], "summary")
+        wrong = "000000" if code != "000000" else "111111"
+        # Every worker imports the tool, then spins until one shared instant, so
+        # the read-modify-write really does overlap. Waiting on a file instead
+        # left milliseconds of jitter between them — more than the unguarded
+        # window itself, so they took turns and the race never showed.
+        worker = """
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+tool, directory, start_at, request_id, code = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("vm_release_worker", tool)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+requests = module.Requests(Path(directory))
+while time.time() < float(start_at):
+    pass
+try:
+    requests.approve(request_id, code)
+except module.GateRefusal:
+    pass
+"""
+        start_at = time.time() + 1.5  # long enough for eight interpreters to be ready and spinning
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker, str(TOOL), str(self.dir), str(start_at), request["id"], wrong],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(8)
+        ]
+        failures = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=10)
+            if process.returncode:
+                failures.append((process.returncode, stdout, stderr))
+        self.assertEqual(failures, [])
+        stored = self.requests.get(request["id"])
+        self.assertEqual(stored["attempts"], vr.REQUEST_MAX_ATTEMPTS)
+        self.assertEqual(stored["status"], "locked")
+        # The temp files a save writes are dotfiles, which glob("*.tmp") never sees.
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
 
     def test_a_request_expires(self):
         request, code = self.requests.create(["rollback"], "summary")
