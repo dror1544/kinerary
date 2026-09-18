@@ -196,6 +196,16 @@ Nothing outside that file needs to know the rule, which is the point: it was
 already written down in `docs/sprint5-trip-bot-router-design.md` and being
 written down was not enough.
 
+**`--test-timeout` bounds a HANG, not a file.** It was set to 60s in #23 to
+catch a test awaiting something that never settles, when "nothing legitimate
+approaches the bound (slowest observed: ~1.2s)". `node:test` applies the same
+value to the per-FILE subtest, and these files are no longer 1.2s:
+`interview-transcript` is 81s locally and CI runners are slower again. Three
+files were cancelled on CI at 60s — `# fail 0`, `# cancelled 3`, every test in
+them passing. It is 300000 now, which still fails a hung test, just not a
+passing suite. Raise it rather than trim a suite to fit; if a file genuinely
+approaches five minutes, split the file.
+
 ### The interview has no agent — and silently grows one back
 
 The interview is a **deterministic router calling bounded LLM functions**, not
