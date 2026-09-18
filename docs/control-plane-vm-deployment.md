@@ -225,14 +225,24 @@ commits are on no remote. `/opt/hermes-src` is a history-less snapshot.
 ### Files sent on Telegram: the hand-off folder
 
 A companion gets a file someone sent as a **local path**. Hermes saves it with
-`tempfile.mkstemp(prefix="relay_media_")`, so under `TMPDIR`. The trip-mcp tools
+`tempfile.mkstemp(prefix="relay_media_")`. The trip-mcp tools
 that put a file on the site (`upload_booking_confirmation`, `add_photo`,
 `set_participant_avatar`) read "an absolute path on the machine running this MCP
-server", and each trip's `mcp.js` runs on the **host** as `hermes`. So Hermes's
-`TMPDIR` is `/opt/kinerary-inbound`, bind-mounted at that same path, owned by
-uid 10000 (the gateways' user in the container and trip-mcp's on the host),
-mode 0700. Before this, Hermes saved into its container `/tmp`, and no file sent
-on Telegram could reach a site.
+server", and each trip's `mcp.js` runs on the **host** as `hermes`. So
+`HERMES_RELAY_MEDIA_DIR` is `/opt/kinerary-inbound`, bind-mounted at that same
+path, owned by uid 10000 (the gateways' user in the container and trip-mcp's on
+the host), mode 0700. Before this, Hermes saved into its container `/tmp`, and
+no file sent on Telegram could reach a site.
+
+That variable is read by Hermes patch `0002-relay-media-dir`, and it replaced a
+plain `TMPDIR` on 2026-09-18. `TMPDIR` worked, and took everything else with
+it: every temporary file the runtime made — model CLIs, document conversion,
+dependencies — landed in a host-persistent folder whose janitor only removes
+`relay_media_*`, so they outlived the container that made them, holding
+whatever a family had sent. **The compose line and `HERMES_REV` move together**:
+an image without patch 0002 ignores the variable and saves into the container's
+own `/tmp`, where the host's trip-mcp cannot open the path — the exact failure
+the folder exists to prevent, and a silent one.
 
 The `inbound` service creates the folder with that owner before Hermes starts
 (Hermes waits for it to be healthy), then runs `inbound-sweep.sh` hourly, which
@@ -249,7 +259,8 @@ After a deploy, check both sides of the path:
 ```bash
 $C ps inbound hermes                               # $C as in "Running it"; inbound healthy, hermes up
 sudo stat -c '%U %a %n' /opt/kinerary-inbound      # hermes 700
-sudo docker exec -u hermes hermes sh -c 'echo "$TMPDIR"'   # /opt/kinerary-inbound
+sudo docker exec -u hermes hermes sh -c 'echo "$HERMES_RELAY_MEDIA_DIR"'   # /opt/kinerary-inbound
+sudo docker exec hermes grep -c HERMES_RELAY_MEDIA_DIR /opt/hermes/gateway/relay/media.py  # 2 — patch 0002 is in the image
 ```
 
 `tests/scripts/test_inbound_handoff.py` holds the compose file to the same-path

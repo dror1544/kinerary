@@ -289,9 +289,9 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
     assert.ok(mediaUrl);
 
     // What Hermes does with it (gateway/relay/media.py): fetch with its bearer,
-    // then `tempfile.mkstemp(prefix="relay_media_")` — under TMPDIR, which on
-    // the VM is the hand-off folder mounted at the same path on the host, where
-    // trip-mcp runs. Here both sides share one filesystem, so a temp directory
+    // then `tempfile.mkstemp(prefix="relay_media_", dir=HERMES_RELAY_MEDIA_DIR)`
+    // — on the VM the hand-off folder, mounted at the same path on the host,
+    // where trip-mcp runs. Here both sides share one filesystem, so a temp directory
     // plays that folder; tests/scripts/test_inbound_handoff.py holds the VM
     // compose to the same-path rule.
     const handoff = mkdtempSync(join(tmpdir(), "kinerary-inbound-"));

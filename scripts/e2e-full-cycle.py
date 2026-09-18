@@ -361,6 +361,15 @@ class Auto:
         with urllib.request.urlopen(f"{self.root}/_control/sent?chatId={chat}&after={after}", timeout=15) as response:
             return json.loads(response.read() or "{}").get("result", {}).get("messages", [])
 
+    def seq_now(self, chat: str) -> int:
+        """Where this chat has got to — take it BEFORE prompting, then wait from it.
+
+        A chat is never empty by the time a document goes in: the router posts
+        and pins a welcome in a new group, and the companion has already spoken
+        in the DM. Waiting from 0 matches that history on the first poll.
+        """
+        return max((m["seq"] for m in self.said(chat)), default=0)
+
 
 def finish_workdir(work: Path, passed: bool) -> None:
     """This run's documents and stand-in log: gone when every scenario passed,
@@ -852,7 +861,7 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
     check(bool(assistant), f"the trip's assistant has a name ({assistant})",
           "no assistant name on the trip — nothing to address in a group")
 
-    dm, base_seq = ctx["chat"], 0
+    dm = ctx["chat"]
     group = f"-100{secrets.randbelow(10**10):010d}"
     marks = {"dm": f"DM-{secrets.token_hex(3).upper()}", "group": f"GRP-{secrets.token_hex(3).upper()}"}
 
@@ -882,13 +891,19 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
         pdfs[where] = path
     note(f"confirmations: {stays['dm'][0]} ({marks['dm']}), {stays['group'][0]} ({marks['group']})")
 
-    def approve_until(what: str, chat: str, deadline_minutes: int, done) -> None:
+    def approve_until(what: str, chat: str, deadline_minutes: int, done, since: int) -> None:
         """Answer whatever the companion asks until the site shows the file.
 
         It asks before it writes — that is the rule in its SOUL — so a run that
         never answers proves nothing. Anything it says gets the same yes.
+
+        `since` is where the chat stood before the document went in, so the
+        first thing answered is a reply to THAT document. Starting from 0 would
+        answer the welcome the router pinned, send the approval before the
+        companion had asked anything, and let a run that never demonstrated
+        "it asks before it writes" pass as if it had.
         """
-        seen, deadline = 0, time.time() + deadline_minutes * 60
+        seen, deadline = since, time.time() + deadline_minutes * 60
         while time.time() < deadline:
             time.sleep(15)
             if done():
@@ -910,13 +925,14 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
         return lambda: digest in _confirmation_digests(base, token) and digest not in before
 
     # ── A private chat: the file and what to do with it, in one message ──────
+    since_dm = auto.seq_now(dm)
     auto.send_document(dm, pdfs["dm"], caption=(
         f"{assistant}, here is our hotel confirmation. Please add the booking to the trip "
         "and attach this PDF to it."))
-    approve_until("private chat", dm, 12, landed("dm"))
+    approve_until("private chat", dm, 12, landed("dm"), since_dm)
 
     # ── The family group: bind it, then the file, then the instruction ───────
-    seq_before = max((m["seq"] for m in auto.said(dm)), default=0)
+    seq_before = auto.seq_now(dm)
     auto.say(dm, "/group")
     token_line = ""
     for _ in range(20):
@@ -939,11 +955,12 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
     check(bool(bound), "the family group is bound to the trip", "the group never bound")
 
     # The live case: a file with no caption, then — separately — the ask.
+    since_group = auto.seq_now(group)   # the binding reply and the pinned welcome are behind us
     auto.send_document(group, pdfs["group"], from_id=dm)
     time.sleep(5)
     auto.say(group, (f"{assistant}, please add this hotel booking to the trip and attach "
                      "the confirmation I just sent."), from_id=dm)
-    approve_until("family group", group, 12, landed("group"))
+    approve_until("family group", group, 12, landed("group"), since_group)
 
 
 TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026",

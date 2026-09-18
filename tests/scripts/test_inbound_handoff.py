@@ -7,7 +7,10 @@ while Hermes runs in a container. Until 2026-09-17 Hermes saved into its own
 sent on Telegram could be put on a site.
 
 What these tests hold the deployment to:
-  - Hermes's TMPDIR is a folder mounted at the identical path inside and out;
+  - Hermes saves received media into a folder mounted at the identical path
+    inside and out — and names that folder for media ALONE, not by moving the
+    whole runtime's TMPDIR there, which would leave every other temporary file
+    in a host-persistent directory whose janitor does not collect them;
   - that folder is created for uid 10000 before Hermes starts (Docker would
     otherwise create it for root, and the gateways could not write to it);
   - the sweep removes only old `relay_media_*` files, and nothing else.
@@ -24,6 +27,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 COMPOSE = REPO / "control-plane/deployment/compose.vm.yml"
+# The one directory Hermes is told to put received media in — read by the fork
+# through control-plane/deployment/hermes-patches/0002-relay-media-dir.patch.
+MEDIA_DIR_ENV = "HERMES_RELAY_MEDIA_DIR"
 SWEEP = REPO / "control-plane/deployment/inbound-sweep.sh"
 
 try:
@@ -96,28 +102,38 @@ class ComposeSharesTheFolderAtOnePath(unittest.TestCase):
 
     def test_hermes_saves_where_the_host_reads(self) -> None:
         hermes = self.services["hermes"]
-        tmpdir = hermes["environment"]["TMPDIR"]
-        self.assertTrue(tmpdir.startswith("/"), tmpdir)
+        inbox = hermes["environment"][MEDIA_DIR_ENV]
+        self.assertTrue(inbox.startswith("/"), inbox)
         self.assertEqual(
-            self.mounts(hermes).get(tmpdir), tmpdir,
-            "TMPDIR must be bind-mounted from the identical host path — "
+            self.mounts(hermes).get(inbox), inbox,
+            f"{MEDIA_DIR_ENV} must be bind-mounted from the identical host path — "
             "trip-mcp on the host opens exactly the path Hermes hands the agent",
         )
-        self.assertNotEqual(tmpdir, "/tmp")
-        self.assertFalse(tmpdir.startswith("/opt/data"), "not inside the profiles volume")
+        self.assertNotEqual(inbox, "/tmp")
+        self.assertFalse(inbox.startswith("/opt/data"), "not inside the profiles volume")
+
+    def test_only_media_is_redirected_there(self) -> None:
+        """The hand-off folder is host-persistent and swept by name, so only the
+        files that sweep names may be sent to it. TMPDIR would send everything."""
+        hermes = self.services["hermes"]
+        self.assertNotIn(
+            "TMPDIR", hermes["environment"],
+            "TMPDIR moves every temporary file the runtime makes into a folder "
+            f"chosen for received media; name {MEDIA_DIR_ENV} instead (Hermes patch 0002)",
+        )
 
     def test_the_folder_is_ready_for_the_gateways_before_hermes_starts(self) -> None:
         hermes = self.services["hermes"]
-        tmpdir = hermes["environment"]["TMPDIR"]
+        inbox = hermes["environment"][MEDIA_DIR_ENV]
         self.assertEqual(hermes["depends_on"]["inbound"]["condition"], "service_healthy")
         self.assertEqual(str(hermes["environment"]["HERMES_UID"]), "10000")
 
         inbound = self.services["inbound"]
-        self.assertEqual(self.mounts(inbound).get(tmpdir), tmpdir)
+        self.assertEqual(self.mounts(inbound).get(inbox), inbox)
         command = " ".join(inbound["command"])
-        self.assertIn(f"chown 10000:10000 {tmpdir}", command)
-        self.assertIn(f"chmod 0700 {tmpdir}", command)
-        self.assertIn(f"inbound-sweep.sh {tmpdir}", command)
+        self.assertIn(f"chown 10000:10000 {inbox}", command)
+        self.assertIn(f"chmod 0700 {inbox}", command)
+        self.assertIn(f"inbound-sweep.sh {inbox}", command)
         self.assertIn("10000:700", " ".join(inbound["healthcheck"]["test"]))
         self.assertEqual(inbound.get("network_mode"), "none", "a janitor needs no network")
 

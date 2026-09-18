@@ -314,15 +314,15 @@ services:
   # The hand-off folder for files people send on Telegram, and its janitor.
   #
   # A companion that receives a booking PDF or a photo gets it as a local path,
-  # saved by Hermes (tempfile.mkstemp, so under TMPDIR). The tools that put a
+  # saved by Hermes (tempfile.mkstemp, into HERMES_RELAY_MEDIA_DIR). The tools that put a
   # file on the trip site — trip-mcp's upload_booking_confirmation, add_photo,
   # set_participant_avatar — take "an absolute path on the machine running this
   # MCP server", and each trip's mcp.js runs on this HOST as the `hermes` user.
   # With Hermes saving into its own container /tmp, that path did not exist
   # where the upload ran, so no file sent on Telegram could reach a site.
   #
-  # So the folder is mounted at the SAME path on both sides, Hermes's TMPDIR
-  # points at it, and it belongs to uid 10000 — the gateways' user in the
+  # So the folder is mounted at the SAME path on both sides, Hermes saves
+  # received media into it, and it belongs to uid 10000 — the gateways' user in the
   # container and trip-mcp's user on the host. The site stores what is uploaded
   # in the trip's own NFS folder, attached to its booking; the copy here is
   # swept after a day (inbound-sweep.sh).
@@ -390,7 +390,17 @@ services:
       # Where a file sent on Telegram is saved, at the path trip-mcp reads it
       # from on the host — see the `inbound` service. s6 starts every gateway
       # with `with-contenv`, so each one inherits it.
-      TMPDIR: /opt/kinerary-inbound
+      #
+      # This names the directory for RECEIVED MEDIA only. It was TMPDIR until
+      # 2026-09-18, which moved the whole runtime's temporary files — model
+      # CLIs, document conversion, dependencies — into a host-persistent folder
+      # whose janitor only ever removes `relay_media_*`: they survived the
+      # container that made them, indefinitely, holding whatever a family had
+      # sent. Reading the variable is Hermes patch 0002
+      # (control-plane/deployment/hermes-patches/), so this line and the pinned
+      # HERMES_REV move together — an image without it saves into the
+      # container's own /tmp, where the host's trip-mcp cannot open the path.
+      HERMES_RELAY_MEDIA_DIR: /opt/kinerary-inbound
     volumes:
       - /opt/hermes-data:/opt/data
       - /opt/kinerary-inbound:/opt/kinerary-inbound
