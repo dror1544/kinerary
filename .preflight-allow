@@ -24,7 +24,6 @@ tests/fixtures/sample-confirmation.pdf  # PDF extraction cannot be tested withou
 # PERMANENT one with a real reason, or you are adding debt — say which.
 
 # ---- PERMANENT ----
-scripts/preflight-checks.sh  # this is the detector; it must contain the literals it searches for
 provisioning/adapters.py  # /opt/kinerary is the path INSIDE a trip container the product itself creates — a product convention, not a fact about where the control plane runs
 
 # ---- BACKLOG ----

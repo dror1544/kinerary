@@ -310,6 +310,13 @@ for f in ${REL+"${REL[@]}"}; do
   # script with "test" in its name and is exactly what this check is for.
   case "$f" in
     tests/*|*/tests/*|*.test.ts|*.test.js|*.test.mjs|test_*.py|*/test_*.py) continue ;;
+    # The detector, skipped BY PATH rather than by an allow-list entry. It has
+    # to contain the literals it searches for, and an entry in .preflight-allow
+    # is not enough: a harness that runs this script against a temp repo has no
+    # allow file, so `allowed` says no and the check reports itself. That is not
+    # hypothetical — tests/scripts/test_preflight_doc_paths.py does exactly
+    # that, and this is what it caught.
+    scripts/preflight-checks.sh) continue ;;
   esac
   [ -f "$f" ] || continue
   allowed "$f" && continue

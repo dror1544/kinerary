@@ -81,6 +81,25 @@ class NamingThisDeployment(unittest.TestCase):
         out = check_paths()
         self.assertNotIn("hard rule 6", out, "an unrecorded rule-6 offender is in the tree")
 
+    def test_the_detector_never_reports_itself_even_with_no_allow_file(self):
+        # preflight-checks.sh must contain the literals it searches for. An
+        # entry in .preflight-allow is NOT enough to exempt it: a harness that
+        # runs the script against a temp repo has no allow file, `allowed` says
+        # no, and the check reports itself into output another test is
+        # asserting on. That is how this was found — on main, where
+        # test_preflight_doc_paths.py does exactly that. So the skip is by path.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "scripts").mkdir()
+            (repo / "scripts/preflight-checks.sh").write_bytes(SCRIPT.read_bytes())
+            (repo / "scripts/preflight-checks.sh").chmod(0o755)
+            subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, check=True)
+            self.assertFalse((repo / ".preflight-allow").exists(), "the point is that there is none")
+            out = subprocess.run([str(repo / "scripts/preflight-checks.sh"), "--all"],
+                                 cwd=repo, capture_output=True, text=True).stdout
+            self.assertNotIn("preflight-checks.sh", out, "the detector reported itself")
+
     def test_the_allow_list_says_permanent_or_backlog_for_every_entry(self):
         # The two kinds are the point: PERMANENT means the rule cannot apply,
         # BACKLOG means it applies and has not been paid yet. An entry that
