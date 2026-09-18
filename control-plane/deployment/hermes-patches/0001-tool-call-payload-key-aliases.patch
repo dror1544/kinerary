@@ -1,0 +1,281 @@
+--- a/tools/tool_search.py
++++ b/tools/tool_search.py
+@@ -1029,6 +1029,58 @@
+         return None
+ 
+ 
++# The schema says ``arguments``, and models do not all agree. gpt-5.6-terra
++# spells it ``parameters`` about half the time; other runtimes use ``args`` or
++# ``input``. Reading only ``arguments`` did not fail loudly — it produced an
++# empty payload, so ``validate_deferred_call_args`` refused the call as missing
++# every required field, handed back the schema, and the model re-sent the same
++# spelling. Live on 2026-09-18 that dropped 49 of one session's 93 dispatches
++# and half a trip's itinerary was never written, while the agent reported the
++# work as done. The key the model picked must not decide whether a call runs.
++_PAYLOAD_KEYS: Tuple[str, ...] = ("arguments", "parameters", "args", "input")
++
++
++def _carries_payload(value: Any) -> bool:
++    """Whether this value holds arguments, as opposed to an empty stand-in.
++
++    A JSON string is parsed before it is judged, because emptiness has more
++    than one spelling: ``"{ }"`` and ``"{\\n}"`` are as empty as ``"{}"``, and a
++    runtime that pretty-prints an empty object must not thereby make its key
++    look populated — that would hand the call back to the documented key,
++    parse it to ``{}``, and lose it to the validator exactly as before.
++
++    Unparseable is NOT empty. A payload the model meant to send, mangled,
++    belongs in an error naming the key it was sent under; falling through to
++    an alias would hide it.
++    """
++    if isinstance(value, dict):
++        return bool(value)
++    if isinstance(value, str):
++        text = value.strip()
++        if not text:
++            return False
++        try:
++            return bool(json.loads(text))
++        except json.JSONDecodeError:
++            return True
++    return False
++
++
++def _payload_key(call: Dict[str, Any]) -> str:
++    """Which key of a ``tool_call`` invocation holds the underlying payload.
++
++    ``arguments`` is the documented key and wins whenever it carries anything.
++    An alias is read only when it is the one with content — that keeps a
++    genuinely empty call (``get_config()``) reporting against the documented
++    key, and stops an alias from overriding a payload the model did spell right.
++    """
++    present = [k for k in _PAYLOAD_KEYS if call.get(k) is not None]
++    for key in present:
++        if _carries_payload(call.get(key)):
++            return key
++    return present[0] if present else "arguments"
++
++
+ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
+ 
+@@ -1044,16 +1096,17 @@
+         return None, {}, "tool_call requires a 'name' argument"
+     if name in BRIDGE_TOOL_NAMES:
+         return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+-    raw_args = args.get("arguments")
++    payload_key = _payload_key(args)
++    raw_args = args.get(payload_key)
+     if raw_args is None:
+         raw_args = {}
+     if isinstance(raw_args, str):
+         try:
+             raw_args = json.loads(raw_args)
+         except json.JSONDecodeError as e:
+-            return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
++            return None, {}, f"tool_call '{payload_key}' is not valid JSON: {e}"
+     if not isinstance(raw_args, dict):
+-        return None, {}, "tool_call 'arguments' must be an object"
++        return None, {}, f"tool_call '{payload_key}' must be an object"
+     if not is_deferrable_tool_name(name):
+         return None, {}, (
+             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
+--- a/tests/tools/test_tool_search.py
++++ b/tests/tools/test_tool_search.py
+@@ -329,6 +329,25 @@
+         assert err is not None
+ 
+ 
++    def test_resolve_underlying_call_reads_parameters_alias(self):
++        """A payload under 'parameters' is the same call as one under 'arguments'.
++
++        gpt-5.6-terra spells the key 'parameters' about half the time. The
++        resolver used to read only 'arguments', so those calls reached the
++        probe-validator empty and were refused as missing every required
++        field — see TestRegression_PayloadKeyAliases below.
++        """
++        from tools.tool_search import resolve_underlying_call
++        TestRegression_PayloadKeyAliases._register("mcp_alias_resolve_probe")
++        name, args, err = resolve_underlying_call({
++            "name": "mcp_alias_resolve_probe",
++            "parameters": {"repo": "kinerary"},
++        })
++        assert err is None, err
++        assert name == "mcp_alias_resolve_probe"
++        assert args == {"repo": "kinerary"}
++
++
+     def test_resolve_underlying_call_rejects_recursion(self):
+         """tool_call cannot invoke tool_call itself."""
+         from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
+@@ -677,3 +696,170 @@
+         ))
+         assert result.get("ok") is True
+         assert result.get("doc") == "abc"
++
++
++class TestRegression_PayloadKeyAliases:
++    """The payload key the model picked must not decide whether a call runs.
++
++    Live 2026-09-18: a companion asked to rewrite a trip's plan issued 93
++    ``tool_call`` dispatches — 44 spelled the payload ``arguments`` and ran,
++    49 spelled it ``parameters`` and were refused as "missing required
++    argument(s) ... The tool was NOT invoked". The probe-validator handed
++    the schema back each time, the model re-sent ``parameters``, and half
++    the itinerary was silently never written. The resolver read one key.
++    """
++
++    @staticmethod
++    def _register(name, required=("phase_id", "text_he")):
++        from tools.registry import registry
++
++        def _handler(args, task_id=None, **kw):
++            return json.dumps({"ok": True, "got": sorted(args)})
++
++        schema = _td(name, f"desc for {name}", {
++            "phase_id": {"type": "string"},
++            "text_he": {"type": "string"},
++            "repo": {"type": "string"},
++        })
++        schema["function"]["parameters"]["required"] = list(required)
++        registry.register(
++            name=name,
++            handler=_handler,
++            schema=schema,
++            toolset="mcp-alias-probe",
++        )
++
++    def test_parameters_alias_survives_the_probe_validator(self):
++        """The exact live shape: {"name", "parameters"} with every field set."""
++        from tools.tool_search import resolve_underlying_call, validate_deferred_call_args
++
++        self._register("mcp_alias_add_plan_item")
++        call = {
++            "name": "mcp_alias_add_plan_item",
++            "parameters": {"phase_id": "tokyo", "text_he": "ביקור במגדל טוקיו סקייטרי"},
++        }
++        name, args, err = resolve_underlying_call(call)
++        assert err is None, err
++        assert args["phase_id"] == "tokyo"
++        assert validate_deferred_call_args(name, args) is None, (
++            "a fully-specified call was still refused as missing arguments"
++        )
++
++    def test_parameters_alias_dispatches_end_to_end(self):
++        import model_tools
++
++        self._register("mcp_alias_dispatch_op")
++        result = json.loads(model_tools.handle_function_call(
++            function_name="tool_call",
++            function_args={"name": "mcp_alias_dispatch_op",
++                           "parameters": {"phase_id": "kyoto", "text_he": "x"}},
++            enabled_toolsets=["mcp-alias-probe"],
++        ))
++        assert result.get("ok") is True
++        assert result.get("got") == ["phase_id", "text_he"]
++
++    def test_json_string_alias_is_parsed(self):
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_string_op")
++        _, args, err = resolve_underlying_call({
++            "name": "mcp_alias_string_op",
++            "parameters": '{"phase_id": "osaka", "text_he": "y"}',
++        })
++        assert err is None, err
++        assert args == {"phase_id": "osaka", "text_he": "y"}
++
++    def test_args_and_input_aliases_also_resolve(self):
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_other_keys_op")
++        for key in ("args", "input"):
++            _, args, err = resolve_underlying_call({
++                "name": "mcp_alias_other_keys_op",
++                key: {"phase_id": "hakone", "text_he": "z"},
++            })
++            assert err is None, f"{key}: {err}"
++            assert args["phase_id"] == "hakone", key
++
++    def test_arguments_wins_when_both_carry_a_payload(self):
++        """'arguments' is the documented key; an alias never overrides it."""
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_both_op")
++        _, args, err = resolve_underlying_call({
++            "name": "mcp_alias_both_op",
++            "arguments": {"phase_id": "tokyo", "text_he": "documented"},
++            "parameters": {"phase_id": "kyoto", "text_he": "alias"},
++        })
++        assert err is None, err
++        assert args["text_he"] == "documented"
++
++    @pytest.mark.parametrize("empty", [
++        {},
++        "",
++        "   ",
++        "{}",
++        "{ }",           # a pretty-printer's empty object is still empty
++        "{\n}",
++        "{\n  \n}",
++        "null",
++        "[]",
++    ])
++    def test_empty_arguments_with_populated_alias_uses_the_alias(self, empty):
++        """Some runtimes emit both, with the real payload under the alias.
++
++        An empty payload is empty however it is spelled: testing the raw string
++        against a literal "{}" let "{ }" and "{\\n}" pass for content, so the
++        documented key won, parsed to {}, and the call was refused as missing
++        every field — the failure this whole patch exists to remove.
++        """
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_empty_args_op")
++        _, args, err = resolve_underlying_call({
++            "name": "mcp_alias_empty_args_op",
++            "arguments": empty,
++            "parameters": {"phase_id": "tokyo4", "text_he": "carried"},
++        })
++        assert err is None, f"{empty!r}: {err}"
++        assert args["text_he"] == "carried", f"{empty!r} was read as content"
++
++    def test_malformed_arguments_keeps_its_own_error(self):
++        """Unparseable is not empty — the model gets the error it earned.
++
++        Silently falling through to an alias would hide a payload the model
++        meant to send under the documented key.
++        """
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_malformed_args_op")
++        _, _, err = resolve_underlying_call({
++            "name": "mcp_alias_malformed_args_op",
++            "arguments": "{not json",
++            "parameters": {"phase_id": "tokyo4", "text_he": "carried"},
++        })
++        assert err is not None
++        assert "arguments" in err
++
++    def test_genuinely_empty_call_still_resolves_empty(self):
++        """A no-argument tool (get_config()) must keep working."""
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_no_args_op", required=())
++        _, args, err = resolve_underlying_call({
++            "name": "mcp_alias_no_args_op",
++            "arguments": {},
++        })
++        assert err is None, err
++        assert args == {}
++
++    def test_malformed_alias_names_the_key_it_read(self):
++        from tools.tool_search import resolve_underlying_call
++
++        self._register("mcp_alias_bad_json_op")
++        _, _, err = resolve_underlying_call({
++            "name": "mcp_alias_bad_json_op",
++            "parameters": "{not json",
++        })
++        assert err is not None
++        assert "parameters" in err
