@@ -221,6 +221,18 @@ class RestoreAgainstPostgres(unittest.TestCase):
         self.sql("kinerary_control_plane",
                  "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_eeeeeeee', 'after', 'draft')")
 
+    def test_a_backup_interrupted_by_ctrl_c_leaves_no_directory_behind(self):
+        class InterruptedDump(self.vr.ControlPlane):
+            def dump_database(self, path):
+                path.write_bytes(b"half a dump")
+                raise KeyboardInterrupt()
+
+        cp = InterruptedDump(self.vr.Report(io.StringIO(), color=False))
+        with self.assertRaises(KeyboardInterrupt):
+            cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)
+        leftovers = [p.name for p in (self.tmp / "backups").glob("*") if not (p / "db.counts.json").exists()]
+        self.assertEqual(leftovers, [], "a rollback would later find a dump with no proven counts")
+
     def test_the_swap_replaces_the_live_database_and_keeps_the_old_one(self):
         backup = self.cp.take_backup("aaaaaaa-to-bbbbbbb", include_hermes=False)
         self.sql("kinerary_control_plane",

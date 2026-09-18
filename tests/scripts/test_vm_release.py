@@ -481,12 +481,13 @@ class RestoreOrchestration(unittest.TestCase):
     back on the untouched database."""
 
     class Stub(vr.ControlPlane):
-        def __init__(self, fail_at=None, error=None, drop_fails=False, start_fails=False):
+        def __init__(self, fail_at=None, error=None, drop_fails=False, start_fails=False, drop_error=None):
             super().__init__(vr.Report(io.StringIO(), color=False))
             self.calls = []
             self.fail_at = fail_at
             self.error = error or vr.Refused(f"{fail_at} failed")
             self.drop_fails = drop_fails
+            self.drop_error = drop_error
             self.start_fails = start_fails
 
         def _step(self, name, result=None):
@@ -510,7 +511,7 @@ class RestoreOrchestration(unittest.TestCase):
         def drop_database(self, name):
             self.calls.append(f"drop:{name}")
             if self.drop_fails:
-                raise subprocess.TimeoutExpired(["psql"], 120)
+                raise self.drop_error or subprocess.TimeoutExpired(["psql"], 120)
 
         def start_database_clients(self):
             self.calls.append("start")
@@ -547,6 +548,13 @@ class RestoreOrchestration(unittest.TestCase):
         with self.assertRaises(OSError):
             vr.restore_database_for_rollback(stub, Path("/d"), "label")
         self.assertEqual(stub.calls[-1], "start")
+
+    def test_ctrl_c_while_dropping_the_copy_still_restarts_the_services(self):
+        stub = self.Stub(fail_at="backup", error=OSError(28, "No space left on device"),
+                         drop_fails=True, drop_error=KeyboardInterrupt())
+        with self.assertRaises(OSError):
+            vr.restore_database_for_rollback(stub, Path("/d"), "label")
+        self.assertEqual(stub.calls[-1], "start", "the bot and signups come back whatever the cleanup did")
 
     def test_services_that_cannot_be_started_again_are_named(self):
         stub = self.Stub(fail_at="backup", error=subprocess.TimeoutExpired(["pg_dump"], 900), start_fails=True)
@@ -734,6 +742,18 @@ class RollbackUndo(unittest.TestCase):
         stub = self.Stub()
         self.run_switch(stub, [self.entry(stub, "the database")])
         self.assertEqual(stub.calls, ["switch", "services"])
+
+    def test_ctrl_c_during_an_undo_does_not_abandon_the_others(self):
+        # Ctrl-C is a recoverable failure everywhere else in a rollback, and the
+        # person pressing it wants OUT of the rollback, not out of the recovery:
+        # the database compensation still has to run.
+        stub = self.Stub()
+        undo = [self.entry(stub, "the database"), self.entry(stub, "Hermes's data", fails=KeyboardInterrupt())]
+        with self.assertRaises(vr.Refused) as refused:
+            self.run_switch(stub, undo, switch_error=vr.Refused("migrate failed"))
+        self.assertEqual(stub.calls, ["switch", "undo:Hermes's data", "undo:the database"])
+        self.assertIn("KeyboardInterrupt", str(refused.exception))
+        self.assertIn("do Hermes's data by hand", str(refused.exception))
 
     def test_an_undo_that_fails_is_reported_and_the_rest_still_run(self):
         stub = self.Stub()

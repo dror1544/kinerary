@@ -999,8 +999,9 @@ class ControlPlane:
             # container; DROP ... WITH (FORCE) ends its session too.
             try:
                 self.drop_database(name)
-            except Exception as error:  # noqa: BLE001 - the original failure is the one to report
-                self.r.note(f"could not drop {name} ({error}); `kinerary-cp-release prune` removes it")
+            except BaseException as error:  # noqa: BLE001 - Ctrl-C too: the original failure is the one to report
+                self.r.note(f"could not drop {name} ({type(error).__name__}: {error}); "
+                            "`kinerary-cp-release prune` removes it")
             raise
         if proc.returncode != 0:
             detail = proc.stderr.decode(errors="replace").strip()[-400:]
@@ -1122,8 +1123,10 @@ class ControlPlane:
                 self.drop_database(verify)
             (target / "db.counts.json").write_text(json.dumps(counts, indent=2, sort_keys=True))
             (target / "taken_at").write_text(dump_started + "\n")
-        except Exception:
-            # A directory without a proven dump must never look like a backup.
+        except BaseException:
+            # A directory without a proven dump must never look like a backup —
+            # a rollback would find its db.dump and no counts to check it against.
+            # Ctrl-C leaves one just as easily as a failure does.
             shutil.rmtree(target, ignore_errors=True)
             raise
         shutil.copy2(VM_ENV, target / "vm.env")
@@ -1686,11 +1689,12 @@ def restore_database_for_rollback(cp: ControlPlane, dump_dir: Path, pre_label: s
         # goes any further, and nothing in the cleanup may keep them down.
         try:
             cp.drop_database(scratch)
-        except Exception as error:  # noqa: BLE001 - a leftover copy is prune's job; the services are not
-            cp.r.note(f"could not drop {scratch} ({error}); `kinerary-cp-release prune` removes it")
+        except BaseException as error:  # noqa: BLE001 - Ctrl-C included: a leftover copy is prune's job, the services are not
+            cp.r.note(f"could not drop {scratch} ({type(error).__name__}: {error}); "
+                      "`kinerary-cp-release prune` removes it")
         try:
             cp.start_database_clients()
-        except Exception as error:  # noqa: BLE001 - reported with the failure that caused it
+        except BaseException as error:  # noqa: BLE001 - Ctrl-C included: stopped services must be reported, never silently left
             restart = shlex.join(cp.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"))
             raise Refused(f"--restore-db failed ({type(failure).__name__}: {failure}), and the services it had stopped "
                           f"could not be started again ({type(error).__name__}: {error}). The bot and signups are "
@@ -1731,12 +1735,17 @@ def run_undo(cp: ControlPlane, undo: Sequence[Undo], failure: BaseException, not
     Every entry is attempted even after one fails, because they are independent
     and each one left undone is production left broken; the problems are then
     reported together, each with the commands to finish it by hand.
+
+    That includes Ctrl-C. Everywhere else in a rollback an interrupt is a
+    recoverable failure, and someone pressing it wants out of the ROLLBACK, not
+    out of putting production back — so it is recorded like any other failure
+    and the remaining entries still run.
     """
     problems = []
     for entry in reversed(list(undo)):
         try:
             entry.put_back()
-        except Exception as error:  # noqa: BLE001 - collected, not raised, so the rest still run
+        except BaseException as error:  # noqa: BLE001 - Ctrl-C too: collected, not raised, so the rest still run
             problems.append(f"{entry.what} ({type(error).__name__}: {error}) — by hand: {entry.by_hand}")
     if problems:
         raise Refused(f"the rollback failed ({type(failure).__name__}: {failure}) and undoing it did not finish: "
