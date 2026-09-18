@@ -18,7 +18,11 @@
  * address back cannot collide, and needs no entry.
  *
  * Adding a test that binds a port: add a named entry here, and import it.
- * Never write a port literal in a test file.
+ * Never write a port literal in a test file. That rule is not style: a literal
+ * is invisible to both checks below, which only ever see this table.
+ * `mcp-budget.test.js` passed a bare `MCP_PORT: '3113'` and so held the same
+ * port as `itineraryOverlaySync` — a real duplicate that `assertUnique()`
+ * could not report, because only one of the two was ever declared here.
  *
  * ── WHY 38000 AND NOT 3000 ────────────────────────────────────────────────
  *
@@ -93,6 +97,7 @@ export const PORTS = {
   itineraryPlanLayerMcp:   38108,
   mcpDefault:              38117,
   mcpBookingConfirmation:  38116,
+  mcpBudget:               38121,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 38103,
