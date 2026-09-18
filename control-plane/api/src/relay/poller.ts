@@ -23,6 +23,7 @@ import {
   findQuestion,
   parseCallbackData,
   renderConfirmPrompt,
+  renderBoundaryAsk,
   renderEssentialsDone,
   renderQuestion,
   renderSuggestion,
@@ -85,15 +86,18 @@ import {
 } from "../interview.js";
 import {
   applyProposals,
+  DEFAULT_MIN_CONFIDENCE,
   extractIntakeFromDocument,
   burstKey,
   claimInterpretation,
   interpretBurst,
   isInterpretPath,
   markInterpretationCommitted,
+  readBoundaryReply,
   recordInterpretationResult,
   storedOutcomes,
   submitArgsFor,
+  type BoundaryIntent,
   type ProposedAnswer,
 } from "../interpret.js";
 import type { StructuredModelRunner } from "../model-runner.js";
@@ -113,7 +117,9 @@ import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
-import { askText, DEFAULT_LANGUAGE, optionLabel, uiString, writtenLanguage, type Language } from "../intake-copy.js";
+import {
+  askText, DEFAULT_LANGUAGE, optionLabel, recapLabel, uiString, writtenLanguage, type Language,
+} from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
   dispatchUpdate,
@@ -1433,9 +1439,34 @@ async function runInterpretPath(
    * understand": that is the message that makes a person guess.
    */
   const ask = async () => {
+    const before = await getSessionForChat(deps.db, burst.chatId);
+    if (!before.ok) return;
+    if (await sendNextStep(before.view, burst.chatId, deps, strings)) return;
+
+    // IT MAY HAVE GIVEN THE FLOOR AWAY ON ITS WAY OUT.
+    //
+    // `sendNextStep`'s dedupe branch hands the floor back when what it would
+    // ask is already on screen, and it is right to: holding it with nothing to
+    // say leaves the session owing a message forever, and the tick scan then
+    // rediscovers it every couple of seconds. But `restateExpectation` needs
+    // the floor to speak, so after that handback it could not — and said
+    // nothing at all.
+    //
+    // That is the silence this whole function exists to prevent, reached from
+    // one step further along. It bites at the BOUNDARY, where the offer is
+    // both what is on screen and what the dedupe compares against: every typed
+    // message that was not understood there produced total silence, which from
+    // the outside is indistinguishable from a broken bot. Found by the
+    // fallback tests for `settleBoundary`, 2026-09-18.
+    //
+    // Only OUR handback is taken back — the floor moving from machine to
+    // person across a call that sent nothing is exactly that, and nothing
+    // else. A floor somebody else is holding stays theirs.
     const after = await getSessionForChat(deps.db, burst.chatId);
     if (!after.ok) return;
-    if (await sendNextStep(after.view, burst.chatId, deps, strings)) return;
+    if (before.view.awaiting === "machine" && after.view.awaiting === "person") {
+      await markAwaitingMachine(deps.db, burst.chatId, AGENT_FLOOR_SECONDS);
+    }
     await restateExpectation(after.view, burst.chatId, deps, "NOT_UNDERSTOOD");
   };
 
@@ -1725,7 +1756,35 @@ async function runInterpretPath(
   // answer regardless; the only question was ever WHEN to come back for it:
   // immediately, which pesters ("עוד צריך את זה: מתי הטיול מתחיל?" after every
   // message about something else), or at the point it blocks something.
-  await ask();
+  //
+  // THE BOUNDARY IS READ LAST, on purpose. Everything the message said about
+  // the trip is already recorded and already read back, so "wait, I forgot we
+  // also want a day at Disney" keeps its detail and still gets an answer to
+  // the choice it left open. `settleBoundary` returns without a model call
+  // unless the offer is actually on screen; "moved" leaves the floor alone so
+  // `ask` sends the recap or the next question, exactly as a tap would.
+  const settled = await settleBoundary(deps, burst.chatId, {
+    sourceText,
+    captured: capturedLabels(decisions.accepted, language),
+  }, log);
+  if (settled !== "spoke") await ask();
+}
+
+/**
+ * What this message put on record, in the organizer's own language, as the
+ * short recap nouns ("Interests", "תחנות").
+ *
+ * For the boundary reader only, which needs to know that a message carried
+ * trip information without being handed the interview's internal ids.
+ */
+function capturedLabels(
+  accepted: readonly { questionId: string }[],
+  language: Language,
+): string[] {
+  return accepted
+    .map((a) => INTAKE_QUESTIONS.find((q) => q.id === a.questionId))
+    .filter((q): q is IntakeQuestion => Boolean(q))
+    .map((q) => recapLabel(q, language));
 }
 
 export async function flushSettledInboundBursts(
@@ -2271,8 +2330,11 @@ async function restateExpectation(
   // tapped — "לא" is the recorded case — the answer belongs to the offer, not
   // to the optional question behind it, and restating that question instead
   // would ask something they may well have just declined.
-  const offerOnScreen = view.lastPrompt === OPTIONAL_OFFER_PROMPT
-    && !view.nextQuestion && !view.pendingAsk && view.state === "interviewing";
+  // `boundaryOnScreen` is the same predicate `settleBoundary` uses, widened
+  // once since: a CONFIRMATION of a reading ("shall I put your summary
+  // together?") is the boundary too, and restating an optional question under
+  // it would answer a choice they were in the middle of making.
+  const offerOnScreen = boundaryOnScreen(view) !== null;
   const question = offerOnScreen
     ? null
     : view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
@@ -2363,6 +2425,211 @@ async function sendOptionalOffer(
     session_id: view.sessionId, prompt: OPTIONAL_OFFER_PROMPT,
   }));
   return true;
+}
+
+/**
+ * A CONFIRMATION OF ONE READING, as its own prompt key.
+ *
+ * "Sounds like that's everything — shall I put your summary together?" is a
+ * different message from the offer itself, and the difference has to survive
+ * into the next turn: a bare "yes" means nothing at the boundary and
+ * everything under a question that named one exit. The intent being confirmed
+ * travels in the key (`optional_offer_confirm:finish`), because the alternative
+ * is a second piece of state that can disagree with what is on the screen.
+ */
+export const BOUNDARY_CONFIRM_PROMPT = "optional_offer_confirm";
+
+/**
+ * Act, confirm, or ask — the three tiers, as two numbers.
+ *
+ * The apply floor IS the interpret gate's floor (`DEFAULT_MIN_CONFIDENCE`),
+ * and the same argument applies: above it the reading is worth acting on, below it a
+ * question costs one message and a wrong move costs the interview. Between
+ * `0.4` and `0.7` there is enough to name a guess and ask about it, which is
+ * what a person does when they half-heard something. Below `0.4` there is
+ * nothing to say except that we did not follow — the behaviour this whole
+ * function is layered on top of, and which stays exactly as it was.
+ */
+export const BOUNDARY_APPLY_CONFIDENCE = DEFAULT_MIN_CONFIDENCE;
+export const BOUNDARY_CONFIRM_CONFIDENCE = 0.4;
+
+interface BoundaryScreen {
+  /** The one exit a confirmation named, when what is on screen is a confirmation. */
+  pendingConfirmation: BoundaryIntent | null;
+}
+
+/**
+ * Is the boundary the thing the organizer is looking at?
+ *
+ * Deliberately keyed on the recorded prompt rather than on `offeredMore`, which
+ * only says the choice was shown ONCE, at some point. The distinction matters
+ * at exactly one place — a session that was offered more, walked its optional
+ * questions and arrived at the recap has `offeredMore` true and is being asked
+ * something else entirely.
+ */
+function boundaryOnScreen(view: SessionView): BoundaryScreen | null {
+  if (view.nextQuestion || view.pendingAsk) return null;
+  if (view.state !== "interviewing") return null;
+  const prompt = view.lastPrompt ?? "";
+  if (prompt === OPTIONAL_OFFER_PROMPT) return { pendingConfirmation: null };
+  if (prompt.startsWith(`${BOUNDARY_CONFIRM_PROMPT}:`)) {
+    const named = prompt.slice(BOUNDARY_CONFIRM_PROMPT.length + 1);
+    return { pendingConfirmation: named === "finish" || named === "more" ? named : null };
+  }
+  return null;
+}
+
+/** One of the boundary's sentences, with both buttons still under it. */
+async function speakBoundary(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  view: SessionView,
+  key: string,
+  promptKey: string,
+): Promise<boolean> {
+  const rendered = renderBoundaryAsk(key, view.language);
+  if (!(await takeFloor(chatId, view, deps))) return false;
+  await recordLastPromptForChat(deps.db, chatId, promptKey);
+  await deps.telegram.sendMessage({
+    chatId, text: rendered.text, replyMarkup: rendered.replyMarkup ?? undefined,
+  });
+  (deps.log ?? (() => {}))(structuredLog("info", "interview.boundary_asked", {
+    session_id: view.sessionId, prompt: promptKey, copy: key,
+  }));
+  return true;
+}
+
+export type BoundarySettlement =
+  /** Said something itself; the caller owes nothing further. */
+  | "spoke"
+  /** Applied a transition; the caller's ordinary next step renders it. */
+  | "moved"
+  /** Not the boundary, or nothing certain enough to act on. Restate. */
+  | "not_settled";
+
+/**
+ * THE BOUNDARY, ANSWERED IN WORDS.
+ *
+ * Every action offered as a button is also reachable by saying it (Dror,
+ * 2026-09-18). Buttons stay the preferred, fast path — they are one tap and
+ * they cannot be misread — but they are a shortcut, not the syntax. "No, I
+ * think that's everything" has to finish an interview, because that is what a
+ * person says when they are finished.
+ *
+ * What it replaces: "לא", live on 2026-09-10, read as a failure to follow the
+ * UI and answered with the same offer under "I didn't quite follow". The
+ * organizer had followed it exactly. The fix is not to show the buttons harder.
+ *
+ * THE DIVISION OF LABOUR is the whole design, and it is the same one the rest
+ * of this path uses (`docs/interview-without-an-agent.md` §4):
+ *
+ *  - The model READS. It is given one message and returns one of four words
+ *    with a confidence. It cannot name a question, a state or an answer, and
+ *    `parseBoundaryReading` refuses anything outside the four.
+ *  - The ROUTER MOVES. `setFinishRequestedForChat` and `askForMoreForChat` are
+ *    the same two functions the buttons call — not a parallel path that can
+ *    drift from them, and the only things here that touch interview state.
+ *
+ * ORDER. Anything the message actually said about the trip is captured and
+ * acknowledged BEFORE this runs, so "wait, I forgot we also want a day at
+ * Disney" is recorded first and the boundary is put back afterwards. Reading
+ * it as an exit first would have thrown the sentence away.
+ *
+ * COST. One extra model call, and only for a typed message while the offer is
+ * on screen — never for a tap, never mid-interview. Dror, 2026-09-18: a
+ * cleaner contract is worth the second call for now; folding it into the
+ * interpret call to save the latency is a later optimisation, not a reason to
+ * give the model a pseudo-question to answer.
+ */
+async function settleBoundary(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  args: { sourceText: string; captured: readonly string[] },
+  log: (line: string) => void,
+): Promise<BoundarySettlement> {
+  const session = await getSessionForChat(deps.db, chatId);
+  if (!session.ok) return "not_settled";
+  const view = session.view;
+  const screen = boundaryOnScreen(view);
+  if (!screen) return "not_settled";
+
+  // No runner is the configured downgrade, not an error — and it lands where
+  // every other failure here lands: the offer, restated, with its buttons.
+  if (!deps.modelRunner) return "not_settled";
+
+  const read = await readBoundaryReply(deps.modelRunner, {
+    sourceText: args.sourceText,
+    language: view.language,
+    captured: args.captured,
+    pendingConfirmation: screen.pendingConfirmation,
+  });
+  if (!read.ok) {
+    log(structuredLog("warn", "interview.boundary_read_failed", {
+      session_id: view.sessionId, reason: read.reason, attempts: read.attempts, ms: read.ms,
+    }));
+    return "not_settled";
+  }
+  const { intent, confidence } = read.reading;
+  log(structuredLog("info", "interview.boundary_read", {
+    session_id: view.sessionId,
+    intent,
+    confidence,
+    captured: args.captured.length,
+    confirming: screen.pendingConfirmation,
+    ms: read.ms,
+  }));
+
+  // CONFIDENT: the same transition the button makes, made by the same function.
+  if ((intent === "finish" || intent === "more") && confidence >= BOUNDARY_APPLY_CONFIDENCE) {
+    const moved = intent === "finish"
+      ? await setFinishRequestedForChat(deps.db, chatId, true)
+      : await askForMoreForChat(deps.db, chatId);
+    if (!moved.ok) {
+      log(structuredLog("warn", "interview.boundary_move_refused", {
+        session_id: view.sessionId, intent, reason: moved.reason,
+      }));
+      return "not_settled";
+    }
+    log(structuredLog("info", "interview.boundary_applied", { session_id: view.sessionId, intent }));
+    // The floor is deliberately NOT taken here: what the transition produced —
+    // the recap, or the next optional question — is sent by the ordinary next
+    // step, exactly as it is for a tap.
+    return "moved";
+  }
+
+  // LEANING ONE WAY. Name the guess and ask about it — one message from where
+  // they were going if it was right, one message from the other exit if it was
+  // not. Both buttons stay underneath.
+  if ((intent === "finish" || intent === "more") && confidence >= BOUNDARY_CONFIRM_CONFIDENCE) {
+    return (await speakBoundary(
+      deps, chatId, view,
+      intent === "finish" ? "confirmFinish" : "confirmMore",
+      `${BOUNDARY_CONFIRM_PROMPT}:${intent}`,
+    )) ? "spoke" : "not_settled";
+  }
+
+  // THEY ADDED SOMETHING, and said nothing about which way to go. It is on
+  // record and was just read back to them; the choice is simply still open, so
+  // it is asked again SHORT. Nothing here suggests they failed to follow
+  // anything, because they did not — which is why this is keyed on what was
+  // CAPTURED rather than on the reading alone. Whatever the model made of the
+  // sentence, a detail landing from it means they were understood.
+  if (args.captured.length > 0) {
+    return (await speakBoundary(deps, chatId, view, "moreOrSummary", OPTIONAL_OFFER_PROMPT))
+      ? "spoke" : "not_settled";
+  }
+
+  // GENUINELY TWO-SIDED. Ask which, plainly, and without blaming them for it.
+  if (intent === "unclear" && confidence >= BOUNDARY_CONFIRM_CONFIDENCE) {
+    return (await speakBoundary(deps, chatId, view, "notSureMoreOrDone", OPTIONAL_OFFER_PROMPT))
+      ? "spoke" : "not_settled";
+  }
+
+  // Not sure enough even to guess: the old behaviour, unchanged. "I didn't
+  // quite follow" is the honest thing to say when nothing was understood and
+  // nothing was recorded — it is only wrong when it is said to someone who was
+  // understood perfectly well.
+  return "not_settled";
 }
 
 /**
@@ -2520,13 +2787,15 @@ export async function sendNextStep(
   // Answered by a TAP, which is why neither exit is blocked here: "a few more
   // questions" nominates the first optional question (`pendingAsk`, checked
   // above this gate), and "skip" asks to finish, which makes the recap due.
-  // Typed at instead, nothing new is asked and `restateExpectation` puts the
-  // offer back with its buttons.
-  const offerOutstanding = onInterpretPath
-    && view.state === "interviewing"
-    && view.lastPrompt === OPTIONAL_OFFER_PROMPT
-    && !view.nextQuestion
-    && !view.pendingAsk;
+  // Typed at instead, `settleBoundary` reads which exit they meant and moves
+  // through those same two functions; when it cannot, `restateExpectation`
+  // puts the offer back with its buttons.
+  //
+  // `boundaryOnScreen` rather than the offer's own key, because a CONFIRMATION
+  // of a reading ("shall I put your summary together?") leaves the choice just
+  // as open. Without it the walk would ask an optional question on top of a
+  // question the organizer is in the middle of answering.
+  const offerOutstanding = onInterpretPath && boundaryOnScreen(view) !== null;
 
   const question =
     view.nextQuestion
@@ -2542,8 +2811,14 @@ export async function sendNextStep(
   // new to say is the whole fix.
   // With the offer outstanding, what is on their screen IS the prompt — so the
   // dedupe below recognises it, says nothing, and hands the floor back rather
-  // than leaving the session owing a message it will never send.
-  const promptKey = offerOutstanding ? OPTIONAL_OFFER_PROMPT : routerPromptKey(view, question);
+  // than leaving the session owing a message it will never send. Read off the
+  // session rather than fixed to the offer's key: the message on screen may be
+  // a confirmation of one exit, and the dedupe has to recognise that too or the
+  // session sits `awaiting = machine` with nothing to say, which is the busy
+  // loop this branch exists to end.
+  const promptKey = offerOutstanding
+    ? view.lastPrompt ?? OPTIONAL_OFFER_PROMPT
+    : routerPromptKey(view, question);
   const questionIsNew = Boolean(question) && promptKey !== view.lastPrompt;
 
   /** The agent's words, folded in above the question rather than sent alone. */
