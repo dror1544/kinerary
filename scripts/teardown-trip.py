@@ -188,7 +188,14 @@ def reference_topology(raw: dict, orig: str) -> dict:
     out["name"] = ref
     lxc = out["proxmox"]["lxc"]
     lxc["name"] = ref
-    lxc["nfs_host_dir"] = f"{lxc['nfs_host_dir'].rstrip('/').rsplit('/', 1)[0]}/{ref}"
+    # A data directory named by TRIP ID cannot be adopted by the next trip of
+    # this slug — the id is unique and never reused — so it stays where it is.
+    # A slug-named one (every trip provisioned before that change) still has to
+    # move: freeing the slug is the whole point of a teardown, and the next
+    # family to name their trip the same way would land on this family's data.
+    base, _, current = lxc["nfs_host_dir"].rstrip("/").rpartition("/")
+    if not current.startswith("trip_"):
+        lxc["nfs_host_dir"] = f"{base}/{ref}"
     for section in ("npm", "cloudflare"):
         host = out.get(section, {}).get("hostname", "")
         if host.startswith(f"{orig}."):

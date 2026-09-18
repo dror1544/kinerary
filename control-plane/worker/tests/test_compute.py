@@ -101,6 +101,58 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             topology_path = os.path.join(deploy_root, "trips", "tokyo-2026", "topology.yaml")
             self.assertTrue(os.path.exists(topology_path))
 
+    def test_a_new_trips_data_dir_is_named_by_trip_id_and_its_mount_by_slug(self) -> None:
+        # A slug is the organizer's words and is deliberately reusable: teardown
+        # frees it, so the next family naming their trip the same way would land
+        # on the previous family's data directory. A trip id cannot collide.
+        # The MOUNT keeps the slug — that is what a person reads in pct config,
+        # in the site's env and in its logs.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205")
+            adapter = _adapter(deploy_root, provisioner=provisioner)
+
+            adapter.create_container("tokyo-2026", trip_id="trip_9f2c11aa4d")
+
+            topology, _ = provisioner.apply_calls[0]
+            self.assertEqual("/mnt/pve/truenas-nfs/trip_9f2c11aa4d", topology.lxc.nfs_host_dir)
+            self.assertEqual("/nfs/tokyo-2026", topology.lxc.nfs_mount_path)
+
+    def test_a_trip_that_already_has_a_topology_keeps_its_data_dir(self) -> None:
+        # THE UPGRADE CASE. An existing site's data lives where its topology
+        # says, and a redeploy must read that file rather than recompute a name
+        # — recomputing is how a running family's site would be pointed at an
+        # empty directory and come back with no participants, no photos and a
+        # login nobody has.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            first = FakeProvisioner(vmid="205")
+            _adapter(deploy_root, provisioner=first).create_container("tokyo-2026")
+            self.assertEqual(
+                "/mnt/pve/truenas-nfs/tokyo-2026", first.apply_calls[0][0].lxc.nfs_host_dir,
+            )
+
+            # Same trip, provisioned again later — now with an id available.
+            again = FakeProvisioner(vmid="205")
+            _adapter(deploy_root, provisioner=again).create_container(
+                "tokyo-2026", trip_id="trip_9f2c11aa4d",
+            )
+
+            self.assertEqual(
+                "/mnt/pve/truenas-nfs/tokyo-2026",
+                again.apply_calls[0][0].lxc.nfs_host_dir,
+                "an existing trip keeps the directory its topology records",
+            )
+
+    def test_without_a_trip_id_the_data_dir_falls_back_to_the_slug(self) -> None:
+        # Callers that have no id (the operator CLI, older call sites) still
+        # provision; they just do not get the uniqueness.
+        with tempfile.TemporaryDirectory() as deploy_root:
+            provisioner = FakeProvisioner(vmid="205")
+            _adapter(deploy_root, provisioner=provisioner).create_container("tokyo-2026")
+
+            self.assertEqual(
+                "/mnt/pve/truenas-nfs/tokyo-2026", provisioner.apply_calls[0][0].lxc.nfs_host_dir,
+            )
+
     def test_create_container_writes_the_assigned_vmid_back_to_topology_yaml(self) -> None:
         # mcp_bridge.ShellMcpBridgeAdapter has no static vmid_map entry for a
         # slug this adapter created, so it reads the vmid from here instead.

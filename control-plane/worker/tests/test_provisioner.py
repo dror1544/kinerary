@@ -50,6 +50,7 @@ class FakeDeployAdapter:
         first_provision: bool = False,
         sidecars: dict[str, Any] | None = None,
         source_dir: str | None = None,
+        trip_id: str | None = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -57,7 +58,7 @@ class FakeDeployAdapter:
             raise exc
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
-            "sidecars": sidecars or {}, "source_dir": source_dir,
+            "sidecars": sidecars or {}, "source_dir": source_dir, "trip_id": trip_id,
         })
         return f"https://{slug}.test.example"
 
@@ -345,6 +346,7 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.assertEqual(len(self.fake_deploy.deployed), 1)
         deployed = self.fake_deploy.deployed[0]
         self.assertIn("prov-test-", deployed["slug"])
+        self.assertEqual(self.fix["trip_id"], deployed["trip_id"])
         config = deployed["config"]
         self.assertIn("meta", config)
         # Year is derived from the (real) departure date, so check the parts
