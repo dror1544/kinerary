@@ -57,9 +57,17 @@ if name == "lvs": print("  " + s["lvs"][args[-1]]); sys.exit(0)
 if name == "vgs": print("  " + s["vgs"][args[-1]]); sys.exit(0)
 if name == "pvesh":
     path = args[1]
-    if path.endswith("/snapshot"):
+    key = "snapshot" if path.endswith("/snapshot") else "tasks" if path.endswith("/tasks") else "other"
+    seen = s.setdefault("pvesh_calls", {})
+    seen[key] = seen.get(key, 0) + 1
+    save(s)
+    if key in s.get("pvesh_fails", []) or seen[key] >= s.get("pvesh_fails_after", {}).get(key, 10 ** 9):
+        print("api error", file=sys.stderr); sys.exit(2)          # the API answered, badly
+    if key in s.get("pvesh_garbage", []):
+        print('[{"name": "pre-tru'); sys.exit(0)                    # truncated JSON, exit 0
+    if key == "snapshot":
         print(json.dumps(s["snapshots"] + [{"name": "current", "running": 1}])); sys.exit(0)
-    if path.endswith("/tasks"):
+    if key == "tasks":
         print(json.dumps([t for t in s["tasks"] if t.get("until", now + 1) > now])); sys.exit(0)
     sys.exit(1)
 if name == "qm":
@@ -173,6 +181,69 @@ class Runner(unittest.TestCase):
             if line.startswith(f"check.{name}="):
                 return line.split("=", 1)[1]
         return ""
+
+    # ------------------------------------------------- queries that fail --
+    # A query that could not run is not an empty answer. Reading a failed task
+    # query as "nothing running" allows a snapshot while a vzdump hammers the
+    # shared storage; reading a failed snapshot query as "no snapshots" counts
+    # the pool's worst case as one snapshot when there may be three.
+
+    def test_a_task_query_that_failed_is_not_an_idle_node(self):
+        state = healthy_state()
+        state["pvesh_fails"] = ["tasks"]
+        code, _, out = self.run_runner(state, "preflight", "900")
+        self.assertEqual(code, 3, out)
+        self.assertTrue(self.check(out, "tasks").startswith("fail"), out)
+        self.assertIn("could not read", self.check(out, "tasks"))
+
+    def test_a_snapshot_query_that_failed_is_not_zero_snapshots(self):
+        state = healthy_state()
+        state["pvesh_fails"] = ["snapshot"]
+        code, _, out = self.run_runner(state, "preflight", "900")
+        self.assertEqual(code, 3, out)
+        self.assertTrue(self.check(out, "snapshots").startswith("fail"), out)
+        self.assertTrue(self.check(out, "worst_case").startswith("fail"), "the worst case is a count of snapshots")
+        self.assertIn("snapshots.total_count=unknown", out)
+
+    def test_json_that_does_not_parse_is_not_an_empty_list(self):
+        state = healthy_state()
+        state["pvesh_garbage"] = ["snapshot", "tasks"]
+        code, _, out = self.run_runner(state, "preflight", "900")
+        self.assertEqual(code, 3, out)
+        for name in ("tasks", "snapshots"):
+            self.assertTrue(self.check(out, name).startswith("fail"), f"{name}: {out}")
+
+    def test_delete_reports_failure_rather_than_success_it_cannot_see(self):
+        state = healthy_state()
+        state["snapshots"] = [{"name": "pre-aaaaaaa-202609010000", "snaptime": 1, "description": "d"}]
+        state["pvesh_fails"] = ["snapshot"]
+        code, after, out = self.run_runner(state, "delete", "900", "pre-aaaaaaa-202609010000")
+        self.assertEqual(code, 4, out)
+        self.assertIn("result=failed", out)
+        self.assertNotIn("result=ok", out)
+        self.assertFalse([c for c in self.calls() if c.startswith("qm delsnapshot")])
+        self.assertEqual(len(after["snapshots"]), 1)
+
+    def test_a_create_that_cannot_read_the_list_takes_no_snapshot(self):
+        state = healthy_state()
+        state["pvesh_fails"] = ["snapshot"]
+        code, after, out = self.run_runner(state, "create", "900", "pre-bbbbbbb-202609170000", "aaaaaaa -> bbbbbbb")
+        self.assertIn(code, (3, 4), out)
+        self.assertNotIn("result=ok", out)
+        self.assertFalse([c for c in self.calls() if c.startswith("qm snapshot")])
+
+    def test_recovery_does_not_unlock_while_it_cannot_see_the_tasks(self):
+        # The task list answers the preflight, then stops answering — which is
+        # exactly when unlocking would corrupt a running task's bookkeeping.
+        state = healthy_state()
+        state["snapshot_behavior"] = "fail"
+        state["task_lingers"] = 0.2
+        state["pvesh_fails_after"] = {"tasks": 2}
+        code, after, out = self.run_runner(state, "create", "900", "pre-bbbbbbb-202609170000", "aaaaaaa -> bbbbbbb")
+        self.assertEqual(code, 4, out)
+        self.assertIn("recovery.lock=left alone", out)
+        self.assertFalse([c for c in self.calls() if c.startswith("qm unlock")], "unlocked under an unreadable task list")
+        self.assertEqual(after["lock"], "snapshot")
 
     # ------------------------------------------------------------ preflight --
 

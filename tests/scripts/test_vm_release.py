@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -512,6 +513,113 @@ class RestoreOrchestration(unittest.TestCase):
         swap = vr.restore_database_for_rollback(stub, Path("/d"), "label")
         self.assertEqual(stub.calls, ["prepare", "stop", "backup", "swap"])
         self.assertEqual(swap.aside, "aside_db", "the caller needs the replaced database to undo the swap")
+
+
+class RecoveryCommands(unittest.TestCase):
+    """The commands that bring production back must be able to fail.
+
+    start_database_clients() runs where the caller is about to report whether
+    the bot and signups are back. With unchecked commands that report could say
+    "the rollback was undone" over a stopped stack, which is worse than the
+    failure it is reporting.
+    """
+
+    def start_clients(self, compose_argv, relay_exit: int):
+        tmp = Path(tempfile.mkdtemp(prefix="recovery-"))
+        relay = tmp / "vm-relay-restart.sh"
+        relay.write_text(f"#!/bin/sh\nexit {relay_exit}\n")
+        relay.chmod(relay.stat().st_mode | stat.S_IEXEC)
+
+        class CP(vr.ControlPlane):
+            def compose(self, *args):
+                return list(compose_argv)
+
+        cp = CP(vr.Report(io.StringIO(), color=False))
+        saved, vr.DEPLOYMENT_DIR = vr.DEPLOYMENT_DIR, tmp
+        try:
+            cp.start_database_clients()
+        finally:
+            vr.DEPLOYMENT_DIR = saved
+
+    def test_a_compose_that_fails_is_reported(self):
+        with self.assertRaises(vr.Refused):
+            self.start_clients(["false"], relay_exit=0)
+
+    def test_a_relay_restart_that_fails_is_reported(self):
+        with self.assertRaises(vr.Refused):
+            self.start_clients(["true"], relay_exit=1)
+
+    def test_a_clean_restart_says_nothing(self):
+        self.start_clients(["true"], relay_exit=0)
+
+
+class RemoteRunnerCommand(unittest.TestCase):
+    """ssh joins its argv with spaces and the far side runs the result through a
+    shell, so every argument is shell source there. A snapshot description is
+    "aa61f6e -> 8c89e30": unquoted, that `>` wrote the runner's output into a
+    file on the Proxmox host and the caller saw no checks and no recovery."""
+
+    def tokens(self, *args, **kwargs) -> list:
+        return shlex.split(vr.remote_runner_command(*args, **kwargs))
+
+    def test_a_description_with_an_arrow_arrives_whole(self):
+        args = ["pre-8c89e30-202609180900", "aa61f6e -> 8c89e30"]
+        self.assertEqual(self.tokens("create", "110", args), ["env", "bash", "-s", "--", "create", "110", *args])
+        self.assertIn("\'aa61f6e -> 8c89e30\'", vr.remote_runner_command("create", "110", args),
+                      "the description reaches the host quoted, or its `>` redirects there")
+
+    def test_environment_values_with_spaces_stay_one_value(self):
+        self.assertEqual(
+            self.tokens("preflight", "110", ignore_snapshots=["pre-a-1", "pre-b-2"], refuse_storage="truenas-nfs other"),
+            ["env", "IGNORE_SNAPSHOTS=pre-a-1 pre-b-2", "REFUSE_STORAGE=truenas-nfs other",
+             "bash", "-s", "--", "preflight", "110"])
+
+    def test_what_the_far_side_receives_is_what_was_meant(self):
+        """End to end through a fake ssh that behaves as ssh does: it joins the
+        arguments it is given with spaces and runs the result through a shell on
+        the far side. Here that shell is real, so an unquoted `>` redirects."""
+        tmp = Path(tempfile.mkdtemp(prefix="remote-"))
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "ssh").write_text(
+            "#!/bin/sh\n"
+            "while [ $# -gt 0 ]; do case \"$1\" in *@*) shift; break ;; *) shift ;; esac; done\n"
+            "exec sh -c \"$*\"\n")                       # exactly what ssh does with its argv
+        (bin_dir / "bash").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "sys.stdin.buffer.read()\n"
+            "open(os.environ['FAKE_REMOTE_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n")
+        for tool in ("ssh", "bash"):
+            (bin_dir / tool).chmod((bin_dir / tool).stat().st_mode | stat.S_IEXEC)
+
+        cp = vr.ControlPlane(vr.Report(io.StringIO(), color=False))
+        cp._site = {"CP_VMID": "110", "CP_PROXMOX_SSH_KEY_ON_VM": "/root/.ssh/k",
+                    "CP_PROXMOX_KNOWN_HOSTS_ON_VM": "/root/.ssh/kh", "PROXMOX_HOST": "pve.example",
+                    "PROXMOX_SSH_USER": "root", "CP_REFUSE_STORAGE": "nas-share other-share"}
+        args_file = tmp / "remote-args.json"
+        saved_path, saved_cwd = os.environ["PATH"], os.getcwd()
+        saved_dirs = (vr.LIB_DIR, vr.DEPLOYMENT_DIR)
+        os.environ["PATH"] = f"{bin_dir}:{saved_path}"
+        os.environ["FAKE_REMOTE_ARGS"] = str(args_file)
+        vr.LIB_DIR, vr.DEPLOYMENT_DIR = tmp / "absent", ROOT / "control-plane" / "deployment"
+        os.chdir(tmp)  # a redirection on the far side would land here, not in the repo
+        try:
+            cp.proxmox("create", "pre-8c89e30-202609180900", "aa61f6e -> 8c89e30")
+        finally:
+            os.environ["PATH"] = saved_path
+            os.environ.pop("FAKE_REMOTE_ARGS", None)
+            vr.LIB_DIR, vr.DEPLOYMENT_DIR = saved_dirs
+            os.chdir(saved_cwd)
+
+        self.assertEqual(json.loads(args_file.read_text()),
+                         ["-s", "--", "create", "110", "pre-8c89e30-202609180900", "aa61f6e -> 8c89e30"])
+        self.assertEqual(sorted(f.name for f in tmp.iterdir() if f.is_file()), ["remote-args.json"],
+                         "the description's `>` created a file on the Proxmox host")
+
+    def test_nothing_a_caller_passes_can_become_another_command(self):
+        tokens = self.tokens("delete", "110", ["pre-x-1; rm -rf /etc", "$(id)", "`id`", "a|b"])
+        self.assertEqual(tokens[-4:], ["pre-x-1; rm -rf /etc", "$(id)", "`id`", "a|b"])
 
 
 class RollbackUndo(unittest.TestCase):

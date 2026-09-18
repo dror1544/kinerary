@@ -373,6 +373,10 @@ A snapshot is refused when any of these hold:
 - the VM is locked;
 - any vzdump, snapshot, clone or migrate task is running on the node;
 - the guest agent does not answer, or the guest is already frozen;
+- the node's task list or the VM's snapshot list could not be read: a query
+  that failed is not an empty answer, and reading one as "nothing running" or
+  "no snapshots" is how a snapshot starts under a vzdump, or with the pool's
+  worst case counted as zero;
 - the guest has a network filesystem mounted;
 - the shared pool (other guests live there too) is at ≥ 70% data or ≥ 50%
   of its metadata volume;

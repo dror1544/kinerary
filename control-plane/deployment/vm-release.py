@@ -448,6 +448,25 @@ class Swap(NamedTuple):
     stamp: str
 
 
+def remote_runner_command(mode: str, vmid: str, args: Sequence[str] = (), *,
+                          ignore_snapshots: Sequence[str] = (), refuse_storage: str = "") -> str:
+    """The snapshot runner's command line, as ONE argument for ssh.
+
+    ssh joins whatever argv it is given with spaces and hands the result to a
+    shell on the far side, so an unquoted argument is shell source there. A
+    snapshot description is "aa61f6e -> 8c89e30": unquoted, that `>` redirected
+    the runner's output into a file named after the target revision on the
+    Proxmox host, and the caller saw none of its checks or recovery lines.
+    """
+    remote = ["env"]
+    if ignore_snapshots:
+        remote.append("IGNORE_SNAPSHOTS=" + " ".join(n for n in ignore_snapshots if re.match(r"^pre-[A-Za-z0-9_-]{1,36}$", n)))
+    if refuse_storage:
+        remote.append("REFUSE_STORAGE=" + refuse_storage)
+    remote += ["bash", "-s", "--", mode, str(vmid), *args]
+    return shlex.join(remote)
+
+
 def databases_to_prune(names: Iterable[str]) -> List[str]:
     """Scratch databases this tool leaves (verify/restore copies, and a restore
     that was undone) always go; of the databases a --restore-db replaced, the
@@ -831,14 +850,9 @@ class ControlPlane:
         argv = ["ssh", "-i", site["CP_PROXMOX_SSH_KEY_ON_VM"], "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={site['CP_PROXMOX_KNOWN_HOSTS_ON_VM']}",
                 "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-                f"{site['PROXMOX_SSH_USER']}@{site['PROXMOX_HOST']}", "env"]
-        # Both lists are validated to [A-Za-z0-9._ -] before they reach the remote shell.
-        if ignore_snapshots:
-            names = " ".join(n for n in ignore_snapshots if re.match(r"^pre-[A-Za-z0-9_-]{1,36}$", n))
-            argv.append(f"IGNORE_SNAPSHOTS='{names}'")
-        if site.get("CP_REFUSE_STORAGE"):
-            argv.append(f"REFUSE_STORAGE='{site['CP_REFUSE_STORAGE']}'")
-        argv += ["bash", "-s", "--", mode, self.vmid, *args]
+                f"{site['PROXMOX_SSH_USER']}@{site['PROXMOX_HOST']}",
+                remote_runner_command(mode, self.vmid, args, ignore_snapshots=ignore_snapshots,
+                                      refuse_storage=site.get("CP_REFUSE_STORAGE", ""))]
         # Output is held in memory, never written to disk, while this call is
         # open: during a snapshot this VM's filesystems are frozen.
         try:
@@ -1026,11 +1040,16 @@ class ControlPlane:
                     timeout=300)
 
     def start_database_clients(self) -> None:
-        """Bring the stopped clients back on whatever version is checked out now."""
+        """Bring the stopped clients back on whatever version is checked out now.
+
+        Both commands are checked: this runs where a caller is about to report
+        whether production is back, and a restart that failed silently would
+        turn that report into "the rollback was undone" over a stopped bot.
+        """
         self.sh.act(self.compose("up", "-d", "--wait", "api", "worker", "interview-mcp", "companion-mcp"),
-                    describe="compose up -d --wait api worker interview-mcp companion-mcp", timeout=900, check=False)
+                    describe="compose up -d --wait api worker interview-mcp companion-mcp", timeout=900)
         self.sh.act([str(DEPLOYMENT_DIR / "vm-relay-restart.sh"), "--force-live"], describe="vm-relay-restart.sh",
-                    env={"KINERARY_RELAY_READY_SECONDS": "120"}, timeout=300, check=False)
+                    env={"KINERARY_RELAY_READY_SECONDS": "120"}, timeout=300)
 
     def take_backup(self, label: str, include_hermes: bool) -> Path:
         stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")

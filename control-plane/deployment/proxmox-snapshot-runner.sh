@@ -75,11 +75,22 @@ valid_release_snap() {
 
 node_name() { hostname 2>/dev/null | cut -d. -f1; }
 
-# name<TAB>snaptime<TAB>description for every snapshot except "current".
+# A QUERY THAT FAILED IS NOT AN EMPTY ANSWER. pvesh can fail (the API down, a
+# renamed node, no permission) and its JSON can arrive truncated; reading either
+# as "no snapshots" or "no tasks" is how a preflight passes while a vzdump runs,
+# and how the pool's worst case gets counted as zero snapshots. These two
+# helpers exit 3 when they could not read, and every caller turns that into a
+# failed precondition or a failed run — never into "nothing found".
+EXIT_UNREADABLE=3
+
+# name<TAB>snaptime<TAB>description for every snapshot except "current". 3 = unreadable.
 list_snapshots() {
-  pvesh get "/nodes/$(node_name)/qemu/$VMID/snapshot" --output-format json 2>/dev/null \
-    | perl -MJSON::PP -e '
-        local $/; my $in = <STDIN>; my $list = eval { decode_json($in) } || [];
+  local json
+  json="$(pvesh get "/nodes/$(node_name)/qemu/$VMID/snapshot" --output-format json 2>/dev/null)" || return $EXIT_UNREADABLE
+  printf '%s' "$json" | perl -MJSON::PP -e '
+        local $/; my $in = <STDIN>;
+        my $list = eval { decode_json($in) };
+        exit 3 unless ref $list eq "ARRAY";
         for my $s (@$list) {
           next if ($s->{name} // "") eq "current";
           my $d = $s->{description} // ""; $d =~ s/[\t\n]/ /g;
@@ -87,27 +98,32 @@ list_snapshots() {
         }'
 }
 
-# Release (pre-*) snapshot names, minus IGNORE_SNAPSHOTS. A function rather
-# than inline: bash 3.2 cannot parse a case pattern's ")" inside "$( … )".
+# Release (pre-*) snapshot names in the list it is given, minus IGNORE_SNAPSHOTS.
+# A function rather than inline: bash 3.2 cannot parse a case pattern's ")"
+# inside "$( … )".
 release_snapshots_kept() {
   local n
-  list_snapshots | cut -f1 | grep '^pre-' | while read -r n; do
+  printf '%s\n' "$1" | cut -f1 | grep '^pre-' | while read -r n; do
     case " $IGNORE_SNAPSHOTS " in *" $n "*) ;; *) printf '%s\n' "$n" ;; esac
   done
   return 0
 }
 
-active_task_types() {
-  pvesh get "/nodes/$(node_name)/tasks" --source active --output-format json 2>/dev/null \
-    | perl -MJSON::PP -e '
-        local $/; my $in = <STDIN>; my $list = eval { decode_json($in) } || [];
+active_task_types() {  # type<TAB>id<TAB>upid per active task. 3 = unreadable.
+  local json
+  json="$(pvesh get "/nodes/$(node_name)/tasks" --source active --output-format json 2>/dev/null)" || return $EXIT_UNREADABLE
+  printf '%s' "$json" | perl -MJSON::PP -e '
+        local $/; my $in = <STDIN>;
+        my $list = eval { decode_json($in) };
+        exit 3 unless ref $list eq "ARRAY";
         for my $t (@$list) { printf "%s\t%s\t%s\n", ($t->{type} // ""), ($t->{id} // ""), ($t->{upid} // ""); }'
 }
 
-# UPIDs of busy tasks, optionally only those on this VM.
+# "type:id" per busy task, optionally only those on this VM. 3 = unreadable.
 busy_tasks() {
-  local only_vm="${1:-}" type id upid
-  active_task_types | while IFS="$(printf '\t')" read -r type id upid; do
+  local only_vm="${1:-}" tasks type id upid
+  tasks="$(active_task_types)" || return $EXIT_UNREADABLE
+  printf '%s\n' "$tasks" | while IFS="$(printf '\t')" read -r type id upid; do
     case " $BUSY_TASK_TYPES " in *" $type "*) ;; *) continue ;; esac
     if [ -n "$only_vm" ] && [ "$id" != "$only_vm" ]; then continue; fi
     printf '%s:%s\n' "$type" "$id"
@@ -180,8 +196,16 @@ EOF
   local lock; lock="$(vm_config | awk -F': ' '$1 == "lock" { print $2 }')"
   if [ -n "$lock" ]; then fail lock "VM $VMID is locked ($lock)"; else pass lock "not locked"; fi
 
-  local busy; busy="$(busy_tasks | tr '\n' ' ')"
-  if [ -n "$busy" ]; then fail tasks "busy tasks on the node: $busy"; else pass tasks "no snapshot/backup/clone/migrate task running"; fi
+  local busy busy_rc=0
+  busy="$(busy_tasks)" || busy_rc=$?
+  busy="$(printf '%s' "$busy" | tr '\n' ' ')"
+  if [ "$busy_rc" -ne 0 ]; then
+    fail tasks "could not read the node's active tasks — a vzdump, snapshot or clone may be running right now"
+  elif [ -n "${busy// /}" ]; then
+    fail tasks "busy tasks on the node: $busy"
+  else
+    pass tasks "no snapshot/backup/clone/migrate task running"
+  fi
 
   if [ "$status" = "running" ]; then
     if timeout "$AGENT_TIMEOUT" qm agent "$VMID" ping >/dev/null 2>&1; then
@@ -198,22 +222,30 @@ EOF
     pass agent "VM not running; no guest freeze will happen"
   fi
 
-  local existing count names="" hand_made all_count
-  # IGNORE_SNAPSHOTS: release snapshots the caller deletes before it creates,
-  # so a dry run and the guard step judge the state the create will really see.
-  existing="$(release_snapshots_kept)"
-  count="$(printf '%s' "$existing" | grep -c . || true)"
-  names="$(printf '%s' "$existing" | tr '\n' ' ')"
-  # Hand-made snapshots are never created or deleted here, but they diverge
-  # from the disk like any other, so they count toward the worst case below.
-  hand_made="$(list_snapshots | cut -f1 | grep -v '^pre-' | grep -c . || true)"
-  all_count=$(( count + hand_made ))
-  say "snapshots.release_count=$count"
-  say "snapshots.total_count=$all_count"
-  if [ "$count" -gt "$MAX_EXISTING_PRE" ]; then
-    fail snapshots "$count release snapshot(s) exist ($names) — at most $MAX_EXISTING_PRE before taking another; delete the oldest first"
+  local snaps snaps_rc=0 existing count names="" hand_made all_count=""
+  snaps="$(list_snapshots)" || snaps_rc=$?
+  if [ "$snaps_rc" -ne 0 ]; then
+    # Unknown, not zero: the worst case below is a count of snapshots.
+    fail snapshots "could not read VM $VMID's snapshots — how much the pool must be able to absorb cannot be judged"
+    say "snapshots.release_count=unknown"
+    say "snapshots.total_count=unknown"
   else
-    pass snapshots "$count existing release snapshot(s)${names:+: $names}"
+    # IGNORE_SNAPSHOTS: release snapshots the caller deletes before it creates,
+    # so a dry run and the guard step judge the state the create will really see.
+    existing="$(release_snapshots_kept "$snaps")"
+    count="$(printf '%s' "$existing" | grep -c . || true)"
+    names="$(printf '%s' "$existing" | tr '\n' ' ')"
+    # Hand-made snapshots are never created or deleted here, but they diverge
+    # from the disk like any other, so they count toward the worst case below.
+    hand_made="$(printf '%s' "$snaps" | cut -f1 | grep -v '^pre-' | grep -c . || true)"
+    all_count=$(( count + hand_made ))
+    say "snapshots.release_count=$count"
+    say "snapshots.total_count=$all_count"
+    if [ "$count" -gt "$MAX_EXISTING_PRE" ]; then
+      fail snapshots "$count release snapshot(s) exist ($names) — at most $MAX_EXISTING_PRE before taking another; delete the oldest first"
+    else
+      pass snapshots "$count existing release snapshot(s)${names:+: $names}"
+    fi
   fi
 
   local vg pool data meta size vgfree free_g need_g
@@ -232,12 +264,23 @@ EOF
     # the new one each diverge from the disk completely. Refused unless the
     # pool could absorb that.
     free_g="$(awk -v s="$size" -v d="$data" 'BEGIN { printf "%.0f", s * (1 - d / 100) }')"
+    if [ -z "$all_count" ]; then
+      fail worst_case "$vg/$pool has ${free_g}G free, but the snapshots to count against it could not be read"
+      continue
+    fi
     need_g="$(awk -v n="$all_count" -v t="$total_g" -v m="$WORST_CASE_MARGIN_G" 'BEGIN { printf "%.0f", (n + 1) * t + m }')"
     if [ "$free_g" -lt "$need_g" ]; then fail worst_case "$vg/$pool has ${free_g}G free, worst case needs ${need_g}G"; else pass worst_case "$vg/$pool has ${free_g}G free, worst case needs ${need_g}G"; fi
   done
 }
 
-snapshot_listed() { list_snapshots | cut -f1 | grep -qx "$1"; }
+# 0 = listed, 1 = not listed, 3 = the list could not be read. "Not listed"
+# decides whether a snapshot was taken and whether a delete is already done, so
+# an unreadable list must never pass for it.
+snapshot_listed() {
+  local snaps
+  snaps="$(list_snapshots)" || return $EXIT_UNREADABLE
+  printf '%s' "$snaps" | cut -f1 | grep -qx "$1"
+}
 
 # After a snapshot or delete that failed or timed out: never leave the guest
 # frozen, never leave the VM locked, never leave a half-made snapshot.
@@ -250,12 +293,15 @@ recover() {
   # "0.1" aborts the script in the middle of the one path that must finish.
   deadline=$(( $(date +%s) + TASK_WAIT_SECONDS ))
   while :; do
-    busy="$(busy_tasks "$VMID" | tr '\n' ' ')"
-    [ -z "$busy" ] && break
+    # Unreadable counts as busy: unlocking under a running task corrupts its
+    # bookkeeping, and "I could not look" is not "there is none".
+    busy="$(busy_tasks "$VMID")" || busy="unknown (the node's task list could not be read)"
+    busy="$(printf '%s' "$busy" | tr '\n' ' ')"
+    [ -z "${busy// /}" ] && break
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep "$RECOVERY_POLL"
   done
-  if [ -n "$busy" ]; then say "recovery.task=still running after ${TASK_WAIT_SECONDS}s: $busy"; else say "recovery.task=none running"; fi
+  if [ -n "${busy// /}" ]; then say "recovery.task=still running after ${TASK_WAIT_SECONDS}s: $busy"; else say "recovery.task=none running"; fi
 
   if [ "$(qm status "$VMID" 2>/dev/null | awk '{print $2}')" = "running" ]; then
     for i in 1 2 3; do
@@ -268,8 +314,8 @@ recover() {
     say "recovery.freeze=${fz:-no answer}"
   fi
 
-  if [ -n "$busy" ]; then
-    say "recovery.lock=left alone: a task still holds VM $VMID — rerun '$MODE' later, or inspect the task"
+  if [ -n "${busy// /}" ]; then
+    say "recovery.lock=left alone: a task still holds VM $VMID (or could not be read) — rerun '$MODE' later, or inspect the task"
     return
   fi
   local lock; lock="$(vm_config | awk -F': ' '$1 == "lock" { print $2 }')"
@@ -279,7 +325,11 @@ recover() {
     *) say "recovery.lock=left alone: locked by '$lock', not by a snapshot" ;;
   esac
 
-  if [ "$remove_partial" = 1 ] && snapshot_listed "$name"; then
+  local listed=1
+  if [ "$remove_partial" = 1 ]; then snapshot_listed "$name"; listed=$?; fi
+  if [ "$listed" -eq "$EXIT_UNREADABLE" ]; then
+    say "recovery.partial=unknown: VM $VMID's snapshots could not be read — check for $name by hand"
+  elif [ "$remove_partial" = 1 ] && [ "$listed" -eq 0 ]; then
     if timeout --kill-after=15 "$DELETE_TIMEOUT" qm delsnapshot "$VMID" "$name" --force >/dev/null 2>&1; then
       say "recovery.partial=removed $name"
     else
@@ -298,7 +348,8 @@ case "$MODE" in
     ;;
   list)
     valid_vmid "$VMID" || { say "result=refused not a vmid"; exit 2; }
-    list_snapshots | sed 's/^/snapshot=/'
+    snaps="$(list_snapshots)" || { say "result=failed could not read VM $VMID's snapshots"; exit 4; }
+    [ -z "$snaps" ] || printf '%s\n' "$snaps" | sed 's/^/snapshot=/'
     say "result=ok"
     ;;
   create)
@@ -306,10 +357,12 @@ case "$MODE" in
     SNAP_DESC="$(printf '%s' "$SNAP_DESC" | tr -cd 'A-Za-z0-9 ._:>-' | cut -c1-120)"
     preflight
     if [ "$FAILED" -gt 0 ]; then say "result=refused $FAILED precondition(s) failed — no snapshot taken"; exit 3; fi
-    if snapshot_listed "$SNAP_NAME"; then say "result=refused a snapshot named $SNAP_NAME already exists"; exit 3; fi
+    snapshot_listed "$SNAP_NAME"; listed=$?
+    [ "$listed" -eq "$EXIT_UNREADABLE" ] && { say "result=failed could not read VM $VMID's snapshots — no snapshot taken"; exit 4; }
+    [ "$listed" -eq 0 ] && { say "result=refused a snapshot named $SNAP_NAME already exists"; exit 3; }
     started="$(date +%s)"
     if timeout --kill-after=15 "$SNAPSHOT_TIMEOUT" qm snapshot "$VMID" "$SNAP_NAME" --vmstate 0 --description "$SNAP_DESC" >/dev/null 2>&1 \
-       && snapshot_listed "$SNAP_NAME"; then
+       && snapshot_listed "$SNAP_NAME"; then  # unreadable (3) is not "taken": it falls through to recover
       say "snapshot.seconds=$(( $(date +%s) - started ))"
       for vgpool in $(for s in $(vm_volumes | cut -f1 | cut -d: -f1 | sort -u); do lvmthin_pool "$s"; done | sort -u); do
         say "pool.after.$vgpool=$(lvs --noheadings --nosuffix -o data_percent,metadata_percent "$vgpool" 2>/dev/null | awk '{print "data " $1 "% meta " $2 "%"}')"
@@ -325,11 +378,15 @@ case "$MODE" in
   delete)
     valid_vmid "$VMID" || { say "result=refused not a vmid"; exit 2; }
     valid_release_snap "$SNAP_NAME" || { say "result=refused only release snapshots (pre-*) are deleted here"; exit 2; }
-    snapshot_listed "$SNAP_NAME" || { say "result=ok $SNAP_NAME does not exist"; exit 0; }
-    busy="$(busy_tasks "$VMID" | tr '\n' ' ')"
-    [ -z "$busy" ] || { say "result=refused a task is running on VM $VMID: $busy"; exit 3; }
-    if timeout --kill-after=15 "$DELETE_TIMEOUT" qm delsnapshot "$VMID" "$SNAP_NAME" >/dev/null 2>&1 && ! snapshot_listed "$SNAP_NAME"; then
-      say "result=ok deleted $SNAP_NAME"; exit 0
+    snapshot_listed "$SNAP_NAME"; listed=$?
+    [ "$listed" -eq "$EXIT_UNREADABLE" ] && { say "result=failed could not read VM $VMID's snapshots — nothing was deleted"; exit 4; }
+    [ "$listed" -eq 0 ] || { say "result=ok $SNAP_NAME does not exist"; exit 0; }
+    busy="$(busy_tasks "$VMID")" || { say "result=failed could not read the node's active tasks — nothing was deleted"; exit 4; }
+    busy="$(printf '%s' "$busy" | tr '\n' ' ')"
+    [ -z "${busy// /}" ] || { say "result=refused a task is running on VM $VMID: $busy"; exit 3; }
+    if timeout --kill-after=15 "$DELETE_TIMEOUT" qm delsnapshot "$VMID" "$SNAP_NAME" >/dev/null 2>&1; then
+      snapshot_listed "$SNAP_NAME"; listed=$?
+      [ "$listed" -eq 1 ] && { say "result=ok deleted $SNAP_NAME"; exit 0; }
     fi
     recover "$SNAP_NAME" 0
     say "result=failed could not delete $SNAP_NAME"; exit 4
