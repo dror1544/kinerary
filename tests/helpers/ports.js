@@ -18,55 +18,93 @@
  * address back cannot collide, and needs no entry.
  *
  * Adding a test that binds a port: add a named entry here, and import it.
- * Never write a port literal in a test file.
+ * Never write a port literal in a test file. That rule is not style: a literal
+ * is invisible to both checks below, which only ever see this table.
+ * `mcp-budget.test.js` passed a bare `MCP_PORT: '3113'` and so held the same
+ * port as `itineraryOverlaySync` — a real duplicate that `assertUnique()`
+ * could not report, because only one of the two was ever declared here.
+ *
+ * ── WHY 38000 AND NOT 3000 ────────────────────────────────────────────────
+ *
+ * The suite used to allocate upward from 3095, which put 29 of these entries
+ * inside 3100-3999 — and that block is not ours. Every provisioned trip runs
+ * its own trip-mcp bridge on `3000 + vmid` (mcp_bridge.py's
+ * `mcp_port_for_vmid`, clamped to 3100-3999), on the same Mac where these
+ * tests run. Proxmox hands out VMIDs from 100 upward, so the live allocation
+ * mapped almost one-to-one onto the old test block: VMID 104, 105, 106, 107
+ * were all in use at once on 2026-09-18, and 3106 is `mcpExtract`.
+ *
+ * It bit exactly as you would expect and read as something else entirely:
+ * `trip-mcp exited with code 1 before becoming ready`, no mention of a port,
+ * and node:test then cancelled a sibling test that was mid-flight. It looks
+ * like a broken MCP server, not like somebody else owning the socket.
+ *
+ * The TESTS moved rather than the bridges, because a bridge port is not free
+ * to change: it is derived from the container, written into every companion's
+ * profile config and recorded in topology.yaml, so moving it would orphan
+ * the bridges already deployed. A test port is a named constant behind
+ * `assertUnique()` with a rule that no test may write a literal, so moving it
+ * costs one file. `assertClearOfTripBridges()` keeps it moved.
+ *
+ * 38000+ is clear of the bridge range, of the legacy shared bridges (3001,
+ * 3011, 3013), of the control plane (4310-4312, 4399) and of its databases
+ * (5433, 5434), and is comfortably below the ephemeral range macOS allocates
+ * from (49152+), so nothing here can collide with an outbound socket either.
  */
 
-export const PORTS = {
-  companionControl:        3201,
-  companionConversation:   3202,
-  // ── Full trip servers ──────────────────────────────────────────────────
-  telegramSso:              3095,
-  telegramSsoConfigResync:  3100,
-  telegramSsoGroupBind:     3102,
-  multiOrganizer:           3096,
-  configVersionsRestart:    3097,
-  configVersionsBoot:       3098,
-  serverDefault:            3099,  // helpers/server.js fallback — server.test.js
-  agentParticipants:        3101,
-  bookingExtractServer:     3104,
-  errorHandling:            3105,
-  currencyRates:            3107,
-  scheduleReviewServer:     3109,
-  itineraryOverlaySync:     3113,
-  planSingleSource:         3119,
-  planSingleSourceBoot:     3120,
-  itineraryPlanLayerServer: 3118,  // moved off 3107 (currencyRates)
-  configDayLinksServer:     3114,  // moved off 3110 (scheduleReviewMockHermes)
+/**
+ * Ports a provisioned trip's own trip-mcp bridge can take, from
+ * `mcp_port_for_vmid`. Not ours to bind, on any machine that provisions trips.
+ */
+export const TRIP_BRIDGE_PORT_RANGE = { first: 3100, last: 3999 };
 
-  modernParity:           3298,
-  modernEnrichment:        3194,
-  heroHttp:                3196,
-  tripEventsHttp:          3198,
-  controlPlaneSession:     3296,
+export const PORTS = {
+  companionControl:        38201,
+  companionConversation:   38202,
+  // ── Full trip servers ──────────────────────────────────────────────────
+  telegramSso:             38095,
+  telegramSsoConfigResync: 38100,
+  telegramSsoGroupBind:    38102,
+  multiOrganizer:          38096,
+  configVersionsRestart:   38097,
+  configVersionsBoot:      38098,
+  serverDefault:           38099,  // helpers/server.js fallback — server.test.js
+  agentParticipants:       38101,
+  bookingExtractServer:    38104,
+  errorHandling:           38105,
+  currencyRates:           38107,
+  scheduleReviewServer:    38109,
+  itineraryOverlaySync:    38113,
+  planSingleSource:        38119,
+  planSingleSourceBoot:    38120,
+  itineraryPlanLayerServer: 38118,
+  configDayLinksServer:    38114,
+
+  modernParity:            38298,
+  modernEnrichment:        38194,
+  heroHttp:                38196,
+  tripEventsHttp:          38198,
+  controlPlaneSession:     38296,
   // control-plane/api/test/group-document-to-plan.integration.test.ts
-  groupDocumentServer:     3294,
+  groupDocumentServer:     38294,
 
   // Servers a single describe() spawns with a patched config of its own.
-  currencyRatesUsdHome:     3111,
-  currencyRatesUsdOnly:     3112,
-  configDayLinksSeeded:     3115,  // moved off 3111 (currencyRatesUsdHome)
+  currencyRatesUsdHome:    38111,
+  currencyRatesUsdOnly:    38112,
+  configDayLinksSeeded:    38115,
 
   // ── MCP servers ────────────────────────────────────────────────────────
-  controlPlaneSessionMcp:  3295,
-  groupDocumentMcp:        3293,
-  mcpExtract:               3106,
-  itineraryPlanLayerMcp:    3108,
-  mcpDefault:               3117,  // moved off 3098 (configVersionsBoot)
-  mcpBookingConfirmation:   3116,  // moved off 3112 (currencyRatesUsdOnly)
+  controlPlaneSessionMcp:  38295,
+  groupDocumentMcp:        38293,
+  mcpExtract:              38106,
+  itineraryPlanLayerMcp:   38108,
+  mcpDefault:              38117,
+  mcpBookingConfirmation:  38116,
+  mcpBudget:               38121,
 
   // ── Stand-ins for services the server calls out to ─────────────────────
-  bookingExtractMockHermes: 3103,
-  scheduleReviewMockHermes: 3110,
+  bookingExtractMockHermes: 38103,
+  scheduleReviewMockHermes: 38110,
 };
 
 function assertUnique(table) {
@@ -82,4 +120,30 @@ function assertUnique(table) {
   }
 }
 
+/**
+ * No test port may sit where a provisioned trip's bridge can land.
+ *
+ * The duplicate check above only compares this table against itself, which is
+ * why 3106 survived: `mcpExtract` was unique among test ports and still
+ * belonged to VMID 106's bridge. This compares the table against the one
+ * other allocator on the machine, so the next entry added by counting upward
+ * from a neighbour fails at import instead of failing for whoever next runs
+ * the suite beside a live trip.
+ */
+function assertClearOfTripBridges(table) {
+  const { first, last } = TRIP_BRIDGE_PORT_RANGE;
+  const clashes = Object.entries(table)
+    .filter(([, port]) => port >= first && port <= last)
+    .map(([name, port]) => `${name} (${port} = the bridge of VMID ${port - 3000})`);
+  if (clashes.length > 0) {
+    throw new Error(
+      `helpers/ports.js: ${clashes.length} test port(s) fall inside ${first}-${last}, ` +
+      'which belongs to provisioned trips\' trip-mcp bridges (mcp_port_for_vmid = 3000 + vmid): ' +
+      `${clashes.join(', ')}. A trip on that VMID makes the test fail as "exited before ` +
+      'becoming ready" with no mention of a port. Allocate from 38000 instead.'
+    );
+  }
+}
+
 assertUnique(PORTS);
+assertClearOfTripBridges(PORTS);
