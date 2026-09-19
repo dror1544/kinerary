@@ -180,7 +180,7 @@ else
 
   if [ -n "$OWNER" ]; then
     if [ "$MODE" = apply ]; then chown "$OWNER" "$ROOT" "$ROOT/$MARKER" 2>/dev/null || say "note: could not chown to $OWNER (NFS squash?) — the write probe below is what decides"
-    else step "chown $OWNER $ROOT"; fi
+    else step "chown $OWNER $ROOT $ROOT/$MARKER"; fi
   fi
 fi
 
@@ -189,6 +189,16 @@ fi
 # control_plane_worker/document_handoff.py and checkDocumentStore in
 # document-store.ts. Those stay the runtime authority; this proves the host
 # will satisfy them BEFORE a service starts and exits 1 in front of a user.
+# Run a probe AS THE USER THAT WILL ACTUALLY USE THE STORE, not as whoever runs
+# this script. Verified on the VM 2026-09-19: root passed every check while the
+# api and relay containers — uid 1000 — could not create a directory at all. A
+# check that passes as root and fails as the service is the same shape as a
+# marker that satisfies stat() and breaks the provisioner.
+as_owner() {
+  if [ -n "$OWNER" ] && [ "$(id -u)" -eq 0 ]; then sudo -u "#${OWNER%%:*}" "$@"
+  else "$@"; fi
+}
+
 verify() {
   local failed=0
   [ -n "$ROOT" ]                 || { say "FAIL NOT_CONFIGURED  root is empty";                         failed=1; }
@@ -202,12 +212,14 @@ verify() {
   fi
   if [ -d "$ROOT/$MARKER" ]; then
     local trialdir="$ROOT/$MARKER/.trip-probe-$$"
-    if mkdir "$trialdir" 2>/dev/null; then rmdir "$trialdir"
-    else say "FAIL NOT_WRITABLE    cannot create a trip directory in $ROOT/$MARKER"; failed=1; fi
+    if as_owner mkdir "$trialdir" 2>/dev/null; then as_owner rmdir "$trialdir" 2>/dev/null || rmdir "$trialdir"
+    else say "FAIL NOT_WRITABLE    cannot create a trip directory in $ROOT/$MARKER${who}"; failed=1; fi
   fi
 
+  local who="${OWNER:+ as ${OWNER%%:*}}"
   local probe="$ROOT/.write-probe-$$"
-  if ( set -C; : > "$probe" ) 2>/dev/null; then rm -f "$probe"; else say "FAIL NOT_WRITABLE    cannot create a file in $ROOT"; failed=1; fi
+  if as_owner test -w "$ROOT" && as_owner touch "$probe" 2>/dev/null; then rm -f "$probe"
+  else say "FAIL NOT_WRITABLE    cannot create a file in $ROOT${who}"; failed=1; fi
 
   # NOT_A_MOUNT: the product asks whether the containing mount is `/`.
   local mp; mp="$(findmnt -rn --target "$ROOT" -o TARGET 2>/dev/null | head -1 || true)"
