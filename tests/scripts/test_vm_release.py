@@ -53,6 +53,18 @@ class Clock:
         return self.now
 
 
+class ProductionLimits(unittest.TestCase):
+    """This module is imported with the VM's own paths, so it must carry the VM's
+    own limits — a rehearsal lowers them by pointing the tool somewhere else, and
+    nothing else can."""
+
+    def test_the_vm_keeps_its_limits(self):
+        self.assertTrue(vr.ON_THE_VM, "no KINERARY_CP_REPO/DEPLOY_ROOT override is set for these tests")
+        self.assertEqual(vr.MIN_ROOT_FREE_GB, 10)
+        self.assertEqual((vr.BACKUP_KEEP, vr.BACKUP_MAX_TOTAL_GB), (10, 5))
+        self.assertEqual(vr.SNAPSHOT_MAX_AGE_DAYS, 14)
+
+
 class GateParsing(unittest.TestCase):
     def test_read_only_verbs(self):
         for verb in ("status", "help", "history", "snapshots", "verify"):

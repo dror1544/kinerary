@@ -208,6 +208,64 @@ its own prior rather than from what the organizer wrote.
   cannot go silent because a provider rate-limited. This is `extractItinerary`'s
   contract, unchanged.
 
+### 4.4 The boundary, answered in words
+
+The same shape, applied to the one message that is a choice rather than a
+question: *"a few more questions, or skip to the summary?"*, with both exits as
+buttons.
+
+Typed at instead of tapped, that message had no reader at all. "לא" answers the
+offer and no question in the schema, so `interpret` proposed nothing, nothing
+was owed by the ordinary rules, and the organizer was shown the same offer
+again under "I didn't quite follow" — live, 2026-09-10. They had followed it
+exactly. The fix is not to show the buttons harder:
+
+> Every action offered as a button should also be reachable naturally through
+> conversation. Buttons are shortcuts, not required syntax. — Dror, 2026-09-18
+
+`readBoundaryReply` (`interpret.ts`) is the bounded function for it, and it is
+deliberately the smallest one here:
+
+```ts
+export const BOUNDARY_INTENTS = ["finish", "more", "answer_only", "unclear"] as const;
+export interface BoundaryReading { intent: BoundaryIntent; confidence: number }
+```
+
+Four words and a number. The model cannot name a question, a state, an answer
+or a transition, and `parseBoundaryReading` refuses anything outside the set —
+where `parseInterpretPayload` drops a bad entry and keeps the good ones, this
+returns null, because one field decides whether an interview moves on.
+
+`settleBoundary` (`relay/poller.ts`) applies it, in this order:
+
+1. **Capture first.** Everything the message said about the trip is already
+   recorded and acknowledged before the reading is taken. "Wait, I forgot we
+   also want a day at Disney" keeps its detail *and* gets an answer.
+2. **≥ 0.7 → move**, through `setFinishRequestedForChat` / `askForMoreForChat`
+   — the same two functions the buttons call, not a parallel path.
+3. **≥ 0.4 → name the guess and ask** ("Sounds like that's everything — shall
+   I put your summary together?"), recording which exit was named so the next
+   "yes" means something.
+4. **Something was captured → put the choice back, short**, with no suggestion
+   that they failed to follow anything.
+5. **Anything else, or `{ ok: false }` → the buttons, restated.** Unchanged
+   behaviour, reached only when nothing was understood *and* nothing landed.
+
+It runs only while the offer is actually on screen, so it costs one extra model
+call at one point in the interview and nothing anywhere else. It shares the
+`interpret` task name on purpose: a new task name means new `*_RUNNER`/`*_MODEL`
+lines in `provisioning.env`, and an environment that has not been updated
+answers `NOT_CONFIGURED` — a silent downgrade of exactly the sentence this
+exists to understand.
+
+Folding the reading into the `interpret` call to save the second round trip is
+a known optimisation and deliberately not taken yet: it would mean giving the
+model a pseudo-question to answer, and the contract is worth more than the
+latency for now.
+
+**Still tap-only, tracked against the same principle:** the document offer, the
+per-question skip, and the recap's Confirm / Keep planning.
+
 ## 5. One writer per session
 
 If the `interpret` path is enabled for a session, **the agent may no longer

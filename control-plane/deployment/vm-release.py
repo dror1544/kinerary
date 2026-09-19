@@ -103,7 +103,10 @@ DB_USER = DB_NAME = "kinerary_control_plane"
 READYZ = ENV.get("KINERARY_CP_READYZ", "http://127.0.0.1:4310/readyz")
 
 # Limits (docs/control-plane-vm-deployment.md, "Upgrades and rollback").
-MIN_ROOT_FREE_GB = 10
+# The VM's own floor. A rehearsal elsewhere is not the VM: it holds a scratch
+# database and no images, and the machine running it (a Mac) has its own idea of
+# free space — so the floor follows the paths, and is not settable by anyone.
+MIN_ROOT_FREE_GB = 10 if ON_THE_VM else 1
 BACKUP_KEEP = 10
 BACKUP_MAX_TOTAL_GB = 5
 IMAGE_KEEP_HISTORY_ROWS = 5

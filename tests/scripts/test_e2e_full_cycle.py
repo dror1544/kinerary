@@ -7,9 +7,12 @@ by the evening of 2026-09-11, none of them from a run anyone needed to read.
 from __future__ import annotations
 
 import importlib.util
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "e2e-full-cycle.py"
 
@@ -42,6 +45,77 @@ class WorkDirTests(unittest.TestCase):
 
     def test_the_stand_ins_log_lives_in_the_runs_own_directory(self) -> None:
         self.assertEqual(self.mod.Auto(self.work).log.parent, self.work)
+
+
+class TeardownInterpreterTests(unittest.TestCase):
+    """The Python teardown runs under the interpreter that invoked it.
+
+    `teardown-trip.py` opens `#!/usr/bin/env python3`, so launching it as a
+    bare script hands it whichever python is first on the caller's PATH. On
+    2026-09-18 that was a stray `.venv-telegram-manager` (3.9.6, python.org
+    framework, CA store never populated), and all three scenarios of a full
+    run ended the same way:
+
+        ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+        certificate verify failed: unable to get local issuer certificate
+        ✗ teardown exited 1 — see above; the trip may be half-removed
+
+    It died reading Cloudflare, before touching anything, so three trips were
+    left fully provisioned on shared infrastructure — container, DNS, proxy
+    host, profile and all. Nothing was wrong with the teardown; it was handed
+    an interpreter that cannot speak TLS.
+
+    The preflight provides a venv precisely so its tools have their
+    dependencies. `sys.executable` is that venv, so the teardown gets the same
+    interpreter, the same packages and the same trust store as the run that
+    called it — and none of it depends on a shell's PATH any more.
+    """
+
+    def setUp(self) -> None:
+        self.mod = load()
+
+    def run_teardown(self, env: dict) -> list[str]:
+        seen: list[list[str]] = []
+
+        def fake_run(argv, *a, **kw):
+            seen.append(list(argv))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(self.mod.subprocess, "run", fake_run):
+            self.mod.stage_teardown({"trip_id": "trip_deadbeef"})
+        self.assertEqual(len(seen), 1, "teardown runs exactly one command")
+        return seen[0]
+
+    def test_a_python_teardown_is_run_through_sys_executable(self) -> None:
+        argv = self.run_teardown({"KINERARY_TEARDOWN": ""})
+        script = str(self.mod.REPO / "scripts/teardown-trip.py")
+        self.assertEqual(argv[0], sys.executable, "the interpreter is named, not left to PATH")
+        self.assertEqual(argv[1], script)
+        self.assertEqual(argv[2:], ["--trip", "trip_deadbeef", "--execute"])
+
+    def test_the_script_is_never_executed_directly(self) -> None:
+        # The drift this guards: `subprocess.run([script, ...])` reads the
+        # shebang, and the shebang reads PATH.
+        argv = self.run_teardown({"KINERARY_TEARDOWN": ""})
+        self.assertTrue(argv[0].endswith(("python", "python3", "python3.12", "python3.13"))
+                        or argv[0] == sys.executable,
+                        f"argv[0] should be an interpreter, got {argv[0]}")
+        self.assertFalse(argv[0].endswith(".py"), "the script must not be argv[0]")
+
+    def test_a_non_python_twin_is_left_alone(self) -> None:
+        # KINERARY_TEARDOWN names the VM's shell twin
+        # (control-plane/deployment/vm-teardown-trip.sh). It is not Python and
+        # must keep being run as itself — the fix is about which interpreter a
+        # PYTHON script gets, not about wrapping everything in one.
+        argv = self.run_teardown({"KINERARY_TEARDOWN": "/opt/kinerary/vm-teardown-trip.sh"})
+        self.assertEqual(argv, ["/opt/kinerary/vm-teardown-trip.sh", "--trip", "trip_deadbeef", "--execute"])
+
+    def test_a_python_twin_gets_the_interpreter_too(self) -> None:
+        # The rule is about the LANGUAGE of the script, not about which of the
+        # two paths named it.
+        argv = self.run_teardown({"KINERARY_TEARDOWN": "/somewhere/other-teardown.py"})
+        self.assertEqual(argv[:2], [sys.executable, "/somewhere/other-teardown.py"])
 
 
 if __name__ == "__main__":

@@ -498,6 +498,43 @@ start_gateway_supervised() {
 # process, silently. Same discipline as interview-stack-deploy's check for the
 # interviewer's `*_for_chat` tools: grep the gateway's own registration line,
 # because an upstream process being alive proves nothing about what it loaded.
+# CAN THE BRIDGE REACH THE TRIP, not merely "is it listening".
+#
+# `gateway_registered_trip_mcp` below proves the agent can see the tools. That
+# is one hop of two, and on 2026-09-18 the other one was the broken one: a
+# freshly provisioned trip's bridge registered 50 tools and then failed every
+# single call with `connect EHOSTUNREACH` on its way to the trip's own site.
+# The companion told the organizer "I can't retrieve the trip plan right now",
+# politely, indefinitely. Provisioning had reported success, because nothing
+# upstream had ever asked the bridge the question that mattered.
+#
+# /health asks it: the bridge fetches its own trip's config and says whether it
+# arrived. Local to this host, so it needs no key and reveals no address.
+bridge_reaches_trip() {
+  local port="$1" trip_dir="$2" key="" body=""
+  # /health is behind the MCP key like every other route on that server. We are
+  # on the host, beside the trip's own mcp/.env, so the key is simply here —
+  # which is why the endpoint never needed an exemption in the first place.
+  key=$(sed -n 's/^MCP_API_KEY=//p' "$trip_dir/mcp/.env" 2>/dev/null | head -1 | tr -d '"\r')
+  if [ -z "$key" ]; then
+    BRIDGE_HEALTH="no MCP_API_KEY in $trip_dir/mcp/.env"
+    return 1
+  fi
+  # `--config -` so the key arrives on stdin and never on the command line,
+  # where `ps` would show it to every user on the box. Same reason the release
+  # notifier feeds curl its token this way.
+  #
+  # Deliberately not `curl -f`: a 503 here carries the verdict we want to read
+  # back to the operator, and -f would throw the body away with it.
+  body=$(printf 'url = "http://127.0.0.1:%s/health"\nheader = "X-API-Key: %s"\nsilent\nshow-error\nmax-time = 15\n' \
+           "$port" "$key" | curl --config - 2>/dev/null || true)
+  case "$body" in
+    *'"ok":true'*) return 0 ;;
+  esac
+  BRIDGE_HEALTH="${body:-no answer from the bridge}"
+  return 1
+}
+
 gateway_registered_trip_mcp() {
   local name="$1" from_line="$2" waited=0
   local log="$HOME/.hermes/profiles/$name/logs/agent.log"
@@ -583,6 +620,16 @@ PYTOPO
     # tools at all, and tried to shell out to reach them.
     start_gateway "$PROFILE_NAME"
     if gateway_registered_trip_mcp "$PROFILE_NAME" "$LOG_FROM"; then
+      # BOTH HOPS, before anyone is handed a companion. The agent can see the
+      # tools; now prove the tools can see the trip. Same stance as the check
+      # above — a failure here is reported as a failure, not as a WIRED with an
+      # asterisk, because a companion that cannot read its own trip is the one
+      # state that looks healthy from every other angle.
+      if ! bridge_reaches_trip "$MCP_PORT" "$TRIP_DIR"; then
+        printf 'companion-install-host: trip-mcp on :%s cannot reach %s — /health said: %s\n' \
+          "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
+        die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"
+      fi
       printf 'WIRED %s\n' "$PROFILE_NAME"
       exit 0
     fi

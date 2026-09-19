@@ -24,6 +24,7 @@ import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
 import {
   INTAKE_QUESTIONS,
+  answersForChat,
   claimExpiredSessions,
   claimSessionsDueWarning,
   expiredSessionLanguage,
@@ -470,39 +471,46 @@ describe("interview session expiry", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATAB
  * The runner here proposes nothing, because "the model found no answer" IS the
  * condition — reproducing it needs no live model.
  */
+const emptyRunner = {
+  async run() {
+    return { ok: true as const, value: { proposals: [], unclear: [], malformed: 0 }, attempts: 1, ms: 1 };
+  },
+};
+
+class Recorder {
+  readonly sent: { text: string; buttons: number }[] = [];
+  async sendMessage(p: { text: string; replyMarkup?: { inline_keyboard: unknown[][] } }) {
+    this.sent.push({ text: p.text, buttons: (p.replyMarkup?.inline_keyboard ?? []).flat().length });
+    return { ok: true as const, messageId: String(this.sent.length) };
+  }
+  async editMessageText() { return { ok: true as const }; }
+  async sendChatAction() {}
+  async answerCallbackQuery() {}
+  async getChatInfo() { return null; }
+  async getMe() { return { id: "7000000001", username: "T" }; }
+  async getUpdates() { return []; }
+  async deleteWebhookIfPresent() {}
+}
+
+let seq = 0;
+/** One typed message, flushed through the real burst path. */
+async function say(
+  pool: pg.Pool,
+  chatId: string,
+  text: string,
+  telegram: Recorder,
+  modelRunner: unknown = emptyRunner,
+) {
+  seq += 1;
+  await queueInboundMessage(pool, chatId, { text, message_id: `m${seq}` } as never);
+  await flushSettledInboundBursts(
+    { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner } as never,
+    () => {},
+    0,
+  );
+}
+
 describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
-  const emptyRunner = {
-    async run() {
-      return { ok: true as const, value: { proposals: [], unclear: [], malformed: 0 }, attempts: 1, ms: 1 };
-    },
-  };
-
-  class Recorder {
-    readonly sent: { text: string; buttons: number }[] = [];
-    async sendMessage(p: { text: string; replyMarkup?: { inline_keyboard: unknown[][] } }) {
-      this.sent.push({ text: p.text, buttons: (p.replyMarkup?.inline_keyboard ?? []).flat().length });
-      return { ok: true as const, messageId: String(this.sent.length) };
-    }
-    async editMessageText() { return { ok: true as const }; }
-    async sendChatAction() {}
-    async answerCallbackQuery() {}
-    async getChatInfo() { return null; }
-    async getMe() { return { id: "7000000001", username: "T" }; }
-    async getUpdates() { return []; }
-    async deleteWebhookIfPresent() {}
-  }
-
-  let seq = 0;
-  async function say(pool: pg.Pool, chatId: string, text: string, telegram: Recorder) {
-    seq += 1;
-    await queueInboundMessage(pool, chatId, { text, message_id: `m${seq}` } as never);
-    await flushSettledInboundBursts(
-      { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never,
-      () => {},
-      0,
-    );
-  }
-
   test("answering the boundary in words gets an answer, not silence", async () => {
     await withTwoInterviews(async ({ pool, a }) => {
       await setInterpretPath(pool, a.chatId, true);
@@ -881,6 +889,293 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
         false,
         "the optional question is behind us, not offered again",
       );
+    });
+  });
+});
+
+/**
+ * THE BOUNDARY, ANSWERED IN WORDS.
+ *
+ * One message offers two ways on — a few more questions, or skip to the
+ * summary — and both of them are buttons. Live on 2026-09-10 an organizer
+ * answered it with "לא" and was told the bot did not quite follow, under the
+ * same offer again. They had followed it exactly. They had just not tapped.
+ *
+ * Dror, 2026-09-18, on rejecting "show the buttons harder" as the fix:
+ * "Every action offered as a button should also be reachable naturally through
+ * conversation. Buttons are shortcuts, not required syntax."
+ *
+ * So these tests are about the seam, not the model: a reading comes back, and
+ * what happens next is `setFinishRequestedForChat` and `askForMoreForChat` —
+ * the same two functions the buttons call. The stand-in runner returns raw
+ * objects and lets the real `parseBoundaryReading` judge them, so a model that
+ * answers outside the closed set is refused here exactly as it would be live.
+ */
+describe("the boundary, answered in words", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  /**
+   * Answers both calls of one turn: `interpret` first, the boundary reading
+   * second, told apart by the schema each asks for — which is how they differ
+   * in production too, since they share the `interpret` task name.
+   */
+  function scripted(options: {
+    boundary?: unknown | Error;
+    proposals?: ProposedAnswer[];
+  }) {
+    const calls: { schema: string; prompt: string }[] = [];
+    return {
+      calls,
+      async run(req: {
+        prompt: string;
+        schema?: { properties?: Record<string, unknown> };
+        parse: (raw: unknown) => unknown;
+      }) {
+        const boundary = Boolean(req.schema?.properties?.intent);
+        calls.push({ schema: boundary ? "boundary" : "interpret", prompt: req.prompt });
+        const raw = boundary ? options.boundary : { proposals: options.proposals ?? [], unclear: [] };
+        if (raw instanceof Error) {
+          return { ok: false as const, reason: "FAILED", detail: raw.message, attempts: 1, ms: 1 };
+        }
+        const parsed = req.parse(raw);
+        if (parsed === null) return { ok: false as const, reason: "BAD_OUTPUT", detail: "", attempts: 1, ms: 1 };
+        return { ok: true as const, value: parsed, attempts: 1, ms: 1 };
+      },
+    };
+  }
+
+  /**
+   * The real boundary: every required question answered, no optional one
+   * touched yet, the offer sent and recorded as what is on screen.
+   *
+   * The optional questions are deliberately left OUTSTANDING — the shape that
+   * makes "a few more questions" mean something, and the one where a careless
+   * restatement would put an optional question on screen in place of the
+   * choice the organizer is in the middle of making.
+   */
+  async function offerOnScreen(pool: pg.Pool, chatId: string, language = "he") {
+    for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [chatId, q.id, JSON.stringify(q.id === "travelers" ? ROSTER_STAND_IN : { kind: "text", schema_version: 3, text: "x" })],
+      );
+    }
+    await pool.query(
+      `UPDATE control_plane.intake_sessions
+          SET language = $2, state = 'interviewing', awaiting = 'person', phase = 'optional',
+              ui_state = jsonb_build_object('offered_more', true, 'last_prompt', $3::text)
+        WHERE telegram_chat_id = $1`,
+      [chatId, language, OPTIONAL_OFFER_PROMPT],
+    );
+    await setInterpretPath(pool, chatId, true);
+  }
+
+  const didNotFollow = (t: { text: string }, language: "he" | "en" = "he") =>
+    t.text.includes(uiString("didNotFollow", language));
+
+  test('"no, I think that\'s everything" finishes, the way the button does', async () => {
+    await withTwoInterviews(async ({ pool, a, b }) => {
+      await offerOnScreen(pool, a.chatId, "en");
+      await offerOnScreen(pool, b.chatId, "en");
+      const telegram = new Recorder();
+      const runner = scripted({ boundary: { intent: "finish", confidence: 0.95 } });
+
+      await say(pool, a.chatId, "No, I think that's everything", telegram, runner);
+
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "awaiting_confirmation", "the interview moved, exactly as a tap would move it");
+      assert.ok(telegram.sent.length > 0, "and said so");
+      assert.ok(
+        telegram.sent.some((m) => m.text.includes(uiString("recapHeader", "en"))),
+        `the summary is what comes next — sent: ${JSON.stringify(telegram.sent.map((m) => m.text.slice(0, 60)))}`,
+      );
+      assert.ok(
+        !telegram.sent.some((m) => didNotFollow(m, "en")),
+        "and nothing tells a person who was understood that they were not",
+      );
+
+      // The other interview is where it was: a reading applies to the session
+      // it was read for, and a transition that ignored the chat id would look
+      // identical on a single-chat test.
+      const other = await getSessionForChat(pool, b.chatId);
+      assert.ok(other.ok);
+      assert.equal(other.view.state, "interviewing");
+    });
+  });
+
+  test('"yes, there are a few more things" carries on, and asks one', async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await offerOnScreen(pool, a.chatId, "en");
+      const telegram = new Recorder();
+      const runner = scripted({ boundary: { intent: "more", confidence: 0.9 } });
+
+      await say(pool, a.chatId, "Yes, there are a few more things", telegram, runner);
+
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "interviewing", "nothing has finished");
+      const last = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(!didNotFollow(last, "en"), `understood, not restated — got: ${last.text}`);
+      assert.ok(
+        !last.text.includes(uiString("essentialsDone", "en")),
+        "a question, not the offer again",
+      );
+      assert.ok(
+        after.view.lastPrompt?.startsWith("q:"),
+        `an optional question is on screen — lastPrompt: ${after.view.lastPrompt}`,
+      );
+    });
+  });
+
+  test("something they forgot is captured first, and the choice is then put back — not as a failure to follow", async () => {
+    // Dror's own example: "Wait, I forgot that we also want a day at Disney."
+    // It is not an exit. It is a detail, arriving at the moment the interview
+    // asked whether there were any more. Losing it to a classification would be
+    // the worst of both worlds, so the ordinary capture runs first and this
+    // reads what is left.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await offerOnScreen(pool, a.chatId, "en");
+      const telegram = new Recorder();
+      const runner = scripted({
+        boundary: { intent: "answer_only", confidence: 0.9 },
+        proposals: [{
+          questionId: "trip_interests",
+          value: { kind: "text", text: "a day at Disney" },
+          confidence: 0.9,
+          evidence: "a day at Disney",
+          sourceMessageId: "",
+        }],
+      });
+
+      await say(pool, a.chatId, "Wait, I forgot that we also want a day at Disney", telegram, runner);
+
+      const store = await answersForChat(pool, a.chatId);
+      assert.equal(
+        (store?.answers.trip_interests as { text?: string } | undefined)?.text,
+        "a day at Disney",
+        "the thing they remembered is on record",
+      );
+      const last = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(!didNotFollow(last, "en"), `they were followed — got: ${last.text}`);
+      assert.equal(last.text, uiString("moreOrSummary", "en"), "the choice is put back, short");
+      assert.equal(last.buttons, 2, "with both exits still tappable");
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "interviewing", "and nothing was decided for them");
+      assert.equal(after.view.lastPrompt, OPTIONAL_OFFER_PROMPT, "the boundary is still what is on screen");
+    });
+  });
+
+  test("a half-heard answer is confirmed in words, and the confirmation is what makes “yes” mean something", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await offerOnScreen(pool, a.chatId, "en");
+      const telegram = new Recorder();
+
+      // Leaning towards finishing, without enough to act on.
+      await say(pool, a.chatId, "nah we're good i guess", telegram,
+        scripted({ boundary: { intent: "finish", confidence: 0.55 } }));
+
+      const asked = await getSessionForChat(pool, a.chatId);
+      assert.ok(asked.ok);
+      assert.equal(asked.view.state, "interviewing", "a guess moves nothing");
+      const confirm = telegram.sent[telegram.sent.length - 1]!;
+      assert.equal(confirm.text, uiString("confirmFinish", "en"), "it names its guess and asks");
+      assert.equal(confirm.buttons, 2, "with the buttons still there for anyone who would rather tap");
+      assert.equal(asked.view.lastPrompt, "optional_offer_confirm:finish", "and records WHICH exit it asked about");
+
+      // AND NOTHING WALKS PAST IT. A confirmation leaves the choice as open as
+      // the offer did, so the router's own walk must not start asking optional
+      // questions on top of a question the organizer is in the middle of
+      // answering — the 2026-09-18 failure, one message further along.
+      const sentSoFar = telegram.sent.length;
+      const { advanceRouterOwnedQuestions } = await import("../src/relay/poller.js");
+      const { DEFAULT_STRINGS } = await import("../src/relay/dispatch.js");
+      await pool.query(
+        "UPDATE control_plane.intake_sessions SET awaiting = 'machine' WHERE telegram_chat_id = $1",
+        [a.chatId],
+      );
+      await advanceRouterOwnedQuestions(
+        { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner: emptyRunner } as never,
+        DEFAULT_STRINGS,
+        () => {},
+      );
+      assert.equal(telegram.sent.length, sentSoFar, "the confirmation is the only thing on screen");
+      const held = await getSessionForChat(pool, a.chatId);
+      assert.ok(held.ok);
+      assert.equal(held.view.awaiting, "person", "and the turn is theirs, not a session owing a message forever");
+
+      // …which is the whole point of recording it: a bare "yes" means nothing
+      // at the boundary and everything under a question that named one exit.
+      const second = scripted({ boundary: { intent: "finish", confidence: 0.95 } });
+      await say(pool, a.chatId, "yes", telegram, second);
+
+      const boundaryPrompt = second.calls.find((c) => c.schema === "boundary")?.prompt ?? "";
+      assert.ok(
+        boundaryPrompt.includes("wrap up and show the summary"),
+        "the reader is told what was being confirmed, so it is not guessing at a bare yes",
+      );
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "awaiting_confirmation", "and then it finishes");
+    });
+  });
+
+  test("a reading that fails falls back to the buttons, restated — the behaviour it is layered on", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await offerOnScreen(pool, a.chatId);
+      const telegram = new Recorder();
+
+      await say(pool, a.chatId, "מה?", telegram, scripted({ boundary: new Error("model down") }));
+
+      const last = telegram.sent[telegram.sent.length - 1]!;
+      assert.ok(didNotFollow(last), `the old path, unchanged — got: ${last.text}`);
+      assert.ok(last.text.includes(uiString("essentialsDone", "he")), "with the offer itself restated");
+      assert.equal(last.buttons, 2, "and both exits tappable");
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "interviewing", "nothing moved on a failed reading");
+    });
+  });
+
+  test("the model cannot name a transition — only one of four words", async () => {
+    // The closed set IS the safety property. `confirm_intake` is a real thing
+    // the interview can do, and the reader has no way to ask for it: the parser
+    // refuses the word, the call is BAD_OUTPUT, and BAD_OUTPUT lands where a
+    // rate limit lands.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await offerOnScreen(pool, a.chatId);
+      const telegram = new Recorder();
+
+      await say(pool, a.chatId, "כן בטח", telegram,
+        scripted({ boundary: { intent: "confirm_intake", confidence: 1 } }));
+
+      const after = await getSessionForChat(pool, a.chatId);
+      assert.ok(after.ok);
+      assert.equal(after.view.state, "interviewing", "no session was confirmed by a word");
+      assert.ok(didNotFollow(telegram.sent[telegram.sent.length - 1]!), "it fell back, visibly");
+    });
+  });
+
+  test("nothing is read when the boundary is not on screen", async () => {
+    // The second call is paid for by a typed message at one point in the
+    // interview, and nowhere else. A reader that ran on every message would
+    // double the cost of the whole conversation to answer a question nobody
+    // asked.
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET language = 'en', state = 'interviewing', awaiting = 'person', phase = 'essentials'
+          WHERE telegram_chat_id = $1`,
+        [a.chatId],
+      );
+      const telegram = new Recorder();
+      const runner = scripted({ boundary: { intent: "finish", confidence: 1 } });
+
+      await say(pool, a.chatId, "it's a family trip", telegram, runner);
+
+      assert.deepEqual(runner.calls.map((c) => c.schema), ["interpret"], "one call, mid-interview");
     });
   });
 });
