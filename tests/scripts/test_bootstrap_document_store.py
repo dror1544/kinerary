@@ -106,7 +106,32 @@ class ReportsTheContractItCannotYetSatisfy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "store"
             root.mkdir()
-            (root / ".kinerary-document-store").write_text("test\n")
+            (root / ".kinerary-document-store").mkdir()
+            env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
+            result = run(["--check"], env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("contract satisfied", result.stdout)
+
+    def test_a_marker_FILE_is_rejected_because_the_provisioner_needs_a_directory(self):
+        """The nastiest shape of this bug: both readiness checks only stat() the
+        marker, so a file passes them and the provisioner then fails creating
+        trip_<id> inside it. Caught here, where it is cheap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "store"
+            root.mkdir()
+            (root / ".kinerary-document-store").write_text("not a directory\n")
+            env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
+            result = run(["--check"], env)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("NOT_A_DIRECTORY", result.stdout)
+            self.assertIn("trip_<id> inside it", result.stdout)
+
+    def test_a_marker_directory_accepts_a_trip_folder(self):
+        """What the provisioner will actually do on the real volume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "store"
+            root.mkdir()
+            (root / ".kinerary-document-store").mkdir()
             env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
             result = run(["--check"], env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -128,7 +153,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "store"
             root.mkdir()
-            (root / ".kinerary-document-store").write_text("test\n")
+            (root / ".kinerary-document-store").mkdir()
             env = dict(BASE_ENV, DOCUMENT_STORE_MOUNT=str(root), DOCUMENT_STORE_ROOT=str(root))
             result = run(["--check"], env)
             self.assertIn(f"KINERARY_NFS_ROOT={root}", result.stdout)
@@ -138,7 +163,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "store"
             root.mkdir()
-            (root / ".kinerary-document-store").write_text("test\n")
+            (root / ".kinerary-document-store").mkdir()
             env_file = Path(tmp) / "vm.env"
             env_file.write_text("KINERARY_REV=abc\nKINERARY_NFS_ROOT=/somewhere/else\n")
             env = dict(
@@ -156,7 +181,7 @@ class TheEnvFileIsDeploymentOwned(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "store"
             root.mkdir()
-            (root / ".kinerary-document-store").write_text("test\n")
+            (root / ".kinerary-document-store").mkdir()
             env_file = Path(tmp) / "vm.env"
             env_file.write_text(f"KINERARY_NFS_ROOT={root}\n")
             before = env_file.read_text()

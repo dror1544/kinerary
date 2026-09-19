@@ -162,11 +162,20 @@ else
   elif [ "$MODE" != apply ]; then step "mkdir -p $ROOT"
   else mkdir -p "$ROOT"; ok "created $ROOT"; fi
 
-  if [ -e "$ROOT/$MARKER" ]; then ok "marker present"
-  elif [ "$MODE" != apply ]; then step "create $ROOT/$MARKER"
+  # The marker is a DIRECTORY, not a file. Both readiness checks only stat() it,
+  # so a file would pass verification and then break the provisioner, which
+  # creates each trip's folder INSIDE it:
+  #   os.path.join(nfs, ".kinerary-document-store", "trip_<id>")
+  # — control_plane_worker/tests/test_provisioner.py. A check that passes and a
+  # system that then fails is worse than no check, so this is asserted below too.
+  if [ -d "$ROOT/$MARKER" ]; then ok "marker directory present"
+  elif [ -e "$ROOT/$MARKER" ]; then die "$ROOT/$MARKER exists but is not a directory — the provisioner creates each trip's folder inside it; move it aside deliberately"
+  elif [ "$MODE" != apply ]; then step "create $ROOT/$MARKER/ (a directory; trips get a folder each inside it)"
   else
-    printf 'kinerary document store\ncreated %s by %s\n' "$(date -u +%FT%TZ)" "$(hostname)" > "$ROOT/$MARKER"
-    ok "marker created"
+    mkdir -p "$ROOT/$MARKER"
+    printf 'Kinerary document store.\nEach trip has a trip_<id> directory here.\nCreated %s on %s.\n' \
+      "$(date -u +%FT%TZ)" "$(hostname)" > "$ROOT/$MARKER/README"
+    ok "marker directory created"
   fi
 
   if [ -n "$OWNER" ]; then
@@ -186,6 +195,16 @@ verify() {
   [ -e "$ROOT" ]                 || { say "FAIL MISSING         $ROOT does not exist";                  failed=1; }
   [ -d "$ROOT" ] || [ ! -e "$ROOT" ] || { say "FAIL NOT_A_DIRECTORY $ROOT is not a directory";          failed=1; }
   [ -e "$ROOT/$MARKER" ]         || { say "FAIL NO_MARKER       $ROOT/$MARKER is missing";              failed=1; }
+  # Stricter than the product's stat(): a marker FILE satisfies both readiness
+  # checks and then breaks the provisioner. Fail here, where it is cheap.
+  if [ -e "$ROOT/$MARKER" ] && [ ! -d "$ROOT/$MARKER" ]; then
+    say "FAIL NOT_A_DIRECTORY $ROOT/$MARKER is a file; the provisioner needs to create trip_<id> inside it"; failed=1
+  fi
+  if [ -d "$ROOT/$MARKER" ]; then
+    local trialdir="$ROOT/$MARKER/.trip-probe-$$"
+    if mkdir "$trialdir" 2>/dev/null; then rmdir "$trialdir"
+    else say "FAIL NOT_WRITABLE    cannot create a trip directory in $ROOT/$MARKER"; failed=1; fi
+  fi
 
   local probe="$ROOT/.write-probe-$$"
   if ( set -C; : > "$probe" ) 2>/dev/null; then rm -f "$probe"; else say "FAIL NOT_WRITABLE    cannot create a file in $ROOT"; failed=1; fi
