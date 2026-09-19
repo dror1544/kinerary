@@ -355,7 +355,7 @@ def build_provisioner():
     adapter = LxcProvisionAdapter(
         deploy_root=str(DEPLOY_ROOT),  # the HOST path; provisioning.env's is the container's
         node=e("PROXMOX_NODE", ""), template=e("PROXMOX_LXC_TEMPLATE", ""), storage=e("PROXMOX_STORAGE", ""),
-        bridge=e("PROXMOX_BRIDGE", ""), ip_pool=json.loads(e("PROVISIONER_LXC_IP_POOL", '["192.168.0.60"]')),
+        bridge=e("PROXMOX_BRIDGE", ""), ip_pool=[],  # teardown removes resources; it never allocates an IP
         hostname_domain=e("PROVISIONER_LXC_HOSTNAME_DOMAIN", ""), tunnel_id=e("PROVISIONER_LXC_TUNNEL_ID", ""),
         npm_url=e("NPM_URL", ""), npm_api_token=e("NPM_API_TOKEN", ""),
         npm_identity=e("NPM_IDENTITY", ""), npm_secret=e("NPM_SECRET", ""),
