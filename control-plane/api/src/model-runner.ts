@@ -324,6 +324,8 @@ export const CODEX_ISOLATION_FEATURES: readonly string[] = [
 ];
 
 export const CODEX_ISOLATION_ARGS: readonly string[] = [
+  // Auth still comes from CODEX_HOME, but no config.toml can re-enable a tool.
+  "--ignore-user-config",
   ...CODEX_ISOLATION_FEATURES.flatMap((feature) => ["--disable", feature]),
   "-c", "mcp_servers={}",
   "-c", "plugins={}",
