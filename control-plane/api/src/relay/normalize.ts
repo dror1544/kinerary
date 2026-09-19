@@ -64,7 +64,11 @@ export interface TelegramMessage {
    * reply chain started from — so the thread id alone does not mean a topic.
    */
   is_topic_message?: boolean;
-  reply_to_message?: { message_id?: number; from?: TelegramUser };
+  /**
+   * Telegram sends the whole replied-to message, attachment included — which
+   * is how "Liv, add this" in reply to a PDF can bring the PDF along.
+   */
+  reply_to_message?: TelegramMessage;
   /**
    * Telegram's two announcements of a group becoming a supergroup. The chat id
    * changes, so every routing key we hold for this chat is about to be stale.
@@ -183,7 +187,14 @@ export function displayName(user: TelegramUser | undefined): string | null {
 }
 
 export type NormalizeOutcome =
-  | { kind: "event"; event: WireMessageEvent; route: ChatRoute }
+  | {
+      kind: "event";
+      /** Text only. Media is attached by the caller, once it knows the turn goes to the assistant. */
+      event: WireMessageEvent;
+      route: ChatRoute;
+      /** What the message carries, as a reference — nothing has been downloaded. */
+      attachment: Attachment | null;
+    }
   | { kind: "dropped"; reason: "NO_MESSAGE" | "NO_CHAT_ID" | "NO_TEXT" | "FROM_BOT" | "UNROUTED" | "INTERVIEW" | "COMPANION_PENDING" };
 
 /**
@@ -295,50 +306,75 @@ export async function toWireEventWithMedia(
   deps?: MediaDeps,
 ): Promise<WireMessageEvent> {
   const event = toWireEvent(message, chatId, text, profile);
-  if (!attachment || !deps) return event;
+  if (!attachment) return event;
+  return attachMedia(event, [{ ...attachment, ...(message.caption ? { caption: message.caption } : {}) }], deps);
+}
 
-  const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
-  if (!file) {
-    // Degrade, never drop: the turn still goes over so the agent can say it
-    // could not read the file, rather than the organizer's upload vanishing.
-    // But it must not vanish from the LOGS too.
-    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
-      stage: "fetch",
-      kind: attachment.kind,
-      has_filename: Boolean(attachment.filename),
-    }));
-    return event;
-  }
+/**
+ * Re-hosts each attachment and adds it to an existing event, in order.
+ *
+ * The ONLY place an inbound file is downloaded, so it is called only for a
+ * turn that is going to an assistant. Each attachment carries the caption of
+ * the message it came from — not necessarily this event's message, when a
+ * held document joins the instruction that followed it.
+ *
+ * A failed download or store skips that one file and logs it: the turn still
+ * goes over, and the agent is told about exactly the files that arrived.
+ */
+export async function attachMedia(
+  event: WireMessageEvent,
+  attachments: ReadonlyArray<Attachment & { caption?: string }>,
+  deps?: MediaDeps,
+): Promise<WireMessageEvent> {
+  if (attachments.length === 0 || !deps) return event;
 
-  const id = deps.store.put({
-    kind: attachment.kind,
-    mime: file.mime || attachment.mime,
-    size: file.bytes.length,
-    ...(attachment.filename ? { filename: attachment.filename } : {}),
-    ...(message.caption ? { caption: message.caption } : {}),
-    bytes: file.bytes,
-  });
-  if (!id) {
-    deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
-      stage: "store",
-      kind: attachment.kind,
-      size: file.bytes.length,
-    }));
-    return event;
-  }
+  const urls: string[] = [];
+  const descriptors: NonNullable<WireMessageEvent["media"]> = [];
+  let firstKind: MediaKind | null = null;
+  for (const attachment of attachments) {
+    const file = await deps.telegram.fetchFile(attachment.fileId, MEDIA_MAX_BYTES);
+    if (!file) {
+      // Degrade, never drop: the turn still goes over so the agent can say it
+      // could not read the file, rather than the organizer's upload vanishing.
+      // But it must not vanish from the LOGS too.
+      deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+        stage: "fetch",
+        kind: attachment.kind,
+        has_filename: Boolean(attachment.filename),
+      }));
+      continue;
+    }
 
-  return {
-    ...event,
-    message_type: messageTypeFor(attachment.kind),
-    media_urls: [`${deps.baseUrl.replace(/\/$/, "")}/relay/media/${id}`],
-    media: [{
+    const id = deps.store.put({
       kind: attachment.kind,
       mime: file.mime || attachment.mime,
       size: file.bytes.length,
       ...(attachment.filename ? { filename: attachment.filename } : {}),
-      ...(message.caption ? { caption: message.caption } : {}),
-    }],
-  };
+      ...(attachment.caption ? { caption: attachment.caption } : {}),
+      bytes: file.bytes,
+    });
+    if (!id) {
+      deps.log?.(structuredLog("warn", "relay.media_rehost_failed", {
+        stage: "store",
+        kind: attachment.kind,
+        size: file.bytes.length,
+      }));
+      continue;
+    }
+
+    firstKind ??= attachment.kind;
+    urls.push(`${deps.baseUrl.replace(/\/$/, "")}/relay/media/${id}`);
+    descriptors.push({
+      kind: attachment.kind,
+      mime: file.mime || attachment.mime,
+      size: file.bytes.length,
+      ...(attachment.filename ? { filename: attachment.filename } : {}),
+      ...(attachment.caption ? { caption: attachment.caption } : {}),
+    });
+  }
+
+  if (firstKind === null) return event;
+  return { ...event, message_type: messageTypeFor(firstKind), media_urls: urls, media: descriptors };
 }
 
 /**
@@ -350,10 +386,16 @@ export async function toWireEventWithMedia(
  */
 export type ReachabilityCheck = (profile: string) => boolean;
 
+/**
+ * Downloads nothing. Whether an attachment is fetched depends on whether the
+ * turn is actually for the assistant, which is the relevance gate's call in
+ * dispatch.ts — so the outcome carries the attachment as a reference and the
+ * caller re-hosts it with `attachMedia` only after that gate has passed. Doing
+ * it here fetched every photo a family shared in its group, then dropped it.
+ */
 export async function normalizeUpdate(
   db: pg.Pool,
   update: TelegramUpdate,
-  deps?: MediaDeps,
   canReach?: ReachabilityCheck,
 ): Promise<NormalizeOutcome> {
   const message = update.message ?? update.edited_message;
@@ -414,8 +456,9 @@ export async function normalizeUpdate(
 
   return {
     kind: "event",
-    event: await toWireEventWithMedia(message, chatId, text, route.hermesProfile, attachment, deps),
+    event: toWireEvent(message, chatId, text, route.hermesProfile),
     route,
+    attachment,
   };
 }
 

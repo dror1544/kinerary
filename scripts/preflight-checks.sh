@@ -283,14 +283,61 @@ if [ -d "$HERMES_PROFILES" ]; then
   fi
 fi
 
+# ── B6 · hard rule 6 — this repo never names this deployment ─────────────────
+# `kinerary` says what and how; `kinerary-deploy` says where. The reason is
+# portability, not secrecy: the product has to run on k3s, on another Proxmox,
+# on hardware nobody here owns, and every value that names THIS house is one the
+# second deployment has to find and undo.
+#
+# A default is the dangerous shape, not a convenience — `compute.py` still
+# defaults to this laptop's Proxmox address, its SSH key name, and an ingress
+# host that was decommissioned. All three are overridden by provisioning.env
+# here, which is exactly why nobody notices; a deployment that forgets one env
+# var gets no error, just somebody else's home lab.
+#
+# SCOPE IS DELIBERATELY NARROW — code, not prose, and not tests. A runbook that
+# names the VM it is a runbook FOR is doing its job. A test fixture using
+# 192.168.1.10 to prove the canonical guardrail rejects private addresses needs
+# that literal to exist. Blocking those would make this check mostly
+# exceptions, and a check that is mostly exceptions teaches people to add one.
+DEPLOYMENT_PAT='/opt/(kinerary|kinerary-deploy|hermes-data|hermes-src|agent-auth)|kinerary-cp-[a-z]+-[0-9]|id_ed25519_[a-z]|debian@|192\.168\.[0-9]|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]'
+for f in ${REL+"${REL[@]}"}; do
+  case "$f" in
+    *.sh|*.py|*.mjs|*.js|*.ts) ;;
+    *) continue ;;
+  esac
+  # Tests, by PATH not by name: control-plane/deployment/vm-manual-test.sh is a
+  # script with "test" in its name and is exactly what this check is for.
+  case "$f" in
+    tests/*|*/tests/*|*.test.ts|*.test.js|*.test.mjs|test_*.py|*/test_*.py) continue ;;
+    # The detector, skipped BY PATH rather than by an allow-list entry. It has
+    # to contain the literals it searches for, and an entry in .preflight-allow
+    # is not enough: a harness that runs this script against a temp repo has no
+    # allow file, so `allowed` says no and the check reports itself. That is not
+    # hypothetical — tests/scripts/test_preflight_doc_paths.py does exactly
+    # that, and this is what it caught.
+    scripts/preflight-checks.sh) continue ;;
+  esac
+  [ -f "$f" ] || continue
+  allowed "$f" && continue
+  hit="$(grep -oE "$DEPLOYMENT_PAT" "$f" 2>/dev/null | sort -u | head -3 | tr '\n' ' ')"
+  [ -n "$hit" ] && block "hard rule 6 — names this deployment: $f ($hit)" \
+    "move the value into kinerary-deploy and read it from env/config at runtime; or record the exception, with its reason, in .preflight-allow"
+done
+
 # ── warnings ─────────────────────────────────────────────────────────────────
 if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
-  # A runbook or rule that names a path which no longer exists.
+  # A runbook or rule that names a path which no longer exists. A gitignored
+  # path is a build output or runtime directory (control-plane/api/dist,
+  # server/data): a fresh checkout or worktree never has one, so its absence
+  # says nothing about the doc. `$p/` too, because a directory-only pattern
+  # like `dist/` cannot match a path git has never seen as a directory.
   for doc in CLAUDE.md AGENTS.md README.md FRAMEWORK.md docs/landing-spa-test-runbook.md; do
     [ -f "$doc" ] || continue
     while read -r p; do
       [ -n "$p" ] || continue
-      [ -e "$p" ] || warn "$doc references a path that no longer exists: $p"
+      [ -e "$p" ] || git check-ignore -q "$p" || git check-ignore -q "$p/" \
+        || warn "$doc references a path that no longer exists: $p"
     done < <(grep -oE '`(control-plane|server|mcp|shared|scripts|site|web|provisioning)/[A-Za-z0-9_./-]+`' "$doc" \
              | tr -d '`' | sed 's#/$##' | sort -u)
   done

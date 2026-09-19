@@ -145,6 +145,41 @@ describe("correctIntake", () => {
     }
   });
 
+  test("a correction whose organizer is not exactly one roster traveller is refused, and writes nothing", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", {
+        ...CORRECTED_ANSWERS,
+        organizer_identity: { kind: "text", schema_version: 2, text: "Grandma Ruth" },
+      });
+      assert.equal(result.ok, false);
+      if (result.ok) throw new Error("unreachable");
+      assert.equal(result.reason, "ORGANIZER_NOT_ON_ROSTER");
+      const versions = await fix.pool.query("SELECT 1 FROM control_plane.intake_versions WHERE trip_id = $1", [fix.tripId]);
+      assert.equal(versions.rowCount, 1);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a correction records the organizer in the roster's own spelling", { skip: SKIP }, async () => {
+    const fix = await setupFixture(pool);
+    try {
+      const result = await correctIntake(pool, fix.tripId, "user:test", {
+        ...CORRECTED_ANSWERS,
+        organizer_identity: { kind: "text", schema_version: 2, text: "איתן" },
+      });
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("unreachable");
+      const row = await fix.pool.query<{ data: { organizer_identity: { text: string } } }>(
+        "SELECT data FROM control_plane.intake_versions WHERE id = $1", [result.versionId],
+      );
+      assert.equal(row.rows[0]?.data.organizer_identity.text, "Eitan");
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
   test("a retired question's answer survives a correction untouched", { skip: SKIP }, async () => {
     // JAPAN_ANSWERS is a pre-v3 intake: it carries group_size and
     // trip_duration, which the interview no longer asks. Correcting the

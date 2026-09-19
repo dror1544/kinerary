@@ -17,7 +17,15 @@
  *   POST /_control/message   {chatId, text, languageCode?}    they type
  *   POST /_control/document  {chatId, filename, mime, base64}  they send a file
  *   POST /_control/tap       {chatId, messageId, data}         they tap a button
+ *   POST /_control/join      {chatId, fromId, status?}         the bot is added to a group
  *   GET  /_control/sent?chatId=&after=                         what the bot said
+ *
+ * A negative `chatId` is a GROUP, where the trip is actually discussed and
+ * where a file has to earn the assistant's attention. There the sender is a
+ * person in the room rather than the chat itself, so `fromId` says who is
+ * talking, and `chatTitle` names the room. `message` and `document` also take
+ * `caption` and `replyToMessageId` (+ `replyToFileId` / `replyToFromId`), which
+ * is how "<assistant>, add this" in reply to a PDF is played.
  *
  * Loopback only. The relay sends the real bot token in every path; it is
  * accepted and never logged or stored.
@@ -40,7 +48,11 @@ const port = Number(process.argv[process.argv.indexOf("--port") + 1] || 4399);
 const BOT = { id: 7000000001, is_bot: true, first_name: "Kinerary", username: process.env.FAKE_BOT_USERNAME || "Kinerary_bot" };
 
 let nextUpdateId = 1;
-let nextMessageId = 1;
+// Message ids must not repeat ACROSS runs against the same chat. A companion's
+// gateway dedupes inbound by `telegram:<chat>:<message_id>`, so a second run
+// starting again at 1 had its first message — the organizer's document —
+// dropped as a replay, silently, with the agent never seeing it.
+let nextMessageId = Math.floor(Date.now() / 1000) % 1_000_000_000;
 let seq = 0;
 const updates: Update[] = [];
 const sent: Sent[] = [];
@@ -55,6 +67,18 @@ function push(update: Omit<Update, "update_id">): void {
 
 function person(chatId: string, languageCode = "en") {
   return { id: Number(chatId), is_bot: false, first_name: "E2E Organizer", language_code: languageCode };
+}
+
+/** The `document` field of a message carrying a file this stand-in already holds. */
+function documentOf(fileId: string): Record<string, unknown> {
+  const file = files.get(fileId);
+  if (!file) return {};
+  return {
+    document: {
+      file_id: fileId, file_unique_id: fileId, file_name: file.name,
+      mime_type: file.mime, file_size: file.bytes.length,
+    },
+  };
 }
 
 function buttonsOf(markup: unknown): { text: string; data: string }[] {
@@ -154,9 +178,27 @@ async function control(path: string, req: IncomingMessage, url: URL, res: Server
   }
   const p = await body(req);
   const chatId = String(p.chatId ?? "");
-  if (!/^\d{1,16}$/.test(chatId)) return bad(res, "chatId must be a private chat id");
-  const base = { message_id: nextMessageId++, date: Math.floor(Date.now() / 1000), chat: { id: Number(chatId), type: "private" },
-    from: person(chatId, String(p.languageCode ?? "en")) };
+  // A group id is negative on Telegram, a private one is the sender's own id.
+  // Both are accepted: a family group is where the trip is actually discussed,
+  // and a file posted there is the case the relay's relevance gate decides on.
+  const isGroup = chatId.startsWith("-");
+  if (!/^-?\d{1,16}$/.test(chatId)) return bad(res, "chatId must be a private chat id, or a negative group id");
+  // In a group the sender is a person in it, NOT the chat. `fromId` defaults to
+  // the chat for a DM, where Telegram makes them the same.
+  const fromId = String(p.fromId ?? (isGroup ? "" : chatId));
+  if (isGroup && !/^\d{1,16}$/.test(fromId)) return bad(res, "a group message needs fromId — who sent it");
+  const chat = isGroup
+    ? { id: Number(chatId), type: "supergroup", title: String(p.chatTitle ?? "Family trip") }
+    : { id: Number(chatId), type: "private" };
+  const base = {
+    message_id: nextMessageId++, date: Math.floor(Date.now() / 1000), chat,
+    from: person(fromId, String(p.languageCode ?? "en")),
+    ...(p.replyToMessageId
+      ? { reply_to_message: { message_id: Number(p.replyToMessageId), date: Math.floor(Date.now() / 1000), chat,
+          from: p.replyToFromId === undefined ? BOT : person(String(p.replyToFromId)),
+          ...(p.replyToFileId ? documentOf(String(p.replyToFileId)) : {}) } }
+      : {}),
+  };
   if (path === "/_control/message") {
     push({ message: { ...base, text: String(p.text ?? "") } });
     return ok(res, { queued: true, messageId: base.message_id });
@@ -166,9 +208,19 @@ async function control(path: string, req: IncomingMessage, url: URL, res: Server
     const fileId = `F${randomBytes(12).toString("hex")}`;
     const name = String(p.filename ?? "document");
     files.set(fileId, { path: `documents/${fileId}-${name}`, bytes, mime: String(p.mime ?? "application/octet-stream"), name });
-    push({ message: { ...base, document: { file_id: fileId, file_unique_id: fileId, file_name: name,
-      mime_type: String(p.mime ?? "application/octet-stream"), file_size: bytes.length } } });
-    return ok(res, { queued: true, fileId });
+    push({ message: { ...base, ...documentOf(fileId),
+      ...(p.caption ? { caption: String(p.caption) } : {}) } });
+    return ok(res, { queued: true, fileId, messageId: base.message_id });
+  }
+  if (path === "/_control/join") {
+    // The bot added to a group, as Telegram announces it: `my_chat_member`.
+    // `administrator` because that is what the organizer is told to do, and it
+    // is what lets the companion pin its welcome.
+    if (!isGroup) return bad(res, "only a group can be joined");
+    push({ my_chat_member: { chat, from: person(fromId),
+      old_chat_member: { user: BOT, status: "left" },
+      new_chat_member: { user: BOT, status: String(p.status ?? "administrator") } } });
+    return ok(res, { queued: true });
   }
   if (path === "/_control/tap") {
     push({ callback_query: { id: `Q${randomBytes(8).toString("hex")}`, from: base.from, chat_instance: chatId,

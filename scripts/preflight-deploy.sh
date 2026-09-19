@@ -18,7 +18,8 @@
 #       returned, never by name (scripts/teardown-trip.py). Nothing that existed
 #       before the run is touched.
 #
-#   --scenario japan|multi|manual|all|none   the trip to walk (default japan);
+#   --scenario japan|multi|manual|chaos|all|none   the trip to walk (default japan);
+#                                        chaos = an organizer who does not follow (needs --auto)
 #                                        none = deploy + automated checks only
 #   --auto                               an automated organizer plays the person
 #                                        (tools/auto-organizer.ts) through a
@@ -63,13 +64,17 @@ while [ $# -gt 0 ]; do
     --deploy) DEPLOY=1 ;;
     --cleanup) CLEANUP=1 ;;
     --auto) AUTO=1 ;;
-    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|all|none}"; shift ;;
+    --scenario) SCENARIO="${2:?--scenario needs japan|multi|manual|chaos|all|none}"; shift ;;
     -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
-case "$SCENARIO" in japan|multi|manual|all|none) ;; *) echo "--scenario must be japan|multi|manual|all|none" >&2; exit 2 ;; esac
+case "$SCENARIO" in japan|multi|manual|chaos|all|none) ;; *) echo "--scenario must be japan|multi|manual|chaos|all|none" >&2; exit 2 ;; esac
+if [ "$SCENARIO" = chaos ] && [ "$AUTO" = 0 ]; then
+  echo "--scenario chaos is the automated organizer misbehaving on purpose; it needs --auto" >&2
+  exit 2
+fi
 if [ "$SCENARIO" = all ] && [ "$AUTO" = 0 ]; then
   echo "--scenario all needs --auto: three interviews back to back are not a thing to ask a person for" >&2
   exit 2
@@ -304,7 +309,15 @@ E2E_ARGS=(--scenario "$SCENARIO")
 # -u: unbuffered. The stages print through Python while the organizer and the
 # teardown write straight to the same stream; buffered, a scenario's failure
 # line surfaced after the NEXT scenario's output, detached from its cause.
-python3 -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
+#
+# "$PY", not `python3`. This script builds a venv at the top precisely so its
+# Python tools have their dependencies, and then launched the longest-running
+# one of them with whatever PATH happened to offer. On 2026-09-18 that was a
+# stray `.venv-telegram-manager` (3.9.6, python.org framework, CA store never
+# populated): the cycle itself survived on it because everything it touches is
+# local HTTP, and the teardown it spawns died on the first HTTPS call, three
+# scenarios running, leaving three provisioned trips behind.
+"$PY" -u scripts/e2e-full-cycle.py "${E2E_ARGS[@]}"
 e2e=$?
 [ "$e2e" = 0 ] || { FAILED=1; exit "$e2e"; }
 if [ "$SCENARIO" = all ]; then walked="every scenario walked"; else walked="the $SCENARIO trip walked"; fi

@@ -53,7 +53,30 @@ DEPLOY = re.compile(
     # Tearing a trip down (container, DNS, proxy host, profile) is at least as
     # live as deploying one. Only --execute: its dry run is read-only, and a
     # prompt that fires on read-only commands teaches people to click through.
-    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b')
+    r'|' + CMDPOS + r'(?:sudo\s+)?(?:python3?\s+)?\S*teardown-trip\.py\b[^\n;&|]*--execute\b'
+    # The production control plane's release tool: every verb that moves the
+    # running version, the database, the trip bridges, or deletes a way back.
+    # Anywhere on the line, not only at a command position, because it is run
+    # through ssh ("ssh <host> sudo kinerary-cp-release upgrade …"). Its
+    # --dry-run, and status/plan/verify, stay prompt-free.
+    r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*'
+    r'\b(?:upgrade|rollback|prune|install|restart-bridges)\b'
+    # Whole-VM restore is plan-only unless --execute.
+    r'|\S*vm-restore-snapshot\.sh\b[^\n;&|]*--execute\b'
+    # Proxmox guest state. A snapshot freezes the guest's filesystems, a
+    # rollback discards data, an unlock clears the lock a stuck task left. Read
+    # verbs (listsnapshot, config, guest cmd …-status) do not match.
+    r'|\bqm\s+(?:snapshot|rollback|delsnapshot|unlock)\b'
+    # A vzdump into an NFS share froze the host's storage VM, every NFS mount and
+    # the control-plane VM on 2026-09-13; any vzdump, direct or over ssh, is a
+    # question for a person.
+    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b'
+    # Promoting a release to 'available' ships code. That is the pool
+    # generatePlan() selects from, so from this moment every trip built or
+    # rebuilt runs this tree — while trips already provisioned stay on the
+    # release they were pinned to. The earlier hops (candidate -> verified)
+    # are checkpoints and reach nobody, so only 'available' prompts.
+    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
 
 raw = strip_heredocs(sys.stdin.read())
 

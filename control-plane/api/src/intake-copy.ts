@@ -48,6 +48,28 @@ export function coerceLanguage(value: unknown): Language | null {
   return named[head] ?? null;
 }
 
+/**
+ * The language someone is WRITING in, when one message says so clearly — or
+ * null when it does not.
+ *
+ * 2026-09-15, live: an organizer whose Telegram app was set to English wrote
+ * the whole interview in Hebrew. The session started from the app's language (a
+ * hint, by design) and nothing on the agentless path ever replaced it with what
+ * they actually wrote, so the interview, the site and the companion were all
+ * built English.
+ *
+ * Deliberately lopsided. Any Hebrew letter means Hebrew: someone writing in
+ * English does not type Hebrew by accident. English needs a sentence (three
+ * words), because a Hebrew speaker types "Tokyo", "Airbnb" or a flight number
+ * all the time and that is not a change of language. Digits, dates and one or
+ * two English words say nothing, and leave the language as it is.
+ */
+export function writtenLanguage(text: string): Language | null {
+  if (/[\u05d0-\u05ea]/u.test(text)) return "he";
+  const englishWords = text.match(/[A-Za-z]{2,}/g) ?? [];
+  return englishWords.length >= 3 ? "en" : null;
+}
+
 type Localised = Record<Language, string>;
 
 interface QuestionCopy {
@@ -56,6 +78,11 @@ interface QuestionCopy {
   /** Short noun for the recap line — a recap of fifteen full questions is unreadable. */
   recap: Localised;
   options?: Record<string, Localised>;
+  /**
+   * Asking again when an answer is on record but does not settle the question
+   * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
+   */
+  unsettled?: Localised;
 }
 
 export const INTAKE_COPY: Record<string, QuestionCopy> = {
@@ -83,6 +110,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
   return_date: {
     ask: { en: "What day does everyone head home?", he: "מתי חוזרים הביתה?" },
     recap: { en: "Ends", he: "תאריך חזרה" },
+    unsettled: {
+      en: "You gave {answer} as the day you head home, but that is before the trip starts. When does everyone head home?",
+      he: "רשמתי {answer} כיום החזרה, אבל זה לפני שהטיול מתחיל. מתי חוזרים הביתה?",
+    },
   },
   timezone: {
     ask: {
@@ -156,10 +187,14 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
   },
   dietary_scope: {
     ask: {
-      en: "Do those apply to everyone, or to particular people?",
-      he: "זה נוגע לכולם או לאנשים מסוימים?",
+      en: "Who does that apply to? Tap a name, or everyone.",
+      he: "למי זה נוגע? אפשר ללחוץ על שם, או על כולם.",
     },
     recap: { en: "Who that applies to", he: "למי זה נוגע" },
+    unsettled: {
+      en: "“{answer}” doesn't tell me which traveller that is. Tap the name, or everyone.",
+      he: "״{answer}״ לא אומר לי על מי מהנוסעים מדובר. אפשר ללחוץ על השם, או על כולם.",
+    },
   },
   dietary_visibility: {
     ask: {
@@ -174,10 +209,14 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
   },
   organizer_identity: {
     ask: {
-      en: "Which of the travellers are you? This opens your private organizer channel with the assistant.",
-      he: "מי מהנוסעים זה אתה? זה פותח לך ערוץ מארגן פרטי מול העוזר.",
+      en: "Which of the travellers are you? Tap your name — this opens your private organizer channel with the assistant.",
+      he: "מי מהנוסעים זה אתה? אפשר ללחוץ על השם שלך — זה פותח לך ערוץ מארגן פרטי מול העוזר.",
     },
     recap: { en: "Organizer", he: "המארגן" },
+    unsettled: {
+      en: "“{answer}” doesn't match any of the names in the travellers list. Which of them are you? Tap your name.",
+      he: "״{answer}״ לא תואם לאף אחד מהשמות ברשימת הנוסעים. מי מהם זה אתה? אפשר ללחוץ על השם שלך.",
+    },
   },
   bot_name: {
     ask: {
@@ -277,6 +316,28 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     otherPrefix: "Other",
     essentialsDone: "That's everything I actually need — the rest is optional. A few more questions let me tailor your assistant to the group: how you like to travel, what people eat, who to keep an eye on. Answer as many or as few as you like, and press Finished whenever you've had enough.",
     askMore: "➕ A few more questions",
+    // THE BOUNDARY, SAID AGAIN SHORT. `essentialsDone` is a paragraph, and a
+    // paragraph is right once — it explains what the optional questions are
+    // for. Every return to the same choice after that is a short question, or
+    // the interview starts reading like a machine repeating itself.
+    //
+    // Said after a message that ADDED something ("we also want a day at
+    // Disney"): the detail is recorded, the choice is still open, and nothing
+    // here suggests they failed to follow anything — because they did not.
+    moreOrSummary: "Anything else you'd like to add, or shall I put it all together?",
+    // Said when the reading came back genuinely two-sided. It asks rather than
+    // guesses, and the two buttons are still underneath it.
+    notSureMoreOrDone: "I want to make sure I've got you — a few more questions, or shall I show you the summary?",
+    // Said when the reading leans one way without being sure of it. A person
+    // who meant it answers "yes" and is a single message from where they were
+    // going; a person who did not is a single message from the other exit.
+    confirmFinish: "Sounds like that's everything — shall I put your summary together?",
+    confirmMore: "Sounds like there's more to add — shall I carry on with a few more questions?",
+    // The boundary's own "no": it declines the OPTIONAL questions, which is
+    // not the same as "Finished" — nothing has finished yet, and an organizer
+    // reading that button was being asked to end an interview they were in
+    // the middle of.
+    skipOptional: "⤼ Skip",
     documentOffer: "Before we start on details — if you already have a plan, a booking confirmation, tickets or a spreadsheet for this trip, send it here and I'll read it instead of making you type it all out.",
     noDocument: "I don't have one",
     // Typed a command mid-interview. Router-owned like every other command:
@@ -332,6 +393,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // to wonder whether their answers survived. It reads as one person
     // gathering the thread again, because from their side it is.
     resumed: "Let's pick this back up.",
+    scopeEveryone: "Everyone on the trip",
     // Said when the organizer wrote something that did not answer the question
     // still on screen. It has to exist because "never send the same message
     // twice" would otherwise make the router silent at exactly the moment the
@@ -480,6 +542,11 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     otherPrefix: "אחר",
     essentialsDone: "זה כל מה שבאמת צריך — מכאן זה רשות. עוד כמה שאלות יעזרו לי להתאים את העוזר לקבוצה: איך אתם אוהבים לטייל, מה אוכלים, על מי לשים לב. תענו על כמה שבא לכם, ותלחצו סיים מתי שתרצו.",
     askMore: "➕ עוד כמה שאלות",
+    moreOrSummary: "יש עוד משהו שתרצו להוסיף, או שנרכיב את הכול לסיכום?",
+    notSureMoreOrDone: "רק שאדע שהבנתי נכון — עוד כמה שאלות, או שאראה לכם סיכום?",
+    confirmFinish: "נשמע שזה הכול — להרכיב לכם את הסיכום?",
+    confirmMore: "נשמע שיש עוד מה להוסיף — להמשיך בעוד כמה שאלות?",
+    skipOptional: "⤼ דלג",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
     notMyCommand: "זו לא פקודה שלי — פשוט ענו כאן בצ'אט, או השתמשו בכפתורים.",
@@ -503,6 +570,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
       "אז שלחו לי מה שכבר יש לכם, או פשוט כתבו \"בואו נתחיל\" ואני אמשיך משם.",
     ].join("\n"),
     resumed: "נמשיך מכאן.",
+    scopeEveryone: "כל מי שנוסע",
     beforeWeFinish: "לפני שאוכל להרכיב לכם את הטיול, נשאר דבר אחד שאני צריך:",
     confirmMeans: "אישור מתחיל את ההקמה: אתר הטיול שלכם, והעוזר.",
     intakeConfirmed: "זהו, יש לי הכול — תודה. אני מקים לכם עכשיו את אתר הטיול, וזה לוקח קצת זמן. כשיהיה מוכן, {name} יכתוב לכם לכאן עם הקישור.",
@@ -615,6 +683,17 @@ function pick(localised: Localised | undefined, language: Language): string | nu
 /** The sentence to put to the organizer. Falls back to the agent-facing prompt. */
 export function askText(question: IntakeQuestion, language: Language = DEFAULT_LANGUAGE): string {
   return pick(INTAKE_COPY[question.id]?.ask, language) ?? question.prompt;
+}
+
+/**
+ * Asking again for a question whose recorded answer does not settle it, quoting
+ * what was written. Falls back to the plain question.
+ */
+export function unsettledText(question: IntakeQuestion, written: string, language: Language = DEFAULT_LANGUAGE): string {
+  const template = pick(INTAKE_COPY[question.id]?.unsettled, language);
+  // A stored date is YYYY-MM-DD; an organizer is never shown that form.
+  const answer = readableDate(written, language) ?? written.trim();
+  return template ? template.replace("{answer}", answer) : askText(question, language);
 }
 
 /** The short noun for a recap line. Falls back to the sentence, then the prompt. */
