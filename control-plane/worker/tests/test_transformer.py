@@ -1299,8 +1299,8 @@ class DeriveBookingsTests(unittest.TestCase):
         intake = {
             **self.PHASED_INTAKE,
             "travel_anchors": _structured([
-                {"type": "activity", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
-                {"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "TK-2"},
+                {"type": "attraction", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
+                {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "TK-2"},
             ]),
         }
         rows = {b["name"]: b for b in self._bookings(intake) if b["type"] == "attraction"}
