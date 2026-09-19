@@ -286,7 +286,19 @@ the chain is duplicated in `profile-templates/kinerary-extract/render_extract.py
 `render_extract.py` writes. Fixing only the YAML changes nothing. No comparison
 run is trustworthy until this is honest.
 
-**Step 1 — the harness.** Extend `control-plane/api/tools/extract-intake-eval.mjs`:
+**Step 1 — inherit the instrumentation from PR #92, do not write it.** Verified
+2026-09-19: #92 already threads
+`ModelUsage {inputTokens, outputTokens, totalTokens, costUsd, costKind}` through
+all four backends, surfaces it on every result beside `attempts` and `ms`, and
+reads `payload.usage` in `callOpenRouter` instead of discarding it
+(`model-runner.ts:50-78`, `:879`). It even carries
+`costKind: "billed" | "api_equivalent"` — the distinction that stops a
+Claude-CLI subscription call being reported as money spent. Writing this
+separately means writing it twice on top of a +537/−66 rewrite of the one file
+that decides which model reads an organizer's documents. **This reverses the
+order: #92's model-runner work goes first, and track 3 builds on it.**
+
+**Step 1b — the harness.** Extend `control-plane/api/tools/extract-intake-eval.mjs`:
 a `--label` per model config, cost emitted alongside the `ms` and `attempts` it
 already records, run across candidate models for the three pinnable tasks.
 Prerequisites inside the product: record **which runner/model produced each
@@ -381,12 +393,47 @@ Findings that exist **right now**, before any sweep:
 #89 trip data dir by id · #90 verified chat binding (current branch) · #91 Codex
 isolation · #92 document intake · #95 organizer invite links.
 
-**#92 goes through the `regression-planner` agent before any land/split call.**
-It claims all fourteen of #49–#62 on one branch, and #91 claims #58 as well. The
-assessment needs to say: which of the fourteen it genuinely closes, what its
-migration does to live rows, which trips and accounts feel it and when, and what
-must be tested alone rather than batched. Land-or-split follows from that, not
-from the PR description.
+**#92 was assessed on 2026-09-19 and the decision is: unbundle it, do not land
+it whole.** Report: `docs/test-reports/pr92-regression-assessment-2026-09-19.md`.
+It targets `integration/sprint-6` (as do all five open PRs), so production sits
+behind sprint-6 → main → a `kinerary-cp-release` upgrade.
+
+**The agreed plan:**
+
+1. **Land #91 first for #58, then rebase #92 onto it** — not revert; both export
+   the same two symbols. They are complementary, not duplicate: #91 has an env
+   *allowlist* and `--ignore-user-config`, #92 a *denylist* and a startup
+   isolation probe #91 lacks. Measured against a fake `codex` that records its
+   own environment, #92's child saw the relay secrets and #91's saw `null` —
+   while #92's `compose.vm.yml` makes codex the **default** for both document
+   tasks. Keep #92's startup probe.
+2. **Slice A — reader, parser, gate — ships first.** `answer-merge.ts` has
+   **zero imports**, so it ships with no registry, store, migration or worker:
+   132 tests in 4.7s, nothing one-way. Closes eight of the defects.
+3. **Slice B — registry, store, migrations, worker — waits** behind NFS
+   provisioning, which lands as its own verified change first.
+
+**Do not treat #62 as open work.** The `travel_anchors` prompt is already
+widened inside #92 ("flights, trains, hotels, cars, tickets or tours",
+`interview.ts:525`, with a comment citing #62) even though the PR body declares
+it open. Picking it up separately duplicates a prompt change on a file #92
+rewrites. This is the exact trap this track exists to catch.
+
+**Two risks that are not #92's alone.** All nine migrations `0050`–`0058` lack
+the required `-- rollback:` header, five of them already on `integration/sprint-6`;
+`vm-release.py:300` treats missing as `breaking`, which converts a rollback from
+"redeploy the previous image" into "restore the dump and lose every write since",
+on a stack with a real organizer. Fixing it is nine comment lines and is
+**provably inert** — `applyMigrations` tracks `(version, applied_at)` keyed on
+filename with no checksum (`migrations.ts:14-28`), so an applied migration is
+skipped and never re-read.
+
+And `${KINERARY_NFS_ROOT:?…}` appears twice in `compose.vm.yml`. Verified
+2026-09-19: the variable exists in neither `main`, nor `integration/sprint-6`,
+nor `kinerary-deploy`, and the VM has **no NFS mount at all**. Unresolvable, it
+stops `docker compose` *parsing* — so API, worker, relay and every bound chat go
+down together. That is unprovisioned infrastructure, not a misconfiguration, and
+it is the reason Slice B waits.
 
 ### Get `integration/sprint-6` onto `main`
 Migration `0053` and the group reply-capture work (PR #64) exist **only** on the
