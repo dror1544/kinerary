@@ -325,6 +325,50 @@ for f in ${REL+"${REL[@]}"}; do
     "move the value into kinerary-deploy and read it from env/config at runtime; or record the exception, with its reason, in .preflight-allow"
 done
 
+# ── B7 · migration naming and the rollback contract ──────────────────────────
+# Three failures, each silent in its own way.
+#
+# 1. applyMigrations only sees /^\d+_.+\.sql$/ (control-plane/api/src/migrations.ts).
+#    A .sql file in that directory whose name does not match is not rejected —
+#    it is IGNORED. The migration simply never runs, on every stack, forever.
+# 2. Sequential numbers are allocated by hand, so two branches pick the same
+#    one. 0054 existed three different ways at once on 2026-09-19, and the repo
+#    had already renumbered twice before that. New migrations therefore use
+#    YYYYMMDDHHMMSS_description.sql: two branches would have to be created in
+#    the same second to collide. Ordering is preserved because `version` is the
+#    whole filename and the sort is lexicographic, so every legacy 00xx_ still
+#    sorts before any timestamp. Legacy names are grandfathered — renaming an
+#    APPLIED migration would make production re-run it.
+# 3. vm-release.py treats a migration with no `-- rollback:` header as
+#    `breaking`, which makes a rollback discard the database rather than keep
+#    it. Missing is not neutral; it is the destructive default.
+#
+# 2 and 3 apply only to migrations this change ADDS: the existing tree is
+# grandfathered, which is why --all stays quiet on 50 headerless legacy files.
+for f in ${REL+"${REL[@]}"}; do
+  case "$f" in control-plane/db/migrations/*.sql) ;; *) continue ;; esac
+  base="${f##*/}"
+  allowed "$f" && continue
+
+  case "$base" in
+    [0-9]*_*.sql) ;;
+    *) block "migration is invisible to the migrator: $f" \
+             "applyMigrations matches ^[0-9]+_<name>.sql — this file would be skipped silently, not rejected"
+       continue ;;
+  esac
+
+  # Already in HEAD means already shipped: grandfathered, and never renamed.
+  git cat-file -e "HEAD:$f" 2>/dev/null && continue
+
+  printf '%s' "$base" | grep -qE '^[0-9]{14}_.+\.sql$' \
+    || block "new migration does not use a timestamp name: $f" \
+             "name it YYYYMMDDHHMMSS_description.sql — hand-allocated numbers collide across branches (see docs/migrations.md)"
+
+  [ -f "$f" ] && ! grep -qE '^--[[:space:]]*rollback:[[:space:]]*(compatible|breaking)[[:space:]]*[-—]' "$f" \
+    && block "new migration declares no rollback contract: $f" \
+             "first line: -- rollback: compatible|breaking — <why>. Absent, vm-release.py treats it as breaking and a rollback DISCARDS the database"
+done
+
 # ── warnings ─────────────────────────────────────────────────────────────────
 if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
   # A runbook or rule that names a path which no longer exists. A gitignored

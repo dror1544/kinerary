@@ -348,9 +348,18 @@ Change the VM's version **only** with `sudo kinerary-cp-release upgrade|rollback
 (always `--dry-run` first) — never by hand-editing `KINERARY_REV`. It snapshots
 the VM from the Proxmox host (never vzdump, never NFS), dumps the database, and
 records the way back; the `trip-monitor` agent can request the same through a
-gate only Dror's one-time code approves. Every new migration must start with
-`-- rollback: compatible|breaking — <why>`. Runbook: "Upgrades and rollback" in
+gate only Dror's one-time code approves. Runbook: "Upgrades and rollback" in
 `docs/control-plane-vm-deployment.md`.
+
+**Migrations: `docs/migrations.md`, and preflight check B7 enforces it.** Two
+rules bite hardest. A new migration is named `YYYYMMDDHHMMSS_description.sql`,
+never a hand-allocated number — `0054` existed three ways at once on
+2026-09-19, after the repo had already renumbered twice to escape the same
+thing. And it must start with `-- rollback: compatible|breaking — <why>`,
+because absent is not neutral: `vm-release.py` reads a missing header as
+`breaking` and a rollback then *discards the database* instead of keeping it.
+Legacy `00xx_` names are grandfathered permanently — the version is the whole
+filename, so renaming an applied migration makes production run it again.
 
 ### A Mac-provisioned companion that cannot read its own trip
 
