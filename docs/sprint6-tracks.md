@@ -54,6 +54,26 @@ Ordered biggest-blank-first. Item 1 is also the content source for 1c phase 2,
 which is why it leads.
 
 1. **Destination info is blank** — Health, Money, Communication, Hospitals, Age notes are rendered (`trip-web/src/readiness.tsx:26-28,197,208`) and never populated. `transformer.py:304-315` states the enrichment pass "was never implemented or wired into this provisioner"; `enrichment._country_entry` emits only flag/capital/currency/callingCode/emergency.
+
+   **Decided 2026-09-19.** Four things, and the third is what makes this cheap:
+
+   - **Deterministic first, a model only at the gaps.** Facts from APIs as `enrichment.py` already does (countries.dev, Nominatim, Wikipedia, emergencynumberapi — it is deliberately model-free today); prose from a model only where no API can answer. Mark which is which in the data, so the site can show provenance and a wrong model line is traceable to its source.
+   - **Hospitals are dropped.** `info.hospitals` stays unrendered. Emergency numbers already come from a real source and are what actually matters in an emergency; a plausible-but-wrong hospital is a failure mode not worth carrying. Health, money and communication stay — they are advisory and lower-stakes.
+   - **The content is shared across trips, not built per trip.** The first trip to a country pays for it; every later trip to the same country reads the stored row. **This store already exists**: `control_plane.country_reference` (`db/migrations/0023_country_reference.sql`) was built as exactly this — *"facts that are true of a destination country regardless of which trip is asking"*, filled once by a web search at interview time and *"reused: every later trip to the same pair reads the row instead of searching again"*, read by `enrich_config` at provision time (`worker/__main__.py:281-291`, `enrichment.py:380`). It carries `fetched_at` already. It simply holds nothing but consular contacts today. Extend it rather than building a second cache.
+   - **Re-verify monthly.** `fetched_at` makes staleness visible and **nothing refreshes it** — there is no job, anywhere, that revisits a `country_reference` row. That refresh is part of this item, not a follow-on.
+   - **Granularity: country base with phase overrides.** National facts once; phase-level additions where they genuinely differ.
+
+   **Open schema question to settle first.** `country_reference`'s primary key is
+   `(destination_country, home_country)`, because which embassy matters depends
+   on the traveler's nationality. Health, money and communication are
+   destination-only, so storing them in that table duplicates them once per home
+   country and invites the copies to drift apart. Either a second table keyed by
+   destination alone, or a deliberate acceptance of the duplication — decide
+   before writing the migration, not after.
+
+   **Cost note, for track 3:** this design makes the model spend
+   *per-country-per-month* rather than per-trip, which is the difference between
+   a cost that grows with customers and one that grows with the world.
 2. **No pre-trip tasks** — Readiness reads `config.tasks`; the transformer never emits it. FRAMEWORK feature #8. Undocumented anywhere until now.
 3. **No per-phase packing lists** — `phase.packing` never emitted; a hardcoded 4-item fallback shows. FRAMEWORK #16.
 4. **No RSVP activities** — `phase.rsvp_activities` never emitted, so the whole RSVP surface is invisible. FRAMEWORK #11. Corroborated by the live-trip report: *"RSVP/trivia features: unused"*.
@@ -448,6 +468,7 @@ folded into any of them — burying it makes the sprint's exit criterion invisib
 **Track 2 — does the product work**
 - Audience is **the business**, so data gathering leads and the dashboard exists to read it.
 - First question: **is the assistant actually helping** — the outcome events.
+- The live-trip families are **consenting alpha testers**: their data may be read for evaluation, their trip contents must **never** be altered (bug fixes excepted), and a metadata policy that removes the need to know the exact source is to be defined later.
 - **Measure the live trip (Nir's) by hand, first**, using the evaluation skill's 8-step workflow. It needs no instrumentation, it gives a real baseline in week one, and it is the design input for the event vocabulary. Re-score the same trip at sprint end.
 - Dashboard: **built as specified**, not wrapped around the fleet monitor.
 - Accounts: **organizer web signup only.** Member login on provisioned sites stays a standing gap.
