@@ -118,3 +118,46 @@ accepts either a hyphen or an em dash before the reason.
 
 Nothing in `--all` fires on the existing tree; the rules that could are scoped
 to migrations a change adds.
+
+## Where B7 is enforced — and the one place it deliberately is not
+
+| Path | Runs | B7 |
+|---|---|---|
+| `git commit` | `preflight-checks.sh --staged` via `.githooks/pre-commit` | ✅ |
+| `git merge` creating a commit | `--staged` via `.githooks/pre-merge-commit` | ✅ |
+| `scripts/preflight-deploy.sh` | `--all` | ✅ |
+| Claude Code `Write` | `--paths` | ❌ *by design* |
+| CI (`control-plane.yml`) | tsc, tests | ❌ *cannot* |
+
+**`git merge` does not run `pre-commit`.** Git fires `pre-merge-commit`
+instead, and the repo had only the former until 2026-09-19 — so every blocking
+rule had a hole shaped like an integration branch. It matters most for B7,
+because a migration arriving by merge is in `HEAD` before anything inspects it
+and is grandfathered from then on. The hook closes it; a fast-forward merge
+needs no hook, since it creates no commit and moves only commits already
+checked where they were written.
+
+The subtle part is that a merge can introduce content that was never committed
+anywhere: **conflict resolution**. Those edits are written into the merge
+commit without `pre-commit` ever seeing them.
+
+**`--paths` is a fast, non-authoritative steer, not a gate.** It is the Claude
+Code `Write` hook, and it returns after B4 so that writing a file stays cheap.
+It is safe precisely *because* it is not final: nothing reaches a branch
+without passing `--staged` at commit or merge. Do not add B7 to it and do not
+treat a clean `--paths` as evidence — testing a migration with
+`preflight-checks.sh --paths <file>` will look clean no matter how wrong the
+file is. Use `--staged`.
+
+**CI cannot make this judgment, and should not pretend to.** The rule needs to
+know whether a migration has *already been applied somewhere*. Git can only
+answer "is it new relative to some ref", and on a long-lived integration branch
+those differ: measured against `main`, sprint-6's `0050`–`0054` all look new,
+and a CI check built that way demands renaming migrations production has
+already run — the one thing that breaks it. CI has no database access on
+purpose, so it cannot know better. The hooks answer correctly because the ref
+they compare against is the branch the file is actually entering.
+
+The residual gap is a clone that never ran `git config core.hooksPath
+.githooks`. That is the same single point of failure every rule here shares,
+and it is why the setup line is in `CLAUDE.md` rather than a comment.

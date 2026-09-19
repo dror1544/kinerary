@@ -451,6 +451,12 @@ Every rule in "Hard Rules" above is now checked by
 
 - **`.githooks/pre-commit`** — every commit, whoever makes it (Codex, Hermes,
   a plain `git commit`). Enable once per clone: `git config core.hooksPath .githooks`.
+- **`.githooks/pre-merge-commit`** — the same checks on the path that skips
+  them. `git merge` does **not** run `pre-commit`; git fires this instead. Until
+  2026-09-19 only the former existed, so every blocking rule had a hole shaped
+  like an integration branch — work is written on a feature branch and arrives
+  by merge, and a merge can also carry content committed nowhere else: conflict
+  resolution.
 - **`.claude/settings.json` hooks** — Claude Code, early enough to steer rather
   than refuse. `git commit` and deploy verbs additionally become a *prompt*
   every time, because rules 1 and 2 are about intent and no script can check

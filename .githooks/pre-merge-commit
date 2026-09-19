@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# .githooks/pre-merge-commit — the same hard rules, on the path that skips them.
+#
+# `git merge` does NOT run pre-commit. Git fires this hook instead, and only
+# when the merge actually creates a commit. Without it every blocking rule in
+# preflight-checks.sh has a hole shaped exactly like an integration branch:
+# work is written on a feature branch and arrives in the target by merge, so
+# the one moment the rules are checked is the one moment that never happens.
+#
+# Verified rather than assumed, 2026-09-19: a `git merge --no-ff` of a branch
+# adding a migration ran pre-commit zero times and put the file straight into
+# HEAD.
+#
+# That ordering is what makes it serious for B7 in particular. B7 scopes its
+# naming and rollback-contract rules to files NOT in HEAD, because renaming an
+# already-applied migration makes production run it a second time. A migration
+# that arrives by merge is therefore in HEAD before anything inspects it, and
+# is grandfathered from then on — the check does not fail, it goes quiet, which
+# is the failure mode this repository keeps paying for.
+#
+# A fast-forward merge needs no hook: it creates no commit, and every commit it
+# moves onto the branch was already checked where it was written.
+#
+# To bypass for a genuine emergency:  git merge --no-verify
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CHECKS="$REPO_ROOT/scripts/preflight-checks.sh"
+[ -x "$CHECKS" ] || exit 0
+
+# During this hook the index already holds the merge result, so --staged sees
+# exactly what the merge is about to introduce and nothing else.
+if ! "$CHECKS" --staged; then
+  echo
+  echo "merge refused — see the BLOCK lines above (CLAUDE.md 'Hard Rules')." >&2
+  echo "override only if you know why:  git merge --no-verify" >&2
+  exit 1
+fi

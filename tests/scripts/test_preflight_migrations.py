@@ -108,5 +108,60 @@ class GrandfatheredTree(unittest.TestCase):
         self.assertTrue(headerless, "no headerless legacy migrations left — scoping is untested")
 
 
+
+class MergeIsAlsoGated(unittest.TestCase):
+    """`git merge` does not run pre-commit — it runs pre-merge-commit.
+
+    Until 2026-09-19 the repo shipped only pre-commit, so every blocking rule
+    was bypassable by arriving through a merge. That matters most for B7:
+    scoping is by "already in HEAD", and a migration that arrives by merge is
+    in HEAD before anything looks at it, so it would be grandfathered rather
+    than refused. A merge can also introduce content committed nowhere else —
+    conflict resolution.
+    """
+
+    HOOK = REPO / ".githooks/pre-merge-commit"
+
+    def test_the_hook_is_shipped_and_executable(self):
+        self.assertTrue(self.HOOK.exists(), "pre-merge-commit is missing — merges bypass every rule")
+        self.assertTrue(self.HOOK.stat().st_mode & 0o111, "pre-merge-commit is not executable")
+
+    def test_it_runs_the_same_checks_as_a_commit(self):
+        body = self.HOOK.read_text(encoding="utf-8")
+        self.assertIn("preflight-checks.sh", body)
+        self.assertIn("--staged", body, "must use --staged; --paths returns after B4 and would pass anything")
+
+    def test_git_really_fires_this_hook_on_a_merge(self):
+        """The load-bearing assumption. If git ever stopped firing it, the hook
+        would sit in the tree looking like protection while protecting nothing."""
+        import tempfile
+
+        def git(*args, cwd):
+            return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, hooks = Path(tmp) / "r", Path(tmp) / "h"
+            hooks.mkdir()
+            (hooks / "pre-merge-commit").write_text('#!/bin/sh\necho FIRED >&2\nexit 1\n', encoding="utf-8")
+            (hooks / "pre-merge-commit").chmod(0o755)
+            repo.mkdir()
+            git("init", "-q", ".", cwd=repo)
+            for k, v in (("user.email", "t@t"), ("user.name", "t"), ("core.hooksPath", str(hooks))):
+                git("config", k, v, cwd=repo)
+            (repo / "a.txt").write_text("base", encoding="utf-8")
+            git("add", "-A", cwd=repo); git("commit", "-qm", "base", cwd=repo)
+            git("checkout", "-qb", "feature", cwd=repo)
+            (repo / "b.txt").write_text("x", encoding="utf-8")
+            git("add", "-A", cwd=repo); git("commit", "-qm", "feat", cwd=repo)
+            git("checkout", "-q", "-", cwd=repo)
+            (repo / "c.txt").write_text("y", encoding="utf-8")
+            git("add", "-A", cwd=repo); git("commit", "-qm", "other", cwd=repo)
+
+            before = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            merged = git("merge", "--no-ff", "feature", "-m", "m", cwd=repo)
+            self.assertIn("FIRED", merged.stderr, "git did not run pre-merge-commit on a merge")
+            after = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+            self.assertEqual(before, after, "a refusing hook did not stop the merge commit")
+
 if __name__ == "__main__":
     unittest.main()
