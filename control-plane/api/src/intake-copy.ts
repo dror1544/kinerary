@@ -320,6 +320,23 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     otherPrefix: "Other",
     essentialsDone: "That's everything I actually need — the rest is optional. A few more questions let me tailor your assistant to the group: how you like to travel, what people eat, who to keep an eye on. Answer as many or as few as you like, and press Finished whenever you've had enough.",
     askMore: "➕ A few more questions",
+    // THE BOUNDARY, SAID AGAIN SHORT. `essentialsDone` is a paragraph, and a
+    // paragraph is right once — it explains what the optional questions are
+    // for. Every return to the same choice after that is a short question, or
+    // the interview starts reading like a machine repeating itself.
+    //
+    // Said after a message that ADDED something ("we also want a day at
+    // Disney"): the detail is recorded, the choice is still open, and nothing
+    // here suggests they failed to follow anything — because they did not.
+    moreOrSummary: "Anything else you'd like to add, or shall I put it all together?",
+    // Said when the reading came back genuinely two-sided. It asks rather than
+    // guesses, and the two buttons are still underneath it.
+    notSureMoreOrDone: "I want to make sure I've got you — a few more questions, or shall I show you the summary?",
+    // Said when the reading leans one way without being sure of it. A person
+    // who meant it answers "yes" and is a single message from where they were
+    // going; a person who did not is a single message from the other exit.
+    confirmFinish: "Sounds like that's everything — shall I put your summary together?",
+    confirmMore: "Sounds like there's more to add — shall I carry on with a few more questions?",
     // The boundary's own "no": it declines the OPTIONAL questions, which is
     // not the same as "Finished" — nothing has finished yet, and an organizer
     // reading that button was being asked to end an interview they were in
@@ -533,6 +550,10 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     otherPrefix: "אחר",
     essentialsDone: "זה כל מה שבאמת צריך — מכאן זה רשות. עוד כמה שאלות יעזרו לי להתאים את העוזר לקבוצה: איך אתם אוהבים לטייל, מה אוכלים, על מי לשים לב. תענו על כמה שבא לכם, ותלחצו סיים מתי שתרצו.",
     askMore: "➕ עוד כמה שאלות",
+    moreOrSummary: "יש עוד משהו שתרצו להוסיף, או שנרכיב את הכול לסיכום?",
+    notSureMoreOrDone: "רק שאדע שהבנתי נכון — עוד כמה שאלות, או שאראה לכם סיכום?",
+    confirmFinish: "נשמע שזה הכול — להרכיב לכם את הסיכום?",
+    confirmMore: "נשמע שיש עוד מה להוסיף — להמשיך בעוד כמה שאלות?",
     skipOptional: "⤼ דלג",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",

@@ -57,7 +57,7 @@ DEPLOY = re.compile(
     # The production control plane's release tool: every verb that moves the
     # running version, the database, the trip bridges, or deletes a way back.
     # Anywhere on the line, not only at a command position, because it is run
-    # through ssh ("ssh debian@vm sudo kinerary-cp-release upgrade …"). Its
+    # through ssh ("ssh <host> sudo kinerary-cp-release upgrade …"). Its
     # --dry-run, and status/plan/verify, stay prompt-free.
     r'|\S*(?:vm-release\.py|kinerary-cp-release)\b(?![^\n;&|]*--dry-run\b)[^\n;&|]*'
     r'\b(?:upgrade|rollback|prune|install|restart-bridges)\b'
@@ -70,7 +70,13 @@ DEPLOY = re.compile(
     # A vzdump into an NFS share froze the host's storage VM, every NFS mount and
     # the control-plane VM on 2026-09-13; any vzdump, direct or over ssh, is a
     # question for a person.
-    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b')
+    r'|(?:' + CMDPOS + r'|\bssh\b[^\n;&|]*\s)(?:sudo\s+)?vzdump\b'
+    # Promoting a release to 'available' ships code. That is the pool
+    # generatePlan() selects from, so from this moment every trip built or
+    # rebuilt runs this tree — while trips already provisioned stay on the
+    # release they were pinned to. The earlier hops (candidate -> verified)
+    # are checkpoints and reach nobody, so only 'available' prompts.
+    r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
 
 raw = strip_heredocs(sys.stdin.read())
 

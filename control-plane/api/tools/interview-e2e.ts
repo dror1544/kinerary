@@ -18,8 +18,11 @@
  *   INTERPRET_RUNNER=codex INTERPRET_TIMEOUT_MS=120000 \
  *     node --import tsx tools/interview-e2e.ts
  *
- * It stops where a person would have to tap a button: the "that is everything"
- * boundary offers a keyboard, and this harness only writes text.
+ * It types, including at the boundary. "That is everything" arrives as a
+ * keyboard, and `settleBoundary` reads a typed answer to it through the model
+ * — so this harness answers it in words, which is the only way to exercise
+ * that reader end to end against a real one. It taps only if the words did not
+ * move it, the way a person eventually would.
  */
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -27,6 +30,9 @@ import pg from "pg";
 
 const API = "./src";
 const { applyMigrations } = await import(`../src/migrations.js`);
+const { dispatchUpdate } = await import(`../src/relay/dispatch.js`);
+const { applyDecision } = await import(`../src/relay/poller.js`);
+const { FINISH_CALLBACK_DATA } = await import(`../src/chat-router.js`);
 const { issueEnrollment } = await import(`../src/enrollment.js`);
 const { startFromDeepLink } = await import(`../src/chat-router.js`);
 const { queueInboundMessage, getSessionForChat, questionStateForChat } = await import(`../src/interview.js`);
@@ -110,6 +116,8 @@ console.log(`session ${started.sessionId}\n`);
 
 let messageId = 1000;
 let sentSeen = 0;
+let typedAtBoundary = false;
+let tappedBoundary = false;
 const turns: { asked: string; said: string; ms: number; accepted: number; rejected: string[]; reason?: string }[] = [];
 
 // Kick the router into asking its first question.
@@ -127,6 +135,50 @@ for (let turn = 1; turn <= 24; turn += 1) {
   sentSeen = telegram.sent.length;
 
   if (view.state === "awaiting_confirmation") { console.log("\n>>> reached the recap <<<"); break; }
+
+  // THE BOUNDARY. The essentials are done and both exits are buttons — and a
+  // person answers it in words, so this does too. "אני חושב שזה הכול" has to
+  // reach `setFinishRequestedForChat` through the reader, with a real model
+  // doing the reading; that round trip is the whole reason this case is here
+  // rather than a tap.
+  //
+  // The tap is the SECOND attempt, not the first: buttons stay the shortcut,
+  // and a harness that cannot get past a keyboard tells you nothing about the
+  // turns after it. "Skip" rather than "a few more" — the optional questions
+  // are the interviewer agent's to nominate, and this harness runs with no
+  // agent by design.
+  if (view.offeredMore && !view.nextQuestion && !view.pendingAsk) {
+    if (!typedAtBoundary) {
+      typedAtBoundary = true;
+      const words = view.language === "he" ? "לא, אני חושב שזה הכול" : "No, I think that's everything";
+      console.log(`  YOU: ${words}`);
+      messageId += 1;
+      const mid = String(messageId);
+      await queueInboundMessage(pool, CHAT, { text: words, message_id: mid } as never);
+      const t0 = Date.now();
+      await flushSettledInboundBursts(deps, deps.log, 0);
+      console.log(`       [${Date.now() - t0}ms  boundary read]\n`);
+      continue;
+    }
+    if (tappedBoundary) { console.log("\n>>> the boundary did not move <<<"); break; }
+    tappedBoundary = true;
+    console.log(`  YOU tap: ${FINISH_CALLBACK_DATA}   (the words did not move it)`);
+    messageId += 1;
+    // One iteration of the real poll loop, as relay-poller runs it: dispatch
+    // decides, applyDecision sends, and the flush delivers what the phase
+    // transition then owes. Dispatching alone left the boundary standing.
+    const decision = await dispatchUpdate(pool, {
+      update_id: 9000 + turn,
+      callback_query: {
+        id: `cbq_${turn}`, data: FINISH_CALLBACK_DATA, from: { id: 777 },
+        message: { message_id: messageId, chat: { id: CHAT, type: "private" } },
+      },
+    } as never);
+    await applyDecision(decision, { db: pool, telegram, connector } as never);
+    await flushSettledInboundBursts(deps, deps.log, 0);
+    continue;
+  }
+
   const question = view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
   if (!question) { console.log("\n>>> nothing left to ask <<<"); break; }
 
