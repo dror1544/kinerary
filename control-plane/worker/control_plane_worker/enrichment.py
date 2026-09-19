@@ -45,13 +45,35 @@ _TIMEOUT = 12
 
 
 def _default_http(url: str) -> Any:
+    """Returns parsed JSON, or None for any non-success.
+
+    None still means "no data" to every caller — enrichment must never fail a
+    provision. But it is NOT silent any more. A geocoder that is rate-limiting
+    us returns the same None as a place that genuinely does not exist, and on
+    2026-09-19 that cost a trip its entire map with not one line in the worker
+    log to say so (issue #112). The lookup still degrades; it just says which
+    kind of nothing it got, because "could not ask" and "asked, no such place"
+    need different fixes.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"})
+    host = urllib.parse.urlsplit(url).netloc
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             if resp.status != 200:
+                logger.warning(
+                    "enrichment.http_status",
+                    extra={"host": host, "status": resp.status},
+                )
                 return None
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:  # network error, HTTP error, decode error — all "no data"
+    except Exception as exc:
+        # Rate limiting arrives here as HTTPError 429 — the case most likely to
+        # be transient, and the one worth seeing in a log.
+        status = getattr(exc, "code", None)
+        logger.warning(
+            "enrichment.http_failed",
+            extra={"host": host, "status": status, "error": type(exc).__name__},
+        )
         return None
 
 
@@ -302,6 +324,14 @@ def enrich_config(
                 if not place:
                     place = _geocode_place(http, city_query)
                     _sleep(pause)
+                if not place:
+                    # Neither the hotel nor the city centre resolved. The phase
+                    # gets no pin, the trip gets no map, and nothing downstream
+                    # treats that as an error — so this line is the only trace.
+                    logger.warning(
+                        "enrichment.geocode_miss",
+                        extra={"phase": phase.get("id"), "query": city_query},
+                    )
                 if place:
                     phase["mapStop"] = _map_stop(phase, (place["lat"], place["lng"]))
                     acc = phase.get("accommodation")

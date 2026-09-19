@@ -8,7 +8,9 @@ enrichment error must never fail a provision job.
 """
 from __future__ import annotations
 
+import logging
 import unittest
+from unittest import mock
 
 from control_plane_worker.enrichment import enrich_config
 
@@ -589,3 +591,60 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeocodeMissIsVisible(unittest.TestCase):
+    """A lookup that returns nothing must leave a trace.
+
+    On 2026-09-19 a trip was provisioned while the geocoder was unavailable and
+    came out with no mapStop on any phase and no map at all — with not one line
+    in the worker log, because `_geocode_place` returning None is not an
+    exception and nothing logged the miss (issue #112). Enrichment still
+    degrades rather than failing; it just has to say so.
+    """
+
+    def _config(self):
+        return {"phases": [{"id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"}}]}
+
+    def test_a_phase_that_resolves_nowhere_is_logged(self):
+        from control_plane_worker import enrichment
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            out = enrichment.enrich_config(self._config(), "Japan", http=lambda url: None, pause=0)
+        self.assertNotIn("mapStop", out["phases"][0], "precondition: nothing should have resolved")
+        self.assertTrue(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            f"no geocode_miss logged; got {[r.getMessage() for r in captured.records]}",
+        )
+
+    def test_a_phase_that_resolves_logs_no_miss(self):
+        from control_plane_worker import enrichment
+
+        def http(url):
+            return [{"lat": "35.68", "lon": "139.76", "display_name": "Tokyo"}]
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            logging.getLogger("control_plane_worker.enrichment").warning("sentinel")
+            out = enrichment.enrich_config(self._config(), "Japan", http=http, pause=0)
+        self.assertIn("mapStop", out["phases"][0])
+        self.assertFalse(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            "logged a miss for a phase that resolved",
+        )
+
+    def test_a_transport_failure_is_distinguished_from_an_empty_result(self):
+        """429 and 'no such place' both yield None downstream; only one is
+        worth retrying, so they must not look identical in the log."""
+        from control_plane_worker import enrichment
+
+        import urllib.error
+
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+        with mock.patch.object(enrichment.urllib.request, "urlopen", boom):
+            with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+                self.assertIsNone(enrichment._default_http("https://nominatim.openstreetmap.org/search?q=x"))
+        messages = [r.getMessage() for r in captured.records]
+        self.assertTrue(any("http_failed" in m for m in messages), messages)
+        self.assertEqual(429, next(getattr(r, "status", None) for r in captured.records))
