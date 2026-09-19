@@ -1,3 +1,4 @@
+-- rollback: compatible — one new table and its indexes; nothing existing changes shape
 -- RENUMBERED 0050 -> 0052 (2026-09-13), to follow integration/sprint-5-plus's
 -- sequence rather than sit in the 0050 gap it leaves open. The dev control
 -- plane had already applied this file as 0050_telegram_organizer_links.sql, and

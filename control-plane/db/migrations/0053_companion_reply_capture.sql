@@ -1,3 +1,4 @@
+-- rollback: compatible — adds a DEFAULTed boolean to trips and two nullable columns to telegram_chat_bindings; every existing row stays valid and the prior version ignores all three
 -- Lets the assistant's OWN question in a group chat open the addressing gate
 -- for exactly one message, the same way an @mention/name-match/reply-to does
 -- today (addressing.ts's isAddressedToAssistant). Without this, a family
