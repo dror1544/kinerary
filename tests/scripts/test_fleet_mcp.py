@@ -55,6 +55,7 @@ TOOLS = [
     ("stalled_interviews", {}),
     ("statistics", {}),
     ("alerts", {}),
+    ("bug_reports", {}),
     ("stacks", {}),
 ]
 
@@ -213,6 +214,12 @@ class FleetMcp(unittest.TestCase):
         for statement in self.statements():
             select_list = statement.split("FROM")[0]
             self.assertNotIn("now()", select_list, "alerts would print a moving value:\n" + statement)
+            # A SELECT with no FROM returns exactly one row — alerts probes for
+            # companion_bug_reports that way, so a stack behind migration 0054
+            # degrades instead of breaking. Row order is not a property one row
+            # can have, let alone lose; everything that reads a table needs it.
+            if "FROM" not in statement:
+                continue
             self.assertIn("ORDER BY", statement, "an alerts query has no stable row order:\n" + statement)
 
     # --------------------------------------------------------- failed reads --

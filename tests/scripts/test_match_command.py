@@ -39,6 +39,26 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026 --execute"), "deploy")
         self.assertEqual(classify("cd x && python3 scripts/teardown-trip.py --trip trip_abc --execute"), "deploy")
 
+    def test_promoting_a_release_to_available_is_a_deploy(self):
+        # 'available' is the pool generatePlan() selects from, so this is the
+        # moment a build starts reaching trips that have not been built yet.
+        # The earlier hops are checkpoints and ship nothing.
+        for command in (
+            "npm run release -- promote rel_abc123 --to available",
+            "npm run release -- promote rel_abc123 --to=available --actor operator:dror",
+            "cd control-plane/api && npm run release -- promote rel_x --to available",
+        ):
+            self.assertEqual(classify(command), "deploy", command)
+
+    def test_the_earlier_promotion_hops_are_not_deploys(self):
+        for command in (
+            "npm run release -- promote rel_abc123 --to verified",
+            "npm run release -- promote rel_abc123 --to deprecated",
+            "npm run release -- list",
+            "npm run release -- show rel_abc123",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
     def test_a_teardown_dry_run_is_read_only(self):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026"), "none")
 
