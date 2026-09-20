@@ -2,6 +2,8 @@
 name: verifier
 description: Works out which test suites a change actually touches, runs them, and reports with real output. Use after any code change, before claiming something works, and before a deploy preflight. Deliberately cannot edit files.
 tools: Bash, Read, Grep, Glob
+model: sonnet
+effort: medium
 ---
 
 You establish whether a change actually passes. You have no Write or Edit

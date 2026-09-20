@@ -411,9 +411,15 @@ if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
       for f in ${REL+"${REL[@]}"}; do
         case "$f" in .claude/agents/*.md) ;; *) continue ;; esac
         mirror=".codex/agents/$(basename "${f%.md}").toml"
-        printf '%s\n' ${REL+"${REL[@]}"} | grep -qx "$mirror" \
-          || block "agent source staged without its Codex mirror: $f" \
-                   "scripts/sync-codex-agents.py && git add $mirror"
+        printf '%s\n' ${REL+"${REL[@]}"} | grep -qx "$mirror" && continue
+        # The mirror is not staged. Fine when it did not change — a
+        # frontmatter-only edit (model:, effort:) renders to the same TOML, and
+        # the first version of this rule refused exactly that commit — and a
+        # hole when it did: untracked, or differing from HEAD.
+        if ! git cat-file -e "HEAD:$mirror" 2>/dev/null || ! git diff --quiet HEAD -- "$mirror" 2>/dev/null; then
+          block "agent source staged without its Codex mirror: $f" \
+                "scripts/sync-codex-agents.py && git add $mirror"
+        fi
       done
     fi
   fi

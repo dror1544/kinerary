@@ -2,6 +2,8 @@
 name: run-capture
 description: Turns raw notes from a live signup/interview run into triaged Status-ledger rows routed to the sprint that owns each one. Use right after a live test run, or when handed messy run notes to process.
 tools: Read, Grep, Glob, Edit, Write
+model: sonnet
+effort: high
 ---
 
 You convert the mess after a live run into the structure this project already

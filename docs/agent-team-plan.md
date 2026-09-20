@@ -555,14 +555,13 @@ Principles behind the table:
    change, the verifier report and a proposed commit message — and the lead
    session is asked as before. One script, one place; no per-agent `hooks:`
    block. Tests in `tests/scripts/test_claude_hooks_bash.py`.
-3. **Write `developer.md`, `integrator.md` and `doc-keeper.md`** (Appendix A);
-   move `pr-steward`'s third sweep into the keeper; add `model:` and `effort:`
-   to the six existing files. The Codex mirror is generated
-   (`scripts/sync-codex-agents.py`, B9 — **built 2026-09-20**), so the new files
-   reach Codex by running it.
-4. **Labels and a milestone** on GitHub: `sprint-6`, `track:1..5`,
-   `size:S|M|L`, `blocked`, `agent:ready`, `agent:in-progress`; milestone
-   "Sprint 6".
+3. **Write `developer.md`, `integrator.md` and `doc-keeper.md` — built
+   2026-09-20**, with `model:` and `effort:` on all nine files per §7,
+   `pr-steward`'s third sweep handed to the keeper, the Codex mirror
+   regenerated, and `tests/scripts/test_agent_files.py` holding the tiers.
+4. **Labels and a milestone — built 2026-09-20** on GitHub: `sprint-6`,
+   `track:1..5`, `size:S|M|L`, `blocked`, `agent:ready`, `agent:in-progress`;
+   milestone "Sprint 6".
 5. **A readable sprint lock — built 2026-09-20.** `.project/sprint.json`,
    changed only by `scripts/project-state.py`, printed at session start,
    checked on every commit (B8), with overrides recorded and named in the
@@ -623,8 +622,8 @@ against product code before it.
 
 **Before the lock — prerequisites only.** §8 touches hooks, agent files,
 labels and tooling, none of which is product code or baseline work, so it is
-built while the baseline is being closed out; items 1, 2, 5, 7 and the Codex
-half of 3 already are.
+built while the baseline is being closed out; everything but the Claude Code
+upgrade (item 6, at session end) already is.
 
 **Day one after the lock.** Dry-run one track-4 documentation item — no
 product code, no infrastructure — through the whole loop: brief → developer →
@@ -653,9 +652,9 @@ whether phase 2 (teams) is worth its preview status.
 
 ## Appendix A — draft agent files
 
-Frontmatter only; the body follows the house style of the six existing files
-(what it does, what it must not do, how it reports). Field names checked
-against the sub-agents documentation on 2026-09-20.
+These are now the files in `.claude/agents/` (built 2026-09-20); the
+frontmatter is reproduced here so the plan reads on its own. Field names were
+checked against the sub-agents documentation the same day.
 
 ```yaml
 ---

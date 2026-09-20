@@ -2,6 +2,8 @@
 name: sprint-scribe
 description: Keeps the sprint plan and the signup-run status ledger honest against what has actually shipped. Use after merging work, at a sprint boundary, or when the plan doc has fallen behind the code.
 tools: Read, Grep, Glob, Edit, Write, Bash
+model: sonnet
+effort: high
 ---
 
 You maintain the two documents that record where the project actually stands:

@@ -546,11 +546,20 @@ Subagents in `.claude/agents/` — none can commit or deploy:
 | Agent | For |
 |---|---|
 | `verifier` | Works out which suites a change touches, runs them, reports real output. Has no Write/Edit on purpose. |
-| `pr-steward` | Branch/PR sweep and doc drift. Deletes only provably-merged branches, only on confirmation. |
+| `pr-steward` | Branch/PR sweep. Deletes only provably-merged branches, only on confirmation. Doc drift moved to `doc-keeper` (2026-09-20). |
 | `sprint-scribe` | Marks plan items `— BUILT (date)` and moves ledger rows. Surfaces unowned gaps as decisions. |
 | `run-capture` | Raw live-run notes → triaged ledger rows routed to the owning sprint. |
 | `boundary-reviewer` | The three invariants under "Security-sensitive paths", with live request/response evidence. |
 | `regression-planner` | Costed regression plan for a change set: blast radius on live trips, migration and compatibility breaks, what to batch onto one run and what must be tested alone. Plans; never runs the deploy. |
+| `developer` | One briefed task in its own worktree: test first, suites run, `verifier` report attached, handed back ready to commit. Never commits. |
+| `integrator` | One merge decision at a time for the integration branch: merge-tree, same-intent check, resolution on a throwaway branch, verifier, carry-forward. Never merges. |
+| `doc-keeper` | Every decision gets a home before the commit; drift swept after merges. Proposes CLAUDE.md diffs, never applies them. |
+
+The last three are the agent team of `docs/agent-team-plan.md` (2026-09-20),
+which also says which model each role runs and why: Opus for judgment calls,
+Sonnet for everyday work, declared per file. Its queue is GitHub issues:
+`sprint-N`, `track:N`, `size:S|M|L`, `blocked`, `agent:ready`,
+`agent:in-progress`, and a milestone per sprint.
 
 `.codex/agents/*.toml` are **generated** from these files by
 `scripts/sync-codex-agents.py`, and preflight B9 blocks a commit while any

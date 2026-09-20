@@ -98,6 +98,16 @@ class B9(Harness):
         out = self.preflight("--staged")
         self.assertEqual(out.returncode, 0, out.stdout)
 
+    def test_a_frontmatter_only_change_renders_the_same_mirror_and_passes(self):
+        # model: and effort: are Claude-only; the TOML does not change, so
+        # there is nothing to stage for it. The first version of the rule
+        # refused this commit (2026-09-20).
+        (self.root / ".claude/agents/sample.md").write_text(AGENT.replace("tools: Read\n", "tools: Read\nmodel: sonnet\neffort: high\n"))
+        self.git("add", ".claude/agents/sample.md")
+        out = self.preflight("--staged")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertNotIn("without its Codex mirror", out.stdout)
+
 
 class CommitPrompt(Harness):
     """The Bash hook names a staged state change inside the approval prompt itself."""
