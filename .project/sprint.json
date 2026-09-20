@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "updated_at": "2026-09-20T13:05:57Z",
-  "updated_by": "Dror (recorded by Claude, agent-team plan session)",
+  "updated_at": "2026-09-20T14:10:02Z",
+  "updated_by": "Dror (recorded by Claude, readiness-baseline session)",
   "sprint": {
     "id": "6",
     "title": "Verification, explicit activation, dashboard, and demo rehearsal",
@@ -16,7 +16,7 @@
   },
   "baseline": {
     "branch": "integration/sprint-6",
-    "commit": "6ebd532cc40636ce263310edd918159e2ab015ec",
+    "commit": "4cfcad5d238419927b8bd668eed247bc11feb502",
     "report": "docs/test-reports/sprint-6-baseline-2026-09-20.md",
     "release": null
   },
@@ -59,6 +59,12 @@
       "by": "Dror (recorded by Claude, agent-team plan session)",
       "change": "init sprint 6 at 6ebd532",
       "reason": "both locks were only in memory files and operator knowledge; Dror asked on 2026-09-20 for one durable, agent-readable source of truth"
+    },
+    {
+      "at": "2026-09-20T14:10:02Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "set-baseline 6ebd532 -> 4cfcad5",
+      "reason": "Dror, 2026-09-20: #131 is approved and committed, so the baseline pointer moves to it; 6ebd532 predated the flight-designator fix and no longer reflected the tree the sprint would start from"
     }
   ]
 }
