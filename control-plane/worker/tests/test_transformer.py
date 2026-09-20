@@ -1299,8 +1299,8 @@ class DeriveBookingsTests(unittest.TestCase):
         intake = {
             **self.PHASED_INTAKE,
             "travel_anchors": _structured([
-                {"type": "activity", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
-                {"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "TK-2"},
+                {"type": "attraction", "name": "Tokyo Skytree", "date": "2026-09-20", "confirmation": "TK-1"},
+                {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "TK-2"},
             ]),
         }
         rows = {b["name"]: b for b in self._bookings(intake) if b["type"] == "attraction"}
@@ -1311,6 +1311,25 @@ class DeriveBookingsTests(unittest.TestCase):
         # Two rows, two keys: hashing the bare type gave both "activity" the
         # same seed_key and the site's INSERT OR IGNORE kept only one.
         self.assertEqual(len({r["seed_key"] for r in rows.values()}), 2)
+
+    def test_every_kind_the_question_invites_is_typed_a_booking_not_other(self) -> None:
+        # The question names these by name, so the model emits them verbatim.
+        # Each one missing from _ANCHOR_TYPE_MAP fell to "other": the
+        # confirmation survived, but a booked visit stopped reading as one.
+        kinds = ["attraction", "tour", "activity", "event", "shuttle", "parking"]
+        intake = {
+            **self.PHASED_INTAKE,
+            "travel_anchors": _structured([
+                {"type": kind, "name": f"Booked {kind}", "date": "2026-09-20", "confirmation": f"C-{kind}"}
+                for kind in kinds
+            ]),
+        }
+        rows = {b["name"]: b for b in self._bookings(intake)}
+        for kind in kinds:
+            row = rows[f"Booked {kind}"]
+            self.assertEqual(row["type"], "attraction", f"{kind!r} should type as a booked attraction")
+            self.assertEqual(row["confirmation"], f"C-{kind}")
+            self.assertEqual((row["date_from"], row["phase"]), ("2026-09-20", "tokyo"))
 
     def test_a_hotel_anchor_for_the_phases_own_hotel_is_one_row_not_two(self) -> None:
         # Same run: the organizer's documents gave each hotel twice — as the
