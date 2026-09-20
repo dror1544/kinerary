@@ -78,6 +78,25 @@ DEPLOY = re.compile(
     # are checkpoints and reach nobody, so only 'available' prompts.
     r'|' + CMDPOS + r'[^\n;&|]*\brelease\b[^\n;&|]*\bpromote\b[^\n;&|]*--to[=\s]+available\b')
 
+# A commit by another name. Each of these creates or rewrites commits on the
+# current branch, so each is hard rule 1 by a route on which the word "commit"
+# never appears: a merge lands a whole branch at once; cherry-pick and revert
+# write new commits; rebase and am rewrite or append them; `gh pr merge` does
+# the merge on GitHub, where no local git hook runs at all. Verified
+# 2026-09-20: every one of them classified as `none`, so an integrator agent
+# with Bash could have landed work on the integration branch with no prompt.
+#
+# The read-only relatives stay quiet, because a prompt on a read teaches people
+# to click through: merge-tree and merge-base compute, --abort and --quit undo,
+# `gh pr view/diff/checks` read. `(?![\w-])` is what keeps `merge-tree` out.
+MERGE = re.compile(
+    CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+(?:merge|cherry-pick|revert|rebase|am)(?![\w-])'
+    r'(?![^\n;&|]*--(?:abort|quit)\b)'
+    r'|' + CMDPOS + r'gh\s+pr\s+merge\b')
+# Pushing publishes. After it the commits exist for everyone who fetches, and a
+# force push rewrites what they already had.
+PUSH = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+push(?![\w-])')
+
 raw = strip_heredocs(sys.stdin.read())
 
 # Asymmetric on purpose. Deploy verbs are matched with quotes intact, because a
@@ -85,9 +104,16 @@ raw = strip_heredocs(sys.stdin.read())
 # one keystroke, while a missed deploy breaks hard rule 2. Commit is matched
 # with quotes stripped, because "git commit" inside quotes is nearly always
 # prose, and a spurious refusal there blocks real work.
+# Merge and push follow commit's rule: quotes stripped, prose does not prompt.
+# Order is by consequence, so `git push && deploy.sh` is a deploy and
+# `git merge x && git commit` is a commit.
 if DEPLOY.search(raw):
     print("deploy")
 elif COMMIT.search(strip_quotes(raw)):
     print("commit")
+elif MERGE.search(strip_quotes(raw)):
+    print("merge")
+elif PUSH.search(strip_quotes(raw)):
+    print("push")
 else:
     print("none")

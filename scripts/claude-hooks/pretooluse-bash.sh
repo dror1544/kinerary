@@ -25,6 +25,16 @@ cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null
 [ -f "$MATCH" ] || exit 0
 
 kind="$(printf '%s' "$cmd" | python3 "$MATCH" 2>/dev/null)" || exit 0
+[ "$kind" != "none" ] || exit 0
+
+# WHO is asking. A tool call from a subagent carries agent_type; the lead
+# session — the one the person is talking to — carries none. CLAUDE.md says
+# no agent can commit or deploy, and docs/agent-team-plan.md (2026-09-20) makes
+# every role hand back instead: the change, the verifier report, a proposed
+# commit message. An "ask" inside a subagent is a prompt nobody expected and
+# nobody may be there to answer, so for a subagent every one of these is a
+# refusal with the reason, not a question.
+agent="$(printf '%s' "$payload" | jq -r '.agent_type // empty' 2>/dev/null)"
 
 # Has this exact HEAD been risk-assessed?
 #
@@ -67,7 +77,24 @@ emit() {  # emit <allow|deny|ask> <reason>
   exit 0
 }
 
+if [ -n "$agent" ]; then
+  case "$kind" in
+    deploy) rule="hard rule 2 — never deploy a live trip site without explicit approval" ;;
+    *)      rule="hard rule 1 — never git commit without explicit user approval; a merge, cherry-pick, revert, rebase, gh pr merge or push is a commit by another name" ;;
+  esac
+  emit deny "A subagent never commits, merges, pushes or deploys (CLAUDE.md: none can commit or deploy — $rule). You are '$agent'. Hand back instead: the change, the verifier report and a proposed commit message; the lead session runs the command after the person approves. Classified as: $kind."
+fi
+
 case "$kind" in
+  merge)
+    # Lands commits without the word "commit". A local merge runs the
+    # git-side pre-merge-commit hook for the mechanical checks; `gh pr merge`
+    # runs on GitHub and gets no hook at all. Either way, this is the approval.
+    emit ask "CLAUDE.md hard rule 1 — a merge, cherry-pick, revert, rebase or gh pr merge creates commits, so it needs the same explicit approval as git commit. Approve only if you meant to land this now."
+    ;;
+  push)
+    emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
+    ;;
   deploy)
     # Deploys do not go through git, so this is the only place to catch them.
     emit ask "CLAUDE.md hard rule 2 — never deploy a live trip site without explicit approval. A commit instruction does not imply a deploy instruction. Approve only if you meant to deploy right now.

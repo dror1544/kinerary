@@ -54,9 +54,9 @@ re-decide:
 `git merge`, `gh pr merge`, `git push` or `git cherry-pick` — all four classify
 as `none` today — so an integrator with Bash could land work on the integration
 branch unprompted. That is closed first, and the hook learns to refuse (not
-ask) for the roles that must never commit. Already in place: the sprint and
-baseline locks in `.project/sprint.json`, the generated Codex mirror, and the
-refusal of CLAUDE.md edits to every subagent.
+ask) for the roles that must never commit. Both are built (§8), as are the
+sprint and baseline locks in `.project/sprint.json`, the generated Codex
+mirror, and the refusal of CLAUDE.md edits to every subagent.
 
 **Recommended path** (§6): subagents from a lead session now, on the Claude Code
 already installed; Agent Teams once the loop has survived one sprint; saved
@@ -543,21 +543,18 @@ Principles behind the table:
 
 ## 8. Prerequisites — build these before the first task
 
-1. **Close the merge hole in the hard-rule-1 hook.**
-   `scripts/claude-hooks/match-command.py` classifies `git merge`,
-   `gh pr merge`, `git push` and `git cherry-pick` as `none` (checked
-   2026-09-20). The git-side `pre-merge-commit` hook runs the mechanical checks
-   but is not an approval. Add a `merge` class (a non-fast-forward `git merge`,
-   `gh pr merge`, `git cherry-pick`, `git rebase`) and a `push` class, both
-   prompting like `commit`. Test file alongside, in `tests/scripts/`.
-2. **Make the hook refuse per role.** Tool-event payloads carry `agent_type`
-   (the Write hook already reads it for CLAUDE.md and `.project/sprint.json`).
-   In `pretooluse-bash.sh`, when `agent_type` is `developer` or `integrator`
-   (or any role whose file says it may not commit), a `commit`/`merge`/`push`/
-   `deploy` classification becomes **deny with the reason**, not `ask`. An
-   "ask" inside a background subagent is a prompt nobody expected; a deny makes
-   the agent hand back instead. The same rule can sit in each agent file's own
-   `hooks:` block, but one script that reads `agent_type` keeps it in one place.
+1. **Close the merge hole in the hard-rule-1 hook — built 2026-09-20.**
+   `scripts/claude-hooks/match-command.py` now classifies `git merge`,
+   `cherry-pick`, `revert`, `rebase`, `am` and `gh pr merge` as `merge` and
+   `git push` as `push`; both prompt like `commit`, and `merge-tree`,
+   `merge-base`, `--abort` and `gh pr view` stay silent. Tests in
+   `tests/scripts/test_match_command.py`.
+2. **Make the hook refuse per role — built 2026-09-20.** `pretooluse-bash.sh`
+   reads `agent_type` from the payload; for any subagent a commit, merge, push
+   or deploy classification is a **deny with the reason** — hand back the
+   change, the verifier report and a proposed commit message — and the lead
+   session is asked as before. One script, one place; no per-agent `hooks:`
+   block. Tests in `tests/scripts/test_claude_hooks_bash.py`.
 3. **Write `developer.md`, `integrator.md` and `doc-keeper.md`** (Appendix A);
    move `pr-steward`'s third sweep into the keeper; add `model:` and `effort:`
    to the six existing files. The Codex mirror is generated
@@ -626,8 +623,8 @@ against product code before it.
 
 **Before the lock — prerequisites only.** §8 touches hooks, agent files,
 labels and tooling, none of which is product code or baseline work, so it is
-built while the baseline is being closed out; items 5, 7 and the Codex half of
-3 already are.
+built while the baseline is being closed out; items 1, 2, 5, 7 and the Codex
+half of 3 already are.
 
 **Day one after the lock.** Dry-run one track-4 documentation item — no
 product code, no infrastructure — through the whole loop: brief → developer →

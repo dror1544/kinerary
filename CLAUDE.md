@@ -463,6 +463,15 @@ Every rule in "Hard Rules" above is now checked by
   intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.
+  Since 2026-09-20 the same prompt covers the routes that create commits
+  without the word: `git merge`, `cherry-pick`, `revert`, `rebase`, `am` and
+  `gh pr merge` (all classified `none` until then — an integrator agent could
+  have landed work on the integration branch unprompted), and `git push`. A
+  tool call carrying an `agent_type` — any subagent — is **refused** rather
+  than asked, for all of these and for deploy verbs: no agent can commit or
+  deploy, so it hands back the change, the verifier report and a proposed
+  commit message, and the lead session runs the command after the person
+  approves. `merge-tree`, `merge-base`, `--abort` and `gh pr view` stay silent.
 
 ```bash
 scripts/preflight-checks.sh --staged   # what the commit hook runs

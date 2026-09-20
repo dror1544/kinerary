@@ -59,6 +59,55 @@ class Classify(unittest.TestCase):
         ):
             self.assertEqual(classify(command), "none", command)
 
+    def test_commits_by_another_name_are_merges(self):
+        # Each creates or rewrites commits without the word "commit" appearing;
+        # gh pr merge does it on GitHub where no local hook runs. All were
+        # `none` until 2026-09-20 — an integrator agent could have landed work
+        # on the integration branch unprompted.
+        for command in (
+            "git merge feat/x",
+            "git merge --no-ff feat/x",
+            "git merge --continue",
+            "git -C /some/worktree merge feat/x",
+            "gh pr merge 116 --squash",
+            "cd x && gh pr merge 116 --merge --delete-branch",
+            "git cherry-pick abc123",
+            "git revert HEAD",
+            "git rebase main",
+            "git rebase --continue",
+            "git am patches.mbox",
+        ):
+            self.assertEqual(classify(command), "merge", command)
+
+    def test_read_only_merge_relatives_and_undo_do_not_prompt(self):
+        for command in (
+            "git merge-tree --write-tree integration/sprint-6 main",
+            "git merge-base main HEAD",
+            "git merge --abort",
+            "git rebase --abort",
+            "git cherry-pick --quit",
+            "git revert --abort",
+            "gh pr view 116 --json title",
+            "gh pr diff 116",
+            "gh pr checks 116",
+            "cat > notes.md <<'EOF'\nrun git merge only after the report\nEOF",
+            "echo 'git push origin main'",
+        ):
+            self.assertEqual(classify(command), "none", command)
+
+    def test_pushes(self):
+        for command in (
+            "git push origin HEAD",
+            "git push --force-with-lease origin feat/x",
+            "git -C /some/worktree push",
+        ):
+            self.assertEqual(classify(command), "push", command)
+
+    def test_the_most_consequential_class_wins(self):
+        self.assertEqual(classify("git merge feat/x && git commit -m 'resolve'"), "commit")
+        self.assertEqual(classify("git push && ~/kinerary-deploy/trips/japan-2026/deploy.sh"), "deploy")
+        self.assertEqual(classify("git fetch && git merge origin/main && git push"), "merge")
+
     def test_a_teardown_dry_run_is_read_only(self):
         self.assertEqual(classify("scripts/teardown-trip.py --trip japan-2026"), "none")
 
