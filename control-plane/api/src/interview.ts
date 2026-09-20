@@ -350,6 +350,50 @@ function canonicalized(answers: AnswerStore, questions: readonly IntakeQuestion[
  * "real" name, which is not something to adjudicate from a control-plane
  * module.
  */
+/**
+ * A date the site can use, or a reason it cannot. `YYYY-MM-DD` and a real day.
+ *
+ * Checked because the transformer reads nothing else: a stop saved with
+ * `start: "2 May"` was accepted here, stored in the canonical intake, and
+ * provisioned with no dates at all — no error anywhere (a document's "Rome 2-6
+ * May" was extracted exactly like that on 2026-09-13).
+ */
+function isoDateProblem(value: unknown, where: string): string | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const parsed = new Date(`${value}T00:00:00Z`);
+    if (!Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value) return null;
+  }
+  return `${where} must be a date written YYYY-MM-DD (got ${JSON.stringify(value).slice(0, 40)}). ` +
+    "Convert it using the trip's year, or leave the field out — never store the date as it was written.";
+}
+
+/** Every date field of a stop list: each stop's start and end, and each day's date. */
+function phaseDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, stop] of data.entries()) {
+    if (!stop || typeof stop !== "object") continue;
+    const s = stop as Record<string, unknown>;
+    const problem = isoDateProblem(s.start, `phases[${i}].start`) ?? isoDateProblem(s.end, `phases[${i}].end`);
+    if (problem) return problem;
+    for (const [j, day] of (Array.isArray(s.days) ? s.days : []).entries()) {
+      const dayProblem = day && typeof day === "object" ? isoDateProblem((day as Record<string, unknown>).date, `phases[${i}].days[${j}].date`) : null;
+      if (dayProblem) return dayProblem;
+    }
+  }
+  return null;
+}
+
+function anchorDatesProblem(data: unknown): string | null {
+  if (!Array.isArray(data)) return null;
+  for (const [i, anchor] of data.entries()) {
+    if (!anchor || typeof anchor !== "object") continue;
+    const problem = isoDateProblem((anchor as Record<string, unknown>).date, `travel_anchors[${i}].date`);
+    if (problem) return problem;
+  }
+  return null;
+}
+
 function hasNamedTraveler(data: unknown): boolean {
   if (!Array.isArray(data)) return false;
   return data.some((entry) => {
@@ -555,11 +599,27 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // confirmation, because a stay named without a code is the common case.
     dataExample: "[{\"name\": \"Reykjavik\", \"name_en\": \"Reykjavik\", \"start\": \"2027-03-04\", \"end\": \"2027-03-07\", \"accommodation\": {\"name\": \"Hotel Borg\", \"confirmation\": \"HB-2217\"}, \"planned\": [\"Hallgrimskirkja\"]}, {\"name\": \"Vik\", \"name_en\": \"Vik\", \"start\": \"2027-03-07\", \"end\": \"2027-03-09\", \"accommodation\": {\"name\": \"Hotel Kria\"}}]",
     required: true,
+    checkComplete: phaseDatesProblem,
   },
   {
     id: "travel_anchors",
     type: "structured",
-    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
+    // Tickets and tours are named because the transformer provisions them
+    // (activity, tour, ticket and reservation map to `attraction`) and the
+    // example shows one. Asked only about "flights, hotels, or cars", a model
+    // left a booked e-ticket, a shuttle voucher and an event parking pass out
+    // of travel_anchors on 2026-09-13 — "no flight, hotel, or car booking
+    // confirmation number" — and their references with them (issue #62).
+    //
+    // TRAINS ARE NOT ASKED FOR, and that is a decision rather than an omission.
+    // Every word in this list has to survive `_ANCHOR_TYPE_MAP` (transformer.py),
+    // whose canonical set is exactly {flight, hotel, car, attraction, other};
+    // there is no rail member and `.get(type, "other")` catches what is missing.
+    // So asking for trains would collect them and then file every one as
+    // "other" — a taxonomy short a member, which is the shape of #115. Add the
+    // canonical type first, then this word; adding the word alone reads as a
+    // feature and behaves as a silent downgrade.
+    prompt: "Anything already booked — flights, hotels, cars, tickets or tours? List them with confirmation numbers.",
     dataShape: "array",
     // One real `type`, not "flight|hotel|car": a list of alternatives shown as
     // a value is a value a model can copy. The transformer reads any type
@@ -570,6 +630,7 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // A flight number is not a confirmation, and that is a rule, not a
     // judgement — see withoutFlightNumbersAsConfirmations (#131).
     sanitize: withoutFlightNumbersAsConfirmations,
+    checkComplete: anchorDatesProblem,
   },
   {
     id: "constraints",
