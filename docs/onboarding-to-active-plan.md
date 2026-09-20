@@ -25,6 +25,9 @@ dedicated exchange key; see [the contract](runtime-session-exchange.md).
 
 ## Update — 2026-09-07
 
+*(The commit/PR checkpoint mentioned below happened: `feat/modern-spa-next`
+merged as PR #44 on 2026-09-11. See B1 in §3.)*
+
 Phase B is implemented on `feat/modern-spa-next` and is waiting for the explicit
 commit/PR checkpoint:
 
@@ -63,9 +66,29 @@ provisioned 2026-09-06 from run 13's confirmed intake.
 | Site serving | **works** | `192.168.0.61:8080` and `japan-2026-2.ara-united.store` → HTTP 200 |
 | Modern SPA present | **works** | `/modern/` → HTTP 200, `<title>Kinerary Modern Trip</title>` |
 | Family can log in | **works** | `nir` + seed password → 200; wrong password → 401 |
-| **Modern is the trip's front door** | **no** | `/` serves the legacy site (`<title>Family Trip</title>`) |
+| **Modern is the trip's front door** | **no** | `/` served the legacy site (`<title>Family Trip</title>`) on `japan-2026-2`, 2026-09-06. The code has since changed for newly bootstrapped trips — see the note below the table. |
 | **Trip companion reachable** | **no** | `assistant_names` empty, `telegram_chat_bindings` = 0 |
 | `runtime_routes` | **no** | 0 rows; "Open trip", invites, participant lookup all dead |
+
+**Why the row above says "no" but the code has moved on.** On 2026-09-06,
+`provisioning/adapters.py` did not set `TRIP_DESIGN_VARIANT` at all —
+`server/living-journey.js`'s own fallback, `normalizeUiVariant` (`:95-96`),
+treats anything other than the literal string `'modern'` (an unset,
+mis-cased, or empty env var included) as `'classic'`. That was a property of
+the code as it stood that day, not of `japan-2026-2` specifically: every trip
+bootstrapped before 2026-09-09 got the same fallback. Since 2026-09-09
+(`a2e51d1`), `provisioning/adapters.py:303` writes `TRIP_DESIGN_VARIANT=modern`
+into a *fresh* container's first `.env` — the write sits inside the `if [ ! -f
+.env ]` guard at `:294`, so it never touches a reused or retargeted
+container's existing file, matching B2 below. `server/living-journey.js:246`
+reads that env var exactly once, through `normalizeUiVariant`, via `INSERT OR
+IGNORE` on the trip's very first `trip_ui_settings` row — a row created before
+2026-09-09, `japan-2026-2`'s included, is never revisited by this code path.
+Confirmed at `tests/provisioning/test_adapters.py:221`
+(`test_proxmox_create_makes_the_nfs_dir_then_creates_and_starts_the_container`).
+None of this has been re-measured against the live `japan-2026-2` site since
+the 2026-09-06 run above; the "no" in the table is that one dated
+measurement, not a claim about today.
 
 **This is much further along than the ledger reads.** A family could use that
 site today. Three things are missing, and only one of them is large.
@@ -111,15 +134,21 @@ real answer. Not a log line — the actual reply.
 
 ## 3. Phase B — make the modern SPA the trip's front door
 
-`site/modern/` already ships with every deploy and is live on the provisioned
-trip. What is missing is that it is not what the organizer's link opens.
+`site/modern/` already ships with every deploy. On `japan-2026-2`, measured
+2026-09-06, it was live on the provisioned trip but not what the organizer's
+link opened — a property of the code as it stood that day, not of that trip
+specifically. See the note under the §1 table for the mechanism and the
+2026-09-09 change.
 
-**B1 — merge `feat/modern-spa-next` (implemented; PR pending).** The feature
-branch now carries the interactive itinerary map, itinerary ordering, editor
-viewport fix, enrichment for Modern itinerary additions, complete Bookings,
-Budget and Photos modules, and its rebuilt production bundle. The current
-Sprint 5 integration tree overlays cleanly; the remaining step is the explicit
-commit/PR/merge checkpoint.
+**B1 — merge `feat/modern-spa-next` (merged).** `f2717c8` ("Merge pull request
+#44 from dror1544/feat/modern-spa-next") is an ancestor of the current tree —
+confirmed 2026-09-20 with `git merge-base --is-ancestor f2717c8
+origin/integration/sprint-6` (exit 0). The feature branch carries the
+interactive itinerary map, itinerary ordering, editor viewport fix,
+enrichment for Modern itinerary additions, complete Bookings, Budget and
+Photos modules, and its rebuilt production bundle. (This bullet read
+"implemented; PR pending" as of 2026-09-09 (`a2e51d1`, per `git blame`); the
+PR merged 2026-09-11.)
 
 **B2 — front door (implemented).** Freshly provisioned trips set
 `TRIP_DESIGN_VARIANT=modern`, so `/` opens Modern. Existing hand-built trips
@@ -183,9 +212,13 @@ that produces an unreachable site.
 1. **A1 + A2** — small, and together they turn the current silent failure into
    either a working companion or a loud one.
 2. **A3 + A4** — B1 and the binding un-gate. Then a family can be onboarded.
-3. **B1 + B2** — merge the modern branch, decide the front door.
+3. **B1 + B2** — merge the modern branch, decide the front door. *(Both done:
+   B1 merged 2026-09-11 as PR #44 (`f2717c8`); B2 shipped in the same merge
+   — see §3, B1/B2.)*
 4. **D** — the one-writer change, once the pipeline is no longer the constraint.
 5. **B3, then C** — the managed organizer path, then what "active" means.
+   *(B3 done — see §3, B3. C is unaffected; still open, see §4.)*
 
-The single decision blocking nothing but worth making early is **B2**. The
-single decision blocking Phase A is the `companion-install-plan.md` fork.
+The single decision blocking nothing but worth making early is **B2**.
+*(Decided — 2026-09-09, `a2e51d1`; see §3, B2.)* The single decision blocking
+Phase A is the `companion-install-plan.md` fork.
