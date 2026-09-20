@@ -12,6 +12,43 @@ import argparse, json, re, shutil, subprocess, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+OVERLAY = ROOT / 'templates' / 'config.overlay.yaml'
+
+
+def overlay():
+    """The profile's routing, read from the one file that states it.
+
+    `install()` used to carry its own copy of every key and the whole fallback
+    chain, under a comment asking whoever changed one to remember the other.
+    Nobody did: the overlay and the `config set` calls both pinned
+    `minimax/minimax-m3:free`, a model id that does not exist on OpenRouter, so
+    the profile silently ran its 7-deep fallback chain from the day it was
+    written. Fixing only the YAML would have changed nothing, because the YAML
+    is copied as a reference file and the `config set` calls are what the live
+    profile gets.
+
+    So there is now one source and it is the YAML. A missing PyYAML is an error
+    rather than a fallback to a built-in copy — a built-in copy is the thing
+    this function exists to delete.
+    """
+    try:
+        import yaml
+    except ImportError:
+        bad('PyYAML is required to read config.overlay.yaml (pip install pyyaml)')
+    data = yaml.safe_load(OVERLAY.read_text()) or {}
+    for key in ('model', 'fallback_providers'):
+        if key not in data: bad(f'{OVERLAY.name} has no {key!r}')
+    return data
+
+
+def config_settings(d):
+    """The scalar `config set` pairs, flattened from the overlay in its order."""
+    out = []
+    for section, value in d.items():
+        if section == 'fallback_providers': continue
+        for key, val in value.items():
+            out.append((f'{section}.{key}', 'true' if val is True else 'false' if val is False else str(val)))
+    return out
 
 def bad(m): raise ValueError(m)
 
@@ -28,6 +65,7 @@ def validate(d):
 
 def render(d, out: Path):
     validate(d)
+    routing = overlay()
     if out.exists() and any(out.iterdir()): bad(f'output is not empty: {out}')
     out.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'templates' / 'config.overlay.yaml', out / 'config.overlay.yaml')
@@ -39,11 +77,15 @@ def render(d, out: Path):
         f"hermes profile create {d['profile']['name']} --no-skills "
         f"--description {json.dumps(d['profile']['description'])}\n"
         f"# Then merge config.overlay.yaml keys into the profile config, e.g.:\n"
-        f"hermes -p {d['profile']['name']} config set model.default minimax/minimax-m3:free\n"
-        f"hermes -p {d['profile']['name']} config set model.provider openrouter\n"
+        + "".join(
+            f"hermes -p {d['profile']['name']} config set {key} {val}\n"
+            for key, val in config_settings(routing)
+        )
+        + (
         f"# Verify fallback working:\n"
         f"hermes -p {d['profile']['name']} -z 'reply OK only'\n"
         "```\n"
+        )
     )
     (out / 'INSTALL.md').write_text(install_md)
 
@@ -56,27 +98,15 @@ def install(bundle: Path, name: str):
         check=True
     )
     shutil.copy2(bundle / 'config.overlay.yaml', home / 'config.overlay.yaml')
-    # These MUST track templates/config.overlay.yaml: the copy above is only
-    # a reference file, the live profile config is whatever these `config set`
-    # calls write. Keep the two in step whenever the overlay's routing changes.
-    for key, val in [
-        ('model.default',       'minimax/minimax-m3:free'),
-        ('model.provider',      'openrouter'),
-        ('delegation.model',    'claude-sonnet-4-6'),
-        ('delegation.provider', 'anthropic'),
-        ('display.show_cost',   'true'),
-    ]:
+    # The copy above is a reference file; the live profile config is whatever
+    # these `config set` calls write. Both now come from the same overlay, so
+    # they cannot disagree — which they did, silently, for the profile's whole
+    # life (see `overlay`).
+    routing = overlay()
+    for key, val in config_settings(routing):
         subprocess.run(['hermes', '-p', name, 'config', 'set', key, val], check=True)
     subprocess.run(['hermes', '-p', name, 'config', 'set', 'fallback_providers',
-        json.dumps([
-            {"provider": "openai-codex", "model": "gpt-5.6-luna-900k"},
-            {"provider": "anthropic",    "model": "claude-sonnet-4-6"},
-            {"provider": "openrouter",   "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"},
-            {"provider": "openrouter",   "model": "nvidia/nemotron-3-ultra-550b-a55b:free"},
-            {"provider": "openrouter",   "model": "dots-studio/dots-3-note-preview:free"},
-            {"provider": "ollama-cloud", "model": "gpt-oss:120b"},
-            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
-        ])], check=True)
+        json.dumps(routing['fallback_providers'])], check=True)
 
 def main():
     p = argparse.ArgumentParser()
