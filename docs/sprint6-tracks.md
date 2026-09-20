@@ -555,6 +555,42 @@ behind sprint-6 → main → a `kinerary-cp-release` upgrade.
 3. **Slice B — registry, store, migrations, worker — waits** behind NFS
    provisioning, which lands as its own verified change first.
 
+### Slice A is BUILT (2026-09-20) — committed, not merged, not pushed
+
+`fix/92-slice-a`, eight commits on `6a46dc3`, 30 files, +3864/−316. **Full
+control-plane suite: 1464 tests, 1458 pass, 0 fail, 0 cancelled, 6 skipped**,
+against a private database (`cptest_92a`, never bare `cptest`). `preflight-checks.sh
+--all` clean. The sprint freeze stands; nothing is merged to `integration/sprint-6`.
+
+`fix/92-slice-b` preserves the rest of #92 whole, plus one commit renaming its
+four migrations to `YYYYMMDDHHMMSS_` and giving each a `-- rollback: compatible`
+header — none of the four has reached production, so renaming is safe here and
+only here.
+
+**Three things the unbundling found, all of which a textual merge would have
+taken silently.** They are the argument for slicing rather than landing whole:
+
+| | |
+|---|---|
+| `<TASK>_EFFORT` | sprint-6 added it (47c99eb) where `modelRunnerFromEnv` built its own runners; #92 moved that construction to `runnerForBinding` from a base predating it. Merged textually, every claude call takes its effort from whatever the process's HOME holds — the 143s-against-60s failure of 2026-09-16, which raises no error |
+| Two correction mechanisms | sprint-6's `allowCorrections` (a person retypes) and #92's `held` reconciliation (a document adds) edit the same function, and **neither branch's tests covered the other's feature**. They are exact complements and both are kept; which applies is decided by which field the caller passed |
+| Hard rule 6 | #92's `model-runner.ts` named this deployment's credential path in a doc comment. Preflight refused the commit — the rule catching code that arrived from a branch older than the rule |
+
+**A0 is as resolved as it can be while #91 is open.** #91 holds #58's real
+isolation (env allowlist, `--ignore-user-config`) and has not landed, so
+`codexIsolationProblem` ships present-but-unwired: `CODEX_ISOLATION_ARGS` *is*
+applied to every codex call, but the startup check that this machine's codex
+knows those feature names lives in `relay/server.ts`, which is Slice B. Written
+into the function's own comment, because the alternative is a reader taking the
+refusal as present. **Do not read #92 as closing #58.**
+
+**#62 is CLOSED** (verified 2026-09-20), and the prompt reconciliation with #109
+landed in Slice A — with **"trains" deliberately dropped**. `_ANCHOR_TYPE_MAP`
+maps onto exactly `{flight, hotel, car, attraction, other}` with no rail member
+and `.get(type, "other")` catching the rest, so asking organizers for trains
+collects them and files every one as `"other"` — #115's shape. The canonical
+type comes first or the word does not go in.
+
 **Do not treat #62 as open work.** The `travel_anchors` prompt is already
 widened inside #92 ("flights, trains, hotels, cars, tickets or tours",
 `interview.ts:525`, with a comment citing #62) even though the PR body declares
