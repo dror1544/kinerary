@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { normalizeIdentity, resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
@@ -2140,6 +2141,57 @@ export async function getSession(
 }
 
 /**
+ * A typed answer resolved against a question's OWN choices, with no model.
+ *
+ * The buttons on a roster-backed question are drawn from data the control
+ * plane already holds, so "which of these is it" is a decidable lookup, not a
+ * judgement — exactly the kind `docs/interview-without-an-agent.md` says must
+ * not be handed to a model. It was anyway, and the model could not do it: on
+ * 2026-09-20 an organizer answered `organizer_identity` with their own name,
+ * exactly as the roster spells it and exactly as the question's prompt asks
+ * for, and `interpret` returned zero proposals twice. The interview asked the
+ * same question forever and no trip was ever built.
+ *
+ * The deterministic matcher was right there and never ran: `satisfiedBy` and
+ * `canonicalize` act on an answer that has been STORED, and the interpreter is
+ * what decides whether to store one.
+ *
+ * Returns the canonical value to record, or null when the text names nobody or
+ * more than one — both of which must stay with the model and the re-ask, since
+ * guessing between two travellers is the failure this cannot afford.
+ */
+export function typedChoiceAnswer(
+  questionId: string,
+  text: string,
+  answers: AnswerStore,
+): string | null {
+  const written = text.trim();
+  if (!written) return null;
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.choicesFrom) return null;
+
+  // organizer_identity has its own matcher, and it is the tested one: it
+  // handles a first name alone, a household name, a self-reference and the
+  // same name in the other alphabet. Nothing here should re-implement it.
+  if (questionId === "organizer_identity") {
+    const match = organizerMatch({ ...answers, organizer_identity: {
+      kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: written,
+    } });
+    return match.kind === "matched" ? match.name : null;
+  }
+
+  // Any other roster-backed question: an exact match on what the button says
+  // or what it would record. Deliberately strict — a looser rule here would be
+  // guessing, and the model plus the re-ask are the right home for that.
+  const normalized = normalizeIdentity(written);
+  const hits = question.choicesFrom(answers).filter(
+    (choice) => normalizeIdentity(choice.value) === normalized
+      || normalizeIdentity(choice.label) === normalized,
+  );
+  return hits.length === 1 ? hits[0]!.value : null;
+}
+
+/**
  * The current view of whichever interview a Telegram chat is conducting.
  *
  * Read-only counterpart to submitAnswerForChat, and addressed the same way —
@@ -2166,7 +2218,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
   }>(
     `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+     WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
   );
   const [session] = row.rows;

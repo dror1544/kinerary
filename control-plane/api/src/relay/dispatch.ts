@@ -74,6 +74,7 @@ import {
   type TelegramUpdate,
 } from "./normalize.js";
 import type { HeldAttachment, PendingAttachments } from "./pending-attachments.js";
+import type { GroupContext } from "./group-context.js";
 import { getSessionForChat, setFinishRequestedForChat, type SessionView } from "../interview.js";
 import type { WireMessageEvent } from "./protocol.js";
 
@@ -316,6 +317,14 @@ export interface DispatchOptions {
    * the poller owns it. Absent, such a document is simply dropped.
    */
   pendingAttachments?: PendingAttachments;
+  /**
+   * What the family said in a group while nobody was addressing the assistant,
+   * carried onto the next message that does. Owned by the poller for the same
+   * reason as the attachments above: it has to outlive one update. Absent,
+   * unaddressed turns are simply forgotten, which is the behaviour before
+   * 2026-09-20.
+   */
+  groupContext?: GroupContext;
   /**
    * Whether a trip's companion gateway is connected right now.
    *
@@ -765,6 +774,17 @@ export async function dispatchUpdate(
       // "send the file, then say what it is for" is one interaction to the
       // person doing it. Photos are not: in a family group they are the family
       // talking, and a photo followed by an unrelated question is the common case.
+      // Remembered, not delivered. Nothing is sent and no model turn happens;
+      // this only means the NEXT addressed message knows what it is replying
+      // into. Groups only — a DM is addressed by construction, so nothing is
+      // ever dropped there.
+      if (options.groupContext && outcome.event.source.chat_type !== "dm" && outcome.event.text) {
+        options.groupContext.hold(
+          chatId,
+          outcome.event.source.user_name || "someone",
+          outcome.event.text,
+        );
+      }
       if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
         options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
           ...(message.caption ? { caption: message.caption } : {}),
@@ -790,6 +810,24 @@ export async function dispatchUpdate(
       if (person?.displayName) {
         outcome.event.source.user_name = person.displayName;
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
+      }
+    }
+
+    // The turns this message is a reply INTO. Prefixed onto the text rather
+    // than carried in its own field because the gateway forwards `text` and
+    // nothing else reaches the model — a new inbound field would be ignored
+    // exactly as `expects_reply` was (#122). Clearly fenced and named as
+    // overheard so it reads as background, never as something said to the
+    // assistant or asked of it. Empty when there is nothing to carry, so a
+    // quiet group's turns look exactly as they did before.
+    if (options.groupContext && outcome.event.source.chat_type !== "dm") {
+      const overheard = options.groupContext.take(chatId);
+      if (overheard.length) {
+        const lines = overheard.map((m) => `${m.sender}: ${m.text}`).join("\n");
+        outcome.event.text =
+          `[overheard in the group since you last spoke — background only, not addressed to you]\n` +
+          `${lines}\n[end of overheard]\n\n${outcome.event.text}`;
+        log(structuredLog("info", "trip_bot.group_context_carried", { turns: overheard.length }));
       }
     }
 

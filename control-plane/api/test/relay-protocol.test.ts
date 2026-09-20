@@ -239,6 +239,30 @@ describe("parseOutboundAction", () => {
     );
   });
 
+  test("infers expects_reply from a question when the gateway states nothing", () => {
+    // INTERIM, and it earns its place: the half that stamps this field is a
+    // cross-repo change that has not landed (#122), so nothing ever set it and
+    // the window never opened. A companion asked a family a question in their
+    // group and could not hear the answer unless somebody repeated its name.
+    const ask = (content: string, metadata?: unknown) =>
+      (parseOutboundAction({ op: "send", chat_id: "1", content, ...(metadata === undefined ? {} : { metadata }) }) as
+        { expectsReply: boolean }).expectsReply;
+
+    assert.equal(ask("כמה ימים בהוי אן?"), true, "a Hebrew question opens it");
+    assert.equal(ask("How many days in Hoi An?"), true);
+    assert.equal(ask("هل تريد؟"), true, "Arabic question mark");
+    assert.equal(ask("שאלה?‏"), true, "a trailing direction mark does not hide the marker");
+    assert.equal(ask('"Which one?"'), true, "closing quotes do not hide it either");
+
+    assert.equal(ask("הוספתי את זה לאתר."), false, "a statement does not");
+    assert.equal(ask("I wonder what they will pick"), false, "and neither does a rhetorical one");
+
+    // An explicit statement always wins, in BOTH directions — this only fills
+    // a silence, and stops mattering the day the gateway speaks.
+    assert.equal(ask("Which one?", { expects_reply: false }), false);
+    assert.equal(ask("Done.", { expects_reply: true }), true);
+  });
+
   test("rejects actions missing required fields", () => {
     for (const bad of [
       null,

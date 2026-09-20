@@ -32,6 +32,23 @@ import { digestTelegramId, isPrivateChatId } from "./identity.js";
 /** Closed-binding reason for a switch the organizer asked for themselves. */
 export const SWITCH_CLOSED_REASON = "organizer_switch";
 
+/**
+ * What makes an intake session LIVE, as a SQL fragment over `$1 = chat id`.
+ *
+ * One definition, two readers — `resolveChatRoute` decides what a chat routes
+ * to, and `switchChatToTrip` refuses while one is running. They must agree:
+ * when they did not, a chat whose interview had expired routed to its
+ * companion while refusing every `/switch` as "we're in the middle of setting
+ * up a trip".
+ *
+ * `expired_at IS NULL` is migration 0049's idle closure and is the half that
+ * went missing. It belongs here for the reason the router already records: a
+ * closed session that still counts as live locks the organizer out of the trip
+ * they were half way through.
+ */
+export const LIVE_INTAKE_SESSION_PREDICATE =
+  "telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL";
+
 function bindingId(): string {
   return `tcb_${randomBytes(16).toString("hex")}`;
 }
@@ -89,6 +106,24 @@ export interface OrganizerTrip {
  * `chatId` is a ROUTING input only — it decides which row gets `current`, and
  * never which rows appear. That is why an organizer reading their list in one
  * chat sees the same trips as in any other.
+ *
+ * TORN-DOWN TRIPS ARE EXCLUDED, and the two markers used are the ones teardown
+ * already writes (`scripts/teardown-trip.py`, `retire_in_db`): the `retired-`
+ * slug prefix, and every binding closed with `trip_destroyed`. Membership alone
+ * was the filter until 2026-09-20, when 39 of 40 `ready_private` rows on a
+ * staging database were torn-down trips and the list was unusable.
+ *
+ * There is deliberately nothing on the trip ROW to test: teardown leaves
+ * `lifecycle_state` exactly as it was, so a destroyed trip still reads
+ * `ready_private`. Adding a state would change teardown's contract and its
+ * refusal set; these two markers need no migration and are written by the only
+ * thing that destroys a trip.
+ *
+ * NOT excluded: a trip whose bindings never carried a `hermes_profile`. That is
+ * REVIVABLE, not dead — migration 0043's rule is that routing and the assistant
+ * behind it are separate, separately retryable components, and the
+ * provisioner's `attach_profile_to_orphan_bindings` fills exactly that gap on
+ * the next provision. `hasCompanion` reports it so the caller can say so.
  */
 export async function listOrganizerTrips(
   db: pg.Pool,
@@ -116,6 +151,10 @@ export async function listOrganizerTrips(
       WHERE m.user_id IN (
               SELECT user_id FROM control_plane.telegram_organizer_links
                WHERE telegram_subject_digest = $1)
+        AND t.slug NOT LIKE 'retired-%'
+        AND NOT EXISTS (
+              SELECT 1 FROM control_plane.telegram_chat_bindings d
+               WHERE d.trip_id = t.id AND d.closed_reason = 'trip_destroyed')
       ORDER BY t.created_at DESC`,
     [digestTelegramId(telegramUserId), chatId],
   );
@@ -196,9 +235,16 @@ export async function switchChatToTrip(
     // A live interview outranks a binding in `resolveChatRoute`, so a switch
     // applied underneath one would look like it did nothing at all. Checked
     // before anything is written, and reported rather than silently applied.
+    //
+    // The predicate is SHARED with the router rather than restated here. It was
+    // restated, and the copy drifted: it omitted `expired_at IS NULL`, so an
+    // interview closed for idleness stopped routing the chat — correctly — and
+    // went on blocking every switch in it, permanently, with a companion
+    // answering in the same chat. Nothing clears it; teardown's own cleanup
+    // expires sessions, it does not confirm them. Found live 2026-09-20.
     const live = await client.query(
       `SELECT 1 FROM control_plane.intake_sessions
-        WHERE telegram_chat_id = $1 AND state <> 'confirmed'`,
+        WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
       [chatId],
     );
     if (live.rowCount) {

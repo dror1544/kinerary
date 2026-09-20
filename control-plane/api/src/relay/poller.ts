@@ -83,6 +83,7 @@ import {
   dismissSuggestionForChat,
   suggestionLabel,
   type SuggestedAnswer,
+  typedChoiceAnswer,
 } from "../interview.js";
 import {
   applyProposals,
@@ -118,6 +119,7 @@ import { resolveTelegramCallbackRef } from "../adapters/telegram.js";
 import { processApprovalCallback, type SignupConfig } from "../signup.js";
 import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
+import { GroupContext } from "./group-context.js";
 import {
   askText, DEFAULT_LANGUAGE, optionLabel, recapLabel, uiString, writtenLanguage, type Language,
 } from "../intake-copy.js";
@@ -175,6 +177,7 @@ export interface TripBotPollerDeps {
    * lives exactly as long as the poll loop does.
    */
   pendingAttachments?: PendingAttachments;
+  groupContext?: GroupContext;
   /**
    * The bounded-call runner behind the interpret path
    * (docs/interview-without-an-agent.md). Absent, `interpret_path` sessions
@@ -1569,6 +1572,44 @@ async function runInterpretPath(
     await markInterpretationCommitted(deps.db, interpretationId, { askAnyway: state.outstanding.slice(0, 1) });
     await ask();
     return;
+  } else if (onScreen && recorded
+             && typedChoiceAnswer(onScreen, sourceText, recorded.answers) !== null) {
+    // DECIDABLE WITHOUT A MODEL, so decided without one.
+    //
+    // The question on screen offers choices drawn from what the control plane
+    // already holds, and what was typed names exactly one of them. That is a
+    // lookup, and `typedChoiceAnswer` is the same matcher the button path uses
+    // — so typing the name and tapping the name now reach the same place, which
+    // is the standing rule for every button in this interview.
+    //
+    // It ran through the model until 2026-09-20 and the model could not do it:
+    // an organizer answered `organizer_identity` with their own name, spelled
+    // exactly as the roster has it, and `interpret` returned zero proposals
+    // twice running. The interview re-asked the same question forever and the
+    // trip was never built. The model is not shown a `choicesFrom` question's
+    // options at all (`describeQuestion` reads only the static ones), so it was
+    // being asked which traveller this is without being given the travellers.
+    //
+    // Cheaper matters less than correct here, but it is also ~7s of model call
+    // saved on a question that has one right answer.
+    const value = typedChoiceAnswer(onScreen, sourceText, recorded.answers)!;
+    proposals = [{
+      questionId: onScreen,
+      value: { kind: "text", text: value },
+      confidence: 1,
+      // The organizer's own words, which is what `evidenceAppears` checks.
+      evidence: sourceText.trim(),
+      sourceMessageId: messageIds[0] ?? "",
+    }];
+    await recordInterpretationResult(deps.db, interpretationId, {
+      proposals,
+      attempts: 0,
+      durationMs: 0,
+    });
+    log(structuredLog("info", "interview.matched_without_model", {
+      session_id: burst.sessionId,
+      question_id: onScreen,
+    }));
   } else {
     const result = await interpretBurst(deps.modelRunner, {
       sourceText,
@@ -3125,6 +3166,9 @@ export function startTripBotPoller(
   const maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   const deliverIntervalMs = options.deliverIntervalMs ?? DEFAULT_DELIVER_INTERVAL_MS;
   const pendingAttachments = deps.pendingAttachments ?? new PendingAttachments();
+  // Same lifetime as the attachments beside it: per relay process, so it
+  // survives updates and is forgotten on restart.
+  const groupContext = deps.groupContext ?? new GroupContext();
 
   let offset = 0;
   let stopped = false;
@@ -3217,6 +3261,7 @@ export function startTripBotPoller(
             interviewerProfile: deps.interviewerProfile,
             media: deps.media,
             pendingAttachments,
+            groupContext,
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the
             // organizer's turn on a socket that is gone.
