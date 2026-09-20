@@ -319,6 +319,67 @@ class VenueEnrichmentTests(unittest.TestCase):
         self.assertIn("waze.com/ul?q=Tokyo%20Skytree", v["waze"])
         self.assertEqual("https://www.tokyo-skytree.jp/en/", v["url"])  # untouched
 
+    def test_a_venue_with_no_link_anywhere_takes_the_website_osm_has(self) -> None:
+        # The case every provisioned trip was in: no documents, so the
+        # cross-trip venue_links store is empty, so nothing set `url` and the
+        # place card had no way to say where to buy a ticket.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+        ]
+        http = FakeHttp({
+            "q=Tokyo%2C+Japan": NOMINATIM_TOKYO,
+            "q=Kyoto": NOMINATIM_KYOTO,
+            "q=Tokyo+Skytree": [{
+                "lat": "35.7101", "lon": "139.8107", "display_name": "Tokyo Skytree",
+                "extratags": {"website": "https://www.tokyo-skytree.jp/en/"},
+            }],
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", out["phases"][0]["venues"][0]["url"])
+        # Where it came from, so a derived link is never mistaken for one a
+        # person supplied — and so nothing downstream reads it as "tickets".
+        self.assertEqual("osm-website", out["phases"][0]["venues"][0]["url_source"])
+        geocodes = [c for c in http.calls if "nominatim" in c]
+        self.assertTrue(geocodes, "the venue was geocoded")
+        self.assertTrue(all("extratags=1" in c for c in geocodes),
+                        "the website rides on the request already being made")
+
+    def test_a_bare_hostname_is_made_into_a_real_url(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"contact:website": "www.somewhere.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.somewhere.example", out["phases"][0]["venues"][0]["url"])
+
+    def test_a_tagged_value_that_is_not_a_url_is_discarded_rather_than_guessed(self) -> None:
+        # A broken link on a place card is worse than no link: the family finds
+        # out by tapping it.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "ask at the desk"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertNotIn("url", out["phases"][0]["venues"][0])
+
+    def test_osm_never_overrides_a_url_that_is_already_there(self) -> None:
+        # The store holds links a person or a document supplied. This is the
+        # floor, not the preference.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "x", "name": {"en": "Somewhere Museum"}, "url": "https://from-the-document.example"},
+        ]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "https://osm.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://from-the-document.example", out["phases"][0]["venues"][0]["url"])
+        self.assertNotIn("url_source", out["phases"][0]["venues"][0],
+                         "a link that was already there is not ours to label")
+
     def test_a_hand_authored_venue_maps_link_is_kept(self) -> None:
         cfg = _config()
         cfg["phases"][0]["venues"] = [

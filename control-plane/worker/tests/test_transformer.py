@@ -7,6 +7,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from control_plane_worker import transformer
 from control_plane_worker.transformer import (
     _names_sound_alike,
     _resolve_organizers,
@@ -1884,3 +1885,86 @@ class DestinationTrailingCountryTests(unittest.TestCase):
         # Japan as a STOP rather than the trailing country: the phase check
         # rules it out before the country list would wave it through.
         self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Japan", ["Tokyo", "Japan"]))
+
+
+class TripClockAndLanguage(unittest.TestCase):
+    """The two `agent` fields that described a trip other than the one they
+    were built from, until 2026-09-20."""
+
+    def test_a_typed_zone_that_is_a_zone_is_kept(self):
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("Asia/Tokyo", "Japan"))
+
+    def test_a_country_name_typed_as_a_zone_is_replaced_by_the_real_one(self):
+        # What an organizer actually typed when asked for a timezone. It
+        # reached the config as `agent.timezone` and left a 07:30 briefing
+        # scheduled in a zone no clock resolves.
+        self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("Vietnam", "Vietnam"))
+
+    def test_the_zone_is_derived_when_nothing_was_typed(self):
+        self.assertEqual("Europe/Lisbon", transformer._resolve_timezone("", "Portugal — Lisbon and Porto"))
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("", "Tokyo, Japan"))
+
+    def test_a_destination_written_in_hebrew_resolves_the_same_as_english(self):
+        # The normal case for a Hebrew interview, and it silently lost BOTH
+        # facts: on 2026-09-20 one run stored "Vietnam" and the next stored
+        # "וייטנאם", and the Hebrew one produced no timezone and a null
+        # travel_info — so the site's currency card and conversion feature were
+        # simply absent, with nothing saying so.
+        for written in ("וייטנאם", "ויאטנם"):
+            with self.subTest(written):
+                self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("", written))
+                self.assertEqual("VND", transformer._lookup_known_currency(written)["code"])
+
+    def test_the_currency_and_the_zone_resolve_together_or_not_at_all(self):
+        # They answer two questions about one place through one key list, so a
+        # destination cannot resolve for one and not the other.
+        for written in ("יפן", "Japan", "Tokyo, Japan", "Portugal — Lisbon and Porto"):
+            with self.subTest(written):
+                self.assertTrue(transformer._resolve_timezone("", written))
+                self.assertIsNotNone(transformer._lookup_known_currency(written))
+
+    def test_an_unmappable_destination_yields_nothing_rather_than_the_text(self):
+        # Absent is a gap something can notice. "Narnia" sitting in a field
+        # read as a zone looks answered and is not.
+        self.assertEqual("", transformer._resolve_timezone("Narnia", "Narnia"))
+
+    def test_a_derived_zone_alone_does_not_invent_an_agent_block(self):
+        # An intake that answered none of the assistant questions must produce
+        # exactly the config it did before those questions existed.
+        agent = transformer._derive_agent({"destination": {"kind": "text", "text": "Japan"}}, [], [])
+        self.assertIsNone(agent)
+
+    def test_the_companion_speaks_the_language_the_interview_was_held_in(self):
+        data = {
+            "bot_name": {"kind": "text", "text": "פאם"},
+            "destination": {"kind": "text", "text": "Vietnam"},
+        }
+        agent = transformer._derive_agent(data, [], [], "he")
+        self.assertEqual("he", agent["default_language"])
+        self.assertEqual("Asia/Ho_Chi_Minh", agent["timezone"])
+
+    def test_an_unknown_interview_language_still_falls_back_to_english(self):
+        data = {"bot_name": {"kind": "text", "text": "Sol"}}
+        self.assertEqual("en", transformer._derive_agent(data, [], [], "kl")["default_language"])
+
+
+class ConfirmedBookingsAreConfirmed(unittest.TestCase):
+    """A travel_anchor is a fixed point in the trip, not evidence of a booking.
+
+    Counting every anchor told one family on their front page that four
+    bookings were confirmed on a trip where nothing was booked — beside map
+    stops rendered from the same anchors correctly showing no confirmation.
+    """
+
+    def test_an_anchor_with_a_confirmation_counts(self):
+        self.assertTrue(transformer._has_confirmation({"confirmation": "PH-88213"}))
+
+    def test_an_anchor_without_one_does_not(self):
+        self.assertFalse(transformer._has_confirmation({"type": "flight", "name": "VN572"}))
+
+    def test_a_placeholder_is_not_a_confirmation(self):
+        # The site renders "–" for a missing confirmation; the count must not
+        # read the same value as evidence.
+        for placeholder in ("–", "-", "  ", "n/a", "TBD", "none"):
+            with self.subTest(placeholder):
+                self.assertFalse(transformer._has_confirmation({"confirmation": placeholder}))
