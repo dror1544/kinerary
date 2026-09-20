@@ -156,8 +156,15 @@ class SshMcpBridgeAdapter:
                 f"trip-mcp bridge over ssh exited {result.returncode}: {(result.stderr or result.stdout)[-500:]}"
             )
         line = (result.stdout or "").strip().splitlines()[-1] if (result.stdout or "").strip() else ""
-        if line != f"WIRED {profile_name}":
+        # "WIRED <profile>" or "WIRED <profile> <commit>". The commit is the
+        # checkout the OTHER side ran from, which the forced command in its
+        # authorized_keys chooses and nothing here can see. It is optional only
+        # so an older host still reports success rather than failing on a field
+        # it does not know to print.
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "WIRED" or parts[1] != profile_name:
             raise RuntimeError(f"unrecognized bridge result: {line[:200]!r}")
+        self.built_from = parts[2] if len(parts) > 2 else "unreported"
         return True
 
 

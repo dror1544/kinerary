@@ -1444,13 +1444,38 @@ class ProvisionerWorker:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
                         logger.info(
                             "provisioner.mcp_bridge_wired" if wired else "provisioner.mcp_bridge_skipped",
-                            extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
+                            extra={
+                                "trip_id": trip_id,
+                                "hermes_profile": hermes_profile,
+                                # Which checkout built this companion. The
+                                # install host chooses it through its own
+                                # forced command, so this is the only place the
+                                # worker can learn it.
+                                "built_from": getattr(self._mcp_bridge, "built_from", "unreported"),
+                            },
                         )
                     except Exception:
                         logger.warning(
                             "provisioner.mcp_bridge_failed",
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
+                        )
+                        # A FACT, not only a log line. The branch above, for a
+                        # missing companion, records one for exactly this
+                        # reason — "without this the run would report success
+                        # with no companion and nothing said about it" — and
+                        # this branch did not, so a companion that could not
+                        # reach its own trip was handed over as ready and the
+                        # only trace was a WARNING inside the worker's
+                        # container. Found live 2026-09-20, after hours spent
+                        # establishing by hand what this row would have said.
+                        _record_reachability(
+                            conn, trip_id, reachable=False,
+                            reason="TRIP_MCP_BRIDGE_FAILED",
+                            consequence=(
+                                "the companion is installed but cannot read this trip: "
+                                "every trip tool will fail while it answers normally"
+                            ),
                         )
 
                     # The assistant's wake-words, recorded as a ROUTING fact
