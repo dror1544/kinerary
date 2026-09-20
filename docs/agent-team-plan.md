@@ -568,11 +568,12 @@ Principles behind the table:
    commit prompt. `.project/README.md` is the contract. The sprint lock is
    recorded as locked, the baseline as open; the session preparing the
    baseline locks it when the baseline fixes have landed.
-7. **CLAUDE.md is closed to subagents — built 2026-09-20.** The Write hook
+6. **CLAUDE.md is closed to subagents — built 2026-09-20.** The Write hook
    refuses it to any tool call carrying an `agent_type`, with the reason; the
    lead session may still write it, and its commit is still hard rule 1.
-6. **Upgrade Claude Code** past 2.1.251 before relying on `maxTurns` partial
-   output or the documented model-resolution order.
+7. **Upgrade Claude Code — done 2026-09-20**, 2.1.236 → 2.1.267 (Homebrew
+   cask), past 2.1.246 for `maxTurns` partial output and 2.1.251 for the
+   documented model-resolution order.
 
 ---
 
@@ -612,8 +613,10 @@ Sprint 6 experiment. What changes per sprint is the input — that sprint's
 section of the plan, its tracks document, the issues in its milestone — never
 the roles, the gates or the brief.
 
-**Start condition: the Sprint 6 baseline is locked down.** Dror's call
-(2026-09-20). The baseline is `docs/test-reports/sprint-6-baseline-2026-09-20.md`
+**Start condition: the Sprint 6 baseline is locked down — it is, at
+`97582b6` since 2026-09-20 — and the end-to-end run has passed at that
+baseline** (Dror, 2026-09-20: "as soon as the e2e will pass the sprint can
+start"). The baseline is `docs/test-reports/sprint-6-baseline-2026-09-20.md`
 with its triage and the fixes it sent to `integration/sprint-6`; the team
 starts when he locks it — `scripts/project-state.py lock baseline --by "Dror"
 --reason …`, which pins the branch head as `baseline.commit` — and every agent
@@ -622,8 +625,7 @@ against product code before it.
 
 **Before the lock — prerequisites only.** §8 touches hooks, agent files,
 labels and tooling, none of which is product code or baseline work, so it is
-built while the baseline is being closed out; everything but the Claude Code
-upgrade (item 6, at session end) already is.
+built while the baseline is being closed out; every item is (2026-09-20).
 
 **Day one after the lock.** Dry-run one track-4 documentation item — no
 product code, no infrastructure — through the whole loop: brief → developer →

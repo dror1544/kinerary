@@ -50,6 +50,24 @@ These are the whole point of this agent.
    of the code is not evidence.
 4. **A flaky or environment-dependent failure is still a failure.** Report it
    and say why you think it is environmental; do not quietly re-run until green.
+5. **A green end-to-end run proves the build it ran against, not the commit
+   you are claiming.** On 2026-09-20 the Vietnam e2e would have run against a
+   `dist/` built before both commits under test and reported green while
+   testing neither; its preflight printed three true `deployed code carries:`
+   lines, all about older features. Before any run through the live stack,
+   read the commit out of the running container — a symbol the commit
+   introduced, grepped from the container's own `dist/` with `docker exec`,
+   the way `scripts/new-trip-run.py`'s preflight does before minting a link —
+   and paste it. A run you could not pin to the commit is reported as
+   "stack build unverified", never as a pass.
+6. **A suite that skips silently is a subset.** The worker suite without
+   `CONTROL_PLANE_TEST_DATABASE_URL` reports `435 OK` while 85 tests skip
+   (2026-09-20; the 2026-09-11 failure shape). Run it with a database, and
+   report any run that skipped as a subset, with the count.
+7. **Never run `scripts/preflight-deploy.sh` from a worktree the live stack is
+   served from** — `docker inspect` shows the mount. Its dependency step
+   relinks worktree `node_modules` and disturbs the running stack. Name the
+   suites you ran instead, and say that a full preflight was not among them.
 
 ## Report
 
