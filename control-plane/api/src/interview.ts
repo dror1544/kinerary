@@ -559,13 +559,13 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travel_anchors",
     type: "structured",
-    prompt: "Any flights, hotels, or cars already booked? List them with confirmation numbers.",
+    prompt: "Which reservations are already booked? Include flights, hotels, cars, and ticketed attractions, tours, activities, events, shuttles, or parking. List each with its confirmation, order, or booking code.",
     dataShape: "array",
     // One real `type`, not "flight|hotel|car": a list of alternatives shown as
     // a value is a value a model can copy. The transformer reads any type
     // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
     // an optional HH:MM `time` puts a booked visit at its hour.
-    dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
+    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
     // A flight number is not a confirmation, and that is a rule, not a
     // judgement — see withoutFlightNumbersAsConfirmations (#131).
