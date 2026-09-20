@@ -557,10 +557,17 @@ behind sprint-6 → main → a `kinerary-cp-release` upgrade.
 
 ### Slice A is BUILT (2026-09-20) — committed, not merged, not pushed
 
-`fix/92-slice-a`, eight commits on `6a46dc3`, 30 files, +3864/−316. **Full
-control-plane suite: 1464 tests, 1458 pass, 0 fail, 0 cancelled, 6 skipped**,
-against a private database (`cptest_92a`, never bare `cptest`). `preflight-checks.sh
---all` clean. The sprint freeze stands; nothing is merged to `integration/sprint-6`.
+`fix/92-slice-a`, eight commits on **`97582b6` — the locked Sprint 6 baseline** —
+30 files, +3864/−316. **Full control-plane suite: 1465 tests, 1459 pass, 0 fail,
+0 cancelled, 6 skipped**, against a private database (`cptest_92a`, never bare
+`cptest`). `preflight-checks.sh --all` clean, typecheck clean.
+
+That 1465 is the baseline's own 1374 plus Slice A's 91 new tests, which is worth
+stating because the baseline record says 1374: the number moves when this lands,
+and it moves for a reason rather than by drift.
+
+The sprint lock stands; nothing is merged to `integration/sprint-6`, and nothing
+is pushed.
 
 `fix/92-slice-b` preserves the rest of #92 whole, plus one commit renaming its
 four migrations to `YYYYMMDDHHMMSS_` and giving each a `-- rollback: compatible`
