@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated_at": "2026-09-20T16:46:34Z",
+  "updated_at": "2026-09-20T17:38:45Z",
   "updated_by": "Dror (recorded by Claude, readiness-baseline session)",
   "sprint": {
     "id": "6",
@@ -22,17 +22,12 @@
   },
   "locks": {
     "sprint": {
-      "state": "locked",
-      "since": "2026-09-19",
-      "by": "Dror (recorded by Claude, agent-team plan session)",
-      "reason": "Dror, 2026-09-19, reaffirmed 2026-09-20: integration/sprint-6 is not ready — do not assess, deploy, or merge it to main; main's b451ee7 (#109) is owed to it once this lifts",
-      "meaning": "the integration branch is not ready to leave: do not assess it, deploy it, or merge it to main",
-      "forbids": [
-        "regression assessment of the integration branch",
-        "deploying the integration branch",
-        "merging the integration branch to main",
-        "merging main into the integration branch"
-      ]
+      "state": "open",
+      "since": "2026-09-20",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "reason": "Dror, 2026-09-20: baseline established and the sprint work begins; he conditioned the unlock on the e2e passing with appropriate waivers, and scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown is green at 97582b6 against a build verified from inside the running container, with no waivers taken",
+      "meaning": "the integration branch may be assessed, merged to main and deployed, through the normal gates",
+      "forbids": []
     },
     "baseline": {
       "state": "locked",
@@ -77,6 +72,12 @@
       "by": "Dror (recorded by Claude, readiness-baseline session)",
       "change": "lock baseline at 97582b6",
       "reason": "Dror, 2026-09-20, approved explicitly: the baseline is final at 97582b6 and the agent team may start; evidence is the nine suites recorded in docs/test-reports/sprint-6-baseline-2026-09-20.md, run at that commit with a clean tree"
+    },
+    {
+      "at": "2026-09-20T17:38:45Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "unlock sprint",
+      "reason": "Dror, 2026-09-20: baseline established and the sprint work begins; he conditioned the unlock on the e2e passing with appropriate waivers, and scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown is green at 97582b6 against a build verified from inside the running container, with no waivers taken"
     }
   ]
 }

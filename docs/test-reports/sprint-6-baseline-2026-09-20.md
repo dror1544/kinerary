@@ -188,6 +188,44 @@ of them skipped for exactly that reason. A baseline that recorded the skipping
 version would be recording 435 OK while 85 tests had not run, which is the
 2026-09-11 "clean preflight that had not run 340 tests" failure repeating.
 
+### The end-to-end run, at the baseline and against the baseline's build
+
+`scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown`, at 97582b6:
+**`✓ full cycle green (vietnam)`**, no waivers, no warnings, no skipped checks.
+Signup through deep link, a Hebrew interview played by the stand-in, confirm,
+provision, site, companion, MCP, then the trip torn down and the relay returned
+to real Telegram.
+
+The assertions that correspond to this sprint's fixes:
+
+| check | issue |
+|---|---|
+| `the site claims 0 confirmed booking(s), which is the truth` — with `VN572` and `VN571` both on the site as flight numbers | **#131** |
+| `every day of the trip is on the site (16 days)` · `the open stretch 2028-03-12..2028-03-20 says it is open` · `1 open stretch(es), shown rather than dropped` | **#117** |
+| `agent.timezone is a real zone: Asia/Ho_Chi_Minh` · `the companion speaks the trip's language: he` | **#132** |
+| `place survived to the site: Thang Long Water Puppet Theatre (day plan)` | #128 |
+
+#131 is the one worth naming. The organizer named two flight designators inside
+a free-text itinerary answer, which is the shape that used to put `VN572` in
+the booking `confirmation` on some runs and not others. It did not here, and
+the reason is not that this run was lucky: code decides it now.
+
+**The run before this one would have been a false green, and is the reason the
+build is named above rather than assumed.** The first attempt stopped at
+preflight because the relay was down. Had it been up, it would have run against
+`dist/` built at 13:34 — before #131 and #134 — and reported the scenario green
+while testing neither. The preflight's three `deployed code carries:` markers
+were all true and all about older features; nothing checked for the commits
+under test. So before the second attempt, `dist` was rebuilt, the four
+interview services were restarted through
+`.agents/skills/interview-stack-deploy/deploy.sh`, and `isFlightDesignator` was
+read back out of the **running container** rather than off the filesystem.
+
+CLAUDE.md already says to verify by reading the running containers rather than
+trusting the directory, and `scripts/new-trip-run.py` enforces exactly that
+before minting an interview link. The e2e does not yet do the equivalent for
+the commit under test. That is a gap worth a check rather than a paragraph.
+
 ### What was NOT run, and why
 
 `scripts/preflight-deploy.sh` was not used, so this is nine targeted suites
