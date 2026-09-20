@@ -8,8 +8,11 @@
  * words are allowed to say, and only the second half can be exercised without
  * provisioned infrastructure.
  *
- * `document-intake.ts` re-exports it, so callers that hold a whole intake keep
- * importing one module.
+ * It MOVED here from `document-intake.ts`, which still holds its own copy on
+ * `fix/92-slice-b` because that branch was cut before this one existed. When
+ * Slice B rebases onto Slice A, that copy is deleted and `document-intake.ts`
+ * imports this — two copies of a gate is how the one that is not called stops
+ * matching the one that is.
  */
 import { normaliseDatesAndTimes, tripWindow } from "./document-dates.js";
 import {
