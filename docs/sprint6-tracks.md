@@ -99,6 +99,59 @@ and useful information" (`:703`), which are three of the four blanks in 1a.
 - **Phase 1 — preparation progress.** What is booked, what is missing, what to pack, what to do before departure. Falls out of 1a items 2–3 and the existing confirmations query (`:665`), so it needs no new content source.
 - **Phase 2 — destination tips and insights**, sourced from 1a item 1's destination-info pass.
 
+### 1c-bis. #117 — the interview holds what it is given, and the companion finishes the plan
+
+**Placed in track 1 on 2026-09-20.** Dror's design, and the answer to #114 —
+which stays in track 2 as the evidence. This is the build.
+
+**The scoping decision first, because it rules out a whole class of solution:**
+*the interviewer does not resolve trip planning.* #114 reads as "the interview
+failed to plan"; the answer is not to make it a planner but to make it **hold**
+what the organizer gives it and hand planning onward. Anyone working from #114
+alone might reach for a planner. They should not.
+
+The flow, in Dror's order: information volunteered mid-question is **captured and
+acknowledged** — even when it maps to no open question, which is exactly the case
+that fails today; it is **parked in a later-check area** rather than force-fit
+into the nearest slot (`travel_anchors: []` is the force-fit failure mode, named
+as such); a **judge pass before the end summary** checks coherence, fills gaps
+from the parked information, raises conflicts, tells the organizer their
+assistant can settle the rest, and lets the interview **finish rather than block
+on completeness**; readiness is **recorded onto the companion being created**,
+state it is born holding rather than a report; the companion **proactively offers
+to help a few minutes after it starts**, deliberately not instantly; and
+readiness is **re-rated as the plan fills**, calibrated to how loose the
+organizer wants to be.
+
+**Why track 1 rather than track 2.** Its goal is the organizer's experience — the
+interview staying a conversation, an incomplete plan reading as a normal state,
+the companion building confidence. That is day-of usefulness for the person
+holding the phone, before the trip. This track already spans the companion
+(1d, 1e) and is not site-only. Track 2's goal is *measurement*, and #114 sits
+there because two of its problems are gaps in the missing-information control
+loop's model and because a false "answered" is what the outcome events exist to
+catch. Problem and solution in different tracks is unusual, so the seam is named
+rather than left implicit:
+
+> **Build the shared representation once.** §1/§2's later-check area and #114's
+> "not yet ≠ none" are the same representation track 2's control loop needs. Two
+> tracks want it; it gets built in one of them, and the other consumes it.
+
+**Two things not to lose, both from kinerary-09:**
+
+- **#114's problem 5 is NOT covered by #117** — a flat `phases` list of unique names cannot hold Tokyo twice. That is a data-model gap, not a conversational one, and #117 is about the organizer's experience. It still needs an owner. It is the same theme as #115's observation that "where" is represented as flat strings that callers concatenate blind, and is most likely to be solved with it.
+- **§6 — "no need to push" — is the easiest thing here to regress and the hardest to notice.** A companion that nags a deliberately-loose trip toward a full itinerary *looks like it is working*. Its test is in scope and should stay there.
+
+**Lineage**, worth knowing before redesigning any of it: this descends from
+2026-08-28 — LLM fallback parsing, carry-forward extraction, summary
+reconciliation. §3's judge is the grown-up form of summary reconciliation, which
+diffed the spoken summary against stored intake; this also judges coherence and
+routes what it cannot resolve. §1 and §2 are what carry-forward extraction always
+needed in order to have somewhere to carry information *to*.
+
+**Cadence note:** this is interview and companion work, so like 1e it does not
+ship on the trip-site cadence with the rest of track 1.
+
 ### 1d. Telegram handoff from the site (conversation deferred)
 **Decision: handoff now, conversation later.** The in-site surface stays an async
 message board; making it a real conversation is recorded as separate, later work
