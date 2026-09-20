@@ -114,20 +114,18 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   const log = dependencies.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const app = Fastify({ logger: false });
 
+  // The route list is collected from Fastify rather than written out by hand:
+  // the hand-maintained version still advertised sprint 4 and listed none of
+  // the portal routes months after they mounted. A list that is derived cannot
+  // drift, and this endpoint has no other consumer to break.
+  const mountedRoutes = new Set<string>();
+  app.addHook("onRoute", (route) => {
+    if (route.path !== "/") mountedRoutes.add(route.path);
+  });
+
   app.get("/", async () => ({
     service: "kinerary-control-plane",
-    sprint: 4,
-    endpoints: [
-      "/healthz", "/readyz",
-      "/v1/signup", "/v1/signup/callback", "/v1/signup/status", "/v1/trips/:id",
-      "/v1/trips/:id/enrollment", "/v1/trips/:id/plan", "/v1/trips/:id/plan/retry", "/v1/trips/:id/intake/correct",
-      "/v1/interview", "/v1/interview/:sessionId", "/v1/interview/:sessionId/answer", "/v1/interview/:sessionId/confirm",
-      "/v1/interview/:sessionId/consular", "/v1/interview/:sessionId/source-document",
-      "/v1/interview/:sessionId/venue-links",
-      "/v1/plans/:planId", "/v1/plans/:planId/approve",
-      "/v1/releases",
-      "/internal/telegram-interviews/bind",
-    ],
+    endpoints: [...mountedRoutes].sort(),
   }));
 
   app.get("/healthz", async () => ({ status: "ok", service: "control-plane-api" }));
