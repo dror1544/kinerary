@@ -648,3 +648,42 @@ class GeocodeMissIsVisible(unittest.TestCase):
         messages = [r.getMessage() for r in captured.records]
         self.assertTrue(any("http_failed" in m for m in messages), messages)
         self.assertEqual(429, next(getattr(r, "status", None) for r in captured.records))
+
+
+class WorkerLogLevel(unittest.TestCase):
+    """INFO must reach the log. `provisioner.mcp_bridge_wired` and
+    `mcp_bridge_skipped` are both INFO, and with Python's default root level of
+    WARNING they were discarded — so a trip that came up with no trip-mcp left
+    no trace of which of the two happened (2026-09-19)."""
+
+    def _configure(self, env):
+        """Apply _configure_logging under `env` and report the level it set,
+        leaving the root logger exactly as it was — otherwise this class would
+        reconfigure logging for every test that runs after it."""
+        import os
+
+        from control_plane_worker.__main__ import _configure_logging
+
+        root = logging.getLogger()
+        saved_level, saved_handlers = root.level, root.handlers[:]
+        try:
+            root.handlers = []
+            with mock.patch.dict(os.environ, env, clear=False):
+                if "WORKER_LOG_LEVEL" not in env:
+                    os.environ.pop("WORKER_LOG_LEVEL", None)
+                _configure_logging()
+                return root.level
+        finally:
+            root.setLevel(saved_level)
+            root.handlers = saved_handlers
+
+    def test_info_is_the_default(self):
+        self.assertEqual(logging.INFO, self._configure({}))
+
+    def test_the_level_can_be_raised_or_lowered(self):
+        self.assertEqual(logging.DEBUG, self._configure({"WORKER_LOG_LEVEL": "DEBUG"}))
+        self.assertEqual(logging.WARNING, self._configure({"WORKER_LOG_LEVEL": "warning"}))
+
+    def test_an_unrecognised_value_falls_back_to_info_not_to_silence(self):
+        # A typo must not disable logging — that is the failure this prevents.
+        self.assertEqual(logging.INFO, self._configure({"WORKER_LOG_LEVEL": "verbose"}))
