@@ -235,9 +235,40 @@ else, and folding this into work already being carried would hide it.
 five by a wide margin, and this makes it larger. If something in this sprint
 gives, this track is where the pressure will show first.
 
-**Worth noting for sequencing:** the hand-run experience evaluation below is the
-kind of exercise that surfaces exactly this class of failure — which is part of
-why it leads rather than follows the pipeline build.
+**Worth noting for sequencing, and it is sharper than it looks.** The live
+interview that produced #114 was in effect a manual run of the experience
+evaluation below — it surfaced a six-part representational failure with zero
+instrumentation. But it only did so because **a human was reading the
+conversation**. The session's own data showed a *clean run*: every interpretation
+succeeded, no `failure_reason`, no stalled turn.
+
+So an outcome-event pipeline derived from the system's own success and failure
+signals would have scored that interview as **successful**. That is a design
+constraint on this track's event vocabulary, not a footnote: measuring "did the
+call succeed" is not measuring "did we understand". Catching #114's class needs
+events about what was *not* consumed — how much of a message mapped to
+proposals, which clauses were left on the floor, whether a request addressed to
+the assistant was recognised at all.
+
+It is also a caution about what the pipeline will never see, and the reason the
+hand evaluation leads rather than follows.
+
+**One thing that is NOT true, corrected 2026-09-20.** An earlier version of this
+note suggested #112 (the geocoder returning nothing) and #114's returning-leg
+problem might share a fix. They do not. `ae397fd` touches five files —
+`enrichment.py` query construction, `venue-links.ts`, `poller.ts` and their
+tests — and **none of the phases model, the schema or the transformer**
+(verified). #112 was the *destination string* being an itinerary and getting
+concatenated into a place query, fixed by splitting on commas, de-duplicating
+and anchoring on the country tail. #114's problem 5 is the *phases list* being
+unable to hold Tokyo twice. A phases model that expressed a returning leg would
+not have fixed #112, and #112's fix does nothing for a returning leg.
+
+The real shared theme is weaker and worth stating only as an observation:
+**"where" is represented as flat strings in several places, and callers
+concatenate them without being able to see what is already inside.** That is not
+a shared fix, and this track should not carry #112-adjacent work on the strength
+of it.
 
 #### Measure the live trip first — by hand, before any events exist
 
