@@ -345,10 +345,10 @@ N is fixed by:
 
 | Migration | Adds |
 |---|---|
-| `0054_document_registry.sql` | `trip_documents`; `source_artifacts.document_id/filename/received_at`; `trip_document_extractions` |
-| `0055_answer_provenance.sql` | `trip_answer_sources`, `trip_answer_conflicts` |
-| `0056_model_task_settings.sql` | `model_task_settings`, append-only `model_task_setting_history` |
-| `0057_document_corrections.sql` | `trip_document_corrections` (post-confirm proposals) |
+| `20260918110129_document_registry.sql` | `trip_documents`; `source_artifacts.document_id/filename/received_at`; `trip_document_extractions` |
+| `20260918110130_answer_provenance.sql` | `trip_answer_sources`, `trip_answer_conflicts` |
+| `20260918110131_model_task_settings.sql` | `model_task_settings`, append-only `model_task_setting_history` |
+| `20260918110132_document_corrections.sql` | `trip_document_corrections` (post-confirm proposals) |
 
 All additive, applied by `src/migrate.ts`. `0050` is absent on purpose. Recheck the
 numbers against `main` before merging.

@@ -1,6 +1,7 @@
+-- rollback: compatible — two new tables (trip_answer_sources, trip_answer_conflicts) and their indexes; nothing existing changes shape
 -- Where each answer came from, and where two documents disagree.
 --
--- The registry (0052) records what documents a trip has and what was read out
+-- The registry (20260918110129_document_registry) records what documents a trip has and what was read out
 -- of each. It does not say which answer a document supplied, so a hotel card
 -- could not point at its voucher and nobody could ask "where did this date come
 -- from". And there was nowhere for a DISAGREEMENT to live: a later document that

@@ -1,3 +1,4 @@
+-- rollback: compatible — two new tables (trip_documents, trip_document_extractions) and their indexes; nothing existing changes shape
 -- The documents a trip is reconstructed from, and what we read out of them.
 --
 -- WHAT WAS THERE BEFORE. One jsonb column, `intake_sessions.source_document`

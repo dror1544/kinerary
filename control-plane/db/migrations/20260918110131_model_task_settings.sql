@@ -1,3 +1,4 @@
+-- rollback: compatible — two new tables, one index and an append-only trigger on a table this migration creates; nothing existing changes shape
 -- Which model serves which task, when the super admin says otherwise.
 --
 -- Every task's model is pinned by the environment (INTERPRET_*, EXTRACT_*, and

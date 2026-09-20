@@ -1,3 +1,4 @@
+-- rollback: compatible — one new table and its index; nothing existing changes shape
 -- Corrections a document proposes to a trip that is already confirmed.
 --
 -- Before confirmation, a document writes into the interview's answers like any
