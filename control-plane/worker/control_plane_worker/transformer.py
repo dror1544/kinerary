@@ -288,6 +288,7 @@ _KNOWN_COUNTRY_CURRENCY: dict[str, dict[str, str]] = {
     "united states": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "america": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "japan": {"country": "Japan", "code": "JPY", "symbol": "¥", "currency_name": "Japanese Yen"},
+    "vietnam": {"country": "Vietnam", "code": "VND", "symbol": "₫", "currency_name": "Vietnamese Dong"},
     "italy": {"country": "Italy", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "france": {"country": "France", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "spain": {"country": "Spain", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
@@ -329,7 +330,46 @@ def _destination_head(destination: str) -> str:
     return head or destination.strip()
 
 
-def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -> tuple[str, str]:
+def _destination_country(destination: str, phase_names: "Sequence[str]") -> str:
+    """The country a destination TRAILS with — "Japan" from "Tokyo, Hakone,
+    Kyoto, Osaka, Japan".
+
+    `_destination_head` reads the other shape, "Portugal — Lisbon and Porto",
+    where the country leads. Both occur, and the trailing one is what the
+    interview actually produces: it normalises a spoken destination into a list
+    of stops with the country last. A real trip on 2026-09-19 stored
+    "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain city list, and
+    was titled "Family Trip 2027" with the country nowhere.
+
+    It has to be RECOGNISED as a country, not merely trailing. "Rome,
+    Florence, Venice" has the same shape and ends in a city; naming that trip
+    "Venice" is worse than the generic fallback. An earlier attempt here used
+    "not one of the phases" as the test, which named a trip OSAKA 2026 as soon
+    as the phases did not happen to list every city the destination mentions —
+    caught by two existing tests, and the reason this asks a country list
+    instead.
+
+    That list is the same fifteen-entry stopgap `_lookup_known_currency` uses,
+    so this inherits its limit: an unlisted country falls back to the trip
+    type rather than being named. Being wrong about which places are countries
+    is worse than being incomplete, and the real answer is the enrichment
+    pass, which resolves countries properly and runs after this.
+    """
+    parts = [p.strip() for p in _MULTI_PLACE_RE.split(destination) if p.strip()]
+    if len(parts) < 2:
+        return ""
+    trailing = parts[-1]
+    known_phases = {str(n).strip().casefold() for n in phase_names if str(n or "").strip()}
+    if trailing.casefold() in known_phases:
+        return ""  # it is one of the stops, so it is not the country
+    return trailing if trailing.strip().lower() in _KNOWN_COUNTRY_CURRENCY else ""
+
+
+
+
+def _derive_brand_and_title(
+    destination: str, trip_type_label: str, year: int, phase_names: "Sequence[str]" = (),
+) -> tuple[str, str]:
     """Derives a short Hero brand ("USA 2026") and a longer title ("USA 2026 —
     Group of Families") from the destination and trip type.
 
@@ -343,8 +383,13 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     place = _destination_head(destination)
     is_multi_place = bool(_MULTI_PLACE_RE.search(place))
     short_destination = _shorten_phase_name(place, max_length=20)
+    trailing = _destination_country(destination, phase_names)
+    short_trailing = _shorten_phase_name(trailing, max_length=20) if trailing else ""
     if not is_multi_place and short_destination == place and short_destination:
         subject = short_destination
+    elif trailing and short_trailing == trailing:
+        # A list of stops that ends with its country is named by the country.
+        subject = trailing
     else:
         subject = trip_type_label if "trip" in trip_type_label.lower() else f"{trip_type_label} Trip"
     brand = f"{subject} {year}".upper()
@@ -1453,7 +1498,11 @@ def transform_intake(
 
     departure_date, return_date, total_days = _resolve_dates(data, today)
 
-    brand, title = _derive_brand_and_title(destination, trip_type_label, departure_date.year)
+    brand, title = _derive_brand_and_title(
+        destination, trip_type_label, departure_date.year,
+        [str(ph.get("name") or ph.get("name_en") or "") for ph in _structured_list(data, "phases")
+         if isinstance(ph, Mapping)],
+    )
     departure_iso = datetime(
         departure_date.year, departure_date.month, departure_date.day,
         0, 0, 0, tzinfo=timezone.utc,

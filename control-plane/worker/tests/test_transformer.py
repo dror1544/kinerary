@@ -1815,3 +1815,72 @@ class NameMatchingContractTests(unittest.TestCase):
                 )
                 expected = [] if case["expect"] is None else [participants[case["expect"]]["username"]]
                 self.assertEqual(resolved, expected)
+
+
+class DestinationTrailingCountryTests(unittest.TestCase):
+    """A trip whose destination ENDS with its country is named by it.
+
+    da66df8 taught the transformer the leading shape, "Portugal — Lisbon and
+    Porto". The interview produces the other one: it normalises a spoken
+    destination into a list of stops with the country last. So a real trip on
+    2026-09-19 stored "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain
+    city list, and was titled "Family Trip 2027" with the country nowhere.
+
+    The phases decide which trailing element is a country, rather than a list
+    of country names — the one this module carries holds fifteen entries and
+    does not include Vietnam, so a list-based check would pass the case that
+    was reported and fail the next one.
+    """
+
+    def title(self, destination, phases):
+        from control_plane_worker.transformer import _derive_brand_and_title
+
+        return _derive_brand_and_title(destination, "Family", 2028, phases)[1]
+
+    def test_a_stop_list_ending_in_its_country_is_named_by_the_country(self):
+        self.assertEqual(
+            "Japan 2028 — Family",
+            self.title("Tokyo, Hakone, Kyoto, Osaka, Japan", ["Tokyo", "Hakone", "Kyoto", "Osaka"]),
+        )
+
+    def test_it_does_not_depend_on_the_country_being_in_any_list(self):
+        # Vietnam is absent from _KNOWN_COUNTRY_CURRENCY on purpose here.
+        self.assertEqual(
+            "Vietnam 2028 — Family",
+            self.title("Hanoi, Ha Long, Hoi An, Saigon, Vietnam", ["Hanoi", "Ha Long", "Hoi An", "Saigon"]),
+        )
+
+    def test_a_city_list_with_no_country_still_falls_back(self):
+        # Every element is a phase, so nothing trails as a country. Naming this
+        # trip "Venice" would be worse than the generic fallback.
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence, Venice", ["Rome", "Florence", "Venice"]),
+        )
+
+    def test_the_leading_country_shape_is_unchanged(self):
+        self.assertEqual(
+            "Portugal 2028 — Family",
+            self.title("Portugal — Lisbon and Porto", ["Lisbon", "Porto"]),
+        )
+
+    def test_matching_ignores_case_and_surrounding_space(self):
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence,  VENICE ", ["rome", "florence", "venice"]),
+        )
+
+    def test_no_phases_still_names_a_recognised_trailing_country(self):
+        self.assertEqual("Japan 2028 — Family", self.title("Tokyo, Kyoto, Japan", []))
+
+    def test_an_unrecognised_trailing_place_falls_back_rather_than_guessing(self):
+        # The guard that matters. An earlier attempt treated "not one of the
+        # phases" as proof of a country, and named trips OSAKA 2026 and
+        # PORTO 2026 the moment the phases did not list every city mentioned.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Kyoto and Osaka", ["Tokyo"]))
+        self.assertEqual("Family Trip 2028 — Family", self.title("Lisbon and Porto", []))
+
+    def test_a_phase_named_like_a_country_is_still_not_the_country(self):
+        # Japan as a STOP rather than the trailing country: the phase check
+        # rules it out before the country list would wave it through.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Japan", ["Tokyo", "Japan"]))
