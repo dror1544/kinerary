@@ -27,7 +27,16 @@ import {
   type IntakeQuestion,
   type AnswerStore,
 } from "./interview.js";
-import type { RunnerFailure, StructuredModelRunner } from "./model-runner.js";
+import { addUsage, type ModelUsage, type RunnerFailure, type StructuredModelRunner } from "./model-runner.js";
+import {
+  identityFold,
+  isRecord,
+  mergeParts,
+  reconcileStructured,
+  type FieldChange,
+  type MergeAmbiguity,
+  type MergeConflict,
+} from "./answer-merge.js";
 import { yearlessDateHints } from "./yearless-dates.js";
 
 // ── The proposal ─────────────────────────────────────────────────────────────
@@ -74,10 +83,58 @@ export interface InterpretPayload {
 }
 
 export type InterpretResult =
-  | { ok: true; payload: InterpretPayload; attempts: number; ms: number }
-  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number };
+  | { ok: true; payload: InterpretPayload; attempts: number; ms: number; usage?: ModelUsage }
+  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number; usage?: ModelUsage };
 
 // ── Parsing: this function is the schema ─────────────────────────────────────
+
+/**
+ * A structured answer's `dataJson`, decoded — or undefined when it is not JSON.
+ *
+ * One repair, and only one: a complete JSON value followed by nothing but
+ * stray closing brackets. gpt-5.6-luna ended a valid four-stop itinerary with an
+ * extra `}` in 2 of 6 benchmark runs on 2026-09-13; the whole proposal was
+ * thrown away and the trip's stops with it. The value before the stray bracket
+ * is exactly what was written, so taking it changes nothing the model said.
+ * Anything else that does not parse is still refused — no guessing at a
+ * truncated or half-written answer.
+ */
+export function parseDataJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // fall through to the one repair
+  }
+  const start = text.search(/\S/);
+  const open = start >= 0 ? text[start] : undefined;
+  if (open !== "[" && open !== "{") return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[" || ch === "{") depth += 1;
+    else if (ch === "]" || ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        if (!/^[\s\]}]*$/.test(text.slice(i + 1))) return undefined;
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
+}
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.trim().length > 0 ? v : null;
@@ -114,11 +171,8 @@ function parseValue(raw: unknown): ProposedValue | null {
       // and a model that cannot produce well-formed JSON inside a string was
       // never going to produce it inline either.
       if (typeof v.dataJson === "string") {
-        try {
-          return { kind: "structured", data: JSON.parse(v.dataJson) };
-        } catch {
-          return null;
-        }
+        const data = parseDataJson(v.dataJson);
+        return data === undefined ? null : { kind: "structured", data };
       }
       // Inline `data` stays accepted: a runner with no schema enforcement, and
       // every test written before `dataJson` existed, both use it.
@@ -472,8 +526,24 @@ export type RejectReason =
   | "ALREADY_ANSWERED"
   /** Not a question the interview is currently asking (or a retired one). */
   | "NOT_OUTSTANDING"
-  /** Another proposal for the same question won on confidence. */
+  /**
+   * Another proposal for the same question said the same thing, won on
+   * confidence within one reply, or — for the trip's own dates — gave the
+   * earlier start or the later return.
+   */
   | "DUPLICATE_PROPOSAL"
+  /**
+   * Proposals from one burst answer this question DIFFERENTLY, each credibly.
+   * Two documents are not ranked by a model's confidence, so neither is
+   * written and the question is asked.
+   */
+  | "CONFLICTING_PROPOSALS"
+  /**
+   * A structured proposal reconciled into an answer already held, and nothing
+   * it said was new — no entry to add, no missing field to fill. Anything it
+   * stated DIFFERENTLY is reported in `conflicts`, not applied.
+   */
+  | "NO_NEW_INFORMATION"
   /** Whatever `validateAnswer` said. */
   | "UNKNOWN_QUESTION"
   | "UNKNOWN_OPTION"
@@ -497,6 +567,26 @@ export interface AcceptedProposal {
   /** Set when the answer was assembled from several structured proposals for
    *  the same question — see `mergeStructuredParts`. Absent for a single one. */
   mergedFrom?: number;
+  /**
+   * Set when the answer was reconciled INTO one already held rather than written
+   * fresh. `held` is the stored answer it was merged with — the writer passes it
+   * as the write's precondition, so a merge computed against an answer that has
+   * since changed is refused rather than applied. `added` and `filled` say what
+   * this proposal actually contributed.
+   */
+  reconciled?: { held: unknown; added: FieldChange[]; filled: FieldChange[] };
+}
+
+/** A field stated differently from what is held, or from an earlier slice of the same answer. */
+export interface QuestionConflict extends MergeConflict {
+  questionId: string;
+  proposal: ProposedAnswer;
+}
+
+/** An entry that could describe more than one held entry. */
+export interface QuestionAmbiguity extends MergeAmbiguity {
+  questionId: string;
+  proposal: ProposedAnswer;
 }
 
 export interface RejectedProposal {
@@ -512,6 +602,18 @@ export interface ProposalDecisions {
   /** Questions to ask next: the model's `unclear`, plus everything rejected.
    *  A rejected proposal never becomes a silent gap. */
   askAnyway: string[];
+  /**
+   * Disagreements, kept rather than decided. The value already held — or the
+   * more confident slice — was kept in every case; these are for a person.
+   * Before this list existed, the losing side of a disagreement simply vanished.
+   */
+  conflicts: QuestionConflict[];
+  /**
+   * Entries that could belong to more than one held entry — "Rome", undated, on
+   * a trip that visits Rome twice. Neither forced onto one nor added as another,
+   * and reported here so they are not silently lost either.
+   */
+  ambiguous: QuestionAmbiguity[];
   /**
    * Answers refused for LOW_CONFIDENCE and for nothing else: the evidence is in
    * the source, no value came from an example, and the answer validates.
@@ -586,6 +688,30 @@ export interface ApplyProposalsContext {
    * organizer sees what was recorded and corrects it.
    */
   pendingQuestionId?: string | null;
+  /**
+   * The answers already held, exactly as stored — `{kind, data, …}` per question.
+   *
+   * Given, a STRUCTURED proposal for an answered question is reconciled into the
+   * held answer instead of being refused: it may add entries and fill fields the
+   * held answer lacks, and never replaces anything (see answer-merge.ts). That is
+   * what lets a hotel confirmation arriving after the plan add its reference to
+   * the stay the plan already named.
+   *
+   * Absent, answered means refused, exactly as before. The typed-message path
+   * does not pass it: an organizer retyping an answer is making a change, and a
+   * change is theirs to make through the recap, not something to merge.
+   */
+  held?: Readonly<Record<string, unknown>>;
+  /**
+   * Which source — which document — a proposal came from. Default: its
+   * `sourceMessageId`.
+   *
+   * Two proposals from ONE source that disagree are one reader hedging, and the
+   * more confident is kept, as it always was. Two SOURCES that disagree are two
+   * documents saying different things, and a model's confidence is not evidence
+   * of which is right: those are decided by the trip-date rule or asked.
+   */
+  sourceOf?: (proposal: ProposedAnswer) => string;
 }
 
 /**
@@ -596,131 +722,53 @@ export interface ApplyProposalsContext {
 const CORRECTION_MIN_CONFIDENCE = 0.8;
 export const DEFAULT_MIN_CONFIDENCE = 0.7;
 
+/** A held or proposed non-structured answer, as something two sources can be compared on. */
+function comparableAnswer(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  switch (value.kind) {
+    case "text":
+      return typeof value.text === "string" ? identityFold(value.text) : null;
+    case "choice":
+      return typeof value.option_id === "string" ? `option:${value.option_id}`
+        : typeof value.optionId === "string" ? `option:${value.optionId}` : null;
+    case "choice_other": {
+      const text = typeof value.other_text === "string" ? value.other_text : value.otherText;
+      return typeof text === "string" ? identityFold(text) : null;
+    }
+    case "multi_choice": {
+      const ids = Array.isArray(value.option_ids) ? value.option_ids : value.optionIds;
+      return Array.isArray(ids) ? `options:${[...ids].map(String).sort().join(",")}` : null;
+    }
+    default:
+      return null;
+  }
+}
+
 // ── Merging a structured answer the model split ──────────────────────────────
 //
-// Several documents are read as one source (runDocumentPath), so one call sees
-// the hotels and the tickets together — and still, sometimes, answers `phases`
-// twice: the stays in one proposal, the attractions in another. Winner-takes-all
-// then kept whichever was more confident and discarded the rest, which on
-// 2026-09-11 dropped every ticketed attraction from a four-document Italy trip.
+// Several documents' readings meet in one gate, and even a single reading
+// sometimes answers `phases` twice: the stays in one proposal, the attractions
+// in another. Winner-takes-all then kept whichever was more confident and
+// discarded the rest, which on 2026-09-11 dropped every ticketed attraction
+// from a four-document Italy trip.
 //
 // For a structured answer the parts are not rivals, they are slices. Each part
-// that passes the gate on its own merits is combined here, entry by entry.
-// Text and choices are still winner-takes-all: two destinations cannot be
-// merged, only chosen between.
-
-function isBlank(v: unknown): boolean {
-  return v === undefined || v === null || v === "" || (Array.isArray(v) && v.length === 0);
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-/** Key order must not make two identical entries look different. */
-function canonical(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
-  if (isRecord(v)) {
-    return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}`;
-  }
-  return JSON.stringify(v) ?? "null";
-}
+// that passes the gate on its own merits is combined, entry by entry. Text and
+// choices are still winner-takes-all: two destinations cannot be merged, only
+// chosen between.
+//
+// What counts as "the same entry", and what a later part may change, lives in
+// answer-merge.ts — shared with merging a document into an answer already held,
+// so a slice of one reply and a document from last week are judged alike.
 
 /**
- * What makes two entries the same thing: a stop, a traveler and a booking are
- * each identified by their name (a booking also by its type — a hotel and a
- * flight can share a name, two flights on one reference cannot). Anything
- * without a name is only the same as an identical copy of itself.
+ * Combines the data of several structured proposals for one question, given in
+ * precedence order (most confident first). A later part fills and adds; it never
+ * replaces what an earlier part stated. A dated list comes back in date order,
+ * because the parts arrive in the order they were read, not the order of the trip.
  */
-function entryKey(entry: unknown): string {
-  if (typeof entry === "string") return `s:${fold(entry)}`;
-  if (isRecord(entry)) {
-    const name = [entry.name_en, entry.name].find((n) => typeof n === "string" && n.trim() !== "");
-    if (typeof name === "string") {
-      const type = typeof entry.type === "string" ? fold(entry.type) : "";
-      return `n:${type}|${fold(name)}`;
-    }
-  }
-  return `j:${canonical(entry)}`;
-}
-
-/** `primary` wins every field both set; `secondary` only fills what is missing. */
-function mergeRecords(primary: Record<string, unknown>, secondary: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...primary };
-  for (const [key, value] of Object.entries(secondary)) {
-    const held = out[key];
-    if (isBlank(held)) out[key] = value;
-    else if (Array.isArray(held) && Array.isArray(value)) out[key] = mergeLists(held, value);
-    else if (isRecord(held) && isRecord(value)) out[key] = mergeRecords(held, value);
-  }
-  return out;
-}
-
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
-
-function isoOf(v: unknown): string | null {
-  return typeof v === "string" && ISO_DAY.test(v) ? v : null;
-}
-
-/**
- * Same name, but the same visit? A trip can return to a city, and a hotel can
- * be booked twice — so the dates decide when both sides have them: the same
- * start, or one starting inside the other's range. An undated side has nothing
- * to contradict it and joins.
- */
-function sameVisit(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-  const aStart = isoOf(a.start) ?? isoOf(a.date);
-  const bStart = isoOf(b.start) ?? isoOf(b.date);
-  if (!aStart || !bStart || aStart === bStart) return true;
-  const aEnd = isoOf(a.end), bEnd = isoOf(b.end);
-  return (aEnd !== null && bStart > aStart && bStart < aEnd) || (bEnd !== null && aStart > bStart && aStart < bEnd);
-}
-
-/**
- * `secondary` folded into `primary`. Entries of ONE list are never merged with
- * each other — the model listed them separately, and two Tokyo legs are two
- * legs. An entry only ever joins one that came from an earlier proposal.
- */
-function mergeLists(primary: readonly unknown[], secondary: readonly unknown[]): unknown[] {
-  const out: unknown[] = [...primary];
-  const earlier = out.length;
-  for (const entry of secondary) {
-    const key = entryKey(entry);
-    if (!isRecord(entry)) {
-      if (!out.some((e) => entryKey(e) === key)) out.push(entry);
-      continue;
-    }
-    let match = -1;
-    for (let i = 0; i < earlier && match === -1; i += 1) {
-      const held = out[i];
-      if (isRecord(held) && entryKey(held) === key && sameVisit(held, entry)) match = i;
-    }
-    if (match === -1) out.push(entry);
-    else out[match] = mergeRecords(out[match] as Record<string, unknown>, entry);
-  }
-  return out;
-}
-
-/**
- * Combines the data of several structured proposals for one question, given
- * in precedence order (most confident first). A list merges entry by entry; an
- * object key by key. A list whose every entry carries an ISO `start` — which is
- * what a stop is — comes back in date order, because the parts arrive in the
- * order the documents happened to be read, not the order of the trip.
- */
-export function mergeStructuredParts(parts: readonly unknown[]): unknown {
-  const [first, ...rest] = parts;
-  if (Array.isArray(first)) {
-    const merged = rest.reduce<unknown[]>((acc, p) => (Array.isArray(p) ? mergeLists(acc, p) : acc), first);
-    const dated = merged.every((e) => isRecord(e) && typeof e.start === "string" && ISO_DAY.test(e.start));
-    return dated
-      ? [...merged].sort((a, b) => String((a as { start: string }).start).localeCompare(String((b as { start: string }).start)))
-      : merged;
-  }
-  if (isRecord(first)) {
-    return rest.reduce<Record<string, unknown>>((acc, p) => (isRecord(p) ? mergeRecords(acc, p) : acc), first);
-  }
-  return first;
+export function mergeStructuredParts(parts: readonly unknown[], options: { people?: boolean } = {}): unknown {
+  return mergeParts(parts, options);
 }
 
 /** The one-for-one mapping onto `validateAnswer`'s parameter list. */
@@ -772,6 +820,8 @@ export function applyProposals(
 
   const accepted: AcceptedProposal[] = [];
   const rejected: RejectedProposal[] = [];
+  const conflicts: QuestionConflict[] = [];
+  const ambiguous: QuestionAmbiguity[] = [];
   const suggested: SuggestedProposal[] = [];
   const reject = (proposal: ProposedAnswer, reason: RejectReason, detail?: string) =>
     rejected.push({ questionId: proposal.questionId, reason, detail, proposal });
@@ -781,7 +831,11 @@ export function applyProposals(
     const primary = ordered[0]!;
     return {
       questionId: primary.questionId,
-      value: { kind: "structured", data: mergeStructuredParts(ordered.map((p) => (p.value as { data: unknown }).data)) },
+      // Travellers merge as people here too, the same as accepted parts do.
+      value: {
+        kind: "structured",
+        data: mergeStructuredParts(ordered.map((p) => (p.value as { data: unknown }).data), { people: primary.questionId === "travelers" }),
+      },
       // As sure as its least sure part: every part was checked on its own,
       // and the answer is only as good as the weakest slice of it.
       confidence: Math.min(...ordered.map((p) => p.confidence)),
@@ -814,16 +868,47 @@ export function applyProposals(
 
   const isStructured = (p: ProposedAnswer) => p.value.kind === "structured";
 
-  // Highest confidence wins a contested question; ties go to the earlier
-  // proposal. The model's ordering carries no meaning, but its confidence does.
-  // Only for answers that cannot be merged — structured ones are grouped below.
+  // ONE answer per text or choice question — these cannot be merged, only
+  // chosen between. Proposals that say the same thing are one answer, and the
+  // most confident credible one speaks for them (ties keep document order).
+  //
+  // Proposals that say DIFFERENT things are ranked only by a rule that is not a
+  // model's confidence: the trip starts with its first departure and ends with
+  // its last return, whichever document gives them. Anything else is contested:
+  // none is written and the question is asked. On 2026-09-13 a 22-document
+  // burst had its destination settled by confidence alone — one hotel's town —
+  // and its start by document order between two itineraries that both scored 1.
+  const TRIP_EDGE: Readonly<Record<string, "earliest" | "latest">> = { departure_date: "earliest", return_date: "latest" };
+  const credible = (p: ProposedAnswer) =>
+    (p.confidence >= minConfidence || p.questionId === ctx.pendingQuestionId) && evidenceAppears(p.evidence, ctx.sourceText);
+  const isoDayOf = (p: ProposedAnswer): string | null =>
+    p.value.kind === "text" && /^\d{4}-\d{2}-\d{2}$/.test(p.value.text) ? p.value.text : null;
   const winner = new Map<string, number>();
+  const contested = new Set<string>();
+  const unmergeable = new Map<string, number[]>();
   proposals.forEach((p, i) => {
-    if (isStructured(p)) return;
-    const held = winner.get(p.questionId);
-    const holder = held === undefined ? undefined : proposals[held];
-    if (!holder || p.confidence > holder.confidence) winner.set(p.questionId, i);
+    if (!isStructured(p)) unmergeable.set(p.questionId, [...(unmergeable.get(p.questionId) ?? []), i]);
   });
+  const sourceOf = ctx.sourceOf ?? ((p: ProposedAnswer) => p.sourceMessageId ?? "");
+  for (const [questionId, indexes] of unmergeable) {
+    const byConfidence = [...indexes].sort((a, b) => proposals[b]!.confidence - proposals[a]!.confidence);
+    const believable = byConfidence.filter((i) => credible(proposals[i]!));
+    const saying = new Set(believable.map((i) => comparableAnswer(proposals[i]!.value)));
+    // One reader hedging between two values keeps its more confident one.
+    const sources = new Set(believable.map((i) => sourceOf(proposals[i]!)));
+    if (saying.size <= 1 || sources.size <= 1) {
+      winner.set(questionId, believable[0] ?? byConfidence[0]!);
+      continue;
+    }
+    const edge = TRIP_EDGE[questionId];
+    const days = believable.map((i) => ({ i, day: isoDayOf(proposals[i]!) }));
+    if (edge && days.every((d) => d.day !== null)) {
+      const first = days.reduce((best, d) => ((edge === "earliest" ? d.day! < best.day! : d.day! > best.day!) ? d : best));
+      winner.set(questionId, first.i);
+      continue;
+    }
+    contested.add(questionId);
+  }
 
   const groups = new Map<string, number[]>();
   proposals.forEach((p, i) => {
@@ -836,12 +921,21 @@ export function applyProposals(
 
   const ownMerits = (p: ProposedAnswer): { reason: RejectReason; detail?: string } | null => {
     if (RETIRED_QUESTION_IDS.has(p.questionId)) return { reason: "NOT_OUTSTANDING", detail: "retired question" };
-    if (answered.has(p.questionId)) {
+    // Held and structured: reconciled below rather than refused here. The two
+    // ways an answer on record can move are deliberately not the same one.
+    const reconcilable = ctx.held?.[p.questionId] !== undefined;
+    if (answered.has(p.questionId) && !reconcilable) {
+      // A DOCUMENT gets no further than this: it may add to an answer through
+      // `held`, never replace one. What the organizer TYPES may correct it, at
+      // a higher bar than a first read — a volunteered side-reading must not
+      // overwrite something a person actually said.
       if (!ctx.allowCorrections) return { reason: "ALREADY_ANSWERED" };
       if (p.confidence < CORRECTION_MIN_CONFIDENCE) {
         return { reason: "ALREADY_ANSWERED", detail: "a correction has to be a confident read" };
       }
-    } else if (!outstanding.has(p.questionId)) return { reason: "NOT_OUTSTANDING" };
+    } else if (!outstanding.has(p.questionId) && !reconcilable) {
+      return { reason: "NOT_OUTSTANDING" };
+    }
     if (p.confidence < minConfidence && p.questionId !== ctx.pendingQuestionId) {
       return { reason: "LOW_CONFIDENCE" };
     }
@@ -867,23 +961,83 @@ export function applyProposals(
     // Stable, so a tie keeps document order — the same rule as `winner`.
     const ordered = [...passing].sort((a, b) => b.confidence - a.confidence);
     const primary = ordered[0]!;
+    const questionId = primary.questionId;
+    const dataOf = (p: ProposedAnswer) => (p.value as { data: unknown }).data;
 
-    if (ordered.length > 1) {
-      const merged = mergedProposal(ordered);
-      const validated = validateProposed(merged, questions);
-      if (validated.ok) {
-          accepted.push({ questionId: primary.questionId, answer: corrected(validated.answer, primary.questionId), proposal: merged, mergedFrom: ordered.length, correction: correcting(primary) });
-        return;
-      }
-      // Refused as a whole: fall back to exactly what the gate did before
-      // merging existed, and say why the others were left out.
-      const why = `merge refused: ${validated.reason}${validated.detail ? ` — ${validated.detail}` : ""}`;
-      for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
+    // The slices of one answer, combined in confidence order. A later slice
+    // fills and adds; where it disagrees with an earlier one, the earlier value
+    // stays and the disagreement is kept — it used to be dropped without a trace.
+    // Travellers are people: the same person printed "BARAK, NOA" by one
+    // ticket and "Noa Barak" by another is one entry, not two (answer-merge.ts).
+    const merging = { people: questionId === "travelers" };
+    let combined = mergeStructuredParts([dataOf(primary)], merging);
+    for (const later of ordered.slice(1)) {
+      const step = reconcileStructured(combined, dataOf(later), merging);
+      combined = step.merged;
+      for (const c of step.conflicts) conflicts.push({ ...c, questionId, proposal: later });
+      for (const a of step.ambiguous) ambiguous.push({ ...a, questionId, proposal: later });
     }
 
-    const validated = validateProposed(primary, questions);
-    if (!validated.ok) return reject(primary, validated.reason, validated.detail);
-    accepted.push({ questionId: primary.questionId, answer: corrected(validated.answer, primary.questionId), proposal: primary, correction: correcting(primary) });
+    // AN ANSWER ALREADY HELD. What the proposals say is merged into it — never
+    // over it. The held answer is recorded so the write can refuse if it has
+    // changed by the time this lands.
+    const heldAnswer = ctx.held?.[questionId];
+    let reconciled: AcceptedProposal["reconciled"];
+    if (heldAnswer !== undefined) {
+      const heldData = isRecord(heldAnswer) && heldAnswer.kind === "structured" ? heldAnswer.data : undefined;
+      const step = reconcileStructured(heldData, combined, merging);
+      for (const c of step.conflicts) conflicts.push({ ...c, questionId, proposal: primary });
+      for (const a of step.ambiguous) ambiguous.push({ ...a, questionId, proposal: primary });
+      if (!step.changed) {
+        for (const p of ordered) reject(p, "NO_NEW_INFORMATION");
+        return;
+      }
+      combined = step.merged;
+      reconciled = { held: heldAnswer, added: step.added, filled: step.filled };
+    }
+
+    const assembled = ordered.length > 1 || reconciled !== undefined;
+    const merged: ProposedAnswer = assembled
+      ? {
+          questionId,
+          value: { kind: "structured", data: combined },
+          // As sure as its least sure part: every part was checked on its own,
+          // and the answer is only as good as the weakest slice of it.
+          confidence: Math.min(...ordered.map((p) => p.confidence)),
+          evidence: [...new Set(ordered.flatMap((p) => p.evidence.split("\n")))].join("\n"),
+          sourceMessageId: primary.sourceMessageId,
+        }
+      : primary;
+
+    // `corrected` is the typed path's own merge into `ctx.answers`, and a no-op
+    // when nothing is held there — which is every document. The two never run
+    // on the same proposal: `held` and `answers` come from different callers.
+    const validated = validateProposed(merged, questions);
+    if (validated.ok) {
+      accepted.push({
+        questionId,
+        answer: corrected(validated.answer, questionId),
+        proposal: merged,
+        ...(ordered.length > 1 ? { mergedFrom: ordered.length } : {}),
+        ...(reconciled ? { reconciled } : {}),
+        correction: correcting(primary),
+      });
+      return;
+    }
+    if (reconciled || ordered.length === 1) {
+      // Merged with what is held, or a single proposal: there is nothing
+      // smaller to fall back to.
+      reject(primary, validated.reason, validated.detail);
+      for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", `merge refused: ${validated.reason}`);
+      return;
+    }
+    // Refused as a whole: fall back to exactly what the gate did before
+    // merging existed, and say why the others were left out.
+    const why = `merge refused: ${validated.reason}${validated.detail ? ` — ${validated.detail}` : ""}`;
+    for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
+    const alone = validateProposed(primary, questions);
+    if (!alone.ok) return reject(primary, alone.reason, alone.detail);
+    accepted.push({ questionId, answer: corrected(alone.answer, questionId), proposal: primary, correction: correcting(primary) });
   };
 
   proposals.forEach((proposal, i) => {
@@ -897,11 +1051,31 @@ export function applyProposals(
 
     if (RETIRED_QUESTION_IDS.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING", "retired question");
     if (answered.has(proposal.questionId)) {
-      if (!ctx.allowCorrections) return reject(proposal, "ALREADY_ANSWERED");
-      if (proposal.confidence < CORRECTION_MIN_CONFIDENCE) {
-        return reject(proposal, "ALREADY_ANSWERED", "a correction has to be a confident read");
+      if (ctx.allowCorrections) {
+        // The organizer typed it. A confident read replaces what is on record;
+        // an unsure one must not.
+        if (proposal.confidence < CORRECTION_MIN_CONFIDENCE) {
+          return reject(proposal, "ALREADY_ANSWERED", "a correction has to be a confident read");
+        }
+      } else {
+        // A text or a choice cannot be merged, only replaced — so a DOCUMENT
+        // never replaces one. But a document that credibly says something
+        // DIFFERENT is worth a question, where one that is unsure or cannot
+        // quote itself is not.
+        const held = ctx.held?.[proposal.questionId];
+        const heldValue = comparableAnswer(held);
+        const proposedValue = comparableAnswer(proposal.value);
+        if (
+          heldValue !== null && proposedValue !== null && heldValue !== proposedValue &&
+          proposal.confidence >= minConfidence &&
+          evidenceAppears(proposal.evidence, ctx.sourceText)
+        ) {
+          conflicts.push({ questionId: proposal.questionId, entryKey: "", path: "", held, incoming: proposal.value, proposal });
+        }
+        return reject(proposal, "ALREADY_ANSWERED");
       }
     } else if (!outstanding.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING");
+    if (contested.has(proposal.questionId)) return reject(proposal, "CONFLICTING_PROPOSALS");
     if (winner.get(proposal.questionId) !== i) return reject(proposal, "DUPLICATE_PROPOSAL");
     if (proposal.confidence < minConfidence && proposal.questionId !== ctx.pendingQuestionId) {
       suggestFrom([proposal]);
@@ -924,7 +1098,7 @@ export function applyProposals(
   for (const r of rejected) if (outstanding.has(r.questionId) && !answered.has(r.questionId)) ask.add(r.questionId);
   for (const a of accepted) ask.delete(a.questionId);
 
-  return { accepted, rejected, askAnyway: [...ask], suggested };
+  return { accepted, rejected, askAnyway: [...ask], conflicts, ambiguous, suggested };
 }
 
 export interface SubmitArgs {
@@ -983,6 +1157,14 @@ function describeQuestion(q: IntakeQuestion): string {
   }
   return lines.join("\n");
 }
+
+/**
+ * How much of a burst of TYPED messages is interpreted. A Telegram message is at
+ * most 4,096 characters, so only several long ones sent together reach this —
+ * and when they do the router logs it, rather than slicing without a word as it
+ * used to. Documents never come through here; they have their own path.
+ */
+export const INTERPRET_SOURCE_BUDGET_CHARS = 8_000;
 
 /** A language a model reads by name: "Hebrew", not the code "he". */
 const LANGUAGE_NAMES: Record<string, string> = { he: "Hebrew", en: "English" };
@@ -1101,14 +1283,41 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `No commentary.`,
     ``,
     `Message:`,
-    args.sourceText.slice(0, 8000),
+    args.sourceText.slice(0, INTERPRET_SOURCE_BUDGET_CHARS),
   ].join("\n");
 }
 
 // ── The call ─────────────────────────────────────────────────────────────────
 
 export const INTERPRET_TASK = "interpret";
-export const EXTRACT_INTAKE_TASK = "extract";
+export const EXTRACT_INTAKE_TASK = "extract_intake";
+
+/**
+ * The questions a document can answer — named by hand, for the same reason
+ * router-owned questions are.
+ *
+ * A document is extracted ONCE and the result kept, so what it is asked cannot
+ * depend on where the interview happens to be: asking a hotel confirmation only
+ * the questions still outstanding would make its stored reading different
+ * depending on when it was sent. So it is asked everything a document could
+ * say, and deciding what to accept stays the gate's job.
+ *
+ * What is left out cannot come from a document: how the organizer wants their
+ * assistant to sound, who the organizer is, how much planning help they want,
+ * and the questions an answer is derived for (timezone) or that the prompt
+ * already says a document must not fill (interests, pace).
+ */
+export const DOCUMENT_ANSWERABLE_QUESTION_IDS: readonly string[] = [
+  "trip_type",
+  "destination",
+  "departure_date",
+  "return_date",
+  "travelers",
+  "phases",
+  "travel_anchors",
+  "constraints",
+  "dietary",
+];
 
 /**
  * What a document says, as proposals for the interview's own questions.
@@ -1155,6 +1364,8 @@ export function buildExtractIntakePrompt(args: {
     `Rules:`,
     `- Answer only what the document actually says. Do not infer a return date`,
     `  from a hotel checkout, or guess who is travelling from a booking name.`,
+    `  People who only send, receive or forward an email (its From, To or Cc`,
+    `  lines) are not travellers.`,
     `- Never invent a value to complete an answer. A missing age, surname,`,
     `  confirmation or time is left out, not filled in.`,
     `- "evidence" must be text copied VERBATIM from the document. When an answer`,
@@ -1190,8 +1401,11 @@ export function buildExtractIntakePrompt(args: {
     `  words confirming that item's booking. Those go in travel_anchors, with`,
     `  the date, the time if one is given, and the confirmation if one is tied`,
     `  to it. "type" is one word: flight, train, hotel, car, or activity (a`,
-    `  ticket, tour or reservation for something you do). A flight's date is`,
-    `  the day it departs.`,
+    `  ticket, pass, voucher, tour or reservation for something you do or`,
+    `  somewhere you go). An order number the document ties to that ticket or`,
+    `  pass is its confirmation. A flight's date is the day it departs, and its`,
+    `  "time" the clock time it departs. "time" is one 24-hour HH:MM ("3:10 PM"`,
+    `  is 15:10). A hotel's check-in hours are not a time: leave it out.`,
     `- A document's title ("Booking Confirmation") or a quote or package number`,
     `  is not a confirmation for every item in it. Put a code in an item's`,
     `  "confirmation" only where the document ties that code to that item.`,
@@ -1210,25 +1424,55 @@ export function buildExtractIntakePrompt(args: {
     `  It is not an anchor, and it does not become one until a booking for it`,
     `  turns up.`,
     `- A price beside a name is not a booking. Neither is a suggested time.`,
+    `- A TABLE of tickets or bookings with a reference column ("Ref", "Booking",`,
+    `  "Confirmation", "PNR") is a list of BOOKED items: each row with a`,
+    `  reference goes in travel_anchors with its date and that reference — one`,
+    `  anchor per row, even when the rows also name planned places.`,
     ``,
     `- "Interests" are what the organizer SAYS they care about — food, temples,`,
     `  walking. A list of places from an itinerary is NOT that: those are`,
     `  planned visits and belong to their phase. Filling the interests question`,
     `  from a document wastes it.`,
     `- A CITY OR REGION with a date range is a STOP: it belongs in phases, with`,
-    `  its start and end. An attraction with a date or time is a visit inside a`,
-    `  stop, not a stop. The same city on two separate date ranges is two stops.`,
+    `  its start and end. The same city on two separate date ranges is two stops.`,
     `  A stop's accommodation may be named with no confirmation; leave`,
     `  "confirmation" out rather than borrow another code from the document.`,
+    `- A STOP'S DATES come only from something that states the stay: a hotel's`,
+    `  check-in and check-out, or a plan's line giving the stay ("Lisbon 11-14`,
+    `  June"). An attraction, ticket, tour or dinner with a date or time is a`,
+    `  visit INSIDE a stop, not a stop, and gives neither its start nor its end:`,
+    `  put it in that stop's "planned" list (or travel_anchors, if it is booked)`,
+    `  and give the stop its name only.`,
+    `- A FLIGHT is not a stop. Landing in a city and flying home from it does`,
+    `  not make the whole trip one stop in that city.`,
     `- A range given for the WHOLE trip answers both the departure date and the`,
-    `  return date; propose both. A hotel stay, one stop, a ticket or a car`,
-    `  rental does not set the trip's dates.`,
+    `  return date; propose both. A hotel stay, one stop, a ticket, a car rental`,
+    `  or one flight within the trip does not set the trip's dates.`,
+    `- The DESTINATION is where the whole trip goes: a country, a region, or one`,
+    `  city when the whole trip is spent there. A document about one booking — a`,
+    `  hotel, a flight, a ticket, a car — does not answer it; that booking's`,
+    `  city is a stop, not the destination.`,
+    `- A traveller's name printed surname-first or with a title ("GREEN/ADAM MR",`,
+    `  "GREEN, ADAM") is written given names first, without the title: "Adam`,
+    `  Green". Keep every given name the document prints. A name cut off at the`,
+    `  edge of a page or column ("REEN/ADAM") is left out, never completed from`,
+    `  another name in the document.`,
     `- A date without a year takes its year from the whole-trip dates only when`,
     `  exactly one reading fits (a trip over New Year crosses into the next`,
     `  year), or from the list of weekday dates just before the document when`,
     `  that date is on it. Never take a year from today or from a quote or`,
     `  reference number.`,
     `  A date that could be read two ways ("03/04") is left out, not guessed.`,
+    `  When a day and month are given with no year on that line, the document`,
+    `  has no whole-trip dates, and the date is not on the weekday list, write`,
+    `  it as --MM-DD ("check-in 9 August" is --08-09): the year is completed`,
+    `  from the rest of the trip.`,
+    `- One booking is one travel_anchors entry, even when the document also`,
+    `  describes the event or place it is for: a parking pass for a match is`,
+    `  one anchor, not one for the match and another for the parking.`,
+    `- "constraints" are what THIS GROUP needs. A supplier's policy, terms or`,
+    `  house rules — a minimum check-in age, a cancellation deadline, a pet`,
+    `  policy — are not a constraint.`,
     `- Do not add a stop, a transfer or dates the document does not describe.`,
     `- A party size with no names ("4 adults", "מבוגרים 4") does not answer`,
     `  "who is coming" on its own — say so in "unclear" and give the number`,
@@ -1298,6 +1542,8 @@ export async function extractIntakeFromDocument(
   });
 
   let result = await once();
+  // Both calls cost, whichever answer is kept.
+  let usage = result.usage;
 
   // NOTHING AT ALL IS WORTH ASKING TWICE.
   //
@@ -1314,13 +1560,15 @@ export async function extractIntakeFromDocument(
   // nothing. A second empty answer is taken at its word.
   if (result.ok && result.value.proposals.length === 0) {
     const second = await once();
+    usage = addUsage(usage, second.usage);
     if (second.ok && second.value.proposals.length > 0) result = second;
   }
 
+  const used = usage ? { usage } : {};
   if (!result.ok) {
-    return { ok: false, reason: result.reason, detail: result.detail, attempts: result.attempts, ms: result.ms };
+    return { ok: false, reason: result.reason, detail: result.detail, attempts: result.attempts, ms: result.ms, ...used };
   }
-  return { ok: true, payload: result.value, attempts: result.attempts, ms: result.ms };
+  return { ok: true, payload: result.value, attempts: result.attempts, ms: result.ms, ...used };
 }
 
 export interface InterpretBurstArgs extends BuildInterpretPromptArgs {
@@ -1539,6 +1787,20 @@ export function burstKey(messageIds: readonly string[], sourceText: string): str
   let hash = 0;
   for (let i = 0; i < sourceText.length; i += 1) hash = (Math.imul(31, hash) + sourceText.charCodeAt(i)) | 0;
   return `text:${(hash >>> 0).toString(16)}`;
+}
+
+/**
+ * The idempotency key for a burst that carried documents: the CONTENT of the
+ * files, not the messages they came in.
+ *
+ * Message ids were the wrong identity for a document. The same PDF re-sent in a
+ * new message got a new key, so it was read — and paid for — again, and a burst
+ * whose bytes had already been read looked fresh. The digests make "these
+ * files, with these words" the thing claimed, whichever messages delivered them.
+ */
+export function documentBurstKey(digests: readonly string[], sourceText: string): string {
+  const files = [...new Set(digests.map((d) => d.replace(/^sha256:/, "")))].sort().join(",");
+  return sourceText.trim() ? `docs:${files}|${burstKey([], sourceText)}` : `docs:${files}`;
 }
 
 // ── Idempotent persistence ───────────────────────────────────────────────────

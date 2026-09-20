@@ -700,8 +700,13 @@ describe("applyProposals — a structured answer split across proposals", () => 
     assert.equal(data[0]?.planned, undefined);
   });
 
-  test("an undated slice joins the first stop of that name, and adds no stop", () => {
-    const { accepted } = applyProposals(
+  test("an undated slice that could belong to either visit is not forced onto one — and is reported, not lost", () => {
+    // It used to join the FIRST stop of that name. Right here, since the
+    // Colosseum is on the first Rome visit; wrong half the time in general, and
+    // silently. Attaching a place to a visit it may not belong to is a false
+    // merge; adding it as a third Rome is a duplicate. So it is neither — and
+    // it comes back in `ambiguous`, so the caller can record it and ask.
+    const decisions = applyProposals(
       [
         part("phases", [{ name: "Rome", start: "2026-05-02", end: "2026-05-06" }, { name: "Rome", start: "2026-05-09", end: "2026-05-12" }],
           "Rome: Hotel Artemide"),
@@ -709,9 +714,12 @@ describe("applyProposals — a structured answer split across proposals", () => 
       ],
       MCTX,
     );
-    const data = (accepted[0]?.answer as { data: { planned?: string[] }[] }).data;
-    assert.equal(data.length, 2);
-    assert.deepEqual(data[0]?.planned, ["Colosseum Underground"]);
+    const data = (decisions.accepted[0]?.answer as { data: { planned?: string[] }[] }).data;
+    assert.equal(data.length, 2, "and adds no stop");
+    assert.ok(data.every((stop) => stop.planned === undefined), "neither visit is given a place that may not be its own");
+    assert.equal(decisions.ambiguous.length, 1);
+    assert.equal(decisions.ambiguous[0]?.candidates, 2);
+    assert.equal(decisions.ambiguous[0]?.questionId, "phases");
   });
 
   test("two stays at one hotel on different dates are two bookings", () => {
@@ -1133,14 +1141,14 @@ describe("identity documents are not read", () => {
   // numbers and partial cards. Refusing those would refuse the whole feature.
   test("a booking confirmation is not an identity document", () => {
     const booking = [
-      "Booking.com Confirmation",
-      "ALOUL MOSHE YOSSI MR",
-      "Confirmation number: DC6MJ6",
-      "Blue Dolphin Inn — check-in 2026-06-14",
+      "Booking Confirmation",
+      "BARAK NOA LEE MS",
+      "Confirmation number: QW7ER2",
+      "Harbour Inn — check-in 2027-03-04",
       "Card ending 4242",
     ].join("\n");
-    assert.equal(looksLikeIdentityDocument(booking, "Booking.com_ Confirmation - Monterey.pdf"), false);
-    assert.equal(looksLikeIdentityDocument(booking, "IRKJJZ - ALOUL CHANA MRS _ Sabre Red Web.pdf"), false);
+    assert.equal(looksLikeIdentityDocument(booking, "Booking Confirmation - Harbour.pdf"), false);
+    assert.equal(looksLikeIdentityDocument(booking, "QW7ER2 - BARAK NOA MS _ Agency Workspace.pdf"), false);
   });
 
   test("documentText refuses it by reason, not by throwing", async () => {
