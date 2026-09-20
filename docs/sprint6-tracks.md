@@ -191,6 +191,54 @@ Sprint plan `:1479-1496`.
 - Also routed here from the live-run ledger: **per-user Telegram info-message logging** (`:1351-1353`).
 - Sprint 7 keeps the weighted 1–5 scoring and repeated-question reduction.
 
+#### #114 — the interview cannot hold an organizer thinking out loud
+
+**Placed in track 2 on 2026-09-20**, captured from a live manual interview on
+`ae397fd` with evidence from `interview_interpretations`
+(`sess_3a16921971ce48ea8a1e8c22721974b6`), not recollection. To be solved this
+sprint; not a now-fix.
+
+One unprompted Hebrew message carried five facts and a request — Tokyo 5 days,
+Hakone 2, equal time in Kyoto and Osaka, three more days back in Tokyo, "we
+haven't booked hotels yet", and *"suggest something like this"*. The interpreter
+returned **one** proposal: `travel_anchors: []`, evidence "we haven't booked
+hotels yet", confidence 0.6. It kept the single negative clause, discarded
+everything else including the direct request for help, and asked its next
+scripted question.
+
+**Why it belongs to track 2 rather than anywhere else.** This track's question is
+"is the assistant actually helping?", and #114 is a precise, evidenced answer:
+*no*, in the common case of an organizer who is unsure and says so. It is not a
+prompt-tuning problem — a better prompt cannot emit a structure the schema does
+not have — so it is not track 3. It is not a regression, so it is not track 4's
+housekeeping. And it is not the trip site, so it is not track 1.
+
+More than proximity, it is the **same conversational model** this track's
+missing-information control loop (`:1493`) needs. That loop detects a missing
+fact and converts it into a focused organizer request. #114 is its mirror image:
+the organizer volunteered the facts unprompted *and* made a request, and there is
+a representation for neither. Two of its six problems are that model's gaps:
+
+- **no proposal kind for "the organizer asked *us* for something"** — a request addressed to the assistant has nowhere to go and vanishes unacknowledged;
+- **"not yet" and "none" are collapsed** — an empty answer at 0.6 confidence may read downstream as *answered*, closing a question the organizer explicitly left open. That is exactly the false "we have this" the outcome events exist to catch, so it is a measurement concern as well as a capture one.
+
+The other four — extraction that slot-fills rather than comprehends, durations
+stated as a solvable constraint system, a returning leg that a flat unique-name
+`phases` list cannot express, and revision of an earlier answer while a later
+question is on screen — are intake-schema work that lands in the same place.
+
+**It is explicitly NOT Slice A or Slice B of #92.** #92 is document intake; this
+is the no-document path. They touch `interpret`/`extract` in common and nothing
+else, and folding this into work already being carried would hide it.
+
+**Sizing, stated rather than skipped:** track 2 was already the largest of the
+five by a wide margin, and this makes it larger. If something in this sprint
+gives, this track is where the pressure will show first.
+
+**Worth noting for sequencing:** the hand-run experience evaluation below is the
+kind of exercise that surfaces exactly this class of failure — which is part of
+why it leads rather than follows the pipeline build.
+
 #### Measure the live trip first — by hand, before any events exist
 
 The measurement model already exists and **does not require instrumentation to
