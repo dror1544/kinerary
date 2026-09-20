@@ -139,7 +139,17 @@ rather than left implicit:
 
 **Two things not to lose, both from kinerary-09:**
 
-- **#114's problem 5 is NOT covered by #117** — a flat `phases` list of unique names cannot hold Tokyo twice. That is a data-model gap, not a conversational one, and #117 is about the organizer's experience. It still needs an owner. It is the same theme as #115's observation that "where" is represented as flat strings that callers concatenate blind, and is most likely to be solved with it.
+- **#114's problem 5 is NOT covered by #117** — a flat `phases` list of unique names cannot hold Tokyo twice. That is a data-model gap, not a conversational one, and #117 is about the organizer's experience. **It still needs an owner.**
+
+  *Corrected 2026-09-20:* an earlier version of this line sent problem 5 to #115 as "the same theme, likely solved together". Both halves were wrong. #115 contains no such observation — it is a **booking-type taxonomy** gap, where a booked train falls through to `"other"` for want of a canonical scheduled-transport type. Three distinct gaps get confused here:
+
+  | | |
+  |---|---|
+  | #115 | a taxonomy missing a member, so a value falls to `"other"` |
+  | #114 problem 5 | a sequence that cannot repeat an element |
+  | #112 *(fixed)* | a string concatenated by a caller blind to its contents |
+
+  They share a real class — **the data model cannot express the real world** — and that is worth recording. They are not likely solved together: a booking vocabulary in the transformer plus site rendering, versus phase sequencing. Different files, different concepts, different owners. Problem 5 keeps needing one rather than looking like it has one.
 - **§6 — "no need to push" — is the easiest thing here to regress and the hardest to notice.** A companion that nags a deliberately-loose trip toward a full itinerary *looks like it is working*. Its test is in scope and should stay there.
 
 **Lineage**, worth knowing before redesigning any of it: this descends from
