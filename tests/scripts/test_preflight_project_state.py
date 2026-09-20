@@ -86,14 +86,24 @@ class B9(Harness):
         self.assertEqual(out.returncode, 1)
         self.assertIn("Codex agent mirror is out of date", out.stdout)
 
-    def test_a_source_staged_without_its_mirror_blocks(self):
+    def test_a_stale_mirror_blocks_however_it_is_staged(self):
+        # The source changed and nobody regenerated the mirror: the working
+        # tree is inconsistent, and --check says so whatever is staged.
         (self.root / ".claude/agents/sample.md").write_text(AGENT.replace("a sample", "a changed sample"))
         self.git("add", ".claude/agents/sample.md")
         out = self.preflight("--staged")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("agent source staged without its Codex mirror", out.stdout)
-        # Regenerate and stage the mirror: clean.
+        self.assertIn("Codex agent mirror is out of date", out.stdout)
+
+    def test_a_regenerated_mirror_left_unstaged_blocks(self):
+        # The working tree is consistent — the mirror was regenerated — but
+        # the commit would carry the new source with the old mirror.
+        (self.root / ".claude/agents/sample.md").write_text(AGENT.replace("a sample", "a changed sample"))
         self.py("scripts/sync-codex-agents.py")
+        self.git("add", ".claude/agents/sample.md")
+        out = self.preflight("--staged")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("agent source staged without its Codex mirror", out.stdout)
         self.git("add", ".codex/agents/sample.toml")
         out = self.preflight("--staged")
         self.assertEqual(out.returncode, 0, out.stdout)
