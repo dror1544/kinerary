@@ -1412,6 +1412,86 @@ def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _open_day_phases(
+    phases: list[dict[str, Any]], departure: str, ret: str,
+) -> list[dict[str, Any]]:
+    """Phases for the days of the trip that no phase covers.
+
+    A DAY OF THE TRIP THAT IS ON NO PHASE MUST NOT BE INVISIBLE. On 2026-09-20
+    an organizer said, in as many words, that ten of their sixteen days were
+    undecided and asked for a proposal. The site showed the six that were
+    decided and nothing at all for the rest — no gap, no note, no sign that
+    nine days existed. The trip simply appeared to be six days long, beside a
+    return flight departing a city no phase mentioned.
+
+    Absent and undecided are different things, and only one of them is true.
+    These phases say the second out loud: the days are real, they belong to the
+    trip, and nothing is planned on them yet.
+
+    `unplanned: true` marks them as the site's own inference rather than
+    something the organizer said, so a later pass — the companion, or the
+    editing surface this is the placeholder for — can replace or shrink one
+    without guessing which phases were authored.
+
+    Contiguous gaps become one phase each: three separate open days in a row
+    are one open stretch, not three tabs.
+    """
+    # A trip with NO phases at all is a different state, not a gap: nobody has
+    # said anything about stops yet, and the site already says so its own way
+    # ("nothing was named, so nothing is served — the companion offers a
+    # draft"). Filling it with one open stretch spanning the whole trip would
+    # be this function answering a question it was not asked.
+    if not phases or not departure or not ret:
+        return []
+    try:
+        first, last = date.fromisoformat(departure[:10]), date.fromisoformat(ret[:10])
+    except ValueError:
+        return []
+    if last < first:
+        return []
+
+    covered: set[date] = set()
+    for phase in phases:
+        dates = phase.get("dates") or {}
+        try:
+            start = date.fromisoformat(str(dates.get("start") or "")[:10])
+            end = date.fromisoformat(str(dates.get("end") or "")[:10])
+        except ValueError:
+            continue
+        day = start
+        while day <= end:
+            covered.add(day)
+            day += timedelta(days=1)
+
+    gaps: list[list[date]] = []
+    day = first
+    while day <= last:
+        if day not in covered:
+            if gaps and gaps[-1][-1] == day - timedelta(days=1):
+                gaps[-1].append(day)
+            else:
+                gaps.append([day])
+        day += timedelta(days=1)
+
+    out: list[dict[str, Any]] = []
+    for index, gap in enumerate(gaps, start=1):
+        suffix = "" if len(gaps) == 1 else f"-{index}"
+        out.append({
+            "id": f"open-days{suffix}",
+            "unplanned": True,
+            "title": {"he": "ימים שעוד לא תוכננו", "en": "Days not planned yet"},
+            "tabLabel": "?",
+            "dates": {"start": gap[0].isoformat(), "end": gap[-1].isoformat()},
+            "note": {
+                "he": f"{len(gap)} ימים בטיול שעוד לא שויכו לתחנה. אפשר לדבר עם "
+                      f"העוזר כדי לשבץ אותם לתחנה קיימת או לפתוח תחנה חדשה.",
+                "en": f"{len(gap)} day(s) of this trip do not belong to a stop yet. "
+                      f"Talk to your assistant to add them to one, or open a new stop.",
+            },
+        })
+    return out
+
+
 def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
     shape — logistics fields, plus a day-by-day `days[]` when the intake
@@ -1705,6 +1785,25 @@ def transform_intake(
         derived = anchor_days.get(str(phase.get("id")))
         if derived and not phase.get("days"):
             phase["days"] = derived
+
+    # AFTER the real phases are settled, and in trip order. A day of the trip
+    # that belongs to no phase is shown as an open stretch rather than not
+    # shown at all — see _open_day_phases for the run that made this necessary.
+    #
+    # ONLY AGAINST DATES THE ORGANIZER GAVE. `_resolve_dates` falls back to
+    # `today + 90 days` when they did not, and a gap measured against an
+    # invented range invents the days in it: a test fixture with no dates and
+    # phases in September produced a fortnight of "unplanned" days three months
+    # away. A day is missing only if the trip is known to contain it.
+    stated_departure = _parse_iso_date(_text_value(data.get("departure_date", {})))
+    stated_return = _parse_iso_date(_text_value(data.get("return_date", {})))
+    if stated_departure and stated_return:
+        phases = sorted(
+            phases + _open_day_phases(
+                phases, stated_departure.isoformat(), stated_return.isoformat(),
+            ),
+            key=lambda ph: str((ph.get("dates") or {}).get("start") or ""),
+        )
 
     # Only a count, never the organizer's free text — same reasoning as above.
     #

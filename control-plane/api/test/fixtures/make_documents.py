@@ -167,9 +167,12 @@ SCENARIOS: dict[str, dict] = {
             # Four travel_anchors, none of them carrying a confirmation, are
             # counted as "4 booking(s) already confirmed".
             "confirmed_bookings": 0,
-            # Ten of sixteen days were explicitly left open WITH a request for a
-            # proposal (planning_help). They are absent from the site, and so is
-            # Saigon, which the trip's own return flight departs from.
+            # Ten of sixteen days were explicitly left open WITH a request for
+            # a proposal (planning_help). Every day of the trip must appear on
+            # the site — in a planned stop or in one that says it is open.
+            # Undecided and absent are different things and the site showed the
+            # second (2026-09-20): six days rendered, nine simply gone, beside
+            # a return flight leaving a city no phase mentioned.
             "days_covered": "all",
             # Deferred by Dror on 2026-09-20 to later in sprint 6: the request
             # is held (`planning_help`) and nothing downstream reads it, which
@@ -181,7 +184,11 @@ SCENARIOS: dict[str, dict] = {
             # NUMBER into `confirmation`, so two anchors look booked on a trip
             # where nothing is. The assertion stays as written — it is the
             # truth — and goes green when #131 does.
-            "deferred": ["days_covered", "confirmed_bookings"],
+            # `days_covered` is NOT deferred: Dror, 2026-09-20 — "we cannot
+            # allow missing days … the first one can not be differed". What is
+            # deferred is EDITING those days on the website; the chat has to be
+            # able to address them.
+            "deferred": ["confirmed_bookings"],
         },
     },
     # Scenario 4 — the chaos organizer (control-plane/api/tools/organizer-chaos.ts).

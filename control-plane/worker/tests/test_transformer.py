@@ -1948,6 +1948,99 @@ class TripClockAndLanguage(unittest.TestCase):
         self.assertEqual("en", transformer._derive_agent(data, [], [], "kl")["default_language"])
 
 
+class DaysOnNoPhaseAreShown(unittest.TestCase):
+    """A day of the trip that no phase covers must not be invisible.
+
+    On 2026-09-20 an organizer said ten of their sixteen days were undecided
+    and asked for a proposal. The site showed the six that were decided and
+    nothing at all for the rest — the trip simply appeared to be six days long,
+    beside a return flight leaving a city no phase mentioned. Absent and
+    undecided are different things and only one of them was true.
+    """
+
+    def _intake(self, phases, departure="2028-03-05", ret="2028-03-20"):
+        return {
+            **JAPAN_INTAKE,
+            "destination": {"kind": "text", "schema_version": 3, "text": "Vietnam"},
+            "departure_date": {"kind": "text", "schema_version": 3, "text": departure},
+            "return_date": {"kind": "text", "schema_version": 3, "text": ret},
+            "phases": _structured(phases),
+        }
+
+    def _build(self, phases, **kw):
+        return transformer.transform_intake(self._intake(phases, **kw))["phases"]
+
+    def test_the_days_after_the_last_phase_are_shown_as_open(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"},
+            {"name": "Ha Long", "start": "2028-03-09", "end": "2028-03-11"},
+        ])
+        open_phases = [p for p in built if p.get("unplanned")]
+        self.assertEqual(1, len(open_phases))
+        self.assertEqual({"start": "2028-03-12", "end": "2028-03-20"}, open_phases[0]["dates"])
+        self.assertIn("9", open_phases[0]["note"]["en"])
+
+    def test_every_day_of_the_trip_belongs_to_some_phase_once_they_are_added(self):
+        # The property the site needs: no day of a stated trip is missing.
+        import datetime as dt
+        built = self._build([{"name": "Hanoi", "start": "2028-03-07", "end": "2028-03-09"}])
+        covered = set()
+        for phase in built:
+            a = dt.date.fromisoformat(phase["dates"]["start"])
+            b = dt.date.fromisoformat(phase["dates"]["end"])
+            while a <= b:
+                covered.add(a)
+                a += dt.timedelta(days=1)
+        day, last = dt.date(2028, 3, 5), dt.date(2028, 3, 20)
+        while day <= last:
+            self.assertIn(day, covered, f"{day} is on no phase")
+            day += dt.timedelta(days=1)
+
+    def test_a_gap_in_the_middle_and_one_at_the_end_are_separate_stretches(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-14"},
+        ])
+        gaps = [p["dates"] for p in built if p.get("unplanned")]
+        self.assertEqual(
+            [{"start": "2028-03-08", "end": "2028-03-11"},
+             {"start": "2028-03-15", "end": "2028-03-20"}],
+            gaps,
+        )
+
+    def test_a_fully_covered_trip_gains_nothing(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-20"}])
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_open_stretches_sit_in_trip_order_between_the_phases(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-20"},
+        ])
+        self.assertEqual(["hanoi", "open-days", "hue"], [p["id"] for p in built])
+
+    def test_a_trip_with_no_phases_at_all_gains_none(self):
+        # A different state, not a gap: nobody has said anything about stops,
+        # and the site already says so its own way.
+        self.assertEqual([], self._build([]))
+
+    def test_dates_the_organizer_never_gave_produce_no_gaps(self):
+        # `_resolve_dates` falls back to today+90; a gap measured against an
+        # invented range invents the days in it.
+        intake = self._intake([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        del intake["departure_date"]
+        del intake["return_date"]
+        built = transformer.transform_intake(intake)["phases"]
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_an_open_stretch_says_how_to_resolve_it(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        note = [p for p in built if p.get("unplanned")][0]["note"]
+        for side in ("he", "en"):
+            self.assertTrue(note[side].strip(), f"{side} side is empty")
+        self.assertIn("assistant", note["en"], "it must say where the organizer can fix it")
+
+
 class ConfirmedBookingsAreConfirmed(unittest.TestCase):
     """A travel_anchor is a fixed point in the trip, not evidence of a booking.
 

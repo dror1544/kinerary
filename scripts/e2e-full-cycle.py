@@ -673,11 +673,26 @@ def _check_site_expectations(ctx: dict, expect: dict) -> None:
                 if day.isoformat() not in covered:
                     missing.append(day.isoformat())
                 day += dt.timedelta(days=1)
+        # The failure text is built only when there IS a failure. Python
+        # evaluates both arguments, so `missing[0]` in the message raised
+        # IndexError the first time this check passed — a latent crash that
+        # only a green run could reach.
+        span = f" ({missing[0]}..{missing[-1]})" if missing else ""
         check_or_note("days_covered", not missing,
-              f"every day of the trip belongs to a phase ({len(covered)} days)",
-              f"{len(missing)} day(s) of the trip are on no phase at all "
-              f"({missing[0]}..{missing[-1]}) — the organizer asked for a proposal "
-              f"for exactly these and the site shows nothing")
+              f"every day of the trip is on the site ({len(covered)} days)",
+              f"{len(missing)} day(s) of the trip are on no phase at all"
+              f"{span} — the trip shows as shorter than it is")
+        # AND the open ones say they are open. Covering a gap with a phase that
+        # looks authored would satisfy the count above while telling the family
+        # something was planned when nothing was.
+        gaps = [p for p in config.get("phases") or [] if p.get("unplanned")]
+        for gap in gaps:
+            note_text = (gap.get("note") or {}).get("en") or ""
+            check(bool(note_text.strip()),
+                  f"the open stretch {gap['dates']['start']}..{gap['dates']['end']} says it is open",
+                  f"phase {gap.get('id')!r} covers days nobody planned and says nothing about it")
+        if gaps:
+            ok(f"{len(gaps)} open stretch(es), shown rather than dropped")
 
 
 def stage_own_content(ctx: dict) -> None:
