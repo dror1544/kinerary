@@ -187,6 +187,16 @@ export interface IntakeQuestion {
    */
   checkComplete?: (data: unknown) => string | null;
   /**
+   * A deterministic correction applied to a STRUCTURED answer before it is
+   * stored, whatever produced it.
+   *
+   * For rules that are decidable in code. A model may propose the value — it
+   * is good at spotting that "VN572" is in the sentence — but where the rule
+   * for what that value MEANS is written down, code decides, rather than the
+   * test suite sampling model variance more often.
+   */
+  sanitize?: (data: unknown) => unknown;
+  /**
    * Marks this question safe for the router to ask entirely on its own —
    * no agent nomination, no agent judgment, asked the moment it is next and
    * nothing else is pending. The architectural rule: the agent owns
@@ -557,6 +567,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // an optional HH:MM `time` puts a booked visit at its hour.
     dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
+    // A flight number is not a confirmation, and that is a rule, not a
+    // judgement — see withoutFlightNumbersAsConfirmations (#131).
+    sanitize: withoutFlightNumbersAsConfirmations,
   },
   {
     id: "constraints",
@@ -838,6 +851,85 @@ export type AnswerValidationResult =
       detail?: string;
     };
 
+/**
+ * Is this string a flight designator — `VN572`, `LY381`, `BA1A`, `U26301`?
+ *
+ * IATA form: a two-character airline code (at least one letter, so `U2` and
+ * `9W` count), one to four digits, and an optional operational suffix letter.
+ * ICAO form: three letters, one to four digits. Separators and case are noise.
+ *
+ * A designator names a SERVICE, not a reservation. Every passenger on that
+ * aircraft carries the same one, and it is printed on a timetable long before
+ * anyone buys a seat — so it is never, on its own, evidence of a booking.
+ */
+export function isFlightDesignator(value: string): boolean {
+  const cleaned = value.replace(/[\s\-_.]/g, "").toUpperCase();
+  if (!cleaned) return false;
+  // The lookahead is what stops a bare number matching: an airline code may
+  // carry a digit ("U2", "9W") but never two, so one of the first two
+  // characters is always a letter. Without it `12345` read as a designator.
+  return /^(?=.{0,1}[A-Z])[A-Z0-9]{2}\d{1,4}[A-Z]?$/.test(cleaned)
+    || /^[A-Z]{3}\d{1,4}[A-Z]?$/.test(cleaned);
+}
+
+/**
+ * Keeps a flight number out of a booking's `confirmation`.
+ *
+ * `travel_anchors` means "already booked", and the field that makes it mean
+ * that is the confirmation — the fixtures say so: *"evidence of booking is a
+ * confirmation number"*. On 2026-09-20 the interpreter filled it with the
+ * flight number instead, from an organizer who had booked nothing and said so:
+ *
+ *     { "name": "VN572 תל אביב-האנוי", "confirmation": "VN572" }
+ *
+ * The site then told the family two bookings were confirmed. The count that
+ * reported it was already correct (#124) and was being fed this; sampling more
+ * e2e runs would only have measured how often a model gets it wrong. Dror,
+ * 2026-09-20: *"flight number should not remain a model judgement … code
+ * should be authoritative."*
+ *
+ * DELIBERATELY NARROW, because the cost of a false positive is deleting a real
+ * booking reference. Applied only when all three hold:
+ *
+ *   1. the anchor is a flight,
+ *   2. the confirmation reads as a flight designator, and
+ *   3. that same designator is already in the anchor's `name`.
+ *
+ * (3) is what makes it safe. A confirmation that merely restates the name is
+ * not independent evidence of anything, whereas a code the organizer supplied
+ * separately might legitimately look designator-shaped — a hotel reference
+ * like `HB-2217` matches the pattern exactly, which is why the pattern alone
+ * must never decide.
+ *
+ * The number is moved to `flight_number` rather than discarded: the model was
+ * right about what it read, only wrong about which field it answers.
+ *
+ * The residual case — a flight whose confirmation is designator-shaped and
+ * NOT in the name — is left alone on purpose. It cannot be told from a real
+ * reference without guessing, and guessing here loses data.
+ */
+export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
+  if (!Array.isArray(data)) return data;
+  return data.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    const anchor = row as Record<string, unknown>;
+    const confirmation = String(anchor.confirmation ?? "").trim();
+    if (!confirmation || String(anchor.type ?? "").toLowerCase() !== "flight") return row;
+    if (!isFlightDesignator(confirmation)) return row;
+
+    const name = String(anchor.name ?? "");
+    const normalised = confirmation.replace(/[\s\-_.]/g, "").toUpperCase();
+    const inName = name
+      .toUpperCase()
+      .split(/[^A-Z0-9]+/)
+      .some((token) => token === normalised);
+    if (!inName) return row;
+
+    const { confirmation: _dropped, ...rest } = anchor;
+    return { ...rest, ...(anchor.flight_number ? {} : { flight_number: confirmation }) };
+  });
+}
+
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
@@ -876,7 +968,11 @@ export function validateAnswer(
     // Shape is necessary, not sufficient — see `checkComplete`'s doc comment.
     const incomplete = question.checkComplete?.(structuredData);
     if (incomplete) return { ok: false, reason: "INCOMPLETE_ANSWER", detail: incomplete };
-    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: structuredData } };
+    // The one gate every path goes through — the model, the agent, a document
+    // and a typed answer all arrive here — so a rule enforced at this point
+    // cannot be bypassed by the route that produced the data.
+    const cleaned = question.sanitize ? question.sanitize(structuredData) : structuredData;
+    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: cleaned } };
   }
 
   if (question.type === "choice") {

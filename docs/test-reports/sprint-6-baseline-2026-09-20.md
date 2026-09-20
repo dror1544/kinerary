@@ -122,6 +122,38 @@ outcome.
 
 Rows marked *pending* are raised and awaiting Dror's triage at the recap.
 
+## The lesson worth keeping
+
+Three of this run's findings were **intermittent** — the destination's language
+(#132), the `en` side of a place name (#130), the flight number in
+`confirmation` (#131). Same interview, different outcomes, run to run. Each was
+caught only because a run happened to land on the bad side, which means any
+single green e2e understates the real failure rate.
+
+The tempting response is to sample more: run the scenario several times and
+treat the spread as the signal. Dror's ruling, 2026-09-20, and it is the right
+one:
+
+> Repeated runs are useful for genuinely generative behavior, but wherever a
+> field has a deterministic rule, prefer enforcing that rule in code rather
+> than treating model variance as something the test suite simply has to sample
+> more often.
+
+Both readings were available for every one of these. A flight designator has a
+written-down format, so #131 became code. Which traveller the organizer is, is
+a lookup against a list we hold, so #129 became code. A country's timezone and
+currency are facts, so #132 became a table. None of them needed a model, and
+each had been left to one.
+
+What genuinely remains generative — how a sentence is phrased, whether a vague
+date means the 1st or the 5th — is where sampling belongs, and where a required
+field should not depend on the answer at all. That is why the vague departure
+date came out of the fixture (R17) rather than being run three times.
+
+The test to apply when something is flaky: **is this field decidable?** If yes,
+the flakiness is a missing rule, not a sampling problem.
+
+
 Triage values: `baseline-fix` (fix before the sprint's work) · `sprint-6`
 (this sprint, tracked) · `defer` (future sprint) · `not-a-bug`.
 
