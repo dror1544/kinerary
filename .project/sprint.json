@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "updated_at": "2026-09-20T13:05:57Z",
+  "updated_by": "Dror (recorded by Claude, agent-team plan session)",
+  "sprint": {
+    "id": "6",
+    "title": "Verification, explicit activation, dashboard, and demo rehearsal",
+    "integration_branch": "integration/sprint-6",
+    "target_branch": "main",
+    "milestone": "Sprint 6",
+    "scope": {
+      "plan": "docs/onboarding-mvp-sprint-plan.md#sprint-6--verification-explicit-activation-dashboard-and-demo-rehearsal",
+      "tracks": "docs/sprint6-tracks.md (arrives with PR #111)",
+      "team": "docs/agent-team-plan.md"
+    }
+  },
+  "baseline": {
+    "branch": "integration/sprint-6",
+    "commit": "6ebd532cc40636ce263310edd918159e2ab015ec",
+    "report": "docs/test-reports/sprint-6-baseline-2026-09-20.md",
+    "release": null
+  },
+  "locks": {
+    "sprint": {
+      "state": "locked",
+      "since": "2026-09-19",
+      "by": "Dror (recorded by Claude, agent-team plan session)",
+      "reason": "Dror, 2026-09-19, reaffirmed 2026-09-20: integration/sprint-6 is not ready — do not assess, deploy, or merge it to main; main's b451ee7 (#109) is owed to it once this lifts",
+      "meaning": "the integration branch is not ready to leave: do not assess it, deploy it, or merge it to main",
+      "forbids": [
+        "regression assessment of the integration branch",
+        "deploying the integration branch",
+        "merging the integration branch to main",
+        "merging main into the integration branch"
+      ]
+    },
+    "baseline": {
+      "state": "open",
+      "since": "2026-09-20",
+      "by": "Dror (recorded by Claude, agent-team plan session)",
+      "reason": "the Sprint 6 baseline (docs/test-reports/sprint-6-baseline-2026-09-20.md) is still being prepared; baseline.commit moves with each fix; the agent team starts only once Dror locks this",
+      "meaning": "the baseline is still being prepared: baseline.commit moves with each fix, and the agent team does not start",
+      "forbids": [
+        "starting sprint work through the agent team (docs/agent-team-plan.md)"
+      ]
+    }
+  },
+  "override": {
+    "rule": "A lock, the baseline commit or the sprint changes only through scripts/project-state.py, with --by and --reason. Moving baseline.commit while the baseline is locked, or changing the sprint while the sprint is locked, needs --override and is recorded as such. The resulting file change is a commit; hard rule 1 makes every commit a human approval, and the commit prompt names every lock, baseline and override change in it.",
+    "commands": [
+      "scripts/project-state.py lock|unlock sprint|baseline --by WHO --reason WHY",
+      "scripts/project-state.py set-baseline --commit REF --by WHO --reason WHY [--override]",
+      "scripts/project-state.py set-sprint --id N --integration-branch B --by WHO --reason WHY [--override]"
+    ]
+  },
+  "history": [
+    {
+      "at": "2026-09-20T13:05:57Z",
+      "by": "Dror (recorded by Claude, agent-team plan session)",
+      "change": "init sprint 6 at 6ebd532",
+      "reason": "both locks were only in memory files and operator knowledge; Dror asked on 2026-09-20 for one durable, agent-readable source of truth"
+    }
+  ]
+}

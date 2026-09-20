@@ -470,8 +470,9 @@ scripts/preflight-checks.sh --all      # audit the whole tree
 ```
 
 Blocking: binaries (rule 3), writes to `trip/` (rule 4), **code that names this
-deployment (rule 6)**, a broken create-trip symlink, a date-shifted trip, and
-repo↔Hermes-profile drift. Reviewed exceptions live in `.preflight-allow` — an
+deployment (rule 6)**, a broken create-trip symlink, a date-shifted trip,
+repo↔Hermes-profile drift, a `.project/sprint.json` that disagrees with the
+tree (B8), and a Codex agent mirror that differs from its source (B9). Reviewed exceptions live in `.preflight-allow` — an
 entry there is a recorded decision with a reason, not a silent exemption.
 
 Rule 6's check is scoped to **code, not prose, and not tests**: a runbook that
@@ -497,6 +498,38 @@ this house.
 there instead. Profile skills with **no** repo copy are warned about, not
 blocked — that is a capture backlog, not a reason nobody can commit.
 
+## Sprint and baseline state — `.project/sprint.json`
+
+Which sprint is active and what its locked scope is, which commit its baseline
+is, and whether the sprint or the baseline is **locked** — one machine-readable
+file, printed to every session at start (`sessionstart.sh`) and checked on
+every commit (preflight B8). Until 2026-09-20 both locks lived in a memory file
+and in Dror's head, and a fresh session could not tell whether
+`integration/sprint-6` was ready to leave or whether the baseline it was about
+to build on was still moving. `.project/README.md` has the full contract.
+
+```bash
+scripts/project-state.py show            # the state, for a person
+scripts/project-state.py show --json     # the state, for an agent
+scripts/project-state.py check           # consistent with the tree? exit 1 says why
+```
+
+- **Sprint lock `locked`**: the integration branch is not to be assessed,
+  deployed or merged to `main`. **Baseline lock `open`**: the baseline is still
+  being prepared and the agent team (`docs/agent-team-plan.md`) does not
+  start; `locked`: it is the commit sprint work builds on.
+- **Change it only through the script.** The Write hook refuses a hand edit,
+  because a hand edit carries no who, when or why:
+  ```bash
+  scripts/project-state.py lock baseline --by "Dror" --reason "baseline fixes landed and verified"
+  scripts/project-state.py unlock sprint --by "Dror" --reason "ready to assess and merge"
+  ```
+- **What needs an override:** moving the baseline commit while the baseline is
+  locked, or changing the sprint while the sprint is locked. Both refuse
+  without `--override`, and an override is recorded in `history`. The change is
+  then a commit — hard rule 1 makes it a human approval, and the commit prompt
+  names every lock, baseline and override change in it.
+
 ## Agents and run tooling
 
 Subagents in `.claude/agents/` — none can commit or deploy:
@@ -509,6 +542,12 @@ Subagents in `.claude/agents/` — none can commit or deploy:
 | `run-capture` | Raw live-run notes → triaged ledger rows routed to the owning sprint. |
 | `boundary-reviewer` | The three invariants under "Security-sensitive paths", with live request/response evidence. |
 | `regression-planner` | Costed regression plan for a change set: blast radius on live trips, migration and compatibility breaks, what to batch onto one run and what must be tested alone. Plans; never runs the deploy. |
+
+`.codex/agents/*.toml` are **generated** from these files by
+`scripts/sync-codex-agents.py`, and preflight B9 blocks a commit while any
+mirror differs from its source or is staged without it. Codex works the same
+issue queue as Claude does (`docs/agent-team-plan.md`), so the two sides have
+to describe the same role — never edit a `.toml` by hand.
 
 `sprint-scribe` and `run-capture` must never record human approval, and must
 never guess which sprint owns an item — see the standing instruction at the top

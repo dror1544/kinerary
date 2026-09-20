@@ -1,3 +1,4 @@
+# Generated from .claude/agents/run-capture.md by scripts/sync-codex-agents.py — edit the .md, never this file.
 name = "run-capture"
 description = "Turns raw notes from a live signup/interview run into triaged Status-ledger rows routed to the sprint that owns each one. Use right after a live test run, or when handed messy run notes to process."
 developer_instructions = """

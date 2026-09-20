@@ -18,4 +18,9 @@ if [ -x scripts/preflight-checks.sh ]; then
   fi
 fi
 
+# Which sprint, which locks, which baseline — from the file, not from memory.
+if [ -f .project/sprint.json ] && [ -f scripts/project-state.py ]; then
+  state="$(python3 scripts/project-state.py show --line 2>/dev/null)" && [ -n "$state" ] && line="$line $state"
+fi
+
 jq -cn --arg c "$line" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'

@@ -75,6 +75,7 @@ case "$kind" in
 $(plan_note)"
     ;;
   commit)
+    out=""
     if [ -x "$CHECKS" ]; then
       if ! out="$("$CHECKS" --staged 2>&1)"; then
         emit deny "Commit refused by scripts/preflight-checks.sh (CLAUDE.md Hard Rules):
@@ -83,6 +84,15 @@ $out
 
 Fix the BLOCK lines above, or bypass deliberately with: git commit --no-verify"
       fi
+    fi
+    # A change to .project/sprint.json — a lock, the baseline, the sprint, an
+    # override — is approved BY NAME inside this prompt, not as one more diff.
+    changes="$(printf '%s\n' "$out" | grep -E '^warn +state change' || true)"
+    if [ -n "$changes" ]; then
+      emit ask "CLAUDE.md hard rule 1 — never git commit without explicit user approval. Mechanical checks passed; this prompt is the approval.
+
+THIS COMMIT CHANGES THE SPRINT/BASELINE STATE (.project/sprint.json):
+$changes"
     fi
     emit ask "CLAUDE.md hard rule 1 — never git commit without explicit user approval. Mechanical checks passed; this prompt is the approval."
     ;;

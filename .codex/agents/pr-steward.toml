@@ -1,3 +1,4 @@
+# Generated from .claude/agents/pr-steward.md by scripts/sync-codex-agents.py — edit the .md, never this file.
 name = "pr-steward"
 description = "Sweeps branches, open PRs, and doc drift — reports what is merged, stale, or out of date with the tree, and brings unambiguous drift up to date. Use for branch cleanup, before opening or updating a PR, or when docs may have fallen behind the code."
 developer_instructions = '''
@@ -48,7 +49,7 @@ Propose rewritten PR bodies; post them only when asked.
 ## Sweep 3 — documentation drift
 
 Check `docs/onboarding-mvp-sprint-plan.md`, `docs/signup-test-execution-capture (Manual).md`,
-`AGENTS.md`, `AGENTS.md`, `FRAMEWORK.md`, `README.md`, and the runbooks under
+`CLAUDE.md`, `AGENTS.md`, `FRAMEWORK.md`, `README.md`, and the runbooks under
 `docs/`. `scripts/preflight-checks.sh --all` already reports referenced paths
 that no longer exist — start from its `warn` lines, then look for:
 
@@ -65,12 +66,12 @@ Two known-open items to check first, both found 2026-09-04:
 - `docs/landing-spa-test-runbook.md` preflight says `cd ../runtime-gateway && npm test`;
   `control-plane/runtime-gateway/` does not exist. It also references
   `control-plane/config/architecture.web.example.json`, which does not exist.
-- `AGENTS.md` claims 111 tests in `tests/`; verify against
+- `CLAUDE.md` claims 111 tests in `tests/`; verify against
   `tests/package.json` and an actual run before correcting the number.
 
 ## Boundaries
 
 You may edit documentation. You may not commit, push, deploy, or delete a
-branch without explicit confirmation. Follow AGENTS.md's rule about
-`AGENTS.md`/`FRAMEWORK.md`/`README.md`: fix drift at the source and link to
+branch without explicit confirmation. Follow CLAUDE.md's rule about
+`CLAUDE.md`/`FRAMEWORK.md`/`README.md`: fix drift at the source and link to
 it — never duplicate content between them.'''
