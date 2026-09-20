@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+import urllib.parse
 from unittest import mock
 
 from control_plane_worker.enrichment import enrich_config
@@ -687,3 +688,66 @@ class WorkerLogLevel(unittest.TestCase):
     def test_an_unrecognised_value_falls_back_to_info_not_to_silence(self):
         # A typo must not disable logging — that is the failure this prevents.
         self.assertEqual(logging.INFO, self._configure({"WORKER_LOG_LEVEL": "verbose"}))
+
+
+class LocationQueriesDoNotRepeatThemselves(unittest.TestCase):
+    """A phase must not ask the geocoder for the whole itinerary.
+
+    Organizers answer the destination with a list — "Tokyo, Hakone, Kyoto,
+    Osaka, Japan". The query was f"{label}, {destination}", so the Tokyo phase
+    asked for "Tokyo, Tokyo, Hakone, Kyoto, Osaka, Japan": its own city twice,
+    then three cities it is not in. Nominatim returns nothing for that and
+    _default_http reports nothing as None, so on 2026-09-19 every phase of a
+    real trip silently lost its coordinates and the site showed no map.
+    """
+
+    DEST = "Tokyo, Hakone, Kyoto, Osaka, Japan"
+
+    def test_the_phase_city_is_not_repeated(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        self.assertEqual("Tokyo, Japan", q)
+        self.assertEqual(1, q.lower().count("tokyo"), q)
+
+    def test_other_phases_cities_are_not_dragged_in(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        for elsewhere in ("Hakone", "Kyoto", "Osaka"):
+            self.assertNotIn(elsewhere, q, f"{elsewhere} is not in the Tokyo phase")
+
+    def test_a_single_country_destination_still_anchors(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Rome, Italy", _location_query("Rome", _destination_anchor("Italy")))
+
+    def test_deduplication_ignores_case_and_whitespace(self):
+        from control_plane_worker.enrichment import _location_query
+
+        self.assertEqual("Tokyo, Japan", _location_query("Tokyo", " tokyo ", "TOKYO, Japan"))
+
+    def test_an_empty_destination_leaves_just_the_label(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Tokyo", _location_query("Tokyo", _destination_anchor("")))
+
+    def test_a_venue_query_carries_its_own_city_and_country_only(self):
+        from control_plane_worker.enrichment import enrich_config
+
+        asked: list[str] = []
+
+        def http(url):
+            asked.append(urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("q", [""])[0]))
+            return None
+
+        cfg = {"phases": [{
+            "id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"},
+            "venues": [{"name": {"en": "Tokyo Skytree"}}],
+        }]}
+        out = enrich_config(cfg, self.DEST, http=http, pause=0)
+        maps = out["phases"][0]["venues"][0]["maps"]
+        target = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(maps).query)["query"][0])
+        self.assertEqual("Tokyo Skytree, Tokyo, Japan", target)
+        for q in asked:
+            self.assertNotIn("Kyoto", q, f"a Tokyo phase asked for Kyoto: {q}")

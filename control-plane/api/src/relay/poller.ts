@@ -103,6 +103,7 @@ import {
 import type { StructuredModelRunner } from "../model-runner.js";
 import { documentText } from "../document-text.js";
 import { extractItinerary, foldExtractedIntoPhases } from "../itinerary-extract.js";
+import { parkDeferredVenueLinks } from "../venue-links.js";
 import { provisionOnConfirm } from "../planner.js";
 import type { RosterChoice } from "../organizer-identity.js";
 
@@ -2198,6 +2199,25 @@ export async function foldItineraryFromDocument(
       detail: (result.detail ?? "").slice(0, 200),
     }));
     return;
+  }
+
+  // Park venues whose URL search was rate-limited, so the API's background
+  // drain retries them and enrich_config back-fills the link at provision
+  // time. The MCP tool has always done this; this path computed the same list
+  // and threw it away, so on the agentless path — the default — a venue only
+  // ever got a ticket link if the model happened to produce one inline.
+  // Deliberately before the staleness and empty-fold returns below: the names
+  // are owed whether or not this particular extraction lands.
+  if (result.venueLinksDeferred.length) {
+    try {
+      const queued = await parkDeferredVenueLinks(deps.db, destination, result.venueLinksDeferred);
+      log(structuredLog("info", "interview.venue_links_parked", { session_id: burst.sessionId, queued }));
+    } catch (error) {
+      log(structuredLog("warn", "interview.venue_links_park_failed", {
+        session_id: burst.sessionId,
+        error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+      }));
+    }
   }
 
   // It runs behind the interview, so the organizer may have changed the stops

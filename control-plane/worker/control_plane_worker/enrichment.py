@@ -77,6 +77,46 @@ def _default_http(url: str) -> Any:
         return None
 
 
+def _location_query(*parts: str) -> str:
+    """Join place components into one search query, without repeating any.
+
+    Every component is split on commas first, so a destination that is itself a
+    list ("Tokyo, Hakone, Kyoto, Osaka, Japan") cannot smuggle a duplicate past
+    a whole-string comparison. Matching is case-insensitive and order is kept.
+
+    This existed as a plain f-string until 2026-09-19, when a trip came out with
+    no map at all: the phase query was built as f"{label}, {destination}", so a
+    Tokyo phase asked the geocoder for "Tokyo, Tokyo, Hakone, Kyoto, Osaka,
+    Japan" — its own city twice, then three cities it is not in. Nominatim
+    returns nothing for that, and _default_http reports nothing as None, so
+    every phase silently lost its coordinates. "Tokyo, Japan" resolves.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in parts:
+        for piece in str(part or "").split(","):
+            piece = piece.strip()
+            key = piece.casefold()
+            if piece and key not in seen:
+                seen.add(key)
+                out.append(piece)
+    return ", ".join(out)
+
+
+def _destination_anchor(destination: str) -> str:
+    """The country-ish tail of a destination answer.
+
+    Organizers answer with an itinerary, not a country — "Tokyo, Hakone, Kyoto,
+    Osaka, Japan". Anchoring a phase on the whole thing drags in every city the
+    phase is NOT in; anchoring on nothing loses the country a city name may need
+    to disambiguate. The last comma-separated part is the country in every
+    multi-part answer seen so far, and is the answer itself when there is only
+    one part.
+    """
+    parts = [p.strip() for p in str(destination or "").split(",") if p.strip()]
+    return parts[-1] if parts else ""
+
+
 # ── country data ─────────────────────────────────────────────────────────────
 
 def _find_country(http: Http, query: str) -> dict | None:
@@ -305,7 +345,7 @@ def enrich_config(
         label, lang = _phase_query(phase)
         if not label:
             continue
-        city_query = f"{label}, {destination}".strip(", ")
+        city_query = _location_query(label, _destination_anchor(destination))
         try:
             if "mapStop" not in phase:
                 # Anchor the pin (and so the Maps/Waze links) on the hotel when
@@ -574,7 +614,7 @@ def _enrich_venues(
                 venue["url"] = found
         if "maps" in venue:
             continue
-        query = ", ".join(p for p in (name, str(venue.get("area") or "").strip(), label, destination) if p)
+        query = _location_query(name, str(venue.get("area") or ""), label, _destination_anchor(destination))
         venue.setdefault("maps", _maps_search_url(query))
         venue.setdefault("waze", _waze_search_url(query))
 
