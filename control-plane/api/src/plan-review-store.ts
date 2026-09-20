@@ -72,8 +72,21 @@ export async function savePlanReview(
   try {
     await client.query("BEGIN");
     await client.query(
-      `INSERT INTO control_plane.plan_reviews (id, trip_id, config_digest, model_used, model_skipped, rejected, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+      // `created_at` is deliberately NOT `review.generatedAt`, and the column's
+      // `DEFAULT now()` is what fills it. It is compared with
+      // `trips.plan_snapshot_at` further down (`r.created_at >= t.plan_snapshot_at`),
+      // and that column is written by the worker as Postgres `now()`
+      // (provisioner.py). `generatedAt` is the API process's own wall clock —
+      // a different machine in production — so the two sides of that `>=` came
+      // from two clocks that drift independently. When the API host ran even a
+      // few milliseconds behind the database, a review that HAD just been
+      // written looked older than the snapshot it reviewed, the trip stayed in
+      // the queue, and the post-deploy pass reviewed it again on every tick.
+      // Both sides now come from the database clock. `generatedAt` stays on the
+      // returned review as the moment the work started; nothing else reads this
+      // column. See #134.
+      `INSERT INTO control_plane.plan_reviews (id, trip_id, config_digest, model_used, model_skipped, rejected)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
       [
         id,
         tripId,
@@ -81,7 +94,6 @@ export async function savePlanReview(
         review.modelUsed,
         review.modelSkipped,
         JSON.stringify(review.rejected),
-        review.generatedAt,
       ],
     );
 
