@@ -597,8 +597,23 @@ export const CODEX_ISOLATION_FEATURES: readonly string[] = CODEX_ISOLATION_ARGS.
  * Feature names are version-specific, and codex EXITS on one it does not know
  * ("Unknown feature flag"). Unchecked, a codex older or newer than the one the
  * list was written against would fail every structuring call at call time. The
- * relay asks once at startup instead, and refuses codex bindings loudly if the
- * answer is not a clean match — never running codex with a shorter list.
+ * relay is meant to ask once at startup instead, and to refuse codex bindings
+ * loudly if the answer is not a clean match — never running codex with a
+ * shorter list.
+ *
+ * NOTHING CALLS THIS ON SLICE A, and the difference matters when reading it.
+ * `CODEX_ISOLATION_ARGS` IS applied to every codex call (`codexSpec`), so the
+ * isolation itself is in force; what is absent is the startup check that this
+ * machine's codex understands the list, because that call lives in
+ * `relay/server.ts`, which is Slice B. Until Slice B lands, a version mismatch
+ * shows up as codex failing every call rather than as a refusal at startup —
+ * noisy, not silent, which is the safe direction, but not the intended one.
+ *
+ * The full isolation for #58 is PR #91 (an env allowlist and
+ * `--ignore-user-config`), which is still open. This probe is what #92 has that
+ * #91 does not, and the agreed plan is to land #91 first and keep this. Neither
+ * half is finished while the other is open, so do not read the presence of this
+ * function as #58 being closed.
  */
 export function codexIsolationProblem(bin = "codex", timeoutMs = 20_000): Promise<string | null> {
   return new Promise((resolve) => {
