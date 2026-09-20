@@ -159,6 +159,74 @@ Triage values: `baseline-fix` (fix before the sprint's work) · `sprint-6`
 
 ---
 
+## The baseline commit, and what was run at it
+
+`.project/sprint.json` records the baseline as **97582b6** and locks it there.
+Everything below was run at that exact commit, with a clean working tree
+(`git status` empty before and after).
+
+| suite | result |
+|---|---|
+| trip site (`tests`) | 483 tests, 483 pass, 0 fail |
+| control-plane API | 1374 tests, 1368 pass, 0 fail, 6 skipped |
+| control-plane API typecheck | clean |
+| worker (`control-plane/worker`, **with a database**) | 435 tests, OK |
+| provisioning (`tests/provisioning`) | 36 tests, OK |
+| scripts (`tests/scripts`) | 305 tests, OK |
+| web | 10 tests, passed |
+| trip-web | 135 tests, passed |
+| runtime-gateway | 5 tests, 5 pass, 0 fail |
+| `preflight-checks.sh --all` | exit 0 |
+
+The 6 API skips are environment-conditional and pre-existing: one needs
+`HERMES_EXTRACT_PROFILE` (itinerary-extract.integration), five need
+`CONTROL_PLANE_TEST_VAULT_ADDR` (secrets.test.ts). Neither was introduced here.
+
+**The worker suite was run WITH a database, deliberately.** Without
+`CONTROL_PLANE_TEST_DATABASE_URL` it reports 435 tests OK with 87 skipped — 85
+of them skipped for exactly that reason. A baseline that recorded the skipping
+version would be recording 435 OK while 85 tests had not run, which is the
+2026-09-11 "clean preflight that had not run 340 tests" failure repeating.
+
+### What was NOT run, and why
+
+`scripts/preflight-deploy.sh` was not used, so this is nine targeted suites
+rather than one preflight run. The live Mac stack is served from this worktree
+— `docker inspect` shows `/app/dist` and `/repo` both mounted from
+`.claude/worktrees/sprint-6-integration` — and preflight's dependency step
+relinks worktree `node_modules` (`scripts/link-worktree-deps.sh`, reached
+whenever `server`, `tests`, `mcp` or `control-plane/api` lack an install). A
+run that disturbs the stack it is verifying is worse than a narrower run that
+does not. The web and trip-web **builds** were skipped for the same reason: the
+trip-web build writes the tracked `site/modern`.
+
+If a full preflight is wanted in the record, it should run from the main
+checkout, or after the live stack is pointed elsewhere.
+
+### Three false reds, all self-inflicted
+
+Recorded because the pattern is the point, not the individual mistakes.
+
+1. **4 API failures** — `ENOENT` on `…/db/migrations/*_zz_probe.sql` inside
+   `applyMigrations`, from running `tests/scripts` concurrently. That suite
+   writes probe migrations into the tracked migrations directory and `git
+   add`s them into the shared index. Filed as **#135**; the API suite re-run
+   alone is the 1374/1368 above.
+2. **2 worker errors** — `psycopg.ProgrammingError: extra key/value separator`,
+   from appending `?application_name=` to the worker's database URL.
+   `test_runtime.py` appends its own unconditionally, so any URL that already
+   carries a query string breaks. Worth knowing because `?application_name=`
+   is otherwise the right habit for attributing connections in
+   `pg_stat_activity`.
+3. **`npm ci` failure in runtime-gateway** — it has no lockfile and no
+   dependencies (`node --test` directly), so nothing needed installing.
+   Preflight is right to skip it.
+
+Every one came from running something concurrently against shared state: a
+database, a migrations directory, a connection string. That is the same shape
+as #134 and #135 themselves, and it is the argument for per-session databases
+and per-session worktrees once several agents are working at once.
+
 ## Known before starting
 
 Stated so the run is not spent rediscovering them.

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated_at": "2026-09-20T14:10:02Z",
+  "updated_at": "2026-09-20T16:46:34Z",
   "updated_by": "Dror (recorded by Claude, readiness-baseline session)",
   "sprint": {
     "id": "6",
@@ -16,7 +16,7 @@
   },
   "baseline": {
     "branch": "integration/sprint-6",
-    "commit": "4cfcad5d238419927b8bd668eed247bc11feb502",
+    "commit": "97582b6bab1832a2f614c836717b229a828907c9",
     "report": "docs/test-reports/sprint-6-baseline-2026-09-20.md",
     "release": null
   },
@@ -35,13 +35,13 @@
       ]
     },
     "baseline": {
-      "state": "open",
+      "state": "locked",
       "since": "2026-09-20",
-      "by": "Dror (recorded by Claude, agent-team plan session)",
-      "reason": "the Sprint 6 baseline (docs/test-reports/sprint-6-baseline-2026-09-20.md) is still being prepared; baseline.commit moves with each fix; the agent team starts only once Dror locks this",
-      "meaning": "the baseline is still being prepared: baseline.commit moves with each fix, and the agent team does not start",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "reason": "Dror, 2026-09-20, approved explicitly: the baseline is final at 97582b6 and the agent team may start; evidence is the nine suites recorded in docs/test-reports/sprint-6-baseline-2026-09-20.md, run at that commit with a clean tree",
+      "meaning": "the baseline is settled: baseline.commit is what sprint work builds on, and the agent team may start",
       "forbids": [
-        "starting sprint work through the agent team (docs/agent-team-plan.md)"
+        "moving baseline.commit without --override"
       ]
     }
   },
@@ -65,6 +65,18 @@
       "by": "Dror (recorded by Claude, readiness-baseline session)",
       "change": "set-baseline 6ebd532 -> 4cfcad5",
       "reason": "Dror, 2026-09-20: #131 is approved and committed, so the baseline pointer moves to it; 6ebd532 predated the flight-designator fix and no longer reflected the tree the sprint would start from"
+    },
+    {
+      "at": "2026-09-20T16:46:34Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "set-baseline 4cfcad5 -> 97582b6",
+      "reason": "Dror, 2026-09-20: the baseline is the point where this session's tasks are finished and verified, and Sprint 6 starts with all agents from there; #131 (4cfcad5) and #134 (97582b6) are committed and nine suites were run green at 97582b6"
+    },
+    {
+      "at": "2026-09-20T16:46:34Z",
+      "by": "Dror (recorded by Claude, readiness-baseline session)",
+      "change": "lock baseline at 97582b6",
+      "reason": "Dror, 2026-09-20, approved explicitly: the baseline is final at 97582b6 and the agent team may start; evidence is the nine suites recorded in docs/test-reports/sprint-6-baseline-2026-09-20.md, run at that commit with a clean tree"
     }
   ]
 }
