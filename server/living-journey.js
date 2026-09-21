@@ -913,8 +913,16 @@ function buildTodayContext(db, config) {
   const clock = localClock(config);
   const today = clock.date;
   const datedItems = rows?.items.filter((item) => item.date).sort((a, b) => String(a.date).localeCompare(String(b.date)) || (a.time_sort ?? 99999) - (b.time_sort ?? 99999)) || [];
-  const firstDate = datedItems[0]?.date || config.meta?.departure || null;
-  const lastDate = datedItems[datedItems.length - 1]?.date || null;
+  // Empty itinerary days still belong to the trip. Include phase boundaries
+  // for destinations whose day-by-day schedule has not been filled in yet.
+  const tripDates = [
+    ...(rows?.days || []).map(day => day.date),
+    ...datedItems.map(item => item.date),
+    ...(config.phases || []).flatMap(phase => [phase.dates?.start || phase.start, phase.dates?.end || phase.end]),
+    config.meta?.departure,
+  ].filter(date => typeof date === 'string' && ISO_DATE_RE.test(date)).sort();
+  const firstDate = tripDates[0] || null;
+  const lastDate = tripDates.at(-1) || null;
   let phase = 'pre_trip';
   if (firstDate && today < firstDate) phase = 'pre_trip';
   else if (lastDate && today > lastDate) phase = 'post_trip';

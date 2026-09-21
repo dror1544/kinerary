@@ -31,6 +31,7 @@ test('living journey seeds immutable original and active itinerary versions once
       CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, name TEXT, date_from TEXT, date_to TEXT, confirmation TEXT, conf_file TEXT, location_url TEXT, google_wallet_url TEXT, apple_wallet_url TEXT, pkpass_file TEXT);
     `);
     const config = fixtureConfig();
+    config.phases.forEach(phase => { (phase.days || []).forEach(day => { day.date = '2000-01-01'; }); });
     const raw = JSON.stringify(config);
     create({ db, config, raw, mediaDir: dir, fetchImpl: fetch });
     create({ db, config, raw, mediaDir: dir, fetchImpl: fetch });
@@ -59,6 +60,23 @@ test('living journey seeds immutable original and active itinerary versions once
     await weather(request, { json(value) { result = value; } });
     assert.equal(fetches, 1);
     assert.deepEqual(result.forecast_dates, ['2026-09-12', '2026-09-13']);
+
+    db.exec("ALTER TABLE bookings ADD COLUMN review_status TEXT DEFAULT 'approved'");
+    db.exec('ALTER TABLE bookings ADD COLUMN notes TEXT');
+    const tripToday = routes.get('get /api/today');
+    delete config.meta.departure;
+    const clockResponse = { setHeader() {}, json(value) { result = value; } };
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    // The trip remains active through calendar-only days, even with no
+    // activities scheduled there. Then moving its dates changes its state.
+    config.phases = [{ id: 'empty', dates: { start: '2000-01-01', end: tomorrow } }];
+    tripToday({}, clockResponse);
+    assert.equal(result.phase, 'active_day');
+    assert.equal(result.last_date, tomorrow);
+    config.phases = [{ id: 'empty', dates: { start: '2000-01-01', end: '2000-01-02' } }];
+    config.meta.departure = '2000-01-01';
+    tripToday({}, clockResponse);
+    assert.equal(result.phase, 'post_trip');
 
     const state = db.prepare('SELECT * FROM trip_itinerary_state').all();
     const versions = db.prepare('SELECT * FROM itinerary_plan_versions ORDER BY created_at ASC').all();
