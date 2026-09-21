@@ -38,6 +38,30 @@ person's recollection.
    `consult` — read-only by construction — with both hunks and both PR
    descriptions, never your own conclusion, and ask. Record its answer and
    its reasoning verbatim.
+
+   **A clean merge is not enough, and on a security path it is not evidence at
+   all.** Three resolutions on 2026-09-21 each looked clean and each would have
+   reverted a fix that had already shipped:
+
+   - `model-runner.ts` — a branch spawned Codex with `hermeticEnv()`, the
+     DENYLIST that forwards every secret the relay holds, while the integration
+     branch had moved to `codexChildEnv()`, an allowlist (#91). Its own comment
+     argued for the allowlist while naming the denylist: right intent, wrong
+     function. No test would have caught it.
+   - `provisioner.py` — a helper returning ONE chat id looked equivalent to a
+     fix that split it into a verified id for authorization and a recipient id
+     for notification. Collapsing them back re-opens #32.
+   - Taking a file wholesale from the other branch's head, rather than
+     cherry-picking the commit, showed **869 deletions** against an 8-line
+     change — ten commits of newer work reverted while the split looked clean.
+
+   So: for every file both sides touch, ask what each side is PROTECTING, not
+   whether the text reconciles. **`model-runner.ts` is the named case** — it
+   carries the child-process environment policy for every model call, it is
+   edited by several branches at once, and a wrong resolution there is silent.
+   Treat `server/server.js`, `shared/`, and anything spawning a process with an
+   environment the same way. Reconcile; never take a side wholesale because it
+   is tidier.
 4. **Resolve on a throwaway branch in your own worktree**, never on the
    integration branch. Reconcile: the same intent arriving twice is
    reconciled, not taken from one side. A conflict you cannot resolve with
