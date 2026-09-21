@@ -69,11 +69,15 @@ describe("question examples — read the way a model's answer is read", () => {
     }
   });
 
-  test("travel_anchors shows one type, not a list of choices, and a clock time", () => {
+  test("travel_anchors shows one canonical booking type, a clock time, and covers ticketed visits", () => {
     const q = INTAKE_QUESTIONS.find((x) => x.id === "travel_anchors")!;
     const [anchor] = readDataJson(q.id, q.dataExample!) as Record<string, unknown>[];
     assert.doesNotMatch(String(anchor!.type), /\|/);
+    assert.equal(anchor!.type, "attraction");
     assert.match(String(anchor!.time), /^([01]\d|2[0-3]):[0-5]\d$/);
+    for (const kind of ["ticketed attractions", "tours", "activities", "events", "shuttles", "parking"]) {
+      assert.match(q.prompt, new RegExp(kind, "i"));
+    }
   });
 
   test("bot_limits entries are {he, en} objects — the transformer drops anything else", () => {
@@ -98,8 +102,8 @@ describe("exampleEchoes — a category the prompt defines is not copied from its
   const example = INTAKE_QUESTIONS.find((q) => q.id === "travel_anchors")!.dataExample!;
   const source = "Vatican Museums - tickets booked, ref VAT-2231, 6 May 09:30";
 
-  test("a booked visit typed `activity`, like the example, is not an echo", () => {
-    const value = { kind: "structured", data: [{ type: "activity", name: "Vatican Museums", date: "2027-05-06", time: "09:30", confirmation: "VAT-2231" }] };
+  test("a booked visit typed `attraction`, like the example, is not an echo", () => {
+    const value = { kind: "structured", data: [{ type: "attraction", name: "Vatican Museums", date: "2027-05-06", time: "09:30", confirmation: "VAT-2231" }] };
     assert.deepEqual(exampleEchoes(example, value, source), []);
   });
 
