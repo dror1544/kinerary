@@ -111,6 +111,15 @@ export interface CliSpec {
   maxAttempts: number;
   /** Where to run it. Defaults to a neutral directory — see `hermeticEnv`. */
   cwd?: string;
+  /**
+   * The environment the child gets. Declared per spec because the adapters do
+   * not agree on what a child legitimately needs: the Claude CLI needs its own
+   * login and nothing else, while `hermesSpec` runs an agent that reaches its
+   * providers through the relay's own configuration. Unset means `hermeticEnv`,
+   * which is inheritance minus session state — correct for Hermes, and not
+   * enough for anything structuring untrusted text.
+   */
+  env?: (source?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 }
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
@@ -161,6 +170,7 @@ export function claudeSpec(
     model,
     timeoutMs,
     maxAttempts: 2,
+    env: claudeChildEnv,
     args: (prompt, m) => effort
       ? ["-p", prompt, "--model", m, "--effort", effort, "--setting-sources", "", "--strict-mcp-config"]
       : ["-p", prompt, "--model", m],
@@ -237,6 +247,42 @@ export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Pro
  * provider keys, bot tokens and other relay configuration never reach a model
  * process that is structuring untrusted organizer input.
  */
+/**
+ * The minimal environment a nested Claude CLI needs: its own login, a place to
+ * run, and certificates. Everything else the relay holds — provider keys for
+ * other services, bot tokens, database URLs — is withheld, on the same grounds
+ * as `codexChildEnv`.
+ *
+ * This is an allowlist, and that is the whole point. `hermeticEnv` is a
+ * denylist: it strips session state and passes the rest through, so every
+ * secret the relay held reached a `claude -p` that was being handed untrusted
+ * organizer text. Codex was isolated for that reason (#58) while the runner
+ * the production configuration actually uses was not, and a denylist cannot be
+ * audited — you would have to enumerate every secret that will ever exist.
+ *
+ * The CLI's OWN credentials stay, because withholding them does not reduce the
+ * blast radius of a prompt injection and does break the call: a child that
+ * cannot authenticate exits non-zero, the task returns FAILED, and the router
+ * silently does less for the rest of the interview. Stripping
+ * CLAUDE_CODE_OAUTH_TOKEN did exactly that on the VM on 2026-09-11.
+ * CLAUDE_CONFIG_DIR stays for the same reason — the VM takes its effort from
+ * the settings.json there, and losing it falls back to the CLI's default.
+ */
+export function claudeChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    "PATH", "HOME",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ]);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  );
+}
+
 export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const allowed = new Set([
     "PATH", "HOME", "CODEX_HOME", "XDG_CONFIG_HOME",
@@ -254,7 +300,7 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
     execFile(
       spec.bin,
       spec.args(prompt, spec.model),
-      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: hermeticEnv() },
+      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: (spec.env ?? hermeticEnv)() },
       (err, stdout, stderr) => {
         if (!err) return resolve({ ok: true, stdout: String(stdout) });
         const tail = `${String(stderr ?? "").trim()} ${String(stdout ?? "").trim()}`.trim().slice(-250);
