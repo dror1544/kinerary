@@ -1,3 +1,4 @@
+-- rollback: compatible — one new table and its indexes; the report is write-only from the companion and nothing else reads it
 -- A companion's way to say "something here is broken" to a human, without
 -- being given any power to act on it.
 --

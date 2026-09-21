@@ -1,3 +1,4 @@
+-- rollback: compatible — adds two nullable trips columns (plan_snapshot, plan_snapshot_at) and two new tables; the prior version reads none of them
 -- The post-deploy plan review, and the queue its proposals wait in.
 --
 -- Sprint 4.5 left one row tagged `separate build`: "Site live-plan enrichment

@@ -79,10 +79,13 @@ still missing.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 # Required question IDs that must be present in the intake data.
 # `group_size` and `trip_duration` are deliberately NOT here: both are derived
@@ -288,6 +291,7 @@ _KNOWN_COUNTRY_CURRENCY: dict[str, dict[str, str]] = {
     "united states": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "america": {"country": "United States", "code": "USD", "symbol": "$", "currency_name": "US Dollar"},
     "japan": {"country": "Japan", "code": "JPY", "symbol": "¥", "currency_name": "Japanese Yen"},
+    "vietnam": {"country": "Vietnam", "code": "VND", "symbol": "₫", "currency_name": "Vietnamese Dong"},
     "italy": {"country": "Italy", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "france": {"country": "France", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
     "spain": {"country": "Spain", "code": "EUR", "symbol": "€", "currency_name": "Euro"},
@@ -299,6 +303,133 @@ _KNOWN_COUNTRY_CURRENCY: dict[str, dict[str, str]] = {
     "england": {"country": "United Kingdom", "code": "GBP", "symbol": "£", "currency_name": "British Pound"},
     "thailand": {"country": "Thailand", "code": "THB", "symbol": "฿", "currency_name": "Thai Baht"},
 }
+
+
+# The zone the trip is IN, keyed the same way as the currency map above and
+# deliberately sharing its country vocabulary — one destination, two facts.
+#
+# The interview asks for a timezone as free text, and an organizer who has not
+# been to the country cannot answer it: on 2026-09-20 the answer was the string
+# "Vietnam", which reached the config as `agent.timezone` and left a 07:30
+# briefing scheduled in a zone no clock resolves. Deriving beats asking, so the
+# typed answer is now only accepted when it is a real zone.
+#
+# A country spanning several zones is given the one its capital keeps, which is
+# where a trip's own clock realistically sits; anything genuinely ambiguous is
+# better left absent than guessed.
+_KNOWN_COUNTRY_TIMEZONE: dict[str, str] = {
+    "usa": "America/New_York",
+    "us": "America/New_York",
+    "united states": "America/New_York",
+    "america": "America/New_York",
+    "japan": "Asia/Tokyo",
+    "vietnam": "Asia/Ho_Chi_Minh",
+    "italy": "Europe/Rome",
+    "france": "Europe/Paris",
+    "spain": "Europe/Madrid",
+    "greece": "Europe/Athens",
+    "portugal": "Europe/Lisbon",
+    "germany": "Europe/Berlin",
+    "uk": "Europe/London",
+    "united kingdom": "Europe/London",
+    "england": "Europe/London",
+    "thailand": "Asia/Bangkok",
+    "israel": "Asia/Jerusalem",
+}
+
+
+# The destination as the ORGANIZER wrote it, mapped to the one key the tables
+# above are written in.
+#
+# Both tables key on English country names, and the interview stores the
+# destination in whatever language it was typed. Which language that is depends
+# on whether the interpreter happened to normalise it: on 2026-09-20 the same
+# scenario produced "Vietnam" on one run and "וייטנאם" on the next. The Hebrew
+# run lost BOTH facts — `travel_info` came out null, so the site's currency
+# card and its conversion feature were simply absent, and `agent.timezone` was
+# empty. Neither failure says anything; they are missing fields on a site that
+# otherwise looks complete.
+#
+# A Hebrew interview is the normal case here, so this is not an edge.
+_COUNTRY_ALIASES: dict[str, str] = {
+    "ארצות הברית": "usa", "ארהב": "usa", "אמריקה": "usa",
+    "יפן": "japan",
+    "וייטנאם": "vietnam", "ויאטנם": "vietnam", "ויטנאם": "vietnam",
+    "איטליה": "italy",
+    "צרפת": "france",
+    "ספרד": "spain",
+    "יוון": "greece",
+    "פורטוגל": "portugal",
+    "גרמניה": "germany",
+    "אנגליה": "uk", "בריטניה": "uk", "אנגליה ובריטניה": "uk",
+    "תאילנד": "thailand",
+    "ישראל": "israel",
+}
+
+
+def _country_keys(destination: str) -> list[str]:
+    """Every key worth trying for a destination, best first.
+
+    Deliberately shared by the currency and timezone lookups: they answer two
+    questions about one place, and a destination either resolves for both or
+    for neither. Keeping two spellings tables in step by hand is how one of
+    them silently stops matching."""
+    raw = (destination or "").strip()
+    tail = [part.strip() for part in raw.split(",") if part.strip()]
+    candidates = [raw, _destination_head(raw), tail[-1] if tail else ""]
+    keys: list[str] = []
+    for candidate in candidates:
+        lowered = candidate.strip().lower()
+        if not lowered:
+            continue
+        for key in (lowered, _COUNTRY_ALIASES.get(lowered.replace('"', "").replace("'", ""), "")):
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _is_iana_timezone(value: str) -> bool:
+    """Whether something can actually be used as a clock."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return False
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        ZoneInfo(candidate)
+        return True
+    except (ImportError, ZoneInfoNotFoundError, ValueError):
+        return False
+
+
+def _resolve_timezone(typed: str, destination: str) -> str:
+    """The trip's zone: what the organizer typed if it is one, else derived
+    from the destination, else nothing.
+
+    Returning "" rather than the unusable text is the point. A field that is
+    absent is a gap something can notice; a field holding "Vietnam" looks
+    answered and is read as a zone by everything downstream.
+    """
+    typed = (typed or "").strip()
+    if _is_iana_timezone(typed):
+        return typed
+    for key in _country_keys(destination):
+        zone = _KNOWN_COUNTRY_TIMEZONE.get(key)
+        if zone:
+            return zone
+    return ""
+
+
+def _has_confirmation(anchor: Any) -> bool:
+    """Whether a travel_anchor carries actual evidence of a booking.
+
+    Placeholders count as absent. A site that renders "–" for a missing
+    confirmation must not also count that anchor as confirmed — the two were
+    reading the same data and disagreeing on one page.
+    """
+    if not isinstance(anchor, Mapping):
+        return False
+    value = str(anchor.get("confirmation") or "").strip()
+    return bool(value) and value.lower() not in {"-", "\u2013", "\u2014", "none", "n/a", "tbd", "-"}
 
 
 def _lookup_known_currency(destination: str) -> dict[str, str] | None:
@@ -314,8 +445,11 @@ def _lookup_known_currency(destination: str) -> dict[str, str] | None:
     isn't unconditionally broken for every control-plane-provisioned trip
     until that enrichment pass exists for real.
     """
-    return (_KNOWN_COUNTRY_CURRENCY.get(destination.strip().lower())
-            or _KNOWN_COUNTRY_CURRENCY.get(_destination_head(destination).lower()))
+    for key in _country_keys(destination):
+        found = _KNOWN_COUNTRY_CURRENCY.get(key)
+        if found:
+            return found
+    return None
 
 
 _MULTI_PLACE_RE = re.compile(r",|&| and |/")
@@ -329,7 +463,46 @@ def _destination_head(destination: str) -> str:
     return head or destination.strip()
 
 
-def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -> tuple[str, str]:
+def _destination_country(destination: str, phase_names: "Sequence[str]") -> str:
+    """The country a destination TRAILS with — "Japan" from "Tokyo, Hakone,
+    Kyoto, Osaka, Japan".
+
+    `_destination_head` reads the other shape, "Portugal — Lisbon and Porto",
+    where the country leads. Both occur, and the trailing one is what the
+    interview actually produces: it normalises a spoken destination into a list
+    of stops with the country last. A real trip on 2026-09-19 stored
+    "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain city list, and
+    was titled "Family Trip 2027" with the country nowhere.
+
+    It has to be RECOGNISED as a country, not merely trailing. "Rome,
+    Florence, Venice" has the same shape and ends in a city; naming that trip
+    "Venice" is worse than the generic fallback. An earlier attempt here used
+    "not one of the phases" as the test, which named a trip OSAKA 2026 as soon
+    as the phases did not happen to list every city the destination mentions —
+    caught by two existing tests, and the reason this asks a country list
+    instead.
+
+    That list is the same fifteen-entry stopgap `_lookup_known_currency` uses,
+    so this inherits its limit: an unlisted country falls back to the trip
+    type rather than being named. Being wrong about which places are countries
+    is worse than being incomplete, and the real answer is the enrichment
+    pass, which resolves countries properly and runs after this.
+    """
+    parts = [p.strip() for p in _MULTI_PLACE_RE.split(destination) if p.strip()]
+    if len(parts) < 2:
+        return ""
+    trailing = parts[-1]
+    known_phases = {str(n).strip().casefold() for n in phase_names if str(n or "").strip()}
+    if trailing.casefold() in known_phases:
+        return ""  # it is one of the stops, so it is not the country
+    return trailing if trailing.strip().lower() in _KNOWN_COUNTRY_CURRENCY else ""
+
+
+
+
+def _derive_brand_and_title(
+    destination: str, trip_type_label: str, year: int, phase_names: "Sequence[str]" = (),
+) -> tuple[str, str]:
     """Derives a short Hero brand ("USA 2026") and a longer title ("USA 2026 —
     Group of Families") from the destination and trip type.
 
@@ -343,8 +516,13 @@ def _derive_brand_and_title(destination: str, trip_type_label: str, year: int) -
     place = _destination_head(destination)
     is_multi_place = bool(_MULTI_PLACE_RE.search(place))
     short_destination = _shorten_phase_name(place, max_length=20)
+    trailing = _destination_country(destination, phase_names)
+    short_trailing = _shorten_phase_name(trailing, max_length=20) if trailing else ""
     if not is_multi_place and short_destination == place and short_destination:
         subject = short_destination
+    elif trailing and short_trailing == trailing:
+        # A list of stops that ends with its country is named by the country.
+        subject = trailing
     else:
         subject = trip_type_label if "trip" in trip_type_label.lower() else f"{trip_type_label} Trip"
     brand = f"{subject} {year}".upper()
@@ -945,6 +1123,7 @@ def _derive_agent(
     data: Mapping[str, Any],
     participants: list[dict[str, Any]],
     dietary_instructions: list[dict[str, Any]],
+    language: str | None = None,
 ) -> dict[str, Any] | None:
     """Builds trip.config.json's `agent` block from the assistant questions.
 
@@ -971,11 +1150,36 @@ def _derive_agent(
         agent["gender"] = gender if gender in _AGENT_GENDERS else "neutral"
         tone = _text_value(data["bot_tone"]) if isinstance(data.get("bot_tone"), Mapping) else ""
         agent["tone"] = tone if tone in _AGENT_TONES else "warm"
-        agent["default_language"] = "en"
+        # The language the interview was actually held in — the same value
+        # meta.defaultLang gets, through the same resolver, so the two halves
+        # of one file cannot disagree.
+        #
+        # This was hardcoded to "en" until 2026-09-20, when a Hebrew interview
+        # produced a config whose meta said `he` and whose companion said `en`.
+        # Nothing failed; the assistant simply answered a Hebrew family in
+        # English, which reads as the product being wrong rather than
+        # misconfigured.
+        agent["default_language"] = _resolve_language(language)
 
-    tz = _text_value(data["timezone"]).strip() if isinstance(data.get("timezone"), Mapping) else ""
+    typed_tz = _text_value(data["timezone"]).strip() if isinstance(data.get("timezone"), Mapping) else ""
+    destination = _text_value(data["destination"]) if isinstance(data.get("destination"), Mapping) else ""
+    # A DERIVED zone must not be the thing that brings an agent block into
+    # existence: an intake that answered none of the assistant questions still
+    # has to produce exactly the config it did before those questions existed
+    # (see this function's contract, and the two tests that assert it). A zone
+    # the organizer TYPED is an answer, so it may.
+    tz = _resolve_timezone(typed_tz, destination) if (typed_tz or agent) else ""
     if tz:
         agent["timezone"] = tz
+    elif typed_tz:
+        # Dropped rather than carried: see _resolve_timezone. Logged because a
+        # destination nobody has mapped yet is the only way to get here, and
+        # that is worth knowing rather than discovering from a briefing that
+        # never arrives.
+        logger.warning(
+            "transformer.timezone_unresolved",
+            extra={"typed": typed_tz, "destination": destination},
+        )
 
     proactive = {
         key: _PROACTIVE_VALUES[key]
@@ -1205,6 +1409,86 @@ def _normalise_venues(raw_venues: Any) -> list[dict[str, Any]]:
         if area:
             venue["area"] = area
         out.append(venue)
+    return out
+
+
+def _open_day_phases(
+    phases: list[dict[str, Any]], departure: str, ret: str,
+) -> list[dict[str, Any]]:
+    """Phases for the days of the trip that no phase covers.
+
+    A DAY OF THE TRIP THAT IS ON NO PHASE MUST NOT BE INVISIBLE. On 2026-09-20
+    an organizer said, in as many words, that ten of their sixteen days were
+    undecided and asked for a proposal. The site showed the six that were
+    decided and nothing at all for the rest — no gap, no note, no sign that
+    nine days existed. The trip simply appeared to be six days long, beside a
+    return flight departing a city no phase mentioned.
+
+    Absent and undecided are different things, and only one of them is true.
+    These phases say the second out loud: the days are real, they belong to the
+    trip, and nothing is planned on them yet.
+
+    `unplanned: true` marks them as the site's own inference rather than
+    something the organizer said, so a later pass — the companion, or the
+    editing surface this is the placeholder for — can replace or shrink one
+    without guessing which phases were authored.
+
+    Contiguous gaps become one phase each: three separate open days in a row
+    are one open stretch, not three tabs.
+    """
+    # A trip with NO phases at all is a different state, not a gap: nobody has
+    # said anything about stops yet, and the site already says so its own way
+    # ("nothing was named, so nothing is served — the companion offers a
+    # draft"). Filling it with one open stretch spanning the whole trip would
+    # be this function answering a question it was not asked.
+    if not phases or not departure or not ret:
+        return []
+    try:
+        first, last = date.fromisoformat(departure[:10]), date.fromisoformat(ret[:10])
+    except ValueError:
+        return []
+    if last < first:
+        return []
+
+    covered: set[date] = set()
+    for phase in phases:
+        dates = phase.get("dates") or {}
+        try:
+            start = date.fromisoformat(str(dates.get("start") or "")[:10])
+            end = date.fromisoformat(str(dates.get("end") or "")[:10])
+        except ValueError:
+            continue
+        day = start
+        while day <= end:
+            covered.add(day)
+            day += timedelta(days=1)
+
+    gaps: list[list[date]] = []
+    day = first
+    while day <= last:
+        if day not in covered:
+            if gaps and gaps[-1][-1] == day - timedelta(days=1):
+                gaps[-1].append(day)
+            else:
+                gaps.append([day])
+        day += timedelta(days=1)
+
+    out: list[dict[str, Any]] = []
+    for index, gap in enumerate(gaps, start=1):
+        suffix = "" if len(gaps) == 1 else f"-{index}"
+        out.append({
+            "id": f"open-days{suffix}",
+            "unplanned": True,
+            "title": {"he": "ימים שעוד לא תוכננו", "en": "Days not planned yet"},
+            "tabLabel": "?",
+            "dates": {"start": gap[0].isoformat(), "end": gap[-1].isoformat()},
+            "note": {
+                "he": f"{len(gap)} ימים בטיול שעוד לא שויכו לתחנה. אפשר לדבר עם "
+                      f"העוזר כדי לשבץ אותם לתחנה קיימת או לפתוח תחנה חדשה.",
+                "en": f"{len(gap)} day(s) of this trip do not belong to a stop yet. "
+                      f"Talk to your assistant to add them to one, or open a new stop.",
+            },
+        })
     return out
 
 
@@ -1453,7 +1737,11 @@ def transform_intake(
 
     departure_date, return_date, total_days = _resolve_dates(data, today)
 
-    brand, title = _derive_brand_and_title(destination, trip_type_label, departure_date.year)
+    brand, title = _derive_brand_and_title(
+        destination, trip_type_label, departure_date.year,
+        [str(ph.get("name") or ph.get("name_en") or "") for ph in _structured_list(data, "phases")
+         if isinstance(ph, Mapping)],
+    )
     departure_iso = datetime(
         departure_date.year, departure_date.month, departure_date.day,
         0, 0, 0, tzinfo=timezone.utc,
@@ -1481,7 +1769,7 @@ def transform_intake(
     # Mutates participants in place to attach needs[], and hands back whatever
     # applies to the whole group for the agent block to carry instead.
     dietary_instructions = _apply_dietary(data, participants)
-    agent = _derive_agent(data, participants, dietary_instructions)
+    agent = _derive_agent(data, participants, dietary_instructions, language)
 
     phases = _derive_phases(_structured_list(data, "phases"))
 
@@ -1498,11 +1786,41 @@ def transform_intake(
         if derived and not phase.get("days"):
             phase["days"] = derived
 
+    # AFTER the real phases are settled, and in trip order. A day of the trip
+    # that belongs to no phase is shown as an open stretch rather than not
+    # shown at all — see _open_day_phases for the run that made this necessary.
+    #
+    # ONLY AGAINST DATES THE ORGANIZER GAVE. `_resolve_dates` falls back to
+    # `today + 90 days` when they did not, and a gap measured against an
+    # invented range invents the days in it: a test fixture with no dates and
+    # phases in September produced a fortnight of "unplanned" days three months
+    # away. A day is missing only if the trip is known to contain it.
+    stated_departure = _parse_iso_date(_text_value(data.get("departure_date", {})))
+    stated_return = _parse_iso_date(_text_value(data.get("return_date", {})))
+    if stated_departure and stated_return:
+        phases = sorted(
+            phases + _open_day_phases(
+                phases, stated_departure.isoformat(), stated_return.isoformat(),
+            ),
+            key=lambda ph: str((ph.get("dates") or {}).get("start") or ""),
+        )
+
     # Only a count, never the organizer's free text — same reasoning as above.
+    #
+    # CONFIRMED means confirmed. This counted every travel_anchor until
+    # 2026-09-20, when a trip with nothing booked told its family on the front
+    # page that four bookings were confirmed — while the map stops rendered
+    # from the same anchors correctly showed `conf: "–"` beside it.
+    #
+    # An anchor is a fixed point in the trip, not evidence of a booking; the
+    # schema's own rule is that a confirmation is what makes it one. With none,
+    # the stat is dropped rather than shown as zero: "0 bookings confirmed" is
+    # a true sentence nobody needs on a hero strip.
     travel_anchors = _structured_list(data, "travel_anchors")
-    if travel_anchors:
+    confirmed = [a for a in travel_anchors if _has_confirmation(a)]
+    if confirmed:
         stats.append({
-            "number": str(len(travel_anchors)),
+            "number": str(len(confirmed)),
             "description": {"en": "booking(s) already confirmed", "he": "הזמנות מאושרות"},
         })
 

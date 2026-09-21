@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import json
 import os
 import secrets
@@ -531,12 +532,25 @@ def stage_content(ctx: dict, scenario: str) -> None:
     venues = [v for p in phases for v in (p.get("venues") or [])]
     day_items = [i for p in phases for d in (p.get("days") or []) for i in (d.get("items") or [])]
     for expected in spec.get("expect_planned", []):
-        needle = expected.lower()
-        in_venues = any(needle in json.dumps(v, ensure_ascii=False).lower() for v in venues)
-        in_days = any(needle in json.dumps(i, ensure_ascii=False).lower() for i in day_items)
-        check(in_venues or in_days,
-              f"place survived to the site: {expected} ({'venue' if in_venues else 'day plan'})",
-              f"{expected!r} was in the document and is on no phase — neither a venue nor a day item")
+        # A string, or several spellings of the same place when the organizer's
+        # language and the site's may differ. The question this asks is "did
+        # the place survive", so ANY spelling of it answers yes — requiring a
+        # particular one turns a content check into a translation check, which
+        # is a different assertion and belongs somewhere else.
+        spellings = [expected] if isinstance(expected, str) else list(expected)
+        found_in = None
+        for spelling in spellings:
+            needle = spelling.lower()
+            if any(needle in json.dumps(v, ensure_ascii=False).lower() for v in venues):
+                found_in = "venue"
+                break
+            if any(needle in json.dumps(i, ensure_ascii=False).lower() for i in day_items):
+                found_in = "day plan"
+                break
+        check(found_in is not None,
+              f"place survived to the site: {spellings[0]} ({found_in})",
+              f"{spellings[0]!r} was in the interview and is on no phase — "
+              f"neither a venue nor a day item (tried: {spellings})")
 
     # Every venue link the site renders must be a real http(s) URL. `maps` and
     # `waze` are derived from the place name, so they are the ones that must
@@ -549,7 +563,136 @@ def stage_content(ctx: dict, scenario: str) -> None:
                       f"{v['id']}.{field} is not a real URL: {url!r}")
     if venues:
         ok(f"{len(venues)} venue(s), links well-formed")
+
+    # A booking reference the organizer gave has to be findable on the site.
+    # This key sat in the fixtures unread until 2026-09-20 — declared like a
+    # check, asserting nothing.
+    #
+    # THE CONFIG IS NOT THE WHOLE SITE. `bookings.json` is served beside it and
+    # is where a booking actually belongs, which is where the return flight of
+    # the vietnam scenario lives: its date falls outside every phase, so no day
+    # item carries it, and a config-only search called it missing when the site
+    # was serving it correctly. Both files count.
+    whole = json.dumps(ctx["config"], ensure_ascii=False)
+    bookings = DEPLOY_ROOT / "trips" / str(ctx.get("slug") or "") / "bookings.json"
+    if bookings.is_file():
+        whole += bookings.read_text(encoding="utf-8")
+    for expected in spec.get("expect_anchor_text", []):
+        check(expected in whole, f"booking reference on the site: {expected}",
+              f"{expected!r} was given in the interview and is nowhere in the config")
+
+    _check_site_expectations(ctx, spec.get("expect_site") or {})
     ctx["planned_places"] = list(spec.get("expect_planned", []))
+
+
+def _check_site_expectations(ctx: dict, expect: dict) -> None:
+    """Facts about the finished site that are not about a named place.
+
+    These come from the 2026-09-20 baseline run, where the site was wrong in
+    ways no place-by-place check could see: it was internally consistent, it
+    just did not say true things. Each one fails loudly on its own line so the
+    report names the defect rather than "content check failed".
+    """
+    if not expect:
+        return
+    config = ctx["config"]
+    agent = config.get("agent") or {}
+    deferred = set(expect.get("deferred") or ())
+
+    def check_or_note(name: str, condition: bool, good: str, bad: str) -> None:
+        """`check`, unless this expectation is a KNOWN gap someone has already
+        triaged. A deferred item still runs — the value of asserting it is that
+        it goes green the day the work lands, and that nobody has to remember
+        it exists — but it reports as a note rather than failing the run."""
+        if condition or name not in deferred:
+            check(condition, good, bad)
+        else:
+            note(f"known gap, deferred: {bad}")
+
+    if expect.get("timezone_is_iana"):
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        tz = str(agent.get("timezone") or "")
+        try:
+            ZoneInfo(tz)
+            valid = True
+        except (ZoneInfoNotFoundError, ValueError):
+            valid = False
+        check(valid, f"agent.timezone is a real zone: {tz}",
+              f"agent.timezone is {tz!r}, which no clock can use — the companion "
+              f"schedules its briefing off this field")
+
+    want_lang = expect.get("agent_language")
+    if want_lang:
+        got = agent.get("default_language")
+        check(got == want_lang,
+              f"the companion speaks the trip's language: {got}",
+              f"the interview ran in {want_lang!r} and meta.defaultLang is "
+              f"{(config.get('meta') or {}).get('defaultLang')!r}, but the companion "
+              f"defaults to {got!r}")
+
+    if "confirmed_bookings" in expect:
+        # Count what the site CLAIMS, against what it can evidence.
+        claimed = 0
+        for stat in config.get("stats") or []:
+            if "confirmed" in str((stat.get("description") or {}).get("en", "")):
+                claimed = int(str(stat.get("number") or 0))
+        placeholders = {"", "-", "\u2013", "\u2014", "none", "n/a"}
+        evidenced = sum(
+            1 for stop in (config.get("map") or {}).get("stops", [])
+            if str(stop.get("conf") or "").strip().lower() not in placeholders
+        )
+        # THE NUMBER, not merely a self-consistent one. Comparing the stat
+        # against the confirmations the site renders was the first version of
+        # this check, and #131 satisfies it while still lying: with flight
+        # numbers written into `confirmation`, claimed and evidenced agree at
+        # 2 on a trip where nothing is booked. A check that a defect can
+        # satisfy is not a check.
+        want = int(expect["confirmed_bookings"])
+        check_or_note("confirmed_bookings", claimed == want,
+              f"the site claims {claimed} confirmed booking(s), which is the truth",
+              f"the site tells the family {claimed} booking(s) are confirmed on a trip with "
+              f"{want}; it renders {evidenced} confirmation(s) of its own")
+
+    if expect.get("days_covered") == "all":
+        meta = config.get("meta") or {}
+        start = str(meta.get("departure") or "")[:10]
+        end = str(meta.get("returnDate") or "")[:10]
+        covered = set()
+        for phase in config.get("phases") or []:
+            dates = phase.get("dates") or {}
+            a, b = str(dates.get("start") or "")[:10], str(dates.get("end") or "")[:10]
+            if a and b:
+                day = dt.date.fromisoformat(a)
+                while day <= dt.date.fromisoformat(b):
+                    covered.add(day.isoformat())
+                    day += dt.timedelta(days=1)
+        missing = []
+        if start and end:
+            day = dt.date.fromisoformat(start)
+            while day <= dt.date.fromisoformat(end):
+                if day.isoformat() not in covered:
+                    missing.append(day.isoformat())
+                day += dt.timedelta(days=1)
+        # The failure text is built only when there IS a failure. Python
+        # evaluates both arguments, so `missing[0]` in the message raised
+        # IndexError the first time this check passed — a latent crash that
+        # only a green run could reach.
+        span = f" ({missing[0]}..{missing[-1]})" if missing else ""
+        check_or_note("days_covered", not missing,
+              f"every day of the trip is on the site ({len(covered)} days)",
+              f"{len(missing)} day(s) of the trip are on no phase at all"
+              f"{span} — the trip shows as shorter than it is")
+        # AND the open ones say they are open. Covering a gap with a phase that
+        # looks authored would satisfy the count above while telling the family
+        # something was planned when nothing was.
+        gaps = [p for p in config.get("phases") or [] if p.get("unplanned")]
+        for gap in gaps:
+            note_text = (gap.get("note") or {}).get("en") or ""
+            check(bool(note_text.strip()),
+                  f"the open stretch {gap['dates']['start']}..{gap['dates']['end']} says it is open",
+                  f"phase {gap.get('id')!r} covers days nobody planned and says nothing about it")
+        if gaps:
+            ok(f"{len(gaps)} open stretch(es), shown rather than dropped")
 
 
 def stage_own_content(ctx: dict) -> None:
@@ -736,8 +879,13 @@ def stage_served(ctx: dict) -> None:
 
     blob = json.dumps(served, ensure_ascii=False).lower()
     for place in ctx.get("planned_places", []):
-        check(place.lower() in blob, f"the site serves a place you named: {place}",
-              f"{place!r} was in the interview, is not in what the site serves")
+        # Same shape as expect_planned: a string, or several spellings of one
+        # place. Any of them answers "is it served" — see stage_content.
+        spellings = [place] if isinstance(place, str) else list(place)
+        check(any(s.lower() in blob for s in spellings),
+              f"the site serves a place you named: {spellings[0]}",
+              f"{spellings[0]!r} was in the interview, is not in what the site "
+              f"serves (tried: {spellings})")
 
     itinerary = site("/api/itinerary/active", token)
     check("days" in itinerary or "items" in itinerary,
@@ -976,6 +1124,7 @@ def stage_documents(ctx: dict, auto: "Auto", work: Path) -> None:
 
 
 TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 2026", "chaos": "Greece 2027",
+              "vietnam": "Vietnam 2028",
               # A placeholder the organizer would have typed on the signup form,
               # deliberately not a destination: naming it would be this script
               # deciding what an `own` run is about. --trip-name replaces it.
@@ -984,7 +1133,7 @@ TRIP_NAMES = {"japan": "Japan 2026", "multi": "Italy 2026", "manual": "Portugal 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", OWN, "all"],
+    ap.add_argument("--scenario", default="multi", choices=["japan", "multi", "manual", "chaos", "vietnam", OWN, "all"],
                     help="a fixture (japan, multi, manual), 'chaos' — an automated organizer who does "
                          "not follow the interview (tools/organizer-chaos.ts), or 'own' — a person's real "
                          "trip, checked against the intake they confirm")

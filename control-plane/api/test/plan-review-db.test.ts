@@ -260,6 +260,28 @@ describe("the post-deploy loop", { skip: SKIP ? "CONTROL_PLANE_TEST_DATABASE_URL
     });
   });
 
+  test("a review still counts when the API host's clock runs behind the database's", async () => {
+    await withDatabase(async (pool) => {
+      const tripId = await seedTrip(pool, { snapshot: CONFIG });
+      const review = await reviewPlan({ config: CONFIG, answers: ANSWERS, destination: "Japan" });
+
+      // The only thing this test changes is the clock the review reports. An
+      // hour is theatre; the real number was single-digit milliseconds, which
+      // is why this failed roughly one run in twenty instead of every time
+      // (#134). `plan_snapshot_at` is written by the worker as Postgres
+      // `now()`, so while `created_at` carried `generatedAt` — the API
+      // process's own wall clock, a different machine in production — the two
+      // sides of `created_at >= plan_snapshot_at` came from two clocks that
+      // drift independently. A review that had just been written could look
+      // older than the snapshot it reviewed, leaving the trip in the queue and
+      // re-reviewing it on every pass, forever.
+      const slowHost = { ...review, generatedAt: new Date(Date.now() - 3_600_000).toISOString() };
+      await savePlanReview(pool, tripId, slowHost, CONFIG);
+
+      assert.deepEqual(await tripsNeedingPlanReview(pool), []);
+    });
+  });
+
   test("a trip with no intake version still gets the findings the config can carry", async () => {
     await withDatabase(async (pool) => {
       // A hand-seeded or imported trip. The arrival and pace rules go quiet;

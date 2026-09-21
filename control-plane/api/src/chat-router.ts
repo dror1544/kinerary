@@ -32,7 +32,7 @@ import {
   type Language,
   unsettledText,
 } from "./intake-copy.js";
-import type { OrganizerTrip } from "./organizer-trips.js";
+import { LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
@@ -337,7 +337,7 @@ export async function resolveChatRoute(db: pg.Pool, chatId: string): Promise<Cha
     // idleness", which is the same idea and always should have been.
     `SELECT id, trip_id
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+     WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
   );
   const [session] = live.rows;

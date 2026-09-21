@@ -1,3 +1,4 @@
+-- rollback: compatible — one new table and its indexes; nothing existing changes shape
 -- Who a Telegram sender IS on a trip — the fact provisioning had and threw away.
 --
 -- Routing was always captured. `telegram_chat_bindings` answers "which

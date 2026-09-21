@@ -7,6 +7,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from control_plane_worker import transformer
 from control_plane_worker.transformer import (
     _names_sound_alike,
     _resolve_organizers,
@@ -1815,3 +1816,248 @@ class NameMatchingContractTests(unittest.TestCase):
                 )
                 expected = [] if case["expect"] is None else [participants[case["expect"]]["username"]]
                 self.assertEqual(resolved, expected)
+
+
+class DestinationTrailingCountryTests(unittest.TestCase):
+    """A trip whose destination ENDS with its country is named by it.
+
+    da66df8 taught the transformer the leading shape, "Portugal — Lisbon and
+    Porto". The interview produces the other one: it normalises a spoken
+    destination into a list of stops with the country last. So a real trip on
+    2026-09-19 stored "Tokyo, Hakone, Kyoto, Osaka, Japan", was read as a plain
+    city list, and was titled "Family Trip 2027" with the country nowhere.
+
+    The phases decide which trailing element is a country, rather than a list
+    of country names — the one this module carries holds fifteen entries and
+    does not include Vietnam, so a list-based check would pass the case that
+    was reported and fail the next one.
+    """
+
+    def title(self, destination, phases):
+        from control_plane_worker.transformer import _derive_brand_and_title
+
+        return _derive_brand_and_title(destination, "Family", 2028, phases)[1]
+
+    def test_a_stop_list_ending_in_its_country_is_named_by_the_country(self):
+        self.assertEqual(
+            "Japan 2028 — Family",
+            self.title("Tokyo, Hakone, Kyoto, Osaka, Japan", ["Tokyo", "Hakone", "Kyoto", "Osaka"]),
+        )
+
+    def test_it_does_not_depend_on_the_country_being_in_any_list(self):
+        # Vietnam is absent from _KNOWN_COUNTRY_CURRENCY on purpose here.
+        self.assertEqual(
+            "Vietnam 2028 — Family",
+            self.title("Hanoi, Ha Long, Hoi An, Saigon, Vietnam", ["Hanoi", "Ha Long", "Hoi An", "Saigon"]),
+        )
+
+    def test_a_city_list_with_no_country_still_falls_back(self):
+        # Every element is a phase, so nothing trails as a country. Naming this
+        # trip "Venice" would be worse than the generic fallback.
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence, Venice", ["Rome", "Florence", "Venice"]),
+        )
+
+    def test_the_leading_country_shape_is_unchanged(self):
+        self.assertEqual(
+            "Portugal 2028 — Family",
+            self.title("Portugal — Lisbon and Porto", ["Lisbon", "Porto"]),
+        )
+
+    def test_matching_ignores_case_and_surrounding_space(self):
+        self.assertEqual(
+            "Family Trip 2028 — Family",
+            self.title("Rome, Florence,  VENICE ", ["rome", "florence", "venice"]),
+        )
+
+    def test_no_phases_still_names_a_recognised_trailing_country(self):
+        self.assertEqual("Japan 2028 — Family", self.title("Tokyo, Kyoto, Japan", []))
+
+    def test_an_unrecognised_trailing_place_falls_back_rather_than_guessing(self):
+        # The guard that matters. An earlier attempt treated "not one of the
+        # phases" as proof of a country, and named trips OSAKA 2026 and
+        # PORTO 2026 the moment the phases did not list every city mentioned.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Kyoto and Osaka", ["Tokyo"]))
+        self.assertEqual("Family Trip 2028 — Family", self.title("Lisbon and Porto", []))
+
+    def test_a_phase_named_like_a_country_is_still_not_the_country(self):
+        # Japan as a STOP rather than the trailing country: the phase check
+        # rules it out before the country list would wave it through.
+        self.assertEqual("Family Trip 2028 — Family", self.title("Tokyo, Japan", ["Tokyo", "Japan"]))
+
+
+class TripClockAndLanguage(unittest.TestCase):
+    """The two `agent` fields that described a trip other than the one they
+    were built from, until 2026-09-20."""
+
+    def test_a_typed_zone_that_is_a_zone_is_kept(self):
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("Asia/Tokyo", "Japan"))
+
+    def test_a_country_name_typed_as_a_zone_is_replaced_by_the_real_one(self):
+        # What an organizer actually typed when asked for a timezone. It
+        # reached the config as `agent.timezone` and left a 07:30 briefing
+        # scheduled in a zone no clock resolves.
+        self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("Vietnam", "Vietnam"))
+
+    def test_the_zone_is_derived_when_nothing_was_typed(self):
+        self.assertEqual("Europe/Lisbon", transformer._resolve_timezone("", "Portugal — Lisbon and Porto"))
+        self.assertEqual("Asia/Tokyo", transformer._resolve_timezone("", "Tokyo, Japan"))
+
+    def test_a_destination_written_in_hebrew_resolves_the_same_as_english(self):
+        # The normal case for a Hebrew interview, and it silently lost BOTH
+        # facts: on 2026-09-20 one run stored "Vietnam" and the next stored
+        # "וייטנאם", and the Hebrew one produced no timezone and a null
+        # travel_info — so the site's currency card and conversion feature were
+        # simply absent, with nothing saying so.
+        for written in ("וייטנאם", "ויאטנם"):
+            with self.subTest(written):
+                self.assertEqual("Asia/Ho_Chi_Minh", transformer._resolve_timezone("", written))
+                self.assertEqual("VND", transformer._lookup_known_currency(written)["code"])
+
+    def test_the_currency_and_the_zone_resolve_together_or_not_at_all(self):
+        # They answer two questions about one place through one key list, so a
+        # destination cannot resolve for one and not the other.
+        for written in ("יפן", "Japan", "Tokyo, Japan", "Portugal — Lisbon and Porto"):
+            with self.subTest(written):
+                self.assertTrue(transformer._resolve_timezone("", written))
+                self.assertIsNotNone(transformer._lookup_known_currency(written))
+
+    def test_an_unmappable_destination_yields_nothing_rather_than_the_text(self):
+        # Absent is a gap something can notice. "Narnia" sitting in a field
+        # read as a zone looks answered and is not.
+        self.assertEqual("", transformer._resolve_timezone("Narnia", "Narnia"))
+
+    def test_a_derived_zone_alone_does_not_invent_an_agent_block(self):
+        # An intake that answered none of the assistant questions must produce
+        # exactly the config it did before those questions existed.
+        agent = transformer._derive_agent({"destination": {"kind": "text", "text": "Japan"}}, [], [])
+        self.assertIsNone(agent)
+
+    def test_the_companion_speaks_the_language_the_interview_was_held_in(self):
+        data = {
+            "bot_name": {"kind": "text", "text": "פאם"},
+            "destination": {"kind": "text", "text": "Vietnam"},
+        }
+        agent = transformer._derive_agent(data, [], [], "he")
+        self.assertEqual("he", agent["default_language"])
+        self.assertEqual("Asia/Ho_Chi_Minh", agent["timezone"])
+
+    def test_an_unknown_interview_language_still_falls_back_to_english(self):
+        data = {"bot_name": {"kind": "text", "text": "Sol"}}
+        self.assertEqual("en", transformer._derive_agent(data, [], [], "kl")["default_language"])
+
+
+class DaysOnNoPhaseAreShown(unittest.TestCase):
+    """A day of the trip that no phase covers must not be invisible.
+
+    On 2026-09-20 an organizer said ten of their sixteen days were undecided
+    and asked for a proposal. The site showed the six that were decided and
+    nothing at all for the rest — the trip simply appeared to be six days long,
+    beside a return flight leaving a city no phase mentioned. Absent and
+    undecided are different things and only one of them was true.
+    """
+
+    def _intake(self, phases, departure="2028-03-05", ret="2028-03-20"):
+        return {
+            **JAPAN_INTAKE,
+            "destination": {"kind": "text", "schema_version": 3, "text": "Vietnam"},
+            "departure_date": {"kind": "text", "schema_version": 3, "text": departure},
+            "return_date": {"kind": "text", "schema_version": 3, "text": ret},
+            "phases": _structured(phases),
+        }
+
+    def _build(self, phases, **kw):
+        return transformer.transform_intake(self._intake(phases, **kw))["phases"]
+
+    def test_the_days_after_the_last_phase_are_shown_as_open(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"},
+            {"name": "Ha Long", "start": "2028-03-09", "end": "2028-03-11"},
+        ])
+        open_phases = [p for p in built if p.get("unplanned")]
+        self.assertEqual(1, len(open_phases))
+        self.assertEqual({"start": "2028-03-12", "end": "2028-03-20"}, open_phases[0]["dates"])
+        self.assertIn("9", open_phases[0]["note"]["en"])
+
+    def test_every_day_of_the_trip_belongs_to_some_phase_once_they_are_added(self):
+        # The property the site needs: no day of a stated trip is missing.
+        import datetime as dt
+        built = self._build([{"name": "Hanoi", "start": "2028-03-07", "end": "2028-03-09"}])
+        covered = set()
+        for phase in built:
+            a = dt.date.fromisoformat(phase["dates"]["start"])
+            b = dt.date.fromisoformat(phase["dates"]["end"])
+            while a <= b:
+                covered.add(a)
+                a += dt.timedelta(days=1)
+        day, last = dt.date(2028, 3, 5), dt.date(2028, 3, 20)
+        while day <= last:
+            self.assertIn(day, covered, f"{day} is on no phase")
+            day += dt.timedelta(days=1)
+
+    def test_a_gap_in_the_middle_and_one_at_the_end_are_separate_stretches(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-14"},
+        ])
+        gaps = [p["dates"] for p in built if p.get("unplanned")]
+        self.assertEqual(
+            [{"start": "2028-03-08", "end": "2028-03-11"},
+             {"start": "2028-03-15", "end": "2028-03-20"}],
+            gaps,
+        )
+
+    def test_a_fully_covered_trip_gains_nothing(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-20"}])
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_open_stretches_sit_in_trip_order_between_the_phases(self):
+        built = self._build([
+            {"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-07"},
+            {"name": "Hue", "start": "2028-03-12", "end": "2028-03-20"},
+        ])
+        self.assertEqual(["hanoi", "open-days", "hue"], [p["id"] for p in built])
+
+    def test_a_trip_with_no_phases_at_all_gains_none(self):
+        # A different state, not a gap: nobody has said anything about stops,
+        # and the site already says so its own way.
+        self.assertEqual([], self._build([]))
+
+    def test_dates_the_organizer_never_gave_produce_no_gaps(self):
+        # `_resolve_dates` falls back to today+90; a gap measured against an
+        # invented range invents the days in it.
+        intake = self._intake([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        del intake["departure_date"]
+        del intake["return_date"]
+        built = transformer.transform_intake(intake)["phases"]
+        self.assertEqual([], [p for p in built if p.get("unplanned")])
+
+    def test_an_open_stretch_says_how_to_resolve_it(self):
+        built = self._build([{"name": "Hanoi", "start": "2028-03-05", "end": "2028-03-09"}])
+        note = [p for p in built if p.get("unplanned")][0]["note"]
+        for side in ("he", "en"):
+            self.assertTrue(note[side].strip(), f"{side} side is empty")
+        self.assertIn("assistant", note["en"], "it must say where the organizer can fix it")
+
+
+class ConfirmedBookingsAreConfirmed(unittest.TestCase):
+    """A travel_anchor is a fixed point in the trip, not evidence of a booking.
+
+    Counting every anchor told one family on their front page that four
+    bookings were confirmed on a trip where nothing was booked — beside map
+    stops rendered from the same anchors correctly showing no confirmation.
+    """
+
+    def test_an_anchor_with_a_confirmation_counts(self):
+        self.assertTrue(transformer._has_confirmation({"confirmation": "PH-88213"}))
+
+    def test_an_anchor_without_one_does_not(self):
+        self.assertFalse(transformer._has_confirmation({"type": "flight", "name": "VN572"}))
+
+    def test_a_placeholder_is_not_a_confirmation(self):
+        # The site renders "–" for a missing confirmation; the count must not
+        # read the same value as evidence.
+        for placeholder in ("–", "-", "  ", "n/a", "TBD", "none"):
+            with self.subTest(placeholder):
+                self.assertFalse(transformer._has_confirmation({"confirmation": placeholder}))

@@ -18,4 +18,17 @@ if [ -x scripts/preflight-checks.sh ]; then
   fi
 fi
 
+# Which roles this session loaded. They are read once, at start; a change on
+# disk afterwards runs silently as the OLD text (dry run 2026-09-20, M4).
+if [ -d .claude/agents ]; then
+  roles="$(git log -1 --format=%h -- .claude/agents 2>/dev/null)"
+  dirty="$(git status --short -- .claude/agents 2>/dev/null | wc -l | tr -d ' ')"
+  [ -n "$roles" ] && line="$line Roles as of $roles$([ "${dirty:-0}" != "0" ] && printf ' (+%s uncommitted)' "$dirty"); restart the session if .claude/agents changes."
+fi
+
+# Which sprint, which locks, which baseline — from the file, not from memory.
+if [ -f .project/sprint.json ] && [ -f scripts/project-state.py ]; then
+  state="$(python3 scripts/project-state.py show --line 2>/dev/null)" && [ -n "$state" ] && line="$line $state"
+fi
+
 jq -cn --arg c "$line" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'

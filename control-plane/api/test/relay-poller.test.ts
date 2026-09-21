@@ -331,6 +331,46 @@ describe("the itinerary a document describes", () => {
     });
   });
 
+  test("venues still owed a URL are parked, not dropped", { skip: SKIP }, async () => {
+    // The MCP tool has always parked these; this path computed the same list
+    // and discarded it. Since the agentless path is the default, no venue was
+    // ever owed a link, the background drain had nothing to retry, and
+    // enrich_config's back-fill correctly found nothing to fill (#113).
+    await withFixture(async (fix) => {
+      const chatId = "700100311";
+      await beginInterview(fix, chatId);
+      await submitAnswerForChat(fix.pool, chatId, "destination", "Japan");
+      await submitAnswerForChat(fix.pool, chatId, "phases", null, undefined, [
+        { name: "Tokyo", start: "2026-09-19", end: "2026-09-21" },
+      ]);
+
+      await foldItineraryFromDocument(
+        {
+          db: fix.pool, telegram: fix.telegram, connector: fix.connector,
+          extractItinerary: async () => ({
+            ok: true,
+            warnings: [],
+            venueLinksDeferred: ["Tokyo Skytree", "TeamLab Planets"],
+            phases: [{ name: "Tokyo", phaseIndex: 0, days: [dayOn("2026-09-19")], venues: [] }],
+          }),
+        },
+        { chatId, sessionId: "sess_test" },
+        "Day 1: Skytree, then TeamLab Planets.",
+        () => {},
+      );
+
+      const parked = await fix.pool.query<{ venue_name: string; url: string | null; source: string }>(
+        "SELECT venue_name, url, source FROM control_plane.venue_links WHERE destination = $1 ORDER BY venue_name",
+        ["japan"],
+      );
+      assert.deepEqual(parked.rows.map((r) => r.venue_name).sort(), ["teamlab planets", "tokyo skytree"]);
+      for (const row of parked.rows) {
+        assert.equal(row.url, null, "parked rows carry no URL yet — the drain fills them");
+        assert.equal(row.source, "deferred");
+      }
+    });
+  });
+
   test("a phase that already has an itinerary is left alone", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const chatId = "700100302";

@@ -257,6 +257,47 @@ function readsExpectsReply(metadata: unknown): boolean {
   );
 }
 
+/** Whether the gateway said ANYTHING about this field, either way. */
+function statesExpectsReply(metadata: unknown): boolean {
+  return (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    "expects_reply" in (metadata as Record<string, unknown>)
+  );
+}
+
+/**
+ * Does this message end by asking something?
+ *
+ * INTERIM, and narrow on purpose. The contract puts the judgement on the agent
+ * — it knows whether it wants an answer — and that half is a cross-repo change
+ * that has not landed (#122). Until it does, `expects_reply` is never set by
+ * anyone, so the window never opens, so an untagged answer to the assistant's
+ * own question is dropped: it asks a family a question in their group and
+ * cannot hear the reply unless somebody repeats its name. Reported live,
+ * 2026-09-20.
+ *
+ * A gateway that DOES state the field always wins, in both directions — this
+ * only fills a silence, and disappears on its own the day the other half
+ * lands.
+ *
+ * The test is deliberately the strongest available signal rather than the most
+ * general one: the message's last non-space character is a question mark, in
+ * any of the scripts this product speaks. A false positive costs exactly one
+ * unwanted reply, because the window is one-shot and expires in 150s — but a
+ * loose rule would make a chatty assistant capture the family's next sentence
+ * every time, which is the behaviour addressing.ts exists to prevent.
+ */
+function looksLikeAQuestion(content: string): boolean {
+  const trimmed = content.trimEnd();
+  if (!trimmed) return false;
+  // "?" Latin/Hebrew, "؟" Arabic, "？" full-width. Hebrew writes "?" but the
+  // sentence runs right-to-left, so a trailing marker may sit after an
+  // invisible direction mark.
+  const last = trimmed.replace(/[\u200e\u200f\u202a-\u202e"'\u201d\u2019)\]]+$/u, "").slice(-1);
+  return last === "?" || last === "\u061f" || last === "\uff1f";
+}
+
 /**
  * Narrows a decoded frame to a known outbound action.
  *
@@ -280,7 +321,9 @@ export function parseOutboundAction(raw: unknown): OutboundAction | null {
             chat_id: chatId,
             content: action.content,
             reply_to: typeof action.reply_to === "string" ? action.reply_to : undefined,
-            expectsReply: readsExpectsReply(action.metadata),
+            expectsReply: statesExpectsReply(action.metadata)
+              ? readsExpectsReply(action.metadata)
+              : looksLikeAQuestion(action.content),
           }
         : null;
     case "edit":

@@ -205,6 +205,53 @@ describe("/trips (DB)", { skip: SKIP }, () => {
     });
   });
 
+  test("never lists a trip that was torn down", async () => {
+    // Membership alone was the filter until 2026-09-20, when 39 of 40
+    // `ready_private` rows on a staging database were torn-down trips and the
+    // list was unusable. There is deliberately nothing on the trip row to test
+    // — teardown leaves `lifecycle_state` exactly as it was — so the markers
+    // are the two it does write.
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      await pool.query(
+        "UPDATE control_plane.trips SET slug = 'retired-italy-2026-20260920' WHERE id = $1",
+        [italyId],
+      );
+      const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.deepEqual(trips.map((t) => t.tripId), [japanId], "the retired slug is gone");
+    });
+  });
+
+  test("a trip whose every binding was closed as destroyed is gone too", async () => {
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      await pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile, closed_at, closed_reason)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, 'italy-companion', now(), 'trip_destroyed')`,
+        [OTHER_CHAT, italyId],
+      );
+      const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.deepEqual(trips.map((t) => t.tripId), [japanId]);
+    });
+  });
+
+  test("a trip that never had a companion is REVIVABLE and stays listed", async () => {
+    // The distinction the rule turns on. A binding with no `hermes_profile` is
+    // migration 0043's normal state, and the provisioner's
+    // `attach_profile_to_orphan_bindings` fills it on the next run. Hiding
+    // those would strand an organizer with a trip they can never reach.
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      await pool.query(
+        `INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile)
+         VALUES ('tcb_' || md5(random()::text), $1, $2, NULL)`,
+        [OTHER_CHAT, italyId],
+      );
+      const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.equal(trips.some((t) => t.tripId === italyId), true);
+      assert.equal(trips.find((t) => t.tripId === italyId)?.hasCompanion, false,
+        "listed, and reported as having no companion yet");
+      assert.equal(trips.some((t) => t.tripId === japanId), true);
+    });
+  });
+
   test("never lists a trip belonging to somebody else", async () => {
     await withFixture(async ({ pool, strangerTripId }) => {
       const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
@@ -370,6 +417,31 @@ describe("/switch (DB)", { skip: SKIP }, () => {
         { kind: "refused", reason: "IN_INTERVIEW" },
       );
       assert.equal(await openBinding(pool, ORGANIZER_CHAT), japanId);
+    });
+  });
+
+  test("an interview closed for idleness does NOT refuse the switch", async () => {
+    // The divergence this pair exists to prevent. `resolveChatRoute` calls a
+    // session live on `state <> 'confirmed' AND expired_at IS NULL`; this
+    // function restated the first half and dropped the second. An interview
+    // closed for idleness therefore stopped routing the chat — correctly — and
+    // went on blocking every switch in it, permanently, while a companion
+    // answered in the same chat. Nothing clears it: teardown's own cleanup
+    // expires sessions, it does not confirm them. Found live 2026-09-20.
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      await bind(pool, ORGANIZER_CHAT, japanId, "japan2026");
+      const { rows } = await pool.query<{ user_id: string }>(
+        "SELECT user_id FROM control_plane.trip_memberships WHERE trip_id = $1", [italyId]);
+      const enrollmentId = await consumedEnrollment(pool, italyId, rows[0]?.user_id ?? "");
+      await pool.query(
+        `INSERT INTO control_plane.intake_sessions(id, trip_id, user_id, enrollment_id, session_token_digest, state, answers, telegram_chat_id, expired_at)
+         VALUES ($1,$2,$3,$4,$5,'interviewing','{}'::jsonb,$6, now())`,
+        [testId("sess"), italyId, rows[0]?.user_id, enrollmentId, `sha256:${"b".repeat(64)}`, ORGANIZER_CHAT],
+      );
+
+      const outcome = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, italyId);
+      assert.equal(outcome.kind, "switched", `expected a switch, got ${JSON.stringify(outcome)}`);
+      assert.equal(await openBinding(pool, ORGANIZER_CHAT), italyId);
     });
   });
 

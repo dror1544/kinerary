@@ -119,6 +119,66 @@ const SCENARIOS: Record<string, Scenario> = {
     choice: { trip_type: "family", bot_gender: "female", bot_tone: "playful", trip_pace: "balanced", dietary_visibility: "group" },
     multi: { dietary: ["vegetarian", "nut_allergy"] },
   },
+  // Scenario 5 — Dror's own baseline run, 2026-09-20, replayed verbatim.
+  //
+  // The others all describe a trip that is ALREADY DECIDED: every phase has a
+  // city and a pair of dates, so the interview only has to write down what it
+  // is told. This one does not, and that is the whole reason it exists. Half
+  // the trip is planned and half is explicitly open, the organizer says so in
+  // as many words and asks for a proposal, and one dietary need belongs to one
+  // traveller and not the rest.
+  //
+  // Answers are the ones that actually reached `intake_sessions.answers` on
+  // that run, in the phrasings that produced them — `timezone` included. It
+  // reads "Vietnam", which is not a timezone, because that is what an organizer
+  // typed when asked; the fixture keeps it so the SITE is what has to end up
+  // with a real zone. Normalising it here would test the fixture instead.
+  vietnam: {
+    language: "he",
+    documents: false,
+    text: {
+      destination: "וייטנאם",
+      // The phrasing the organizer actually gave, and the one that was stored.
+      //
+      // Their first answer was "בתחילת מרץ" — early March — and the exact date
+      // came only when the interview asked again. A scenario answers each
+      // question once, so it cannot replay a two-turn exchange; and the vague
+      // form is not a gate-worthy input anyway. It was tried: one run resolved
+      // it to 2028-03-01 (wrong — the trip starts on the 5th) and the next
+      // returned `unclear`, on identical input. A required field whose value
+      // depends on model whim cannot decide whether a build is green.
+      //
+      // Loose date PARSING belongs in a test that asserts parsing. What this
+      // scenario still carries is the other real shape: a return date written
+      // in English in the middle of a Hebrew interview.
+      departure_date: "5.3.28",
+      return_date: "until March 20",
+      travelers: "דרור אלול, שירן אלול, נועם אלול, יעל אלול ומשה אלול",
+      // SIX of sixteen days. The rest is the next answer's problem, on purpose.
+      // The flights and the show are in the run's own travel_anchors, so the
+      // organizer gave them; which turn they were typed in is not recorded, so
+      // they ride with the phases answer here. Note the return leg departs
+      // SAIGON — the trip's own anchors prove a city no phase covers.
+      phases:
+        "האנוי 5-9 במרץ, ואז הא לונג 9-11 במרץ. " +
+        "טיסה VN572 מתל אביב להאנוי ב-5 במרץ ב-06:40, " +
+        "וחזרה VN571 מסייגון לתל אביב ב-20 במרץ ב-23:15. " +
+        "הזמנתי הצגה בתיאטרון בובות המים תאנג לונג ב-6 במרץ ב-18:00.",
+      planning_help: "עשרה ימים בהוי אן וסייגון - לא הוחלט איך לחלק, מבקש הצעת חלוקה",
+      bot_name: "פאם",
+      organizer_identity: "דרור אלול",
+      dietary_scope: "רק נועם צמחוני",
+      timezone: "Vietnam",
+    },
+    choice: {
+      trip_type: "family",
+      bot_gender: "female",
+      bot_tone: "warm",
+      trip_pace: "balanced",
+      dietary_visibility: "group",
+    },
+    multi: { dietary: ["vegetarian"], bot_proactive: ["morning_briefing"] },
+  },
   manual: {
     language: "en",
     documents: false,

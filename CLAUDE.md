@@ -348,9 +348,18 @@ Change the VM's version **only** with `sudo kinerary-cp-release upgrade|rollback
 (always `--dry-run` first) — never by hand-editing `KINERARY_REV`. It snapshots
 the VM from the Proxmox host (never vzdump, never NFS), dumps the database, and
 records the way back; the `trip-monitor` agent can request the same through a
-gate only Dror's one-time code approves. Every new migration must start with
-`-- rollback: compatible|breaking — <why>`. Runbook: "Upgrades and rollback" in
+gate only Dror's one-time code approves. Runbook: "Upgrades and rollback" in
 `docs/control-plane-vm-deployment.md`.
+
+**Migrations: `docs/migrations.md`, and preflight check B7 enforces it.** Two
+rules bite hardest. A new migration is named `YYYYMMDDHHMMSS_description.sql`,
+never a hand-allocated number — `0054` existed three ways at once on
+2026-09-19, after the repo had already renumbered twice to escape the same
+thing. And it must start with `-- rollback: compatible|breaking — <why>`,
+because absent is not neutral: `vm-release.py` reads a missing header as
+`breaking` and a rollback then *discards the database* instead of keeping it.
+Legacy `00xx_` names are grandfathered permanently — the version is the whole
+filename, so renaming an applied migration makes production run it again.
 
 ### A Mac-provisioned companion that cannot read its own trip
 
@@ -442,12 +451,27 @@ Every rule in "Hard Rules" above is now checked by
 
 - **`.githooks/pre-commit`** — every commit, whoever makes it (Codex, Hermes,
   a plain `git commit`). Enable once per clone: `git config core.hooksPath .githooks`.
+- **`.githooks/pre-merge-commit`** — the same checks on the path that skips
+  them. `git merge` does **not** run `pre-commit`; git fires this instead. Until
+  2026-09-19 only the former existed, so every blocking rule had a hole shaped
+  like an integration branch — work is written on a feature branch and arrives
+  by merge, and a merge can also carry content committed nowhere else: conflict
+  resolution.
 - **`.claude/settings.json` hooks** — Claude Code, early enough to steer rather
   than refuse. `git commit` and deploy verbs additionally become a *prompt*
   every time, because rules 1 and 2 are about intent and no script can check
   intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.
+  Since 2026-09-20 the same prompt covers the routes that create commits
+  without the word: `git merge`, `cherry-pick`, `revert`, `rebase`, `am` and
+  `gh pr merge` (all classified `none` until then — an integrator agent could
+  have landed work on the integration branch unprompted), and `git push`. A
+  tool call carrying an `agent_type` — any subagent — is **refused** rather
+  than asked, for all of these and for deploy verbs: no agent can commit or
+  deploy, so it hands back the change, the verifier report and a proposed
+  commit message, and the lead session runs the command after the person
+  approves. `merge-tree`, `merge-base`, `--abort` and `gh pr view` stay silent.
 
 ```bash
 scripts/preflight-checks.sh --staged   # what the commit hook runs
@@ -455,8 +479,9 @@ scripts/preflight-checks.sh --all      # audit the whole tree
 ```
 
 Blocking: binaries (rule 3), writes to `trip/` (rule 4), **code that names this
-deployment (rule 6)**, a broken create-trip symlink, a date-shifted trip, and
-repo↔Hermes-profile drift. Reviewed exceptions live in `.preflight-allow` — an
+deployment (rule 6)**, a broken create-trip symlink, a date-shifted trip,
+repo↔Hermes-profile drift, a `.project/sprint.json` that disagrees with the
+tree (B8), and a Codex agent mirror that differs from its source (B9). Reviewed exceptions live in `.preflight-allow` — an
 entry there is a recorded decision with a reason, not a silent exemption.
 
 Rule 6's check is scoped to **code, not prose, and not tests**: a runbook that
@@ -482,6 +507,38 @@ this house.
 there instead. Profile skills with **no** repo copy are warned about, not
 blocked — that is a capture backlog, not a reason nobody can commit.
 
+## Sprint and baseline state — `.project/sprint.json`
+
+Which sprint is active and what its locked scope is, which commit its baseline
+is, and whether the sprint or the baseline is **locked** — one machine-readable
+file, printed to every session at start (`sessionstart.sh`) and checked on
+every commit (preflight B8). Until 2026-09-20 both locks lived in a memory file
+and in Dror's head, and a fresh session could not tell whether
+`integration/sprint-6` was ready to leave or whether the baseline it was about
+to build on was still moving. `.project/README.md` has the full contract.
+
+```bash
+scripts/project-state.py show            # the state, for a person
+scripts/project-state.py show --json     # the state, for an agent
+scripts/project-state.py check           # consistent with the tree? exit 1 says why
+```
+
+- **Sprint lock `locked`**: the integration branch is not to be assessed,
+  deployed or merged to `main`. **Baseline lock `open`**: the baseline is still
+  being prepared and the agent team (`docs/agent-team-plan.md`) does not
+  start; `locked`: it is the commit sprint work builds on.
+- **Change it only through the script.** The Write hook refuses a hand edit,
+  because a hand edit carries no who, when or why:
+  ```bash
+  scripts/project-state.py lock baseline --by "Dror" --reason "baseline fixes landed and verified"
+  scripts/project-state.py unlock sprint --by "Dror" --reason "ready to assess and merge"
+  ```
+- **What needs an override:** moving the baseline commit while the baseline is
+  locked, or changing the sprint while the sprint is locked. Both refuse
+  without `--override`, and an override is recorded in `history`. The change is
+  then a commit — hard rule 1 makes it a human approval, and the commit prompt
+  names every lock, baseline and override change in it.
+
 ## Agents and run tooling
 
 Subagents in `.claude/agents/` — none can commit or deploy:
@@ -489,11 +546,41 @@ Subagents in `.claude/agents/` — none can commit or deploy:
 | Agent | For |
 |---|---|
 | `verifier` | Works out which suites a change touches, runs them, reports real output. Has no Write/Edit on purpose. |
-| `pr-steward` | Branch/PR sweep and doc drift. Deletes only provably-merged branches, only on confirmation. |
+| `pr-steward` | Branch/PR sweep. Deletes only provably-merged branches, only on confirmation. Doc drift moved to `doc-keeper` (2026-09-20). |
 | `sprint-scribe` | Marks plan items `— BUILT (date)` and moves ledger rows. Surfaces unowned gaps as decisions. |
 | `run-capture` | Raw live-run notes → triaged ledger rows routed to the owning sprint. |
 | `boundary-reviewer` | The three invariants under "Security-sensitive paths", with live request/response evidence. |
 | `regression-planner` | Costed regression plan for a change set: blast radius on live trips, migration and compatibility breaks, what to batch onto one run and what must be tested alone. Plans; never runs the deploy. |
+| `developer` | One briefed task in its own worktree: test first, suites run, `verifier` report attached, handed back ready to commit. Never commits. |
+| `integrator` | One merge decision at a time for the integration branch: merge-tree, same-intent check, resolution on a throwaway branch, verifier, carry-forward. Never merges. |
+| `doc-keeper` | Every decision gets a home before the commit; drift swept after merges. Proposes CLAUDE.md diffs, never applies them. |
+| `consult` | One judgment call for a Sonnet role, answered from the evidence with its reasoning. Read-only: no Bash, no Write, because the first consult with a full tool surface wrote a probe into the live-served worktree and staged it (#135). |
+
+The last three are the agent team of `docs/agent-team-plan.md` (2026-09-20),
+which also says which model each role runs and why: Opus for judgment calls,
+Sonnet for everyday work, declared per file. Its queue is GitHub issues:
+`sprint-N`, `track:N`, `size:S|M|L`, `blocked`, `agent:ready`,
+`agent:in-progress`, and a milestone per sprint.
+
+**Roles load once per session, from the checkout it starts in.** A role
+absent from that checkout is not spawnable, and a role that changes on disk
+afterwards keeps running its old text silently — the dry run's session had
+loaded a `pr-steward` that still owned the doc sweep and still had Edit. Start
+a team session from a checkout of the integration branch after the roles it
+needs are committed there, and restart it after any role changes; the
+session-start line prints `roles as of <commit>` so the transcript says which
+version loaded. And an `isolation: worktree` spawn branches from wherever
+`worktree.baseRef` says — the default `fresh` is `origin/main`, which is where
+every dry-run spawn landed; `.claude/settings.json` sets `head` so a spawn
+starts on the session's branch. A developer's first act is still to move its
+fresh worktree onto the brief's base commit and prove it, and a failed check
+blocks rather than becoming a note.
+
+`.codex/agents/*.toml` are **generated** from these files by
+`scripts/sync-codex-agents.py`, and preflight B9 blocks a commit while any
+mirror differs from its source or is staged without it. Codex works the same
+issue queue as Claude does (`docs/agent-team-plan.md`), so the two sides have
+to describe the same role — never edit a `.toml` by hand.
 
 `sprint-scribe` and `run-capture` must never record human approval, and must
 never guess which sprint owns an item — see the standing instruction at the top

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { normalizeIdentity, resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
@@ -185,6 +186,16 @@ export interface IntakeQuestion {
    * — the mechanism already generalizes; only the check itself is per-question.
    */
   checkComplete?: (data: unknown) => string | null;
+  /**
+   * A deterministic correction applied to a STRUCTURED answer before it is
+   * stored, whatever produced it.
+   *
+   * For rules that are decidable in code. A model may propose the value — it
+   * is good at spotting that "VN572" is in the sentence — but where the rule
+   * for what that value MEANS is written down, code decides, rather than the
+   * test suite sampling model variance more often.
+   */
+  sanitize?: (data: unknown) => unknown;
   /**
    * Marks this question safe for the router to ask entirely on its own —
    * no agent nomination, no agent judgment, asked the moment it is next and
@@ -556,6 +567,9 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // an optional HH:MM `time` puts a booked visit at its hour.
     dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
+    // A flight number is not a confirmation, and that is a rule, not a
+    // judgement — see withoutFlightNumbersAsConfirmations (#131).
+    sanitize: withoutFlightNumbersAsConfirmations,
   },
   {
     id: "constraints",
@@ -837,6 +851,85 @@ export type AnswerValidationResult =
       detail?: string;
     };
 
+/**
+ * Is this string a flight designator — `VN572`, `LY381`, `BA1A`, `U26301`?
+ *
+ * IATA form: a two-character airline code (at least one letter, so `U2` and
+ * `9W` count), one to four digits, and an optional operational suffix letter.
+ * ICAO form: three letters, one to four digits. Separators and case are noise.
+ *
+ * A designator names a SERVICE, not a reservation. Every passenger on that
+ * aircraft carries the same one, and it is printed on a timetable long before
+ * anyone buys a seat — so it is never, on its own, evidence of a booking.
+ */
+export function isFlightDesignator(value: string): boolean {
+  const cleaned = value.replace(/[\s\-_.]/g, "").toUpperCase();
+  if (!cleaned) return false;
+  // The lookahead is what stops a bare number matching: an airline code may
+  // carry a digit ("U2", "9W") but never two, so one of the first two
+  // characters is always a letter. Without it `12345` read as a designator.
+  return /^(?=.{0,1}[A-Z])[A-Z0-9]{2}\d{1,4}[A-Z]?$/.test(cleaned)
+    || /^[A-Z]{3}\d{1,4}[A-Z]?$/.test(cleaned);
+}
+
+/**
+ * Keeps a flight number out of a booking's `confirmation`.
+ *
+ * `travel_anchors` means "already booked", and the field that makes it mean
+ * that is the confirmation — the fixtures say so: *"evidence of booking is a
+ * confirmation number"*. On 2026-09-20 the interpreter filled it with the
+ * flight number instead, from an organizer who had booked nothing and said so:
+ *
+ *     { "name": "VN572 תל אביב-האנוי", "confirmation": "VN572" }
+ *
+ * The site then told the family two bookings were confirmed. The count that
+ * reported it was already correct (#124) and was being fed this; sampling more
+ * e2e runs would only have measured how often a model gets it wrong. Dror,
+ * 2026-09-20: *"flight number should not remain a model judgement … code
+ * should be authoritative."*
+ *
+ * DELIBERATELY NARROW, because the cost of a false positive is deleting a real
+ * booking reference. Applied only when all three hold:
+ *
+ *   1. the anchor is a flight,
+ *   2. the confirmation reads as a flight designator, and
+ *   3. that same designator is already in the anchor's `name`.
+ *
+ * (3) is what makes it safe. A confirmation that merely restates the name is
+ * not independent evidence of anything, whereas a code the organizer supplied
+ * separately might legitimately look designator-shaped — a hotel reference
+ * like `HB-2217` matches the pattern exactly, which is why the pattern alone
+ * must never decide.
+ *
+ * The number is moved to `flight_number` rather than discarded: the model was
+ * right about what it read, only wrong about which field it answers.
+ *
+ * The residual case — a flight whose confirmation is designator-shaped and
+ * NOT in the name — is left alone on purpose. It cannot be told from a real
+ * reference without guessing, and guessing here loses data.
+ */
+export function withoutFlightNumbersAsConfirmations(data: unknown): unknown {
+  if (!Array.isArray(data)) return data;
+  return data.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    const anchor = row as Record<string, unknown>;
+    const confirmation = String(anchor.confirmation ?? "").trim();
+    if (!confirmation || String(anchor.type ?? "").toLowerCase() !== "flight") return row;
+    if (!isFlightDesignator(confirmation)) return row;
+
+    const name = String(anchor.name ?? "");
+    const normalised = confirmation.replace(/[\s\-_.]/g, "").toUpperCase();
+    const inName = name
+      .toUpperCase()
+      .split(/[^A-Z0-9]+/)
+      .some((token) => token === normalised);
+    if (!inName) return row;
+
+    const { confirmation: _dropped, ...rest } = anchor;
+    return { ...rest, ...(anchor.flight_number ? {} : { flight_number: confirmation }) };
+  });
+}
+
 export function validateAnswer(
   questionId: string,
   optionId: string | "other" | null,
@@ -875,7 +968,11 @@ export function validateAnswer(
     // Shape is necessary, not sufficient — see `checkComplete`'s doc comment.
     const incomplete = question.checkComplete?.(structuredData);
     if (incomplete) return { ok: false, reason: "INCOMPLETE_ANSWER", detail: incomplete };
-    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: structuredData } };
+    // The one gate every path goes through — the model, the agent, a document
+    // and a typed answer all arrive here — so a rule enforced at this point
+    // cannot be bypassed by the route that produced the data.
+    const cleaned = question.sanitize ? question.sanitize(structuredData) : structuredData;
+    return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: cleaned } };
   }
 
   if (question.type === "choice") {
@@ -2140,6 +2237,57 @@ export async function getSession(
 }
 
 /**
+ * A typed answer resolved against a question's OWN choices, with no model.
+ *
+ * The buttons on a roster-backed question are drawn from data the control
+ * plane already holds, so "which of these is it" is a decidable lookup, not a
+ * judgement — exactly the kind `docs/interview-without-an-agent.md` says must
+ * not be handed to a model. It was anyway, and the model could not do it: on
+ * 2026-09-20 an organizer answered `organizer_identity` with their own name,
+ * exactly as the roster spells it and exactly as the question's prompt asks
+ * for, and `interpret` returned zero proposals twice. The interview asked the
+ * same question forever and no trip was ever built.
+ *
+ * The deterministic matcher was right there and never ran: `satisfiedBy` and
+ * `canonicalize` act on an answer that has been STORED, and the interpreter is
+ * what decides whether to store one.
+ *
+ * Returns the canonical value to record, or null when the text names nobody or
+ * more than one — both of which must stay with the model and the re-ask, since
+ * guessing between two travellers is the failure this cannot afford.
+ */
+export function typedChoiceAnswer(
+  questionId: string,
+  text: string,
+  answers: AnswerStore,
+): string | null {
+  const written = text.trim();
+  if (!written) return null;
+  const question = INTAKE_QUESTIONS.find((q) => q.id === questionId);
+  if (!question?.choicesFrom) return null;
+
+  // organizer_identity has its own matcher, and it is the tested one: it
+  // handles a first name alone, a household name, a self-reference and the
+  // same name in the other alphabet. Nothing here should re-implement it.
+  if (questionId === "organizer_identity") {
+    const match = organizerMatch({ ...answers, organizer_identity: {
+      kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: written,
+    } });
+    return match.kind === "matched" ? match.name : null;
+  }
+
+  // Any other roster-backed question: an exact match on what the button says
+  // or what it would record. Deliberately strict — a looser rule here would be
+  // guessing, and the model plus the re-ask are the right home for that.
+  const normalized = normalizeIdentity(written);
+  const hits = question.choicesFrom(answers).filter(
+    (choice) => normalizeIdentity(choice.value) === normalized
+      || normalizeIdentity(choice.label) === normalized,
+  );
+  return hits.length === 1 ? hits[0]!.value : null;
+}
+
+/**
  * The current view of whichever interview a Telegram chat is conducting.
  *
  * Read-only counterpart to submitAnswerForChat, and addressed the same way —
@@ -2166,7 +2314,7 @@ export async function getSessionForChat(db: pg.Pool, chatId: string): Promise<Ge
   }>(
     `SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language
      FROM control_plane.intake_sessions
-     WHERE telegram_chat_id = $1 AND state <> 'confirmed' AND expired_at IS NULL`,
+     WHERE ${LIVE_INTAKE_SESSION_PREDICATE}`,
     [chatId],
   );
   const [session] = row.rows;
