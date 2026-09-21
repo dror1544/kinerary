@@ -322,7 +322,11 @@ describe("claude effort", () => {
   async function echoCli(): Promise<string> {
     const dir = await mkdtemp(join(tmpdir(), "kinerary-fake-claude-"));
     const bin = join(dir, "claude");
-    await writeFile(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ args: process.argv.slice(2) }));\n`);
+    // Every claude call now asks for `--output-format json`, so the answer
+    // arrives inside a `result` event rather than on bare stdout. The fake has
+    // to speak that shape or `claudeStreamAnswer` reports "no result event in
+    // stream" — which is the adapter working, not the fake being clever.
+    await writeFile(bin, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({\n  type: "result", subtype: "success", is_error: false,\n  result: JSON.stringify({ args: process.argv.slice(2) }),\n}));\n`);
     await chmod(bin, 0o755);
     return bin;
   }
@@ -334,16 +338,35 @@ describe("claude effort", () => {
     return (result.value as { args: string[] }).args;
   }
 
-  test("no effort configured leaves the invocation exactly as it was", () => {
+  test("no effort configured leaves the SETTINGS exactly as they were", () => {
     // The VM takes its effort from CLAUDE_CONFIG_DIR's settings.json. Ignoring
     // settings when nobody asked would silently drop that to the CLI default —
     // the effort at which the VM once mapped answers to the wrong question.
-    assert.deepEqual(claudeSpec("m").args("PROMPT", "m"), ["-p", "PROMPT", "--model", "m"]);
+    // That is about `--setting-sources`, and it is the assertion below; the
+    // tools and output format are not settings and apply to every call.
+    const args = claudeSpec("m").args("PROMPT", "m");
+    assert.ok(!args.includes("--setting-sources"), "settings dropped with nobody asking");
+    assert.ok(!args.includes("--strict-mcp-config"));
+    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json"]);
+  });
+
+  test("every call is toolless and reports its usage, effort or no effort", () => {
+    // A structuring call reads untrusted document text, so it gets no tools at
+    // all — print mode still offers the read-only ones. `--output-format json`
+    // is what makes the usage readable rather than guessed. Both were added
+    // after this file's effort tests were written, and both have to hold on
+    // the effort path too: the flags that matter most for a document are the
+    // ones the pinned-effort calls also carry.
+    for (const args of [claudeSpec("m").args("P", "m"), claudeSpec("m", 1000, "claude", "medium").args("P", "m")]) {
+      assert.deepEqual(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 4),
+                       ["--tools", "", "--output-format", "json"]);
+    }
   });
 
   test("an explicit effort is passed, and personal settings and connectors are not loaded", () => {
     assert.deepEqual(claudeSpec("m", 1000, "claude", "medium").args("PROMPT", "m"), [
-      "-p", "PROMPT", "--model", "m", "--effort", "medium", "--setting-sources", "", "--strict-mcp-config",
+      "-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json",
+      "--effort", "medium", "--setting-sources", "", "--strict-mcp-config",
     ]);
   });
 
@@ -366,7 +389,8 @@ describe("claude effort", () => {
       { CLAUDE_BIN: bin, INTERPRET_RUNNER: "claude", INTERPRET_MODEL: "m", EXTRACT_RUNNER: "claude", EXTRACT_MODEL: "m", INTERPRET_EFFORT: "low" },
       "extract",
     );
-    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m"]);
+    assert.deepEqual(args, ["-p", "PROMPT", "--model", "m", "--tools", "", "--output-format", "json"]);
+    assert.ok(!args.includes("--effort"), "the other task's effort leaked");
   });
 
   test("a misspelt effort refuses to start rather than failing every call", () => {
