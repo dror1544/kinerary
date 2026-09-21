@@ -805,6 +805,16 @@ class ProvisionerWorker:
                 slug=slug, config=config, intake_version_id=intake_version_id,
             )
 
+            # Hand the deployed plan to the post-deploy review pass
+            # (control-plane/api/src/plan-review.ts). Deliberately AFTER
+            # _complete and in its own transaction: this worker can be newer
+            # than the schema it is talking to, and an UPDATE naming a column
+            # that migration 0050 has not added yet would abort the
+            # transaction that marks the job succeeded — turning a finished
+            # deploy into a failed one over a nice-to-have. Same posture as
+            # the enrichment call above: never fatal.
+            self._record_plan_snapshot(conn, trip_id, config)
+
             logger.info(
                 "provisioner.job_succeeded",
                 extra={"job_id": job_id, "trip_id": trip_id, "attempt": attempt},
@@ -1039,6 +1049,43 @@ class ProvisionerWorker:
                 "confirmed_at": row["confirmed_at"].isoformat(),
                 "schema_version": row["schema_version"],
             }
+
+    def _record_plan_snapshot(
+        self, conn: psycopg.Connection, trip_id: str, config: Mapping[str, Any],
+    ) -> None:
+        """Store the trip.config.json this deploy actually shipped.
+
+        The post-deploy plan review needs three things at once — the built
+        config, the confirmed intake and the uploaded document — and until now
+        the only place all three existed together was ``_work_claimed_job``,
+        mid-deploy. The other two are already stored; this is the one that was
+        not, because it is derivable and re-deriving it means running the
+        transformer, which only exists on this side.
+
+        Never served to a client. Same rule, and the same reason, as the trip
+        site's ``sanitizeConfig()``: no raw trip.config.json value reaches a
+        reader. The review is read back as findings, never as config.
+
+        Best-effort by construction — a snapshot that does not land costs a
+        review, not a deploy, so every failure is swallowed with a warning.
+        The column may simply not exist yet on a database this worker is newer
+        than.
+        """
+        try:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE control_plane.trips "
+                        "SET plan_snapshot = %s::jsonb, plan_snapshot_at = now(), updated_at = now() "
+                        "WHERE id = %s",
+                        (json.dumps(config), trip_id),
+                    )
+        except Exception:
+            logger.warning(
+                "provisioner.plan_snapshot_failed",
+                extra={"trip_id": trip_id},
+                exc_info=True,
+            )
 
     def _complete(
         self,
@@ -1397,13 +1444,38 @@ class ProvisionerWorker:
                         wired = self._mcp_bridge.setup(slug, hermes_profile)
                         logger.info(
                             "provisioner.mcp_bridge_wired" if wired else "provisioner.mcp_bridge_skipped",
-                            extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
+                            extra={
+                                "trip_id": trip_id,
+                                "hermes_profile": hermes_profile,
+                                # Which checkout built this companion. The
+                                # install host chooses it through its own
+                                # forced command, so this is the only place the
+                                # worker can learn it.
+                                "built_from": getattr(self._mcp_bridge, "built_from", "unreported"),
+                            },
                         )
                     except Exception:
                         logger.warning(
                             "provisioner.mcp_bridge_failed",
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
                             exc_info=True,
+                        )
+                        # A FACT, not only a log line. The branch above, for a
+                        # missing companion, records one for exactly this
+                        # reason — "without this the run would report success
+                        # with no companion and nothing said about it" — and
+                        # this branch did not, so a companion that could not
+                        # reach its own trip was handed over as ready and the
+                        # only trace was a WARNING inside the worker's
+                        # container. Found live 2026-09-20, after hours spent
+                        # establishing by hand what this row would have said.
+                        _record_reachability(
+                            conn, trip_id, reachable=False,
+                            reason="TRIP_MCP_BRIDGE_FAILED",
+                            consequence=(
+                                "the companion is installed but cannot read this trip: "
+                                "every trip tool will fail while it answers normally"
+                            ),
                         )
 
                     # The assistant's wake-words, recorded as a ROUTING fact

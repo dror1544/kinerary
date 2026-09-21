@@ -32,6 +32,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any, Callable
 
 logger = logging.getLogger("control_plane_worker.enrichment")
@@ -45,14 +46,76 @@ _TIMEOUT = 12
 
 
 def _default_http(url: str) -> Any:
+    """Returns parsed JSON, or None for any non-success.
+
+    None still means "no data" to every caller — enrichment must never fail a
+    provision. But it is NOT silent any more. A geocoder that is rate-limiting
+    us returns the same None as a place that genuinely does not exist, and on
+    2026-09-19 that cost a trip its entire map with not one line in the worker
+    log to say so (issue #112). The lookup still degrades; it just says which
+    kind of nothing it got, because "could not ask" and "asked, no such place"
+    need different fixes.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": "application/json"})
+    host = urllib.parse.urlsplit(url).netloc
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             if resp.status != 200:
+                logger.warning(
+                    "enrichment.http_status",
+                    extra={"host": host, "status": resp.status},
+                )
                 return None
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:  # network error, HTTP error, decode error — all "no data"
+    except Exception as exc:
+        # Rate limiting arrives here as HTTPError 429 — the case most likely to
+        # be transient, and the one worth seeing in a log.
+        status = getattr(exc, "code", None)
+        logger.warning(
+            "enrichment.http_failed",
+            extra={"host": host, "status": status, "error": type(exc).__name__},
+        )
         return None
+
+
+def _location_query(*parts: str) -> str:
+    """Join place components into one search query, without repeating any.
+
+    Every component is split on commas first, so a destination that is itself a
+    list ("Tokyo, Hakone, Kyoto, Osaka, Japan") cannot smuggle a duplicate past
+    a whole-string comparison. Matching is case-insensitive and order is kept.
+
+    This existed as a plain f-string until 2026-09-19, when a trip came out with
+    no map at all: the phase query was built as f"{label}, {destination}", so a
+    Tokyo phase asked the geocoder for "Tokyo, Tokyo, Hakone, Kyoto, Osaka,
+    Japan" — its own city twice, then three cities it is not in. Nominatim
+    returns nothing for that, and _default_http reports nothing as None, so
+    every phase silently lost its coordinates. "Tokyo, Japan" resolves.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in parts:
+        for piece in str(part or "").split(","):
+            piece = piece.strip()
+            key = piece.casefold()
+            if piece and key not in seen:
+                seen.add(key)
+                out.append(piece)
+    return ", ".join(out)
+
+
+def _destination_anchor(destination: str) -> str:
+    """The country-ish tail of a destination answer.
+
+    Organizers answer with an itinerary, not a country — "Tokyo, Hakone, Kyoto,
+    Osaka, Japan". Anchoring a phase on the whole thing drags in every city the
+    phase is NOT in; anchoring on nothing loses the country a city name may need
+    to disambiguate. The last comma-separated part is the country in every
+    multi-part answer seen so far, and is the answer itself when there is only
+    one part.
+    """
+    parts = [p.strip() for p in str(destination or "").split(",") if p.strip()]
+    return parts[-1] if parts else ""
 
 
 # ── country data ─────────────────────────────────────────────────────────────
@@ -185,9 +248,21 @@ def _geocode(http: Http, query: str) -> tuple[float, float] | None:
 
 
 def _geocode_place(http: Http, query: str) -> dict[str, Any] | None:
-    """Like _geocode but also returns Nominatim's `display_name` as `address`."""
+    """Like _geocode, plus Nominatim's `display_name` as `address` and, where
+    OSM has one, the place's own `website`.
+
+    `extratags=1` is what carries the website, and it costs nothing extra: it
+    is the same request, already being made, with one more parameter. That
+    matters because the alternative — a second lookup per venue — is what the
+    1 req/s budget cannot afford.
+
+    A venue's website is the answer to "where do I buy a ticket / check the
+    opening hours", which is the one thing a place card had no way to say. The
+    cross-trip `venue_links` store can only RECALL a link somebody already
+    found; nothing in an agentless interview ever finds one, so on a trip with
+    no documents every card was mute (2026-09-20)."""
     url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
-        {"q": query, "format": "jsonv2", "limit": "1"}
+        {"q": query, "format": "jsonv2", "limit": "1", "extratags": "1"}
     )
     rows = http(url)
     if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
@@ -199,7 +274,35 @@ def _geocode_place(http: Http, query: str) -> dict[str, Any] | None:
     display = str(rows[0].get("display_name") or "").strip()
     if display:
         out["address"] = display
+    website = _place_website(rows[0])
+    if website:
+        out["website"] = website
     return out
+
+
+def _place_website(row: Mapping[str, Any]) -> str:
+    """The place's own URL out of a Nominatim row, or "".
+
+    OSM records it under several keys depending on who tagged it, and a
+    surprising number of values are bare hostnames rather than URLs. Anything
+    that is not http(s) after that is discarded rather than guessed at — a
+    broken link on a place card is worse than no link, because the family finds
+    out by tapping it.
+    """
+    extra = row.get("extratags")
+    if not isinstance(extra, Mapping):
+        return ""
+    for key in ("website", "contact:website", "url", "operator:website"):
+        value = str(extra.get(key) or "").strip()
+        if not value:
+            continue
+        # Several tagged values are "example.com" with no scheme at all.
+        if value.startswith("www.") or ("." in value.split("/")[0] and "://" not in value):
+            value = f"https://{value}"
+        if value.startswith("https://") or value.startswith("http://"):
+            # Multiple sites are sometimes tagged separated by ';'.
+            return value.split(";")[0].strip()
+    return ""
 
 
 def _accommodation_name(phase: dict[str, Any]) -> str:
@@ -283,7 +386,7 @@ def enrich_config(
         label, lang = _phase_query(phase)
         if not label:
             continue
-        city_query = f"{label}, {destination}".strip(", ")
+        city_query = _location_query(label, _destination_anchor(destination))
         try:
             if "mapStop" not in phase:
                 # Anchor the pin (and so the Maps/Waze links) on the hotel when
@@ -302,6 +405,14 @@ def enrich_config(
                 if not place:
                     place = _geocode_place(http, city_query)
                     _sleep(pause)
+                if not place:
+                    # Neither the hotel nor the city centre resolved. The phase
+                    # gets no pin, the trip gets no map, and nothing downstream
+                    # treats that as an error — so this line is the only trace.
+                    logger.warning(
+                        "enrichment.geocode_miss",
+                        extra={"phase": phase.get("id"), "query": city_query},
+                    )
                 if place:
                     phase["mapStop"] = _map_stop(phase, (place["lat"], place["lng"]))
                     acc = phase.get("accommodation")
@@ -314,7 +425,7 @@ def enrich_config(
         except Exception:
             logger.warning("enrichment.nav_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
-            _enrich_venues(phase, label, destination, venue_lookup)
+            _enrich_venues(phase, label, destination, venue_lookup, http, pause)
         except Exception:
             logger.warning("enrichment.venues_failed", extra={"phase": phase.get("id")}, exc_info=True)
         try:
@@ -498,13 +609,39 @@ def _waze_search_url(query: str) -> str:
 def _enrich_venues(
     phase: dict[str, Any], label: str, destination: str,
     venue_lookup: "VenueLookup | None" = None,
+    http: Http | None = None, pause: float = 0.0,
 ) -> None:
-    """Give each must-see venue a Google Maps + Waze link that searches by the
-    venue *name* (reliable — no geocode needed). A venue's `url` (an official or
-    ticket link) comes from the source document or the interview-time web
-    search; where that was rate-limited, back-fill it here from the cross-trip
-    venue_links store via the injected reader. `maps`/`waze`/`url` are all
-    `setdefault` — a value already present wins."""
+    """Give each must-see venue its links.
+
+    `maps`/`waze` search by the venue *name* — reliable, no geocode needed.
+
+    WHAT `url` MEANS, because three different things can fill it and the site
+    renders them identically:
+
+    | `url_source`   | what it is                          | filled by |
+    |----------------|-------------------------------------|-----------|
+    | (absent)       | supplied by a document or the intake | the transformer, from the source |
+    | `venue-links`  | found by the interview's web search | the cross-trip store, via `venue_lookup` |
+    | `osm-website`  | the place's OWN site, as OSM tags it | the geocode below |
+
+    **It is the best available URL, not a ticket link.** Nothing here can
+    promise a booking page: `osm-website` is whatever the place lists as its
+    website, and a document's link is whatever the organizer had. A venue that
+    sells tickets usually sells them from its own site, which is why this is
+    worth showing — but "buy here" is a stronger claim than the data supports,
+    so the field is not named or treated as one.
+
+    `url_source` is recorded so a later pass can tell a *derived* link from one
+    a person supplied, and so the site could label them differently without
+    guessing. Preference order is strongest-evidence-first and never reversed:
+    a link a person or a document gave wins over a search result, which wins
+    over a tag.
+
+    A real ticket/booking link is a different source and a different piece of
+    work — see the follow-up on #128; it is deliberately not a Sprint 6
+    blocker.
+
+    `maps`/`waze`/`url` are all `setdefault` — a value already present wins."""
     venues = phase.get("venues")
     if not isinstance(venues, list):
         return
@@ -542,11 +679,32 @@ def _enrich_venues(
             found = resolved.get(name.lower())
             if found:
                 venue["url"] = found
-        if "maps" in venue:
-            continue
-        query = ", ".join(p for p in (name, str(venue.get("area") or "").strip(), label, destination) if p)
-        venue.setdefault("maps", _maps_search_url(query))
-        venue.setdefault("waze", _waze_search_url(query))
+                venue["url_source"] = "venue-links"
+        query = _location_query(name, str(venue.get("area") or ""), label, _destination_anchor(destination))
+        if "maps" not in venue:
+            venue.setdefault("maps", _maps_search_url(query))
+            venue.setdefault("waze", _waze_search_url(query))
+        # LAST, and only when nothing better was found. The store above holds
+        # links a person or a document supplied, which beat a tagged one; this
+        # is the floor, not the preference. It is also the only source that
+        # works on a trip with no documents at all, which is the common case
+        # for a first-time organizer.
+        if not venue.get("url") and http is not None:
+            try:
+                place = _geocode_place(http, query)
+                _sleep(pause)
+            except Exception:
+                logger.warning("enrichment.venue_site_failed", extra={"venue": name}, exc_info=True)
+                place = None
+            site = str((place or {}).get("website") or "")
+            if site:
+                venue["url"] = site
+                venue["url_source"] = "osm-website"
+            else:
+                # Not an error — plenty of real places have no website tagged.
+                # Logged because "the card is mute" otherwise has no trace at
+                # all, which is how it went unnoticed until a person said so.
+                logger.info("enrichment.venue_site_miss", extra={"venue": name, "query": query})
 
 
 def _venue_name_variants(name: Any, label: str, destination: str) -> list[str]:

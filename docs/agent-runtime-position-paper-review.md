@@ -233,6 +233,6 @@ The position paper (2026-09-05), plus the repo documents it cites:
 `docs/k3s-home-deployment-sprint-plan.md`,
 `docs/onboarding-mvp-sprint-plan.md`, and the Sprint 5 interview/relay work.
 
-Evidence cited from 2026-09-05 lives in `docs/signup-test-run9..11-raw-notes.md`,
+Evidence cited from 2026-09-05 lives in `docs/test-reports/signup-test-run9..11-raw-notes.md`,
 the run-12 turn table and relay log readings recorded in this session, and
 commit `6205b2d`.

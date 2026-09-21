@@ -48,6 +48,7 @@ async function withConnector(
     interviewChats?: readonly string[];
     interviewSay?: (chatId: string, text: string) => Promise<boolean>;
     fallbackGatewayId?: string;
+    setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
   } = {},
 ): Promise<void> {
   const telegram = new FakeTelegram();
@@ -60,6 +61,7 @@ async function withConnector(
       : {}),
     ...(options.interviewSay ? { interviewSay: options.interviewSay } : {}),
     ...(options.fallbackGatewayId ? { fallbackGatewayId: options.fallbackGatewayId } : {}),
+    ...(options.setExpectsReply ? { setExpectsReply: options.setExpectsReply } : {}),
   });
   await connector.listen();
   const port = connector.address;
@@ -381,6 +383,106 @@ describe("RelayConnector — outbound actions", () => {
       await waitFor(() => frames.find((f) => f.type === "descriptor"));
       assert.equal(ws.readyState, ws.OPEN);
       ws.close();
+    });
+  });
+});
+
+describe("RelayConnector — reply-expected capture (migration 0053)", () => {
+  async function roundTrip(
+    h: Harness,
+    action: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const { ws, frames } = await dial(h.port, makeUpgradeToken("gw_1", SECRET, 300));
+    sendFrame(ws, { type: "outbound", requestId: "req_1", action });
+    const result = await waitFor(() => frames.find((f) => f.type === "outbound_result"));
+    ws.close();
+    return result.result as Record<string, unknown>;
+  }
+
+  test("a companion send with metadata.expects_reply opens the window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works for everyone?",
+        metadata: { expects_reply: true },
+      });
+      assert.equal(result.success, true);
+      assert.deepEqual(calls, [{ chatId: "901", expects: true }]);
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a companion send with no expects_reply signal clears any open window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, { op: "send", chat_id: "901", content: "sounds good!" });
+      assert.equal(result.success, true);
+      assert.deepEqual(calls, [{ chatId: "901", expects: false }]);
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("an interview chat never touches the reply-capture window", async () => {
+    // That branch returns to the gateway before reaching Telegram at all, so
+    // this option must never see an interview chat's send.
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "900",
+        content: "The next question is destination.",
+        metadata: { expects_reply: true },
+      });
+      assert.deepEqual(result, { success: true });
+      assert.deepEqual(calls, [], "the interview branch never calls setExpectsReply");
+    }, {
+      interviewChats: ["900"],
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a failed send does not open or clear the window", async () => {
+    const calls: Array<{ chatId: string; expects: boolean }> = [];
+    await withConnector(async (h) => {
+      h.telegram.failSend = true;
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works?",
+        metadata: { expects_reply: true },
+      });
+      assert.equal(result.success, false);
+      assert.deepEqual(calls, [], "nothing reached Telegram, so nothing here should change");
+    }, {
+      setExpectsReply: async (chatId, expects) => {
+        calls.push({ chatId, expects });
+      },
+    });
+  });
+
+  test("a write failure here does not turn a delivered message into a failure", async () => {
+    await withConnector(async (h) => {
+      const result = await roundTrip(h, {
+        op: "send",
+        chat_id: "901",
+        content: "what date works?",
+        metadata: { expects_reply: true },
+      });
+      assert.deepEqual(result, { success: true, message_id: "555" });
+    }, {
+      setExpectsReply: async () => {
+        throw new Error("db unavailable");
+      },
     });
   });
 });

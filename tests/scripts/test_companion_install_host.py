@@ -38,6 +38,22 @@ npm:
 
 
 class BridgeRequest(unittest.TestCase):
+    def assertWired(self, result, profile: str) -> None:  # noqa: N802 - unittest style
+        """The `WIRED` line is a CONTRACT, not a log line: the worker parses it.
+
+        Since 2026-09-20 it carries the commit the install ran from, because
+        the forced command in authorized_keys decides which checkout builds
+        every companion and nothing anywhere recorded which one that was
+        (#127). The worker accepts both the old and new shapes so an older host
+        still reports success; this asserts the new one without pinning the
+        commit, which changes with every build.
+        """
+        line = result.stdout.strip().splitlines()[-1]
+        parts = line.split()
+        self.assertEqual(parts[:2], ["WIRED", profile], f"line was {line!r}")
+        self.assertEqual(len(parts), 3, f"no provenance on the WIRED line: {line!r}")
+        self.assertTrue(parts[2].strip(), "provenance is present but empty")
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
@@ -110,7 +126,7 @@ class BridgeRequest(unittest.TestCase):
     def test_the_bridge_is_wired_from_this_hosts_own_topology(self) -> None:
         result = self.send(self.request())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip().splitlines()[-1], "WIRED italy2026")
+        self.assertWired(result, "italy2026")
         self.assertEqual(self.recorded(), [
             f"REPO_ROOT={REPO} italy2026 http://192.168.0.61:8080 --vmid 104 "
             f"--trip-dir {self.deploy}/trips/italy-2026 --port 3104"
@@ -183,7 +199,7 @@ class BridgeReachesTheTrip(BridgeRequest):
     def test_a_reachable_bridge_still_wires(self) -> None:
         result = self.send(self.request())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip().splitlines()[-1], "WIRED italy2026")
+        self.assertWired(result, "italy2026")
 
     def test_the_key_reaches_the_bridge_but_never_the_command_line(self) -> None:
         # `ps` is readable by every user on the box. A key in argv is a key

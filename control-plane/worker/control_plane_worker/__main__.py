@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -123,9 +124,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_logging() -> None:
+    """Without this the worker inherits Python's default root level, WARNING,
+    and every logger.info in the package is discarded.
+
+    That is not a cosmetic loss. `provisioner.mcp_bridge_wired` and
+    `mcp_bridge_skipped` are both INFO, so on 2026-09-19 a trip came up with no
+    trip-mcp and the worker's entire log for that provision was four lines —
+    none of them about the bridge. Whether the step ran, declined or was never
+    reached could not be established afterwards, because the two outcomes that
+    say which are exactly the two that were silent. The failure path
+    (`mcp_bridge_failed`) was visible the whole time, which is why nothing
+    looked broken.
+
+    INFO is the default because this is a background service whose actions are
+    only ever reconstructed from its log, and it emits a handful of lines per
+    provision rather than a stream. WORKER_LOG_LEVEL overrides it; an
+    unrecognised value falls back to INFO rather than silently disabling
+    logging, which would reintroduce the thing this exists to prevent.
+    """
+    requested = (os.environ.get("WORKER_LOG_LEVEL") or "INFO").upper()
+    level = getattr(logging, requested, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s %(message)s")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging()
     try:
         if args.command in {"run", "check-database", "provision"} and not args.database_url_file:
             raise ValueError("--database-url-file or CONTROL_PLANE_DATABASE_URL_FILE is required")

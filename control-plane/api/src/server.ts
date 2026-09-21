@@ -5,6 +5,8 @@ import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
+import { modelRunnerFromEnv } from "./model-runner.js";
+import { runPendingPlanReviews } from "./plan-review-store.js";
 import { structuredLog } from "./redaction.js";
 import { resolveSecretRef } from "./secrets.js";
 import { deleteWebhookIfPresent, startTelegramApprovalPoller } from "./telegram-poller.js";
@@ -196,6 +198,39 @@ if (venueLinkSearchConfigured()) {
       })
       .finally(() => { draining = false; });
   }, VENUE_LINK_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Reviews the plan of every trip that has been provisioned (or re-provisioned)
+// since its last review, and files what it finds as proposals — never as edits
+// to a live trip. See plan-review.ts for what it looks for and plan-review-
+// store.ts for the queue's rules.
+//
+// Runs UNCONDITIONALLY, unlike the venue-link drain above. The deterministic
+// half of the review needs no model, and a deployment with no `plan_review`
+// runner configured still gets every finding that is arithmetic over the
+// config — the missing check-in, the day out of clock order, the place on the
+// list that is on no day. Gating the whole loop on a runner would have made
+// "no model configured" and "your plan is fine" look identical, which is the
+// shape of the downgrade CLAUDE.md's interview section was written about.
+{
+  let reviewing = false;
+  const PLAN_REVIEW_POLL_INTERVAL_MS = 5 * 60_000;
+  const planReviewRunner = modelRunnerFromEnv();
+  const timer = setInterval(() => {
+    if (reviewing) return;
+    reviewing = true;
+    runPendingPlanReviews(pool, {
+      runner: planReviewRunner,
+      log: (line) => process.stderr.write(`${line}\n`),
+    })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "plan_review.loop_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { reviewing = false; });
+  }, PLAN_REVIEW_POLL_INTERVAL_MS);
   timer.unref();
 }
 

@@ -271,7 +271,8 @@ if [ -d "$HERMES_PROFILES" ]; then
     [ -d "$dest" ] || continue
     name="$(basename "$dest")"
     profile="$(basename "$(dirname "$(dirname "$(dirname "$dest")")")")"
-    if [ ! -d ".agents/skills/$name" ]; then
+    # A skill the companion template ships has its repo copy there, not in .agents/skills.
+    if [ ! -d ".agents/skills/$name" ] && ! compgen -G "profile-templates/*/templates/skills/*/$name" >/dev/null; then
       UNCAPTURED="$UNCAPTURED $profile/$name"
       UNCAPTURED_N=$((UNCAPTURED_N + 1))
     fi
@@ -279,6 +280,148 @@ if [ -d "$HERMES_PROFILES" ]; then
   if [ "$UNCAPTURED_N" -gt 0 ]; then
     warn "$UNCAPTURED_N profile skills have no repo copy — ~/.hermes holds the only one:$UNCAPTURED" \
          "review each and capture what is worth keeping: scripts/install-hermes-skill.sh <skill> <profile> --capture"
+  fi
+fi
+
+# ── B6 · hard rule 6 — this repo never names this deployment ─────────────────
+# `kinerary` says what and how; `kinerary-deploy` says where. The reason is
+# portability, not secrecy: the product has to run on k3s, on another Proxmox,
+# on hardware nobody here owns, and every value that names THIS house is one the
+# second deployment has to find and undo.
+#
+# A default is the dangerous shape, not a convenience — `compute.py` still
+# defaults to this laptop's Proxmox address, its SSH key name, and an ingress
+# host that was decommissioned. All three are overridden by provisioning.env
+# here, which is exactly why nobody notices; a deployment that forgets one env
+# var gets no error, just somebody else's home lab.
+#
+# SCOPE IS DELIBERATELY NARROW — code, not prose, and not tests. A runbook that
+# names the VM it is a runbook FOR is doing its job. A test fixture using
+# 192.168.1.10 to prove the canonical guardrail rejects private addresses needs
+# that literal to exist. Blocking those would make this check mostly
+# exceptions, and a check that is mostly exceptions teaches people to add one.
+DEPLOYMENT_PAT='/opt/(kinerary|kinerary-deploy|hermes-data|hermes-src|agent-auth)|kinerary-cp-[a-z]+-[0-9]|id_ed25519_[a-z]|debian@|192\.168\.[0-9]|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]'
+for f in ${REL+"${REL[@]}"}; do
+  case "$f" in
+    *.sh|*.py|*.mjs|*.js|*.ts) ;;
+    *) continue ;;
+  esac
+  # Tests, by PATH not by name: control-plane/deployment/vm-manual-test.sh is a
+  # script with "test" in its name and is exactly what this check is for.
+  case "$f" in
+    tests/*|*/tests/*|*.test.ts|*.test.js|*.test.mjs|test_*.py|*/test_*.py) continue ;;
+    # The detector, skipped BY PATH rather than by an allow-list entry. It has
+    # to contain the literals it searches for, and an entry in .preflight-allow
+    # is not enough: a harness that runs this script against a temp repo has no
+    # allow file, so `allowed` says no and the check reports itself. That is not
+    # hypothetical — tests/scripts/test_preflight_doc_paths.py does exactly
+    # that, and this is what it caught.
+    scripts/preflight-checks.sh) continue ;;
+  esac
+  [ -f "$f" ] || continue
+  allowed "$f" && continue
+  hit="$(grep -oE "$DEPLOYMENT_PAT" "$f" 2>/dev/null | sort -u | head -3 | tr '\n' ' ')"
+  [ -n "$hit" ] && block "hard rule 6 — names this deployment: $f ($hit)" \
+    "move the value into kinerary-deploy and read it from env/config at runtime; or record the exception, with its reason, in .preflight-allow"
+done
+
+# ── B7 · migration naming and the rollback contract ──────────────────────────
+# Three failures, each silent in its own way.
+#
+# 1. applyMigrations only sees /^\d+_.+\.sql$/ (control-plane/api/src/migrations.ts).
+#    A .sql file in that directory whose name does not match is not rejected —
+#    it is IGNORED. The migration simply never runs, on every stack, forever.
+# 2. Sequential numbers are allocated by hand, so two branches pick the same
+#    one. 0054 existed three different ways at once on 2026-09-19, and the repo
+#    had already renumbered twice before that. New migrations therefore use
+#    YYYYMMDDHHMMSS_description.sql: two branches would have to be created in
+#    the same second to collide. Ordering is preserved because `version` is the
+#    whole filename and the sort is lexicographic, so every legacy 00xx_ still
+#    sorts before any timestamp. Legacy names are grandfathered — renaming an
+#    APPLIED migration would make production re-run it.
+# 3. vm-release.py treats a migration with no `-- rollback:` header as
+#    `breaking`, which makes a rollback discard the database rather than keep
+#    it. Missing is not neutral; it is the destructive default.
+#
+# 2 and 3 apply only to migrations this change ADDS: the existing tree is
+# grandfathered, which is why --all stays quiet on 50 headerless legacy files.
+for f in ${REL+"${REL[@]}"}; do
+  case "$f" in control-plane/db/migrations/*.sql) ;; *) continue ;; esac
+  base="${f##*/}"
+  allowed "$f" && continue
+
+  case "$base" in
+    [0-9]*_*.sql) ;;
+    *) block "migration is invisible to the migrator: $f" \
+             "applyMigrations matches ^[0-9]+_<name>.sql — this file would be skipped silently, not rejected"
+       continue ;;
+  esac
+
+  # Already in HEAD means already shipped: grandfathered, and never renamed.
+  git cat-file -e "HEAD:$f" 2>/dev/null && continue
+
+  printf '%s' "$base" | grep -qE '^[0-9]{14}_.+\.sql$' \
+    || block "new migration does not use a timestamp name: $f" \
+             "name it YYYYMMDDHHMMSS_description.sql — hand-allocated numbers collide across branches (see docs/migrations.md)"
+
+  [ -f "$f" ] && ! grep -qE '^--[[:space:]]*rollback:[[:space:]]*(compatible|breaking)[[:space:]]*[-—]' "$f" \
+    && block "new migration declares no rollback contract: $f" \
+             "first line: -- rollback: compatible|breaking — <why>. Absent, vm-release.py treats it as breaking and a rollback DISCARDS the database"
+done
+
+# ── B8 · sprint and baseline state ───────────────────────────────────────────
+# .project/sprint.json is the single source of truth for which sprint is active,
+# what its locked scope is, which commit its baseline is, and whether either is
+# locked (scripts/project-state.py). A fresh session reads it instead of a
+# memory file or a person. Two checks: the file agrees with the tree (the
+# baseline commit exists and is on the integration branch), and any lock,
+# baseline, sprint or override change in THIS commit is named, so the commit
+# prompt shows it by name rather than as one more JSON diff.
+if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
+  if [ -f .project/sprint.json ] && [ -f scripts/project-state.py ]; then
+    if ! out="$(python3 scripts/project-state.py check 2>&1)"; then
+      block "sprint/baseline state disagrees with the tree (.project/sprint.json)" \
+            "$(printf '%s\n' "$out" | grep '^PROBLEM' | head -3 | tr '\n' ' ')"
+    fi
+    if [ "$MODE" = "--staged" ] && printf '%s\n' ${REL+"${REL[@]}"} | grep -qx '.project/sprint.json'; then
+      old="$(mktemp)"; new="$(mktemp)"
+      git show HEAD:.project/sprint.json > "$old" 2>/dev/null || : > "$old"
+      git show :.project/sprint.json    > "$new" 2>/dev/null || : > "$new"
+      while IFS= read -r line; do
+        [ -n "$line" ] && warn "state change — $line" "this is part of what the commit approval approves"
+      done < <(python3 scripts/project-state.py describe-change "$old" "$new" 2>/dev/null)
+      rm -f "$old" "$new"
+    fi
+  fi
+fi
+
+# ── B9 · Codex agent mirror ──────────────────────────────────────────────────
+# .codex/agents/*.toml are generated from .claude/agents/*.md by
+# scripts/sync-codex-agents.py. Two hand-kept copies drift — by 2026-09-20 two
+# of six had — and a Codex session then runs an older role than a Claude one
+# on the same issue queue. Blocks while any mirror differs, and while a source
+# is staged without its mirror; the fix is one command either way.
+if [ "$MODE" = "--staged" ] || [ "$MODE" = "--all" ]; then
+  if [ -d .claude/agents ] && [ -f scripts/sync-codex-agents.py ]; then
+    if ! out="$(python3 scripts/sync-codex-agents.py --check 2>&1)"; then
+      block "Codex agent mirror is out of date: $(printf '%s\n' "$out" | grep -vE '^fix:' | head -3 | tr '\n' ' ')" \
+            "scripts/sync-codex-agents.py    # regenerates .codex/agents/*.toml from .claude/agents/*.md; never edit a .toml by hand"
+    fi
+    if [ "$MODE" = "--staged" ]; then
+      for f in ${REL+"${REL[@]}"}; do
+        case "$f" in .claude/agents/*.md) ;; *) continue ;; esac
+        mirror=".codex/agents/$(basename "${f%.md}").toml"
+        printf '%s\n' ${REL+"${REL[@]}"} | grep -qx "$mirror" && continue
+        # The mirror is not staged. Fine when it did not change — a
+        # frontmatter-only edit (model:, effort:) renders to the same TOML, and
+        # the first version of this rule refused exactly that commit — and a
+        # hole when it did: untracked, or differing from HEAD.
+        if ! git cat-file -e "HEAD:$mirror" 2>/dev/null || ! git diff --quiet HEAD -- "$mirror" 2>/dev/null; then
+          block "agent source staged without its Codex mirror: $f" \
+                "scripts/sync-codex-agents.py && git add $mirror"
+        fi
+      done
+    fi
   fi
 fi
 

@@ -38,4 +38,13 @@ class Tests(unittest.TestCase):
    self.assertIn('tone is set too, not defaulted',soul,tone)
  def test_profile_description_is_yaml_safe(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['profile']['description']='A trip: "quoted"'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr); self.assertIn('description: "A trip: \\"quoted\\""',(o/'profile.yaml').read_text())
+ def test_shipped_skills_find_their_own_files(self):
+  # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
+  # defines, so on every companion the path pointed at /travel/... (#71). A
+  # skill locates its files through skill_view's skill_dir, never an env var
+  # or a path copied from one machine's profile.
+  for f in (ROOT/'templates/skills').rglob('SKILL.md'):
+   t=f.read_text(); self.assertNotIn('$PROFILE_SKILLS_DIR',t,str(f)); self.assertNotIn('/Users/',t,str(f))
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  self.assertTrue(list(o.rglob('trip-kml-export/scripts/trip_kml_export.py')),'the rendered profile must still ship the export script')
 if __name__=='__main__': unittest.main()

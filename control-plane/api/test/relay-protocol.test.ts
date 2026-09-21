@@ -200,6 +200,7 @@ describe("parseOutboundAction", () => {
       chat_id: "1",
       content: "hi",
       reply_to: undefined,
+      expectsReply: false,
     });
     assert.deepEqual(parseOutboundAction({ op: "typing", chat_id: "1" }), { op: "typing", chat_id: "1" });
     assert.deepEqual(parseOutboundAction({ op: "edit", chat_id: "1", message_id: "9", content: "x" }), {
@@ -214,6 +215,52 @@ describe("parseOutboundAction", () => {
     // The contract's versioning is additive: a newer gateway may send an op we
     // predate. Answering success:false keeps its per-request future resolving.
     assert.equal(parseOutboundAction({ op: "send_media", chat_id: "1", source_url: "x" }), null);
+  });
+
+  test("reads metadata.expects_reply, failing closed on anything but a literal true", () => {
+    const base = { op: "send", chat_id: "1", content: "hi" };
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: { expects_reply: true } }) as { expectsReply: boolean })
+        .expectsReply,
+      true,
+    );
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: { expects_reply: "yes" } }) as { expectsReply: boolean })
+        .expectsReply,
+      false,
+    );
+    assert.equal(
+      (parseOutboundAction({ ...base, metadata: null }) as { expectsReply: boolean }).expectsReply,
+      false,
+    );
+    assert.equal(
+      (parseOutboundAction(base) as { expectsReply: boolean }).expectsReply,
+      false,
+    );
+  });
+
+  test("infers expects_reply from a question when the gateway states nothing", () => {
+    // INTERIM, and it earns its place: the half that stamps this field is a
+    // cross-repo change that has not landed (#122), so nothing ever set it and
+    // the window never opened. A companion asked a family a question in their
+    // group and could not hear the answer unless somebody repeated its name.
+    const ask = (content: string, metadata?: unknown) =>
+      (parseOutboundAction({ op: "send", chat_id: "1", content, ...(metadata === undefined ? {} : { metadata }) }) as
+        { expectsReply: boolean }).expectsReply;
+
+    assert.equal(ask("כמה ימים בהוי אן?"), true, "a Hebrew question opens it");
+    assert.equal(ask("How many days in Hoi An?"), true);
+    assert.equal(ask("هل تريد؟"), true, "Arabic question mark");
+    assert.equal(ask("שאלה?‏"), true, "a trailing direction mark does not hide the marker");
+    assert.equal(ask('"Which one?"'), true, "closing quotes do not hide it either");
+
+    assert.equal(ask("הוספתי את זה לאתר."), false, "a statement does not");
+    assert.equal(ask("I wonder what they will pick"), false, "and neither does a rhetorical one");
+
+    // An explicit statement always wins, in BOTH directions — this only fills
+    // a silence, and stops mattering the day the gateway speaks.
+    assert.equal(ask("Which one?", { expects_reply: false }), false);
+    assert.equal(ask("Done.", { expects_reply: true }), true);
   });
 
   test("rejects actions missing required fields", () => {

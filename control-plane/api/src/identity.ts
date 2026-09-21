@@ -117,3 +117,22 @@ export function verifyTelegramWebhookSecret(headerValue: unknown, configuredSecr
   if (provided.length !== expected.length) return false;
   return timingSafeEqual(provided, expected);
 }
+
+/**
+ * Whether a Telegram chat id is a private 1:1 chat rather than a group.
+ *
+ * Telegram gives a group or supergroup a negative id and a private chat a
+ * positive one, and in a private chat that id IS the person's own Telegram
+ * user id. Both facts are load-bearing: routing that binds a chat to an
+ * organizer, and any lookup that treats a chat id as an identity, are only
+ * correct for the private shape.
+ *
+ * Lives here, beside `digestTelegramId`, because three modules were each
+ * carrying their own copy of this regex — chat-router (before consuming an
+ * enrollment), interview (before recording a session's chat), and now the
+ * organizer trip list. A predicate three places re-derive is a predicate that
+ * eventually disagrees with itself.
+ */
+export function isPrivateChatId(chatId: string): boolean {
+  return /^\d{1,20}$/.test(chatId);
+}

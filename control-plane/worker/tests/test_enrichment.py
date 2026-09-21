@@ -8,7 +8,10 @@ enrichment error must never fail a provision job.
 """
 from __future__ import annotations
 
+import logging
 import unittest
+import urllib.parse
+from unittest import mock
 
 from control_plane_worker.enrichment import enrich_config
 
@@ -316,6 +319,67 @@ class VenueEnrichmentTests(unittest.TestCase):
         self.assertIn("waze.com/ul?q=Tokyo%20Skytree", v["waze"])
         self.assertEqual("https://www.tokyo-skytree.jp/en/", v["url"])  # untouched
 
+    def test_a_venue_with_no_link_anywhere_takes_the_website_osm_has(self) -> None:
+        # The case every provisioned trip was in: no documents, so the
+        # cross-trip venue_links store is empty, so nothing set `url` and the
+        # place card had no way to say where to buy a ticket.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "skytree", "name": {"he": "סקייטרי", "en": "Tokyo Skytree"}},
+        ]
+        http = FakeHttp({
+            "q=Tokyo%2C+Japan": NOMINATIM_TOKYO,
+            "q=Kyoto": NOMINATIM_KYOTO,
+            "q=Tokyo+Skytree": [{
+                "lat": "35.7101", "lon": "139.8107", "display_name": "Tokyo Skytree",
+                "extratags": {"website": "https://www.tokyo-skytree.jp/en/"},
+            }],
+        })
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.tokyo-skytree.jp/en/", out["phases"][0]["venues"][0]["url"])
+        # Where it came from, so a derived link is never mistaken for one a
+        # person supplied — and so nothing downstream reads it as "tickets".
+        self.assertEqual("osm-website", out["phases"][0]["venues"][0]["url_source"])
+        geocodes = [c for c in http.calls if "nominatim" in c]
+        self.assertTrue(geocodes, "the venue was geocoded")
+        self.assertTrue(all("extratags=1" in c for c in geocodes),
+                        "the website rides on the request already being made")
+
+    def test_a_bare_hostname_is_made_into_a_real_url(self) -> None:
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"contact:website": "www.somewhere.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://www.somewhere.example", out["phases"][0]["venues"][0]["url"])
+
+    def test_a_tagged_value_that_is_not_a_url_is_discarded_rather_than_guessed(self) -> None:
+        # A broken link on a place card is worse than no link: the family finds
+        # out by tapping it.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [{"id": "x", "name": {"en": "Somewhere Museum"}}]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "ask at the desk"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertNotIn("url", out["phases"][0]["venues"][0])
+
+    def test_osm_never_overrides_a_url_that_is_already_there(self) -> None:
+        # The store holds links a person or a document supplied. This is the
+        # floor, not the preference.
+        cfg = _config()
+        cfg["phases"][0]["venues"] = [
+            {"id": "x", "name": {"en": "Somewhere Museum"}, "url": "https://from-the-document.example"},
+        ]
+        http = FakeHttp({"q=Somewhere+Museum": [{
+            "lat": "1", "lon": "2", "extratags": {"website": "https://osm.example"},
+        }]})
+        out = enrich_config(cfg, "Japan", http=http, pause=0)
+        self.assertEqual("https://from-the-document.example", out["phases"][0]["venues"][0]["url"])
+        self.assertNotIn("url_source", out["phases"][0]["venues"][0],
+                         "a link that was already there is not ours to label")
+
     def test_a_hand_authored_venue_maps_link_is_kept(self) -> None:
         cfg = _config()
         cfg["phases"][0]["venues"] = [
@@ -589,3 +653,162 @@ class ResilienceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GeocodeMissIsVisible(unittest.TestCase):
+    """A lookup that returns nothing must leave a trace.
+
+    On 2026-09-19 a trip was provisioned while the geocoder was unavailable and
+    came out with no mapStop on any phase and no map at all — with not one line
+    in the worker log, because `_geocode_place` returning None is not an
+    exception and nothing logged the miss (issue #112). Enrichment still
+    degrades rather than failing; it just has to say so.
+    """
+
+    def _config(self):
+        return {"phases": [{"id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"}}]}
+
+    def test_a_phase_that_resolves_nowhere_is_logged(self):
+        from control_plane_worker import enrichment
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            out = enrichment.enrich_config(self._config(), "Japan", http=lambda url: None, pause=0)
+        self.assertNotIn("mapStop", out["phases"][0], "precondition: nothing should have resolved")
+        self.assertTrue(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            f"no geocode_miss logged; got {[r.getMessage() for r in captured.records]}",
+        )
+
+    def test_a_phase_that_resolves_logs_no_miss(self):
+        from control_plane_worker import enrichment
+
+        def http(url):
+            return [{"lat": "35.68", "lon": "139.76", "display_name": "Tokyo"}]
+
+        with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+            logging.getLogger("control_plane_worker.enrichment").warning("sentinel")
+            out = enrichment.enrich_config(self._config(), "Japan", http=http, pause=0)
+        self.assertIn("mapStop", out["phases"][0])
+        self.assertFalse(
+            any("geocode_miss" in r.getMessage() for r in captured.records),
+            "logged a miss for a phase that resolved",
+        )
+
+    def test_a_transport_failure_is_distinguished_from_an_empty_result(self):
+        """429 and 'no such place' both yield None downstream; only one is
+        worth retrying, so they must not look identical in the log."""
+        from control_plane_worker import enrichment
+
+        import urllib.error
+
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+        with mock.patch.object(enrichment.urllib.request, "urlopen", boom):
+            with self.assertLogs("control_plane_worker.enrichment", level="WARNING") as captured:
+                self.assertIsNone(enrichment._default_http("https://nominatim.openstreetmap.org/search?q=x"))
+        messages = [r.getMessage() for r in captured.records]
+        self.assertTrue(any("http_failed" in m for m in messages), messages)
+        self.assertEqual(429, next(getattr(r, "status", None) for r in captured.records))
+
+
+class WorkerLogLevel(unittest.TestCase):
+    """INFO must reach the log. `provisioner.mcp_bridge_wired` and
+    `mcp_bridge_skipped` are both INFO, and with Python's default root level of
+    WARNING they were discarded — so a trip that came up with no trip-mcp left
+    no trace of which of the two happened (2026-09-19)."""
+
+    def _configure(self, env):
+        """Apply _configure_logging under `env` and report the level it set,
+        leaving the root logger exactly as it was — otherwise this class would
+        reconfigure logging for every test that runs after it."""
+        import os
+
+        from control_plane_worker.__main__ import _configure_logging
+
+        root = logging.getLogger()
+        saved_level, saved_handlers = root.level, root.handlers[:]
+        try:
+            root.handlers = []
+            with mock.patch.dict(os.environ, env, clear=False):
+                if "WORKER_LOG_LEVEL" not in env:
+                    os.environ.pop("WORKER_LOG_LEVEL", None)
+                _configure_logging()
+                return root.level
+        finally:
+            root.setLevel(saved_level)
+            root.handlers = saved_handlers
+
+    def test_info_is_the_default(self):
+        self.assertEqual(logging.INFO, self._configure({}))
+
+    def test_the_level_can_be_raised_or_lowered(self):
+        self.assertEqual(logging.DEBUG, self._configure({"WORKER_LOG_LEVEL": "DEBUG"}))
+        self.assertEqual(logging.WARNING, self._configure({"WORKER_LOG_LEVEL": "warning"}))
+
+    def test_an_unrecognised_value_falls_back_to_info_not_to_silence(self):
+        # A typo must not disable logging — that is the failure this prevents.
+        self.assertEqual(logging.INFO, self._configure({"WORKER_LOG_LEVEL": "verbose"}))
+
+
+class LocationQueriesDoNotRepeatThemselves(unittest.TestCase):
+    """A phase must not ask the geocoder for the whole itinerary.
+
+    Organizers answer the destination with a list — "Tokyo, Hakone, Kyoto,
+    Osaka, Japan". The query was f"{label}, {destination}", so the Tokyo phase
+    asked for "Tokyo, Tokyo, Hakone, Kyoto, Osaka, Japan": its own city twice,
+    then three cities it is not in. Nominatim returns nothing for that and
+    _default_http reports nothing as None, so on 2026-09-19 every phase of a
+    real trip silently lost its coordinates and the site showed no map.
+    """
+
+    DEST = "Tokyo, Hakone, Kyoto, Osaka, Japan"
+
+    def test_the_phase_city_is_not_repeated(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        self.assertEqual("Tokyo, Japan", q)
+        self.assertEqual(1, q.lower().count("tokyo"), q)
+
+    def test_other_phases_cities_are_not_dragged_in(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        q = _location_query("Tokyo", _destination_anchor(self.DEST))
+        for elsewhere in ("Hakone", "Kyoto", "Osaka"):
+            self.assertNotIn(elsewhere, q, f"{elsewhere} is not in the Tokyo phase")
+
+    def test_a_single_country_destination_still_anchors(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Rome, Italy", _location_query("Rome", _destination_anchor("Italy")))
+
+    def test_deduplication_ignores_case_and_whitespace(self):
+        from control_plane_worker.enrichment import _location_query
+
+        self.assertEqual("Tokyo, Japan", _location_query("Tokyo", " tokyo ", "TOKYO, Japan"))
+
+    def test_an_empty_destination_leaves_just_the_label(self):
+        from control_plane_worker.enrichment import _destination_anchor, _location_query
+
+        self.assertEqual("Tokyo", _location_query("Tokyo", _destination_anchor("")))
+
+    def test_a_venue_query_carries_its_own_city_and_country_only(self):
+        from control_plane_worker.enrichment import enrich_config
+
+        asked: list[str] = []
+
+        def http(url):
+            asked.append(urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("q", [""])[0]))
+            return None
+
+        cfg = {"phases": [{
+            "id": "tokyo", "title": {"en": "Tokyo", "he": "Tokyo"},
+            "venues": [{"name": {"en": "Tokyo Skytree"}}],
+        }]}
+        out = enrich_config(cfg, self.DEST, http=http, pause=0)
+        maps = out["phases"][0]["venues"][0]["maps"]
+        target = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlsplit(maps).query)["query"][0])
+        self.assertEqual("Tokyo Skytree, Tokyo, Japan", target)
+        for q in asked:
+            self.assertNotIn("Kyoto", q, f"a Tokyo phase asked for Kyoto: {q}")

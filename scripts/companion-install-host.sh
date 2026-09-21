@@ -510,6 +510,21 @@ start_gateway_supervised() {
 #
 # /health asks it: the bridge fetches its own trip's config and says whether it
 # arrived. Local to this host, so it needs no key and reveals no address.
+# The commit this script is running from — "unknown" rather than empty when
+# the checkout is not a git tree, so the field is always present and a missing
+# answer is never mistaken for a matching one.
+repo_commit() {
+  git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || printf 'unknown'
+}
+
+companion_provenance() {
+  local trip_dir="$1" profile="$2" out="$1/companion-provenance.json"
+  printf '{"repo_root":"%s","commit":"%s","branch":"%s","profile":"%s","wired_at":"%s"}\n' \
+    "$REPO_ROOT" "$(repo_commit)" \
+    "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')" \
+    "$profile" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out" 2>/dev/null || true
+}
+
 bridge_reaches_trip() {
   local port="$1" trip_dir="$2" key="" body=""
   # /health is behind the MCP key like every other route on that server. We are
@@ -630,7 +645,17 @@ PYTOPO
           "$MCP_PORT" "$TRIP_SLUG" "$BRIDGE_HEALTH" >&2
         die "trip-mcp wired for $TRIP_SLUG but it cannot reach the trip site"
       fi
-      printf 'WIRED %s\n' "$PROFILE_NAME"
+      # WHICH CHECKOUT BUILT THIS COMPANION. The forced command in
+      # authorized_keys decides that, and on 2026-09-20 it named a feature
+      # branch 12 commits behind — so a run reported on two branches at once
+      # and nothing anywhere said so. Not the worker's log, not the trip's
+      # mcp/.env, not the profile. Hours went into establishing by hand what
+      # this one field says.
+      #
+      # Printed on the WIRED line because that is what the worker already
+      # reads, and written beside the trip because a log line ages out.
+      companion_provenance "$TRIP_DIR" "$PROFILE_NAME"
+      printf 'WIRED %s %s\n' "$PROFILE_NAME" "$(repo_commit)"
       exit 0
     fi
     # Wired but not reachable BY THE AGENT, which is the only sense that

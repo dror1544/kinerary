@@ -511,7 +511,8 @@ out of 4.5).
 
 As of 2026-08-30 every item below is `built` except one low-visual residual
 (`follow-on`): **prose anchor extraction**. The `separate build` (site
-live-plan enrichment worker) stays out of 4.5.
+live-plan enrichment worker) stayed out of 4.5 and was built separately on
+2026-09-12 — see its row.
 
 | Item | Tag | Notes |
 |---|---|---|
@@ -528,7 +529,34 @@ live-plan enrichment worker) stays out of 4.5.
 | Phase narrative blurb | `built` | `transformer._phase_note_text` writes a readable blurb ("4 nights in Tokyo, 6 Sep–10 Sep. Staying at …. 3 days planned") with any trimmed name context as a trailing clause, replacing the raw concat. |
 | Persist the raw uploaded document | `built` | Migration 0024 adds `intake_sessions.source_document` + `intake_versions.source_document` (jsonb `{filename,text,savedAt}`). `POST /v1/interview/:id/source-document` stages it; `extract_itinerary` forwards the document after extracting (best-effort); `confirmIntake` copies session → version. Sibling column — outside the `data` canonical-safety CHECK and the digest. |
 | Structured budget | `built` | Optional `budget_detail` structured question → `transformer._derive_budget` projects `config.budget` (`party_size` / `phases` / `phase_labels` / `seed_items`), the shape `server.js` seeds `budget_items` from. Categories validated to the site's set; `amount 0 + estimate` → a "fill-in" row; `seed_key` stable for idempotent re-seed. No `INTAKE_SCHEMA_VERSION` bump (additive-optional). |
-| Site live-plan enrichment worker | `separate build` | The trip site already has the DB hooks — `phase_plan_items` / `phase_plan_days` with `enrichment_status` (`none/pending/done/failed`), `review_status`, `config_ref` dedup, day-headline correction trail. A worker that calls a model post-deploy to detect ticketing needs, re-enrich, and feed the in-app review queue is its own sprint, not 4.5. |
+| Site live-plan enrichment worker | `separate build` — **BUILT (2026-09-12)** | The post-deploy judge, and the queue its proposals wait in. `control-plane/api/src/plan-review.ts` reads the deployed `trip.config.json` plus the confirmed intake and the uploaded document, and files PROPOSALS — never edits to a live trip. Deterministic half (no model, runs everywhere): the arrival with no landing on it (timed from a `travel_anchors` flight, asked for when there is none), the check-in that was never written down (by hotel name, deliberately with no time and a question for the hour), the transfer between two legs that nothing describes, a blank day, a day out of clock order, a place on `venues[]` that no day mentions, a venue link the day line never got, a ticketing question for a venue with no URL, a day too full or too long for the `trip_pace` they answered (budget tightened by a young child or a `constraints` note, both quoted), and a hop between two districts with no time to make it. Model half (task `plan_review` through `model-runner.ts`, `PLAN_REVIEW_RUNNER`/`PLAN_REVIEW_MODEL`): day headlines, orderings and additions, each through `interpret.ts`'s own gate — `evidenceAppears`, `exampleEchoes`, plus a refusal of any URL and of any place the trip does not already name. Storage: migration 0050 (`plan_reviews`, `plan_review_proposals`, `trips.plan_snapshot`), keyed by the proposal's content fingerprint so a re-review dedups, with an organizer's accept/dismiss sticky across passes. The provisioner stores the config it shipped (`_record_plan_snapshot`, best-effort); `runPendingPlanReviews` on a 5-minute loop in `server.ts` does the rest. **Not yet built**: nothing applies an accepted patch, and nothing surfaces the queue to the organizer — no route, no companion tool. The trip site's own `phase_plan_items`/`phase_plan_days` hooks this row names are still unused by it. |
+
+> **Ship rules-only for now — decided 2026-09-15, after a live comparison against
+> today's per-item `/enrich`.** Full test: `docs/test-reports/plan-review-vs-enrich-comparison-2026-09-15.md`.
+> Both were run against the same `kinerary-extract` Hermes profile on the Mac mini
+> only (no VM). Headline finding: the **deterministic half alone** produced 33
+> real, evidence-backed proposals on the `japan-2025` fixture for zero model
+> calls — arrival, check-in, ordering, unscheduled venues, pace fit, all of it
+> arithmetic over data the trip already has. The **model half added nothing**
+> beyond that on the same run (4 phase calls, `rejected: 0`, `modelUsed: false`)
+> — not proven worthless, just not proven worth its cost yet; a fixture with a
+> gap only a model could catch (e.g. a document naming something the config
+> doesn't) would be needed to tell "rules already cover everything" apart from
+> "the model underperforms this task," and that has not been run.
+>
+> So: this row ships with `PLAN_REVIEW_RUNNER` **left unset in every deployment
+> config** — which the code already degrades to cleanly (`modelSkipped: NO_RUNNER`,
+> never a silent downgrade) — until a harder fixture justifies turning the model
+> half on. `/enrich` itself is unchanged and keeps doing its own job (today's
+> fallback, `gpt-5.6-luna-900k` via `openai-codex` since `kinerary-extract`'s
+> primary OpenRouter id is broken — same finding as the 2026-09-13 report —
+> returned three verified-live links on this run, a real improvement over that
+> report's OpenRouter result of 4-of-6 dead). One thing worth carrying back into
+> `/enrich`, separately from this row: its only guard on model output today is
+> "starts with `http(s)`", where this module's gate (no invented place, no
+> model-supplied URL, every claim needs a quotable source) is strictly
+> stronger — the dead-link finding in the 09-13 report is exactly the failure
+> mode that gate exists to prevent.
 
 #### §4.5-i. Itinerary-from-document spec (`this step`)
 
@@ -897,6 +925,19 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Half B (two live Hermes profiles, no private-memory leakage) tests an
 > upstream property and belongs as a one-time live verification, not a suite.
 >
+> **`/select` is BUILT, under the name `/switch`** — c3ac940, PR #47
+> (`feat/trip-bot-trip-commands`).
+> `docs/trip-bot-command-surface.md` designs the organizer command surface
+> Dror asked for — `/trips`, `/switch`, `/interview`, `/group`, `/url` — plus
+> Telegram's own command menu. `/trips`, `/switch` (alias `/select`) and the
+> menu shipped; `/group` already worked; `/interview` is kept for later and
+> `/url` was dropped, since `/help` already gives the site address (Dror,
+> 2026-09-13). It also built a **prerequisite this box never named**: the
+> router could not resolve a Telegram sender to a `user_id` at all. That is
+> migration 0052's
+> `telegram_organizer_links` — its own many-`user_id`s-per-person table, not a
+> row in `user_identities`, whose unique constraint allows only one.
+>
 > **Deferred with a reason:** the richer router-issued
 > organizer/trip/channel/role/lifecycle capability. What ships stamps a
 > *profile name*. Whether that suffices for the exit gate is undecided — see
@@ -906,7 +947,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > remaining piece of this sprint.
 >
 > **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
-> runs in one day (`docs/signup-test-run1..6-raw-notes.md`) reached a confirmed
+> runs in one day (`docs/test-reports/signup-test-run1..6-raw-notes.md`) reached a confirmed
 > intake twice, and one of those needed two manual database unblocks. The
 > analysis is `docs/interview-design-review.md`: these are not six unrelated
 > defects but four missing pieces of the contract between the router and the
@@ -1241,9 +1282,14 @@ Build:
 - Create provider-neutral messaging bindings and the shared Trip Bot router.
   Bind `provider + bot identity + chat ID` to exactly one trip only after a
   signed organizer action and permission verification.
-- Implement private `/select` over owned trips with signed callbacks. Private
+- Implement private `/select` over owned trips with callback buttons. Private
   selection is independent from group routing, and reviewed reassignment
-  preserves binding history.
+  preserves binding history. *(Amended 2026-09-13, Dror's decision — this said
+  "signed callbacks". A switch button's payload only names a row: the tap is
+  re-authorized from the tapper's verified Telegram id against their own trips,
+  so a forged payload selects nothing a typed `/switch <slug>` could not, and a
+  signature would protect nothing. Signed, expiring actions remain the rule
+  wherever the payload itself carries authority — signup approval, enrollment.)*
 - Keep intake, organizer-private and group-chat sessions/policies separate.
   Add the private owner-only Super Bot for redacted alerts and narrow
   plan/approve/execute operations. Dedicated-bot support remains optional.
@@ -1409,6 +1455,33 @@ own completeness check. Not met while the SOUL gap above stands.
 
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
+
+> **How this work is organised — five tracks (2026-09-19).** The build list
+> below is unchanged and remains the authority on *what* Sprint 6 delivers. It is
+> executed as five tracks with different goals, audiences and shipping cadences,
+> defined in **`docs/sprint6-tracks.md`** — read that before picking anything up.
+>
+> | Track | Goal | Ships |
+> |---|---|---|
+> | 1 — Trip UI/UX | Day-of usefulness for the traveler | site items continuously; transformer items to one pilot trip, then the fleet |
+> | 2 — Landing page, accounts, monitoring, data | Does the product actually work? | to the VM at sprint end, via `kinerary-cp-release` |
+> | 3 — Model efficiency and cost | Make model spend real, predictable, attributable | harness → recommendation → instrumentation |
+> | 4 — Housekeeping | Truthful backlog, live trips stop breaking, clean tree, docs aligned | front-loaded, then small |
+> | 5 — Exit gate | Prove the lifecycle end to end | last |
+>
+> Where this section's own bullets land: the verification aggregator, the
+> dashboard, the runbook, the outcome events, the daily report and the
+> missing-information control loop are all **track 2**; the demo rehearsal, the
+> `japan-2026` full cycle and the automated test list are **track 5**; the
+> activation bullet stays superseded. **Nothing in this build list is track 1, 3
+> or 4** — those fill from the Sprint 5 carry-forward, the §4.5 enrichment
+> residue and the open issue list, and the added and removed items are recorded
+> in `docs/sprint6-tracks.md` rather than edited into this section.
+>
+> The tracks are meant to **run in parallel**; that file names the few places
+> they contend — chiefly migration numbering, PR #92 gating the model work, and
+> provisioning infrastructure being single-threaded.
+
 
 Build:
 
@@ -1840,12 +1913,23 @@ that branch) so it evolves on this line rather than diverging. The SPA ships
 here **ahead of its control-plane wiring**: the endpoints it calls
 (`web/src/api.ts`) are not yet mounted on this branch's control-plane API.
 Until then the SPA builds and tests in isolation (its own CI job) but is not
-wired to a live control plane. Landing-spa's parallel early control-plane
+wired to a live control plane.
+
+**Superseded 2026-09-19 — the wiring landed.** `control-plane/api/src/portal.ts`
+mounts every endpoint `web/src/api.ts` calls, registered from `app.ts` whenever
+`profile.web` is configured, with `portal.test.ts` and `portal-db.test.ts`
+covering it. The paragraph above describes the branch as it was; it is kept
+because the *decisions* after it are still open, but the SPA is wired. What is
+genuinely missing is narrower: the richer trip-card model and the action surface
+in `docs/web-control-plane-integration-plan.md` §8, and organizer email/password
+signup (four of its nine account endpoints exist).
+
+Landing-spa's parallel early control-plane
 implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
 deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
 authoritative.
 
-Three connection points between the SPA and the control plane are **open
+Four connection points between the SPA and the control plane are **open
 future decisions**. They are recorded here so they are not lost; each is
 revisited in a dedicated post-MVP web track *unless* the note below says a
 coming sprint is the right place to start it:
@@ -1874,6 +1958,18 @@ coming sprint is the right place to start it:
    intake flow is a smaller addition there than as its own track. What starts
    the intake (the SPA vs. the Telegram router) and where the organizer's
    verified chat id is captured are the sub-decisions.
+4. **A Telegram Mini App over the same console** *(raised 2026-09-10)*. A mini
+   app managing trips is the SPA's pages in a Telegram webview over
+   `portal.ts`'s existing organizer-scoped read model — which is why it is
+   recorded here rather than as its own thing. It is a **discussion, not a
+   plan**, and it has one blocking question ahead of any estimate: a mini app
+   authenticates by verifying `initData`, which is Telegram-derived web
+   authentication, and this deployment retired exactly that
+   (`/v1/auth/telegram` → 410, and Telegram SSO is permanently ruled out). The
+   retired path was a *per-trip site* widget and the structural objection may
+   not carry over to one bot and one control-plane origin — but that is a
+   ruling for Dror, not an inference. Discussion and the remaining open
+   questions: `docs/trip-bot-command-surface.md` §10.
 
 After the MVP, connected services should arrive in separately reviewed tracks:
 

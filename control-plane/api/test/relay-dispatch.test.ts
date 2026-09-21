@@ -5,8 +5,14 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink, answerCallbackData, CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
+import {
+  startFromDeepLink,
+  answerCallbackData,
+  CONFIRM_CALLBACK_DATA,
+  setCompanionExpectsReply,
+} from "../src/chat-router.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
+import { GroupContext } from "../src/relay/group-context.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -838,6 +844,81 @@ describe("the companion arriving in a group", { skip: SKIP }, () => {
   });
 });
 
+describe("companion reply-capture through dispatchUpdate (migration 0053)", { skip: SKIP }, () => {
+  test("an open window lets the very next unaddressed group message through, once", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001000";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await setCompanionExpectsReply(fix.pool, chatId, true);
+
+      const first = await dispatchUpdate(fix.pool, msg(chatId, "Friday works for us", "group"));
+      assert.equal(first.kind, "to_gateway", "the window captures the very next message, whoever sends it");
+
+      const second = await dispatchUpdate(fix.pool, msg(chatId, "anyway, who's driving?", "group"));
+      assert.deepEqual(
+        second,
+        { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "one-shot: the window was already spent by the first message",
+      );
+    });
+  });
+
+  test("an unaddressed group message with no open window is ignored, as today", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001001";
+      await bindCompanion(fix, chatId, "companion-japan");
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "just chatting amongst ourselves", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a window past its floor lapses instead of capturing", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001002";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.telegram_chat_bindings
+            SET awaiting_reply_since = now() - interval '1 hour', awaiting_reply_floor_seconds = 150
+          WHERE chat_id = $1`,
+        [chatId],
+      );
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "Friday works", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("a per-trip opt-out defeats capture even with a fresh window", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002001003";
+      await bindCompanion(fix, chatId, "companion-japan");
+      await fix.pool.query(
+        "UPDATE control_plane.trips SET companion_reply_capture_enabled = false WHERE id = $1",
+        [fix.tripId],
+      );
+      await setCompanionExpectsReply(fix.pool, chatId, true);
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "Friday works", "group"));
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" });
+    });
+  });
+
+  test("an @mention still addresses the assistant normally, independent of any window", async () => {
+    // Guards against the new `capturedAsReply ||` short-circuit having broken
+    // the ordinary gate it sits beside.
+    await withFixture(async (fix) => {
+      const chatId = "-1002001004";
+      await bindCompanion(fix, chatId, "companion-japan");
+      const decision = await dispatchUpdate(
+        fix.pool,
+        msg(chatId, "@kinerary_bot what time is our flight?", "group"),
+        DEFAULT_STRINGS,
+        () => {},
+        { id: "8463178587", username: "kinerary_bot" },
+      );
+      assert.equal(decision.kind, "to_gateway");
+    });
+  });
+});
+
 describe("the agent answering in the wrong language", () => {
   test("Hebrew interview, Hebrew agent text — kept", () => {
     assert.equal(agentTextIsInLanguage("רשמתי, ממשיכים", "he"), true);
@@ -867,5 +948,162 @@ describe("the agent answering in the wrong language", () => {
   test("empty text is not a language failure", () => {
     assert.equal(agentTextIsInLanguage("", "he"), true);
     assert.equal(agentTextIsInLanguage("   ", "he"), true);
+  });
+});
+
+/**
+ * Overheard group context (R11) — and what it must NOT touch.
+ *
+ * The rule, stated by Dror on 2026-09-20 and asserted here so it cannot drift:
+ *
+ *   - explicitly addressed            -> respond, exactly as today
+ *   - not addressed                   -> DO NOT respond; retain as context
+ *   - later explicitly addressed      -> respond, with the retained context
+ *   - the reply-capture window (#122) -> the ONE separate exception where an
+ *                                        unaddressed message is still routed
+ *
+ * The danger this block exists to catch is a subtle one: that holding a
+ * message for context quietly becomes a reason to answer it. Every test here
+ * pairs "what was retained" with "what the gate decided", because the second
+ * is the part that must not move.
+ */
+describe("overheard group context (R11)", { skip: SKIP }, () => {
+  const NAMED = ["פאם", "Pam"];
+
+  async function bindNamedCompanion(fix: Fixture, chatId: string): Promise<void> {
+    await bindCompanion(fix, chatId, "companion-japan");
+    await fix.pool.query(
+      "UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1",
+      [fix.tripId, NAMED],
+    );
+  }
+
+  test("an unaddressed group message is still NOT answered — it is only remembered", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002100000";
+      await bindNamedCompanion(fix, chatId);
+      const ctx = new GroupContext();
+
+      const decision = await dispatchUpdate(
+        fix.pool, msg(chatId, "אני חושבת שעדיף יומיים בהוי אן", "group"),
+        undefined, undefined, {}, { groupContext: ctx },
+      );
+
+      assert.deepEqual(decision, { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "retaining context must never become a reason to answer");
+      assert.equal(ctx.take(chatId).length, 1, "and it was retained");
+    });
+  });
+
+  test("being named still routes, and carries what was overheard since", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002100001";
+      await bindNamedCompanion(fix, chatId);
+      const ctx = new GroupContext();
+
+      await dispatchUpdate(fix.pool, msg(chatId, "אני רוצה יום חופש בים", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "פאם, מה דעתך?", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+
+      assert.equal(decision.kind, "to_gateway", "naming it routes, exactly as before");
+      const text = JSON.stringify(decision);
+      assert.ok(text.includes("יום חופש בים"), "the overheard turn rode along");
+      assert.ok(text.includes("מה דעתך"), "and so did what was actually said to it");
+    });
+  });
+
+  test("a @mention routes with the same context, by the same rule", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002100002";
+      await bindNamedCompanion(fix, chatId);
+      const ctx = new GroupContext();
+
+      await dispatchUpdate(fix.pool, msg(chatId, "מישהו בדק מחירים?", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      const decision = await dispatchUpdate(
+        fix.pool, msg(chatId, "@Kinerary_bot what do you think?", "group"),
+        undefined, undefined, { username: "Kinerary_bot" }, { groupContext: ctx },
+      );
+
+      assert.equal(decision.kind, "to_gateway");
+      assert.ok(JSON.stringify(decision).includes("מחירים"), "the overheard turn rode along");
+    });
+  });
+
+  test("the context is spent once, not attached to every later question", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "-1002100003";
+      await bindNamedCompanion(fix, chatId);
+      const ctx = new GroupContext();
+
+      await dispatchUpdate(fix.pool, msg(chatId, "נועם רוצה מסעדה צמחונית", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      const first = await dispatchUpdate(fix.pool, msg(chatId, "פאם, יש רעיון?", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      const second = await dispatchUpdate(fix.pool, msg(chatId, "פאם, ומה עם מחר?", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+
+      assert.ok(JSON.stringify(first).includes("צמחונית"));
+      assert.ok(!JSON.stringify(second).includes("צמחונית"),
+        "the same small talk must not follow every question for the rest of the trip");
+    });
+  });
+
+  test("a DM is untouched: nothing is retained and nothing is prefixed", async () => {
+    await withFixture(async (fix) => {
+      const chatId = "998877";
+      await bindNamedCompanion(fix, chatId);
+      const ctx = new GroupContext();
+
+      const decision = await dispatchUpdate(fix.pool, msg(chatId, "מה התוכנית למחר?"),
+        undefined, undefined, {}, { groupContext: ctx });
+
+      assert.equal(decision.kind, "to_gateway", "a DM is addressed by construction");
+      assert.ok(!JSON.stringify(decision).includes("overheard"),
+        "a DM has no unaddressed traffic, so it must gain no banner");
+      assert.equal(ctx.take(chatId).length, 0);
+    });
+  });
+
+  test("with no context to carry, an addressed message is byte-for-byte what it was", async () => {
+    // The regression that would be easiest to ship unnoticed: a banner, or an
+    // empty fence, on every message in a quiet group.
+    await withFixture(async (fix) => {
+      const chatId = "-1002100004";
+      await bindNamedCompanion(fix, chatId);
+
+      const withCtx = await dispatchUpdate(fix.pool, msg(chatId, "פאם, מה השעה?", "group"),
+        undefined, undefined, {}, { groupContext: new GroupContext() });
+      const without = await dispatchUpdate(fix.pool, msg(chatId, "פאם, מה השעה?", "group"));
+
+      assert.equal(withCtx.kind, "to_gateway");
+      assert.deepEqual(
+        (withCtx as { event?: { text?: string } }).event?.text,
+        (without as { event?: { text?: string } }).event?.text,
+        "no context means no change at all",
+      );
+    });
+  });
+
+  test("the reply-capture window stays the ONE exception, and does not become two", async () => {
+    // #122's window is the only path by which an unaddressed message is
+    // answered. R11 must not create a second one, and must not disable this.
+    await withFixture(async (fix) => {
+      const chatId = "-1002100005";
+      await bindNamedCompanion(fix, chatId);
+      await setCompanionExpectsReply(fix.pool, chatId, true);
+      const ctx = new GroupContext();
+
+      const captured = await dispatchUpdate(fix.pool, msg(chatId, "יום שישי מתאים לנו", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      assert.equal(captured.kind, "to_gateway", "the open window still captures, as before");
+
+      const next = await dispatchUpdate(fix.pool, msg(chatId, "ומי נוהג?", "group"),
+        undefined, undefined, {}, { groupContext: ctx });
+      assert.deepEqual(next, { kind: "ignore", reason: "NOT_ADDRESSED" },
+        "one-shot still means one-shot — context does not extend it");
+      assert.equal(ctx.take(chatId).length, 1, "the ignored one was retained instead");
+    });
   });
 });

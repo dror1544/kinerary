@@ -295,6 +295,50 @@ and a bare sha means the patches are gone. Currently carried:
 which a deferred tool call whose payload the model spelled `parameters` is
 silently never invoked.
 
+### The fleet monitor — bootstrapped, not assembled
+
+```bash
+/opt/kinerary-deploy/bootstrap-monitor.sh            # build it; gateway stays stopped
+/opt/kinerary-deploy/bootstrap-monitor.sh --check    # what is missing, changes nothing
+/opt/kinerary-deploy/bootstrap-monitor.sh --start-gateway
+```
+
+Part of bringing this VM up, not a thing to remember: profile, skill, config,
+MCP servers and both schedules, idempotent, so rebuilding the VM is one command
+rather than a page of steps. Run it after the stack is up.
+
+**It is split across the two repositories on purpose.** The mechanism is
+`scripts/bootstrap-fleet-monitor.sh` in the product repo and names no host,
+container, uid or path — it refuses rather than defaulting to somebody's
+machine. `kinerary-deploy/bootstrap-monitor.sh` is the half that knows this VM,
+and it is private for the same reason `deploy.sh` and `bring-up.sh` are.
+
+It belongs here rather than on the Mac because it watches production, and on
+the Mac it watched production *through an SSH tunnel, while the laptop was
+awake* — so the fleet went unwatched exactly when nobody was looking.
+
+Three things it decides, each of which has an obvious wrong answer:
+
+- **It reads the database over host-networked loopback** —
+  `.local-secrets/control_plane_database_url_host`, the relay's own view, at
+  `127.0.0.1:5433`. The fleet MCP can also `docker exec` into postgres, and that
+  is the answer to refuse: Hermes gets no Docker socket (safety rule 6). The MCP
+  still opens every connection read-only through `PGOPTIONS`.
+- **It verifies psql exists inside the Hermes container**, because the image is
+  not ours. Without it the MCP reads nothing and reports nothing — which looks
+  exactly like a healthy fleet. If it is missing, add a `postgresql-client`
+  layer to the Hermes image and rebuild; do not install it into the running
+  container, which loses it on the next recreate.
+- **It does not start the gateway.** The monitor has its own bot, and Telegram
+  gives each update to one `getUpdates` loop. Stop the Mac's
+  (`hermes -p trip-monitor gateway stop`) before `--start-gateway` here.
+
+Issue filing is optional and off unless `/opt/kinerary-deploy/issue-target.json`
+exists: without it the monitor still watches and still reports to the operator
+chat, it just cannot open a GitHub issue. The token is a fine-grained PAT scoped
+to Issues on one repository — never the `gh` CLI's login. See the skill's
+Install section.
+
 ## Companion host
 
 The worker installs a trip's companion over SSH to a forced command, as on the
@@ -687,8 +731,11 @@ so the Mac stops depending on a coding-session preference.
 Not done. Gates, in order:
 
 1. The VM's branch must carry every migration the Mac's database has applied —
-   today the Mac has `0050_telegram_organizer_links.sql`, the VM's branch does
-   not.
+   today the Mac has `0050_telegram_organizer_links.sql`, which PR #47 renamed
+   `0052_telegram_organizer_links.sql`. The VM's branch needs the 0052 file.
+   The Mac's leftover `0050_…` row names a file that no longer exists and is not
+   a gap to close: the renamed file is safe to re-run, and does exactly that on
+   the Mac.
 2. No interview mid-turn (`intake_sessions.awaiting = 'machine'`).
 3. Stop the Mac's relay, sidecar, trip-intake gateway and compose stack — only
    one `getUpdates` loop may own `@Kinerary_bot`.

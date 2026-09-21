@@ -159,6 +159,12 @@ for marker, rows in fixtures.items():
         for sql in self.sql_for("prod"):
             select_list = sql.split("FROM", 1)[0]
             self.assertNotIn("now()", select_list, f"elapsed time in alerts output:\n{sql}")
+            # A SELECT with no FROM returns exactly one row — alerts probes for
+            # companion_bug_reports that way, so a stack behind migration 0054
+            # degrades instead of breaking. Row order is not a property one row
+            # can have, let alone lose; everything that reads a table needs it.
+            if "FROM" not in sql:
+                continue
             self.assertIn("ORDER BY", sql, f"unordered alerts query:\n{sql}")
 
     def test_healthy_alerts_print_nothing(self):

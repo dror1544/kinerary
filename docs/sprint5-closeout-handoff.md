@@ -63,6 +63,14 @@ Sprint 5 FINISHED box in the sprint plan, `docs/e2e-full-test.md`, and this file
 
 ## 5. Merge #40 (integration → `main`), with Dror's approval
 
+**Done — 2026-09-13.** `d6d2e0e` merged PR #40 (`integration/sprint-5-plus` →
+`main`). Independently confirmed from this checkout's git history
+(`git log --oneline main`/`origin/main`). PR #76 (dispatch.ts never threaded
+`botUsername`/login usernames into a live group message —
+`companionIntroLoginUsernames()` in `chat-router.ts`) landed first. Full suite
+green at the time: 1081 tests, 1075 pass, 6 skipped, `tsc` clean, all 6 CI
+checks pass. #47, #64, #73 remained open at that point, not blocking.
+
 ## 6. Deploy `main` to the VM, with Dror's approval
 
 The VM checkout still tracks `feat/cp-vm-compose`; move it to `main`
@@ -76,6 +84,17 @@ The VM checkout still tracks `feat/cp-vm-compose`; move it to `main`
 *Done when:* every `kinerary-cp-*` container runs the rev, `readyz` is ready,
 the relay's `relay.bot_identity` is `Kinerary_bot`, and there are no `409`s.
 
+**Reported done by Dror 2026-09-14; independently re-verified 2026-09-15 by
+SSH** (`ssh -i ~/.ssh/id_ed25519_kinerary_cp debian@192.168.0.45` — `readyz`
+is loopback-only on the VM, not reachable from a Mac shell directly, so this
+needs SSH, not `curl` from the Mac). Confirmed on the VM: `/opt/kinerary` on
+`main` @ `aa61f6e` (= `origin/main` HEAD at check time, "Merge PR #79"),
+`vm.env`'s `KINERARY_REV` matches, every `kinerary-cp-*` container running
+that tag (~9-10h old at check time), `readyz` reports ready with 51
+migrations, relay log shows `bot_identity=Kinerary_bot`, `polling: true`,
+zero 409s in the last 300 lines. All of this step's own done-when criteria
+are met, checked directly rather than taken on Dror's word.
+
 ## 7. Run the full E2E: `docs/e2e-full-test.md`
 
 1. **A:** `--scenario all --auto --teardown`, with provisioning on only for
@@ -83,6 +102,19 @@ the relay's `relay.bot_identity` is `Kinerary_bot`, and there are no `409`s.
 2. **B:** hand Dror the `vm-manual-test.sh --wait-minutes 60` link and stop;
    he drives it and reports back.
 3. Write `docs/test-reports/vm-e2e-<date>.md`.
+
+**Reported done by Dror 2026-09-14; only partially corroborated 2026-09-15,
+not confirmed.** `control_plane.trips` on the VM shows a dense burst of test
+trips created and torn down through 2026-09-14, slugs matching the documented
+scenarios, ending in a clean batch ~18:21–19:25 UTC — consistent with a real
+run. But **no `docs/test-reports/vm-e2e-2026-09-14.md` (or any date past
+09-13) exists anywhere** — checked git history on every branch, every
+worktree, and the VM's own checkout. The only committed report is
+`vm-e2e-2026-09-13.md`, against an earlier revision (`39ba81e`, before
+`aa61f6e`). So: activity looks real, but sub-step 3 (write the report)
+genuinely was not done. Scenario B is inherently unverifiable from server
+state alone. **Someone still needs to write
+`docs/test-reports/vm-e2e-2026-09-14.md`** before this step is actually done.
 
 ## 8. First real user, once steps 6–7 pass
 
@@ -92,6 +124,15 @@ generating one, check that provisioning is back off, no test trip is still in a
 build, and the relay is on `@Kinerary_bot`. Remember it is a real family's data
 from then on: teardown refuses past `ready_private`, and nothing about them goes
 into the repo.
+
+**Reported done by Dror 2026-09-14; not independently verifiable from this
+environment, by design** — no LAN/VM access here beyond the SSH path above,
+and this step is specifically about a real family's private data, which
+should not be inspected or reproduced in a repo checkout regardless. One
+non-identifying data point: a new `draft`-state trip appeared in the VM's
+database 14 minutes after the last E2E teardown on 09-14, untouched since —
+consistent with, but not proof of, a link having been sent. Its
+destination/chat-id/contents were deliberately not inspected.
 
 ## 9. Clean-up, only on Dror's word
 

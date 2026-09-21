@@ -1,15 +1,15 @@
 # Signup test — execution capture
 
 Where issues raised during signup-test-plan runs stand. Dror's verbatim run-1
-notes and the agent debriefs live in **`signup-test-run1-raw-notes.md`**
+notes and the agent debriefs live in **`test-reports/signup-test-run1-raw-notes.md`**
 (archived 2026-08-29); this file keeps only the triaged Status ledger below,
 which is the source of truth for what is done vs. planned.
 
 **No run is in progress.** The most recent is **run 13 (2026-09-05,
-finished)** — notes in **`signup-test-run13-raw-notes.md`**, outcome
+finished)** — notes in **`test-reports/signup-test-run13-raw-notes.md`**, outcome
 `intake_confirmed` with 18 answers, the fourth clean confirmation in a row.
 Its five findings are triaged into the ledger below as Step 3 #13 (refined),
-#14, #15 and #16. Earlier runs keep their own `signup-test-run<N>-raw-notes.md`
+#14, #15 and #16. Earlier runs keep their own `test-reports/signup-test-run<N>-raw-notes.md`
 files; nothing from a run enters the ledger until that run ends.
 
 **Standing instructions for every run:**
@@ -60,7 +60,7 @@ Every row below now has a home:
   analytics; approval gates via the Hermes MCP (Step 3 #12) → exploration,
   unscheduled.
 
-Issue text and original wording: `signup-test-run1-raw-notes.md`. "Open" here
+Issue text and original wording: `test-reports/signup-test-run1-raw-notes.md`. "Open" here
 does not mean "no owner" — read the row's home from Routing.
 
 ### General comments
