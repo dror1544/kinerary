@@ -359,6 +359,17 @@ for f in ${REL+"${REL[@]}"}; do
 
   # Already in HEAD means already shipped: grandfathered, and never renamed.
   git cat-file -e "HEAD:$f" 2>/dev/null && continue
+  # A MERGE brings the other branch's files in as if they were new: on a merge
+  # commit HEAD is still this side, so every legacy migration arriving from the
+  # other parent looks like one this change is adding. It is not — it was
+  # committed over there, where this same check already fired at the moment
+  # someone could still act on it. Re-litigating it here blocks the merge and
+  # teaches an allow-list entry for a file that is genuinely grandfathered.
+  # `.githooks/pre-merge-commit` runs these checks, so this fires in both
+  # directions on any branch still carrying a legacy `00xx_` name.
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    git cat-file -e "MERGE_HEAD:$f" 2>/dev/null && continue
+  fi
 
   printf '%s' "$base" | grep -qE '^[0-9]{14}_.+\.sql$' \
     || block "new migration does not use a timestamp name: $f" \
