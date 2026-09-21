@@ -15,7 +15,8 @@ REPO = Path(__file__).resolve().parents[2]
 AGENTS = REPO / ".claude/agents"
 MODELS = {"sonnet", "opus", "haiku", "inherit", "fable"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
-READ_ONLY = {"verifier", "boundary-reviewer"}
+READ_ONLY = {"verifier", "boundary-reviewer", "consult"}
+NO_SHELL = {"consult"}  # a judgment call runs nothing: no Bash either
 TEAM = {"developer", "integrator", "doc-keeper"}
 
 
@@ -43,13 +44,21 @@ class AgentFiles(unittest.TestCase):
             tools = frontmatter(AGENTS / f"{name}.md").get("tools", "")
             self.assertNotRegex(tools, r"\b(Write|Edit)\b", name)
 
+    def test_the_consult_cannot_run_or_spawn_anything(self):
+        # 2026-09-20: a consult with a full tool surface wrote a probe into the
+        # live-served worktree and staged it into the shared index (#135).
+        for name in NO_SHELL:
+            tools = frontmatter(AGENTS / f"{name}.md").get("tools", "")
+            self.assertNotRegex(tools, r"\b(Bash|Agent|Write|Edit|NotebookEdit)\b", name)
+            self.assertNotIn("general-purpose", (AGENTS / "integrator.md").read_text().split("\n---\n")[0])
+
     def test_no_role_disallows_a_specific_subagent(self):
         # `disallowedTools: Agent(x)` removes the Agent tool entirely (docs, 2026-09-20).
         for path in AGENTS.glob("*.md"):
             self.assertNotIn("disallowedTools: Agent(", path.read_text(), path.name)
 
     def test_judgment_roles_run_opus_and_everyday_roles_run_sonnet(self):
-        expected = {"regression-planner": "opus", "boundary-reviewer": "opus",
+        expected = {"regression-planner": "opus", "boundary-reviewer": "opus", "consult": "opus",
                     "developer": "sonnet", "integrator": "sonnet", "doc-keeper": "sonnet",
                     "verifier": "sonnet", "pr-steward": "sonnet", "sprint-scribe": "sonnet", "run-capture": "sonnet"}
         for name, model in expected.items():
