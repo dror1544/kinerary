@@ -231,6 +231,24 @@ export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Pro
   return env;
 }
 
+/**
+ * The minimal environment a nested Codex CLI needs to locate its executable,
+ * authentication/config directory and system certificates. In particular,
+ * provider keys, bot tokens and other relay configuration never reach a model
+ * process that is structuring untrusted organizer input.
+ */
+export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    "PATH", "HOME", "CODEX_HOME", "XDG_CONFIG_HOME",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ]);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  );
+}
+
 function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
   return new Promise((resolve) => {
     execFile(
@@ -292,6 +310,29 @@ export interface CodexSpec {
   cwd: string;
 }
 
+/**
+ * Disable every Codex agent capability that could act on untrusted document
+ * text. `read-only` limits writes; these flags also remove shell, network,
+ * computer-use, MCP, plugins, apps and delegation from the model's tool set.
+ */
+export const CODEX_ISOLATION_FEATURES: readonly string[] = [
+  "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host",
+  "apps", "plugins", "remote_plugin", "plugin_sharing",
+  "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser", "computer_use",
+  "hooks", "multi_agent", "image_generation", "view_image", "sleep_tool",
+  "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
+];
+
+export const CODEX_ISOLATION_ARGS: readonly string[] = [
+  // Auth still comes from CODEX_HOME, but no config.toml can re-enable a tool.
+  "--ignore-user-config",
+  ...CODEX_ISOLATION_FEATURES.flatMap((feature) => ["--disable", feature]),
+  "-c", "mcp_servers={}",
+  "-c", "plugins={}",
+  "-c", "apps={}",
+  "-c", 'shell_environment_policy.inherit="none"',
+];
+
 export function codexSpec(model: string, timeoutMs = DEFAULT_TIMEOUT_MS, over: Partial<CodexSpec> = {}): CodexSpec {
   return { bin: "codex", model, timeoutMs, maxAttempts: 2, cwd: tmpdir(), ...over };
 }
@@ -306,6 +347,7 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
     "--skip-git-repo-check",
     "--ephemeral",
     "--ignore-rules",
+    ...CODEX_ISOLATION_ARGS,
     "-o", answerPath,
   ];
   if (req.schema) {
@@ -320,7 +362,11 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
       // spawn, not execFile: stdin must be closed. Codex waits on it for extra
       // instructions otherwise, and a call that hangs on an empty pipe is worse
       // than one that fails.
-      const child = spawn(spec.bin, args, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(spec.bin, args, {
+        cwd: spec.cwd,
+        env: codexChildEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
       let err = "";
       let settled = false;
       const timer = setTimeout(() => {
