@@ -981,7 +981,8 @@ export function composeRunners(byTask: Record<string, StructuredModelRunner>): S
  *
  * The file may hold the bare key, or be an env file with an
  * `OPENROUTER_API_KEY=` line — which is where the key already lives: Hermes
- * keeps it in `~/.hermes/.env`, and the VM mounts `/opt/agent-auth/openrouter.env`.
+ * keeps it in `~/.hermes/.env`, and a deployment mounts its own env file
+ * wherever it keeps credentials.
  * Pointing `OPENROUTER_API_KEY_FILE` at that file uses the one credential that
  * exists instead of a second copy of it. Only that line is read; the rest of
  * the file — other providers' keys, bot tokens — is never returned.
