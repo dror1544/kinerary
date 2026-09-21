@@ -204,9 +204,13 @@ The "data gaps in the generated site" table at
 `docs/signup-test-execution-capture (Manual).md:131-144` lists **seven rows as
 Open/Partial that are all built**: phase map stops, per-phase itinerary from PDF,
 structured budget, embassy/police numbers, family-name transliteration, the trip
-bot wiring, hero photos. Likewise `docs/onboarding-to-active-plan.md:81-94`
-(Modern *is* the front door now) and "thin phases" generally (fixed 2026-09-12/13
-in `0daf16a`, `078237c`, `f184cd3`, `947aa2d`).
+bot wiring, hero photos — not re-verified in this pass. `docs/onboarding-to-active-plan.md`
+is no longer stale on the front-door claim: fixed in place **2026-09-20** (#137,
+PR #138) with dated corrections. The citation that used to sit here (`:81-94`)
+was wrong regardless of the fix — that range is A1/A2, not the front-door claim
+— see Track 4's drift note below for the corrected locations. "Thin phases"
+generally (fixed 2026-09-12/13 in `0daf16a`, `078237c`, `f184cd3`, `947aa2d`)
+is unaffected.
 
 ---
 
@@ -644,7 +648,13 @@ Part of the goal, not a side effect. The known drift, all verified 2026-09-19:
 - `web/README.md:14-17` — says auth is interface-only; it creates real sessions.
 - `control-plane/api/src/app.ts:119` — the service index self-reports `"sprint": 4` and omits every portal route.
 - `docs/signup-test-execution-capture (Manual).md:131-144` — seven rows Open/Partial that are all built.
-- `docs/onboarding-to-active-plan.md:81-94` — describes the 2026-09-06 deployment; Modern is the front door now.
+- `docs/onboarding-to-active-plan.md` — **fixed 2026-09-20** (#137, PR #138). Four
+  present-tense structures now carry dated corrections in place: §1's table row
+  (`:69`), §2's "Update — 2026-09-07" (`:26-29`), §3's Phase B intro + B1 bullet
+  (`:135-151`), §6's next-actions list (`:215-223`). Two-sided, not a blanket
+  claim: Modern is the front door for trips provisioned since 2026-09-09
+  (`a2e51d1`); trips provisioned earlier keep what they had. Previously miscited
+  here as `:81-94` — that range is A1/A2, unrelated.
 - `docs/NEXT-TASKS.md` — from 2026-08-08, pre-control-plane, not a live source.
 - Sprint 6's own section has **no `— BUILT` markers at all** while §4.5 and Sprint 5 Track 8 do; `sprint-scribe` should bring it level, and record the four-track split from this document into the plan itself.
 
