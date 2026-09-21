@@ -41,6 +41,10 @@ import { MediaStore } from "./media-store.js";
 import type { BotIdentity } from "./dispatch.js";
 import { publishCommandMenu } from "./command-menu.js";
 import { startTripBotPoller } from "./poller.js";
+import { checkDocumentStore, documentStoreFromEnv } from "../document-store.js";
+import { startDocumentSweeper } from "../document-sweeper.js";
+import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model-runner.js";
+import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
@@ -90,6 +94,11 @@ interface Runtime {
   botIdentity?: BotIdentity;
   /** From `relay.interviewer_profile`; absent disables interview forwarding. */
   interviewerProfile?: string;
+  /**
+   * From `signup.super_admin_subject_digest`, whether or not signup shares this
+   * bot: it names a Telegram user, not a bot. Absent disables `/model`.
+   */
+  superAdminSubjectDigest?: string;
   /**
    * From `relay.multiplex_gateway_id`. Absent means routing is exact and a
    * trip with no gateway of its own is reported unreachable rather than
@@ -198,6 +207,9 @@ async function serveRuntime(path: string): Promise<Runtime> {
     interviewerProfile: relay.interviewer_profile,
     multiplexGatewayId: relay.multiplex_gateway_id,
     approvals,
+    ...(profile.signup?.super_admin_subject_digest
+      ? { superAdminSubjectDigest: profile.signup.super_admin_subject_digest }
+      : {}),
   };
 }
 
@@ -225,6 +237,47 @@ async function main(): Promise<void> {
   // so the platform credential never reaches the wire. The gateway fetches
   // each reference back with its own bearer.
   const mediaStore = new MediaStore();
+  // Undefined unless DOCUMENT_STORE_DIR is set. Documents are then still read
+  // and registered; their bytes are simply not kept.
+  // Originals cannot be rebuilt, so a store that is not a real, writable,
+  // mounted volume is refused. DOCUMENT_STORE_REQUIRED=1 (compose.vm.yml) makes
+  // that fatal at startup; elsewhere the relay runs without keeping originals
+  // rather than keeping them somewhere they will be lost.
+  const storeReadiness = process.env.DOCUMENT_STORE_DIR || process.env.DOCUMENT_STORE_REQUIRED === "1"
+    ? await checkDocumentStore(process.env)
+    : null;
+  if (storeReadiness && !storeReadiness.ok) {
+    const fatal = process.env.DOCUMENT_STORE_REQUIRED === "1";
+    log(structuredLog(fatal ? "error" : "warn", "relay.document_store_not_ready", {
+      reason: storeReadiness.reason,
+      detail: storeReadiness.detail,
+      hint: fatal ? "refusing to start: originals would not be kept safely" : "running without keeping originals",
+    }));
+    if (fatal) process.exit(1);
+  }
+  const documentStore = storeReadiness?.ok ? documentStoreFromEnv() : undefined;
+  // The environment's pinned models, overridable per task at runtime by the
+  // super admin (/model) — see model-task-settings.ts. Undefined when nothing is
+  // configured, which keeps the no-runner behaviour exactly as it was.
+  // Codex runs with its tools switched off by feature name, and those names are
+  // version-specific. Checked once here, only when some task is bound to codex;
+  // a mismatch refuses codex bindings loudly instead of failing every call.
+  const codexBound = Object.entries(process.env).some(([key, value]) => /_RUNNER$/.test(key) && value?.trim().toLowerCase() === "codex");
+  if (codexBound) {
+    const problem = await codexIsolationProblem(process.env.CODEX_BIN || "codex");
+    if (problem) {
+      process.env.KINERARY_CODEX_ISOLATION_UNVERIFIED = "1";
+      log(structuredLog("error", "relay.codex_isolation_unverified", {
+        detail: problem,
+        hint: "codex bindings are refused until the isolation list in model-runner.ts matches this codex",
+      }));
+    }
+  }
+  const envRunner = modelRunnerFromEnv();
+  const modelRunner = envRunner
+    ? switchableRunner(envRunner, (task, binding) =>
+        runnerForBinding(binding.runner, binding.model, taskTimeoutMs(task), task))
+    : undefined;
   const mediaBaseUrl = `http://${runtime.host === "0.0.0.0" ? "127.0.0.1" : runtime.host}:${runtime.port}`;
 
   const connector = new RelayConnector({
@@ -295,6 +348,8 @@ async function main(): Promise<void> {
   await connector.listen();
 
   let stopPolling: (() => void) | undefined;
+  let stopSweeping: (() => void) | undefined;
+  let stopOverrides: (() => void) | undefined;
   if (runtime.db) {
     // …and poll only once the companions are back. Every restart (upgrade,
     // rollback, reboot, runner switch) otherwise answers the messages Telegram
@@ -330,12 +385,23 @@ async function main(): Promise<void> {
       interviewerProfile: runtime.interviewerProfile,
       approvals: runtime.approvals,
       media: { telegram: runtime.telegram, store: mediaStore, baseUrl: mediaBaseUrl, log },
-      // Undefined unless INTERPRET_RUNNER is set. A session flagged onto the
-      // interpret path without one still works: the router asks its own
-      // questions from intake-copy.ts, which is slower, not broken.
-      modelRunner: modelRunnerFromEnv(),
+      documentStore,
+      superAdminSubjectDigest: runtime.superAdminSubjectDigest,
+      // The switchable runner computed above, so a super admin's `/model`
+      // override reaches the trip bot poller too — not a fresh
+      // `modelRunnerFromEnv()` that would silently ignore it. Undefined unless
+      // INTERPRET_RUNNER is set. A session flagged onto the interpret path
+      // without one still works: the router asks its own questions from
+      // intake-copy.ts, which is slower, not broken.
+      modelRunner,
       log,
     });
+    // Clears interrupted document writes and claims — see document-sweeper.ts.
+    stopSweeping = startDocumentSweeper(runtime.db, documentStore, log);
+    // Keeps a super admin's `/model` override actually in force. Without this,
+    // `/model` writes the override to the database and the switchable runner
+    // never reads it back — the command reports success and changes nothing.
+    if (modelRunner) stopOverrides = startTaskOverrideRefresh(runtime.db, modelRunner, log);
   }
 
   log(structuredLog("info", "relay.ready", {
@@ -351,6 +417,8 @@ async function main(): Promise<void> {
     process.on(signal, () => {
       log(structuredLog("info", "relay.shutting_down", { signal }));
       stopPolling?.();
+      stopSweeping?.();
+      stopOverrides?.();
       void connector
         .close()
         .then(() => runtime.db?.end())

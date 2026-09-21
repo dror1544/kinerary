@@ -79,6 +79,8 @@ export const PORTS = {
   planSingleSourceBoot:    38120,
   itineraryPlanLayerServer: 38118,
   configDayLinksServer:    38114,
+  // tests/trip-documents.test.js
+  tripDocuments:           38299,
 
   modernParity:            38298,
   modernEnrichment:        38194,
@@ -97,6 +99,7 @@ export const PORTS = {
   controlPlaneSessionMcp:  38295,
   groupDocumentMcp:        38293,
   mcpExtract:              38106,
+  mcpExtractEmpty:         38300,
   itineraryPlanLayerMcp:   38108,
   mcpDefault:              38117,
   mcpBookingConfirmation:  38116,

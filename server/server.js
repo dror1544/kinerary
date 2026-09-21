@@ -2030,6 +2030,19 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   const contentTypes = {
     '.pdf': 'application/pdf',
     '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.txt': 'text/plain; charset=utf-8',
+    // A photographed confirmation. Raster types only: .svg stays unmapped for
+    // the same reason .html does — it can carry script.
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    // .html is deliberately NOT here. A booking page an organizer saved from
+    // their browser is a real source document, and served as text/html on this
+    // origin it would run its own scripts with a trip member's session. It
+    // falls through to application/octet-stream, which with nosniff is a
+    // download and never a page.
     '.md': 'text/markdown; charset=utf-8',
     '.pkpass': 'application/vnd.apple.pkpass',
   };
@@ -2040,11 +2053,34 @@ function protectedDocumentResponse(res, filePath, disposition = 'attachment') {
   return fs.createReadStream(filePath).pipe(res);
 }
 
+// Where a trip's source documents are, in the order they are looked for.
+// Provisioning hard-links each original into the trip's own NFS directory — one
+// physical copy, shared with the control plane's store — and names it in
+// TRIP_DOCUMENTS_DIR. A container created before that variable existed still
+// has DATA_DIR=<its NFS dir>/server-data, so the same directory is derived from
+// it. A trip whose documents could not be linked carries a copy beside its
+// config instead.
+const TRIP_DOCUMENT_DIRS = [
+  process.env.TRIP_DOCUMENTS_DIR,
+  path.basename(DATA_DIR) === 'server-data' ? path.join(path.dirname(DATA_DIR), 'documents') : null,
+  path.join(TRIP_DIR, 'documents'),
+].filter((dir, index, all) => typeof dir === 'string' && dir !== '' && all.indexOf(dir) === index);
+
+function tripDocumentPath(file) {
+  for (const dir of TRIP_DOCUMENT_DIRS) {
+    const candidate = path.join(dir, file);
+    try { if (fs.statSync(candidate).isFile()) return candidate; } catch { /* not in this one */ }
+  }
+  return null;
+}
+
 function confirmationPath(filename, { staticOnly = false } = {}) {
   const safeName = path.basename(filename);
   const candidates = staticOnly
     ? [path.join(STATIC_CONFIRMATIONS_DIR, safeName)]
-    : [path.join(CONF_DIR, safeName), path.join(STATIC_CONFIRMATIONS_DIR, safeName)];
+    // TRIP_DIR/documents holds the source documents a provisioned trip was
+    // built from, under content-addressed names — see documents.json.
+    : [path.join(CONF_DIR, safeName), ...TRIP_DOCUMENT_DIRS.map((dir) => path.join(dir, safeName)), path.join(STATIC_CONFIRMATIONS_DIR, safeName)];
   return candidates.find(candidate => {
     try { return fs.statSync(candidate).isFile(); } catch { return false; }
   }) || candidates[0];
@@ -2055,6 +2091,40 @@ function confirmationPath(filename, { staticOnly = false } = {}) {
 // UI call site use the same Authorization-header blob flow.
 app.get('/api/bookings/confirmation/:fn', authRequired, (req, res) => {
   return protectedDocumentResponse(res, confirmationPath(req.params.fn), 'inline');
+});
+
+// The source documents a provisioned trip was built from, and what each one
+// supports — documents.json, written by the provisioner beside the config. A
+// booking has one conf_file and a hotel card one link; this is where "this
+// voucher supports that stay AND that booking" reaches the site.
+//
+// Behind the same authentication as every other trip document, and it lists
+// only content-addressed names that are actually present: a manifest line
+// naming anything else is dropped, never followed, so this can never become a
+// way to probe or reach a path.
+const TRIP_DOCUMENT_FILE = /^[a-f0-9]{64}\.(pdf|docx|xlsx|html|txt|png|jpg|webp|gif)$/;
+app.get('/api/trip-documents', authRequired, (_req, res) => {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(TRIP_DIR, 'documents.json'), 'utf8'));
+  } catch {
+    return res.json([]);
+  }
+  if (!Array.isArray(manifest)) return res.json([]);
+  const present = (file) => tripDocumentPath(file) !== null;
+  const links = (raw) => (Array.isArray(raw) ? raw : []).flatMap((link) => {
+    if (link?.kind === 'phase' && typeof link.id === 'string') return [{ kind: 'phase', id: link.id }];
+    if (link?.kind === 'booking' && typeof link.seed_key === 'string') return [{ kind: 'booking', seed_key: link.seed_key }];
+    return [];
+  });
+  res.json(manifest
+    .filter((doc) => typeof doc?.file === 'string' && TRIP_DOCUMENT_FILE.test(doc.file) && present(doc.file))
+    .map((doc) => ({
+      file: doc.file,
+      filename: typeof doc.filename === 'string' ? doc.filename : null,
+      mime: typeof doc.mime === 'string' ? doc.mime : null,
+      links: links(doc.links),
+    })));
 });
 
 // Preserve old bookmarks/links, but route them through the same authentication

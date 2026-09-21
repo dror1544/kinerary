@@ -18,6 +18,9 @@ import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
+import { digestTelegramId } from "../src/identity.js";
+import { runnerForBinding, type StructuredModelRunner } from "../src/model-runner.js";
+import { switchableRunner } from "../src/model-task-settings.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -156,6 +159,88 @@ describe("dispatchUpdate — the branch table", () => {
         // to operate, and saying so is the point.
         assert.match(decision.reply.text, /just talk to me/i);
       }
+    });
+  });
+
+  test("the super admin switches a task's model from their own DM, and it is recorded", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000560", "companion-japan");
+      const superAdmin = digestTelegramId("777");
+      const pinned: StructuredModelRunner = {
+        describe: () => ({ provider: "claude", model: "claude-sonnet-5" }),
+        run: async () => ({ ok: false, error: "NOT_CONFIGURED", attempts: 0, ms: 0 }) as never,
+      };
+      const runner = switchableRunner(pinned, (task, b) => runnerForBinding(b.runner, b.model, 90_000, task, {}));
+      const options = { superAdminSubjectDigest: superAdmin, modelRunner: runner };
+
+      const listing = await dispatchUpdate(fix.pool, msg("700000560", "/models"), DEFAULT_STRINGS, () => {}, {}, options);
+      assert.equal(listing.kind, "reply");
+      if (listing.kind !== "reply") return;
+      assert.match(listing.reply.text, /extract_intake: claude:claude-sonnet-5 — environment/);
+
+      const set = await dispatchUpdate(
+        fix.pool, msg("700000560", "/model extract_intake codex:gpt-5.6-luna"), DEFAULT_STRINGS, () => {}, {}, options,
+      );
+      assert.equal(set.kind === "reply" && /extract_intake → codex:gpt-5.6-luna \(override\)/.test(set.reply.text), true);
+      assert.deepEqual(runner.describe?.("extract_intake"), { provider: "codex", model: "gpt-5.6-luna" }, "applied at once");
+      assert.deepEqual(runner.describe?.("interpret"), { provider: "claude", model: "claude-sonnet-5" });
+
+      // Refused bindings change nothing and record nothing.
+      for (const refused of ["/model extract_intake openrouter:openrouter/auto", "/model extract_intake openrouter:vendor/model", "/model plan_review codex:x"]) {
+        const reply = await dispatchUpdate(fix.pool, msg("700000560", refused), DEFAULT_STRINGS, () => {}, {}, options);
+        assert.equal(reply.kind, "reply", refused);
+      }
+      const cleared = await dispatchUpdate(
+        fix.pool, msg("700000560", "/model extract_intake default"), DEFAULT_STRINGS, () => {}, {}, options,
+      );
+      assert.equal(cleared.kind === "reply" && /\(environment\)/.test(cleared.reply.text), true);
+
+      const settings = await fix.pool.query("SELECT task FROM control_plane.model_task_settings");
+      assert.equal(settings.rowCount, 0, "cleared");
+      const history = await fix.pool.query<{ task: string; runner: string | null; model: string | null; changed_by: string }>(
+        "SELECT task, runner, model, changed_by FROM control_plane.model_task_setting_history ORDER BY changed_at, id",
+      );
+      assert.deepEqual(history.rows.map((r) => [r.task, r.runner, r.model]).sort((a, b) => String(a[1]).localeCompare(String(b[1]))), [
+        ["extract_intake", "codex", "gpt-5.6-luna"],
+        ["extract_intake", null, null],
+      ]);
+      assert.ok(history.rows.every((r) => r.changed_by === superAdmin));
+      await assert.rejects(
+        fix.pool.query("DELETE FROM control_plane.model_task_setting_history"),
+        /append-only/,
+      );
+    });
+  });
+
+  test("/model is nobody else's, and nowhere else: it answers like any unknown command", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, "700000561", "companion-japan");
+      await bindCompanion(fix, "-1002000561", "companion-japan");
+      await fix.pool.query(
+        `UPDATE control_plane.trips SET companion_intro = $2::jsonb WHERE id = $1`,
+        [fix.tripId, JSON.stringify({ assistant_name: "Rio", language: "en" })],
+      );
+      const runner = switchableRunner(
+        { describe: () => ({ provider: "claude", model: "claude-sonnet-5" }), run: async () => ({}) as never },
+        () => undefined,
+      );
+      const notTheAdmin = { superAdminSubjectDigest: digestTelegramId("999"), modelRunner: runner };
+      const theAdmin = { superAdminSubjectDigest: digestTelegramId("777"), modelRunner: runner };
+
+      const cases: [TelegramUpdate, typeof theAdmin | Record<string, never>][] = [
+        [msg("700000561", "/model extract_intake codex:gpt-5.6-luna"), notTheAdmin],
+        [msg("700000561", "/models"), {}],
+        [msg("-1002000561", "/model extract_intake codex:gpt-5.6-luna", "supergroup"), theAdmin],
+      ];
+      for (const [update, options] of cases) {
+        const decision = await dispatchUpdate(fix.pool, update, DEFAULT_STRINGS, () => {}, {}, options);
+        assert.equal(decision.kind, "reply");
+        if (decision.kind !== "reply") return;
+        assert.match(decision.reply.text, /Rio/, "the companion's answer to an unknown command");
+        assert.doesNotMatch(decision.reply.text, /extract_intake|override|environment/);
+      }
+      const written = await fix.pool.query("SELECT 1 FROM control_plane.model_task_setting_history");
+      assert.equal(written.rowCount, 0);
     });
   });
 

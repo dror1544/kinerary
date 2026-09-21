@@ -238,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
                 vmid_map=vmid_map,
                 repo_root=args.repo_root,
                 compute=compute_adapter,
+                # The trips' NFS export as this worker sees it: originals are
+                # hard-linked into <slug>/documents instead of travelling with
+                # the deploy. Unset keeps the deploy copy.
+                trip_nfs_local_base=os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None,
             )
             # Both default ON, so a trip onboarded through the pipeline is
             # born complete: site, companion profile, MCP bridge. The bridge
@@ -358,6 +362,19 @@ def main(argv: list[str] | None = None) -> int:
                     venue_lookup=_venue_lookup,
                 )
 
+            # Originals cannot be rebuilt. A store that is REQUIRED
+            # (DOCUMENT_STORE_REQUIRED=1, compose.vm.yml) but is not the real
+            # volume stops the worker here, exactly as it stops the relay; an
+            # optional one that is not ready is simply not used.
+            from .document_handoff import check_document_store
+            store_dir = os.environ.get("DOCUMENT_STORE_DIR", "")
+            store_required = os.environ.get("DOCUMENT_STORE_REQUIRED") == "1"
+            if store_dir or store_required:
+                store_ok, store_reason, store_detail = check_document_store(store_dir or None)
+                if not store_ok:
+                    if store_required:
+                        raise ValueError(f"document store not ready ({store_reason}): {store_detail}")
+                    store_dir = ""
             worker_obj = ProvisionerWorker(
                 db_url=db_url, deploy=deploy_adapter,
                 companion=companion_adapter, mcp_bridge=mcp_bridge_adapter,
@@ -378,6 +395,9 @@ def main(argv: list[str] | None = None) -> int:
                 # .env, read from one place so the password the organizer is
                 # told and the password the site accepts cannot drift apart.
                 seed_password=os.environ.get("PROVISIONER_SEED_PASSWORD", ""),
+                # The relay's document store. Unset provisions without source
+                # documents, which is what every trip before them had.
+                document_store_dir=store_dir,
             )
             if args.reconcile_companion:
                 print(json.dumps(worker_obj.reconcile_companion(args.reconcile_companion), sort_keys=True), flush=True)

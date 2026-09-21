@@ -8,10 +8,10 @@
  * words are allowed to say, and only the second half can be exercised without
  * provisioned infrastructure.
  *
- * It MOVED here from `document-intake.ts`, which still holds its own copy on
- * `fix/92-slice-b` because that branch was cut before this one existed. When
- * Slice B rebases onto Slice A, that copy is deleted and `document-intake.ts`
- * imports this — two copies of a gate is how the one that is not called stops
+ * It MOVED here from `document-intake.ts`, which was cut on `fix/92-slice-b`
+ * before this file existed and so had its own copy — deleted, verbatim, as
+ * part of forward-porting that branch onto this one: `document-intake.ts` now
+ * imports this. Two copies of a gate is how the one that is not called stops
  * matching the one that is.
  */
 import { normaliseDatesAndTimes, tripWindow } from "./document-dates.js";

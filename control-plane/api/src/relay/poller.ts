@@ -20,6 +20,7 @@
  */
 import type pg from "pg";
 import {
+  conflictCallbackData,
   findQuestion,
   parseCallbackData,
   renderConfirmPrompt,
@@ -88,8 +89,9 @@ import {
 import {
   applyProposals,
   DEFAULT_MIN_CONFIDENCE,
-  extractIntakeFromDocument,
   burstKey,
+  documentBurstKey,
+  INTERPRET_SOURCE_BUDGET_CHARS,
   claimInterpretation,
   interpretBurst,
   isInterpretPath,
@@ -100,10 +102,48 @@ import {
   submitArgsFor,
   type BoundaryIntent,
   type ProposedAnswer,
+  type InterpretPayload,
+  type ProposedValue,
+  type StoredOutcomes,
 } from "../interpret.js";
-import type { StructuredModelRunner } from "../model-runner.js";
-import { documentText } from "../document-text.js";
-import { extractItinerary, foldExtractedIntoPhases } from "../itinerary-extract.js";
+import { modelRunnerFromEnv, type StructuredModelRunner } from "../model-runner.js";
+import {
+  approveCorrection,
+  confirmedOrganizerChat,
+  correctionDocumentName,
+  getCorrection,
+  proposeCorrectionsFromReadings,
+  rejectCorrection,
+  renderCorrection,
+  reviewDeliveries,
+  tripOwnerUserId,
+} from "../document-correction.js";
+import {
+  applyConflictChoice,
+  canonical,
+  entryIdentity,
+  isRecord as isRecordValue,
+  itineraryCoverageComplete,
+  matchEntry,
+} from "../answer-merge.js";
+import {
+  getConflict,
+  nextOpenConflict,
+  openConflict,
+  recordAnswerSources,
+  resolveConflict,
+  type AnswerConflict,
+  type AnswerSource,
+} from "../answer-provenance.js";
+import { listTripDocuments } from "../document-registry.js";
+import { contentDigest, type DocumentBlobStore } from "../document-store.js";
+import { gateDocumentProposals, type DocumentGateResult } from "../document-gate.js";
+import {
+  extractRegisteredDocuments,
+  ingestDocument,
+  type RegisteredDocument,
+} from "../document-intake.js";
+import { extractItinerary, foldExtractedIntoPhases, ITINERARY_TRUNCATED_WARNING } from "../itinerary-extract.js";
 import { parkDeferredVenueLinks } from "../venue-links.js";
 import { provisionOnConfirm } from "../planner.js";
 import type { RosterChoice } from "../organizer-identity.js";
@@ -121,7 +161,8 @@ import type { MediaDeps } from "./normalize.js";
 import { PendingAttachments } from "./pending-attachments.js";
 import { GroupContext } from "./group-context.js";
 import {
-  askText, DEFAULT_LANGUAGE, optionLabel, recapLabel, uiString, writtenLanguage, type Language,
+  askText, DEFAULT_LANGUAGE, optionLabel, readableDate, recapLabel, UI_STRINGS, uiString, writtenLanguage,
+  type Language,
 } from "../intake-copy.js";
 import { structuredLog } from "../redaction.js";
 import {
@@ -186,6 +227,12 @@ export interface TripBotPollerDeps {
    */
   modelRunner?: StructuredModelRunner;
   /**
+   * Where uploaded documents' original bytes are kept (`DOCUMENT_STORE_DIR`).
+   * Absent, documents are still registered, read and extracted — their bytes
+   * are just not kept, and their registry rows say so.
+   */
+  documentStore?: DocumentBlobStore;
+  /**
    * The day-by-day extractor, injectable for tests.
    *
    * Defaults to the real one, which runs on the shared model runner when
@@ -207,6 +254,11 @@ export interface TripBotPollerDeps {
    * approval branch is unreachable and stays defensive.
    */
   approvals?: { config: SignupConfig };
+  /**
+   * The signup super admin's subject digest, whichever bot signup runs on. The
+   * only person who may switch a task's model from a chat (`/model`).
+   */
+  superAdminSubjectDigest?: string;
   log?: (line: string) => void;
 }
 
@@ -351,6 +403,29 @@ export async function applyDecision(
       await applyInterviewCallback(decision, deps, strings, log);
       return;
 
+    case "document_correction": {
+      // Reading takes minutes, and the poll loop must not wait on it: every
+      // other chat's messages would queue behind one upload. One chat's
+      // uploads are still read one after another, in the order they came.
+      const previous = correctionChains.get(decision.chatId) ?? Promise.resolve();
+      const next = previous
+        .then(() => runDocumentCorrection(decision, deps, log))
+        .catch((error) => {
+          log(structuredLog("error", "trip_bot.document_correction_failed", {
+            detail: String((error as Error)?.message ?? error).slice(0, 200),
+          }));
+        });
+      correctionChains.set(decision.chatId, next);
+      void next.finally(() => {
+        if (correctionChains.get(decision.chatId) === next) correctionChains.delete(decision.chatId);
+      });
+      return;
+    }
+
+    case "correction_callback":
+      await applyCorrectionCallback(decision, deps, log);
+      return;
+
     case "interview_to_gateway": {
       // An upload gets an immediate acknowledgement, from the router rather
       // than the agent. The agent's reply cannot arrive until it has READ the
@@ -482,6 +557,151 @@ export async function applyDecision(
   }
 }
 
+/** Post-confirmation document readings in progress, one chain per chat. */
+const correctionChains = new Map<string, Promise<void>>();
+
+/** Resolves when every post-confirmation reading started so far has finished. For tests and shutdown. */
+export async function settleDocumentCorrections(): Promise<void> {
+  await Promise.all([...correctionChains.values()]);
+}
+
+/**
+ * A document the organizer sent after confirmation: read like any other, then
+ * proposed back to them — see document-correction.ts. Nothing here writes the
+ * trip; the organizer's Approve does.
+ */
+async function runDocumentCorrection(
+  decision: Extract<DispatchDecision, { kind: "document_correction" }>,
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  const { chatId, tripId, language } = decision;
+  const say = async (text: string, replyMarkup?: InlineKeyboard) => {
+    await deps.telegram.sendMessage({ chatId, text, ...(replyMarkup ? { replyMarkup } : {}) }).catch(() => {});
+  };
+  await say(uiString("correctionReading", language));
+
+  const documents = documentsInBurst(decision.event, deps);
+  const { registered, identity, unreadable } = await ingestBurstDocuments(
+    deps, { sessionId: decision.sessionId, chatId }, tripId, documents, log, "pending",
+  );
+  if (identity > 0) await say(uiString("documentIdentity", language));
+  if (registered.length === 0) {
+    if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
+    return;
+  }
+  if (registered.some(readPartially)) await say(uiString("documentPartial", language));
+  const runner = deps.modelRunner;
+  if (!runner) return;
+
+  const extracted = await extractRegisteredDocuments(
+    { db: deps.db, runner, tripId, language, timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS, log },
+    registered,
+  );
+  const usable = extracted.flatMap((e) => (e.kind === "ok" ? [e] : []));
+  if (usable.length === 0) {
+    await say(uiString("documentExtractFailed", language));
+    return;
+  }
+
+  const outcome = await proposeCorrectionsFromReadings(deps.db, {
+    tripId,
+    chatId,
+    readings: usable.map((e) => ({ documentId: e.documentId, text: e.text, payload: e.payload })),
+    documentIds: registered.map((d) => d.documentId),
+  });
+  if (outcome.kind === "no_version") return;
+  if (outcome.corrections.length === 0) {
+    await reviewDeliveries(deps.db, tripId, registered.map((d) => d.documentId), "approved");
+    await say(uiString("correctionNothingNew", language));
+    return;
+  }
+  for (const correction of outcome.corrections) {
+    if (correction.status !== "pending") {
+      await say(uiString("correctionAlreadyDecided", language));
+      continue;
+    }
+    const rendered = renderCorrection(correction, await correctionDocumentName(deps.db, correction), language);
+    await say(rendered.text, rendered.replyMarkup);
+  }
+  log(structuredLog("info", "trip_bot.document_correction_proposed", {
+    trip_id: tripId,
+    documents: registered.length,
+    proposals: outcome.corrections.length,
+    new_proposals: outcome.created.filter(Boolean).length,
+  }));
+}
+
+/**
+ * The organizer's decision on a proposal. Accepted only from the chat it was
+ * asked in, from the person that private chat is, while that chat is still the
+ * trip's confirmed interview chat.
+ */
+async function applyCorrectionCallback(
+  decision: Extract<DispatchDecision, { kind: "correction_callback" }>,
+  deps: TripBotPollerDeps,
+  log: (line: string) => void,
+): Promise<void> {
+  const ack = (text?: string) =>
+    deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text }).catch(() => {});
+  const correction = await getCorrection(deps.db, decision.proposalId);
+  if (!correction || correction.requestedChatId !== decision.chatId || !decision.fromId || decision.fromId !== decision.chatId) {
+    await ack();
+    return;
+  }
+  const organizer = await confirmedOrganizerChat(deps.db, correction.tripId, decision.chatId);
+  if (!organizer) {
+    await ack();
+    return;
+  }
+  const { language } = organizer;
+  const say = (text: string) => deps.telegram.sendMessage({ chatId: decision.chatId, text }).catch(() => {});
+  const decidedBy = digestTelegramId(decision.fromId);
+
+  if (decision.choice === "reject") {
+    const rejected = await rejectCorrection(deps.db, { id: correction.id, chatId: decision.chatId, decidedBy });
+    await ack(uiString(rejected ? "correctionRejected" : "correctionAlreadyDecided", language));
+    if (rejected) await say(uiString("correctionRejected", language));
+    return;
+  }
+
+  const outcome = await approveCorrection(deps.db, { id: correction.id, chatId: decision.chatId, decidedBy });
+  switch (outcome.kind) {
+    case "already_decided":
+      await ack(uiString("correctionAlreadyDecided", language));
+      return;
+    case "stale":
+      await ack();
+      await say(uiString("correctionStale", language));
+      return;
+    case "not_now":
+      await ack();
+      await say(uiString("correctionNotNow", language));
+      return;
+    case "failed":
+      await ack();
+      await say(uiString("correctionFailed", language));
+      log(structuredLog("warn", "trip_bot.document_correction_not_applied", { trip_id: correction.tripId, reason: outcome.reason }));
+      return;
+    case "applied": {
+      await ack(uiString("correctionApplied", language));
+      // The same step confirming takes: a new version is the organizer's
+      // approval, so the site is rebuilt from it.
+      const owner = await tripOwnerUserId(deps.db, correction.tripId);
+      const provisioned = owner
+        ? await provisionOnConfirm(deps.db, correction.tripId, owner).catch(() => ({ ok: false as const, stage: "plan" as const, reason: "THREW" }))
+        : ({ ok: false as const, stage: "plan" as const, reason: "NO_SINGLE_OWNER" });
+      await say(uiString(provisioned.ok ? "correctionApplied" : "correctionAppliedSiteLater", language));
+      log(structuredLog("info", "trip_bot.document_correction_applied", {
+        trip_id: correction.tripId,
+        version_id: outcome.versionId,
+        provisioning: provisioned.ok ? "started" : `not started: ${provisioned.reason}`,
+      }));
+      return;
+    }
+  }
+}
+
 /**
  * A tapped interview button: record it, acknowledge the tap, ask what's next.
  *
@@ -560,6 +780,98 @@ async function applyInterviewCallback(
     const fresh = await getSessionForChat(deps.db, decision.chatId);
     if (fresh.ok) await sendNextStep(fresh.view, decision.chatId, deps, strings);
   };
+
+  // A DISAGREEMENT BETWEEN DOCUMENTS, settled. The decision is about one field
+  // of one entry, and it applies only while that field still holds what the
+  // question showed. A tap on a question that has stopped being true — someone
+  // corrected the answer, another document landed — is answered as settled and
+  // never applied over whatever changed it.
+  if (parsed.kind === "conflict") {
+    const session = await getSessionForChat(deps.db, decision.chatId);
+    if (!session.ok) {
+      await ack();
+      return;
+    }
+    const { tripId, language } = session.view;
+    const conflict = await getConflict(deps.db, tripId, parsed.conflictId);
+    if (!conflict || conflict.status !== "open") {
+      await ack(uiString("documentConflictStale", language));
+      await respond(session.view);
+      return;
+    }
+    const rendered = await renderConflictQuestion(deps.db, decision.chatId, conflict, language);
+    const collapse = async (label: string) => {
+      if (!decision.messageId) return;
+      await deps.telegram.editMessageText({
+        chatId: decision.chatId,
+        messageId: decision.messageId,
+        text: `${rendered.text}\n\n✅ ${label}`,
+        replyMarkup: undefined,
+      });
+    };
+
+    if (parsed.choice === "keep") {
+      await resolveConflict(deps.db, { tripId, conflictId: conflict.id, status: "kept", resolvedBy: "organizer" });
+      await ack(uiString("documentConflictKept", language));
+      await collapse(rendered.keepLabel);
+      await respond(session.view);
+      return;
+    }
+
+    const store = await answersForChat(deps.db, decision.chatId);
+    const heldAnswer = store?.answers[conflict.questionId] as { kind?: string; data?: unknown } | undefined;
+    let written: Awaited<ReturnType<typeof submitAnswerForChat>> | null = null;
+    if (conflict.entryKey === "" && conflict.path === "") {
+      // A whole answer — a text or a choice — applies only if it is still
+      // exactly the answer the question showed.
+      if (heldAnswer && canonical(heldAnswer) === canonical(conflict.held) && isRecordValue(conflict.incoming)) {
+        const args = submitArgsFor(conflict.incoming as ProposedValue);
+        written = await submitAnswerForChat(
+          deps.db, decision.chatId, conflict.questionId,
+          args.optionId, args.otherText, args.structuredData, args.optionIds,
+          { held: heldAnswer },
+        );
+      }
+    } else if (heldAnswer?.kind === "structured") {
+      const next = applyConflictChoice(heldAnswer.data, conflict);
+      if (next !== null) {
+        written = await submitAnswerForChat(
+          deps.db, decision.chatId, conflict.questionId, null, undefined, next, undefined,
+          { held: heldAnswer },
+        );
+      }
+    }
+
+    if (!written || (!written.ok && written.reason === "STALE_ANSWER")) {
+      await resolveConflict(deps.db, { tripId, conflictId: conflict.id, status: "superseded", resolvedBy: "system" });
+      await ack(uiString("documentConflictStale", language));
+      await collapse(uiString("documentConflictStale", language));
+      await respond(session.view);
+      return;
+    }
+    if (!written.ok) {
+      log(structuredLog("warn", "trip_bot.conflict_write_refused", {
+        session_id: decision.sessionId,
+        question_id: conflict.questionId,
+        safe_error_code: written.reason,
+      }));
+      await ack("I couldn't record that — try again.");
+      return;
+    }
+    await resolveConflict(deps.db, { tripId, conflictId: conflict.id, status: "replaced", resolvedBy: "organizer" });
+    await recordAnswerSources(deps.db, [{
+      tripId,
+      questionId: conflict.questionId,
+      entryKey: conflict.entryKey,
+      documentId: conflict.documentId,
+      disposition: "accepted",
+      paths: conflict.path ? [conflict.path] : [],
+    }]).catch(() => 0);
+    await ack(uiString("documentConflictReplaced", language));
+    await collapse(rendered.replaceLabel);
+    await respond(written.view);
+    return;
+  }
 
   if (parsed.kind === "answer") {
     const question = findQuestion(parsed.questionId);
@@ -1037,7 +1349,11 @@ export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEv
   if (!last) return null;
 
   const mediaUrls = events.flatMap((e) => e.media_urls ?? []);
-  const media = events.flatMap((e) => e.media ?? []);
+  // Each descriptor keeps the id of the message it came in, which the combined
+  // event's own `message_id` (the last message's) cannot tell it.
+  const media = events.flatMap((e) =>
+    (e.media ?? []).map((m) => (m.message_id || !e.message_id ? m : { ...m, message_id: e.message_id })),
+  );
   const text = events
     .map((e) => e.text)
     .filter((t) => t.trim().length > 0)
@@ -1058,11 +1374,11 @@ export function combineBurst(events: readonly WireMessageEvent[]): WireMessageEv
 function documentsInBurst(
   combined: WireMessageEvent,
   deps: TripBotPollerDeps,
-): { bytes: Uint8Array; mime: string; filename?: string }[] {
+): BurstDocument[] {
   const store = deps.media?.store;
   if (!store?.get) return [];
-  const out: { bytes: Uint8Array; mime: string; filename?: string }[] = [];
-  for (const url of combined.media_urls ?? []) {
+  const out: BurstDocument[] = [];
+  for (const [index, url] of (combined.media_urls ?? []).entries()) {
     // The wire carries `{connector}/relay/media/{id}` — a URL rather than the
     // bytes, because a Telegram file URL embeds the bot token and must never
     // cross. Reading it back locally by id skips an HTTP round trip to
@@ -1070,10 +1386,14 @@ function documentsInBurst(
     const id = url.split("/").pop() ?? "";
     const stored = id ? store.get(id) : null;
     if (!stored) continue;
+    // The message this file came in, for its delivery record. Media
+    // descriptors run parallel to `media_urls`.
+    const messageId = combined.media?.[index]?.message_id ?? combined.message_id;
     out.push({
       bytes: new Uint8Array(stored.bytes),
       mime: stored.mime,
       ...(stored.filename ? { filename: stored.filename } : {}),
+      ...(messageId ? { messageId } : {}),
     });
   }
   return out;
@@ -1087,42 +1407,188 @@ function documentsInBurst(
  * reads as broken), read, report back what was taken so it can be corrected,
  * then carry on with the questions the document could not answer.
  *
- * Every extracted answer goes through `applyProposals` exactly like a typed
- * one. A document is not a privileged source — nothing here can write an
- * option id that does not exist, and a proposal quoting text that is not in
- * the file is refused before it is validated.
+ * EACH FILE IS ITS OWN DOCUMENT. It is registered once per trip by its content,
+ * its bytes are kept, and it is read and extracted on its own — so a re-sent
+ * confirmation costs no model call, a retry resumes rather than re-paying, and
+ * every answer can be traced to the file that supplied it. What the files say
+ * is then decided TOGETHER, by one gate: each proposal must quote the file it
+ * came from, and several files' slices of one structured answer merge exactly as
+ * they did when the files were read as one string. That is what keeps five
+ * uploads describing one trip from becoming five competing sets of phases — the
+ * reason the files were once joined in the first place.
+ *
+ * Every extracted answer still goes through `applyProposals` and
+ * `validateAnswer` exactly like a typed one. A document is not a privileged
+ * source.
  */
 async function runDocumentPath(
   deps: TripBotPollerDeps,
   burst: { sessionId: string; chatId: string },
-  documents: { bytes: Uint8Array; mime: string; filename?: string }[],
-  state: { outstanding: string[]; answered: string[] },
+  documents: BurstDocument[],
   language: Language,
   log: (line: string) => void,
+  interpretationId: string,
+  tripId: string | null,
 ): Promise<void> {
   const strings = deps.strings ?? DEFAULT_STRINGS;
   const say = async (text: string) => {
     await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => {});
+  };
+  const ask = async () => {
+    const after = await getSessionForChat(deps.db, burst.chatId);
+    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
+  };
+  // The interpretation row claimed for this burst is closed on EVERY exit. The
+  // document branch used to return without committing it, so a redelivered
+  // upload found an open row and paid for the model call again.
+  const commit: CommitDocumentBurst = async ({ outcomes = {}, failureReason = null, proposals = [], durationMs = 0 }) => {
+    await recordInterpretationResult(deps.db, interpretationId, { proposals, failureReason, attempts: 0, durationMs });
+    await markInterpretationCommitted(deps.db, interpretationId, outcomes);
   };
 
   // The acknowledgement was already sent, the instant the file landed — see
   // `interview_to_gateway` in `applyDecision`. Sending it again here is what
   // produced the same sentence twice on 2026-09-09.
 
-  const texts: string[] = [];
-  let unreadable = 0;
+  if (!tripId) {
+    await commit({ failureReason: "NO_SESSION" });
+    await ask();
+    return;
+  }
+
+  const { registered, identity, unreadable } = await ingestBurstDocuments(deps, burst, tripId, documents, log);
+
+  // Said whenever one arrived, even alongside readable files — someone who
+  // sent a passport should be told it was left unread, not have it silently
+  // disappear into a batch.
+  if (identity > 0) await say(uiString("documentIdentity", language));
+
+  if (registered.length === 0) {
+    if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
+    await commit({ failureReason: "NO_READABLE_DOCUMENT" });
+    await ask();
+    return;
+  }
+
+  // Said before the recap: what follows is built from part of a file, and an
+  // organizer reading the recap would otherwise take anything missing from it
+  // as not being in the file at all.
+  if (registered.some(readPartially)) await say(uiString("documentPartial", language));
+
+  // KEEP IT. The relay's media store is in-memory with a TTL, so once the
+  // extraction has run the document is gone — and a confirmed intake built from
+  // a four-page itinerary carried `source_document: null`, with no way to ask
+  // later where any of it came from, or to re-extract when the extractor gets
+  // better. The agent path has always staged it; the interpret path never did.
+  // `confirmIntakeVia` still falls back to it until the registry migration
+  // lands (docs/test-reports/slice-b-step6-handoff-2026-09-21.md §3).
+  void saveSourceDocumentForChat(
+    deps.db, burst.chatId, registered.map((d) => d.text).join("\n\n"), registered[0]?.filename ?? undefined,
+  ).catch(() => { /* best-effort, exactly like the agent path's */ });
+
+  if (!deps.modelRunner) {
+    await say(uiString("documentNothing", language));
+    await commit({ failureReason: "NOT_CONFIGURED" });
+    await ask();
+    return;
+  }
+
+  await markReadingDocument(deps.db, burst.chatId, true);
+  try {
+    await readDocumentsInto(deps, deps.modelRunner, burst, tripId, registered, language, say, commit, log);
+  } finally {
+    // THE NEXT QUESTION, NOW — after the flag is down, not before. `ask` used to
+    // be a closure `readDocumentsInto` called at each of its own exits, all of
+    // them still inside this `try` — so `sendNextStep`'s `isReadingDocument`
+    // check (a DB-persisted flag, not cleared until this `finally` runs) held
+    // every one of those calls and sent nothing. The organizer got the recap and
+    // then silence until a later poll tick happened to notice the next question
+    // was due — a weaker form of the exact 51-seconds-of-silence incident
+    // (2026-09-16) this flag/ask ordering exists to prevent. Found by `consult`
+    // review during the #145 forward-port, 2026-09-21, before this landed.
+    await markReadingDocument(deps.db, burst.chatId, false);
+  }
+  await ask();
+}
+
+type CommitDocumentBurst = (result: {
+  outcomes?: StoredOutcomes;
+  failureReason?: string | null;
+  proposals?: ProposedAnswer[];
+  durationMs?: number;
+}) => Promise<void>;
+
+/** A burst attachment, out of the relay's media store. */
+interface BurstDocument {
+  bytes: Uint8Array;
+  mime: string;
+  filename?: string;
+  /** The message it arrived in — its delivery identity. */
+  messageId?: string;
+}
+
+/** One delivery of one file, identified within its channel. */
+function deliveryRef(chatId: string, messageId: string | undefined): string {
+  return `chat:${chatId}:msg:${messageId ?? "unknown"}`;
+}
+
+function readPartially(doc: RegisteredDocument): boolean {
+  return doc.truncated || doc.coverage.some((unit) => !unit.usable || unit.cut === true);
+}
+
+/**
+ * Registers every file in a burst: refuses identity documents, keeps the bytes
+ * of what it can read, and records each delivery. No model call — which is why
+ * it is also safe to run on a burst that was already interpreted.
+ */
+async function ingestBurstDocuments(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  tripId: string,
+  documents: BurstDocument[],
+  log: (line: string) => void,
+  // 'approved' during the interview, where the organizer's own answers are
+  // written as they go; 'pending' after confirmation, where a document only
+  // proposes and the organizer decides.
+  reviewStatus: "approved" | "pending" = "approved",
+): Promise<{ registered: RegisteredDocument[]; identity: number; unreadable: number }> {
+  const registered: RegisteredDocument[] = [];
   let identity = 0;
+  let unreadable = 0;
   for (const doc of documents) {
-    const read = await documentText(doc.bytes, doc.mime, doc.filename);
-    if (read.ok) {
-      texts.push(read.text);
+    const outcome = await ingestDocument(
+      {
+        db: deps.db,
+        store: deps.documentStore,
+        tripId,
+        provider: "telegram",
+        reviewStatus,
+        // Photos and scans are read through the relay's own runner, so the super
+        // admin's `read_image` choice applies here like every other task's.
+        ...(deps.modelRunner ? { vision: deps.modelRunner } : {}),
+        log,
+      },
+      {
+        bytes: doc.bytes,
+        mime: doc.mime,
+        ...(doc.filename ? { filename: doc.filename } : {}),
+        sourceRef: deliveryRef(burst.chatId, doc.messageId),
+      },
+    );
+    if (outcome.kind === "registered") {
+      const read = outcome.document;
+      registered.push(read);
       log(structuredLog("info", "interview.document_read", {
         session_id: burst.sessionId,
+        document_id: read.documentId,
         pages: read.pages,
         chars: read.text.length,
         truncated: read.truncated,
+        unread_units: read.coverage.filter((unit) => !unit.usable || unit.cut === true).length,
+        stored: read.stored,
+        duplicate: read.duplicateContent,
       }));
-    } else if (read.reason === "IDENTITY_DOCUMENT") {
+    } else if (outcome.kind === "refused") {
       // Not a failure and not logged as one: refusing a passport is the
       // system working. No detail either — there is nothing about it worth
       // recording beyond that one arrived and was left alone.
@@ -1132,73 +1598,229 @@ async function runDocumentPath(
       unreadable += 1;
       log(structuredLog("warn", "interview.document_unreadable", {
         session_id: burst.sessionId,
-        reason: read.reason,
-        detail: read.detail,
+        reason: outcome.reason,
+        detail: outcome.detail,
+      }));
+    }
+  }
+  // The same file attached twice in one burst is one document, read once.
+  const unique = [...new Map(registered.map((doc) => [doc.documentId, doc])).values()];
+  return { registered: unique, identity, unreadable };
+}
+
+/** How many times a document write is re-gated after the answers changed underneath it. */
+const DOCUMENT_WRITE_ATTEMPTS = 3;
+
+/**
+ * What each document's claims became, recorded beside the answers (0053), and
+ * every disagreement opened as a question for the organizer. Returns how many
+ * disagreements are newly open.
+ *
+ * Attributed per document and per entry: a document is recorded against the
+ * entries ITS OWN surviving proposals described, so a voucher is linked to the
+ * stay it confirms and not to every stop on the trip. Best-effort — the answers
+ * are already written, and a lost provenance row must not undo them.
+ */
+async function recordDocumentOutcomes(
+  deps: TripBotPollerDeps,
+  tripId: string,
+  gated: DocumentGateResult,
+  usable: readonly { documentId: string; payload: InterpretPayload }[],
+  recorded: ReadonlySet<string>,
+  log: (line: string) => void,
+): Promise<number> {
+  const { decisions } = gated;
+  const readFrom = new Map<unknown, string>();
+  for (const reading of usable) for (const proposal of reading.payload.proposals) readFrom.set(proposal, reading.documentId);
+  const refused = new Set<unknown>(decisions.rejected.map((r) => r.proposal));
+  const rows: AnswerSource[] = [];
+  const entriesOf = (value: ProposedValue): unknown[] | null =>
+    value.kind === "structured" && Array.isArray(value.data) ? value.data : null;
+
+  for (const accepted of decisions.accepted) {
+    if (!recorded.has(accepted.questionId)) continue;
+    const changes = accepted.reconciled;
+    const heldAnswer = changes?.held as { data?: unknown } | undefined;
+    const heldEntries = Array.isArray(heldAnswer?.data) ? heldAnswer.data : [];
+    const added = new Set(changes?.added.map((c) => c.entryKey));
+    const filled = new Map<string, string[]>();
+    for (const change of changes?.filled ?? []) {
+      filled.set(change.entryKey, [...(filled.get(change.entryKey) ?? []), change.path]);
+    }
+
+    for (const reading of usable) {
+      const own = reading.payload.proposals.filter(
+        (p) => p.questionId === accepted.questionId && gated.documentOf(p) === reading.documentId && !refused.has(p),
+      );
+      for (const proposal of own) {
+        const entries = entriesOf(proposal.value);
+        if (!entries) {
+          rows.push({
+            tripId, questionId: accepted.questionId, entryKey: "", documentId: reading.documentId,
+            disposition: changes ? "filled" : "accepted",
+          });
+          continue;
+        }
+        for (const entry of entries) {
+          // The key of the HELD entry this one merged into, where it did — a
+          // fill can change an entry's identity (a reference is added), and the
+          // change was recorded under the entry as it was held.
+          let key = entryIdentity(entry);
+          if (changes && isRecordValue(entry)) {
+            const match = matchEntry(heldEntries, heldEntries.length, entry);
+            if (match.kind === "match") key = entryIdentity(heldEntries[match.index]);
+          }
+          const disposition = !changes || added.has(key) ? "accepted" : filled.has(key) ? "filled" : "unchanged";
+          rows.push({
+            tripId, questionId: accepted.questionId, entryKey: key, documentId: reading.documentId,
+            disposition, paths: filled.get(key) ?? [], entrySnapshot: entry,
+          });
+        }
+      }
+    }
+  }
+
+  for (const rejection of decisions.rejected) {
+    const documentId = readFrom.get(rejection.proposal);
+    if (!documentId) continue;
+    const agreed = rejection.reason === "NO_NEW_INFORMATION" || rejection.reason === "ALREADY_ANSWERED";
+    rows.push({
+      tripId, questionId: rejection.questionId, entryKey: "", documentId,
+      disposition: agreed ? "unchanged" : "rejected",
+      reason: agreed ? null : rejection.reason,
+    });
+  }
+
+  for (const ambiguity of decisions.ambiguous) {
+    const documentId = readFrom.get(ambiguity.proposal);
+    if (!documentId) continue;
+    rows.push({
+      tripId, questionId: ambiguity.questionId, entryKey: ambiguity.entryKey, documentId,
+      disposition: "ambiguous", entrySnapshot: ambiguity.incoming, reason: `${ambiguity.candidates} candidates`,
+    });
+  }
+
+  let opened = 0;
+  for (const disagreement of decisions.conflicts) {
+    const documentId = readFrom.get(disagreement.proposal);
+    if (!documentId) continue;
+    try {
+      const { created } = await openConflict(deps.db, {
+        tripId,
+        questionId: disagreement.questionId,
+        entryKey: disagreement.entryKey,
+        path: disagreement.path,
+        held: disagreement.held,
+        incoming: disagreement.incoming,
+        documentId,
+      });
+      if (created) opened += 1;
+      rows.push({
+        tripId, questionId: disagreement.questionId, entryKey: disagreement.entryKey, documentId,
+        disposition: "conflict", paths: disagreement.path ? [disagreement.path] : [],
+      });
+    } catch (error) {
+      log(structuredLog("warn", "interview.document_conflict_not_opened", {
+        question_id: disagreement.questionId,
+        detail: String((error as Error)?.message ?? error).slice(0, 200),
       }));
     }
   }
 
-  const ask = async () => {
-    const after = await getSessionForChat(deps.db, burst.chatId);
-    if (after.ok) await sendNextStep(after.view, burst.chatId, deps, strings);
-  };
-
-  // Said whenever one arrived, even alongside readable files — someone who
-  // sent a passport should be told it was left unread, not have it silently
-  // disappear into a batch.
-  if (identity > 0) await say(uiString("documentIdentity", language));
-
-  if (texts.length === 0) {
-    if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
-    await ask();
-    return;
-  }
-
-  // Several files are read as ONE document. Five uploads describing one trip
-  // are one trip: extracting each separately would produce five competing
-  // `phases` proposals and let the last one win on nothing better than order.
-  const source = texts.join("\n\n");
-
-  // KEEP IT. The relay's media store is in-memory with a TTL, so once the
-  // extraction has run the document is gone — and a confirmed intake built from
-  // a four-page itinerary carried `source_document: null`, with no way to ask
-  // later where any of it came from, or to re-extract when the extractor gets
-  // better. The agent path has always staged it; the interpret path never did.
-  void saveSourceDocumentForChat(deps.db, burst.chatId, source, documents[0]?.filename)
-    .catch(() => { /* best-effort, exactly like the agent path's */ });
-
-  if (!deps.modelRunner) {
-    await say(uiString("documentNothing", language));
-    await ask();
-    return;
-  }
-
-  await markReadingDocument(deps.db, burst.chatId, true);
-  let answeredSomething = false;
   try {
-    answeredSomething = await readDocumentInto(deps, burst, source, state, language, say, log);
-  } finally {
-    await markReadingDocument(deps.db, burst.chatId, false);
+    await recordAnswerSources(deps.db, rows);
+  } catch (error) {
+    log(structuredLog("warn", "interview.document_provenance_failed", {
+      detail: String((error as Error)?.message ?? error).slice(0, 200),
+    }));
   }
-  // THE NEXT QUESTION, NOW — after the flag is down. Asked from inside the read,
-  // it met `held_for_document_read` in sendNextStep and waited for the loop to
-  // come round again, which it did only after the day-by-day pass below: 51s of
-  // silence after a 115s read, live on 2026-09-16.
-  await ask();
+  return opened;
+}
 
-  // THE DAY-BY-DAY PLAN, LAST AND IN THE BACKGROUND. It is a second model call
-  // taking up to minutes, and this runs inside the relay's one delivery loop:
-  // awaited, it held every chat's next message — including this organizer's
-  // answer to the question just sent. It fills in `phases`, which is already
-  // answered, so nothing the interview asks depends on it; and it refuses to
-  // write over stops that changed while it ran (foldItineraryFromDocument).
-  // Before the recap it once left an organizer watching nothing for seven
-  // minutes (2026-09-12).
-  if (answeredSomething) {
-    void foldItineraryFromDocument(deps, burst, source, log, say, language).catch(() => {
-      log(structuredLog("warn", "interview.itinerary_extract_threw", { session_id: burst.sessionId }));
-    });
+/** A disputed value, as the organizer should read it. */
+function conflictValueText(value: unknown, language: Language): string {
+  if (typeof value === "string") return readableDate(value, language) ?? value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (isRecordValue(value)) {
+    for (const key of ["text", "other_text", "otherText", "name", "name_en"]) {
+      if (typeof value[key] === "string" && (value[key] as string).trim()) return value[key] as string;
+    }
+    if (typeof value.option_id === "string") return value.option_id;
+    if (typeof value.optionId === "string") return value.optionId;
   }
+  return JSON.stringify(value);
+}
+
+/** The question for one disagreement, with its two answers as buttons. */
+async function renderConflictQuestion(
+  db: pg.Pool,
+  chatId: string,
+  conflict: AnswerConflict,
+  language: Language,
+): Promise<{ text: string; replyMarkup: InlineKeyboard; keepLabel: string; replaceLabel: string }> {
+  const question = findQuestion(conflict.questionId);
+  const questionLabel = question ? recapLabel(question, language) : "";
+
+  const fieldKey = `conflictField.${conflict.path}`;
+  const what = conflict.path === ""
+    ? questionLabel || uiString("conflictField.default", language)
+    : UI_STRINGS[language]?.[fieldKey] ?? UI_STRINGS[DEFAULT_LANGUAGE][fieldKey] ?? uiString("conflictField.default", language);
+
+  // The entry by the name the organizer knows it by, from the answer as held.
+  let entry = questionLabel;
+  if (conflict.entryKey) {
+    const store = await answersForChat(db, chatId);
+    const answer = store?.answers[conflict.questionId] as { data?: unknown } | undefined;
+    const found = (Array.isArray(answer?.data) ? answer.data : []).find((e) => entryIdentity(e) === conflict.entryKey);
+    if (isRecordValue(found)) {
+      const name = [found.name, found.name_en].find((n) => typeof n === "string" && n.trim());
+      if (typeof name === "string") entry = name;
+    }
+  }
+
+  const documents = await listTripDocuments(db, conflict.tripId);
+  const documentName = documents.find((d) => d.id === conflict.documentId)?.filename ?? "";
+  const fill = (template: string) =>
+    template
+      .replace("{what}", what)
+      .replace("{entry}", entry)
+      .replace("{held}", conflictValueText(conflict.held, language))
+      .replace("{incoming}", conflictValueText(conflict.incoming, language))
+      .replace("{document}", documentName);
+
+  const keepLabel = fill(uiString("documentConflictKeep", language));
+  const replaceLabel = fill(uiString("documentConflictReplace", language));
+  return {
+    text: fill(uiString("documentConflict", language)),
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: keepLabel, callback_data: conflictCallbackData(conflict.id, "keep") }],
+        [{ text: replaceLabel, callback_data: conflictCallbackData(conflict.id, "replace") }],
+      ],
+    },
+    keepLabel,
+    replaceLabel,
+  };
+}
+
+/**
+ * Ask the oldest open disagreement, if there is one and it is not already on
+ * screen. Returns whether a message was sent.
+ */
+async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotPollerDeps): Promise<boolean> {
+  const conflict = await nextOpenConflict(deps.db, view.tripId);
+  if (!conflict) return false;
+  const key = `cfl:${conflict.id}`;
+  // Already asked and still on screen: its buttons are there to tap. Asking it
+  // again would bury the question under copies of itself, and holding back
+  // everything else until it is answered would make a disagreement block the
+  // interview, which it must never do.
+  if (view.lastPrompt === key) return false;
+  if (!(await takeFloor(chatId, view, deps))) return false;
+  const rendered = await renderConflictQuestion(deps.db, chatId, conflict, view.language);
+  await deps.telegram.sendMessage({ chatId, text: rendered.text, replyMarkup: rendered.replyMarkup });
+  await recordLastPromptForChat(deps.db, chatId, key);
+  return true;
 }
 
 /**
@@ -1233,65 +1855,108 @@ function fromRecord(
 
 /**
  * The read itself — everything that must happen before the router speaks.
- * True when it recorded an answer, which is when the day-by-day pass is worth
- * running. The caller asks the next question once the reading flag is down.
+ *
+ * Deliberately does not ask the next question itself: every exit here runs
+ * while the caller still holds `markReadingDocument`, and asking from inside
+ * that window is exactly what silently swallowed the question — see the
+ * comment at this function's one call site.
  */
-async function readDocumentInto(
+async function readDocumentsInto(
   deps: TripBotPollerDeps,
+  runner: StructuredModelRunner,
   burst: { chatId: string; sessionId: string },
-  source: string,
-  state: { outstanding: string[]; answered: string[] },
+  tripId: string,
+  documents: RegisteredDocument[],
   language: Language,
   say: (text: string) => Promise<void>,
+  commit: CommitDocumentBurst,
   log: (line: string) => void,
-): Promise<boolean> {
-  if (!deps.modelRunner) return false;
-  const result = await extractIntakeFromDocument(deps.modelRunner, {
-    documentText: source,
-    outstanding: state.outstanding,
-    language,
-    timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS,
-  });
-
-  if (!result.ok) {
+): Promise<void> {
+  const started = Date.now();
+  const extracted = await extractRegisteredDocuments(
+    { db: deps.db, runner, tripId, language, timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS, log },
+    documents,
+  );
+  const usable = extracted.flatMap((e) => (e.kind === "ok" ? [e] : []));
+  const failures = extracted.flatMap((e) => (e.kind === "failed" ? [e] : []));
+  for (const failure of failures) {
     log(structuredLog("warn", "interview.document_extract_failed", {
       session_id: burst.sessionId,
-      reason: result.reason,
-      ms: result.ms,
+      document_id: failure.documentId,
+      reason: failure.reason,
       // The detail was already being carried and thrown away, which made the
-      // first live BAD_OUTPUT unexplainable: the model answered, the parser
-      // refused it, and nothing anywhere said what it had actually returned.
-      // Truncated, and it is model output about a document the organizer chose
-      // to share — enough to diagnose the shape, not a copy of their booking.
-      detail: (result.detail ?? "").slice(0, 300),
+      // first live BAD_OUTPUT unexplainable. Truncated, and it is model output
+      // about a document the organizer chose to share — enough to diagnose the
+      // shape, not a copy of their booking.
+      detail: (failure.detail ?? "").slice(0, 300),
     }));
-    await say(uiString("documentExtractFailed", language));
-    return false;
   }
 
-  const decisions = applyProposals(result.payload.proposals, {
-    sourceText: source,
-    outstanding: state.outstanding,
-    answered: state.answered,
-    unclear: result.payload.unclear,
-  });
+  if (usable.length === 0) {
+    await say(uiString("documentExtractFailed", language));
+    await commit({ failureReason: failures[0]?.reason ?? "FAILED", durationMs: Date.now() - started });
+    return;
+  }
 
-  const recorded: string[] = [];
-  for (const accepted of decisions.accepted) {
-    const args = submitArgsFor(accepted.proposal.value);
-    const written = await submitAnswerForChat(
-      deps.db, burst.chatId, accepted.questionId,
-      args.optionId, args.otherText, args.structuredData, args.optionIds,
-    );
-    if (written.ok) recorded.push(accepted.questionId);
-    else {
-      log(structuredLog("warn", "interview.document_write_refused", {
-        session_id: burst.sessionId,
-        question_id: accepted.questionId,
-        reason: written.reason,
-      }));
+  // THE GATE AND THE WRITE, against the answers held NOW — not when the burst
+  // arrived. Extraction takes minutes, and an organizer who corrected an answer
+  // in the meantime, or another document that landed first, is exactly what a
+  // minutes-old view would overwrite. Each write carries the answer it was
+  // merged against; a write refused as stale sends the whole gate round again
+  // on what is there now.
+  const readings = usable.map((e) => ({ documentId: e.documentId, text: e.text, payload: e.payload }));
+  const recordedSet = new Set<string>();
+  let gated: DocumentGateResult | null = null;
+  for (let attempt = 1; ; attempt += 1) {
+    const [store, state] = await Promise.all([
+      answersForChat(deps.db, burst.chatId),
+      questionStateForChat(deps.db, burst.chatId),
+    ]);
+    if (!store || !state) {
+      await commit({ failureReason: "SESSION_CLOSED", durationMs: Date.now() - started });
+      return;
+    }
+    gated = gateDocumentProposals(readings, {
+      outstanding: state.outstanding,
+      answered: state.answered,
+      held: store.answers,
+    });
+
+    let stale = false;
+    for (const accepted of gated.decisions.accepted) {
+      const args = submitArgsFor(accepted.proposal.value);
+      const written = await submitAnswerForChat(
+        deps.db, burst.chatId, accepted.questionId,
+        args.optionId, args.otherText, args.structuredData, args.optionIds,
+        // Unanswered when gated is a precondition too: an answer given by hand
+        // since then is merged into, not written over.
+        { held: accepted.reconciled ? accepted.reconciled.held : store.answers[accepted.questionId] },
+      );
+      if (written.ok) recordedSet.add(accepted.questionId);
+      else if (written.reason === "STALE_ANSWER") {
+        stale = true;
+        break;
+      } else {
+        log(structuredLog("warn", "interview.document_write_refused", {
+          session_id: burst.sessionId,
+          question_id: accepted.questionId,
+          reason: written.reason,
+        }));
+      }
+    }
+    if (!stale) break;
+    log(structuredLog("info", "interview.document_write_stale", { session_id: burst.sessionId, attempt }));
+    if (attempt >= DOCUMENT_WRITE_ATTEMPTS) {
+      log(structuredLog("warn", "interview.document_write_gave_up", { session_id: burst.sessionId, attempts: attempt }));
+      break;
     }
   }
+  const { decisions, sources } = gated!;
+  const recorded = [...recordedSet];
+  const conflictsOpened = await recordDocumentOutcomes(deps, tripId, gated!, usable, recordedSet, log);
+
+  const proposed = usable.flatMap((e) => e.payload.proposals);
+  const malformed = usable.reduce((n, e) => n + (e.payload.malformed ?? 0), 0);
 
   // UNSURE READINGS, kept to be asked about instead of lost. The gate refused
   // them for confidence alone; the organizer decides with one tap when the
@@ -1312,35 +1977,69 @@ async function readDocumentInto(
 
   log(structuredLog("info", "interview.document_committed", {
     session_id: burst.sessionId,
-    // PROPOSED vs ACCEPTED, and MALFORMED alongside both — the interpret log
-    // has carried all three from the start and this one carried neither.
-    // 2026-09-10: a real booking PDF read cleanly (4 pages, 4708 chars) and
-    // committed `accepted: 0, rejected: 0`. Those two numbers cannot tell you
-    // whether the model proposed nothing, or proposed things that never
-    // survived parsing — and the same document through
-    // `tools/extract-intake-check.ts` proposed four and had all four accepted.
-    // A whole session went into distinguishing two cases one field separates.
-    proposed: result.payload.proposals.length,
-    malformed: result.payload.malformed ?? 0,
+    documents: documents.length,
+    // Served from a stored reading rather than a model call — a re-sent file,
+    // or a retry after a crash.
+    reused: usable.filter((e) => e.reused).length,
+    failed: failures.length,
+    // PROPOSED vs ACCEPTED, and MALFORMED alongside both. On 2026-09-10 a real
+    // booking PDF committed `accepted: 0, rejected: 0`, and those two numbers
+    // could not tell "the model proposed nothing" from "nothing it proposed
+    // survived parsing".
+    proposed: proposed.length,
+    malformed,
     accepted: decisions.accepted.length,
     // An answer assembled from several proposals for one question — the case
     // that, before merging, silently dropped a document's attractions.
     merged: decisions.accepted.filter((a) => a.mergedFrom).length,
     rejected: decisions.rejected.length,
     reasons: decisions.rejected.map((r) => r.reason),
-    // WHICH question was refused, not only how many and why. "rejected: 1,
-    // reasons: [EVIDENCE_NOT_IN_SOURCE]" cost a live diagnosis on 2026-09-12:
-    // the organizer was asked for every stop and date their document had
-    // already given, and nothing in the log said it was `phases` that fell.
+    // WHICH question was refused, not only how many and why — a live diagnosis
+    // on 2026-09-12 needed exactly this.
     rejected_questions: decisions.rejected.map((r) => `${r.questionId}:${r.reason}`),
+    // How many documents each accepted answer was drawn from.
+    sources: [...sources].map(([questionId, ids]) => `${questionId}:${ids.length}`),
+    // Disagreements kept rather than decided, and entries that could not be
+    // placed. Counts only — the values are the organizer's to see, in their
+    // own chat, not a log's.
+    conflicts: decisions.conflicts.length,
+    conflicts_opened: conflictsOpened,
+    ambiguous: decisions.ambiguous.length,
     suggested: unsure,
-    ms: result.ms,
+    ms: Date.now() - started,
   }));
+  await commit({
+    outcomes: storedOutcomes(decisions, malformed),
+    proposals: proposed,
+    durationMs: Date.now() - started,
+  });
 
   if (recorded.length === 0) {
-    // "Found nothing" would be untrue when it found things it was unsure of.
-    await say(uiString(unsure.length > 0 ? "documentUnsure" : "documentNothing", language));
-    return false;
+    // Nothing new — for one of three reasons that must not be confused: every
+    // file is one already read, a read failed, or the files genuinely say
+    // nothing the interview still needs. And two that are not "nothing" at all:
+    // the files disagree with what is held, which the question that follows
+    // says far better than any of these sentences would; or they said things
+    // the reader was unsure of, which are checked with the organizer instead.
+    if (conflictsOpened === 0) {
+      const alreadyRead = failures.length === 0 && usable.every((e) => e.reused);
+      // The file was read and AGREES with what is held — a second copy of the
+      // itinerary, a voucher for a stay already recorded. Telling the organizer
+      // "I couldn't find anything about the trip" about a booking that confirms
+      // the trip was the reply on 2026-09-13's acceptance run.
+      const agreed = proposed.length > 0 &&
+        decisions.rejected.some((r) => r.reason === "NO_NEW_INFORMATION" || r.reason === "ALREADY_ANSWERED");
+      await say(uiString(
+        alreadyRead ? "documentAlreadyRead"
+          : failures.length > 0 ? "documentExtractFailed"
+          // "Found nothing" would be untrue when it found things it was unsure of.
+          : unsure.length > 0 ? "documentUnsure"
+          : agreed ? "documentNothingNew"
+          : "documentNothing",
+        language,
+      ));
+    }
+    return;
   }
 
   // WHAT IT TOOK, in the organizer's own recap format, so they can correct it.
@@ -1385,7 +2084,21 @@ async function readDocumentInto(
       await say(`${uiString("documentRead", language)}\n\n${lines.join("\n")}\n\n${uiString("documentCorrect", language)}`);
     }
   }
-  return true;
+
+  // IN THE BACKGROUND, AND DELIBERATELY NOT AWAITED. It is a second model call
+  // taking up to minutes, and this runs inside the relay's one delivery loop:
+  // awaited, it held every chat's next message — including this organizer's
+  // answer to the question the caller is about to ask, live on 2026-09-16. It
+  // fills in `phases`, which is already answered, so nothing the interview asks
+  // depends on it; and it refuses to write over stops that changed while it ran
+  // (foldItineraryFromDocument). Before the recap it once left an organizer
+  // watching nothing for seven minutes (2026-09-12). Triggering it here rather
+  // than waiting for the caller costs nothing — `void` returns control
+  // immediately either way — and the caller's `ask()`, once the reading flag is
+  // down, is what actually matters for latency, not this line's position.
+  void foldItineraryFromDocument(deps, burst, usable.map((e) => e.text).join("\n\n"), log, say, language).catch(() => {
+    log(structuredLog("warn", "interview.itinerary_extract_threw", { session_id: burst.sessionId }));
+  });
 }
 
 /**
@@ -1413,7 +2126,19 @@ async function runInterpretPath(
   const strings = deps.strings ?? DEFAULT_STRINGS;
   const sourceText = combined.text ?? "";
   const messageIds = combined.message_id ? [combined.message_id] : [];
-  const key = burstKey(messageIds, sourceText);
+  if (sourceText.length > INTERPRET_SOURCE_BUDGET_CHARS) {
+    log(structuredLog("warn", "interview.interpret_source_truncated", {
+      session_id: burst.sessionId,
+      chars: sourceText.length,
+      budget: INTERPRET_SOURCE_BUDGET_CHARS,
+    }));
+  }
+  // Resolved before the claim, because a burst that carried files is claimed by
+  // what the files ARE — see `documentBurstKey`.
+  const documents = documentsInBurst(combined, deps);
+  const key = documents.length > 0
+    ? documentBurstKey(documents.map((doc) => contentDigest(doc.bytes)), sourceText)
+    : burstKey(messageIds, sourceText);
 
   // TAKE THE FLOOR FIRST, before anything slow.
   //
@@ -1498,6 +2223,21 @@ async function runInterpretPath(
       session_id: burst.sessionId,
       burst_key: key,
     }));
+    // A document burst already read. Its deliveries are still recorded — a
+    // file re-sent in a new message is a real delivery — but only a NEW
+    // delivery is told the file was already read. A redelivered update the
+    // organizer never re-sent must not produce a message they did not prompt.
+    if (documents.length > 0) {
+      const replaying = await getSessionForChat(deps.db, burst.chatId);
+      if (replaying.ok) {
+        const { registered } = await ingestBurstDocuments(deps, burst, replaying.view.tripId, documents, log);
+        if (registered.some((doc) => doc.newDelivery)) {
+          await deps.telegram
+            .sendMessage({ chatId: burst.chatId, text: uiString("documentAlreadyRead", replaying.view.language) })
+            .catch(() => {});
+        }
+      }
+    }
     // Committed already, but the organizer may never have seen the question
     // that followed — asking again is safe (the flood dedupe suppresses a
     // genuine repeat), staying silent is not.
@@ -1537,9 +2277,15 @@ async function runInterpretPath(
   // the file is the message. The whole exchange — acknowledge, read, report
   // back, ask only for what is left — is the reason accepting a file is worth
   // anything, and until now the bot accepted files and read none of them.
-  const documents = documentsInBurst(combined, deps);
   if (documents.length > 0) {
-    await runDocumentPath(deps, burst, documents, state, language, log);
+    // Not-fresh-and-uncommitted lands here too: the crash window. Re-running
+    // the document path IS the resume — every document already read is served
+    // from its stored extraction, so nothing is paid for twice.
+    await runDocumentPath(
+      deps, burst, documents, language, log,
+      claim.fresh ? claim.id : claim.row.id,
+      session.ok ? session.view.tripId : null,
+    );
     return;
   }
   // Which question is currently on the organizer's screen. Needed after the
@@ -2200,8 +2946,10 @@ export async function foldItineraryFromDocument(
   if (!phasesAnswer || phasesAnswer.kind !== "structured" || !Array.isArray(phasesAnswer.data)) return;
   const phases = phasesAnswer.data as Record<string, unknown>[];
   if (phases.length === 0) return;
-  // Already has an itinerary: this is a second document, or a retry. Leave it.
-  if (phases.every((phase) => Array.isArray(phase.days) && phase.days.length > 0)) return;
+  // Every night of every stop already has a day: nothing a document could add.
+  // The old test was "every stop has A day", which let one captured day stand
+  // for a whole five-day stop, so no later document could fill in the rest.
+  if (itineraryCoverageComplete(phases)) return;
 
   const destinationAnswer = store?.answers.destination;
   const destination = destinationAnswer?.kind === "text" ? destinationAnswer.text
@@ -2227,7 +2975,10 @@ export async function foldItineraryFromDocument(
       })),
       travelers,
       documentText,
-    });
+    // The relay's own runner, so a super admin's override for the day-by-day
+    // task applies here too. Left to its default this would build a runner
+    // from the environment and silently ignore the override.
+    }, deps.modelRunner ?? modelRunnerFromEnv());
   } catch {
     log(structuredLog("warn", "interview.itinerary_extract_threw", { session_id: burst.sessionId }));
     return;
@@ -2291,6 +3042,12 @@ export async function foldItineraryFromDocument(
   }));
   // An extraction nobody can see reads as a document that was not understood.
   if (written.ok && folded.daysAdded > 0 && say) await say(uiString("documentDays", language));
+  // And a day-by-day built from part of a plan must not pass for all of it: the
+  // organizer would reasonably take a missing day as a free one.
+  if (written.ok && say && result.warnings.some((w) => w.startsWith(ITINERARY_TRUNCATED_WARNING))) {
+    log(structuredLog("warn", "interview.itinerary_truncated", { session_id: burst.sessionId }));
+    await say(uiString("itineraryPartial", language));
+  }
 }
 
 async function handBackToInterviewer(
@@ -2786,6 +3543,17 @@ export async function sendNextStep(
     return false;
   }
 
+  // A DISAGREEMENT BETWEEN DOCUMENTS, waiting on the organizer — asked before
+  // anything new, because it is about something they have already been shown
+  // and it is cheapest to settle while the document is fresh in their mind. It
+  // never blocks anything: the held value stands until they answer, and an
+  // unanswered disagreement stops neither the interview nor confirmation.
+  //
+  // Re-enabled as part of the same step that added the four b2e3051
+  // migrations (control_plane.trip_answer_conflicts now exists) — see the
+  // #145 forward-port note on `askOpenConflict` for why this was held back.
+  if (await askOpenConflict(view, chatId, deps)) return true;
+
   // THE BOUNDARY. Nothing required left to ask, but a required answer is still
   // missing — one that stepped aside after a reply did not answer it. Bring the
   // set-aside questions back, and say why they are back, BEFORE anything
@@ -3262,6 +4030,8 @@ export function startTripBotPoller(
             media: deps.media,
             pendingAttachments,
             groupContext,
+            ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
+            ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the
             // organizer's turn on a socket that is gone.

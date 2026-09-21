@@ -125,6 +125,13 @@ export interface WireMediaDescriptor {
   size: number;
   filename?: string;
   caption?: string;
+  /**
+   * The message this attachment arrived in. Set when a burst is combined,
+   * because the combined event keeps only the LAST message's id — and a
+   * document's delivery record needs its own, or two files sent in two
+   * messages look like one delivery.
+   */
+  message_id?: string;
 }
 
 export interface WireMessageEvent {
