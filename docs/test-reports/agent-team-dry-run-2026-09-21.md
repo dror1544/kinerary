@@ -11,7 +11,9 @@ present tense. **Shipped:** PR #138, merged `7f742b5` into `integration/sprint-6
 **Start condition met before anything ran:** baseline LOCKED at `97582b6`,
 sprint lock OPEN (`scripts/project-state.py show`).
 
-The loop works. Every gate held, no agent committed or merged, and the change
+The loop works. Every gate held, no developer or subagent committed — the lead
+session committed only after Dror's word at gate 1, which is §4 as written —
+and the change
 that shipped is better than the one the first pass produced. What follows is
 what it cost and what is wrong with the templates.
 
@@ -51,21 +53,33 @@ developer instance via `SendMessage`, context intact. No re-briefing cost.
 
 ## 2. The mechanism defects — these matter more than the templates
 
-**M1 · `isolation: worktree` branches from `origin/main`, always.** Root cause
-found by `pr-steward` from the reflog, re-verified:
+**M1 · `isolation: worktree` branched from `origin/main`, because nothing set
+`worktree.baseRef`.** Root cause found by `pr-steward` from the reflog,
+re-verified:
 
 ```
 worktree-agent-aa16bcb12fa68d1ef@{0}: branch: Created from origin/main
 worktree-agent-a14346a359e4fef07@{0}: branch: Created from origin/main
 ```
 
-Not the session's branch, not the brief's declared base. **Appendix B's
-`Base branch:` field is decorative** — nothing reads it and the spawn
-contradicts it silently. Two of three spawns this run landed on `b451ee7`
-(#109), which is not on `integration/sprint-6`. It cost nothing here only
-because the file was the identical blob on every base; a task on a file that
-*differs* would have produced a silently wrong diff. The PR was rebuilt on a
-fresh branch off `integration/sprint-6` so #109 would not ride along.
+Both observed spawns — not, on this evidence, "every spawn always": the base
+comes from the `worktree.baseRef` setting, whose default `fresh` branches from
+the remote's default branch, while `head` branches from the session's HEAD.
+Nothing set it, so both landed on `origin/main`, then at `b451ee7` (#109),
+which is not on `integration/sprint-6`.
+
+**Appendix B's `Base branch:` field was decorative** — nothing read it and the
+spawn contradicted it silently. It cost nothing here only because the file was
+the identical blob on every base; a task on a file that *differs* would have
+produced a silently wrong diff. The PR was rebuilt on a fresh branch off
+`integration/sprint-6` so #109 would not ride along.
+
+**Fixed after the run** (2026-09-21): `.claude/settings.json` now sets
+`worktree.baseRef: "head"`, proved by two probes — a spawn before the setting
+landed on `origin/main` (`b451ee7`), one after it on the integration branch
+head (`7f742b5`). So the durable answer is a setting, not a precondition the
+brief has to re-check; the developer's base check remains as the proof it
+worked.
 
 **M2 · `origin/integration/sprint-6` was 17 commits behind local, and did not
 contain the sprint's own locked baseline.** Found by the integrator.
@@ -174,10 +188,12 @@ Add to the preamble:
 Replace three fields and add one:
 
 ```
-Base branch: integration/sprint-6   <- VERIFY AFTER SPAWN. `isolation: worktree`
-             branches from origin/main regardless of what this says. First act
-             in the worktree: `git merge-base --is-ancestor <base> HEAD`. If it
-             fails, say so in the handover before doing any work.
+Base branch: integration/sprint-6   <- VERIFY AFTER SPAWN. The spawn's base is
+             `worktree.baseRef` (`head` since 2026-09-21; the default `fresh`
+             branches from the remote's default branch instead). First act in
+             the worktree: `git merge-base --is-ancestor <base> HEAD`. A failed
+             check is BLOCKED with no work done — never a note in a handover
+             attached to work already written against the wrong tree.
 
 Unit of work: <for a drift or correctness fix on a document: the CLAIM, not the
              line range. Enumerate every place in the owned paths that makes it;
@@ -235,16 +251,31 @@ Proposed commit message:   <for the WHOLE task, not this handover. On a rework
 
 ## 5. Open items for Dror
 
-1. **Fix the spawn base (M1)** or make Appendix B's field a checked precondition.
-   This is the one defect that will corrupt a real task.
-2. **Decide `doc-keeper`'s authority (C5).** Either write the co-authorship
-   exception into `doc-keeper.md`, or drop it and let it edit.
-3. **Make the consult read-only (M5)** — a tools-restricted agent file, or a
-   standing line in §7.
-4. **`sprint-scribe`'s citation fix is uncommitted** in
-   `.claude/worktrees/sprint6-tracks` on `docs/sprint-6-tracks` — a branch that
-   already merged via #111. It needs a fresh branch and PR; it will not arrive
-   on its own.
+Items 1–3 were the ones that mattered most, and all three were closed on
+2026-09-21, after this report was first written. They are kept here with their
+outcome rather than deleted, because the outcome is the evidence that the dry
+run paid for itself.
+
+1. ~~**Fix the spawn base (M1).**~~ **Closed** — `.claude/settings.json` sets
+   `worktree.baseRef: "head"`, proved by two probes. A setting, not a
+   precondition the brief re-checks.
+2. ~~**Decide `doc-keeper`'s authority (C5).**~~ **Closed by decision 10**
+   (2026-09-21) — the keeper edits the document under task. The restriction
+   this run operated under was the manager's own error: it rested on "a
+   co-author cannot certify", and the keeper certifies nothing. `grep -rni
+   'certif'` over the plan and `.claude/agents/` returns two hits, both the
+   developer, both answered by `verifier`.
+3. ~~**Make the consult read-only (M5).**~~ **Closed** — `.claude/agents/consult.md`,
+   `tools: Read, Grep, Glob`, Opus at high effort, and the integrator's
+   `Agent(general-purpose)` became `Agent(consult)`. Read-only by construction
+   rather than by instruction.
+4. ~~**`sprint-scribe`'s citation fix is uncommitted.**~~ **Closed** — it was
+   sitting in `.claude/worktrees/sprint6-tracks` on `docs/sprint-6-tracks`, a
+   branch that had already merged via #111, so it would never have arrived on
+   its own. Rebuilt on a fresh branch off `integration/sprint-6` and opened as
+   **PR #140**; its four corrected line numbers were re-read against the merged
+   file before committing, because a wrong citation fix would have been the
+   very defect the fix is for.
 5. **Branch/worktree cleanup proposed, not run** — `docs/137-front-door-claims`
    (and its origin copy), `worktree-agent-aa16bcb12fa68d1ef`,
    `worktree-agent-a14346a359e4fef07`, `integrator/pr138-check`, `pr-138-head`.
