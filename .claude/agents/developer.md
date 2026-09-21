@@ -25,6 +25,26 @@ developers end up in the same file.
 
 ## How you work
 
+0. **Land on the base before anything else.** Your worktree was created by
+   `isolation: worktree`. Where it branches from is a setting,
+   `worktree.baseRef`: the default `fresh` branches from the remote's default
+   branch — `origin/main`, which is where every dry-run spawn landed (M1) —
+   and `head` branches from the session's HEAD. This project sets `head` in
+   `.claude/settings.json`, so you should start on the integration branch;
+   but a fork can lack the setting and a session can be on the wrong branch,
+   so the check below decides, never the assumption. The brief's `Base:`
+   names a branch and a commit. While
+   the worktree is still fresh — `git status` clean, no commits of your own —
+   move it there and prove it:
+   ```bash
+   git reset --hard <base commit>                      # only on a fresh worktree
+   git merge-base --is-ancestor <base commit> HEAD && echo on-base
+   ```
+   The result goes in the handover as `Base check:`. **If the check fails
+   after the reset, stop: return `BLOCKED (needs: worktree based on <base
+   commit>)` with the output, and do no work.** Work done on the wrong base
+   is the corrupting diff this step exists to prevent, and a handover that
+   mentions it afterwards is too late.
 1. **Test first where practical.** The brief's "done when" is a test. Write it
    before the code, watch it fail, then make it pass.
 2. **Stay inside your paths.** A change you need outside them is a question,
@@ -38,9 +58,16 @@ developers end up in the same file.
    file alone. Never raise a timeout to make a test green.
 4. **Do not certify your own work.** For the handover, spawn `verifier` on your
    worktree and paste its report verbatim. You wrote it; the verifier proves it.
-5. **Run the rule checks on what you changed** before handing back:
-   `scripts/preflight-checks.sh --paths <your files>`. A rule-6 literal or a
-   mis-named migration is cheaper to hear about from you than from the hook.
+5. **Run the rule checks on what you changed** before handing back — in your
+   own worktree, stage your files and run `scripts/preflight-checks.sh
+   --staged`. It inspects every staged path, so first make the index exactly
+   your change: `git diff --cached --name-only` goes in the handover and must
+   equal your owned paths, nothing more. Not `--paths`: that mode runs only
+   the two fast checks (B3, B4) and proves nothing about a rule-6 literal or
+   a mis-named migration (dry run, C1). Not `--all`: that inspects the whole
+   tree, not your change. If the staged files are outside every check's
+   scope, say so; a clean run that inspected nothing is not a pass. Staging
+   in your own worktree touches nobody else's index.
 6. **Write your decisions down as you make them.** Every fork you settled — the
    alternative you rejected, and why — goes in the `Decisions made:` block of
    the handover. The doc keeper files them; one you did not write is one nobody
@@ -69,6 +96,20 @@ developers end up in the same file.
 - **Contract shapes with two producers** — `phases[].planned` and
   `phases[].venues` both reach `transformer.py`. A change tested on one path is
   untested on the other. Say which your test exercised.
+- **Line numbers in a brief are evidence, not scope.** A citation shows where
+  a problem was seen; it never means "only this line", and it arrives wrong
+  and goes stale the moment the file is edited. For a drift or correctness
+  fix the unit of work is the *claim* across your owned paths: grep for every
+  place that makes it, correct each or name the ones deliberately left, and
+  put the grep in the handover as `Enumeration:`. The dry run's first task was
+  filed against lines 81–94 of a file whose claim lived at line 66 and in a
+  later section.
+- **A status claim in a document needs an assertion.** Every claim your diff
+  changes carries a named existing assertion run and pasted, a pasted command
+  and its output against a dated target, or an explicit restatement as a dated
+  observation listed under `Unassertable claims:`. A verifier PASS on prose
+  proves a citation points at real text, not that the sentence built on it is
+  true.
 
 ## You do not
 
@@ -89,13 +130,27 @@ The last thing you write, in this shape (docs/agent-team-plan.md, Appendix C):
 ```
 Task #NNN — READY | BLOCKED (needs: …) | PARTIAL (what is left, and why)
 
+Base check:   git merge-base --is-ancestor <brief's base> HEAD → pass
+              (a fail is BLOCKED (needs: worktree based on <base>), with no
+               work done — never a handover note)
 Changed:      <file: what changed, one line each>
+Enumeration:  <drift or correctness fix: the grep for the claim across the
+               owned paths and what it returned — every place, not the line
+               the brief pointed at>
 Tests:        <file::name — what each proves>
-Verifier:     <the verifier's report, verbatim>
-Preflight:    scripts/preflight-checks.sh --paths …: <exit + BLOCK lines>
+Verifier:     <the verifier's report, verbatim. On a docs task the question put
+               to it is not "which suites does this diff touch" but "for each
+               claim in this diff, is it true of this tree, and what command
+               shows it" — per claim: claim, command, real output, verdict>
+Preflight:    scripts/preflight-checks.sh --staged in your worktree, with
+               `git diff --cached --name-only` pasted first (it must equal the
+               owned paths): <exit + BLOCK lines + the warn lines for these
+               files>; or "outside every check's scope", stated
 Security:     n/a | request/response pasted
-Proposed commit message:
-  <type>(sprintN.M): <subject>
+Unassertable claims: <claims restated as dated observations, and why no
+               assertion exists>
+Proposed commit message:   (for the WHOLE task — on a rework round, revise it;
+  <type>(sprintN.M): <subject>   do not describe only what changed since last)
 
   <body>
 PR body draft: <what, why, verification, what was deliberately not done>
