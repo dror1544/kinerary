@@ -25,9 +25,16 @@ it("follows destinations and stops at the provider forecast horizon", async () =
   fireEvent.click(screen.getByRole("button", { name: "Back" }));
   expect(screen.getByText("Tokyo")).toBeInTheDocument();
 });
-it("uses the active itinerary day over phase date ranges", () => {
+it("uses the active itinerary day over phase date ranges and the first destination before departure", () => {
   expect(weatherPhase(config, { revision: "1", days: [{ date: "2026-09-12", phase_id: "kyoto" }], items: [] }, "2026-09-12")?.id).toBe("kyoto");
-  expect(weatherPhase(config, undefined, "2026-08-01")).toBeUndefined();
+  expect(weatherPhase(config, undefined, "2026-08-01")?.id).toBe("tokyo");
+});
+it("shows the first destination's forecast before departure", async () => {
+  vi.mocked(getWeather).mockResolvedValue({ source: "open-meteo", date: "2026-09-10", forecast_dates: ["2026-09-10"], temperature_max: 26 });
+  render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><TodayWeather config={config} today="2026-09-10" lang="en" /></QueryClientProvider>);
+  expect(screen.getByText("Tokyo")).toBeInTheDocument();
+  expect(await screen.findByText("High 26°C · Low —")).toBeInTheDocument();
+  expect(getWeather).toHaveBeenCalledWith(35, 139, "2026-09-10");
 });
 it("does not substitute the first stop for an unmapped day", () => {
   show({ phases: [] });
@@ -41,14 +48,27 @@ it("handles unavailable forecasts without inventing temperatures or a horizon", 
   expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
 });
 
-it("stops on the last itinerary day even when forecasts and phase dates extend further", async () => {
+it("continues into later phases without scheduled days, up to the forecast horizon", async () => {
   vi.mocked(getWeather).mockImplementation(async (_lat, _lon, date) => ({ source: "open-meteo", date, forecast_dates: ["2026-09-12", "2026-09-13", "2026-09-14"], temperature_max: 22 }));
-  show(config, "en", { revision: "1", days: [{ date: "2026-09-12", phase_id: "tokyo" }, { date: "2026-09-13", phase_id: "kyoto" }], items: [] });
+  show(config, "en", { revision: "1", days: [{ date: "2026-09-12", phase_id: "tokyo" }], items: [] });
+  await screen.findByText("High 22°C · Low —");
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByText("Kyoto");
+  expect(screen.queryByText("Last trip day")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Next" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByText("Latest available forecast day");
+  expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
+  expect(getWeather).toHaveBeenCalledWith(34, 135, "2026-09-14");
+});
+it("stops at the final phase date when forecasts extend past the trip", async () => {
+  vi.mocked(getWeather).mockImplementation(async (_lat, _lon, date) => ({ source: "open-meteo", date, forecast_dates: ["2026-09-12", "2026-09-13", "2026-09-14"], temperature_max: 22 }));
+  show({ phases: [config.phases![0], { ...config.phases![1], dates: { start: "2026-09-13", end: "2026-09-13" } }] });
   await screen.findByText("High 22°C · Low —");
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   await screen.findByText("Last trip day");
   expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
-  expect(screen.getByRole("button", { name: "Back" })).toBeEnabled();
   expect(getWeather).not.toHaveBeenCalledWith(34, 135, "2026-09-14");
 });
 it.each(["en", "he"] as const)("uses icon-only arrows with the correct direction in %s", async (lang) => {

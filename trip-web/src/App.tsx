@@ -72,6 +72,7 @@ import {
   ItineraryDay,
   ItineraryItem,
   ItineraryItemInput,
+  TodayContext,
   TripConfig,
   createMoment,
   extractBookingDetails,
@@ -648,7 +649,7 @@ export function UpcomingActivity({ item, config, lang, onOpenItinerary }: {
   </article>;
 }
 
-function TodayView({
+export function TodayView({
   itinerary,
   config,
   lang,
@@ -666,14 +667,14 @@ function TodayView({
   const hermes = useQuery({ queryKey: ["hermes"], queryFn: getHermes });
   const flights = useQuery({ queryKey: ["flights"], queryFn: getFlightStatus });
   const missing = confirmations.data?.items.filter((item) => item.state !== "verified").slice(0, 3) || [];
-  const next = today.data?.next || itinerary?.items[0] || null;
+  const next = today.data?.next || null;
   const companionName = botDisplayName(config, hermes.data?.identity.name, lang);
 
   return (
     <section className="view-grid today-grid">
       <div className="focus-panel">
         <span className="panel-label">{today.data ? phaseLabel(today.data.phase, lang) : copy(lang, "Today", "היום")}</span>
-        <h2>{next ? itemTitle(next, lang) : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
+        <h2>{next ? itemTitle(next, lang) : today.data ? copy(lang, "No upcoming activities scheduled.", "אין פעילויות קרובות מתוכננות.") : copy(lang, "Your trip clock is warming up.", "שעון הטיול מתכונן לצאת לדרך.")}</h2>
         {today.data?.phase === "pre_trip" && today.data.countdown_days != null ? (
           <p>{copy(lang, `${Math.max(today.data.countdown_days, 0)} days until departure.`, `נותרו ${Math.max(today.data.countdown_days, 0)} ימים ליציאה.`)}</p>
         ) : null}
@@ -761,6 +762,7 @@ export function JourneyView({
   telegramUsername,
   onHeroPhaseChange,
   focus,
+  today,
 }: {
   itinerary?: ActiveItinerary;
   config?: TripConfig;
@@ -771,6 +773,7 @@ export function JourneyView({
   telegramUsername?: string | null;
   onHeroPhaseChange: (phaseId: string) => void;
   focus?: JourneyFocus | null;
+  today?: TodayContext;
 }) {
   const days = itinerary?.days || [];
   const phaseGroups = useMemo(() => buildPhaseGroups(config?.phases, days, lang), [config?.phases, days, lang]);
@@ -801,6 +804,7 @@ export function JourneyView({
   const day = days.find((entry) => entry.date === activeDate && (!activePhase?.id || entry.phase_id === activePhase.id));
   const daySpineRef = useRef<HTMLElement>(null);
   const handledFocus = useRef<JourneyFocus | null>(null);
+  const initializedForTripDate = useRef(false);
 
   useEffect(() => {
     if (!selectedPhase && phaseGroups[0]?.id) setSelectedPhase(phaseGroups[0].id);
@@ -813,6 +817,22 @@ export function JourneyView({
   useEffect(() => {
     if (phaseDates.length && !phaseDates.includes(selected)) setSelected(phaseDates[0]!);
   }, [phaseDates, selected]);
+
+  // Journey normally begins at day one, which remains the useful preview
+  // before departure. Once the trip clock says today belongs to the itinerary,
+  // use that day for Journey's first view instead. This runs once per mount so
+  // changing days manually is never undone by a later query refresh.
+  useEffect(() => {
+    if (initializedForTripDate.current || !itinerary || !today?.today || today.phase === "pre_trip" || !phaseGroups.length) return;
+    initializedForTripDate.current = true;
+    const phase = phaseGroups.find((entry) => mergePhaseDates(
+      entry.calendar,
+      entry.days.map((day) => day.date),
+    ).includes(today.today));
+    if (!phase) return;
+    setSelectedPhase(phase.id);
+    setSelected(today.today);
+  }, [itinerary, phaseGroups, today?.phase, today?.today]);
 
   useEffect(() => {
     if (!focus?.phaseId || handledFocus.current === focus) return;
@@ -2591,7 +2611,7 @@ export default function App() {
       : "";
   const tabContent = {
     today: <TodayView itinerary={itinerary.data} config={config.data} lang={lang} isOrganizer={me.data?.is_organizer} onOpenItinerary={openMapItinerary} />,
-    journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} />,
+    journey: <JourneyView username={me.data?.username} itinerary={itinerary.data} config={config.data} isOrganizer={me.data?.is_organizer} lang={lang} botName={companionName} telegramUsername={hermes.data?.telegram_username} onHeroPhaseChange={setJourneyHeroPhaseId} focus={journeyFocus} today={today.data} />,
     moments: <MomentsView todayDate={today.data?.today} lang={lang} />,
     more: <MoreView config={config.data} currentUser={me.data} isOrganizer={me.data?.is_organizer} lang={lang} openModule={openModule} />,
   }[activeTab];

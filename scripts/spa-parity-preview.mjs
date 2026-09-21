@@ -21,6 +21,26 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const temp = mkdtempSync(join(tmpdir(), "spa-parity-preview-"));
 cpSync(join(root, "tests/fixtures"), temp, { recursive: true });
 const config = JSON.parse(readFileSync(join(temp, "trip.config.json"), "utf8"));
+if (process.env.SPA_PREVIEW_ACTIVE === "1") {
+  const today = new Date().toISOString().slice(0, 10);
+  const after = (days) => {
+    const date = new Date(`${today}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
+  };
+  // Keep this entirely inside the throwaway fixture copy. Today is day two,
+  // with its own activity so Today and Journey can be compared directly.
+  config.phases[0].dates = { start: after(-1), end: after(2) };
+  const firstDay = config.phases[0].days[0];
+  config.phases[0].days = Array.from({ length: 4 }, (_, index) => index === 0
+    ? { ...firstDay, date: after(-1), label: { en: "Day 1 — New York", he: "יום 1 — ניו יורק" } }
+    : {
+      date: after(index - 1),
+      label: { en: `Day ${index + 1} — New York`, he: `יום ${index + 1} — ניו יורק` },
+      items: index === 1 ? [{ text: { en: "Day 2 — Riverside walk", he: "יום 2 — הליכה ליד הנהר" } }] : [],
+    });
+  config.phases[1].dates = { start: after(6), end: after(12) };
+}
 config.tasks = [
   {
     id: "parity-passport",
