@@ -1924,6 +1924,11 @@ _ANCHOR_TYPE_MAP: dict[str, str] = {
     "reservation": "attraction",
     "ticket": "attraction",
     "excursion": "attraction",
+    # The question invites these three by name, so the model emits them; without
+    # a row here they fall to "other" and a booked visit stops reading as one.
+    "event": "attraction",
+    "shuttle": "attraction",
+    "parking": "attraction",
     "proposal": "other",
     "booking": "other",
 }

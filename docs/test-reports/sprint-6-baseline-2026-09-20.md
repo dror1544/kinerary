@@ -159,6 +159,112 @@ Triage values: `baseline-fix` (fix before the sprint's work) · `sprint-6`
 
 ---
 
+## The baseline commit, and what was run at it
+
+`.project/sprint.json` records the baseline as **97582b6** and locks it there.
+Everything below was run at that exact commit, with a clean working tree
+(`git status` empty before and after).
+
+| suite | result |
+|---|---|
+| trip site (`tests`) | 483 tests, 483 pass, 0 fail |
+| control-plane API | 1374 tests, 1368 pass, 0 fail, 6 skipped |
+| control-plane API typecheck | clean |
+| worker (`control-plane/worker`, **with a database**) | 435 tests, OK |
+| provisioning (`tests/provisioning`) | 36 tests, OK |
+| scripts (`tests/scripts`) | 305 tests, OK |
+| web | 10 tests, passed |
+| trip-web | 135 tests, passed |
+| runtime-gateway | 5 tests, 5 pass, 0 fail |
+| `preflight-checks.sh --all` | exit 0 |
+
+The 6 API skips are environment-conditional and pre-existing: one needs
+`HERMES_EXTRACT_PROFILE` (itinerary-extract.integration), five need
+`CONTROL_PLANE_TEST_VAULT_ADDR` (secrets.test.ts). Neither was introduced here.
+
+**The worker suite was run WITH a database, deliberately.** Without
+`CONTROL_PLANE_TEST_DATABASE_URL` it reports 435 tests OK with 87 skipped — 85
+of them skipped for exactly that reason. A baseline that recorded the skipping
+version would be recording 435 OK while 85 tests had not run, which is the
+2026-09-11 "clean preflight that had not run 340 tests" failure repeating.
+
+### The end-to-end run, at the baseline and against the baseline's build
+
+`scripts/e2e-full-cycle.py --scenario vietnam --auto --teardown`, at 97582b6:
+**`✓ full cycle green (vietnam)`**, no waivers, no warnings, no skipped checks.
+Signup through deep link, a Hebrew interview played by the stand-in, confirm,
+provision, site, companion, MCP, then the trip torn down and the relay returned
+to real Telegram.
+
+The assertions that correspond to this sprint's fixes:
+
+| check | issue |
+|---|---|
+| `the site claims 0 confirmed booking(s), which is the truth` — with `VN572` and `VN571` both on the site as flight numbers | **#131** |
+| `every day of the trip is on the site (16 days)` · `the open stretch 2028-03-12..2028-03-20 says it is open` · `1 open stretch(es), shown rather than dropped` | **#117** |
+| `agent.timezone is a real zone: Asia/Ho_Chi_Minh` · `the companion speaks the trip's language: he` | **#132** |
+| `place survived to the site: Thang Long Water Puppet Theatre (day plan)` | #128 |
+
+#131 is the one worth naming. The organizer named two flight designators inside
+a free-text itinerary answer, which is the shape that used to put `VN572` in
+the booking `confirmation` on some runs and not others. It did not here, and
+the reason is not that this run was lucky: code decides it now.
+
+**The run before this one would have been a false green, and is the reason the
+build is named above rather than assumed.** The first attempt stopped at
+preflight because the relay was down. Had it been up, it would have run against
+`dist/` built at 13:34 — before #131 and #134 — and reported the scenario green
+while testing neither. The preflight's three `deployed code carries:` markers
+were all true and all about older features; nothing checked for the commits
+under test. So before the second attempt, `dist` was rebuilt, the four
+interview services were restarted through
+`.agents/skills/interview-stack-deploy/deploy.sh`, and `isFlightDesignator` was
+read back out of the **running container** rather than off the filesystem.
+
+CLAUDE.md already says to verify by reading the running containers rather than
+trusting the directory, and `scripts/new-trip-run.py` enforces exactly that
+before minting an interview link. The e2e does not yet do the equivalent for
+the commit under test. That is a gap worth a check rather than a paragraph.
+
+### What was NOT run, and why
+
+`scripts/preflight-deploy.sh` was not used, so this is nine targeted suites
+rather than one preflight run. The live Mac stack is served from this worktree
+— `docker inspect` shows `/app/dist` and `/repo` both mounted from
+`.claude/worktrees/sprint-6-integration` — and preflight's dependency step
+relinks worktree `node_modules` (`scripts/link-worktree-deps.sh`, reached
+whenever `server`, `tests`, `mcp` or `control-plane/api` lack an install). A
+run that disturbs the stack it is verifying is worse than a narrower run that
+does not. The web and trip-web **builds** were skipped for the same reason: the
+trip-web build writes the tracked `site/modern`.
+
+If a full preflight is wanted in the record, it should run from the main
+checkout, or after the live stack is pointed elsewhere.
+
+### Three false reds, all self-inflicted
+
+Recorded because the pattern is the point, not the individual mistakes.
+
+1. **4 API failures** — `ENOENT` on `…/db/migrations/*_zz_probe.sql` inside
+   `applyMigrations`, from running `tests/scripts` concurrently. That suite
+   writes probe migrations into the tracked migrations directory and `git
+   add`s them into the shared index. Filed as **#135**; the API suite re-run
+   alone is the 1374/1368 above.
+2. **2 worker errors** — `psycopg.ProgrammingError: extra key/value separator`,
+   from appending `?application_name=` to the worker's database URL.
+   `test_runtime.py` appends its own unconditionally, so any URL that already
+   carries a query string breaks. Worth knowing because `?application_name=`
+   is otherwise the right habit for attributing connections in
+   `pg_stat_activity`.
+3. **`npm ci` failure in runtime-gateway** — it has no lockfile and no
+   dependencies (`node --test` directly), so nothing needed installing.
+   Preflight is right to skip it.
+
+Every one came from running something concurrently against shared state: a
+database, a migrations directory, a connection string. That is the same shape
+as #134 and #135 themselves, and it is the argument for per-session databases
+and per-session worktrees once several agents are working at once.
+
 ## Known before starting
 
 Stated so the run is not spent rediscovering them.

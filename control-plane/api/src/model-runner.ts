@@ -430,6 +430,24 @@ export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Pro
   return env;
 }
 
+/**
+ * The minimal environment a nested Codex CLI needs to locate its executable,
+ * authentication/config directory and system certificates. In particular,
+ * provider keys, bot tokens and other relay configuration never reach a model
+ * process that is structuring untrusted organizer input.
+ */
+export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    "PATH", "HOME", "CODEX_HOME", "XDG_CONFIG_HOME",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ]);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  );
+}
+
 function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
   return new Promise((resolve) => {
     execFile(
@@ -555,15 +573,17 @@ export interface CodexSpec {
 }
 
 /**
- * Everything a structuring call must not have, switched off on every call.
+ * Disable every Codex agent capability that could act on untrusted document
+ * text. `read-only` limits writes; these flags also remove shell, network,
+ * computer-use, MCP, plugins, apps and delegation from the model's tool set.
  *
- * `codex exec` loads the whole CODEX_HOME it runs under. On the machine this was
- * built on that meant a shell (`exec_command`), web access (`web__run`),
- * `apply_patch`, computer-use MCP tools, image generation, plugins and apps —
- * all offered to a model reading an untrusted document. Asked to list its tools
- * it named fourteen, and asked to transcribe a PDF it ran python over the file
- * on its own (2026-09-13). A read-only sandbox limits writes, not reading files
- * or reaching the network.
+ * Not a precaution in the abstract. `codex exec` loads the whole CODEX_HOME it
+ * runs under, which on the machine this was built on meant a shell
+ * (`exec_command`), web access (`web__run`), `apply_patch`, computer-use MCP
+ * tools, image generation, plugins and apps — all offered to a model reading an
+ * untrusted document. Asked to list its tools it named fourteen, and asked to
+ * transcribe a PDF it ran python over the file on its own (2026-09-13). A
+ * read-only sandbox limits writes, not reading files or reaching the network.
  *
  * With these flags the same model lists only `exec`, `wait` and
  * `request_user_input`, and `exec` refuses ("code-mode host is disabled").
@@ -572,23 +592,23 @@ export interface CodexSpec {
  * The login's own CODEX_HOME is kept deliberately. A private copy would refresh
  * the login's token in one place and lock the other copy out.
  */
+export const CODEX_ISOLATION_FEATURES: readonly string[] = [
+  "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host",
+  "apps", "plugins", "remote_plugin", "plugin_sharing",
+  "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser", "computer_use",
+  "hooks", "multi_agent", "image_generation", "view_image", "sleep_tool",
+  "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
+];
+
 export const CODEX_ISOLATION_ARGS: readonly string[] = [
-  ...[
-    "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host",
-    "apps", "plugins", "remote_plugin", "plugin_sharing",
-    "browser_use", "browser_use_external", "browser_use_full_cdp_access", "in_app_browser", "computer_use",
-    "hooks", "multi_agent", "image_generation", "view_image", "sleep_tool",
-    "skill_search", "skill_mcp_dependency_install", "tool_suggest", "tool_call_mcp_elicitation",
-  ].flatMap((feature) => ["--disable", feature]),
+  // Auth still comes from CODEX_HOME, but no config.toml can re-enable a tool.
+  "--ignore-user-config",
+  ...CODEX_ISOLATION_FEATURES.flatMap((feature) => ["--disable", feature]),
   "-c", "mcp_servers={}",
   "-c", "plugins={}",
   "-c", "apps={}",
   "-c", 'shell_environment_policy.inherit="none"',
 ];
-
-/** The feature names CODEX_ISOLATION_ARGS disables. */
-export const CODEX_ISOLATION_FEATURES: readonly string[] = CODEX_ISOLATION_ARGS.flatMap((arg, i, all) =>
-  arg === "--disable" && all[i + 1] ? [all[i + 1]!] : []);
 
 /**
  * Whether this machine's codex knows every feature the isolation disables —
@@ -658,9 +678,13 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
       // spawn, not execFile: stdin must be closed. Codex waits on it for extra
       // instructions otherwise, and a call that hangs on an empty pipe is worse
       // than one that fails.
-      // hermeticEnv like the other CLIs: the relay's own environment — bot
-      // tokens, provider keys — is nothing a structuring call should carry.
-      const child = spawn(spec.bin, args, { cwd: spec.cwd, env: hermeticEnv(), stdio: ["ignore", "pipe", "pipe"] });
+      // codexChildEnv, not hermeticEnv: an allowlist, so a secret the relay
+      // gains later is withheld by default rather than by remembering to add it.
+      const child = spawn(spec.bin, args, {
+        cwd: spec.cwd,
+        env: codexChildEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
       let err = "";
       let settled = false;
       const timer = setTimeout(() => {

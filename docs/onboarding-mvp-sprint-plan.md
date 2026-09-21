@@ -1456,6 +1456,33 @@ own completeness check. Not met while the SOUL gap above stands.
 **Goal:** complete the end-to-end lifecycle and prove operations can safely
 observe, pause and recover it.
 
+> **How this work is organised — five tracks (2026-09-19).** The build list
+> below is unchanged and remains the authority on *what* Sprint 6 delivers. It is
+> executed as five tracks with different goals, audiences and shipping cadences,
+> defined in **`docs/sprint6-tracks.md`** — read that before picking anything up.
+>
+> | Track | Goal | Ships |
+> |---|---|---|
+> | 1 — Trip UI/UX | Day-of usefulness for the traveler | site items continuously; transformer items to one pilot trip, then the fleet |
+> | 2 — Landing page, accounts, monitoring, data | Does the product actually work? | to the VM at sprint end, via `kinerary-cp-release` |
+> | 3 — Model efficiency and cost | Make model spend real, predictable, attributable | harness → recommendation → instrumentation |
+> | 4 — Housekeeping | Truthful backlog, live trips stop breaking, clean tree, docs aligned | front-loaded, then small |
+> | 5 — Exit gate | Prove the lifecycle end to end | last |
+>
+> Where this section's own bullets land: the verification aggregator, the
+> dashboard, the runbook, the outcome events, the daily report and the
+> missing-information control loop are all **track 2**; the demo rehearsal, the
+> `japan-2026` full cycle and the automated test list are **track 5**; the
+> activation bullet stays superseded. **Nothing in this build list is track 1, 3
+> or 4** — those fill from the Sprint 5 carry-forward, the §4.5 enrichment
+> residue and the open issue list, and the added and removed items are recorded
+> in `docs/sprint6-tracks.md` rather than edited into this section.
+>
+> The tracks are meant to **run in parallel**; that file names the few places
+> they contend — chiefly migration numbering, PR #92 gating the model work, and
+> provisioning infrastructure being single-threaded.
+
+
 Build:
 
 - Implement a verification aggregator requiring release compatibility,
@@ -1886,7 +1913,18 @@ that branch) so it evolves on this line rather than diverging. The SPA ships
 here **ahead of its control-plane wiring**: the endpoints it calls
 (`web/src/api.ts`) are not yet mounted on this branch's control-plane API.
 Until then the SPA builds and tests in isolation (its own CI job) but is not
-wired to a live control plane. Landing-spa's parallel early control-plane
+wired to a live control plane.
+
+**Superseded 2026-09-19 — the wiring landed.** `control-plane/api/src/portal.ts`
+mounts every endpoint `web/src/api.ts` calls, registered from `app.ts` whenever
+`profile.web` is configured, with `portal.test.ts` and `portal-db.test.ts`
+covering it. The paragraph above describes the branch as it was; it is kept
+because the *decisions* after it are still open, but the SPA is wired. What is
+genuinely missing is narrower: the richer trip-card model and the action surface
+in `docs/web-control-plane-integration-plan.md` §8, and organizer email/password
+signup (four of its nine account endpoints exist).
+
+Landing-spa's parallel early control-plane
 implementation (`portal.ts`, `runtime-gateway/`, a second `0021` migration) is
 deliberately **not** merged — this branch's Sprints 1–4.5 control-plane is
 authoritative.

@@ -604,12 +604,12 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
   {
     id: "travel_anchors",
     type: "structured",
-    // Tickets and tours are named because the transformer provisions them
-    // (activity, tour, ticket and reservation map to `attraction`) and the
-    // example shows one. Asked only about "flights, hotels, or cars", a model
-    // left a booked e-ticket, a shuttle voucher and an event parking pass out
-    // of travel_anchors on 2026-09-13 — "no flight, hotel, or car booking
-    // confirmation number" — and their references with them (issue #62).
+    // These kinds are named because the transformer provisions them
+    // (activity, tour, ticket, reservation, and since #109 event, shuttle and
+    // parking, all map to `attraction`). Asked only about "flights, hotels, or
+    // cars", a model left a booked e-ticket, a shuttle voucher and an event
+    // parking pass out of travel_anchors on 2026-09-13 — "no flight, hotel, or
+    // car booking confirmation number" — and their references with them (#62).
     //
     // TRAINS ARE NOT ASKED FOR, and that is a decision rather than an omission.
     // Every word in this list has to survive `_ANCHOR_TYPE_MAP` (transformer.py),
@@ -619,13 +619,13 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
     // "other" — a taxonomy short a member, which is the shape of #115. Add the
     // canonical type first, then this word; adding the word alone reads as a
     // feature and behaves as a silent downgrade.
-    prompt: "Anything already booked — flights, hotels, cars, tickets or tours? List them with confirmation numbers.",
+    prompt: "Which reservations are already booked? Include flights, hotels, cars, and ticketed attractions, tours, activities, events, shuttles, or parking. List each with its confirmation, order, or booking code.",
     dataShape: "array",
     // One real `type`, not "flight|hotel|car": a list of alternatives shown as
     // a value is a value a model can copy. The transformer reads any type
     // (`_read_anchor`); hotel, car and proposal stay out of the day plan, and
     // an optional HH:MM `time` puts a booked visit at its hour.
-    dataExample: "[{\"type\": \"activity\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
+    dataExample: "[{\"type\": \"attraction\", \"name\": \"Sky Lagoon\", \"date\": \"2027-03-05\", \"time\": \"15:00\", \"confirmation\": \"SL-58213\"}]",
     required: false,
     // A flight number is not a confirmation, and that is a rule, not a
     // judgement — see withoutFlightNumbersAsConfirmations (#131).

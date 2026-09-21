@@ -554,12 +554,27 @@ Subagents in `.claude/agents/` — none can commit or deploy:
 | `developer` | One briefed task in its own worktree: test first, suites run, `verifier` report attached, handed back ready to commit. Never commits. |
 | `integrator` | One merge decision at a time for the integration branch: merge-tree, same-intent check, resolution on a throwaway branch, verifier, carry-forward. Never merges. |
 | `doc-keeper` | Every decision gets a home before the commit; drift swept after merges. Proposes CLAUDE.md diffs, never applies them. |
+| `consult` | One judgment call for a Sonnet role, answered from the evidence with its reasoning. Read-only: no Bash, no Write, because the first consult with a full tool surface wrote a probe into the live-served worktree and staged it (#135). |
 
 The last three are the agent team of `docs/agent-team-plan.md` (2026-09-20),
 which also says which model each role runs and why: Opus for judgment calls,
 Sonnet for everyday work, declared per file. Its queue is GitHub issues:
 `sprint-N`, `track:N`, `size:S|M|L`, `blocked`, `agent:ready`,
 `agent:in-progress`, and a milestone per sprint.
+
+**Roles load once per session, from the checkout it starts in.** A role
+absent from that checkout is not spawnable, and a role that changes on disk
+afterwards keeps running its old text silently — the dry run's session had
+loaded a `pr-steward` that still owned the doc sweep and still had Edit. Start
+a team session from a checkout of the integration branch after the roles it
+needs are committed there, and restart it after any role changes; the
+session-start line prints `roles as of <commit>` so the transcript says which
+version loaded. And an `isolation: worktree` spawn branches from wherever
+`worktree.baseRef` says — the default `fresh` is `origin/main`, which is where
+every dry-run spawn landed; `.claude/settings.json` sets `head` so a spawn
+starts on the session's branch. A developer's first act is still to move its
+fresh worktree onto the brief's base commit and prove it, and a failed check
+blocks rather than becoming a note.
 
 `.codex/agents/*.toml` are **generated** from these files by
 `scripts/sync-codex-agents.py`, and preflight B9 blocks a commit while any

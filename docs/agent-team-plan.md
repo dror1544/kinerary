@@ -39,14 +39,14 @@ re-decide:
 
 | Role | Exists? | Runs as | Model · effort | May | May not |
 |---|---|---|---|---|---|
-| **Dev manager** | new | the lead session — the one Dror talks to | Sonnet 5 · high; an Opus 5 consult for a judgment call (§7) | order the queue, write briefs, allocate paths, hold the infrastructure window, surface decisions | write product code, commit, deploy, decide an unowned gap |
+| **Dev manager** | new | the lead session — the one Dror talks to | Sonnet 5 · high; an Opus 5 consult for a judgment call (§7) | order the queue, write briefs, allocate paths, hold the infrastructure window, surface decisions; run the commit, merge, push or deploy command *after* Dror's word at the gate | write product code; commit, merge, push or deploy without that word; decide an unowned gap |
 | **Developer** | new | `developer` subagent, one worktree each, in the background | Sonnet 5 · high; Opus 5 when the brief is marked *design-heavy* (§7) | code and tests inside its owned paths, spawn `verifier`, ask the manager | commit, push, merge, deploy, touch paths outside its brief, edit plan/ledger/agents/hooks |
 | **Reviewer** | exists as `/code-review` + `boundary-reviewer` | run by the manager against the developer's worktree, fresh context | Opus 5 · high | read, report | fix |
 | **Integrator** | half exists (`pr-steward`, `sprint-scribe`) | `integrator` subagent | Sonnet 5 · high; an Opus 5 consult for the same-intent check and conflict resolution | order the merge queue, `merge-tree`, resolve conflicts on a throwaway branch, verify the merged tree, prepare carry-forward | merge, push, close issues, record approval, promote a release |
 | **Regression planner** | exists | as today: CI on PR open; locally before a risk-class merge; sprint mode at sprint end | Opus 5 (CI already pins it) · high | assess, cost, plan | deploy, approve, edit the plan doc |
 | `verifier` | exists | spawned by developer and integrator | Sonnet 5 · medium | run the suites, paste real output | edit |
 | `sprint-scribe`, `run-capture` | exist | after every merge / after every live run | Sonnet 5 · high | mark plan and ledger, route rows | invent an owner, record approval |
-| `pr-steward` | exists | after every merge; sprint end | Sonnet 5 · medium | sweep branches, PRs, doc drift | delete an unmerged branch |
+| `pr-steward` | exists | after every merge; sprint end | Sonnet 5 · medium | sweep branches and PRs (doc drift is `doc-keeper`'s since 2026-09-20) | delete an unmerged branch |
 | `boundary-reviewer` | exists | whenever a brief flags a security path | Opus 5 · high | audit with live evidence | fix |
 | **Doc keeper** | new (takes over `pr-steward`'s doc-drift sweep) | `doc-keeper` subagent: before gate 1 on the developer's handover; after each merge and at sprint end as a sweep | Sonnet 5 · high; judgment calls reported, not decided | edit any document, write design docs, fix unambiguous drift, propose CLAUDE.md wording | edit code, the plan or the ledger; commit; invent a rationale; apply a CLAUDE.md rule change |
 
@@ -158,17 +158,27 @@ everyday work.
 
 ### 3.2 Developer — `.claude/agents/developer.md`
 
-Spawned by the manager with a brief, in a fresh worktree off the branch the
-brief names (`isolation: worktree`, which is the same practice as the
-`.claude/worktrees/<name>` directories in use today). Runs in the background;
-several run at once on path-disjoint briefs.
+Spawned by the manager with a brief, in a fresh worktree (`isolation:
+worktree`). **Where that worktree branches from is a documented setting,
+`worktree.baseRef`** (code.claude.com/docs/en/worktrees): the default `fresh`
+branches from the remote's default branch, `origin/main` — which is where two
+of the dry run's three spawns landed (M1) and a probe from a second session
+on 2026-09-21 landed too — and `head` branches from the session's current
+HEAD. This project sets `head` in `.claude/settings.json` (this revision), so
+a spawn from a lead session on the integration branch starts there — proven
+the same day: a probe spawned before the setting landed on `origin/main`, one
+spawned after it landed on the integration branch head. The
+developer still proves it: first act, move the fresh branch onto the brief's
+base commit and check; a failed check blocks, and the handover carries a pass
+as `Base check:`. Runs in the background; several run at once on
+path-disjoint briefs.
 
 **Does:** reads the brief and only the parts of CLAUDE.md the brief points at;
 writes the test first where practical; changes only its owned paths; runs the
 suites the brief names as it goes; spawns `verifier` for the final report;
-runs `scripts/preflight-checks.sh --staged`-equivalent on its own tree
-(`--paths` on its changed files) so a rule-6 literal or a mis-named migration
-is caught before the handover; returns the handover block (Appendix C).
+stages its files in its own worktree and runs `scripts/preflight-checks.sh
+--staged` — `--paths` runs only the two fast checks and proves nothing about
+rule 6 or migrations (dry run, C1); returns the handover block (Appendix C).
 
 **Asks the manager when:** it needs a path outside its brief, the brief's
 acceptance test cannot be written as stated, it finds a second bug (it reports;
@@ -220,7 +230,9 @@ Runs when the manager says a PR is ready, and at sprint end.
    semantic one — the `travel_anchors` prompt and `_ANCHOR_TYPE_MAP` case
    (memory `sprint6-locked-pending-main-merge`) is the model: both sides edit the
    same concept in different regions. For every file both sides touch, read
-   both hunks and say whether they are the same intent.
+   both hunks; whether they are the same intent is a judgment call, so it goes
+   to `consult` (§7) with both hunks and both PR descriptions, never the
+   integrator's own conclusion, and the answer is recorded verbatim.
 4. **Resolve on a throwaway branch in its own worktree**, never on the
    integration branch. Reconcile, do not take a side wholesale.
 5. **Verify the merged tree** by spawning `verifier` on it. A migration added by
@@ -316,13 +328,43 @@ own file and refuses to put content where it does not belong:
 | Evidence from a run or an assessment | `docs/test-reports/` |
 | A decision with no document yet | a new `docs/<topic>-design.md`, never a paragraph in CLAUDE.md |
 
+**When the task's owned path is itself a document, the keeper still edits it**
+(decided 2026-09-21, from the §10 dry run's C5). On track 4 nearly every task's
+deliverable is a document, so a keeper restricted to reporting there is
+structurally report-only for a whole track and every finding becomes a
+developer round — the dry run paid exactly one round plus one Opus consult for
+it, and the file still shipped unfinished. The objection the restriction rested
+on, that a co-author cannot certify, does not apply: the keeper certifies
+nothing. "Certify" appears twice in this plan and in `.claude/agents/`, both
+times about the developer, both times answered by `verifier` (§3.7, the only
+source of "the suites pass") and `/code-review` (§3.3). `verifier` may not edit
+because an editing verifier can make itself pass — a named, mechanical failure.
+There is no equivalent failure here, and a restriction with no failure behind it
+is a tax, not discipline.
+
+**Invariant 3 is kept by sequence, not by silence.** "One writer per path at a
+time" bars *concurrent* writers and ownership moving by peer agreement; the
+keeper is spawned by the manager after the handover is returned and after
+review, into a worktree whose developer has stopped — which is the manager
+reallocating, the one sanctioned path. This is not new exposure: the seat has
+always written into the developer's worktree so the paragraph ships with the
+code. What the manager holds is the order — it does not resume a developer
+while the keeper is in its tree, and a keeper finding that needs the developer
+back is a re-spawn *after* the keeper finishes, never alongside it.
+
+**What the keeper does not fix, it routes with its cost.** A judgment call, a
+finding that needs code, a reason it cannot source: each names who must act and
+whether acting costs a round before gate 1. Reporting drift without its
+consequence is what made the dry run's third consult necessary.
+
 **The rule it must not break: it never invents a rationale.** When a decision
 is visible in the diff but its reason is in nobody's handover, PR body, commit
 message or conversation, the keeper records *decided; reason not recorded —
 ask <who>* rather than a plausible why. A rationale nobody made is worse than a
 gap, because it will be relied on.
 
-**Does:** edit any document; write a new design document; run read-only
+**Does:** edit any document, including the one the task under review delivers;
+write a new design document; run read-only
 inspection; propose CLAUDE.md wording.
 
 **Does not:** edit code or tests; edit the sprint plan or the ledger; commit;
@@ -416,7 +458,12 @@ The tracks document already did the analysis; the mechanism is what is missing.
   never share a path. The four day-one items in the tracks doc are
   path-disjoint by construction and are the natural first parallel run (§10).
 - **One worktree per developer,** created by the spawn (`isolation: worktree`).
-  Nobody in the main checkout.
+  Nobody in the main checkout. **And one lead per worktree:** on 2026-09-21
+  two lead sessions edited this plan and `doc-keeper.md` in the same worktree
+  within seconds of each other, each applying the same five edits. It was
+  found by file timestamps, not by any mechanism, and nothing was lost only
+  because both stopped and one took the pen. A lead session works in a
+  worktree no other session commits from.
 - **The hard serialisations, each a single lock the manager grants:**
   - the **infrastructure window** — a pilot re-provision, the `japan-2026` full
     cycle, a VM ship, a Mac e2e: one at a time, and never overlapping a VM run;
@@ -458,6 +505,17 @@ four developers in parallel with the manager as the hub. Two fields to know
 about: `maxTurns` returning a *partial* handover arrived in 2.1.246 and the
 documented model-resolution order in 2.1.251, so upgrade before relying on
 either.
+
+**Roles load once per session, from the checkout it starts in** (dry run, M3
+and M4). A role missing from that checkout is not spawnable — the dry run ran
+three roles as `general-purpose` with the file pasted — and a role that changes
+on disk after the session started keeps running its *old* text silently: the
+session had loaded a `pr-steward` that still owned the doc sweep and still had
+Edit. So: a team session starts from a checkout of the integration branch
+*after* the roles it needs are committed there, and restarts after any role
+changes. `sessionstart.sh` prints `roles as of <commit>` so the transcript
+records which version loaded; before spawning, compare it with
+`git log -1 --format=%h -- .claude/agents`.
 
 **Phase 2 — Agent Teams, once the loop has run a sprint.** Experimental, behind
 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`. Teammates get their own context
@@ -509,15 +567,19 @@ the Codex side only as an untracked file.
 | pr-steward | Sonnet 5 | medium | mechanical sweeps with explicit rules |
 | boundary-reviewer | Opus 5 | high | security is a judgment call |
 | doc-keeper | Sonnet 5 | high | sweeping and filing are everyday; stale-or-aspirational is reported, not decided |
-| **The consult** | Opus 5 | high | one question, the evidence, one answer with its reasoning |
+| **The consult** (`consult`) | Opus 5 | high | one question, the evidence, one answer with its reasoning; read-only by construction |
 
 **The consult** is how decision 8 is applied without a second copy of every
 role: a Sonnet role that reaches a judgment call — the manager ordering two
 briefs that contend for a path, the integrator deciding whether two hunks are
-the same intent — spawns a one-shot `general-purpose` agent with
-`model: opus`, hands it the question and the evidence (both hunks, both
-briefs, never its own conclusion), and records the answer with its reasoning.
-The Agent tool takes `model` per invocation, so no file changes.
+the same intent — spawns `consult`, hands it the question and the evidence
+(both hunks, both briefs, never its own conclusion), and records the answer
+with its reasoning. It is its own agent file, `.claude/agents/consult.md`, with
+Read, Grep and Glob and nothing else, because the dry run's second consult —
+spawned as `general-purpose` with every tool — wrote a probe file into the
+live-served worktree, staged it into the shared index and ran a suite there
+(M5, the #135 failure). A judgment call runs nothing; a command it needs is
+returned for the caller to run.
 
 Principles behind the table:
 
@@ -568,15 +630,16 @@ Principles behind the table:
    commit prompt. `.project/README.md` is the contract. The sprint lock is
    recorded as locked, the baseline as open; the session preparing the
    baseline locks it when the baseline fixes have landed.
-7. **CLAUDE.md is closed to subagents — built 2026-09-20.** The Write hook
+6. **CLAUDE.md is closed to subagents — built 2026-09-20.** The Write hook
    refuses it to any tool call carrying an `agent_type`, with the reason; the
    lead session may still write it, and its commit is still hard rule 1.
-6. **Upgrade Claude Code** past 2.1.251 before relying on `maxTurns` partial
-   output or the documented model-resolution order.
+7. **Upgrade Claude Code — done 2026-09-20**, 2.1.236 → 2.1.267 (Homebrew
+   cask), past 2.1.246 for `maxTurns` partial output and 2.1.251 for the
+   documented model-resolution order.
 
 ---
 
-## 9. Decisions — taken by Dror, 2026-09-20
+## 9. Decisions — taken by Dror
 
 1. **Developer commit authority.** Hard rule 1 stays exactly as written: one
    prompt per commit, batched at the end of a task. Count the prompts during
@@ -602,6 +665,14 @@ Principles behind the table:
    drift and prepare a suggested diff; it never applies one. Any edit to
    CLAUDE.md is a decision and needs explicit approval. Enforced: the Write
    hook refuses CLAUDE.md to every subagent. *Built.*
+10. **The keeper edits the document under task** (2026-09-21, from the §10 dry
+    run's C5). When a task's owned path is itself a document, the doc keeper
+    edits it like any other. It holds no verdict, so co-authorship costs
+    nothing; invariant 3 is kept by sequence — the developer has handed over
+    and stopped — rather than by making the keeper report-only across a whole
+    documentation track. What it does not fix, it routes with its cost.
+    Decision 9 is untouched: CLAUDE.md remains the one document it may never
+    edit.
 
 ---
 
@@ -612,8 +683,10 @@ Sprint 6 experiment. What changes per sprint is the input — that sprint's
 section of the plan, its tracks document, the issues in its milestone — never
 the roles, the gates or the brief.
 
-**Start condition: the Sprint 6 baseline is locked down.** Dror's call
-(2026-09-20). The baseline is `docs/test-reports/sprint-6-baseline-2026-09-20.md`
+**Start condition: the Sprint 6 baseline is locked down — it is, at
+`97582b6` since 2026-09-20 — and the end-to-end run has passed at that
+baseline** (Dror, 2026-09-20: "as soon as the e2e will pass the sprint can
+start"). The baseline is `docs/test-reports/sprint-6-baseline-2026-09-20.md`
 with its triage and the fixes it sent to `integration/sprint-6`; the team
 starts when he locks it — `scripts/project-state.py lock baseline --by "Dror"
 --reason …`, which pins the branch head as `baseline.commit` — and every agent
@@ -622,14 +695,20 @@ against product code before it.
 
 **Before the lock — prerequisites only.** §8 touches hooks, agent files,
 labels and tooling, none of which is product code or baseline work, so it is
-built while the baseline is being closed out; everything but the Claude Code
-upgrade (item 6, at session end) already is.
+built while the baseline is being closed out; every item is (2026-09-20).
 
-**Day one after the lock.** Dry-run one track-4 documentation item — no
-product code, no infrastructure — through the whole loop: brief → developer →
-verifier → review → doc keeper → gate 1 → integrator → gate 2 → scribe and
-keeper sweep. Fix the brief template and the handover shape from what that run
-shows, before anything with a blast radius goes through.
+**Day one after the lock — done 2026-09-20/21.** Issue #137 went through
+the whole loop as PR #138; the findings are
+`docs/test-reports/agent-team-dry-run-2026-09-21.md` (PR #139). Every gate
+held and nothing was rubber-stamped. It found five mechanism defects and five
+template defects; this revision of the plan carries the fixes — the worktree
+base (§3.2 — `worktree.baseRef: head` in `.claude/settings.json`, plus the
+developer's check), the read-only consult (§7), the stale-role rule (§6), and
+Appendices B and C rewritten from the report's proposed wording. The doc
+keeper's editing authority (C5) is settled by decision 10: it edits the
+document under task, because it certifies nothing and invariant 3 is kept by
+sequence — the restriction the dry run ran under was the one finding that, on
+review, turned out to be the manager's own error rather than the plan's.
 
 **Then.** The four day-one items the tracks document names — track 4's audit,
 track 2's hand evaluation, track 3's `minimax` pin, track 1's destination-info
@@ -673,7 +752,7 @@ maxTurns: 150
 ---
 name: integrator
 description: Prepares one merge decision at a time for the integration branch — order, merge-tree, same-intent check, conflict resolution on a throwaway branch, verifier on the merged tree, carry-forward — and hands it to a person. Never merges, pushes, closes issues or records approval. Use when a PR is ready for the integration branch, and at sprint end.
-tools: Read, Grep, Glob, Edit, Write, Bash, Agent(verifier), Agent(regression-planner), Agent(sprint-scribe), Agent(pr-steward), Agent(general-purpose)
+tools: Read, Grep, Glob, Edit, Write, Bash, Agent(verifier), Agent(regression-planner), Agent(sprint-scribe), Agent(pr-steward), Agent(consult)
 model: sonnet
 effort: high
 isolation: worktree
@@ -690,10 +769,21 @@ effort: high
 ---
 ```
 
+```yaml
+---
+name: consult
+description: Answers one judgment call for a Sonnet role from the evidence it is handed, with its reasoning. Read-only by construction: no Bash, no Write. Spawn it with the question and the evidence, never with your own conclusion.
+tools: Read, Grep, Glob
+model: opus
+effort: high
+---
+```
+
 The manager spawns the developer with `model: opus` on a brief marked
-*design-heavy*; the integrator's `Agent(general-purpose)` is for the Opus
-consult (§7). Both are per-invocation overrides, which is why the files say
-`sonnet`.
+*design-heavy* — a per-invocation override, which is why the file says
+`sonnet`. The consult is a file rather than an override because a tool
+restriction cannot be passed per invocation, and the dry run showed why it
+must be one.
 
 No `hooks:` block: the project's `PreToolUse` hook in `.claude/settings.json`
 already fires inside subagents, and its payload carries `agent_type`, which is
@@ -708,15 +798,38 @@ the values in §7. Nothing else in them changes.
 
 The manager writes this; the developer receives it and nothing else about the
 task. A field left blank is a field the developer will fill with a guess.
+Revised after the dry run (`docs/test-reports/agent-team-dry-run-2026-09-21.md`).
+
+**Line numbers are evidence, not scope.** A brief may cite a line to show
+where a problem was seen; it never means "only this line". For a drift or
+correctness fix the unit is the **claim on a topic across the owned paths**:
+the developer enumerates every place the file makes that claim, and the grep
+belongs in the handover. Citations arrive wrong and go stale the moment the
+file is edited — this template's own first task was filed against
+`docs/onboarding-to-active-plan.md:81-94`, twice, for a claim that lived at
+`:66` and in §3.
 
 ```
 Task:        #NNN <title>
 Track:       N          Size: S|M|L        Model: opus|sonnet    Effort: …
-Base branch: integration/sprint-6           Worktree: (created by the spawn)
+Base:        integration/sprint-6 @ <commit>     <- VERIFIED BY THE DEVELOPER,
+             not by this line: the spawn's worktree may not start here (§3.2).
+             Its first act: `git reset --hard <commit>` on the fresh worktree,
+             then `git merge-base --is-ancestor <commit> HEAD`. Pass goes in
+             the handover as `Base check:`; fail is BLOCKED (needs: worktree
+             based on <commit>) with no work done.
+Worktree:    (created by the spawn)
 
 Goal (one observable sentence):
+Unit of work: <for a drift or correctness fix on a document: the CLAIM, not the
+             line range. Enumerate every place in the owned paths that makes
+             it; correct each, or name the ones deliberately left.>
 Done when:   <the test that proves it> · verifier report attached · handover
              block returned. Not "PR opened" — the manager opens it after gate 1.
+             Docs task: every status claim the diff changes carries (a) a named
+             existing assertion, run and pasted, (b) a pasted command and output
+             against a named, dated target, or (c) an explicit restatement as a
+             dated observation, listed under "Unassertable claims".
 
 Owns (paths):        …
 Must not touch:      …  (owned by #MMM — say why, so a developer who needs
@@ -724,7 +837,13 @@ Must not touch:      …  (owned by #MMM — say why, so a developer who needs
 Surface row:         control-plane | relay | worker | migration | release
                      payload (site/server/shared) | trip-web | web | mcp |
                      companion templates | scripts   (the two clocks)
-Suites to run:       …  (from verifier's path→suite table)
+                     | docs — no runtime, no clock; name who reads it and what
+                       they do with it. A wrong claim is acted on at the next
+                       read, not the next restart.
+Suites to run:       …  (from verifier's path→suite table — for a docs task
+                     look up the path each corrected CLAIM is about, not the
+                     path the diff touches; a claim with no assertion is listed
+                     as such, never left blank)
 Security path:       no | yes → boundary-reviewer on the handover
 Migration:           no | yes → timestamped name, `-- rollback:` header,
                      migrations.test.ts list updated
@@ -736,16 +855,43 @@ Ask the manager when: <the forks this brief did not settle>
 
 ## Appendix C — the developer's handover
 
+Revised after the dry run: `Base check:`, `Enumeration:` and `Unassertable
+claims:` are new; `Verifier:` and `Preflight:` say what they prove; the commit
+message is per task, not per handover.
+
 ```
 Task #NNN — READY | BLOCKED (needs: …) | PARTIAL (what is left, and why)
 
+Base check:   git merge-base --is-ancestor <brief's base> HEAD → pass
+              (a fail is BLOCKED (needs: worktree based on <base>) with no
+               work done — never a handover note)
 Changed:      <file: what changed, one line each>
-Tests:        <written: file::name — what each proves>
-Verifier:     <pasted report, verbatim — every suite, counts, failures, the
-               "not run, and why" list>
-Preflight:    scripts/preflight-checks.sh --paths <files>: <exit + BLOCK lines>
+Enumeration:  <drift or correctness fix: the grep for the claim across the
+               owned paths and what it returned — the evidence the claim was
+               checked everywhere, not just where it was last pointed at>
+Tests:        <file::name — what each proves>
+Verifier:     <pasted report, verbatim>. On a docs task the question put to
+              verifier is NOT "which suites does this diff touch" (none) but
+              "for each claim in this diff, is it true of this tree, and what
+              command shows it" — per claim: the claim, the assertion or
+              command, the real output, true/false/unassertable. A verifier
+              PASS proves a citation points at real text; it does not prove
+              the sentence built on it is true.
+Preflight:    scripts/preflight-checks.sh --staged in the developer's own
+              worktree, with `git diff --cached --name-only` pasted first: it
+              inspects every staged path, so that list must equal the owned
+              paths. Then <exit + BLOCK lines + the warn lines for these
+              files>. `--paths` runs B3 and B4 only and is NOT evidence — B6
+              (rule 6) and B7 (migrations) sit after its early exit; `--all`
+              inspects the whole tree, not the change. If the staged files are
+              outside every check's scope, say so: a clean run that inspected
+              nothing is not a pass.
 Security:     n/a | request/response pasted
-Proposed commit message:
+Unassertable claims: <claims restated as dated observations, and why no
+              assertion exists>
+Proposed commit message: <for the WHOLE task, not this handover. On a rework
+              round, revise it rather than describing only what changed since
+              the last one.>
   <type>(sprintN.M): <subject>
 
   <body>

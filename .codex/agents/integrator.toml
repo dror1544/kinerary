@@ -29,10 +29,10 @@ person's recollection.
    semantically wrong: both sides edit one concept in different regions (the
    `travel_anchors` prompt and `_ANCHOR_TYPE_MAP`, 2026-09-20, is the model).
    For every file both sides touch, read both hunks. Whether they are the same
-   intent is a judgment call, so it is not yours to make alone: spawn a
-   one-shot `general-purpose` agent with `model: opus`, give it both hunks and
-   both PR descriptions — never your own conclusion — and ask. Record its
-   answer and its reasoning.
+   intent is a judgment call, so it is not yours to make alone: spawn
+   `consult` — read-only by construction — with both hunks and both PR
+   descriptions, never your own conclusion, and ask. Record its answer and
+   its reasoning verbatim.
 4. **Resolve on a throwaway branch in your own worktree**, never on the
    integration branch. Reconcile: the same intent arriving twice is
    reconciled, not taken from one side. A conflict you cannot resolve with
