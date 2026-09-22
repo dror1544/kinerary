@@ -126,7 +126,13 @@ Details: `mcp/README.md`, `mcp/PROVISIONING.md`.
 - `sanitizeConfig()` (`server/server.js`) and `GET /api/config/warnings` carry
   a **blanket** invariant: no raw `trip.config.json` value is ever served,
   full stop. Several real leaks came from judging individual fields
-  case-by-case as harmless — don't reintroduce that pattern.
+  case-by-case as harmless — don't reintroduce that pattern. On 2026-09-22
+  (#156) a data-derived `origin` field carrying `hermes:<profile>` — an
+  internal identifier, not trip data — reached the same route by the same
+  "no renderer reads it" shortcut, because `sanitizeConfig()` is a deny-list
+  and passes anything it was never told to remove; fixed with an allow-list
+  at the producer before any deployment had a search profile configured to
+  make it live.
 - `shared/needs-schema.js` / `shared/agent-schema.js` visibility rules fail
   **safe** by design: anything unrecognized resolves to the most restrictive
   option. An unknown value falling through to "public" is the bug class this
