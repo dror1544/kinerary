@@ -66,6 +66,21 @@ and supervision. That is new surface, not an existing pattern.
 **Recommendation: the tooled worker.** It is the option that matches the shape
 the worker already has.
 
+*Not the fork that shipped. `d2b8817` ("feat(provisioning): materialize a
+companion on the host, over a restricted key", 2026-09-06) and `9a0139f`
+("fix(companion): the trip-mcp bridge is wired where node and Hermes are",
+2026-09-11) are both ancestors of `integration/sprint-6` — the worker instead
+SSHes out to the host over a forced-command key
+(`control_plane_worker/companion_profile.py`) and runs
+`scripts/companion-install-host.sh`; `render_profile.py` never runs inside the
+worker container. Found and cross-checked 2026-09-22 while re-verifying A3 of
+`docs/onboarding-to-active-plan.md` (§2 there). Decided; reason not recorded
+in any commit message, PR or doc found so far — ask Dror. Recommendation left
+as written rather than rewritten, matching this repo's convention of
+annotating a superseded decision in place rather than editing history; §3
+below ("the work") describes the tooled-worker path that was not the one
+built and is not a plan for future work.*
+
 ## 3. The work
 
 1. **Worker image** — add `node` and the `hermes` CLI to
