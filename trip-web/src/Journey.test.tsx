@@ -28,4 +28,30 @@ describe("Journey lodging", () => {
     if (expected) expect(screen.getByText(expected)).toBeInTheDocument();
     else expect(screen.queryByText(/Tonight:/)).not.toBeInTheDocument();
   });
+
+  it("opens the active trip day, while retaining day one before departure", () => {
+    const itinerary = {
+      revision: "test",
+      days: [
+        { phase_id: "tokyo", date: "2026-10-01", label_en: "First day" },
+        { phase_id: "kyoto", date: "2026-10-02", label_en: "Active day" },
+      ],
+      items: [],
+    };
+    const today = { today: "2026-10-02", phase: "active_day" as const, countdown_days: 0, current: null, next: null, events: [], flights: [] };
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JourneyView itinerary={itinerary} today={today} lang="en" onHeroPhaseChange={() => {}} />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("heading", { name: "Active day" })).toBeInTheDocument();
+
+    cleanup();
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <JourneyView itinerary={itinerary} today={{ ...today, phase: "pre_trip" }} lang="en" onHeroPhaseChange={() => {}} />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("heading", { name: "First day" })).toBeInTheDocument();
+  });
 });

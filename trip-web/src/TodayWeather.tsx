@@ -10,11 +10,21 @@ export function weatherPhase(config: TripConfig | undefined, itinerary: ActiveIt
   const day = itinerary?.days.find((entry) => entry.date === date);
   // A dated itinerary day is authoritative, including one with no mapped location.
   if (day) return config?.phases?.find((phase) => phase.id === day.phase_id);
-  return config?.phases?.find((phase) => {
+  const matchingPhase = config?.phases?.find((phase) => {
     const start = phase.start || phase.dates?.start;
     const end = phase.end || phase.dates?.end;
     return start && end && start <= date && date <= end;
   });
+  if (matchingPhase) return matchingPhase;
+
+  // Before departure there is no itinerary day for today yet. Forecast the
+  // first dated destination rather than treating a known trip as locationless.
+  const datedPhases = (config?.phases || [])
+    .map((phase) => ({ phase, start: phase.start || phase.dates?.start }))
+    .filter((entry): entry is { phase: NonNullable<TripConfig["phases"]>[number]; start: string } => Boolean(entry.start))
+    .sort((a, b) => a.start.localeCompare(b.start));
+  if (datedPhases[0] && date <= datedPhases[0].start) return datedPhases[0].phase;
+  return !datedPhases.length ? config?.phases?.[0] : undefined;
 }
 const shiftDate = (date: string, offset: number) => {
   const value = new Date(`${date}T12:00:00Z`);
@@ -26,9 +36,11 @@ export function TodayWeather({ config, itinerary, today, lang }: {
   config?: TripConfig; itinerary?: ActiveItinerary; today: string; lang: Lang;
 }) {
   const [offset, setOffset] = useState(0);
-  const tripDates = itinerary?.days.length
-    ? itinerary.days.map((day) => day.date)
-    : config?.phases?.map((phase) => phase.end || phase.dates?.end || "") || [];
+  // A phase without scheduled activities is still part of the trip.
+  const tripDates = [
+    ...(itinerary?.days.map((day) => day.date) || []),
+    ...(config?.phases?.map((phase) => phase.dates?.end || phase.end || "") || []),
+  ];
   const lastTripDay = tripDates.filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)).sort().at(-1);
   const requestedDate = shiftDate(today, offset);
   const date = lastTripDay && lastTripDay >= today && requestedDate > lastTripDay ? lastTripDay : requestedDate;
