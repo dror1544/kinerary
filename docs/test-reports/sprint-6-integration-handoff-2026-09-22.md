@@ -1,6 +1,6 @@
 # Integration handoff — `integration/sprint-6`, 2026-09-22
 
-**Branch tip: `b4754ed`.** Four pieces of work landed today, all verified before
+**Branch tip: `7881ac4`** (this document's own commit; the code tip is `b4754ed`). Four pieces of work landed today, all verified before
 push. This document says what is done, what is left, where reality diverged from
 the plan and why, and which documents are now wrong.
 
@@ -11,11 +11,11 @@ will silently mislead you otherwise.
 
 ## Before you touch anything
 
-### 1. The local `integration/sprint-6` branch is 14 commits stale — and it is what the running stack serves
+### 1. The local `integration/sprint-6` branch is 15 commits stale — and it is what the running stack serves
 
 ```
-origin/integration/sprint-6   b4754ed   ← today's work
-      integration/sprint-6    59ed025   ← the LOCAL branch, 14 behind, 0 ahead
+origin/integration/sprint-6   7881ac4   ← today's work
+      integration/sprint-6    59ed025   ← the LOCAL branch, 15 behind, 0 ahead
 ```
 
 Every push today went from a **detached HEAD** straight to
@@ -42,8 +42,11 @@ git -C .claude/worktrees/sprint-6-integration merge --ff-only origin/integration
 
 ### 2. The main checkout is on a detached HEAD
 
-`/Users/elul/kinerary` sits at `d12c761` detached, left over from the PR #95
-merge. Harmless, but `git status` there will not say what you expect.
+`/Users/elul/kinerary` is detached at `7881ac4` — the same commit as
+`origin/integration/sprint-6`, but not *on* the branch. Harmless, but
+`git status` there will not say what you expect, and a commit made there goes
+nowhere unless it is pushed explicitly with `HEAD:integration/sprint-6`, which
+is how everything today was landed.
 
 ---
 
