@@ -53,14 +53,18 @@ Nothing here comes from the Sprint 6 section.
 Ordered biggest-blank-first. Item 1 is also the content source for 1c phase 2,
 which is why it leads.
 
-1. **Destination info is blank** — Health, Money, Communication, Hospitals, Age notes are rendered (`trip-web/src/readiness.tsx:26-28,197,208`) and never populated. `transformer.py:304-315` states the enrichment pass "was never implemented or wired into this provisioner"; `enrichment._country_entry` emits only flag/capital/currency/callingCode/emergency.
+1. **Destination info is blank** — Health, Money, Communication, Hospitals, Age notes are rendered (`trip-web/src/readiness.tsx:26-28,197,208`) and never populated. `transformer.py` states the enrichment pass "was never implemented or wired into this provisioner" in `_lookup_known_currency`'s docstring, at `:442` — the `:304-315` cited here was always the wrong location, even before #156 below (that range is the static currency/timezone lookup tables, not the docstring); `enrichment._country_entry` emits only flag/capital/currency/callingCode/emergency.
+
+   **No longer the current state, as of #156 (2026-09-22).** The enrichment pass this bullet describes as missing now exists — `enrichment._enrich_destination_info`, wired into `enrich_config`, reading a cross-trip cache filled by a monthly job in the control-plane API — for Health, Money and Communication; Hospitals stays excluded by the decision below and Age notes is also excluded (see the note after the schema question). `transformer.py`'s docstring at that same location has been corrected to say so. This note only fixes the two false claims (blank, and the citation); whether this item's status/ledger entry should move is sprint-scribe's call, not this doc-keeper pass's.
 
    **Decided 2026-09-19.** Four things, and the third is what makes this cheap:
 
    - **Deterministic first, a model only at the gaps.** Facts from APIs as `enrichment.py` already does (countries.dev, Nominatim, Wikipedia, emergencynumberapi — it is deliberately model-free today); prose from a model only where no API can answer. Mark which is which in the data, so the site can show provenance and a wrong model line is traceable to its source.
    - **Hospitals are dropped.** `info.hospitals` stays unrendered. Emergency numbers already come from a real source and are what actually matters in an emergency; a plausible-but-wrong hospital is a failure mode not worth carrying. Health, money and communication stay — they are advisory and lower-stakes.
    - **The content is shared across trips, not built per trip.** The first trip to a country pays for it; every later trip to the same country reads the stored row. **This store already exists**: `control_plane.country_reference` (`db/migrations/0023_country_reference.sql`) was built as exactly this — *"facts that are true of a destination country regardless of which trip is asking"*, filled once by a web search at interview time and *"reused: every later trip to the same pair reads the row instead of searching again"*, read by `enrich_config` at provision time (`worker/__main__.py:281-291`, `enrichment.py:380`). It carries `fetched_at` already. It simply holds nothing but consular contacts today. Extend it rather than building a second cache.
-   - **Re-verify monthly.** `fetched_at` makes staleness visible and **nothing refreshes it** — there is no job, anywhere, that revisits a `country_reference` row. That refresh is part of this item, not a follow-on.
+
+     **The "filled once by a web search at interview time" phrase above describes the ORIGINAL, consular-only design — resolved (#156, 2026-09-22) to NOT extend to Health/Money/Communication.** Those columns depend on no interview answer, and the monthly refresh has to run when no interview session exists at all, so an interview-time MCP tool couldn't perform it; they are instead filled by a timer inside the control-plane API (`destination-info-store.ts`'s `refreshStaleDestinationInfo`, ticked from `server.ts`), with provision time staying a pure cached read — the same read pattern `_enrich_consular` already uses, just not the same write pattern. This was a real fork this doc did not settle (see the "Open schema question" note below for the sibling decision); the write-side reasoning, including why provision-time-only was also ruled out, lives in that module's docstring rather than duplicated here.
+   - **Re-verify monthly.** `fetched_at` makes staleness visible and **nothing refreshes it** — there is no job, anywhere, that revisits a `country_reference` row. That refresh is part of this item, not a follow-on. (Built as the timer described just above; a *second*, separate clock — `destination_info_fetched_at` — was needed rather than reusing this one, so that refreshing prose does not silently re-date consular contacts as freshly verified. See the migration comment.)
    - **Granularity: country base with phase overrides.** National facts once; phase-level additions where they genuinely differ.
 
    **Open schema question to settle first.** `country_reference`'s primary key is
@@ -70,6 +74,30 @@ which is why it leads.
    country and invites the copies to drift apart. Either a second table keyed by
    destination alone, or a deliberate acceptance of the duplication — decide
    before writing the migration, not after.
+
+   **Resolved (Dror, 2026-09-22, on #156): duplication accepted, no second
+   table.** A destination-keyed table would be normal-form-correct but adds a
+   second store, a second staleness clock and a second join to every read, for
+   a table whose row count is "countries people have travelled to". The
+   migration computes a destination's info once and fans it out to every
+   home-country row sharing that destination in a single `UPDATE` — duplication
+   is a storage cost this accepts, never licence to redo the model call per
+   pairing. Full reasoning: the header comment on
+   `control-plane/db/migrations/20260922120000_destination_info.sql` — linked
+   here rather than repeated.
+
+   **Also resolved: Age notes are excluded too**, alongside Hospitals (Dror,
+   confirmed 2026-09-22 between the two review rounds on #156, via the dev
+   manager). Same reasoning as Hospitals: no deterministic API source exists
+   for legal age limits, so an included line would only ever be unverifiable
+   model prose about a legal question, shown to families as if it were fact —
+   a failure mode not worth carrying, exactly like an invented hospital name.
+   Three in-code comments — the module docstring in
+   `control-plane/api/src/destination-info.ts`, the comment near `_INFO_LISTS`
+   in `control-plane/worker/control_plane_worker/enrichment.py`, and a test
+   comment in `control-plane/api/test/destination-info.test.ts` — had called
+   this an open question rather than a settled exclusion; fixed in this same
+   commit to say so in the past tense, on the same ground as Hospitals.
 
    **Cost note, for track 3:** this design makes the model spend
    *per-country-per-month* rather than per-trip, which is the difference between
