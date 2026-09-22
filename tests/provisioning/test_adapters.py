@@ -70,7 +70,7 @@ class FakeSshTransport:
 LXC_SPEC = LxcSpec(
     "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8, "vmbr0",
     "192.168.0.60/24", "192.168.0.1", "192.168.0.41",
-    "/mnt/pve/truenas-nfs/tokyo-2026", "/nfs/tokyo-2026",
+    "/mnt/pve/truenas-nfs/tokyo-2026", "/nfs/tokyo-2026", "tokyo-2026",
 )
 
 # Real `pct list` output (2026-08-25, read-only inspection of the actual
@@ -108,6 +108,8 @@ class FakeProxmoxSsh:
         if command.startswith("mkdir -p "):
             return ""
         if command.startswith("rm -rf "):
+            return ""
+        if command.startswith("printf %s ") and "TRIP.txt" in command:
             return ""
         if command.startswith("pct create ") and " && pct start " in command:
             return ""
@@ -219,6 +221,15 @@ class AdapterTests(unittest.TestCase):
         # still honors the stored setting, so existing hand-built trips keep
         # their Classic front door until an organizer changes it explicitly.
         self.assertIn("TRIP_DESIGN_VARIANT=modern", bootstrap)
+
+        # Both NFS paths are trip-id-shaped in general, so the marker is the
+        # recovery path for the slug — read from spec.trip_slug, not derived
+        # from nfs_mount_path (LXC_SPEC's happens to still look like a slug,
+        # but the two are independent now).
+        marker_write = ssh.commands[4]
+        self.assertIn("TRIP.txt", marker_write)
+        self.assertIn("trip: tokyo-2026", marker_write)
+        self.assertIn(f"container: {LXC_SPEC.name}", marker_write)
 
     def test_seed_password_is_written_into_the_site_env_when_configured(self) -> None:
         # Without it a provisioned site has NO way in at all: Telegram SSO is

@@ -52,6 +52,7 @@ class FakeDeployAdapter:
         sidecars: dict[str, Any] | None = None,
         source_dir: str | None = None,
         documents: Any = None,
+        trip_id: str | None = None,
     ) -> str:
         if self._fail:
             exc = RuntimeError("simulated deploy failure")
@@ -60,7 +61,7 @@ class FakeDeployAdapter:
         self.deployed.append({
             "slug": slug, "config": config, "first_provision": first_provision,
             "sidecars": sidecars or {}, "source_dir": source_dir,
-            "documents": list(documents or []),
+            "documents": list(documents or []), "trip_id": trip_id,
         })
         return f"https://{slug}.test.example"
 
@@ -348,6 +349,7 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         self.assertEqual(len(self.fake_deploy.deployed), 1)
         deployed = self.fake_deploy.deployed[0]
         self.assertIn("prov-test-", deployed["slug"])
+        self.assertEqual(self.fix["trip_id"], deployed["trip_id"])
         config = deployed["config"]
         self.assertIn("meta", config)
         # Year is derived from the (real) departure date, so check the parts
@@ -1510,6 +1512,42 @@ class ShellDeployAdapterDocumentPlacementTests(unittest.TestCase):
             self.assertFalse(
                 os.path.exists(os.path.join(deploy_root, "trips", "italy-2026", "documents", document.file_name)),
                 "no second copy travels with the deploy",
+            )
+
+    def test_publishes_to_the_trip_id_directory_when_that_is_what_topology_recorded(self) -> None:
+        # A trip provisioned after NFS directories moved to trip id has a
+        # topology.yaml naming its directory `trip_<hex>`, not its slug —
+        # documents must follow that file, not assume the slug.
+        import tempfile
+
+        from control_plane_worker.provisioner import ShellDeployAdapter
+
+        with tempfile.TemporaryDirectory() as root:
+            deploy_root = os.path.join(root, "deploy")
+            nfs = os.path.join(root, "nfs")
+            store = os.path.join(root, "store")
+            trip_dir = os.path.join(deploy_root, "trips", "italy-2026")
+            os.makedirs(trip_dir)
+            os.makedirs(os.path.join(nfs, "trip_9f2c11aa4d"))
+            os.makedirs(store)
+            with open(os.path.join(trip_dir, "topology.yaml"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    "version: 1\nname: italy-2026\nproxmox:\n  node: pve\n  lxc:\n"
+                    "    name: trip-italy-2026\n    nfs_host_dir: /mnt/pve/truenas-nfs/trip_9f2c11aa4d\n"
+                    "    nfs_mount_path: /nfs/trip_9f2c11aa4d\n"
+                )
+            document = self._document(store)
+            adapter = ShellDeployAdapter(
+                deploy_root=deploy_root, vmid_map={"italy-2026": "101"}, repo_root="/repo",
+                trip_nfs_local_base=nfs,
+            )
+            self._deploy(adapter, [document])
+
+            published = os.path.join(nfs, "trip_9f2c11aa4d", "documents", document.file_name)
+            self.assertTrue(os.path.isfile(published), "followed topology.yaml's trip-id directory")
+            self.assertFalse(
+                os.path.exists(os.path.join(nfs, "italy-2026")),
+                "never guessed the slug once a topology.yaml said otherwise",
             )
 
     def test_falls_back_beside_the_config_when_the_trip_nfs_directory_is_not_visible(self) -> None:

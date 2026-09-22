@@ -234,6 +234,19 @@ class ProxmoxLxcAdapter:
         )
         self.ssh.run(f"{create_cmd} && pct start {shlex.quote(vmid)}")
         self._bootstrap_app_environment(vmid, spec)
+        # Who this directory belongs to, written where someone browsing the
+        # share will see it. A directory named by trip id is unique and never
+        # reused — the point of naming it that way — and tells a person
+        # nothing on its own; both NFS paths are id-named now, so this line
+        # is the recovery path for the human name.
+        marker = (
+            f"trip: {spec.trip_slug}\n"
+            f"data: {spec.nfs_host_dir}\n"
+            f"container: {spec.name}\n"
+        )
+        self.ssh.run(
+            f"printf %s {shlex.quote(marker)} > {shlex.quote(spec.nfs_host_dir + '/TRIP.txt')}"
+        )
 
     def _bootstrap_app_environment(self, vmid: str, spec: LxcSpec) -> None:
         """Installs everything kinerary-deploy/deploy.sh assumes already
@@ -250,7 +263,9 @@ class ProxmoxLxcAdapter:
         Reruns are safe: apt installs are no-ops when already satisfied, and
         every file this writes is fully overwritten each time, not appended.
         """
-        trip_slug = spec.nfs_mount_path.rsplit("/", 1)[-1]
+        # spec.trip_slug, not the mount path's last segment: both NFS paths
+        # are trip-id-named now, so the slug only still exists here.
+        trip_slug = spec.trip_slug
         app_dir = "/opt/kinerary"
         avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
         # Appended with printf rather than written inside the heredoc above:
@@ -430,7 +445,12 @@ BOOTSTRAP_INNER
         # Defence in depth before an `rm -rf`: the last path segment must be a
         # real slug, never empty (which would target the shared NFS root).
         segment = base.rsplit("/", 1)[-1]
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", segment):
+        # A slug (`tokyo-2026`) or a trip id (`trip_<hex>`), never empty and
+        # never anything else — an empty segment would target the shared NFS
+        # root. Trip ids became the directory name so a reused slug could not
+        # reach a previous family's data; the guard had to learn their shape
+        # or it would have refused every id-named directory outright.
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*|trip_[0-9a-f]{8,}", segment):
             raise ValueError(f"refusing to reset data for unexpected dir {base!r}")
         self.ssh.run(
             f"rm -rf {shlex.quote(base + '/server-data')} {shlex.quote(base + '/media')}"

@@ -76,6 +76,7 @@ class DeployAdapter(Protocol):
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
         documents: Sequence[TripDocumentFile] | None = None,
+        trip_id: str | None = None,
     ) -> str: ...
 
 
@@ -180,24 +181,72 @@ class ShellDeployAdapter:
         self._timeout = timeout
         self._compute = compute or NullComputeAdapter()
         # The trips' NFS export as THIS process sees it — the directory whose
-        # <slug>/ subdirectories Proxmox mounts into each container. Unset: the
-        # worker cannot reach trip NFS directories, and documents travel with
-        # the deploy instead.
+        # per-trip subdirectories Proxmox mounts into each container, named by
+        # slug or by trip id depending on when each trip's topology.yaml was
+        # built (see `_trip_nfs_dirname`). Unset: the worker cannot reach trip
+        # NFS directories, and documents travel with the deploy instead.
         self._trip_nfs_local_base = trip_nfs_local_base or os.environ.get("PROVISIONER_TRIP_NFS_LOCAL_BASE") or None
+
+    def _trip_nfs_dirname(self, slug: str) -> str | None:
+        """The last path segment of this trip's `nfs_host_dir`, read from its
+        own topology.yaml — the file `LxcProvisionAdapter._build_topology`
+        calls the truth: "a later upgrade or redeploy reads that file, never
+        this function" (compute.py). A trip provisioned before NFS
+        directories moved to trip id has a slug-shaped directory there
+        forever; one provisioned after has a trip-id-shaped one
+        (`trip_<hex>`). Reconstructing the name from `trip_id` instead would
+        get every already-provisioned trip wrong: `trip_id` is known on every
+        deploy, but the directory is only actually trip-id-shaped for a
+        topology built after that change.
+
+        Hand-parsed line by line, like `_private_url` below, rather than
+        through `provisioning.models.load_topology` — that raises on a
+        legacy topology with no `nfs_host_dir` at all (pre-Phase-G trips
+        hand-written before this field existed), which is exactly the file
+        this has to tolerate.
+        """
+        topology_path = os.path.join(self._deploy_root, "trips", slug, "topology.yaml")
+        try:
+            with open(topology_path, encoding="utf-8") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.startswith("nfs_host_dir:"):
+                        value = stripped.split(":", 1)[1].strip()
+                        if value and not value.startswith("$"):
+                            return value.rstrip("/").rsplit("/", 1)[-1]
+                        return None
+        except FileNotFoundError:
+            pass
+        return None
 
     def _trip_nfs_documents_dir(self, slug: str) -> str | None:
         """The trip's NFS documents directory as this worker sees it, or None."""
         if not self._trip_nfs_local_base:
             return None
-        # The same guard as the NFS reset: a real slug, never a path.
-        if not slug or slug != slug.lower() or not slug.replace("-", "").isalnum() or slug.startswith("-"):
+        # The directory topology.yaml actually recorded, trip-id-shaped or
+        # slug-shaped; falling back to the slug itself when there is no
+        # topology yet to read — a vmid_map trip never gets one — or it names
+        # nothing usable (an unresolved ${VAR}, say).
+        dirname = self._trip_nfs_dirname(slug) or slug
+        # A path component, never a path: the same guard as the NFS reset in
+        # provisioning/adapters.py, widened for a trip-id name (which has an
+        # underscore, so plain `.isalnum()` after stripping hyphens rejects it).
+        if (
+            not dirname
+            or dirname != dirname.lower()
+            or dirname in (".", "..")
+            or dirname.startswith("-")
+            or not dirname.replace("-", "").replace("_", "").isalnum()
+        ):
             return None
-        trip_nfs = os.path.join(self._trip_nfs_local_base, slug)
+        trip_nfs = os.path.join(self._trip_nfs_local_base, dirname)
         # The compute adapter creates the trip's NFS directory. One this worker
         # cannot see means it is not looking at the same export, and creating a
         # look-alike would publish documents the container never mounts.
         if not os.path.isdir(trip_nfs):
-            logger.warning("provisioner.trip_nfs_dir_not_visible", extra={"slug": slug})
+            logger.warning(
+                "provisioner.trip_nfs_dir_not_visible", extra={"slug": slug, "dirname": dirname}
+            )
             return None
         return os.path.join(trip_nfs, "documents")
 
@@ -210,6 +259,7 @@ class ShellDeployAdapter:
         sidecars: Mapping[str, Any] | None = None,
         source_dir: str | None = None,
         documents: Sequence[TripDocumentFile] | None = None,
+        trip_id: str | None = None,
     ) -> str:
         # A static vmid_map entry (the two legacy, hand-provisioned trips)
         # always wins; a slug with no entry falls to the compute adapter —
@@ -218,7 +268,7 @@ class ShellDeployAdapter:
         # only reaches the compute path (a vmid_map trip is a long-lived hand
         # box whose data is never reset here).
         vmid = self._vmid_map.get(slug) or self._compute.create_container(
-            slug, first_provision=first_provision
+            slug, first_provision=first_provision, trip_id=trip_id,
         )
 
         trip_dir = os.path.join(self._deploy_root, "trips", slug)
@@ -918,6 +968,9 @@ class ProvisionerWorker:
                     sidecars=sidecars,
                     source_dir=source_dir,
                     documents=trip_documents,
+                    # Names the trip's data directory on a FIRST provision; an
+                    # existing trip's directory comes from its topology file.
+                    trip_id=trip_id,
                 )
             finally:
                 if source_dir:

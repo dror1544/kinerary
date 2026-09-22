@@ -209,6 +209,20 @@ class KeepContainer(unittest.TestCase):
         self.assertEqual(lxc["nfs_host_dir"], "/mnt/pve/truenas-nfs/ref-japan-2026")
         self.assertEqual(out["npm"]["hostname"], "ref-japan-2026.example.store")
 
+    def test_a_data_dir_named_by_trip_id_is_left_where_it_is(self):
+        # The rename exists so the next trip to take this slug cannot adopt
+        # this family's data. A directory named by trip id cannot be adopted —
+        # ids are never reused — so moving it would only break the kept site's
+        # own mount for no gain.
+        import copy
+        raw = copy.deepcopy(self.RAW)
+        raw["proxmox"]["lxc"]["nfs_host_dir"] = "/mnt/pve/truenas-nfs/trip_9f2c11aa4d"
+
+        out = teardown.reference_topology(raw, "japan-2026")
+
+        self.assertEqual(out["proxmox"]["lxc"]["nfs_host_dir"], "/mnt/pve/truenas-nfs/trip_9f2c11aa4d")
+        self.assertEqual(out["name"], "ref-japan-2026", "everything else still moves")
+
     def test_the_address_and_the_path_inside_the_container_do_not_move(self):
         out = teardown.reference_topology(self.RAW, "japan-2026")
         # the site's own .env names the mount path; the IP allocator reads ipv4
