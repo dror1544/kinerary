@@ -6,7 +6,8 @@ currency and emergency numbers for the destination country, map coordinates
 for each phase, a hero photo per phase, per-phase map-app deep links plus the
 weather-widget key (the site fetches the forecast itself, client-side), and
 the top-level ``map`` object (centre + zoom + stops) the site's map tab needs
-to open framed on the trip instead of on a world view. It is the "port, don't
+to open framed on the trip instead of on a world view, and the Info tab's
+Health / Money / Communication lists (issue #156). It is the "port, don't
 design" half of Sprint 4.5; the AI phase-narrative/anchor-extraction half is
 separate and still unscheduled.
 
@@ -16,12 +17,18 @@ Two hard rules, both from the plan's own test list:
     miss just leaves that slice of the config as transform_intake() left it;
   * this module does not invent facts — a phase that will not geocode gets no
     mapStop, a country that will not resolve gets no travel_info, full stop.
+    It does now carry facts a model wrote, which is not the same thing: that
+    prose is produced elsewhere (the API's monthly refresh job), read here
+    from a cache, and every line it becomes is stamped ``source: "model"`` so
+    a wrong one is traceable. Nothing in this module asks a model anything.
 
 Live sources, all keyless, matching scripts/country-info.js:
   countries.dev              name -> currency / calling code / capital / ISO
   emergencynumberapi.com     ISO  -> police / ambulance / fire
   nominatim.openstreetmap.org  free-text place -> lat / lon
   <lang>.wikipedia.org REST   page title -> lead image
+and one injected cache, read-only, never written here:
+  country_reference          destination -> health / money / communication
 """
 from __future__ import annotations
 
@@ -353,6 +360,19 @@ ConsularLookup = Callable[[str, str], Any]
 # Fills a venue's official/ticket URL from the cross-trip venue_links store when
 # the interview-time search was rate-limited and a later drain resolved it.
 VenueLookup = Callable[[str, list], Any]
+# destination country -> {"health": [{he,en}], "money": [...],
+# "communication": [...]} or None. The model-written half of the Info tab, read
+# from the cross-trip country_reference store — never generated here, because
+# prose paid for per trip is prose paid for many times over.
+#
+# THE PROSE AND NOTHING ELSE. The lookup used to also return the row's
+# `destination_info_source` (`hermes:<profile>`); it no longer does, and a
+# lookup that supplies extra keys gains nothing by it — `_cached_info_lines`
+# reads only the three lists, and `origin` is a literal from `_INFO_ORIGINS`,
+# never a value from the row. Everything in a returned dict is one hop from a
+# trip config and from GET /api/config, which every authenticated family member
+# can read.
+DestinationInfoLookup = Callable[[str], Any]
 
 
 def enrich_config(
@@ -363,6 +383,7 @@ def enrich_config(
     pause: float = 1.0,
     consular_lookup: ConsularLookup | None = None,
     venue_lookup: VenueLookup | None = None,
+    destination_info_lookup: DestinationInfoLookup | None = None,
 ) -> dict[str, Any]:
     """Return a copy of *config* with destination data, phase coordinates and
     phase hero photos filled in where a lookup succeeds. Never raises; a copy
@@ -370,15 +391,32 @@ def enrich_config(
     http = http or _default_http
     out = copy.deepcopy(config)
 
+    country_entry: dict | None = None
     try:
-        _enrich_country(out, destination, http)
+        country_entry = _enrich_country(out, destination, http)
     except Exception:
         logger.warning("enrichment.country_failed", exc_info=True)
+
+    if country_entry is None:
+        # The live lookup missed (or failed). Fall back to whatever the
+        # transformer's static currency floor left in place — resolved HERE,
+        # once and explicitly, so the Info-tab pass below takes its input as an
+        # argument rather than reaching back into a dict two passes have already
+        # mutated.
+        country_entry = _config_country_entry(out)
 
     try:
         _enrich_consular(out, destination, consular_lookup)
     except Exception:
         logger.warning("enrichment.consular_failed", exc_info=True)
+
+    # Still must run after _enrich_country, which REPLACES travel_info wholesale
+    # rather than merging into it — but the country data it needs now arrives as
+    # an argument, so that ordering is the only thing the comment has to carry.
+    try:
+        _enrich_destination_info(out, destination, destination_info_lookup, country_entry)
+    except Exception:
+        logger.warning("enrichment.destination_info_failed", exc_info=True)
 
     for phase in out.get("phases") or []:
         if not isinstance(phase, dict):
@@ -458,17 +496,29 @@ def enrich_config(
     return out
 
 
-def _enrich_country(out: dict[str, Any], destination: str, http: Http) -> None:
+def _enrich_country(out: dict[str, Any], destination: str, http: Http) -> dict | None:
+    """Write the live country card, and RETURN the entry it wrote.
+
+    The return value is what makes the Info-tab pass's dependency on this one
+    explicit. `_enrich_destination_info` needs this entry to derive its
+    API-sourced lines; having it read the entry back out of the mutated `out`
+    made the two passes coupled by ORDER ALONE, with nothing but a comment
+    saying so. A later reorder would then have produced an Info tab missing its
+    currency, calling-code and ambulance lines, with no exception and no log —
+    just a thinner page. Returning it moves the dependency into the signature,
+    where a reorder is a visible change rather than a silent one.
+    """
     if not destination or not destination.strip():
-        return
+        return None
     result = _country_entry(http, destination.strip())
     if not result:
-        return
+        return None
     name, entry = result
     # A live hit is the single source of truth: drop the transformer's static
     # currency stub (which may sit under a slightly different name) so the Info
     # tab shows one country card, not two.
     out["travel_info"] = {"countries": {name: entry}}
+    return entry
 
 
 def _home_country(out: dict[str, Any]) -> str:
@@ -511,6 +561,300 @@ def _enrich_consular(
     travel_info = out.setdefault("travel_info", {})
     if isinstance(travel_info, dict):
         travel_info["emergency_contacts"] = cleaned
+
+
+# ── destination info: the Info tab's Health / Money / Communication ──────────
+#
+# Two sources, deliberately unequal (Dror, 2026-09-19; issue #156):
+#
+#   api    derived HERE, per trip, from the country entry countries.dev and the
+#          emergency table already produced — currency, calling code, ambulance.
+#          Free, deterministic, always present when the country resolved.
+#   model  prose for which no keyless API exists — tap water, cash vs card,
+#          eSIM. Read from the cross-trip country_reference cache, written
+#          monthly by the API's refresh job. Never generated here: generating it
+#          at provision time would pay a model once per trip instead of once per
+#          destination per month, which is the whole reason the cache exists.
+#
+# Every line carries its own `source` (and `origin`), not the list — a list
+# mixes the two, and "which line is the model's" is exactly the question asked
+# when a fact turns out to be wrong. The extra keys ride alongside `he`/`en`,
+# which is all the site reads, so they cost the renderer nothing.
+#
+# HOSPITALS ARE NOT PRODUCED, from either source, by decision rather than by
+# omission: the site renders `info.hospitals` and it stays empty. In an
+# emergency the emergency NUMBER is what matters and it is real and sourced,
+# whereas an invented hospital name is the failure mode that decision exists to
+# avoid.
+#
+# AGE NOTES ARE EXCLUDED ON THE SAME GROUND (Dror, 2026-09-22). Not by analogy
+# with hospitals but for the same reason: no deterministic API answers legal age
+# limits, so an age note could only ever be unverifiable model prose about a
+# legal question. `info.age_notes` is rendered by both the modern and legacy
+# sites and stays empty, exactly as `info.hospitals` does. `_INFO_LISTS` below
+# is therefore the whole set, and `_cached_info_lines` reads nothing outside it
+# — a cache row that grows either key contributes nothing.
+
+_INFO_LISTS = ("health", "money", "communication")
+
+# Defensive ceilings on what may come out of the cache, deliberately EQUAL to
+# the caps its only writer already applies: destination-info.ts's
+# MAX_ITEMS_PER_LIST (6) and MAX_ITEM_CHARS (220). The producer truncating first
+# is what makes them equal today, not a reason to leave the consumer unbounded —
+# the row is read back from a database, and "the writer promised" is not a bound.
+#
+# THESE TWO NUMBERS MUST MATCH THE TYPESCRIPT ONES, and nothing in either
+# language can see the other, so the match is asserted rather than hoped for:
+# test_enrichment.InfoCapConsistencyTests reads destination-info.ts and fails if
+# either side is changed alone. That test IS the link between the two files.
+_MAX_INFO_ITEMS_PER_LIST = 6
+_MAX_INFO_ITEM_CHARS = 220
+
+# Every value `origin` is allowed to take. AN ALLOW-LIST, NOT A FILTER, and the
+# difference is the whole point.
+#
+# `origin` rides on every Info-tab line into trip.config.json, and from there
+# through sanitizeConfig() — which is a DENY-list, so it removes named fields
+# and passes everything else — out of GET /api/config to any authenticated
+# family member. `authRequired` is not an organizer check, so "authenticated"
+# there means every kid and one-off guest on the trip.
+#
+# The model half used to take this value from DATA: the cache row's
+# `destination_info_source` column, which holds `hermes:<profile>` — an
+# env-supplied internal profile identifier with no product purpose on the wire.
+# Neither renderer reads `origin` at all (site/app.js's renderInfo, and
+# trip-web's readiness.tsx, both read only he/en), so it was internal naming
+# shipped to families for nothing. Found in review on #156 while still LATENT:
+# no deployment sets a search profile yet, so no model line exists in
+# production. Fixed before it could become live rather than after.
+#
+# Traceability is NOT lost, because it never belonged here: which profile wrote
+# a line is answerable server-side from country_reference.destination_info_source
+# and from the destination_info.refreshed log lines. The wire needs to say
+# whether a line was written by a model, which is `source`, and — for the
+# deterministic half — which public API produced it, which is a literal in this
+# module's own code and names no deployment.
+#
+# Written as an allow-list so the fail-safe direction is the DEFAULT: anything
+# unrecognised collapses to the coarse `source` value rather than being passed
+# through. A deny-list would have to anticipate the next leaky value; this has
+# to anticipate nothing.
+_INFO_ORIGINS = frozenset({"countries.dev", "emergency-numbers", "model"})
+
+
+def _info_plain(value: Any) -> str:
+    """Mirror of ``plainText`` in control-plane/api/src/hermes-search.ts, in the
+    same order it applies its three rules: strip angle brackets, collapse
+    internal whitespace to single spaces, trim, then bound the length.
+
+    THE WHITESPACE RULE IS NOT COSMETIC, and leaving it out was a real bug. The
+    two halves of one Info-tab list come from two different places — the model
+    half through `plainText`, which collapses, and the API half through this
+    function, which did not — so an API-derived value carrying a newline or a
+    run of spaces rendered differently from the model line sitting directly
+    beneath it in the same list. Both halves reach `_biSpan` in site/app.js,
+    which interpolates them into raw HTML where a newline is not even visible
+    as a line break, just as inconsistent spacing. One list, two producers, one
+    normalisation.
+
+    Order matters and is copied deliberately: collapsing BEFORE trimming is what
+    turns a leading "\\n  " into a single space that trim then removes, and
+    bounding LAST is what makes the 220-character cap count rendered characters
+    rather than whitespace the renderer will never show.
+    """
+    text = re.sub(r"\s+", " ", re.sub(r"[<>]", "", str(value or ""))).strip()
+    return text[:_MAX_INFO_ITEM_CHARS]
+
+
+def _info_line(he: str, en: str, source: str, origin: str) -> dict[str, str] | None:
+    """One Info-tab row. Markup is stripped and whitespace collapsed on both
+    sides — the site renders these through the same bilingual span as the
+    itinerary text, so model prose and API-derived text get the identical
+    treatment consular contacts get.
+
+    `origin` is clamped to `_INFO_ORIGINS` HERE rather than at the two call
+    sites, because this is the single point every line passes through on its way
+    into a trip config. A clamp at the call site is a clamp the next call site
+    forgets; a clamp here is one a new caller cannot get wrong.
+    """
+    he = _info_plain(he)
+    en = _info_plain(en)
+    if not he and not en:
+        return None
+    if origin not in _INFO_ORIGINS:
+        # Can only be reached by a code change in this module or by a caller
+        # reintroducing a data-derived origin — never by ordinary operation — so
+        # this is loud rather than silent. A quiet downgrade here would hide
+        # exactly the leak the allow-list exists to stop, and hide it in the one
+        # direction nobody checks: the value would still be wrong, just coarser.
+        logger.warning(
+            "enrichment.info_origin_rejected",
+            extra={"origin": str(origin)[:40], "source": source},
+        )
+        origin = source
+    return {"he": he or en, "en": en or he, "source": source, "origin": origin}
+
+
+def _config_country_entry(out: dict[str, Any]) -> dict | None:
+    """The country card already sitting in the config — the transformer's static
+    currency floor, when the live countries.dev lookup did not resolve.
+
+    Only reached from `enrich_config`, once, as the explicit fallback for
+    `_enrich_country`'s return value. `_enrich_country` and the transformer both
+    write exactly one country.
+    """
+    travel_info = out.get("travel_info")
+    countries = travel_info.get("countries") if isinstance(travel_info, dict) else None
+    if not isinstance(countries, dict):
+        return None
+    return next((v for v in countries.values() if isinstance(v, dict)), None)
+
+
+def _api_info_lines(entry: dict | None) -> dict[str, list]:
+    """The deterministic half, derived from the country card *entry*.
+
+    Taken as an argument rather than read back off the config: these lines exist
+    only because `_enrich_country` already paid for countries.dev and the
+    emergency table, so the dependency is real and belongs in the signature.
+    Costs not one extra request.
+    """
+    lines: dict[str, list] = {key: [] for key in _INFO_LISTS}
+    if not isinstance(entry, dict):
+        return lines
+
+    def add(key: str, he: str, en: str, origin: str) -> None:
+        line = _info_line(he, en, "api", origin)
+        if line:
+            lines[key].append(line)
+
+    currency = entry.get("currency")
+    if isinstance(currency, dict):
+        code = str(currency.get("code") or "").strip()
+        symbol = str(currency.get("symbol") or "").strip()
+        name = str(currency.get("name") or "").strip()
+        if code:
+            marked = f"{code} {symbol}".strip()
+            # The API gives the currency NAME in English only; putting it in the
+            # Hebrew line would read as an untranslated word, so the Hebrew side
+            # carries code and symbol, which are language-neutral.
+            add("money",
+                f"מטבע: {marked}",
+                f"Currency: {name} ({marked})" if name else f"Currency: {marked}",
+                "countries.dev")
+
+    calling = str(entry.get("callingCode") or "").strip()
+    if calling:
+        add("communication",
+            f"קידומת חיוג בינלאומית: {calling}",
+            f"Country calling code: {calling}",
+            "countries.dev")
+
+    emergency = entry.get("emergency")
+    if isinstance(emergency, dict):
+        # The ambulance number is the health-relevant one; police and fire
+        # already have their own card on the Info tab. Origin covers both the
+        # live API and the static fallback table — neither is a model.
+        ambulance = str(emergency.get("ambulance") or emergency.get("general") or "").strip()
+        if ambulance:
+            add("health", f"אמבולנס: {ambulance}", f"Ambulance: {ambulance}", "emergency-numbers")
+        if emergency.get("unified112"):
+            add("health",
+                "המספר 112 פועל בכל מדינות האיחוד האירופי",
+                "112 works across the EU",
+                "emergency-numbers")
+    return lines
+
+
+def _cached_info_lines(cached: Any) -> dict[str, list]:
+    """The model half, as stored in country_reference.destination_info.
+
+    Only the three lists are read. A cache row that has grown a `hospitals` key
+    — because a future model was helpful, or because someone widened the prompt
+    — contributes nothing: the exclusion is enforced here, at the point the data
+    enters a trip config, not only in the prompt that asked for it.
+
+    NOTHING FROM THE ROW REACHES `origin`. It used to: the row's
+    `destination_info_source` column (`hermes:<profile>`) was copied onto every
+    line and shipped to every authenticated family member through
+    GET /api/config, for a field no renderer reads. The coarse literal below is
+    the whole answer the wire is entitled to; the profile name stays server-side
+    in that column and in the refresh job's log lines. See `_INFO_ORIGINS`.
+    """
+    lines: dict[str, list] = {key: [] for key in _INFO_LISTS}
+    if not isinstance(cached, dict):
+        return lines
+    origin = "model"
+    for key in _INFO_LISTS:
+        entries = cached.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries[:_MAX_INFO_ITEMS_PER_LIST]:
+            if isinstance(entry, str):
+                line = _info_line(entry, entry, "model", origin)
+            elif isinstance(entry, dict):
+                line = _info_line(entry.get("he"), entry.get("en"), "model", origin)
+            else:
+                continue
+            if line:
+                lines[key].append(line)
+    return lines
+
+
+def _enrich_destination_info(
+    out: dict[str, Any],
+    destination: str,
+    lookup: "DestinationInfoLookup | None",
+    country_entry: dict | None = None,
+) -> None:
+    api_lines = _api_info_lines(country_entry)
+
+    cached: Any = None
+    # country_reference is keyed by destination_COUNTRY, but the value the
+    # provisioner passes is the organizer's raw answer — "Tokyo, Hakone, Kyoto,
+    # Osaka, Japan". Asking the cache for that string misses every time, so ask
+    # for the country tail, which is what the store is keyed by.
+    country = _destination_anchor(destination) or str(destination or "").strip()
+    if lookup is not None and country:
+        # Scoped to the lookup alone. A cache that is down must cost only the
+        # prose it was going to supply — wrapping the whole function instead
+        # would silently drop the deterministic currency / calling-code /
+        # ambulance lines too, which need no cache and cannot fail.
+        #
+        # THE TWO LOG LINES BELOW ARE MUTUALLY EXCLUSIVE, and that is the whole
+        # point of having two. A destination nobody has refreshed yet and a
+        # cache that cannot be reached produce an identical thin Info tab, so
+        # they have to be told apart from the log alone — same reason
+        # enrichment.geocode_miss exists (issue #112). Emitting "miss" after a
+        # failure would put the benign line on every broken provision and undo
+        # the distinction.
+        failed = False
+        try:
+            cached = lookup(country)
+        except Exception:
+            failed = True
+            logger.warning(
+                "enrichment.destination_info_failed",
+                extra={"destination": country}, exc_info=True,
+            )
+        if not failed and not isinstance(cached, dict):
+            logger.warning("enrichment.destination_info_miss", extra={"destination": country})
+    model_lines = _cached_info_lines(cached)
+
+    # An empty list is not the same as an absent one: the site renders a section
+    # per non-empty list, so writing [] would add an empty heading. And an empty
+    # `travel_info` is not the same as no `travel_info` — a country that did not
+    # resolve must leave the config exactly as the transformer left it, which is
+    # what two existing resilience tests assert. So nothing is touched until
+    # there is something real to write.
+    merged = {key: api_lines[key] + model_lines[key] for key in _INFO_LISTS}
+    if not any(merged.values()):
+        return
+    travel_info = out.setdefault("travel_info", {})
+    if not isinstance(travel_info, dict):
+        return
+    for key, lines in merged.items():
+        if lines:
+            travel_info[key] = lines
 
 
 def _bilingual_name(value: Any) -> dict[str, str] | None:

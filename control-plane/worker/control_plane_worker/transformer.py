@@ -72,9 +72,11 @@ Hero `meta.brand`/`meta.title` are derived from destination + trip type + the
 departure year (e.g. "USA 2026"), not a fixed value — the site renders
 `meta.brand` as its main, prominent heading (see server/server.js and
 site/app.js's applyBrandFromConfig()). `meta.homeCurrency` and
-`travel_info.countries[*].currency` are a small static stopgap for the site's
-currency-conversion feature; see _lookup_known_currency's docstring for what's
-still missing.
+`travel_info.countries[*].currency` are a small static floor for the site's
+currency-conversion feature — `enrichment` replaces them with a live
+countries.dev hit when one resolves, and adds the Info tab's Health / Money /
+Communication lists on top (issue #156); see _lookup_known_currency's docstring
+for what this floor still covers on its own.
 """
 from __future__ import annotations
 
@@ -435,15 +437,23 @@ def _has_confirmation(anchor: Any) -> bool:
 def _lookup_known_currency(destination: str) -> dict[str, str] | None:
     """Static country-name -> currency lookup for well-known destinations.
 
-    This is a deliberately small stopgap, not the real fix: the actual
-    destination-info enrichment (currency, health/money tips, hospitals,
-    packing) was scoped as its own deterministic pass in
+    A pre-enrichment floor, not the whole story. The destination-info pass
+    scoped in
     `.hermes/plans/2026-08-06_063428-post-interview-enrichment-and-provisioning.md`
-    and never implemented or wired into this provisioner. This lookup exists
-    only so the site's currency-conversion feature (server/server.js's
-    HOME_CURRENCY/destinationCurrencyCodes, gated on travel_info.countries)
-    isn't unconditionally broken for every control-plane-provisioned trip
-    until that enrichment pass exists for real.
+    now EXISTS (issue #156): `enrichment._enrich_country` replaces this stub
+    with a live countries.dev hit whenever one resolves, and
+    `enrichment._enrich_destination_info` adds the Info tab's Health / Money /
+    Communication lists. Hospitals were dropped from that scope deliberately
+    (Dror, 2026-09-19) and are not coming — a wrong hospital name is worse than
+    no hospital name, and the emergency numbers are real.
+
+    This lookup still runs, and still matters, because it is the only source
+    reached when enrichment is disabled or countries.dev does not resolve the
+    destination: without it the site's currency-conversion feature
+    (server/server.js's HOME_CURRENCY/destinationCurrencyCodes, gated on
+    travel_info.countries) is unconditionally broken for that trip. It is also
+    what `_api_info_lines` reads in that case, so a fallback trip still gets its
+    Money line.
     """
     for key in _country_keys(destination):
         found = _KNOWN_COUNTRY_CURRENCY.get(key)

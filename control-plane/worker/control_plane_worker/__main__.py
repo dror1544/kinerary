@@ -355,11 +355,70 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     return None
 
+            def _destination_info_lookup(destination: str):
+                """Read-only view of control_plane.country_reference's
+                destination_info, written monthly by the API's refresh job
+                (destination-info-store.ts). Keyed by DESTINATION ALONE — the
+                same value is duplicated across every home_country row for that
+                destination, so any row answers; the freshest is taken in case a
+                fan-out was interrupted partway. A miss (or any DB error)
+                returns None and enrich_config keeps only the deterministic
+                lines it derives itself.
+
+                The key comes from the shared helper, NOT open-coded here: the
+                writers bound it at 80 characters and a reader that does not
+                would look up a key no row can hold. See country_key.py.
+
+                ERRORS ARE DELIBERATELY NOT SWALLOWED HERE. Returning None on a
+                DB failure would make a broken database indistinguishable from a
+                destination nobody has refreshed yet: both would produce the
+                same `destination_info_miss` line, so rotated credentials or a
+                network partition would log something harmless-looking on every
+                provision and nothing would say the cache was unreachable. The
+                exception propagates one frame to _enrich_destination_info,
+                which logs it as `destination_info_failed` WITH the traceback
+                and suppresses the miss line. Enrichment still cannot fail a
+                provision — enrich_config wraps the whole pass.
+
+                (The `_consular_lookup` above still swallows, which is the same
+                blind spot on the older path. Left alone deliberately: it is
+                pre-existing and feeds a live trip's embassy numbers.)"""
+                from .country_key import normalise_country_key
+                dest = normalise_country_key(destination)
+                if not dest:
+                    return None
+                import psycopg
+                with psycopg.connect(db_url) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT destination_info, destination_info_source "
+                            "FROM control_plane.country_reference "
+                            "WHERE destination_country = %s "
+                            "AND destination_info_fetched_at IS NOT NULL "
+                            "ORDER BY destination_info_fetched_at DESC LIMIT 1",
+                            (dest,),
+                        )
+                        row = cur.fetchone()
+                if row and isinstance(row[0], dict):
+                    # ONLY THE PROSE CROSSES THIS LINE. `destination_info_source`
+                    # is selected because the query is the reference read shared
+                    # with destination-info-store.ts, but it is deliberately NOT
+                    # copied into the returned dict: it holds `hermes:<profile>`,
+                    # an internal profile identifier, and anything in this dict
+                    # is one hop from a trip config and from GET /api/config,
+                    # which every authenticated family member can read.
+                    # Reviewed on #156 — it used to be copied here as
+                    # `info["source"]`. Which profile wrote a line is answered
+                    # server-side from the column itself, not on the wire.
+                    return dict(row[0])
+                return None
+
             def _enrich(config, destination):
                 return enrich_config(
                     config, destination,
                     consular_lookup=_consular_lookup,
                     venue_lookup=_venue_lookup,
+                    destination_info_lookup=_destination_info_lookup,
                 )
 
             # Originals cannot be rebuilt. A store that is REQUIRED

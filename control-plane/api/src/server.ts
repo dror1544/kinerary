@@ -3,6 +3,7 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
 import { modelRunnerFromEnv } from "./model-runner.js";
@@ -221,6 +222,45 @@ if (venueLinkSearchConfigured()) {
       .finally(() => { draining = false; });
   }, VENUE_LINK_POLL_INTERVAL_MS);
   timer.unref();
+}
+
+// Re-verifies destination info (the Info tab's Health / Money / Communication
+// lists) for every destination in country_reference, monthly, and fans each
+// answer out to every home-country row for that destination. Migration 0023
+// shipped `fetched_at` in 2026-08 and nothing has ever refreshed a row since;
+// this is that job for the destination-info half. See destination-info-store.ts
+// for why the WRITE lives on a timer here rather than in an interview-time MCP
+// tool the way consular contacts do.
+//
+// The tick is hourly, not monthly: the age test is in the query
+// (DESTINATION_INFO_MAX_AGE_DAYS), so the interval only decides how promptly a
+// newly-inserted row gets its first fill. A monthly timer in a process that
+// restarts on every deploy would in practice never fire.
+if (destinationInfoSearchConfigured()) {
+  let refreshing = false;
+  const DESTINATION_INFO_POLL_INTERVAL_MS = 60 * 60_000;
+  const timer = setInterval(() => {
+    if (refreshing) return;
+    refreshing = true;
+    refreshStaleDestinationInfo(pool, undefined, (line) => process.stderr.write(`${line}\n`))
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "destination_info.refresh_loop_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { refreshing = false; });
+  }, DESTINATION_INFO_POLL_INTERVAL_MS);
+  timer.unref();
+} else {
+  // UNSET IS A DOWNGRADE, NOT AN ERROR — and this is the line that says so.
+  // With no search profile the loop simply does not exist, every Info tab keeps
+  // only its API-sourced lines, and nothing anywhere distinguishes that from
+  // "every destination is up to date". One startup line is the whole difference
+  // between a deployment that knows the prose half is off and one that finds
+  // out from a family asking why the Info tab is thin.
+  process.stderr.write(`${structuredLog("warn", "destination_info.refresh_disabled", {
+    reason: "no HERMES_DESTINATION_INFO_PROFILE or HERMES_SEARCH_PROFILE",
+  })}\n`);
 }
 
 // Reviews the plan of every trip that has been provisioned (or re-provisioned)

@@ -3,6 +3,10 @@ import { normalizeIdentity, resolveOrganizer, rosterChoices, type OrganizerMatch
 import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
+// The country_reference key. Shared, not local, because destination-info-store's
+// fan-out UPDATE has to address the very rows saveConsularContacts writes here —
+// see country-key.ts for what divergence costs.
+import { normaliseCountryKey as normaliseCountry } from "./country-key.js";
 import { consumeEnrollmentInTx } from "./enrollment.js";
 import { isPrivateChatId } from "./identity.js";
 import { linkTelegramOrganizerInTx } from "./organizer-trips.js";
@@ -4237,10 +4241,6 @@ export async function saveSourceDocumentForChat(
 export type ConsularContact = { name: { he: string; en: string }; phone: string };
 
 const CONSULAR_MAX_AGE_DAYS = 180;
-
-function normaliseCountry(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
-}
 
 /** The site renders contact.name through `_biSpan` (raw HTML) and phone into a
  * `tel:` href — same XSS posture as the itinerary `days` text, so strip markup
