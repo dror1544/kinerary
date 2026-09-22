@@ -53,9 +53,12 @@ Nothing here comes from the Sprint 6 section.
 Ordered biggest-blank-first. Item 1 is also the content source for 1c phase 2,
 which is why it leads.
 
-1. **Destination info is blank** — Health, Money, Communication, Hospitals, Age notes are rendered (`trip-web/src/readiness.tsx:26-28,197,208`) and never populated. `transformer.py` states the enrichment pass "was never implemented or wired into this provisioner" in `_lookup_known_currency`'s docstring, at `:442` — the `:304-315` cited here was always the wrong location, even before #156 below (that range is the static currency/timezone lookup tables, not the docstring); `enrichment._country_entry` emits only flag/capital/currency/callingCode/emergency.
+1. **Destination info is blank — BUILT for Health/Money/Communication (2026-09-22, #156);
+   Hospitals and Age notes excluded by decision, not deferred (see below).** Health,
+   Money, Communication, Hospitals, Age notes are rendered (`trip-web/src/readiness.tsx:26-28,197,208`)
+   and never populated. `transformer.py` states the enrichment pass "was never implemented or wired into this provisioner" in `_lookup_known_currency`'s docstring, at `:442` — the `:304-315` cited here was always the wrong location, even before #156 below (that range is the static currency/timezone lookup tables, not the docstring); `enrichment._country_entry` emits only flag/capital/currency/callingCode/emergency.
 
-   **No longer the current state, as of #156 (2026-09-22).** The enrichment pass this bullet describes as missing now exists — `enrichment._enrich_destination_info`, wired into `enrich_config`, reading a cross-trip cache filled by a monthly job in the control-plane API — for Health, Money and Communication; Hospitals stays excluded by the decision below and Age notes is also excluded (see the note after the schema question). `transformer.py`'s docstring at that same location has been corrected to say so. This note only fixes the two false claims (blank, and the citation); whether this item's status/ledger entry should move is sprint-scribe's call, not this doc-keeper pass's.
+   **No longer the current state, as of #156 (2026-09-22).** The enrichment pass this bullet describes as missing now exists — `enrichment._enrich_destination_info`, wired into `enrich_config`, reading a cross-trip cache filled by a monthly job in the control-plane API — for Health, Money and Communication; Hospitals stays excluded by the decision below and Age notes is also excluded (see the note after the schema question). `transformer.py`'s docstring at that same location has been corrected to say so. This note only fixes the two false claims (blank, and the citation); **sprint-scribe (2026-09-22): marked BUILT above** — matches the convention this doc's own §4.5 and Sprint 5 Track 8 use (a dated tag on the item, with what was cut named rather than silently dropped). A corresponding `built` row was added to the sprint plan's §4.5 enrichment table (`docs/onboarding-mvp-sprint-plan.md`), alongside its existing venue-link and consular-contact rows.
 
    **Decided 2026-09-19.** Four things, and the third is what makes this cheap:
 
@@ -472,13 +475,22 @@ separately means writing it twice on top of a +537/−66 rewrite of the one file
 that decides which model reads an organizer's documents. **This reverses the
 order: #92's model-runner work goes first, and track 3 builds on it.**
 
-**Step 1b — the harness.** Extend `control-plane/api/tools/extract-intake-eval.mjs`:
-a `--label` per model config, cost emitted alongside the `ms` and `attempts` it
-already records, run across candidate models for the three pinnable tasks.
-Prerequisites inside the product: record **which runner/model produced each
-result** (a column beside `duration_ms` in `interview_interpretations`, which
-records neither today) and stop discarding `payload.usage` in `callOpenRouter`
-(`model-runner.ts:475-545`).
+**Step 1b — the harness. — BUILT (2026-09-22), #155/`0caf49d`.** Extended
+`control-plane/api/tools/extract-intake-eval.mjs`: per-run and per-label
+`usage` (tokens, cost) threaded into both the failure and success JSON lines
+and rolled up into the run summary via `model-runner.js`'s own `addUsage`,
+flagging `costKindMixed` when a label's runs blend billed and
+`api_equivalent` cost rather than silently picking one. `--label` already
+existed; only the cost/usage plumbing was missing. Of the two prerequisites
+named here: **"stop discarding `payload.usage` in `callOpenRouter`" was
+already done** — Step 1 above already covers it (inherited from #92,
+verified 2026-09-19), so this bullet was stale on that point before #155
+landed too. **Still open:**
+recording **which runner/model produced each result** — no column beside
+`duration_ms` on `interview_interpretations` (`0048_interview_interpretations.sql`);
+no later migration has added one, so historical model comparison stays
+impossible until it does. That remains Track 3's own scope, not routed
+elsewhere.
 
 **Step 2 — the recommendation, as a migration plan.** Per mission: the model, its
 metered cost, the quality it holds, the evidence — and explicitly which missions
@@ -688,8 +700,34 @@ Part of the goal, not a side effect. The known drift, all verified 2026-09-19:
   claim: Modern is the front door for trips provisioned since 2026-09-09
   (`a2e51d1`); trips provisioned earlier keep what they had. Previously miscited
   here as `:81-94` — that range is A1/A2, unrelated.
+
+  **Second round, 2026-09-22** (#157, `55fd3ea`), same file. §2's Phase A
+  (A1–A4) and §6's order items 1/2/4 had the same shape as the first round —
+  shipped work still presented as open — plus line 93's "a family could use
+  that site today" read as an unqualified present-tense claim. All four Phase
+  A items, independently re-verified against commit ancestry rather than the
+  earlier dry-run report, now carry dated "(implemented, …)" annotations
+  naming where the shipped mechanism diverged from what the document
+  proposed (A2: a worker log-level fix, not the skip's own level; A3: the
+  SSH-bridge fork, not the tooled-worker recommendation
+  `companion-install-plan.md` still names). §6 item 4 (Phase D) is annotated
+  **not done**, on its own evidence — neither round had asserted a status for
+  it before. `docs/companion-install-plan.md` also picked up an annotation
+  (found during A3's re-check) that the SSH-bridge fork shipped, not its own
+  "Recommendation: the tooled worker".
 - `docs/NEXT-TASKS.md` — from 2026-08-08, pre-control-plane, not a live source.
-- Sprint 6's own section has **no `— BUILT` markers at all** while §4.5 and Sprint 5 Track 8 do; `sprint-scribe` should bring it level, and record the four-track split from this document into the plan itself.
+- Sprint 6's own section previously had **no `— BUILT` markers at all** while
+  §4.5 and Sprint 5 Track 8 did. The four-track split itself was already
+  recorded in the plan (`onboarding-mvp-sprint-plan.md:1459-1483`, table +
+  routing note, landed in this same commit that first wrote this bullet,
+  `3fdacba`, 2026-09-19) — that half of this ask was done before it was
+  written down as outstanding. **sprint-scribe (2026-09-22):** added
+  item-level `— BUILT` markers for what has shipped since — Track 1a item 1
+  (destination info) and Track 3 Step 1b (the harness's cost/usage) above,
+  plus a new `built` row in the plan's §4.5 table. The rest of this file's
+  items (Track 1a items 2–6, 1b, 1c, 1c-bis, 1d, 1e; Track 4's own Slice A,
+  already dated separately at "Slice A is BUILT (2026-09-20)") get their
+  markers as each ships, not in this pass.
 
 ### The guard: make preflight check it (decided)
 A working rule decays; `scripts/preflight-checks.sh` does not. The repo already has
