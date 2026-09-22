@@ -677,7 +677,27 @@ export type ParsedCallback =
   | { kind: "more" }
   | { kind: "no_document" }
   | { kind: "switch"; tripId: string }
+  | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
+  | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
   | { kind: "unknown" };
+
+/**
+ * `x:<conflictId>:<k|r>` — settle a disagreement between documents: keep what is
+ * held, or take the document's value. The id names the disagreement, never the
+ * trip: which trip it belongs to still comes from the chat the tap arrived in.
+ */
+export function conflictCallbackData(conflictId: string, choice: "keep" | "replace"): string {
+  return `x:${conflictId}:${choice === "keep" ? "k" : "r"}`;
+}
+
+/**
+ * `dc:<proposalId>:<a|r>` — the organizer's decision on a change a document
+ * proposes to a CONFIRMED trip. Carries only which proposal and which choice;
+ * who may decide is established from the chat and the sender, never from this.
+ */
+export function correctionCallbackData(proposalId: string, choice: "approve" | "reject"): string {
+  return `dc:${proposalId}:${choice === "approve" ? "a" : "r"}`;
+}
 
 /**
  * Parses callback_data from a tapped button. The result is a claim about
@@ -696,6 +716,16 @@ export function parseCallbackData(data: string): ParsedCallback {
   // be mistaken for one of them.
   const switched = /^s:(trip_[A-Za-z0-9]{8,64})$/.exec(data);
   if (switched?.[1]) return { kind: "switch", tripId: switched[1] };
+
+  const conflict = /^x:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([kr])$/.exec(data);
+  if (conflict?.[1] && conflict[2]) {
+    return { kind: "conflict", conflictId: conflict[1], choice: conflict[2] === "k" ? "keep" : "replace" };
+  }
+
+  const correction = /^dc:([a-z]{2,12}_[A-Za-z0-9]{8,64}):([ar])$/.exec(data);
+  if (correction?.[1] && correction[2]) {
+    return { kind: "correction", proposalId: correction[1], choice: correction[2] === "a" ? "approve" : "reject" };
+  }
 
   const pair = /^([at]):([A-Za-z0-9_]{1,64}):([A-Za-z0-9_]{1,64})$/.exec(data);
   if (pair?.[2] && pair[3]) {

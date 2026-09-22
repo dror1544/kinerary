@@ -418,6 +418,55 @@ def narrow_allowlist(profile: str) -> None:
     subprocess.run([hermes(), "--profile", "trip-intake", "gateway", "restart"], capture_output=True, text=True)
 
 
+# The document registry and what was derived from it (migrations 0052, 0053,
+# and trip_document_corrections's own). Backed up with the trip because a
+# registry row without its bytes, or bytes without their row, cannot be put
+# back together later.
+#
+# source_artifacts is NOT a phantom — it is a real per-trip provenance table
+# created in 0001_foundation.sql, unrelated to the document-registry work
+# despite the similar name, and it belongs here on its own terms. An earlier
+# report called it a phantom; that was wrong. Whether teardown SHOULD back it
+# up is a separate product question and out of scope for this port — Dror,
+# 2026-09-21.
+DOCUMENT_TABLES = (
+    "trip_documents",
+    "source_artifacts",
+    "trip_document_extractions",
+    "trip_answer_sources",
+    "trip_answer_conflicts",
+    "trip_document_corrections",
+)
+
+
+def table_exists(table: str) -> bool:
+    """An older stack has no document tables; backing one up must not fail on that."""
+    return psql(f"SELECT to_regclass('control_plane.{table}') IS NOT NULL") == "t"
+
+
+def document_store(trip: dict) -> Path | None:
+    """This trip's kept originals — DOCUMENT_STORE_DIR/<trip_id> — when a store is configured.
+
+    The same variable the relay writes originals under and the provisioner reads
+    them from. The trip id is the only path component, and it has already been
+    checked against TRIP_ID; the resolved directory must still sit directly under
+    the root.
+    """
+    load_provisioning_env()
+    root = os.environ.get("DOCUMENT_STORE_DIR", "").strip()
+    if not root or not TRIP_ID.match(trip["id"]):
+        return None
+    base = Path(root).resolve()
+    store = (base / trip["id"]).resolve()
+    return store if store.parent == base else None
+
+
+def kept_originals(store: Path | None) -> int:
+    if not store or not store.is_dir():
+        return 0
+    return sum(1 for p in store.iterdir() if p.is_file() and not p.name.startswith("."))
+
+
 def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     os.chmod(dest, 0o700)
@@ -433,10 +482,18 @@ def backup(trip: dict, trip_dir: Path, dest: Path) -> None:
         shutil.copy2(plist, dest / plist.name)
     if INTERVIEWER_CONFIG.is_file():
         shutil.copy2(INTERVIEWER_CONFIG, dest / "trip-intake-config.yaml")
-    for table in ("trips", "telegram_chat_bindings"):
+    for table in ("trips", "telegram_chat_bindings", *DOCUMENT_TABLES):
+        if table in DOCUMENT_TABLES and not table_exists(table):
+            continue
         key = "id" if table == "trips" else "trip_id"
         rows = psql(f"SELECT row_to_json(r) FROM control_plane.{table} r WHERE {key} = '{trip['id']}'")
         (dest / f"db-{table}.jsonl").write_text(rows + "\n" if rows else "")
+    # The originals themselves, as one archive: the uploads a trip was built from
+    # are the one thing about it that cannot be regenerated.
+    store = document_store(trip)
+    if kept_originals(store):
+        with tarfile.open(dest / "documents.tar.gz", "w:gz") as tar:
+            tar.add(store, arcname=f"documents/{trip['id']}")
     for f in dest.iterdir():
         os.chmod(f, 0o600)
 
@@ -508,6 +565,8 @@ def main() -> int:
         topo_vmid = str((raw.get("proxmox") or {}).get("vmid") or "")
 
     b = bridge(trip_dir)
+    store = document_store(trip)
+    originals = kept_originals(store)
     plan = [
         ("allowlist", interviewer_allows(profile), f"drop {profile} from the interviewer's allowlist, restart it"),
         ("gateway", gateway_installed(profile), f"uninstall the {profile} gateway"),
@@ -518,6 +577,8 @@ def main() -> int:
           else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
         ("database", trip["open_bindings"] > 0 or not trip["slug"].startswith("retired-"),
          f"close {trip['open_bindings']} binding(s), retire slug {trip['slug']}"),
+        ("documents", originals > 0,
+         f"archive and remove {originals} kept original(s); registry rows stay, marked unstored"),
         ("deploy dir", trip_dir.is_dir(),
          f"move {trip_dir} to trips/{reference_name(orig)} (keeps its IP claimed)" if args.keep_container
          else f"move {trip_dir} to retired-trips/"),
@@ -613,6 +674,21 @@ def main() -> int:
 
     new_slug = retire_in_db(trip)
     say(f"{GREEN}✓{RESET}", f"database   bindings closed, slug -> {new_slug}")
+
+    if originals:
+        # Rows first, bytes second. If removing the files fails halfway, the
+        # registry already says the bytes are not kept and the leftovers are
+        # harmless; the other order could leave rows promising files that are
+        # gone. The rows themselves stay — intake versions still name these
+        # documents, and a reference to a document is not the document.
+        if table_exists("trip_documents"):
+            psql(f"UPDATE control_plane.trip_documents SET ingest_state = 'unstored', storage_key = NULL, "
+                 f"stored_at = NULL WHERE trip_id = '{trip['id']}' AND ingest_state = 'stored'")
+        shutil.rmtree(store)
+        gone = not store.exists()
+        failed |= not gone
+        say(f"{GREEN}✓{RESET}" if gone else f"{RED}✗{RESET}",
+            f"documents  {originals} original(s) {'removed' if gone else 'NOT fully removed'} — archived in {dest.name}")
 
     if trip_dir.is_dir() and kept:
         import yaml

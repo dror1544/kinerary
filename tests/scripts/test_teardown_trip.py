@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -257,3 +258,46 @@ class KeepContainer(unittest.TestCase):
         topo = mock.Mock(lxc=mock.Mock(nfs_host_dir="/mnt/pve/truenas-nfs/japan-2026", nfs_mount_path="/nfs/japan-2026"))
         with self.assertRaises(RuntimeError):
             teardown.keep_container(mock.Mock(proxmox=Proxmox()), topo, "japan-2026")
+
+
+class DocumentTablesAlignment(unittest.TestCase):
+    """DOCUMENT_TABLES must name every table the document-store feature owns —
+    found independently here, from the TypeScript source, rather than from
+    DOCUMENT_TABLES itself: a table added on one side and forgotten on the
+    other must fail this test, not agree with itself.
+
+    source_artifacts is real (created in 0001_foundation.sql, not a
+    document-registry table by origin) and belongs here on its own terms —
+    document-registry.ts reads and writes it, so the same backup-before-
+    teardown obligation applies. An earlier report called it a phantom; it is
+    not. Whether teardown SHOULD back it up is a separate product question,
+    decided as: yes, for now — Dror, 2026-09-21.
+
+    intake_sessions/intake_versions/trip_memberships are excluded:
+    document-correction.ts joins against them, but they are pre-existing
+    tables the document-store feature does not own, and this test's job is
+    the tables it does.
+    """
+
+    REPO_ROOT = SCRIPT.parents[1]
+    SOURCE_FILES = (
+        "control-plane/api/src/document-registry.ts",
+        "control-plane/api/src/document-intake.ts",
+        "control-plane/api/src/answer-provenance.ts",
+        "control-plane/api/src/document-correction.ts",
+    )
+    NOT_DOCUMENT_TABLES = {"intake_sessions", "intake_versions", "trip_memberships"}
+
+    def test_document_tables_matches_every_table_the_ts_source_references(self):
+        found: set[str] = set()
+        for rel in self.SOURCE_FILES:
+            text = (self.REPO_ROOT / rel).read_text(encoding="utf-8")
+            found |= set(re.findall(r"control_plane\.([a-z_]+)", text))
+        found -= self.NOT_DOCUMENT_TABLES
+        self.assertEqual(
+            found, set(teardown.DOCUMENT_TABLES),
+            "DOCUMENT_TABLES has drifted from the tables document-registry.ts / "
+            "document-intake.ts / answer-provenance.ts / document-correction.ts "
+            "actually reference — a table added on one side and not the other "
+            "would otherwise back up nothing for it, silently.",
+        )

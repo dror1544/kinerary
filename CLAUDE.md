@@ -263,6 +263,9 @@ INTERPRET_PATH_DEFAULT=1
 INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5   INTERPRET_EFFORT=medium
 EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5     EXTRACT_EFFORT=medium
 ITINERARY_EXTRACT_TIMEOUT_MS=120000
+# Document reading, per task (benchmarked 2026-09-13 — docs/document-intake-operations.md):
+EXTRACT_INTAKE_RUNNER=codex      EXTRACT_INTAKE_MODEL=gpt-5.6-luna
+EXTRACT_ITINERARY_RUNNER=codex   EXTRACT_ITINERARY_MODEL=gpt-5.6-luna
 ```
 
 **Set the effort.** Unset, a nested `claude -p` takes its effort from the
