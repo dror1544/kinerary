@@ -1,20 +1,27 @@
 # Integration handoff — `integration/sprint-6`, 2026-09-22
 
-**Branch tip: `7881ac4`** (this document's own commit; the code tip is `b4754ed`). Four pieces of work landed today, all verified before
-push. This document says what is done, what is left, where reality diverged from
-the plan and why, and which documents are now wrong.
+**Last code commit: `b4754ed`** (documentation commits follow it; check the real
+tip with `git log --oneline -1 origin/integration/sprint-6`). Four pieces of
+work landed today, all verified before push.
 
-Read the **"Before you touch anything"** section first — one of its two items
-will silently mislead you otherwise.
+This document says what is done, what is left, where reality diverged from the
+plan and why, and which documents are now wrong.
+
+This session existed to clear the PRs the next one is waiting on. **That work is
+done** — #145, #95, #89 and #92 are all closed, and the branch is ready to be
+started from.
+
+But **do the fast-forward below before that session starts**, not after. It is
+not housekeeping; it decides which version of your own instructions you load.
 
 ---
 
-## Before you touch anything
+## Do this before starting the next session
 
-### 1. The local `integration/sprint-6` branch is 15 commits stale — and it is what the running stack serves
+### The local `integration/sprint-6` branch is 15 commits stale — including the agent roles and CLAUDE.md
 
 ```
-origin/integration/sprint-6   7881ac4   ← today's work
+origin/integration/sprint-6   742a28b+  ← today's work (grows with doc commits)
       integration/sprint-6    59ed025   ← the LOCAL branch, 15 behind, 0 ahead
 ```
 
@@ -23,26 +30,42 @@ Every push today went from a **detached HEAD** straight to
 `sprint-6-integration` worktree and cannot be checked out twice. The local
 branch therefore never moved.
 
-That worktree is what the dev stack bind-mounts — confirmed, not assumed:
+**Why this is a prerequisite and not a chore.** CLAUDE.md's own rule: *"Roles
+load once per session, from the checkout it starts in… a role that changes on
+disk afterwards keeps running its old text silently."* Between `59ed025` and the
+tip:
+
+```
+.claude/agents/integrator.md   +24    (the "a clean merge is not evidence on a
+.codex/agents/integrator.toml  +24     security path" rule, #151 / 81e8484)
+CLAUDE.md                      +30    (organizer-invites, identity invariants)
+```
+
+A session started in that worktree as it stands loads the **old** integrator —
+the one that treats a clean merge as evidence on a security path — and reads a
+CLAUDE.md with no organizer-invites section. Fast-forwarding afterwards does not
+fix it: the roles are already in memory. Hence: before, not after.
+
+That worktree is also what the dev stack bind-mounts — confirmed, not assumed:
 
 ```
 $ docker inspect kinerary-control-plane-local-worker-1 --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}'
 /Users/elul/kinerary/.claude/worktrees/sprint-6-integration
 ```
 
-**So the running API and worker are executing pre-2026-09-22 code.** Nothing has
-diverged (0 ahead), so this is a clean fast-forward. It was deliberately *not*
-done in this session: fast-forwarding that worktree changes what the running
-stack serves, which is Dror's call, not an agent's.
+So the running API and worker are also executing pre-2026-09-22 code. Nothing
+has diverged (0 ahead), so this is a clean fast-forward, left to a person
+because it changes what the running stack serves:
 
 ```bash
 git -C .claude/worktrees/sprint-6-integration merge --ff-only origin/integration/sprint-6
 # then rebuild: the API mount is dist/, not src/ — see CLAUDE.md
+# the session-start line should then name the current tip in "roles as of <sha>"
 ```
 
-### 2. The main checkout is on a detached HEAD
+### Also: the main checkout is on a detached HEAD
 
-`/Users/elul/kinerary` is detached at `7881ac4` — the same commit as
+`/Users/elul/kinerary` is detached at the branch tip — the same commit as
 `origin/integration/sprint-6`, but not *on* the branch. Harmless, but
 `git status` there will not say what you expect, and a commit made there goes
 nowhere unless it is pushed explicitly with `HEAD:integration/sprint-6`, which
@@ -59,9 +82,9 @@ is how everything today was landed.
 | `a9d02b2` → merged `c197ebc` | PR #89 — a trip's NFS directories named by trip id |
 | `b4754ed` | Three files the Slice B forward-port had dropped |
 
-PRs **#145, #95 and #89 are all closed/merged on GitHub.** #145 was closed
-manually with an explanation, since a forward-port leaves no ancestry for
-GitHub to detect.
+PRs **#145, #95, #89 and #92 are all closed/merged on GitHub.** #145 and #92
+were closed by hand with an explanation, since a forward-port leaves no ancestry
+for GitHub to detect.
 
 ### Verification actually performed
 
@@ -196,15 +219,16 @@ sounds deliberately immutable.
 
 Deferred past Sprint 6 by Dror as not critical at this stage.
 
-### PR #92 is fully superseded and could be closed
+### PR #92 — closed
 
 All 79 of its files are on `integration/sprint-6`. The only four absent are its
 hand-numbered migrations `0054`–`0057`, which exist under their timestamped
 names (`20260918110129`–`20260918110132`) — the rename PR #145's own final
-commit made. `fix/92-slice-a` is already an ancestor of the branch.
+commit made, required by preflight B7. `fix/92-slice-a` is already an ancestor
+of the branch, and Slice B arrived by forward-port.
 
-Not closed in this session: Dror asked to land #145, not #92. One instruction,
-one action.
+**Nothing is outstanding on the PR queue that the next session was waiting for.**
+#145, #95, #89 and #92 are all closed.
 
 ### Branch and worktree housekeeping — never swept
 
