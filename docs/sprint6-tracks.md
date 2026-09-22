@@ -480,10 +480,15 @@ runner kinds (`openrouter`/`codex`/`claude`/`hermes`) at `:738-753`, per-task
 ### The comparison harness already exists
 `control-plane/api/tools/extract-intake-eval.mjs` — 13 scenarios including prompt
 injection, a failure taxonomy (`unsupported`/`lost`/`datetime`/`info`),
-cross-document invariants, `--runs`/`--concurrency`, per-run JSON with **`ms` and
-`attempts`**, and `--scenarios` for private documents that must not be committed.
-Model comes from `modelRunnerFromEnv()`, so **`EXTRACT_MODEL` is already the A/B
-axis**. It is roughly one `--label` away from being the cost/quality test set.
+cross-document invariants, `--runs`/`--concurrency`, per-run JSON with **`ms`,
+`attempts` and (Step 1b, shipped) per-run and per-label `usage`** folded through
+`model-runner.js`'s own `addUsage`, flagging `costKindMixed` when a run blends
+billed and `api_equivalent` calls — and `--scenarios` for private documents that
+must not be committed. Model comes from `modelRunnerFromEnv()`, so
+**`EXTRACT_MODEL` is already the A/B axis**, and `--label` already exists. The
+harness itself is now the cost/quality test set; Step 0's OpenRouter pin and the
+missing model/runner column on `interview_interpretations` (see "What blocks
+measurement today") are what's left before a comparison run means anything.
 
 Supporting material: `test/fixtures/make_documents.py` (generates japan/multi/chaos
 documents *with* their assertions, never committed), `interview-transcript.test.ts`

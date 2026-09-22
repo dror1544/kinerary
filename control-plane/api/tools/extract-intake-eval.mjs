@@ -49,7 +49,7 @@ const today = opt("today", "") ? new Date(`${opt("today", "")}T00:00:00Z`) : und
 const mod = (name) => import(pathToFileURL(join(modules, name)).href);
 const { extractIntakeFromDocument, applyProposals } = await mod("interpret.js");
 const { INTAKE_QUESTIONS } = await mod("interview.js");
-const { modelRunnerFromEnv } = await mod("model-runner.js");
+const { modelRunnerFromEnv, addUsage } = await mod("model-runner.js");
 const { documentText } = await mod("document-text.js");
 
 const runner = modelRunnerFromEnv(process.env);
@@ -368,7 +368,8 @@ async function work(job) {
     // The runner's own detail: for a fixture it is model output about fixture
     // text. Omitted for folder scenarios, which may be a family's documents.
     const line = { label, scenario: job.name, run: job.run, ok: false, reason: result.reason, attempts: result.attempts,
-      ...(job.scenario.text !== undefined ? { detail: String(result.detail ?? "").slice(0, 400) } : {}), ms: Date.now() - started };
+      ...(job.scenario.text !== undefined ? { detail: String(result.detail ?? "").slice(0, 400) } : {}), ms: Date.now() - started,
+      ...(result.usage ? { usage: result.usage } : {}) };
     results.push(line);
     console.log(JSON.stringify(line));
     return;
@@ -385,6 +386,7 @@ async function work(job) {
     : checks;
   const line = {
     label, scenario: job.name, run: job.run, ok: true, ms: Date.now() - started, attempts: result.attempts,
+    ...(result.usage ? { usage: result.usage } : {}),
     ...(source.read ? { read: source.read } : {}),
     malformed: result.payload.malformed ?? 0,
     proposed: result.payload.proposals.length, accepted: decisions.accepted.map((a) => a.questionId),
@@ -405,10 +407,48 @@ await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => {
   while (queue.length) await work(queue.shift());
 }));
 
+// Cost/usage per label — `--label` is the per-model-config axis a candidate
+// comparison runs on, so a run's own summary is naturally single-label (one
+// process = one label), but the bucket is keyed by label rather than flat so
+// combining several runs' summaries (jq -s, one per candidate) still gives a
+// per-model total without recomputing from the raw lines.
+//
+// The numeric fold is model-runner.js's own addUsage — not reimplemented here,
+// so a new ModelUsage field stays summed without this file's key list going
+// stale. addUsage keeps only the first-seen costKind, which is right for the
+// case it was built for (one call's own retry) but wrong for a bucket that
+// spans many calls: a run mixing a metered API and a subscription CLI would
+// otherwise report one dollar figure under a kind that only half of it earned.
+// This tracks every distinct kind seen and flags the bucket rather than
+// silently picking one.
+const usageBucket = () => {
+  let usage;
+  let runs = 0;
+  const kinds = new Set();
+  return {
+    add(u) {
+      if (!u) return;
+      usage = addUsage(usage, u);
+      runs++;
+      if (u.costKind) kinds.add(u.costKind);
+    },
+    toJSON() {
+      if (!runs) return {};
+      return { runs, ...usage, ...(kinds.size > 1 ? { costKindMixed: true } : {}) };
+    },
+  };
+};
+
+const usageTotal = usageBucket();
+const usageByLabel = new Map();
+
 const sum = { label, runs: results.length, failedRuns: 0, malformed: 0, evidenceRejects: 0, echoRejects: 0, lowConfidence: 0,
   unsupported: 0, lost: 0, datetime: 0, checks: 0,
   suggested: 0, unsupportedIfYes: 0, lostIfYes: 0, datetimeIfYes: 0 };
 for (const r of results) {
+  usageTotal.add(r.usage);
+  if (!usageByLabel.has(r.label)) usageByLabel.set(r.label, usageBucket());
+  usageByLabel.get(r.label).add(r.usage);
   if (!r.ok) { sum.failedRuns++; continue; }
   sum.malformed += r.malformed;
   sum.evidenceRejects += r.rejected.filter((x) => x.endsWith("EVIDENCE_NOT_IN_SOURCE")).length;
@@ -419,4 +459,6 @@ for (const r of results) {
   for (const f of r.failedIfYes ?? r.failed) sum[`${f.split(":")[0]}IfYes`]++;
   sum.checks += r.checks;
 }
+sum.usage = usageTotal.toJSON();
+sum.costByLabel = Object.fromEntries([...usageByLabel].map(([k, b]) => [k, b.toJSON()]));
 console.log(JSON.stringify({ summary: sum }));
