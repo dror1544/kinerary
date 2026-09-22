@@ -628,6 +628,32 @@ scenario produced `portugal-lisbon-and-porto-2026` — the same slug the Mac's
 run of that scenario produces. A VM run and a Mac run of the same scenario
 would fight over one hostname, NPM host and ingress rule: never overlap them.
 
+## Inviting an organizer
+
+Only a person who already has an account can mint their own interview link, so
+onboarding somebody new used to mean signing up on their behalf and keeping a
+password they never chose. `kinerary-invite` (`control-plane/deployment/vm-invite.py`)
+calls the control plane's operator route instead:
+
+```bash
+kinerary-invite preview someone@example.com                              # reads, changes nothing
+kinerary-invite create someone@example.com --language he --invited-by dror
+```
+
+It prints the link and a message to forward, and sends nothing itself. Three
+outcomes, decided by what the address already has: a first trip, a fresh link
+for a draft they never started (no second trip), or a second trip for someone
+whose first was built — who then meets a shorter opening in the interview.
+
+Set `CONTROL_PLANE_OPERATOR_KEY` in `vm.env` **and restart the API**: without
+it the routes are not mounted at all, and a key on one side only reads as a
+401. The fleet monitor reaches the same tool through the `cpinvite` forced
+command — install and rules in `.agents/skills/organizer-invites/SKILL.md`.
+
+There is no password reset behind any of this. The control plane has no such
+route for organizers, and an invited account is deliberately given no password
+credential at all.
+
 ## Manual test
 
 A person's end-to-end run on the VM — the gate for declaring Sprint 5 done.

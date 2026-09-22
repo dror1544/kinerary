@@ -444,6 +444,27 @@ def link_organizer_person(
     return True
 
 
+def _record_trip_companion(
+    conn: psycopg.Connection, trip_id: str, hermes_profile: str
+) -> None:
+    """Writes the companion this trip was built with onto the trip itself.
+
+    Separate from any binding on purpose (migration 20260922060000): routing can be
+    refused, closed or moved, and none of that changes which profile was
+    installed for this trip.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE control_plane.trips
+                SET    hermes_profile = %s, updated_at = now()
+                WHERE  id = %s AND hermes_profile IS DISTINCT FROM %s
+                """,
+                (hermes_profile, trip_id, hermes_profile),
+            )
+
+
 def bind_chat_to_trip(
     conn: psycopg.Connection,
     chat_id: str,
@@ -461,7 +482,7 @@ def bind_chat_to_trip(
     retried later without first reconstructing routing.
 
     Returns the outcome as a short string for logging: "created", "unchanged",
-    or "profile_rebound".
+    "profile_rebound" or "retargeted".
 
     Three cases, and the distinction between the last two is the whole point:
 
@@ -487,6 +508,10 @@ def bind_chat_to_trip(
     trips, not about which job happened to run last. A refusal still stands for
     every other chat — a family group actively using trip A is exactly what
     BindingRefused exists to protect, and no group binding passes this flag.
+
+    On this branch the displaced trip is NOT stranded: `/trips` and `/switch`
+    exist here, and `trips.hermes_profile` (migration 20260922060000) is what
+    lets a switch back find the companion that serves it.
 
     Runs in one transaction and takes FOR UPDATE on the open row, so two
     provisions racing for the same chat serialise here instead of both
@@ -529,7 +554,6 @@ def bind_chat_to_trip(
                         existing["id"],
                     ),
                 )
-
             cur.execute(
                 """
                 INSERT INTO control_plane.telegram_chat_bindings
@@ -1553,6 +1577,15 @@ class ProvisionerWorker:
                         consequence="no companion profile adapter is configured for this deployment",
                     )
                 else:
+                    # The trip's own record of its companion, written the
+                    # moment the profile exists and BEFORE any chat is bound
+                    # (migration 20260922060000). Until now this name lived only on a
+                    # binding row, so a trip whose binding was refused — a
+                    # returning organizer's second trip, every time — kept no
+                    # record of the companion sitting installed on the host
+                    # beside it, and `/switch` had nothing to bind to.
+                    _record_trip_companion(conn, trip_id, hermes_profile)
+
                     # Independently gated and independently non-fatal: a
                     # trip-mcp wiring failure must not block the chat binding
                     # below — the organizer should still land in the right
@@ -1654,22 +1687,28 @@ class ProvisionerWorker:
                 # of the interview they just finished. See bind_chat_to_trip —
                 # it still refuses unless THIS trip is the newer one, and no
                 # group binding ever reaches here.
+                #
+                # Read BEFORE the call, unconditionally: bind_chat_to_trip
+                # closes the displaced row, so afterwards this query would
+                # find nothing (or the new trip) instead of what was lost.
                 previous_trip_id = _bound_trip_id(conn, recipient_chat_id)
                 outcome = bind_chat_to_trip(
                     conn, recipient_chat_id, trip_id, hermes_profile,
                     allow_retarget=True,
                 )
                 if outcome == "retargeted":
-                    # Loud on purpose: another trip just lost this chat, and on
-                    # this branch there is no way back from the chat itself.
-                    # /trips and /switch are PR #47; until that lands, moving
-                    # the binding back is an operator action. Nothing else in
-                    # the system would record that it happened.
+                    # Loud on purpose: another trip just lost this chat. Here
+                    # they can take it back with /switch, and the introduction
+                    # about to be sent says so — closing the binding already
+                    # records that it happened, but previous_trip_id puts the
+                    # displaced trip in the LOG LINE, so an operator reading
+                    # logs does not have to go to the database to learn what
+                    # was taken.
                     logger.warning("provisioner.organizer_chat_retargeted", extra={
                         "trip_id": trip_id,
                         "chat_id": recipient_chat_id,
                         "previous_trip_id": previous_trip_id,
-                        "consequence": "the organizer's chat now talks to this trip; the previous trip is no longer reachable from it",
+                        "consequence": "the organizer's chat now talks to this trip; /trips moves back to the previous one",
                     })
                 # The same chat, as a PERSON. Deliberately here and not in its
                 # own step: the two facts are one fact — this chat is the

@@ -675,6 +675,33 @@ Three things in this path that look incidental and are not:
   report against another trip. Found 2026-09-18. Any future fleet-MCP query that
   selects a free-text column must fold it the same way (`foldSql`).
 
+`.agents/skills/organizer-invites/` hands somebody an interview link without
+their password: `POST /internal/operator/invitations` creates the trip and
+issues the same single-use link their own request would have, and prints a
+message to forward in English or Hebrew. The routes are **unmounted unless
+`CONTROL_PLANE_OPERATOR_KEY` is set**, and a monitoring agent reaches them only
+through a forced-command SSH user (`cpinvite`) that accepts two verbs. It
+refuses an address that is mid-interview or mid-build, and there is no password
+reset anywhere in the control plane — for organizers, no such route exists.
+
+An invitation bypasses the organizer's **login**, never their **identity**.
+`resolveOrCreateEmailAccount` (`password-identity.ts`) is the single answer to
+"which user is this address?", and every path goes through it: an operator's
+invitation, `POST /v1/signup`, and a Google sign-in whose address Google has
+verified. One address is one `user_id`. Do not add a path that mints a user for
+an email on its own; that is the bug migration 20260922060001 had to go back and merge.
+
+**Every email account holds a credential from birth.** Signup writes the
+password the person chose; an invitation and a Google sign-in write one built
+from random bytes nobody keeps (`ensureUnknownPasswordCredential`, which never
+overwrites an existing one). An invited organizer is therefore a structurally
+normal account whose owner has no password *yet* — they use Telegram or Google
+until password recovery ships with the landing page, and that flow will just
+replace the hash. The invariant is what stops an account being claimed by
+whoever signs up with its address first, so a credential-less account can only
+be an older row: signup refuses to adopt one that carries another identity,
+because asserting an address is a weaker claim than the auth already on it.
+
 `.agents/skills/interview-stack-deploy/` restarts the four services the Trip
 Bot interview needs (control-plane API, interview MCP sidecar, trip-intake
 gateway, relay) with the checks a 2026-09-05 live run found missing: it reads

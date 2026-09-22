@@ -32,7 +32,7 @@ import {
   type Language,
   unsettledText,
 } from "./intake-copy.js";
-import { LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
+import { hasEarlierBuiltTrip, LIVE_INTAKE_SESSION_PREDICATE, type OrganizerTrip } from "./organizer-trips.js";
 import type { RosterChoice } from "./organizer-identity.js";
 import {
   closeStaleSessionForChat,
@@ -442,7 +442,14 @@ export async function consumeExpectsReplyWindow(db: pg.Pool, chatId: string): Pr
 // ── /start deep link ─────────────────────────────────────────────────────────
 
 export type StartLinkOutcome =
-  | { kind: "started"; sessionId: string; tripId: string; view: SessionView }
+  | {
+      kind: "started";
+      sessionId: string;
+      tripId: string;
+      view: SessionView;
+      /** They have had a trip built before, so the opening greets them as such. */
+      returning: boolean;
+    }
   | { kind: "already_in_interview"; sessionId: string; tripId: string }
   | {
       kind: "rejected";
@@ -576,13 +583,24 @@ export async function startFromDeepLink(
     return { kind: "rejected", reason: result.reason };
   }
 
+  // Which opening they meet. A failure here must not cost anyone their
+  // interview — the link has already been consumed by this point — so it falls
+  // back to the opening every first-time organizer gets.
+  let returning = false;
+  try {
+    returning = await hasEarlierBuiltTrip(db, result.view.tripId, chatId);
+  } catch {
+    returning = false;
+  }
+
   log(
     structuredLog("info", "chat_router.interview_started", {
       session_id: result.sessionId,
       trip_id: result.view.tripId,
+      returning,
     }),
   );
-  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view };
+  return { kind: "started", sessionId: result.sessionId, tripId: result.view.tripId, view: result.view, returning };
 }
 
 // ── Inline keyboards ─────────────────────────────────────────────────────────
@@ -930,7 +948,10 @@ export function renderConfirmPrompt(
  * It belongs here for the same reason every other opening message does: the
  * router speaks first, and can be relied on to speak at all.
  */
-export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): RenderedQuestion {
+export function renderDocumentOffer(
+  language: Language = DEFAULT_LANGUAGE,
+  returning = false,
+): RenderedQuestion {
   return {
     // One message, not two: an opening that arrives as a pair of notifications
     // reads as a bot talking AT someone, and the keyboard has to hang off
@@ -940,7 +961,12 @@ export function renderDocumentOffer(language: Language = DEFAULT_LANGUAGE): Rend
     // what to send — `documentOffer` is no longer appended, because saying it
     // twice in one breath is how an opening starts sounding like terms and
     // conditions. See `introduction` in intake-copy.ts for what it has to do.
-    text: uiString("introduction", language),
+    // A returning organizer gets the shorter opening: they have a trip site
+    // and an assistant already, so nine paragraphs explaining what those are
+    // is a bot talking past them. What that version says instead is the one
+    // thing only a second trip raises — that the first one is not being
+    // replaced.
+    text: uiString(returning ? "introductionReturning" : "introduction", language),
     replyMarkup: {
       inline_keyboard: [[
         { text: uiString("noDocument", language), callback_data: NO_DOCUMENT_CALLBACK_DATA },

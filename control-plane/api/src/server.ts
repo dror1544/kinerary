@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -138,6 +138,27 @@ if (interviewAgentKey) {
   interviewAgent = { db: pool, apiKey: interviewAgentKey };
 }
 
+// The operator's invitation routes, which create a trip and an interview link
+// for someone who has never contacted this deployment. Mounted only where the
+// key is set, which means the Mac's stack does not have them because a shell
+// was open; it has them because somebody put the key in that host's env file.
+//
+// The TTL is the signup profile's own enrollment TTL, not a second setting: an
+// invited link and an organizer's own link expire the same way, or an operator
+// is quoting an expiry the system does not honour.
+let operator: OperatorDependencies | undefined;
+const operatorKey = process.env.CONTROL_PLANE_OPERATOR_KEY;
+if (operatorKey) {
+  operator = {
+    db: pool,
+    apiKey: operatorKey,
+    enrollmentTtlSeconds: profile.signup?.enrollment_ttl_seconds ?? 86400,
+    // A fallback only. The tool resolves the handle from the bot token itself,
+    // which is the one source that cannot be stale after a rename.
+    botUsername: profile.web?.telegram_bot_username ?? process.env.TELEGRAM_BOT_USERNAME ?? null,
+  };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -148,6 +169,7 @@ const app = buildApp(profile, {
   chatRouting,
   portal,
   interviewAgent,
+  operator,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker

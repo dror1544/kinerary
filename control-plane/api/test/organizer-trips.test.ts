@@ -580,3 +580,80 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
     });
   });
 });
+
+/**
+ * A second trip for the same organizer — the case the whole feature exists for.
+ *
+ * Their private chat is bound to the first trip when the second is built, and
+ * every step of getting them across to it used to lose the one fact that makes
+ * the new trip usable: which companion serves it.
+ */
+describe("a returning organizer's second trip", () => {
+  test("a switch finds the companion on the trip, not only on a binding", async () => {
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      // Exactly the state a returning organizer's second trip is left in: the
+      // companion installed, the binding REFUSED because the chat still belongs
+      // to their first trip, so japan has no binding row at all.
+      await bind(pool, ORGANIZER_CHAT, italyId, "familytrip-italy2026");
+      await pool.query("UPDATE control_plane.trips SET hermes_profile = $2 WHERE id = $1",
+        [japanId, "familytrip-japan2026"]);
+
+      const outcome = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, japanId);
+      assert.equal(outcome.kind, "switched");
+      assert.equal(await openBinding(pool, ORGANIZER_CHAT), japanId);
+
+      const { rows } = await pool.query<{ hermes_profile: string | null }>(
+        "SELECT hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
+        [ORGANIZER_CHAT],
+      );
+      // Without this the chat routes to a trip whose assistant it cannot name,
+      // and the companion answers "I'm still finishing your assistant" for
+      // good — with the assistant installed and running beside it.
+      assert.equal(rows[0]?.hermes_profile, "familytrip-japan2026");
+    });
+  });
+
+  test("a trip built before the column existed still switches, through its binding", async () => {
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      await bind(pool, ORGANIZER_CHAT, italyId, "familytrip-italy2026");
+      await bind(pool, "-1009999", japanId, "familytrip-japan2026");
+      // trips.hermes_profile deliberately left NULL: the backfill covers the
+      // trips that already existed, and this is one of them.
+
+      const outcome = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, japanId);
+      assert.equal(outcome.kind, "switched");
+      const { rows } = await pool.query<{ hermes_profile: string | null }>(
+        "SELECT hermes_profile FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND closed_at IS NULL",
+        [ORGANIZER_CHAT],
+      );
+      assert.equal(rows[0]?.hermes_profile, "familytrip-japan2026");
+    });
+  });
+
+  test("someone who has had a trip built before is recognised as returning", async () => {
+    await withFixture(async ({ pool, japanId, strangerTripId }) => {
+      const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
+      // italy-2026 is ready_private and belongs to the same Telegram person
+      // through a DIFFERENT user_id — the shape this deployment is really in.
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), true);
+      // The stranger's chat owns nothing that was ever built.
+      assert.equal(await hasEarlierBuiltTrip(pool, strangerTripId, OTHER_CHAT), false);
+    });
+  });
+
+  test("an abandoned draft is not a previous trip, and neither is a torn-down one", async () => {
+    await withFixture(async ({ pool, italyId, japanId }) => {
+      const { hasEarlierBuiltTrip } = await import("../src/organizer-trips.js");
+
+      await pool.query("UPDATE control_plane.trips SET lifecycle_state = 'draft' WHERE id = $1", [italyId]);
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), false,
+        "a draft they never finished was greeted as a previous trip");
+
+      await pool.query(
+        "UPDATE control_plane.trips SET lifecycle_state = 'ready_private', slug = 'retired-italy-20260101' WHERE id = $1",
+        [italyId]);
+      assert.equal(await hasEarlierBuiltTrip(pool, japanId, ORGANIZER_CHAT), false,
+        "a torn-down trip was greeted as one they still have");
+    });
+  });
+});

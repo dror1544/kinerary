@@ -85,6 +85,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20260918110130_answer_provenance.sql",
       "20260918110131_model_task_settings.sql",
       "20260918110132_document_corrections.sql",
+      "20260922060000_organizer_invitations.sql",
+      "20260922060001_one_organizer_per_address.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -150,6 +152,8 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20260918110130_answer_provenance.sql",
       "20260918110131_model_task_settings.sql",
       "20260918110132_document_corrections.sql",
+      "20260922060000_organizer_invitations.sql",
+      "20260922060001_one_organizer_per_address.sql",
     ]);
   } finally {
     await reset(client);
@@ -373,6 +377,123 @@ test("the SQL guardrail and the application guard agree on every shared fixture"
     }
   } finally {
     await reset(client);
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20260922060001 merges the two accounts an invited organizer used to end up with", { skip: !databaseUrl }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    // Everything up to and including the migration that introduced the split.
+    const files = (await applyMigrations(client, migrationsDir));
+    assert.ok(files.includes("20260922060001_one_organizer_per_address.sql"));
+
+    // Rebuild, by hand, exactly what the old code left behind: an invited user
+    // with no identity row owning the built trip, and a separately created
+    // credentialed user for the SAME address, which is the only one that can
+    // log in. This is the state migration 20260922060001 exists to repair.
+    const digest = "sha256:" + "a".repeat(64);
+    const invitedUser = "user_" + "1".repeat(32);
+    const webUser = "user_" + "2".repeat(32);
+    const tripId = "trip_" + "3".repeat(32);
+    const tgDigest = "sha256:" + "b".repeat(64);
+
+    await client.query(
+      "INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Invited'), ($2,'active','Signed up')",
+      [invitedUser, webUser]);
+    await client.query(
+      "INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'ready_private')",
+      [tripId, "draft-" + tripId.replace(/_/g, "-")]);
+    await client.query(
+      "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')",
+      ["memb_" + "4".repeat(32), tripId, invitedUser]);
+    await client.query(
+      "INSERT INTO control_plane.organizer_invitations(id, email_digest, user_id, trip_id, kind, language, invited_by) VALUES ($1,$2,$3,$4,'new','en','an operator')",
+      ["invt_" + "5".repeat(32), digest, invitedUser, tripId]);
+    await client.query(
+      "INSERT INTO control_plane.telegram_organizer_links(id, user_id, telegram_subject_digest, verified_via) VALUES ($1,$2,$3,'enrollment_redemption')",
+      ["tol_" + "6".repeat(32), invitedUser, tgDigest]);
+    // The account they can actually log in with, holding the address.
+    await client.query(
+      "INSERT INTO control_plane.user_identities(id, user_id, provider, provider_subject_digest, verified_at) VALUES ($1,$2,'password',$3, now())",
+      ["idnt_" + "7".repeat(32), webUser, digest]);
+    await client.query(
+      "INSERT INTO control_plane.password_credentials(user_id, email_digest, password_hash) VALUES ($1,$2,$3)",
+      [webUser, digest, "scrypt:" + "c".repeat(40)]);
+
+    // Re-run just the repair, as an upgrade of a database that already held it.
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20260922060001_one_organizer_per_address.sql'");
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20260922060001_one_organizer_per_address.sql"]);
+
+    // The trip now belongs to the account they log in with.
+    const owner = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.trip_memberships WHERE trip_id = $1 AND role = 'owner'", [tripId]);
+    assert.deepEqual(owner.rows.map((r) => r.user_id), [webUser]);
+
+    // The Telegram link moved with it, so the bot still finds their trip.
+    const link = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.telegram_organizer_links WHERE telegram_subject_digest = $1", [tgDigest]);
+    assert.deepEqual(link.rows.map((r) => r.user_id), [webUser]);
+
+    // The audit record still points at an account that owns something.
+    const invitation = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.organizer_invitations WHERE email_digest = $1", [digest]);
+    assert.deepEqual(invitation.rows.map((r) => r.user_id), [webUser]);
+
+    // The emptied account is marked rather than left looking like an organizer.
+    const stale = await client.query<{ status: string }>(
+      "SELECT status FROM control_plane.users WHERE id = $1", [invitedUser]);
+    assert.equal(stale.rows[0].status, "deleted");
+
+    // One identity for the address, and re-running changes nothing further.
+    const identities = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1", [digest]);
+    assert.deepEqual(identities.rows.map((r) => r.user_id), [webUser]);
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20260922060001_one_organizer_per_address.sql'");
+    assert.deepEqual(await applyMigrations(client, migrationsDir), ["20260922060001_one_organizer_per_address.sql"]);
+    const afterRerun = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.trip_memberships WHERE trip_id = $1 AND role = 'owner'", [tripId]);
+    assert.deepEqual(afterRerun.rows.map((r) => r.user_id), [webUser]);
+  } finally {
+    client.release();
+    await pool.end();
+  }
+});
+
+test("20260922060001 gives an invited account with no rival an identity of its own", { skip: !databaseUrl }, async () => {
+  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const client = await pool.connect();
+  try {
+    await reset(client);
+    await applyMigrations(client, migrationsDir);
+
+    const digest = "sha256:" + "d".repeat(64);
+    const invitedUser = "user_" + "8".repeat(32);
+    const tripId = "trip_" + "9".repeat(32);
+    await client.query("INSERT INTO control_plane.users(id, status, display_name) VALUES ($1,'active','Invited')", [invitedUser]);
+    await client.query("INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ($1,$2,'draft')",
+      [tripId, "draft-" + tripId.replace(/_/g, "-")]);
+    await client.query(
+      "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1,$2,$3,'owner','active')",
+      ["memb_" + "a".repeat(32), tripId, invitedUser]);
+    await client.query(
+      "INSERT INTO control_plane.organizer_invitations(id, email_digest, user_id, trip_id, kind, language, invited_by) VALUES ($1,$2,$3,$4,'new','en','an operator')",
+      ["invt_" + "b".repeat(32), digest, invitedUser, tripId]);
+
+    await client.query("DELETE FROM public.control_plane_schema_migrations WHERE version = '20260922060001_one_organizer_per_address.sql'");
+    await applyMigrations(client, migrationsDir);
+
+    // The account they were invited into is now the address's canonical one, so
+    // signing up later completes it instead of building a second organizer.
+    const identities = await client.query<{ user_id: string }>(
+      "SELECT user_id FROM control_plane.user_identities WHERE provider = 'password' AND provider_subject_digest = $1", [digest]);
+    assert.deepEqual(identities.rows.map((r) => r.user_id), [invitedUser]);
+    const stale = await client.query<{ status: string }>("SELECT status FROM control_plane.users WHERE id = $1", [invitedUser]);
+    assert.equal(stale.rows[0].status, "active");
+  } finally {
     client.release();
     await pool.end();
   }
