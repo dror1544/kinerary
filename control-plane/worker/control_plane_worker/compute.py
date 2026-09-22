@@ -220,17 +220,23 @@ class LxcProvisionAdapter:
     def _build_topology(self, slug: str, trip_id: str | None = None) -> Topology:
         """The trip's topology, built ONCE — afterwards the file is the truth.
 
-        The data directory is named by TRIP ID, not by slug. A slug comes from
-        the organizer's answers and is deliberately reusable: teardown frees it
+        Both NFS paths — the host directory AND the container's mount point —
+        are named by TRIP ID, not by slug. A slug comes from the organizer's
+        answers and is deliberately reusable: teardown frees it
         (`retired-<slug>-<date>`), so the next family to name their trip the
         same way would otherwise land on the previous family's directory. That
         is only survivable today because teardown remembers to rename the
         directory and a first provision wipes it — two safeguards guarding a
-        name collision that need not exist.
+        name collision that need not exist. Nothing about `pct config` reading
+        an id instead of a slug is worse; `TRIP.txt` in the directory and the
+        LXC's own hostname (`trip-<slug>`) are where a person still finds the
+        human name.
 
-        The MOUNT path inside the container stays the slug, because that is
-        what a person reads in `pct config`, in the site's own env and in its
-        logs. An id in a log line helps nobody.
+        The slug survives in exactly one place: `LxcSpec.trip_slug`, which
+        names the container's OWN filesystem path (TRIP_DIR) — not NFS, so
+        not one of the paths above, and the one spot a person actually reads
+        it. It is always this topology's own top-level `name`, never a second
+        value that could drift from it.
 
         Existing trips are untouched: `create_container` only reaches here when
         the trip has no topology file yet, so every already-provisioned trip
@@ -249,7 +255,8 @@ class LxcProvisionAdapter:
                 bridge=self._bridge, ipv4=f"{ipv4}/24",
                 gateway=self._gateway, nameserver=self._nameserver,
                 nfs_host_dir=f"{self._nfs_host_base}/{trip_id or slug}",
-                nfs_mount_path=f"{self._nfs_mount_base}/{slug}",
+                nfs_mount_path=f"{self._nfs_mount_base}/{trip_id or slug}",
+                trip_slug=slug,
             ),
             # forward_host is the container's IP, deliberately not its LXC name.
             # No trip-* hostname resolves on this LAN — the containers hold

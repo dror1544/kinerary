@@ -225,10 +225,10 @@ class ProxmoxLxcAdapter:
         # Who this directory belongs to, written where someone browsing the
         # share will see it. A directory named by trip id is unique and never
         # reused — the point of naming it that way — and tells a person
-        # nothing. The mount path still carries the slug, so one line recovers
-        # the human name.
+        # nothing on its own; both NFS paths are id-named now, so this line
+        # is the recovery path for the human name.
         marker = (
-            f"trip: {spec.nfs_mount_path.rsplit('/', 1)[-1]}\n"
+            f"trip: {spec.trip_slug}\n"
             f"data: {spec.nfs_host_dir}\n"
             f"container: {spec.name}\n"
         )
@@ -251,7 +251,9 @@ class ProxmoxLxcAdapter:
         Reruns are safe: apt installs are no-ops when already satisfied, and
         every file this writes is fully overwritten each time, not appended.
         """
-        trip_slug = spec.nfs_mount_path.rsplit("/", 1)[-1]
+        # spec.trip_slug, not the mount path's last segment: both NFS paths
+        # are trip-id-named now, so the slug only still exists here.
+        trip_slug = spec.trip_slug
         app_dir = "/opt/kinerary"
         avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
         # Appended with printf rather than written inside the heredoc above:

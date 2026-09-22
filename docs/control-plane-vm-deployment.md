@@ -279,10 +279,14 @@ container: the site's SQLite database, uploaded photos, booking confirmations.
 It outlives the container by design — a redeploy replaces the code, never the
 family's data.
 
-**New trips are named by trip id** (`/mnt/pve/truenas-nfs/trip_<id>`), while the
-path INSIDE the container keeps the slug (`/nfs/<slug>`), which is what appears
-in `pct config`, in the site's `.env` and in its logs. A `TRIP.txt` in the
-directory names the slug, so the share stays browsable.
+**New trips are named by trip id on both sides of the NFS mount** — the host
+directory (`/mnt/pve/truenas-nfs/trip_<id>`) and the path the container sees it
+at (`/nfs/trip_<id>`, mp0). Neither reads as a slug in `pct config` any more; a
+`TRIP.txt` written into the directory at create time names the slug, so the
+share still stays browsable. The slug survives in exactly one other place —
+the container's own filesystem, where `deploy.sh` puts the git-tracked
+`trips/<slug>/` content (`TRIP_DIR=/opt/kinerary/trips/<slug>`) — because that
+one is not NFS, and is not reused the way a slug's NFS directory would be.
 
 The reason is that a slug is not an identity. It comes from the organizer's
 answers, and teardown deliberately frees it (`retired-<slug>-<date>`) so the
@@ -313,14 +317,14 @@ turns deletions-in-use into `.nfs*` placeholders:
 # on the Proxmox host, with the trip's vmid and its new id-shaped name
 pct stop <vmid>
 mv /mnt/pve/truenas-nfs/<slug> /mnt/pve/truenas-nfs/trip_<id>
-pct set <vmid> --mp0 /mnt/pve/truenas-nfs/trip_<id>,mp=/nfs/<slug>   # mount path unchanged
+pct set <vmid> --mp0 /mnt/pve/truenas-nfs/trip_<id>,mp=/nfs/trip_<id>
 pct start <vmid>
 ```
 
-Then update `nfs_host_dir` in `~/kinerary-deploy/trips/<slug>/topology.yaml` to
-match, or the next provision will recreate the old directory and serve an empty
-site. Verify before walking away: the site answers, and its bookings and
-participants are still there.
+Then update both `nfs_host_dir` and `nfs_mount_path` in
+`~/kinerary-deploy/trips/<slug>/topology.yaml` to match, or the next provision
+will recreate the old directory and serve an empty site. Verify before walking
+away: the site answers, and its bookings and participants are still there.
 
 ## Boot order on the Proxmox host
 

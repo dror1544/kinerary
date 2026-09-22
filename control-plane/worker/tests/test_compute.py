@@ -97,16 +97,18 @@ class LxcProvisionAdapterTests(unittest.TestCase):
             self.assertEqual("192.168.0.41", topology.lxc.nameserver)
             self.assertEqual("/mnt/pve/truenas-nfs/tokyo-2026", topology.lxc.nfs_host_dir)
             self.assertEqual("/nfs/tokyo-2026", topology.lxc.nfs_mount_path)
+            self.assertEqual("tokyo-2026", topology.lxc.trip_slug)
 
             topology_path = os.path.join(deploy_root, "trips", "tokyo-2026", "topology.yaml")
             self.assertTrue(os.path.exists(topology_path))
 
-    def test_a_new_trips_data_dir_is_named_by_trip_id_and_its_mount_by_slug(self) -> None:
+    def test_a_new_trips_data_dir_and_its_mount_are_both_named_by_trip_id(self) -> None:
         # A slug is the organizer's words and is deliberately reusable: teardown
         # frees it, so the next family naming their trip the same way would land
-        # on the previous family's data directory. A trip id cannot collide.
-        # The MOUNT keeps the slug — that is what a person reads in pct config,
-        # in the site's env and in its logs.
+        # on the previous family's data directory. A trip id cannot collide —
+        # true of the host directory AND the container's own mount point, so
+        # both are named by it. The slug survives only as LxcSpec.trip_slug,
+        # for the one place that is not NFS: the container's own TRIP_DIR.
         with tempfile.TemporaryDirectory() as deploy_root:
             provisioner = FakeProvisioner(vmid="205")
             adapter = _adapter(deploy_root, provisioner=provisioner)
@@ -115,7 +117,8 @@ class LxcProvisionAdapterTests(unittest.TestCase):
 
             topology, _ = provisioner.apply_calls[0]
             self.assertEqual("/mnt/pve/truenas-nfs/trip_9f2c11aa4d", topology.lxc.nfs_host_dir)
-            self.assertEqual("/nfs/tokyo-2026", topology.lxc.nfs_mount_path)
+            self.assertEqual("/nfs/trip_9f2c11aa4d", topology.lxc.nfs_mount_path)
+            self.assertEqual("tokyo-2026", topology.lxc.trip_slug)
 
     def test_a_trip_that_already_has_a_topology_keeps_its_data_dir(self) -> None:
         # THE UPGRADE CASE. An existing site's data lives where its topology
