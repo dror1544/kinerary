@@ -366,6 +366,26 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "אנגליה": "uk", "בריטניה": "uk", "אנגליה ובריטניה": "uk",
     "תאילנד": "thailand",
     "ישראל": "israel",
+    # Hemisphere-only additions (see _KNOWN_COUNTRY_HEMISPHERE below): none of
+    # these have a currency/timezone row, so a destination that resolves
+    # through one of these keys still resolves for hemisphere only — the
+    # "both or neither" promise above is about keeping the CURRENCY and
+    # TIMEZONE tables in step with each other, not about every consumer of
+    # this alias table having a row in both of them. Values with a Hebrew
+    # geresh (Chile, Fiji) are stored WITHOUT it, matching what `_country_keys`
+    # actually looks up: it strips ASCII quote characters from the typed text
+    # before checking this dict, so a key that still has one could never match.
+    "אוסטרליה": "australia",
+    "ניו זילנד": "new zealand",
+    "דרום אפריקה": "south africa",
+    "ארגנטינה": "argentina",
+    "צילה": "chile",
+    "ברזיל": "brazil",
+    "פרו": "peru",
+    "אורוגוואי": "uruguay",
+    "פרגוואי": "paraguay",
+    "בוליביה": "bolivia",
+    "פיגי": "fiji",
 }
 
 
@@ -1516,12 +1536,133 @@ def _open_day_phases(
     return out
 
 
-def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
+# Southern-hemisphere destinations worth flipping the season on, keyed the
+# same way _KNOWN_COUNTRY_CURRENCY/_KNOWN_COUNTRY_TIMEZONE are -- exact
+# _country_keys() output, never a raw substring test. A raw substring match
+# was tried first and shipped a real bug: "peru" matches inside "Perugia,
+# Italy" (an Italian city, not Peru), and a typed-Hebrew destination never
+# matched at all since the set only held English names. Both are fixed by
+# routing through the same extraction (_destination_head/tail-split) and the
+# same _COUNTRY_ALIASES Hebrew->English translation the currency/timezone
+# lookups already use, rather than re-deriving either.
+#
+# Everything else -- every entry below missing, and any destination
+# _country_keys() resolves to a key not in this dict -- defaults north, which
+# is also where nearly every trip on this platform has gone so far. This is a
+# coarse floor for a packing hint, not a claim about where the equator
+# actually runs.
+_KNOWN_COUNTRY_HEMISPHERE: dict[str, str] = {
+    "australia": "south",
+    "new zealand": "south",
+    "south africa": "south",
+    "argentina": "south",
+    "chile": "south",
+    "brazil": "south",
+    "peru": "south",
+    "uruguay": "south",
+    "paraguay": "south",
+    "bolivia": "south",
+    "fiji": "south",
+}
+
+
+def _destination_hemisphere(destination: str) -> str:
+    """"north" or "south" -- looked up the same way `_lookup_known_currency`
+    resolves a destination: through `_country_keys()`'s exact, extracted
+    keys, never a raw substring test on the typed text. Unresolved (no key
+    in `_KNOWN_COUNTRY_HEMISPHERE`, including "Unknown Destination" and every
+    known-northern destination) defaults north."""
+    for key in _country_keys(destination):
+        if _KNOWN_COUNTRY_HEMISPHERE.get(key) == "south":
+            return "south"
+    return "north"
+
+
+def _season_bucket(month: int, hemisphere: str) -> str:
+    """A coarse meteorological-season bucket for one calendar month in one
+    hemisphere -- "cold"/"hot"/"rainy"/"moderate", never a destination-
+    specific climate (no monsoon calendars, no desert-vs-rainforest
+    knowledge). Southern-hemisphere months are shifted by six to reuse the
+    northern mapping below: south's December is north's June, both summer.
+
+    Winter -> cold and summer -> hot swap between hemispheres, as real
+    seasons do. Spring keeps "rainy" and autumn keeps "moderate" in BOTH
+    hemispheres -- there is no equally-ordinary idiom for "rainy autumn" to
+    swap to instead, and inventing one would be exactly the destination-
+    specific guessing this bucket is deliberately not doing.
+    """
+    if hemisphere == "south":
+        month = (month + 5) % 12 + 1
+    if month in (12, 1, 2):
+        return "cold"
+    if month in (3, 4, 5):
+        return "rainy"
+    if month in (6, 7, 8):
+        return "hot"
+    return "moderate"
+
+
+# [{he,en} category, {he,en} item] pairs, the exact tuple shape
+# readiness.tsx's packing renderer expects for `config.packing_general` and
+# every `phase.packing` alike. "moderate" deliberately stays short -- nothing
+# specific to add on top of the trip-level general list readiness.tsx already
+# falls back to on its own (documents/passport/insurance/charger/meds).
+_PACKING_ITEMS_BY_SEASON: dict[str, list[tuple[dict[str, str], dict[str, str]]]] = {
+    "hot": [
+        ({"he": "בריאות", "en": "Health"}, {"he": "קרם הגנה", "en": "Sunscreen"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "בגדים קלים ונושמים", "en": "Light, breathable clothing"}),
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "משקפי שמש וכובע", "en": "Sunglasses and a hat"}),
+    ],
+    "cold": [
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "מעיל חם", "en": "Warm jacket"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "שכבות לבוש", "en": "Layers"}),
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "כפפות", "en": "Gloves"}),
+    ],
+    "rainy": [
+        ({"he": "אביזרים", "en": "Accessories"}, {"he": "מטריה או מעיל גשם", "en": "Umbrella or rain jacket"}),
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "נעליים אטומות למים", "en": "Waterproof footwear"}),
+    ],
+    "moderate": [
+        ({"he": "ביגוד", "en": "Clothing"}, {"he": "שכבה קלה נוספת", "en": "A light layer"}),
+    ],
+}
+
+
+def _derive_phase_packing(
+    destination: str, start: date | None, end: date | None,
+) -> list[list[dict[str, str]]]:
+    """A phase's climate-appropriate packing additions, layered on top of the
+    trip-level general list (readiness.tsx's `config.packing_general`, which
+    already has its own frontend fallback and is out of this function's
+    scope). Deterministic only: a small fixed item table keyed on a coarse
+    season bucket derived from the trip destination's hemisphere and the
+    phase's start month -- never a live weather call, never a model call.
+
+    A phase with no destination or no start date gets nothing, on purpose:
+    fail toward "nothing shown" (which an absent/empty `phase.packing` already
+    degrades to on the site) rather than toward a guessed season. A phase
+    spanning several months is bucketed on its start month alone -- coarse,
+    same as the season bucket itself.
+    """
+    if not destination or not start:
+        return []
+    hemisphere = _destination_hemisphere(destination)
+    bucket = _season_bucket(start.month, hemisphere)
+    items = _PACKING_ITEMS_BY_SEASON.get(bucket) or []
+    return [[dict(category), dict(item)] for category, item in items]
+
+
+def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, Any]]:
     """Turns the phases[] intake answer into trip.config.json's phases[]
     shape — logistics fields, plus a day-by-day `days[]` when the intake
     carries one (extracted from an uploaded plan document at interview time).
     Hero images and map coordinates still need external lookups this
     transformer deliberately doesn't perform (see module docstring).
+
+    `destination` is the trip's raw (pre-"Unknown Destination"-fallback)
+    typed answer, threaded through only so each phase's `packing` additions
+    (see _derive_phase_packing) know the hemisphere; nothing else here reads
+    it. Passing "" is the "no destination" case that suppresses packing.
 
     Consecutive stops that shorten to the same location (a group split like
     "Dallas (boys...)" immediately followed by "Dallas (all travelers)") are
@@ -1602,6 +1743,10 @@ def _derive_phases(phases: list[Any]) -> list[dict[str, Any]]:
         venues = _normalise_venues(entry["venues"])
         if venues:
             phase["venues"] = venues
+
+        packing = _derive_phase_packing(destination, entry["start"], entry["end"])
+        if packing:
+            phase["packing"] = packing
 
         acc_for_note = phase.get("accommodation") or {}
         hotel_he = str(acc_for_note.get("name") or "")
@@ -1755,7 +1900,8 @@ def transform_intake(
         raise ValueError(f"intake is missing required questions: {sorted(missing)}")
 
     today = today or date.today()
-    destination = _text_value(data["destination"]).strip() or "Unknown Destination"
+    destination_raw = _text_value(data["destination"]).strip()
+    destination = destination_raw or "Unknown Destination"
     trip_type_label = _resolve_trip_type(data["trip_type"])
     group_size_label = _resolve_group_size(data)
 
@@ -1795,7 +1941,7 @@ def transform_intake(
     dietary_instructions = _apply_dietary(data, participants)
     agent = _derive_agent(data, participants, dietary_instructions, language)
 
-    phases = _derive_phases(_structured_list(data, "phases"))
+    phases = _derive_phases(_structured_list(data, "phases"), destination_raw)
 
     # A day-by-day from the dated anchors, for every phase that does not
     # already have one. Extracted days WIN: `extract_itinerary`'s pass over an
