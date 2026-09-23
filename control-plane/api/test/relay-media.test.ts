@@ -19,7 +19,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { MediaStore, MEDIA_MAX_BYTES } from "../src/relay/media-store.js";
-import { toWireEventWithMedia } from "../src/relay/normalize.js";
+import { toWireEventWithMedia, sniffContentType } from "../src/relay/normalize.js";
 import { contentDispositionFor } from "../src/relay/connector.js";
 
 const BOT_TOKEN = "8463178587:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -123,6 +123,47 @@ describe("inbound attachment re-hosting", () => {
     );
     assert.equal(event.media_urls, undefined);
     assert.equal(event.text, "hello");
+  });
+});
+
+describe("content-sniff fallback (issue #163)", () => {
+  test("a PDF with no mime_type or file_name from Telegram still lands typed", async () => {
+    // 2026-09-16, live: exactly this shape reached the companion as
+    // `hyk_31mj.bin` and Hermes's reader refused it outright. Telegram left
+    // both `mime_type` and `file_name` empty — real behaviour for a document
+    // shared from some phone export flows, not a malformed update.
+    const store = new MediaStore();
+    const noMetadataMessage = {
+      chat: { id: 391627336 },
+      message_id: 43,
+      document: { file_id: "BQACAgQAAy" },
+    } as never;
+    const event = await toWireEventWithMedia(
+      noMetadataMessage, "391627336", "", "trip-intake",
+      { fileId: "BQACAgQAAy", kind: "document", mime: "application/octet-stream" },
+      {
+        telegram: fakeTelegram(Buffer.from("%PDF-1.4 itinerary"), "application/octet-stream"),
+        store, baseUrl: "http://127.0.0.1:4312",
+      },
+    );
+
+    assert.equal(event.media?.[0]?.mime, "application/pdf", "sniffed from the %PDF- bytes, not left as octet-stream");
+    assert.equal(event.media?.[0]?.filename, "document.pdf", "synthesized so a downstream reader sees a real extension");
+  });
+
+  test("a mime Telegram did report is never second-guessed", async () => {
+    const store = new MediaStore();
+    const event = await toWireEventWithMedia(
+      message, "391627336", "", "trip-intake",
+      { fileId: "BQACAgQAAx", kind: "document", mime: "application/pdf", filename: "trip-plan.pdf" },
+      { telegram: fakeTelegram(Buffer.from("%PDF-1.4 itinerary")), store, baseUrl: "http://127.0.0.1:4312" },
+    );
+    assert.equal(event.media?.[0]?.mime, "application/pdf");
+    assert.equal(event.media?.[0]?.filename, "trip-plan.pdf", "Telegram's own filename is kept, not overwritten");
+  });
+
+  test("unrecognized bytes with no metadata stay octet-stream rather than a wrong guess", () => {
+    assert.equal(sniffContentType(Buffer.from("just some text, not a known format")), null);
   });
 });
 
