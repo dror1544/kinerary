@@ -181,14 +181,32 @@ export type GroupBindingRedeemResult =
  * `NOT EXISTS` subquery below, the same `NOT_RETIRED_SQL` fragment
  * `bind_chat_to_trip` checks first on its own side.
  *
- * THE RACE THIS DOES NOT CLOSE — related to, but sharper than,
+ * A REAL DEADLOCK WAS HERE, AND IS FIXED — on `teardown-trip.py`'s side, not
+ * in this function. `INSERT INTO telegram_chat_bindings` below has a foreign
+ * key to `trips`, which takes a `FOR KEY SHARE` lock on the referenced trip
+ * row as a side effect — regardless of the `NOT EXISTS` subquery above
+ * correctly avoiding a direct lock on `trips` in the SELECT itself (see that
+ * query's own comment). This function's real lock order is therefore: the
+ * token row first (via `FOR UPDATE`), then `trips` second (via the FK).
+ * `teardown-trip.py`'s `retire_in_db` used to revoke a trip's group-binding
+ * token LAST, after closing its bindings and renaming its slug — locking
+ * `trips` first and the token row second, the OPPOSITE order. Two
+ * transactions each holding one of those two locks and waiting on the
+ * other's is a real `40P01: deadlock detected`, reproduced against Postgres
+ * by regression-planner — not a theoretical one this docstring merely
+ * warned about. The fix is entirely on `teardown-trip.py`'s side:
+ * `REVOKE_GROUP_TOKENS` now runs FIRST in both of that function's
+ * transaction branches, so it locks the token row before `trips`, matching
+ * this function's own order instead of opposing it.
+ *
+ * THE RACE THIS STILL DOES NOT CLOSE — separate from the deadlock above
+ * (that one is fixed; this one is not), and related to, but sharper than,
  * `bind_chat_to_trip`'s own documented one (`provisioner.py`). That race is
  * a stale binding created after teardown already ran; this one is a stale
- * binding created DURING teardown. The `NOT EXISTS` subquery reads
- * `control_plane.trips` with no lock on it (see the query itself for why
- * folding it into a locking `JOIN` would trade this race for a deadlock
- * instead), so it can run while a concurrent `teardown-trip.py` transaction
- * has already executed — but not yet committed — its own slug-rename and
+ * binding created DURING teardown, by TIMING rather than by lock order: the
+ * `NOT EXISTS` subquery reads `control_plane.trips` with no lock on it at
+ * all, so it can run while a concurrent `teardown-trip.py` transaction has
+ * already executed — but not yet committed — its own slug-rename and
  * binding-close steps. This function sees the trip as still live, proceeds,
  * and INSERTs a brand-new open binding; teardown's close step already ran
  * earlier in ITS OWN transaction, before that row existed, so it never
@@ -218,26 +236,30 @@ export async function redeemGroupBindingToken(
     // `trip_retired` is a `NOT EXISTS` subquery, not a `JOIN`: a subquery's
     // tables are never locked by `FOR UPDATE`, only tables named in the
     // top-level `FROM` are — so this folds the retired-trip check into the
-    // same round trip as the token lookup without taking any lock on
-    // `control_plane.trips`. A `JOIN` would take that lock, and would then
-    // race `teardown-trip.py`'s own transaction for the SAME two rows in the
-    // OPPOSITE order (teardown locks trips first, tokens second; this query
-    // would lock tokens first, trips second) — a deadlock, not a fix. See
-    // the docstring above for the race this narrows but does not close.
+    // same round trip as the token lookup without this SELECT itself taking
+    // any lock on `control_plane.trips`. That does NOT make the function
+    // lock-order-safe on its own, though: the INSERT below still takes a
+    // `FOR KEY SHARE` lock on the same trip row via its foreign key, so this
+    // function's real order is token row, then trips — a `JOIN` here would
+    // have taken that same trips lock one statement earlier, not changed
+    // the order. The actual `40P01` deadlock regression-planner reproduced
+    // was `teardown-trip.py` locking trips before the token row, the
+    // opposite way around; fixed there, by revoking the token first. See
+    // the docstring above.
     const { rows } = await client.query<{
       trip_id: string;
       issued_to_telegram_user_id: string;
       expired: boolean;
       trip_retired: boolean;
     }>(
-      `SELECT trip_id, issued_to_telegram_user_id, expires_at <= now() AS expired,
+      `SELECT tg.trip_id, tg.issued_to_telegram_user_id, tg.expires_at <= now() AS expired,
               NOT EXISTS (
                 SELECT 1 FROM control_plane.trips t
-                 WHERE t.id = trip_id AND ${NOT_RETIRED_SQL}
+                 WHERE t.id = tg.trip_id AND ${NOT_RETIRED_SQL}
               ) AS trip_retired
-         FROM control_plane.telegram_group_binding_tokens
-        WHERE token_digest = $1
-        FOR UPDATE`,
+         FROM control_plane.telegram_group_binding_tokens tg
+        WHERE tg.token_digest = $1
+        FOR UPDATE OF tg`,
       [tokenDigest(token)],
     );
     const row = rows[0];
