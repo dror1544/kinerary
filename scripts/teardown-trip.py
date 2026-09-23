@@ -513,11 +513,37 @@ CLOSE_SESSIONS = ("UPDATE control_plane.intake_sessions SET expired_at = now() "
                   "WHERE trip_id = '{id}' AND expired_at IS NULL AND state <> 'confirmed'")
 
 
+# A group-binding token (issue #175, migration 0045) is issued into the
+# organizer's DM and stays redeemable for up to its own TTL — 7 to 30 days —
+# with nothing in `trips.lifecycle_state` to say the trip it names is gone.
+# `redeemGroupBindingToken` now refuses it once the trip's slug reads
+# `retired-...` (control-plane/api/src/group-binding.ts), but that still
+# leaves a live token sitting in the table for someone to try, and try again,
+# until it expires on its own. Revoking it here — the same moment its
+# bindings and sessions close — is the proactive half of the same fix.
+# `expires_at > now()` also protects the table's own CHECK
+# (`expires_at > created_at`): only a token that has not already expired is
+# touched, so this can never try to set an expiry equal to or before its
+# creation time.
+REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
+                       "WHERE trip_id = '{id}' AND expires_at > now()")
+
+
 def retire_in_db(trip: dict) -> str:
     if trip["slug"].startswith("retired-"):
-        psql(f"UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' "
-             f"WHERE trip_id = '{trip['id']}' AND closed_at IS NULL")
-        psql(CLOSE_SESSIONS.format(id=trip["id"]))
+        # One transaction, not three bare calls: three separate `psql()`
+        # calls can die between any two of them, and a process that dies
+        # between the binding-close and the token-revoke leaves exactly the
+        # gap this whole task exists to close — bindings and sessions gone,
+        # a live group-binding token still sitting in the table. Same
+        # BEGIN...COMMIT shape as the rename branch below, for the same
+        # reason.
+        psql(f"""BEGIN;
+UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
+ WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLOSE_SESSIONS.format(id=trip['id'])};
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
+COMMIT;""")
         return trip["slug"]
     base = f"retired-{trip['orig']}-{datetime.now():%Y%m%d}"
     new = base
@@ -531,6 +557,7 @@ UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
  WHERE id = '{trip['id']}' AND slug = '{trip['slug']}';
 {CLOSE_SESSIONS.format(id=trip['id'])};
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 COMMIT;""")
     return new
 

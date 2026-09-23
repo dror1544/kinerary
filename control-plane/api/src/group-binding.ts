@@ -27,6 +27,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
+import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 /**
  * `KIN-` plus eight unambiguous characters.
@@ -157,7 +158,13 @@ export type GroupBindingRedeemResult =
   | { ok: true; tripId: string; rebound: boolean }
   | {
       ok: false;
-      reason: "NOT_FOUND" | "EXPIRED" | "WRONG_SENDER" | "CHAT_BOUND_ELSEWHERE" | "NOT_A_GROUP";
+      reason:
+        | "NOT_FOUND"
+        | "EXPIRED"
+        | "WRONG_SENDER"
+        | "CHAT_BOUND_ELSEWHERE"
+        | "NOT_A_GROUP"
+        | "TRIP_RETIRED";
     };
 
 /**
@@ -168,6 +175,31 @@ export type GroupBindingRedeemResult =
  * binding somebody else made — the organizer of the other trip never agreed to
  * lose it. Rebinding the SAME trip is the supported path and reports
  * `rebound: true` so the caller can greet again without claiming it is new.
+ *
+ * Refuses a token whose trip has been retired (`t.slug` renamed
+ * `retired-<slug>-<yyyymmdd>` by `teardown-trip.py`, issue #105) via the
+ * `NOT EXISTS` subquery below, the same `NOT_RETIRED_SQL` fragment
+ * `bind_chat_to_trip` checks first on its own side.
+ *
+ * THE RACE THIS DOES NOT CLOSE — related to, but sharper than,
+ * `bind_chat_to_trip`'s own documented one (`provisioner.py`). That race is
+ * a stale binding created after teardown already ran; this one is a stale
+ * binding created DURING teardown. The `NOT EXISTS` subquery reads
+ * `control_plane.trips` with no lock on it (see the query itself for why
+ * folding it into a locking `JOIN` would trade this race for a deadlock
+ * instead), so it can run while a concurrent `teardown-trip.py` transaction
+ * has already executed — but not yet committed — its own slug-rename and
+ * binding-close steps. This function sees the trip as still live, proceeds,
+ * and INSERTs a brand-new open binding; teardown's close step already ran
+ * earlier in ITS OWN transaction, before that row existed, so it never
+ * closes it. Once both transactions commit, the result is a fresh, OPEN,
+ * stale binding — arguably worse than #105's original evidence (an
+ * eight-minute gap between teardown finishing and a stray binding
+ * appearing), because here the two are interleaved rather than sequential.
+ * Accepted as a narrow residual risk for the same reason `bind_chat_to_trip`
+ * accepts its own: actually closing it needs the trips row locked here AND
+ * `teardown-trip.py` cooperating with that lock, which is a bigger
+ * transactional change than this fix is meant to be.
  */
 export async function redeemGroupBindingToken(
   db: pg.Pool,
@@ -183,12 +215,26 @@ export async function redeemGroupBindingToken(
   const client = await db.connect();
   try {
     await client.query("BEGIN");
+    // `trip_retired` is a `NOT EXISTS` subquery, not a `JOIN`: a subquery's
+    // tables are never locked by `FOR UPDATE`, only tables named in the
+    // top-level `FROM` are — so this folds the retired-trip check into the
+    // same round trip as the token lookup without taking any lock on
+    // `control_plane.trips`. A `JOIN` would take that lock, and would then
+    // race `teardown-trip.py`'s own transaction for the SAME two rows in the
+    // OPPOSITE order (teardown locks trips first, tokens second; this query
+    // would lock tokens first, trips second) — a deadlock, not a fix. See
+    // the docstring above for the race this narrows but does not close.
     const { rows } = await client.query<{
       trip_id: string;
       issued_to_telegram_user_id: string;
       expired: boolean;
+      trip_retired: boolean;
     }>(
-      `SELECT trip_id, issued_to_telegram_user_id, expires_at <= now() AS expired
+      `SELECT trip_id, issued_to_telegram_user_id, expires_at <= now() AS expired,
+              NOT EXISTS (
+                SELECT 1 FROM control_plane.trips t
+                 WHERE t.id = trip_id AND ${NOT_RETIRED_SQL}
+              ) AS trip_retired
          FROM control_plane.telegram_group_binding_tokens
         WHERE token_digest = $1
         FOR UPDATE`,
@@ -206,6 +252,10 @@ export async function redeemGroupBindingToken(
     if (row.expired) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "EXPIRED" };
+    }
+    if (row.trip_retired) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "TRIP_RETIRED" };
     }
 
     const existing = await client.query<{ trip_id: string }>(

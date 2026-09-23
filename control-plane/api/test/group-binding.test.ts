@@ -218,6 +218,30 @@ describe("group binding tokens", { skip: SKIP }, () => {
     });
   });
 
+  test("a token whose trip has been retired binds nothing", async () => {
+    // `teardown-trip.py` renames the trip's slug to `retired-<slug>-<yyyymmdd>`
+    // (issue #105) without necessarily touching `lifecycle_state`, and a token
+    // issued before teardown can stay live for up to 30 days after — the
+    // actual production reproduction path this task closes.
+    await withFixture(async ({ pool, tripId }) => {
+      const issued = await issueGroupBindingToken(pool, tripId, "777", { ttlSeconds: 3600 });
+      assert.ok(issued.ok);
+      if (!issued.ok) return;
+
+      await pool.query("UPDATE control_plane.trips SET slug = $1 WHERE id = $2", [
+        "retired-italy-20260911",
+        tripId,
+      ]);
+
+      const result = await redeemGroupBindingToken(pool, issued.token, "-1002000888", "777");
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.equal(result.reason, "TRIP_RETIRED");
+
+      assert.equal((await resolveChatRoute(pool, "-1002000888")).kind, "unbound");
+    });
+  });
+
   test("a token is not redeemable in a private chat", async () => {
     // Binding the organizer's own DM to their trip is provisioning's job and
     // already done. A token redeemed in a DM would at best be a no-op and at

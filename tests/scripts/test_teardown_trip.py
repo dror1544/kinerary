@@ -98,6 +98,60 @@ class RetireInDb(unittest.TestCase):
         self.assertLess(tx.index("BEGIN"), tx.index("intake_sessions"))
         self.assertLess(tx.index("intake_sessions"), tx.index("COMMIT"))
 
+    def test_a_live_group_binding_token_is_revoked_with_the_trip(self):
+        # issue #175: a token issued into the organizer's DM stays redeemable
+        # for up to its own TTL (7-30 days) with nothing on the trip row
+        # saying it is gone. Revoking it here closes the reproduction path
+        # `redeemGroupBindingToken`'s own retired-slug check narrows but does
+        # not eliminate on its own.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"})
+        tx = seen[-1]
+        self.assertIn(
+            "UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
+            "WHERE trip_id = 'trip_abcdefgh12' AND expires_at > now()",
+            tx,
+        )
+        self.assertLess(tx.index("BEGIN"), tx.index("telegram_group_binding_tokens"))
+        self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("COMMIT"))
+
+    def test_an_already_retired_trip_still_revokes_a_lingering_token(self):
+        # The fast path for a trip that is already `retired-...` (e.g. a
+        # rerun) must not skip revocation just because the slug rename is
+        # already done.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"})
+        self.assertTrue(any("telegram_group_binding_tokens" in sql for sql in seen))
+
+    def test_the_already_retired_fast_path_is_one_transaction_not_three_calls(self):
+        # A process that died between separate bare psql() calls used to be
+        # able to close bindings and sessions and still leave a live
+        # group-binding token behind — reopening the exact gap this task
+        # exists to close, by its own non-atomicity. One BEGIN...COMMIT call,
+        # the same shape the rename branch below already uses, means a crash
+        # anywhere in it leaves the database exactly as it was before.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "retired-japan-2026-20260101", "orig": "japan-2026"})
+        self.assertEqual(len(seen), 1, "exactly one psql() call for the whole fast path")
+        tx = seen[0]
+        self.assertLess(tx.index("BEGIN"), tx.index("telegram_chat_bindings"))
+        self.assertLess(tx.index("telegram_chat_bindings"), tx.index("intake_sessions"))
+        self.assertLess(tx.index("intake_sessions"), tx.index("telegram_group_binding_tokens"))
+        self.assertLess(tx.index("telegram_group_binding_tokens"), tx.index("COMMIT"))
+
+    def test_the_revocation_never_touches_an_already_expired_token(self):
+        # The table's own CHECK forbids expires_at <= created_at; only
+        # touching a still-live token (expires_at > now()) is what keeps this
+        # from ever trying to set an expiry at or before creation.
+        seen: list[str] = []
+        with mock.patch.object(teardown, "psql", side_effect=lambda sql: seen.append(sql) or "0"):
+            teardown.retire_in_db({"id": "trip_abcdefgh12", "slug": "japan-2026", "orig": "japan-2026"})
+        tx = seen[-1]
+        self.assertIn("AND expires_at > now()", tx)
+
 
 class OriginalSlug(unittest.TestCase):
     def test_a_retired_slug_still_names_its_old_resources(self):
