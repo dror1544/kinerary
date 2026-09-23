@@ -204,6 +204,13 @@ profile is deleted — the interviewer runs a cron ticker per allowlisted profil
 and on 2026-09-11 that ticker recreated a deleted profile's directory, which is
 enough to make the next trip of that name install without a companion.
 
+**Order matters a second time, inside `retire_in_db`'s own transaction**:
+revoking any still-live group-binding token runs *before* closing chat
+bindings and renaming the slug, not after — reversed, it deadlocks against a
+concurrent `redeemGroupBindingToken` call (a real `40P01`, reproduced against
+Postgres, issue #175). See `REVOKE_GROUP_TOKENS`'s comment in
+`scripts/teardown-trip.py` for the lock order.
+
 It refuses a trip past `ready_private` (real people have used it) and a profile
 another trip's open binding still names. There is no `--force`.
 
