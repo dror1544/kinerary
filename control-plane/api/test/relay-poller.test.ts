@@ -11,6 +11,7 @@ import {
   answerCallbackData,
   CONFIRM_CALLBACK_DATA,
   KEEP_PLANNING_CALLBACK_DATA,
+  otherCallbackData,
   skipCallbackData,
   startFromDeepLink,
 } from "../src/chat-router.js";
@@ -24,6 +25,7 @@ import {
   toggleMultiChoiceForChat,
 } from "../src/interview.js";
 import { submitArgsFor } from "../src/interpret.js";
+import type { StructuredModelRunner } from "../src/model-runner.js";
 import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
@@ -175,9 +177,9 @@ function msg(chatId: string, text: string): TelegramUpdate {
 }
 
 /** Runs one update all the way through: dispatch decides, applyDecision acts. */
-async function turn(fix: Fixture, update: TelegramUpdate): Promise<void> {
+async function turn(fix: Fixture, update: TelegramUpdate, modelRunner?: StructuredModelRunner): Promise<void> {
   const decision = await dispatchUpdate(fix.pool, update);
-  await applyDecision(decision, { db: fix.pool, telegram: fix.telegram, connector: fix.connector });
+  await applyDecision(decision, { db: fix.pool, telegram: fix.telegram, connector: fix.connector, modelRunner });
 }
 
 /** Gets an interview going in `chatId` and returns its session id. */
@@ -250,6 +252,44 @@ describe("a multi-select waits for Done", () => {
         !after.view.optionalRemaining.some((q) => q.id === "dietary"),
         "a skipped question does not come back because it was mid-tick",
       );
+    });
+  });
+});
+
+describe("a choice's Other button", () => {
+  test("turns the next typed message into the literal custom answer", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const chatId = "700100204";
+      await beginInterview(fix, chatId);
+
+      await turn(fix, tap(chatId, otherCallbackData("trip_type")));
+      const awaitingText = await getSessionForChat(fix.pool, chatId);
+      assert.ok(awaitingText.ok);
+      assert.equal(awaitingText.view.otherPending?.id, "trip_type");
+      assert.equal(fix.telegram.edited.at(-1)?.buttonData.length, 0, "the choice keyboard is retired while typing");
+
+      const reviewer: StructuredModelRunner = {
+        async run(req) {
+          const value = req.parse({
+            proposals: [{
+              questionId: "trip_type",
+              value: { kind: "choice_other", otherText: "extended family reunion" },
+              confidence: 1,
+              evidence: "extended family reunion",
+            }],
+            unclear: [],
+          });
+          assert.ok(value, "the review proposal must satisfy the bounded interpreter schema");
+          return { ok: true, value, attempts: 1, ms: 0 };
+        },
+      };
+      await turn(fix, msg(chatId, "extended family reunion"), reviewer);
+      const answers = await answersForChat(fix.pool, chatId);
+      assert.equal(answers?.answers.trip_type?.kind, "choice_other");
+      assert.equal(answers?.answers.trip_type?.other_text, "extended family reunion");
+      const recorded = await getSessionForChat(fix.pool, chatId);
+      assert.ok(recorded.ok);
+      assert.equal(recorded.view.otherPending, null, "the custom-text state clears after it is recorded");
     });
   });
 });
@@ -473,8 +513,11 @@ describe("the organizer's first taps are recorded", () => {
       const question = fix.telegram.lastSent;
       assert.ok(question?.hasButtons, "the first intake question is tap-answerable");
       assert.ok(
-        question!.buttonData.every((d) => d.startsWith("a:trip_type:")),
-        "the buttons answer the question that was asked",
+        // `trip_type` sets allowsOther, so its keyboard carries an Other button
+        // alongside its options. The claim is that every button belongs to the
+        // question that was asked — not that the question has no Other.
+        question!.buttonData.every((d) => d.startsWith("a:trip_type:") || d === "o:trip_type"),
+        `the buttons answer the question that was asked, got: ${question?.buttonData}`,
       );
     });
   });
@@ -974,7 +1017,11 @@ describe("a document's unsure reading is asked about, not lost", () => {
       await saveSuggestionsForChat(fix.pool, chatId, { trip_type: { optionId: "not_an_option" } });
       await turn(fix, tap(chatId, "c:nodoc"));
       const asked = fix.telegram.lastSent;
-      assert.ok(asked?.buttonData.length && asked.buttonData.every((d) => d.startsWith("a:trip_type:")), `got: ${asked?.buttonData}`);
+      assert.ok(
+        asked?.buttonData.length
+          && asked.buttonData.every((d) => d.startsWith("a:trip_type:") || d === "o:trip_type"),
+        `got: ${asked?.buttonData}`,
+      );
     });
   });
 });

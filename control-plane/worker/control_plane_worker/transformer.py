@@ -1200,6 +1200,20 @@ def _derive_agent(
         agent["proactive"] = proactive
 
     instructions = list(dietary_instructions)
+    # A custom trip type is more than branding. The companion needs the
+    # organizer's actual framing — e.g. an extended-family reunion behaves
+    # differently from the preset "Family" trip — when it makes suggestions.
+    # It is kept verbatim in both language slots: it was reviewed by the
+    # interviewer before storage, but translating a personal description would
+    # still put words in the organizer's mouth.
+    trip_type = data.get("trip_type")
+    if isinstance(trip_type, Mapping) and trip_type.get("kind") == "choice_other":
+        custom_type = str(trip_type.get("other_text") or "").strip()
+        if custom_type:
+            instructions.append(_instruction({
+                "en": f"The organizer describes this trip as: {custom_type}",
+                "he": f"המארגן מתאר את הטיול כך: {custom_type}",
+            }))
     pace = _text_value(data["trip_pace"]) if isinstance(data.get("trip_pace"), Mapping) else ""
     if pace in _PACE_TEXT:
         instructions.append(_instruction(_PACE_TEXT[pace]))

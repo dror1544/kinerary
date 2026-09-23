@@ -654,6 +654,11 @@ export function multiDoneCallbackData(questionId: string): string {
   return `n:${questionId}`;
 }
 
+/** `o:<questionId>` — the organizer wants to type a custom choice. */
+export function otherCallbackData(questionId: string): string {
+  return `o:${questionId}`;
+}
+
 /** `y:<questionId>` — "yes, that's right" to what a document suggested. */
 export function suggestionYesCallbackData(questionId: string): string {
   return `y:${questionId}`;
@@ -685,6 +690,7 @@ export function switchCallbackData(tripId: string): string {
 export type ParsedCallback =
   | { kind: "answer"; questionId: string; optionId: string }
   | { kind: "toggle"; questionId: string; optionId: string }
+  | { kind: "other"; questionId: string }
   | { kind: "multi_done"; questionId: string }
   | { kind: "skip"; questionId: string }
   | { kind: "suggestion_yes"; questionId: string }
@@ -752,11 +758,12 @@ export function parseCallbackData(data: string): ParsedCallback {
       : { kind: "toggle", questionId: pair[2], optionId: pair[3] };
   }
 
-  const single = /^([knyx]):([A-Za-z0-9_]{1,64})$/.exec(data);
+  const single = /^([knoyx]):([A-Za-z0-9_]{1,64})$/.exec(data);
   if (single?.[2]) {
     const questionId = single[2];
     if (single[1] === "k") return { kind: "skip", questionId };
     if (single[1] === "n") return { kind: "multi_done", questionId };
+    if (single[1] === "o") return { kind: "other", questionId };
     return single[1] === "y" ? { kind: "suggestion_yes", questionId } : { kind: "suggestion_no", questionId };
   }
 
@@ -833,6 +840,9 @@ export function renderQuestion(
       const text = optionLabel(question, option.id, language);
       const label = multi && selected.includes(option.id) ? `✅ ${text}` : text;
       rows.push([{ text: label, callback_data: data }]);
+    }
+    if (!multi && question.allowsOther) {
+      rows.push([{ text: uiString("other", language), callback_data: otherCallbackData(question.id) }]);
     }
     if (multi) {
       rows.push([{ text: uiString("multiDone", language), callback_data: multiDoneCallbackData(question.id) }]);
