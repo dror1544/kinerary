@@ -1956,6 +1956,18 @@ def transform_intake(
         if derived and not phase.get("days"):
             phase["days"] = derived
 
+    # The votable half of the same anchors, from the same reading of them: the
+    # unconfirmed attractions, which are the ones still open to a "shall we?".
+    # Same insertion point and same reason as the days above — it needs the real
+    # phases with their ids and date ranges, which `_derive_phases` has just
+    # settled. Absent rather than empty when a phase has none: an empty
+    # `rsvp_activities` is a heading over no cards, not a statement.
+    anchor_rsvps = derive_rsvp_activities({"phases": phases}, data)
+    for phase in phases:
+        derived = anchor_rsvps.get(str(phase.get("id")))
+        if derived and not phase.get("rsvp_activities"):
+            phase["rsvp_activities"] = derived
+
     # AFTER the real phases are settled, and in trip order. A day of the trip
     # that belongs to no phase is shown as an open stretch rather than not
     # shown at all — see _open_day_phases for the run that made this necessary.
@@ -2183,8 +2195,66 @@ def _phase_id_for_date(phases: list[dict[str, Any]], when: date) -> str | None:
     return None
 
 
+def _stable_id(prefix: str, *parts: Any) -> str:
+    """A short, deterministic id for a derived row, hashed from what the row IS.
+
+    Both callers key something that lives OUTSIDE trip.config.json by the string
+    this returns — the site's `INSERT OR IGNORE ... seed_key` for a booking row,
+    the `rsvps` table for a vote — so re-provisioning the same intake has to
+    produce the same string again or the row is duplicated and the votes are
+    orphaned. Neither failure is loud.
+
+    One helper rather than the same three lines twice, so a change to the
+    scheme cannot be made in one caller and forgotten in the other. The joined
+    parts are the caller's business; the hashing is not.
+    """
+    identity = "|".join(str(part or "") for part in parts)
+    return f"{prefix}_{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _first_phase_id(phases: list[Any], default: str) -> str:
+    """The phase an anchor parks on when its own date maps to none of them.
+
+    Both anchor derivations need somewhere to put an undated item rather than
+    dropping it — `bookings.phase` is `TEXT NOT NULL`, and a vote card nobody
+    can see is a question nobody gets asked. `default` is what to say when the
+    trip has no phases at all: a literal the site will accept for bookings,
+    and "" for callers that would rather emit nothing.
+    """
+    return str(phases[0].get("id")) if phases and phases[0].get("id") else default
+
+
+# These two are the only pieces pulled out of the walk `derive_days_from_anchors`,
+# `derive_bookings` and `derive_rsvp_activities` otherwise each repeat in full:
+# read `travel_anchors`, run each entry through `_read_anchor`, map its date to
+# a phase, decide what to keep. Three call sites sharing a loop shape is not
+# yet unified into one traversal — deliberately, a carry-forward from #169's
+# review rather than an oversight. Revisit if a FOURTH consumer of
+# `travel_anchors` needs the same shape; three is a coincidence, four is a
+# pattern worth the indirection a shared walker would cost.
+
+
 _ANCHOR_TIME_RE = re.compile(r"\bat\s+([0-2]?\d:[0-5]\d)\b", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _anchor_label_text(text: Any) -> str:
+    """An anchor's free text as it should be SHOWN: the date and the time taken
+    out, because both are carried structurally beside it — printing "at 10:00"
+    next to a 10:00 slot is the same fact twice.
+
+    Split out of `_read_anchor` so the vote card's title and the detail it is
+    compared against are produced by one function, rather than by two that can
+    disagree about whether they are the same text.
+    """
+    stripped = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", str(text or "")))
+    return stripped.strip(" —-—,;:").strip()
+
+
+def _squash(text: Any) -> str:
+    """Text reduced to what it SAYS — case folded, runs of whitespace collapsed.
+    For asking whether two strings are the same sentence; never for display."""
+    return " ".join(str(text or "").casefold().split())
 
 
 def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -2217,8 +2287,7 @@ def _read_anchor(raw: Mapping[str, Any]) -> dict[str, Any]:
     clock = stated_time if _CLOCK_RE.match(stated_time) else (time_match.group(1) if time_match else None)
     # The date and time are represented structurally, so strip them from the
     # label rather than printing "at 10:00" beside a 10:00 slot.
-    label = _ANCHOR_TIME_RE.sub("", _ANCHOR_DATE_RE.sub("", name or detail))
-    label = label.strip(" \u2014-—,;:").strip()
+    label = _anchor_label_text(name or detail)
     return {"type": anchor_type, "detail": detail, "name": name, "when": when,
             "time": clock, "label": label}
 
@@ -2291,6 +2360,142 @@ def derive_days_from_anchors(
     return out
 
 
+#: The canonical anchor type that names something you DO, rather than where you
+#: sleep, how you get there, or what a quote costs. Read through
+#: _ANCHOR_TYPE_MAP rather than against a second list of words, so every member
+#: that map gains ("event", "shuttle" and "parking" arrived in #109) arrives
+#: here the same day — a taxonomy short a member is the shape of #115.
+_VOTABLE_ANCHOR_TYPE = "attraction"
+
+
+def derive_rsvp_activities(
+    config: Mapping[str, Any], data: Mapping[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """The family's "shall we actually do this?" list, per phase, from the
+    anchors. No model.
+
+    `phases[].rsvp_activities[]` had no producer at all. The site has rendered
+    vote cards since the hand-authored era (`site/app.js` renderRsvpCard;
+    trip-web's `GroupActivities`), `server/server.js` has stored the answers in
+    `rsvps`, and the config schema has carried the field — and this transformer
+    never wrote it, so the whole RSVP surface was invisible on every provisioned
+    trip. The live-trip report put it as "RSVP/trivia features: unused".
+
+    WHICH ANCHORS. Attraction-typed ones carrying NO confirmation. That is this
+    file's own existing line rather than a new one: an anchor is a fixed point
+    in the trip, not evidence of a booking, and the schema's rule is that a
+    confirmation is what makes it one (see the confirmed-count stat in
+    `transform_intake`, and `_has_confirmation`, which already reads a
+    placeholder as absent). A CONFIRMED attraction is already happening —
+    tickets bought, seats held — so asking the family to vote on it is asking a
+    question whose answer changes nothing; it belongs on the Bookings tab only.
+    An UNCONFIRMED one is exactly where "does everyone want this?" is real.
+
+    DELIBERATELY NOT EXCLUSIVE with `derive_bookings`. The same unconfirmed
+    anchor stays a Bookings row AND becomes a vote. Two views of one fact, not
+    duplication to be removed: Bookings is the organizer's tracking view ("what
+    is still pending"), RSVP is the family-facing interactive one ("does
+    everyone want it"). Changing either to hide the other loses a real surface.
+
+    THE ID IS THE VOTE'S PRIMARY KEY. `rsvps` is keyed by the activity id string
+    alone (`/api/rsvps/:activityId`) and knows nothing about trip.config.json,
+    so an id that moves on re-provision does not fail loudly — it orphans every
+    vote already cast and the card comes back empty with nobody told. So it is a
+    hash of what the anchor IS, through the same `_stable_id` `derive_bookings`
+    keys its rows with — over the name, the stated date and the free text
+    TOGETHER, because a structured anchor states all three and keying on any one
+    of them lets two different activities collide on one vote record.
+
+    Two fields are deliberately left out of that identity, for the same reason
+    in both cases: they cannot tell two of these anchors apart, and they CAN
+    change under one. The confirmation, because everything here is unconfirmed
+    by construction and so it holds only "" or a placeholder — an organizer
+    tidying an empty field into "TBD" must not move a live vote. And the type
+    word, because the filter above has already fixed the canonical type at
+    "attraction", so all the raw word could contribute is the synonym drift
+    between two extraction runs of one document ("activity" this time,
+    "attraction" the next).
+
+    `item_uid` is left unset: there is no itinerary item an anchor is a link to
+    (the field exists for a day-plan item marked votable), and the schema's own
+    legacy case omits it. `activity-rsvp.ts` then matches by phase, date and
+    exact title — which lines up, because the title here is the same `_read_anchor`
+    label `derive_days_from_anchors` puts on the day.
+
+    Returns {phase_id: activities[]}, date order with the undated last.
+    """
+    phases = list(config.get("phases") or [])
+    fallback_phase = _first_phase_id(phases, "")
+    by_phase: dict[str, list[dict[str, Any]]] = {}
+    seen: set[str] = set()
+
+    for raw in _structured_list(data, "travel_anchors"):
+        if not isinstance(raw, dict):
+            continue
+        anchor = _read_anchor(raw)
+        if _ANCHOR_TYPE_MAP.get(anchor["type"]) != _VOTABLE_ANCHOR_TYPE:
+            continue
+        if _has_confirmation(raw):
+            continue
+        title = _bilingual_text(anchor["label"])
+        if not title:
+            continue  # nothing to put on the card; a bare type is not a question
+        when = anchor["when"]
+        # Undated, or dated outside every phase: parked on the first phase,
+        # exactly where `derive_bookings` already parks the same anchor's row.
+        # Dropping it instead would hide the MOST vote-worthy case — an
+        # attraction nobody has booked or even scheduled — from the surface
+        # built to ask about it, and the family already sees it on phase 1.
+        phase_id = (_phase_id_for_date(phases, when) if when else None) or fallback_phase
+        if not phase_id:
+            continue
+        # EVERY field the anchor states, not the first one that is non-empty.
+        # A structured anchor can carry name, date AND detail at once (the
+        # document-extraction path writes all three), so keying on `detail`
+        # alone would give two different activities that happen to share a notes
+        # line one id — and the dedupe below would then silently drop the second
+        # one's card.
+        #
+        # The date is `_read_anchor`'s PARSED one, not the raw field: it is the
+        # same date whether the organizer's document said "20 Sep 2026" or
+        # "2026-09-20", and it is still there when the anchor states it as
+        # `date_from` or `start` — both shapes this file already reads, and
+        # both of which a raw `date` lookup would read as blank, colliding one
+        # activity's two dates onto one vote.
+        #
+        # Two fields are deliberately absent, for one reason twice: neither can
+        # tell two of THESE anchors apart, and both can change under one. The
+        # canonical type, because the filter above has already fixed it at
+        # "attraction", so all the raw word could add is the synonym drift
+        # between two extraction runs ("activity" this time, "attraction" the
+        # next). The confirmation, because everything here is unconfirmed.
+        activity_id = _stable_id(
+            "rsvp", anchor["name"], when.isoformat() if when else "", anchor["detail"],
+        )
+        if activity_id in seen:
+            continue  # one activity, one vote record — never two cards sharing one
+        seen.add(activity_id)
+        activity: dict[str, Any] = {"id": activity_id, "title": title}
+        # Only when it says something the title does not. A free-text anchor's
+        # label IS its detail, and a document pass that copies the venue name
+        # into a notes field produces the same text twice — either way a desc
+        # would print the heading again directly under the heading. Compared
+        # after the same date/time stripping the title had, so "Sky Lagoon" and
+        # "Sky Lagoon — 5 Mar 2027" are recognised as the one sentence they are.
+        desc = _bilingual_text(_anchor_label_text(anchor["detail"]))
+        if desc and _squash(desc["en"]) == _squash(title["en"]):
+            desc = None
+        if desc:
+            activity["desc"] = desc
+        if when:
+            activity["date"] = when.isoformat()
+        by_phase.setdefault(phase_id, []).append(activity)
+
+    for activities in by_phase.values():
+        activities.sort(key=lambda a: ("date" not in a, a.get("date") or ""))
+    return by_phase
+
+
 def _same_place(a: str, b: str) -> bool:
     """Whether two booking names name the same place: "Hotel Artemide" and
     "Hotel Artemide, Rome" do; "OMO3 Asakusa" and "Park Hyatt Tokyo" do not."""
@@ -2329,7 +2534,7 @@ def derive_bookings(
     point.
     """
     phases = list(config.get("phases") or [])
-    fallback_phase = str(phases[0].get("id")) if phases and phases[0].get("id") else "trip"
+    fallback_phase = _first_phase_id(phases, "trip")
     bookings: list[dict[str, Any]] = []
     hotel_row: dict[str, dict[str, Any]] = {}
 
@@ -2391,8 +2596,8 @@ def derive_bookings(
         # an existing trip stays idempotent. A structured one has no `detail`;
         # hashing the type alone gave every "activity" the SAME key, and the
         # site's INSERT OR IGNORE kept one of them.
-        identity = detail or "|".join(
-            str(part) for part in (anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "")
+        identity = (detail,) if detail else (
+            anchor_type, anchor["name"], raw.get("date") or "", raw.get("confirmation") or "",
         )
         bookings.append({
             "phase": phase_id or fallback_phase,
@@ -2407,7 +2612,7 @@ def derive_bookings(
             # If the anchor names a venue the itinerary already links, reuse
             # that link rather than leaving the row with a bare 📍.
             "location_url": _config_venue_link(f"{name} {detail}", phases),
-            "seed_key": "anchor_" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10],
+            "seed_key": _stable_id("anchor", *identity),
         })
         if anchor_file:
             bookings[-1]["conf_file"] = anchor_file
