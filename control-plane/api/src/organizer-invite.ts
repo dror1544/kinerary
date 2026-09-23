@@ -38,6 +38,7 @@ import {
   resolveOrCreateEmailAccount,
 } from "./password-identity.js";
 import { structuredLog } from "./redaction.js";
+import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -199,7 +200,7 @@ async function ownedTrips(db: pg.Pool, emailDigest: string): Promise<OwnedTrip[]
        JOIN control_plane.trips t ON t.id = m.trip_id
       WHERE m.user_id IN (SELECT user_id FROM people)
         AND m.role = 'owner' AND m.status = 'active'
-        AND t.slug NOT LIKE 'retired-%'
+        AND ${NOT_RETIRED_SQL}
       ORDER BY t.created_at DESC`,
     [emailDigest],
   );

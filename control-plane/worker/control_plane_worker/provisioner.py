@@ -104,8 +104,14 @@ UNREACHABLE_REASONS = {
     # The chat is already bound to a different trip; moving it is a reviewed
     # organizer action this job has no standing to perform.
     "BINDING_REFUSED",
-    # The binding write itself failed.
+    # The binding write itself failed — a technical, retriable fault.
     "BINDING_FAILED",
+    # The trip has been torn down (`teardown-trip.py`, slug renamed
+    # `retired-<slug>-<yyyymmdd>`). Distinct from BINDING_FAILED on purpose:
+    # that one implies retrying might help, and retrying THIS one cannot —
+    # the deploy directory, container and Hermes profile are already gone.
+    # See TripRetired and issue #105.
+    "TRIP_RETIRED",
     # The companion is installed but its trip-mcp bridge could not be wired —
     # every trip tool will fail while the companion answers normally.
     "TRIP_MCP_BRIDGE_FAILED",
@@ -408,6 +414,32 @@ class BindingRefused(Exception):
         self.requested_trip_id = requested_trip_id
 
 
+class TripRetired(Exception):
+    """The REQUESTED trip has been torn down.
+
+    Sibling of `BindingRefused`, not a case of it: that exception is about a
+    chat already committed to a different trip. This one fires even for a
+    chat with no open binding at all — the trip itself is the problem, and no
+    signed organizer action can retry it away, because `teardown-trip.py` has
+    already deleted the deploy directory, the container and the Hermes
+    profile behind it.
+
+    `teardown-trip.py` renames the trip's slug to `retired-<orig-slug>-<yyyymmdd>`
+    as the durable signal (issue #105) — `lifecycle_state` is not necessarily
+    updated, so the slug prefix is what this checks. Production evidence,
+    2026-09-18: a fourth binding was created against a trip eight minutes
+    after its other three were closed with `closed_reason = 'trip_destroyed'`,
+    silently re-routing a group's messages to a companion that no longer
+    existed.
+    """
+
+    def __init__(self, chat_id: str, trip_id: str, slug: str) -> None:
+        super().__init__("target trip has been torn down")
+        self.chat_id = chat_id
+        self.trip_id = trip_id
+        self.slug = slug
+
+
 def attach_profile_to_orphan_bindings(
     conn: psycopg.Connection, trip_id: str, hermes_profile: str
 ) -> int:
@@ -537,8 +569,19 @@ def bind_chat_to_trip(
     Returns the outcome as a short string for logging: "created", "unchanged",
     "profile_rebound" or "retargeted".
 
-    Three cases, and the distinction between the last two is the whole point:
+    Three cases, and the distinction between the last two is the whole point —
+    plus a fourth that is checked before any of them, because it does not
+    depend on whether a binding already exists at all:
 
+      target trip retired -> refuse and log, always. See TripRetired. A trip
+                              whose slug has been renamed `retired-<slug>-
+                              <yyyymmdd>` by `teardown-trip.py` (issue #105)
+                              has no deploy directory, container or Hermes
+                              profile left behind it — binding a chat to it,
+                              new or retargeted, only routes real messages to
+                              nothing and costs every relay restart the full
+                              gateway-wait timeout for a companion that can
+                              never reconnect.
       no open binding      -> open one.
       same trip            -> not a reassignment. Identical profile is a
                               no-op (a re-provision of an unchanged trip);
@@ -570,9 +613,35 @@ def bind_chat_to_trip(
     provisions racing for the same chat serialise here instead of both
     believing they won. The partial unique index from migration 0029 is the
     backstop if they somehow don't.
+
+    The retired-trip slug SELECT above has no equivalent lock: FOR UPDATE
+    protects two `bind_chat_to_trip` calls racing each other, not this call
+    racing a concurrent `teardown-trip.py` run — nothing here takes a lock on
+    the TRIPS row, only on the binding row, so a teardown that renames the
+    slug between this SELECT and the INSERT below would not be seen. Accepted
+    as a narrow residual risk rather than closed: the production case this
+    fix answers (issue #105) was an eight-minute gap between teardown and the
+    stray binding, not a race decided by microseconds, and actually closing
+    it would mean locking the trips row itself and `teardown-trip.py`
+    cooperating with that lock — a bigger transactional change than this fix
+    is meant to be.
     """
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT slug FROM control_plane.trips WHERE id = %s",
+                (trip_id,),
+            )
+            trip_row = cur.fetchone()
+            if trip_row is not None and trip_row["slug"].startswith("retired-"):
+                logger.error("provisioner.binding_refused_trip_retired", extra={
+                    "chat_id": chat_id,
+                    "trip_id": trip_id,
+                    "slug": trip_row["slug"],
+                    "consequence": "no binding opened; the trip was torn down",
+                })
+                raise TripRetired(chat_id, trip_id, trip_row["slug"])
+
             cur.execute(
                 """
                 SELECT id, trip_id, hermes_profile
@@ -1867,6 +1936,24 @@ class ProvisionerWorker:
                 _record_reachability(
                     conn, trip_id, reachable=False, reason="BINDING_REFUSED",
                     consequence="the chat is bound to another trip; reassignment needs an organizer action",
+                )
+            except TripRetired as retired:
+                # Not a bug and not retryable — and NOT the same as
+                # BINDING_FAILED, which implies a technical, retriable fault.
+                # This trip has been torn down; `bind_chat_to_trip` already
+                # logged the refusal itself (issue #105), this only records
+                # the distinct reason so an operator or trip-fleet-monitor
+                # reading `unreachable_reason` does not treat a permanently
+                # gone trip as a glitch worth re-provisioning.
+                logger.error("provisioner.companion_binding_trip_retired", extra={
+                    "trip_id": trip_id,
+                    "slug": retired.slug,
+                    "hermes_profile": hermes_profile,
+                    "consequence": "trip was torn down; no binding was opened and none should be retried",
+                })
+                _record_reachability(
+                    conn, trip_id, reachable=False, reason="TRIP_RETIRED",
+                    consequence="the trip has been torn down; retrying will not help",
                 )
             except Exception:
                 logger.error("provisioner.companion_binding_failed", extra={

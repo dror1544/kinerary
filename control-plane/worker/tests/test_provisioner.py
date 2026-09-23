@@ -21,6 +21,7 @@ from control_plane_worker.provisioner import (
     BindingRefused,
     DeployAdapter,
     ProvisionerWorker,
+    TripRetired,
     bind_chat_to_trip,
     _record_trip_companion,
     attach_profile_to_orphan_bindings,
@@ -1669,6 +1670,46 @@ class ChatBindingLifecycleTests(unittest.TestCase):
         self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
         self.assertEqual(self._open_row()["hermes_profile"], "companion-a")
 
+    def test_binding_a_new_chat_to_a_retired_trip_is_refused_and_logged(self) -> None:
+        # Issue #105, production 2026-09-18: a chat with NO open binding at
+        # all got one against a trip `teardown-trip.py` had already renamed
+        # `retired-<slug>-<yyyymmdd>` eight minutes earlier. This is the
+        # fourth case in the docstring, checked before the other three
+        # because it does not depend on whether a binding already exists.
+        retired_slug = f"retired-italy-2026-{rnd(4)}"
+        retired = setup_fixture(self.conn, slug=retired_slug)
+        with self.assertLogs("control_plane_worker.provisioner", level="ERROR") as logs:
+            with self.assertRaises(TripRetired) as caught:
+                bind_chat_to_trip(self.conn, self.chat_id, retired["trip_id"], "companion-x")
+        self.assertEqual(caught.exception.chat_id, self.chat_id)
+        self.assertEqual(caught.exception.trip_id, retired["trip_id"])
+        self.assertEqual(caught.exception.slug, retired_slug)
+        # Logged, not silent — the issue's own suggested fix says this.
+        self.assertTrue(any("binding_refused_trip_retired" in line for line in logs.output))
+
+        # Nothing was written at all.
+        self.assertEqual(len(self._rows()), 0)
+        teardown_fixture(self.conn, retired)
+
+    def test_retargeting_to_a_retired_trip_is_refused_even_with_allow_retarget(self) -> None:
+        # A retired trip is never a valid target, even for the one flag that
+        # exists specifically to let a chat move to a genuinely newer trip.
+        # The organizer's own chat must not be handed to a trip that no
+        # longer has a deploy directory, a container or a companion.
+        retired = setup_fixture(self.conn, slug=f"retired-france-2026-{rnd(4)}")
+        self._age_trip(self.fix_a["trip_id"], 3)
+        bind_chat_to_trip(self.conn, self.chat_id, self.fix_a["trip_id"], "companion-a")
+
+        with self.assertRaises(TripRetired):
+            bind_chat_to_trip(
+                self.conn, self.chat_id, retired["trip_id"], "companion-x",
+                allow_retarget=True,
+            )
+        # The existing binding is untouched.
+        self.assertEqual(len(self._rows()), 1)
+        self.assertEqual(self._open_row()["trip_id"], self.fix_a["trip_id"])
+        teardown_fixture(self.conn, retired)
+
     def _age_trip(self, trip_id: str, hours: int) -> None:
         """Put a trip's creation that many hours in the past, so "newer" is a
         fact the test states rather than one it hopes two inserts produced."""
@@ -2146,6 +2187,29 @@ class ReachabilityTests(unittest.TestCase):
                 self._reachability(fix["trip_id"]),
                 ("unreachable", "NO_ORGANIZER_CHAT"),
             )
+        finally:
+            self._cleanup(fix)
+
+    def test_a_retired_trip_is_named_distinctly_from_a_binding_failure(self) -> None:
+        # Issue #105, code review follow-up: TripRetired must not fall into
+        # the generic BINDING_FAILED bucket. BINDING_FAILED implies a
+        # technical, retriable fault; a torn-down trip is never retriable —
+        # trip-fleet-monitor's triage reads `unreachable_reason` and would
+        # treat a permanently gone trip as a glitch worth re-provisioning.
+        fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE, slug=f"retired-japan-2026-{rnd(4)}")
+        self._with_chat(fix)
+        try:
+            with self.assertLogs("control_plane_worker.provisioner", level="ERROR") as logs:
+                ProvisionerWorker(
+                    db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-reach-retired",
+                    companion=FakeCompanionProfileAdapter(),
+                ).run_once()
+            self.assertEqual(
+                self._reachability(fix["trip_id"]),
+                ("unreachable", "TRIP_RETIRED"),
+            )
+            self.assertTrue(any("binding_refused_trip_retired" in line for line in logs.output))
+            self.assertTrue(any("companion_binding_trip_retired" in line for line in logs.output))
         finally:
             self._cleanup(fix)
 

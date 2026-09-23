@@ -99,7 +99,8 @@ test("expected companions are the open bindings of trips not known to be unreach
       ('trip_live0001', 'japan', 'ready_private', 'reachable', NULL),
       ('trip_unkn0001', 'usa', 'ready_private', 'unknown', NULL),
       ('trip_down0001', 'broken', 'ready_private', 'unreachable', 'COMPANION_INSTALL_FAILED'),
-      ('trip_gone0001', 'retired-italy-20260911', 'ready_private', 'reachable', NULL)`);
+      ('trip_gone0001', 'retired-italy-20260911', 'ready_private', 'reachable', NULL),
+      ('trip_gone0002', 'retired-france-20260920', 'ready_private', 'unknown', NULL)`);
     const columns = await client.query(
       "SELECT column_name FROM information_schema.columns WHERE table_schema = 'control_plane' AND table_name = 'telegram_chat_bindings'",
     );
@@ -118,6 +119,12 @@ test("expected companions are the open bindings of trips not known to be unreach
     await insert("tcb_nocomp01", "-1005", "trip_unkn0001", null, false);
     await insert("tcb_down0001", "-1003", "trip_down0001", "broken2026", false);
     await insert("tcb_gone0001", "-1004", "trip_gone0001", "italy2026", true);
+    // The issue #105 shape exactly: a fourth binding created AFTER teardown,
+    // still open, naming a companion profile that no longer exists, on a
+    // trip whose `reachability` was never updated to `unreachable`. Without
+    // the slug exclusion this profile would enter the expected set and cost
+    // every other trip the full gateway-wait timeout.
+    await insert("tcb_gone0002", "-1006", "trip_gone0002", "france2026", false);
     assert.deepEqual(await expectedGatewayProfiles(client), ["japan2026", "usa2026"]);
   } finally {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

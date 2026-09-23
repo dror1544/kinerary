@@ -28,6 +28,7 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import { digestTelegramId, isPrivateChatId } from "./identity.js";
+import { NOT_RETIRED_SQL } from "./trip-retirement.js";
 
 /** Closed-binding reason for a switch the organizer asked for themselves. */
 export const SWITCH_CLOSED_REASON = "organizer_switch";
@@ -83,7 +84,7 @@ export async function hasEarlierBuiltTrip(
            ON m.trip_id = t.id AND m.role = 'owner' AND m.status = 'active'
         WHERE t.id <> $1
           AND t.lifecycle_state IN ('ready_private', 'ready_public')
-          AND t.slug NOT LIKE 'retired-%'
+          AND ${NOT_RETIRED_SQL}
           AND (
             m.user_id IN (
               SELECT own.user_id FROM control_plane.trip_memberships own
@@ -200,7 +201,7 @@ export async function listOrganizerTrips(
       WHERE m.user_id IN (
               SELECT user_id FROM control_plane.telegram_organizer_links
                WHERE telegram_subject_digest = $1)
-        AND t.slug NOT LIKE 'retired-%'
+        AND ${NOT_RETIRED_SQL}
         AND NOT EXISTS (
               SELECT 1 FROM control_plane.telegram_chat_bindings d
                WHERE d.trip_id = t.id AND d.closed_reason = 'trip_destroyed')
