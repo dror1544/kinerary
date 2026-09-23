@@ -11,8 +11,10 @@ from control_plane_worker import transformer
 from control_plane_worker.transformer import (
     _names_sound_alike,
     _resolve_organizers,
+    _stable_id,
     derive_days_from_anchors,
     derive_bookings,
+    derive_rsvp_activities,
     derive_trip_slug,
     transform_intake,
 )
@@ -1905,6 +1907,335 @@ class DeriveDaysFromAnchorsTests(unittest.TestCase):
         cfg = transform_intake(intake)
         items = cfg["phases"][0]["days"][0]["items"]
         self.assertEqual([i["text"]["en"] for i in items], ["From the document"])
+
+
+class DeriveRsvpActivitiesTests(unittest.TestCase):
+    """`phases[].rsvp_activities[]` had no producer at all.
+
+    The site has rendered RSVP cards since the hand-authored era (site/app.js
+    `renderRsvpCard`, trip-web `GroupActivities`), `server/server.js` has stored
+    the votes in `rsvps`, and the config schema has carried the field — and
+    `transform_intake` never emitted it, so the whole vote surface was invisible
+    on every provisioned trip. The live-trip report said it plainly: "RSVP /
+    trivia features: unused".
+
+    The source is the unconfirmed attraction-typed anchors: a confirmed one is
+    already happening, an unconfirmed one is exactly the open question.
+    """
+
+    PHASED_INTAKE = {
+        **JAPAN_INTAKE,
+        "phases": _structured([
+            {"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"},
+            {"name": "Kyoto", "start": "2026-09-24", "end": "2026-09-27"},
+        ]),
+    }
+
+    PHASES = [
+        {"id": "tokyo", "dates": {"start": "2026-09-19", "end": "2026-09-23"}},
+        {"id": "kyoto", "dates": {"start": "2026-09-24", "end": "2026-09-27"}},
+    ]
+
+    def _rsvps(self, anchors):
+        return derive_rsvp_activities(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )
+
+    def _intake(self, anchors):
+        return {**self.PHASED_INTAKE, "travel_anchors": _structured(anchors)}
+
+    def test_an_unconfirmed_attraction_becomes_a_votable_activity_on_its_phase(self) -> None:
+        out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        self.assertEqual(sorted(out), ["kyoto"])
+        activity = out["kyoto"][0]
+        self.assertEqual(activity["title"], {"he": "Sky Lagoon", "en": "Sky Lagoon"})
+        self.assertEqual(activity["date"], "2026-09-25")
+        self.assertTrue(activity["id"])
+
+    def test_a_confirmed_attraction_is_a_booking_not_a_vote(self) -> None:
+        # Tickets are bought and seats are held: "does everyone want this?" is a
+        # question whose answer changes nothing. It stays on the Bookings tab.
+        self.assertEqual(
+            self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                          "confirmation": "SL-58213"}]),
+            {},
+        )
+
+    def test_a_placeholder_confirmation_is_not_a_confirmation(self) -> None:
+        # Same rule _has_confirmation already applies to the hero stat: a site
+        # that renders "–" for a missing confirmation must not read that anchor
+        # as booked.
+        for placeholder in ("", "  ", "-", "–", "TBD", "n/a", "none"):
+            with self.subTest(confirmation=placeholder):
+                out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon",
+                                    "date": "2026-09-25", "confirmation": placeholder}])
+                self.assertEqual(len(out.get("kyoto", [])), 1, "a placeholder is not a booking")
+
+    def test_only_things_you_do_are_votable(self) -> None:
+        # Read through _ANCHOR_TYPE_MAP, never against a second word list, so
+        # every member it gains arrives here too. A flight, a hotel, a car and a
+        # whole-trip quote are not things the family votes on.
+        votable = ["attraction", "activity", "tour", "reservation", "ticket",
+                   "excursion", "event", "shuttle", "parking"]
+        for kind in votable:
+            with self.subTest(kind=kind):
+                out = self._rsvps([{"type": kind, "name": f"A {kind}", "date": "2026-09-20"}])
+                self.assertEqual([a["title"]["en"] for a in out.get("tokyo", [])], [f"A {kind}"])
+        for kind in ("flight", "hotel", "accommodation", "car", "rental", "proposal", "booking", "mystery"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._rsvps([{"type": kind, "name": f"A {kind}", "date": "2026-09-20"}]), {})
+
+    def test_the_id_is_stable_across_re_provisions(self) -> None:
+        # `rsvps` is keyed by this string alone and knows nothing about
+        # trip.config.json, so an id that changes on re-provision does not fail
+        # loudly — it orphans every vote already cast and the card comes back
+        # empty with nobody told.
+        anchors = [
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"},
+            {"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"},
+        ]
+        first, second = self._rsvps(anchors), self._rsvps(anchors)
+        self.assertEqual(first, second)
+        ids = [a["id"] for phase in first.values() for a in phase]
+        self.assertEqual(len(ids), len(set(ids)), "one activity, one vote record")
+
+    def test_two_anchors_of_the_same_type_do_not_share_one_vote_record(self) -> None:
+        # The bug derive_bookings' seed_key already had and fixed: hashing the
+        # bare type gave every "activity" the same key.
+        out = self._rsvps([
+            {"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25"},
+            {"type": "activity", "name": "Fushimi Inari", "date": "2026-09-25"},
+        ])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_two_anchors_sharing_a_notes_line_are_still_two_activities(self) -> None:
+        # A structured anchor states name, date AND detail at once, and the
+        # document pass writes all three. Keying on `detail` alone collided
+        # these two onto one id, and the dedupe then dropped the second card
+        # without a word — one family vote surface quietly short a question.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25",
+             "detail": "Included in the city pass"},
+            {"type": "attraction", "name": "Ginkaku-ji", "date": "2026-09-26",
+             "detail": "Included in the city pass"},
+        ])
+        self.assertEqual([a["title"]["en"] for a in out["kyoto"]], ["Kinkaku-ji", "Ginkaku-ji"])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_same_activity_on_two_dates_is_two_questions(self) -> None:
+        out = self._rsvps([
+            {"type": "attraction", "name": "Onsen", "date": "2026-09-25"},
+            {"type": "attraction", "name": "Onsen", "date": "2026-09-26"},
+        ])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_date_counts_in_whichever_field_the_anchor_states_it(self) -> None:
+        # _read_anchor accepts `date`, `date_from` and `start`. Keying on the
+        # raw `date` field alone read the other two as blank, which collided
+        # one activity's two dates onto a single vote record.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Onsen", "date_from": "2026-09-25"},
+            {"type": "attraction", "name": "Onsen", "start": "2026-09-26"},
+        ])
+        self.assertEqual([a["date"] for a in out["kyoto"]], ["2026-09-25", "2026-09-26"])
+        self.assertEqual(len({a["id"] for a in out["kyoto"]}), 2)
+
+    def test_the_same_date_written_two_ways_is_the_same_question(self) -> None:
+        # The id is keyed on the parsed date, so a document re-read that spells
+        # the date differently does not move a vote already cast.
+        iso = self._rsvps([{"type": "attraction", "name": "Onsen", "date": "2026-09-25"}])
+        spelled = self._rsvps([{"type": "attraction", "name": "Onsen", "date": "25 Sep 2026"}])
+        self.assertEqual(iso["kyoto"][0]["id"], spelled["kyoto"][0]["id"])
+
+    def test_a_synonym_of_the_same_type_does_not_move_the_vote(self) -> None:
+        # Both words map to "attraction", so both describe the same activity;
+        # the extraction pass picks between them run to run, and a vote already
+        # cast must not move because it did.
+        first = self._rsvps([{"type": "activity", "name": "Kinkaku-ji", "date": "2026-09-25"}])
+        again = self._rsvps([{"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25"}])
+        self.assertEqual(first["kyoto"][0]["id"], again["kyoto"][0]["id"])
+
+    def test_tidying_a_placeholder_confirmation_does_not_orphan_the_votes(self) -> None:
+        # Every anchor here is unconfirmed by construction, so `confirmation`
+        # can only hold "" or a placeholder — no discrimination to add, and
+        # including it would move every vote to a new id the day an organizer
+        # typed "TBD" into an empty field.
+        blank = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        tidied = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                               "confirmation": "TBD"}])
+        self.assertEqual(blank["kyoto"][0]["id"], tidied["kyoto"][0]["id"])
+
+    def test_nothing_votable_produces_no_key_rather_than_an_empty_card(self) -> None:
+        self.assertEqual(self._rsvps([]), {})
+        self.assertEqual(self._rsvps([{"type": "flight", "name": "LY075", "date": "2026-09-19"}]), {})
+        config = transform_intake(self._intake([
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25", "confirmation": "SL-1"},
+        ]))
+        for phase in config["phases"]:
+            self.assertNotIn("rsvp_activities", phase)
+
+    def test_an_undated_anchor_parks_where_its_booking_row_already_parks(self) -> None:
+        # derive_bookings puts it on the first phase (bookings.phase is NOT
+        # NULL), so the family already sees it there. Dropping it here instead
+        # would hide exactly the most vote-worthy case — an attraction nobody
+        # has booked OR scheduled — from the surface built to ask about it.
+        out = self._rsvps([{"type": "activity", "detail": "Museum pass, sometime"}])
+        self.assertEqual(sorted(out), ["tokyo"])
+        self.assertNotIn("date", out["tokyo"][0], "no date is absent, never a guessed one")
+
+    def test_a_date_outside_every_phase_still_reaches_the_family(self) -> None:
+        out = self._rsvps([{"type": "activity", "detail": "Something — 30 Sep 2026"}])
+        self.assertEqual(out["tokyo"][0]["date"], "2026-09-30")
+
+    def test_the_entry_carries_only_what_the_config_schema_names(self) -> None:
+        # trip-web/src/parity-schema.ts phaseParityFields.rsvp_activities:
+        # {id, item_uid?, title, name?, desc?, price?, date?}. item_uid stays
+        # unset — there is no itinerary item to link an anchor to, and the
+        # schema's own "legacy" case omits it.
+        out = self._rsvps([
+            {"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+             "detail": "Geothermal lagoon, evening slot"},
+        ])
+        activity = out["kyoto"][0]
+        self.assertLessEqual(set(activity), {"id", "title", "desc", "date"})
+        self.assertIsInstance(activity["id"], str)
+        self.assertEqual(set(activity["title"]), {"he", "en"})
+        self.assertEqual(activity["desc"], {"he": "Geothermal lagoon, evening slot",
+                                            "en": "Geothermal lagoon, evening slot"})
+
+    def test_the_description_never_just_repeats_the_title(self) -> None:
+        # A free-text anchor has no separate name: the title IS the detail, so a
+        # desc would print the same sentence twice under it.
+        out = self._rsvps([{"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"}])
+        self.assertNotIn("desc", out["tokyo"][0])
+
+    def test_a_detail_that_only_echoes_the_name_is_not_a_description(self) -> None:
+        # A document pass that copies the venue name into a notes field is the
+        # ordinary case, not a freak one — printing the heading again directly
+        # under the heading is not "extra context".
+        for detail in ("Sky Lagoon", "  sky   lagoon  ", "Sky Lagoon — 25 Sep 2026",
+                       "Sky Lagoon at 15:00"):
+            with self.subTest(detail=detail):
+                out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon",
+                                    "date": "2026-09-25", "detail": detail}])
+                self.assertNotIn("desc", out["kyoto"][0])
+
+    def test_a_detail_that_adds_something_is_kept(self) -> None:
+        out = self._rsvps([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25",
+                            "detail": "Sky Lagoon — bring a towel"}])
+        self.assertEqual(out["kyoto"][0]["desc"]["en"], "Sky Lagoon — bring a towel")
+
+    def test_the_title_matches_the_day_item_the_same_anchor_produces(self) -> None:
+        # activity-rsvp.ts falls back to matching an activity to an itinerary
+        # item by phase, date and EXACT title when there is no item_uid. Both
+        # surfaces read the anchor through _read_anchor, so the Journey card for
+        # this anchor opens its RSVP rather than showing an unlinked duplicate.
+        anchors = [{"type": "activity", "detail": "TeamLab Planets — 20 Sep 2026 at 18:00"}]
+        rsvp = self._rsvps(anchors)["tokyo"][0]
+        day_item = derive_days_from_anchors(
+            {"phases": self.PHASES},
+            {"travel_anchors": {"kind": "structured", "schema_version": 3, "data": anchors}},
+        )["tokyo"][0]["items"][0]
+        self.assertEqual(rsvp["title"], day_item["text"])
+        self.assertEqual(rsvp["date"], "2026-09-20")
+
+    def test_markup_never_reaches_the_card(self) -> None:
+        # site/app.js renderRsvpCard interpolates the title into an innerHTML
+        # string, and these anchors come from a model reading an uploaded
+        # document. Same backstop _plain already gives phases[].days[].
+        out = self._rsvps([{"type": "attraction", "name": "<img src=x onerror=alert(1)>Tour",
+                            "date": "2026-09-20"}])
+        self.assertEqual(out["tokyo"][0]["title"]["en"], "img src=x onerror=alert(1)Tour")
+
+    def test_an_anchor_with_no_readable_label_is_skipped(self) -> None:
+        self.assertEqual(self._rsvps([{"type": "attraction", "date": "2026-09-20"}]), {})
+        self.assertEqual(self._rsvps(["not a dict", None, 7]), {})
+
+    def test_one_anchor_is_both_a_pending_booking_and_an_open_question(self) -> None:
+        # Deliberately not exclusive, and not duplication to be removed:
+        # Bookings is the organizer's tracking view ("what is still pending"),
+        # RSVP is the family's interactive one ("does everyone want it").
+        intake = self._intake([{"type": "attraction", "name": "Sky Lagoon", "date": "2026-09-25"}])
+        config = transform_intake(intake)
+        booking = next(b for b in derive_bookings(config, intake) if b["name"] == "Sky Lagoon")
+        self.assertIsNone(booking["confirmation"])
+        kyoto = next(p for p in config["phases"] if p["id"] == "kyoto")
+        self.assertEqual([a["title"]["en"] for a in kyoto["rsvp_activities"]], ["Sky Lagoon"])
+        # Different namespaces: a bookings seed_key is not an rsvps activity id.
+        self.assertNotEqual(booking["seed_key"], kyoto["rsvp_activities"][0]["id"])
+
+    def test_the_transformed_config_carries_the_activities_on_the_right_phases(self) -> None:
+        config = transform_intake(self._intake([
+            {"type": "activity", "detail": "Tokyo Skytree — 20 Sep 2026 at 10:00"},
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25"},
+            {"type": "attraction", "name": "Fushimi Inari", "date": "2026-09-26", "confirmation": "FI-9"},
+        ]))
+        by_phase = {p["id"]: [a["title"]["en"] for a in p.get("rsvp_activities", [])] for p in config["phases"]}
+        self.assertEqual(by_phase["tokyo"], ["Tokyo Skytree"])
+        self.assertEqual(by_phase["kyoto"], ["Kinkaku-ji"])
+
+    def test_activities_are_listed_in_date_order_with_the_undated_last(self) -> None:
+        out = self._rsvps([
+            {"type": "attraction", "name": "Whenever"},
+            {"type": "attraction", "name": "Later", "date": "2026-09-22"},
+            {"type": "attraction", "name": "Earlier", "date": "2026-09-20"},
+        ])
+        self.assertEqual([a["title"]["en"] for a in out["tokyo"]], ["Earlier", "Later", "Whenever"])
+
+    def test_a_trip_with_no_phases_yields_nothing_rather_than_raising(self) -> None:
+        self.assertEqual(
+            derive_rsvp_activities(
+                {"phases": []},
+                {"travel_anchors": {"kind": "structured", "schema_version": 3,
+                                    "data": [{"type": "attraction", "name": "Sky Lagoon"}]}},
+            ),
+            {},
+        )
+
+
+class StableIdTests(unittest.TestCase):
+    """`_stable_id` is shared by both anchor derivations because both key
+    something that lives OUTSIDE trip.config.json by what it returns — the
+    site's `INSERT OR IGNORE ... seed_key` for a booking row, the `rsvps` table
+    for a vote. Changing the scheme is a data migration wearing a one-line diff:
+    every booking row re-inserted as a duplicate, every vote orphaned. So these
+    pin the exact strings, not only their shape.
+    """
+
+    def _bookings(self, anchors):
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Tokyo", "start": "2026-09-19", "end": "2026-09-23"}]),
+            "travel_anchors": _structured(anchors),
+        }
+        return derive_bookings(transform_intake(intake), intake)
+
+    def test_a_free_text_anchors_booking_key_is_the_one_it_has_always_had(self) -> None:
+        # Read off the tree before `_stable_id` was extracted out of
+        # derive_bookings. Live trips already hold these keys.
+        rows = self._bookings([
+            {"type": "activity", "detail": "Tokyo Skytree e-ticket - 20 Sep 2026 at 10:00"},
+        ])
+        self.assertEqual([b["seed_key"] for b in rows], ["anchor_433c6642c7"])
+
+    def test_a_structured_anchors_booking_key_is_the_one_it_has_always_had(self) -> None:
+        rows = self._bookings([
+            {"type": "attraction", "name": "Kinkaku-ji", "date": "2026-09-25", "confirmation": "KJ-1"},
+        ])
+        self.assertEqual([b["seed_key"] for b in rows], ["anchor_a2f04cd0cc"])
+
+    def test_the_helper_joins_its_parts_rather_than_concatenating_them(self) -> None:
+        # "ab" + "" and "a" + "b" are different anchors and must not collide.
+        self.assertNotEqual(_stable_id("x", "ab", ""), _stable_id("x", "a", "b"))
+
+    def test_a_missing_part_reads_as_empty_rather_than_as_the_word_none(self) -> None:
+        self.assertEqual(_stable_id("x", "a", None, "b"), _stable_id("x", "a", "", "b"))
+
+    def test_the_prefix_is_the_namespace_and_the_hash_is_short(self) -> None:
+        self.assertNotEqual(_stable_id("anchor", "a"), _stable_id("rsvp", "a"))
+        self.assertEqual(_stable_id("rsvp", "a"), "rsvp_" + _stable_id("anchor", "a").split("_", 1)[1])
+        self.assertTrue(re.fullmatch(r"rsvp_[0-9a-f]{10}", _stable_id("rsvp", "a")))
 
 
 _NAME_CASES = json.loads(
