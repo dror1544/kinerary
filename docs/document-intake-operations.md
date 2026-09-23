@@ -228,6 +228,16 @@ images — it can. Transparency defeats every model except claude, so flattening
 transparent PNGs in the reader is a follow-up; until then such files may read as
 illegible.
 
+**A caveat that applies to both harnesses below.** `control-plane/api/tsconfig.json`'s
+`include` is `src/**/*.ts`, so `npm run build` (`tsc -p tsconfig.json`) typechecks
+neither `tools/` nor `test/`. A clean build is not evidence `tools/extract-eval.ts`
+or `tools/document-acceptance.ts` still compile — a stale import `extract-eval.ts`
+kept from `document-intake.ts` after the gate split into `document-gate.ts`
+(2026-09-22) survived exactly this way, caught only when the file was actually
+run, not by the build. Run these under `tsc --noEmit` against the whole tree, or
+execute them, before trusting that a change to `document-intake.ts` or
+`document-gate.ts` hasn't broken either silently.
+
 ## Extraction benchmark (`tools/extract-eval.ts`, 3 repetitions, golden `japan` + `multi`)
 
 Metrics per provider:

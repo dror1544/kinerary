@@ -611,6 +611,20 @@ nobody has.
 So **upgrading software on a live site changes nothing about this** — deploys
 send code, and the mount comes from the topology.
 
+**Uploaded documents live one level inside the same NFS directory, in a
+`documents` subdirectory — not the trip id or slug directly.** The worker's
+`ShellDeployAdapter._trip_nfs_documents_dir` (`control-plane/worker/control_plane_worker/provisioner.py`)
+reads the directory name `topology.yaml` actually recorded for this trip —
+trip-id-shaped for a trip provisioned after PR #89, slug-shaped for one
+provisioned before it — via `_trip_nfs_dirname`, then joins `documents` onto
+it: `<nfs_host_dir>/documents`. It never derives the name from `trip_id`
+itself, for the same reason the directory above does not: `trip_id` is known
+on every deploy, but the directory is only trip-id-shaped for a topology built
+after that change. If the worker cannot see that directory on its own
+filesystem, it logs a warning and falls back to publishing documents into the
+deploy directory instead (`documents_dir` under `TRIP_DIR`) — slower, and not
+hardlinked, but not silently missing.
+
 ### Renaming an existing trip's directory (optional, deliberate)
 
 Only worth doing to retire the old naming; nothing requires it. The trip must

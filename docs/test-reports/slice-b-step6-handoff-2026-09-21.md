@@ -223,6 +223,22 @@ stages probe files into the worktree index, #135) and do **not** run
 
 ## 5. After step 6
 
+*Correction (2026-09-23), left here rather than rewriting the step above: step
+7 named `document-sweeper.ts` and wiring `startDocumentSweeper`, but never
+named that file's own test (`document-sweeper-db.test.ts`) or either `tools/`
+file (`tools/document-acceptance.ts`, `tools/extract-eval.ts`). The forward-port
+session that worked from this list did exactly what it said and dropped all
+three — `extract-eval.ts` among them, the harness CLAUDE.md's "The interview
+has no agent" section cites for the `EXTRACT_INTAKE_*`/`EXTRACT_ITINERARY_*`
+benchmark numbers. Restored in `b4754ed`
+(`docs/test-reports/sprint-6-integration-handoff-2026-09-22.md`), which also
+names the method that catches this class of gap: diff every file the source PR
+touched against the target branch, rather than trusting a step list to be
+complete. The step list below is left as the historical record of what this
+session actually specified — not fixed in place — because rewriting it would
+erase the evidence of the blind spot itself; a next forward-port working from
+this document should read this note before treating step 7 as complete.*
+
 7. `document-sweeper.ts`, and wire `startDocumentSweeper` in `relay/server.ts`
    (deliberately **not** wired in step 5 — a dated comment there says why).
 8. Python side, in order: `document_handoff.py` → `transformer.py`'s
