@@ -315,3 +315,33 @@ class DocumentTablesAlignment(unittest.TestCase):
             "actually reference — a table added on one side and not the other "
             "would otherwise back up nothing for it, silently.",
         )
+
+
+class BuildProvisioner(unittest.TestCase):
+    """Teardown inspects and deletes; it never calls create_container, so it
+    never allocates. The pool it passes is therefore dead input — and a dead
+    default that names a real address is the kind that is believed later, on a
+    host whose Proxmox is shared with another stack."""
+
+    def patched_adapter(self):
+        import sys
+        sys.path[:0] = [str(teardown.REPO / "control-plane/worker"), str(teardown.REPO)]
+        import control_plane_worker.compute as compute
+        return mock.patch.object(compute, "LxcProvisionAdapter")
+
+    def build(self, env):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(teardown, "DEPLOY_ROOT", Path(d)), \
+                mock.patch.dict(teardown.os.environ, env), \
+                self.patched_adapter() as adapter:
+            teardown.os.environ.pop("PROVISIONER_LXC_IP_POOL", None)
+            teardown.os.environ.update(env)
+            teardown.build_provisioner()
+        return adapter.call_args.kwargs
+
+    def test_a_pool_in_the_environment_is_not_adopted(self):
+        # the Mac's own pool spans .60-.99 and overlaps the VM's reserved .95-.99
+        self.assertEqual(self.build({"PROVISIONER_LXC_IP_POOL": '["192.168.0.95"]'})["ip_pool"], [])
+
+    def test_it_needs_no_pool_variable_at_all(self):
+        self.assertEqual(self.build({})["ip_pool"], [])
