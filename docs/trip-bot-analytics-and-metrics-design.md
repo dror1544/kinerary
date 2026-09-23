@@ -413,6 +413,23 @@ Tags must be from a bounded vocabulary. Never use free-form text as a metric lab
 | `timeout` | bounded execution timeout |
 | `escalated_to_organizer` | bot identified an item for private organizer follow-up |
 
+**Precedence when both apply, confirmed against real evidence (2026-09-23
+hand evaluation, `docs/test-reports/nir-trip-assistant-experience-2026-09-23.md`):**
+a request can be conversationally successful (a clear, well-formed reply was
+sent) while the substantive tool call behind it failed — the live case was a
+document upload where `read_file` errored twice with the identical parse
+failure, and each time the assistant sent a good "please resend" message.
+If `outcome` is set from "was a reply sent" rather than "did the required
+tool succeed," this records as `answered` and the resolution-rate metric
+(§7.2 item 5) reads as healthy while the organizer's actual need — getting
+his itinerary into the system — went unmet twice. **`outcome` must reflect
+the substantive task, not the conversational wrapper: `failed_tool` takes
+precedence over `answered` whenever a request's required tool call failed,
+even if the bot's own message was graceful.** This is the same distinction
+`docs/sprint6-tracks.md` names for #114 ("measuring 'did the call succeed' is
+not measuring 'did we understand'") — this is confirmation that it also
+applies here, in a different corner of the same product.
+
 ### 6.4 Time dimensions
 
 Every event must retain UTC time and derive, using the active trip phase timezone:
@@ -462,6 +479,23 @@ Do not derive trip location from raw text when the configured active phase alrea
 8. **Repeat-question rate:** same normalized fingerprint/category within a bounded time window. This indicates missing information or weak answers.
 9. **Follow-up-within-N-minutes rate:** a non-command inbound message in the same session shortly after an answer. Treat as a friction proxy, not proof of dissatisfaction.
 10. **Unclassified rate** and classifier-confidence distribution.
+11. **Same-fingerprint, different-outcome-by-channel rate — added 2026-09-23,
+    confirmed real rather than theoretical.** `content_fingerprint` (§5.1)
+    already correlates repeated inputs; this cross-tabulates it against
+    `channel_type` and `outcome`. On the one live trip, the identical link
+    was rejected in a private DM and accepted, two days later, in the group —
+    a traveler-visible "it's broken, now it isn't" with no product change in
+    between. Nothing upstream of this metric needed to change to compute it;
+    it was missing only as a named check, not as data.
+12. **Memory/enrichment write rate — gap, not yet a metric.** Neither this
+    list nor §7.4 has a rate for "how often does the assistant actually write
+    a durable fact relative to conversation volume." The live trip's own
+    `MEMORY.md` held exactly one fact after six days and dozens of exchanges
+    containing several learnable preferences (a schedule correction, a
+    repeated cuisine preference). `preference_detected`/`preference_confirmed`
+    (the skill reference's draft event list) would feed this once
+    instrumented; add the rate itself here so a future trip's memory file
+    can be judged against a number, not a hand re-read.
 
 ### 7.3 Operational reliability metrics
 
