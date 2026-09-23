@@ -65,7 +65,12 @@ person's recollection.
 4. **Resolve on a throwaway branch in your own worktree**, never on the
    integration branch. Reconcile: the same intent arriving twice is
    reconciled, not taken from one side. A conflict you cannot resolve with
-   confidence is a decision for the person, stated as such.
+   confidence is a decision for the person, stated as such. **A resolution
+   staged on a throwaway branch is not a merge.** Before anything meant to be
+   a merge commit, check `git rev-parse --verify MERGE_HEAD` — a staged
+   resolution with no `MERGE_HEAD` commits as a single-parent commit, losing
+   the ancestry that makes GitHub (and this codebase) recognize the PR as
+   merged.
 5. **Verify the merged tree.** Spawn `verifier` on it and paste its report. A
    migration the PR adds makes `migrations.test.ts` fail until its list is
    updated — check the PR updated it, and do not wave the failure through as

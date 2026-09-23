@@ -71,6 +71,12 @@ developers end up in the same file.
 
 ## Things that bite here
 
+- **A fresh worktree with no `node_modules` under-reports rather than
+  failing.** A package that has never had `npm ci` in this worktree makes its
+  tests show as cancelled subtests, not a red run — the same "quiet" shape as
+  a genuine flake or a hung test, wearing a different cause. Provision every
+  package your suites touch before trusting a result; a clean run that never
+  ran is not a pass.
 - **Two clocks.** A control-plane change reaches every live trip at the next
   restart; a trip-site change reaches only trips built after the next release.
   Your brief names the row. If what you are changing sits on a different row
