@@ -196,8 +196,9 @@ scripts/teardown-trip.py --trip <slug|trip_id> --execute  # do it
 The inverse of provisioning: backs everything up first, then the interviewer's
 allowlist entry, the companion's gateway and trip-mcp bridge, the Cloudflare
 record and ingress rule, the NPM host and the LXC (through the worker's own
-provisioner), the chat bindings and slug (`retired-<slug>-<yyyymmdd>`, which
-frees the name), the deploy directory, and the profile. **Order matters in one
+provisioner), the chat bindings, any still-live group-binding tokens (issue
+#175), and slug (`retired-<slug>-<yyyymmdd>`, which frees the name), the
+deploy directory, and the profile. **Order matters in one
 place**: the allowlist entry goes, and the interviewer restarts, *before* the
 profile is deleted — the interviewer runs a cron ticker per allowlisted profile,
 and on 2026-09-11 that ticker recreated a deleted profile's directory, which is
