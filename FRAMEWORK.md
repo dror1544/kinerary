@@ -280,9 +280,14 @@ docker compose up -d --build
   in trivia. Add a real photo anytime via the site's own upload/crop flow.
 - `travel_info.countries` — emergency numbers, currency, calling code per destination country.
   Don't hand-write these either: `node scripts/country-info.js "Japan"` fetches them live (free,
-  no API key). `travel_info.health`/`hospitals`/`money`/`communication`/`age_notes` are freeform
-  bilingual lists you fill in yourself — not automatable, and all optional (the Info tab hides
-  each block when its list is empty). See "Country Info" below for the full shape.
+  no API key). `travel_info.health`/`money`/`communication` fill automatically for a
+  control-plane-provisioned trip (`enrichment._enrich_destination_info`, sprint 6.1,
+  deterministic where an API answers, model-sourced and cached cross-trip at the gaps) —
+  this manual quickstart path still has no equivalent, so for a hand-scaffolded trip they
+  remain freeform bilingual lists you fill in yourself. `hospitals`/`age_notes` are excluded
+  by decision on both paths (no reliable deterministic source) and stay empty. All are
+  optional (the Info tab hides each block when its list is empty). See "Country Info" below
+  for the full shape.
 
 ---
 
