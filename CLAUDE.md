@@ -274,6 +274,15 @@ EXTRACT_INTAKE_RUNNER=codex      EXTRACT_INTAKE_MODEL=gpt-5.6-luna
 EXTRACT_ITINERARY_RUNNER=codex   EXTRACT_ITINERARY_MODEL=gpt-5.6-luna
 ```
 
+**The harness behind those numbers reached this branch four days after the
+numbers did.** `tools/extract-eval.ts` — the benchmark script
+`docs/document-intake-operations.md` cites for the 2026-09-13 run — was part of
+Slice B's `tools/` files that a step-list handoff omitted, and it was restored
+only in `b4754ed` (2026-09-22,
+`docs/test-reports/sprint-6-integration-handoff-2026-09-22.md`). Between those
+dates the `EXTRACT_INTAKE_*`/`EXTRACT_ITINERARY_*` config above was live on the
+branch with no way to regenerate or re-check the evidence behind it.
+
 **Set the effort.** Unset, a nested `claude -p` takes its effort from the
 settings in the relay's HOME — on the Mac, a personal `effortLevel: xhigh`, at
 which a 4-page PDF's day-by-day plan took 143s against a 60s limit and never
