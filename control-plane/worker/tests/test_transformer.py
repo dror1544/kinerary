@@ -1218,6 +1218,100 @@ class PhaseVenuesTests(unittest.TestCase):
         self.assertEqual(p["venues"][0]["url"], "https://www.tokyo-skytree.jp/en/")
 
 
+class PhasePackingTests(unittest.TestCase):
+    """phase.packing — readiness.tsx expects each entry to be a
+    [{he,en} category, {he,en} item] pair, exactly config.packing_general's
+    shape (see trip-web/src/readiness.tsx and its own hardcoded fallback,
+    which this deliberately does not touch)."""
+
+    def _phase(self, destination: str, start: str, end: str):
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text(destination),
+            "phases": _structured([{"name": "Stop", "start": start, "end": end}]),
+        }
+        return transform_intake(intake)["phases"][0]
+
+    def test_northern_hemisphere_winter_phase_gets_cold_weather_items(self) -> None:
+        # Japan (no hemisphere-table hit) defaults north; January is winter there.
+        phase = self._phase("Japan", "2027-01-10", "2027-01-17")
+        self.assertIn("packing", phase)
+        for category, item in phase["packing"]:
+            self.assertIn("he", category)
+            self.assertIn("en", category)
+            self.assertIn("he", item)
+            self.assertIn("en", item)
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Warm jacket", items_en)
+        self.assertNotIn("Sunscreen", items_en)
+
+    def test_southern_hemisphere_equivalent_month_gets_hot_weather_items(self) -> None:
+        # Same calendar month, Australia: January is high summer there.
+        phase = self._phase("Australia", "2027-01-10", "2027-01-17")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Sunscreen", items_en)
+        self.assertNotIn("Warm jacket", items_en)
+
+    def test_a_phase_with_no_destination_gets_no_packing_additions(self) -> None:
+        # destination is a required question, so an empty/whitespace-only
+        # typed answer still transforms rather than raising -- falls back to
+        # the "Unknown Destination" placeholder brand text elsewhere, but
+        # must not fabricate a season for it here.
+        intake = {
+            **JAPAN_INTAKE,
+            "destination": _text("   "),
+            "phases": _structured([{"name": "Stop", "start": "2027-01-10", "end": "2027-01-17"}]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertNotIn("packing", phase)
+
+    def test_a_phase_with_no_dates_gets_no_packing_additions(self) -> None:
+        intake = {
+            **JAPAN_INTAKE,
+            "phases": _structured([{"name": "Stop"}]),
+        }
+        phase = transform_intake(intake)["phases"][0]
+        self.assertNotIn("packing", phase)
+
+    def test_packing_shares_the_general_lists_bilingual_tuple_shape(self) -> None:
+        phase = self._phase("Japan", "2027-07-05", "2027-07-12")
+        self.assertTrue(phase["packing"])
+        for pair in phase["packing"]:
+            self.assertEqual(len(pair), 2)
+            category, item = pair
+            self.assertEqual(set(category.keys()), {"he", "en"})
+            self.assertEqual(set(item.keys()), {"he", "en"})
+
+    def test_a_hebrew_typed_southern_hemisphere_destination_still_flips_the_season(self) -> None:
+        # "אוסטרליה" is Australia — a real Hebrew-typed answer, not an
+        # English one. A raw-substring/English-only hemisphere lookup would
+        # miss this and default north, inverting the packing advice for a
+        # January (southern summer) trip.
+        phase = self._phase("אוסטרליה", "2027-01-10", "2027-01-17")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Sunscreen", items_en)
+        self.assertNotIn("Warm jacket", items_en)
+
+    def test_a_hebrew_typed_northern_hemisphere_destination_keeps_its_season(self) -> None:
+        # "יפן" is Japan, already aliased for currency/timezone — same
+        # extraction path must keep resolving it correctly for hemisphere.
+        phase = self._phase("יפן", "2027-01-10", "2027-01-17")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Warm jacket", items_en)
+        self.assertNotIn("Sunscreen", items_en)
+
+    def test_perugia_italy_is_not_mistaken_for_peru(self) -> None:
+        # "peru" is a substring of "Perugia" — a real Italian city, not
+        # Peru. A raw substring match on the typed text would wrongly flip
+        # this January (northern winter, Italy) phase to a southern-summer
+        # bucket. Must resolve through the same extracted country key
+        # _lookup_known_currency uses, not a substring test.
+        phase = self._phase("Perugia, Italy", "2027-01-10", "2027-01-17")
+        items_en = {item["en"] for _category, item in phase["packing"]}
+        self.assertIn("Warm jacket", items_en)
+        self.assertNotIn("Sunscreen", items_en)
+
+
 class HomeCountryTests(unittest.TestCase):
     def test_answer_is_written_to_meta_home_country(self) -> None:
         intake = {**JAPAN_INTAKE, "home_country": _text("United States")}
