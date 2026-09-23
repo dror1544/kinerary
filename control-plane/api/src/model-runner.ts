@@ -228,6 +228,15 @@ export interface CliSpec {
     /** The model's answer out of stdout — or the failure the CLI reported in it. */
     answer: (stdout: string) => { ok: true; text: string; usage?: ModelUsage } | { ok: false; detail: string };
   };
+  /**
+   * The environment the child gets. Declared per spec because the adapters do
+   * not agree on what a child legitimately needs: the Claude CLI needs its own
+   * login and nothing else, while `hermesSpec` runs an agent that reaches its
+   * providers through the relay's own configuration. Unset means `hermeticEnv`,
+   * which is inheritance minus session state — correct for Hermes, and not
+   * enough for anything structuring untrusted text.
+   */
+  env?: (source?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 }
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
@@ -278,6 +287,7 @@ export function claudeSpec(
     model,
     timeoutMs,
     maxAttempts: 2,
+    env: claudeChildEnv,
     // `--tools ""`: a structuring call gets no tools at all. Print mode already
     // denies anything needing permission, but still offers the read-only ones,
     // and a document is untrusted input that should not be able to ask for a
@@ -436,6 +446,42 @@ export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Pro
  * provider keys, bot tokens and other relay configuration never reach a model
  * process that is structuring untrusted organizer input.
  */
+/**
+ * The minimal environment a nested Claude CLI needs: its own login, a place to
+ * run, and certificates. Everything else the relay holds — provider keys for
+ * other services, bot tokens, database URLs — is withheld, on the same grounds
+ * as `codexChildEnv`.
+ *
+ * This is an allowlist, and that is the whole point. `hermeticEnv` is a
+ * denylist: it strips session state and passes the rest through, so every
+ * secret the relay held reached a `claude -p` that was being handed untrusted
+ * organizer text. Codex was isolated for that reason (#58) while the runner
+ * the production configuration actually uses was not, and a denylist cannot be
+ * audited — you would have to enumerate every secret that will ever exist.
+ *
+ * The CLI's OWN credentials stay, because withholding them does not reduce the
+ * blast radius of a prompt injection and does break the call: a child that
+ * cannot authenticate exits non-zero, the task returns FAILED, and the router
+ * silently does less for the rest of the interview. Stripping
+ * CLAUDE_CODE_OAUTH_TOKEN did exactly that on the VM on 2026-09-11.
+ * CLAUDE_CONFIG_DIR stays for the same reason — the VM takes its effort from
+ * the settings.json there, and losing it falls back to the CLI's default.
+ */
+export function claudeChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    "PATH", "HOME",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+    "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+  ]);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  );
+}
+
 export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const allowed = new Set([
     "PATH", "HOME", "CODEX_HOME", "XDG_CONFIG_HOME",
@@ -453,7 +499,7 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
     execFile(
       spec.bin,
       spec.args(prompt, spec.model),
-      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: hermeticEnv() },
+      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: (spec.env ?? hermeticEnv)() },
       (err, stdout, stderr) => {
         if (!err) {
           if (!spec.output) return resolve({ ok: true, stdout: String(stdout) });
@@ -479,10 +525,18 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
  * A CLI call whose input goes through stdin — how files reach a CLI that takes
  * them. Same hermetic directory and environment as `runOnce`, same failure
  * vocabulary.
+ *
+ * Same `spec.env ?? hermeticEnv` policy as `runOnce`, applied here during
+ * integration of #144 (which predates this function): this is the path an
+ * organizer-uploaded document actually travels — `claudeSpec()`'s
+ * `attachments` block is only consumed here — so it is the one #144's own
+ * threat model ("a crafted document") most needs covered, and leaving it on
+ * the denylist while `runOnce` moved would have silently reopened #58 on the
+ * one call site untested by `claude-isolation.test.ts`.
  */
 function runWithInput(spec: CliSpec, args: string[], input: string): Promise<RunOnce> {
   return new Promise((resolve) => {
-    const child = spawn(spec.bin, args, { cwd: spec.cwd ?? tmpdir(), env: hermeticEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(spec.bin, args, { cwd: spec.cwd ?? tmpdir(), env: (spec.env ?? hermeticEnv)(), stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     let settled = false;

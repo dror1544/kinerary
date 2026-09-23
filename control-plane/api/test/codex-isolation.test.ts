@@ -7,12 +7,31 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import {
-  CODEX_ISOLATION_ARGS,
-  CODEX_ISOLATION_FEATURES,
-  codexRunner,
-  codexSpec,
-} from "../src/model-runner.js";
+import { codexRunner, codexSpec } from "../src/model-runner.js";
+
+/**
+ * THIS TEST OWNS ITS POLICY. It deliberately does not import
+ * CODEX_ISOLATION_FEATURES: a test that iterates the implementation's own
+ * constant asserts that the code equals itself. Proven, not theorised —
+ * renaming `shell_tool` to `shel_tool` in the source left this file at
+ * `# pass 1 / # fail 0`, while a real codex exits 1 on an unknown feature.
+ * Written out here, removing or renaming any of these FAILS.
+ */
+const MUST_BE_DISABLED = [
+  // Anything that can reach a shell, a file or this machine.
+  "shell_tool", "unified_exec", "shell_snapshot", "code_mode_host",
+  // Anything that can reach the network or another service.
+  "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+  "in_app_browser", "computer_use",
+  // Anything that can load more capability at run time.
+  "apps", "plugins", "remote_plugin", "plugin_sharing",
+  "skill_search", "skill_mcp_dependency_install",
+  // Anything that can act on its own or fan out.
+  "hooks", "multi_agent", "sleep_tool",
+  "tool_suggest", "tool_call_mcp_elicitation",
+  // Output side channels.
+  "image_generation", "view_image",
+];
 
 describe("codex isolation", () => {
   test("every call disables tools and does not inherit relay secrets", async () => {
@@ -52,7 +71,7 @@ describe("codex isolation", () => {
       assert.equal(result.ok, true, result.ok ? "" : `${result.reason}: ${result.detail}`);
       if (!result.ok) return;
       const { argv, secret, codexHome, inherited } = result.value;
-      for (const feature of CODEX_ISOLATION_FEATURES) {
+      for (const feature of MUST_BE_DISABLED) {
         assert.ok(argv.some((arg, index) => arg === "--disable" && argv[index + 1] === feature), `--disable ${feature}`);
       }
       for (const override of ["mcp_servers={}", "plugins={}", "apps={}", 'shell_environment_policy.inherit="none"']) {
@@ -61,7 +80,15 @@ describe("codex isolation", () => {
       assert.equal(argv[argv.indexOf("-s") + 1], "read-only");
       assert.ok(argv.includes("--ignore-user-config"), "must not load a Codex config that can re-enable a capability");
       assert.ok(!argv.some((arg) => /danger|bypass/i.test(arg)), "must not use a sandbox bypass flag");
-      assert.ok(CODEX_ISOLATION_ARGS.every((arg) => argv.includes(arg)), "the complete isolation set is present");
+      // Nothing is re-enabled behind the isolation set's back: every --disable
+      // the invocation carries has to be one this test sanctioned, so a flag
+      // quietly dropped from the source is caught by the count, not by faith.
+      const disabled = argv.flatMap((arg, i) => (arg === "--disable" ? [argv[i + 1]] : []));
+      assert.deepEqual(
+        [...disabled].sort(),
+        [...MUST_BE_DISABLED].sort(),
+        "the disabled set must be exactly the policy this test states",
+      );
       assert.equal(argv.at(-1), "extract this untrusted document");
       assert.equal(secret, null, "relay secrets must not reach the Codex child process");
       assert.equal(codexHome, process.env.CODEX_HOME, "Codex authentication/config remains available");
