@@ -284,6 +284,40 @@ export function describeAttachment(message: TelegramMessage): Attachment | null 
   return null;
 }
 
+/**
+ * Recognizes a document by its leading bytes when Telegram's own metadata
+ * did not say what it was.
+ *
+ * `document.mime_type`/`file_name` are both optional Telegram fields, and go
+ * missing often enough for a file exported from a phone's "save/share as
+ * PDF" flow — issue #163 traced a real upload that arrived with neither,
+ * fell back to `application/octet-stream` with no filename, and was
+ * rejected downstream (Hermes's reader saw a useless `.bin` extension).
+ * Only signatures unambiguous enough to bet on are worth checking; anything
+ * else is left as octet-stream rather than a wrong guess.
+ */
+export function sniffContentType(bytes: Buffer): { mime: string; extension: string } | null {
+  if (bytes.length >= 5 && bytes.subarray(0, 5).toString("latin1") === "%PDF-") {
+    return { mime: "application/pdf", extension: "pdf" };
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { mime: "image/jpeg", extension: "jpg" };
+  }
+  if (
+    bytes.length >= 8 &&
+    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return { mime: "image/png", extension: "png" };
+  }
+  if (
+    bytes.length >= 6 &&
+    (bytes.subarray(0, 6).toString("latin1") === "GIF87a" || bytes.subarray(0, 6).toString("latin1") === "GIF89a")
+  ) {
+    return { mime: "image/gif", extension: "gif" };
+  }
+  return null;
+}
+
 /** message_type reflects the first attachment's kind (contract §"Phase 2 media ingress"). */
 function messageTypeFor(kind: MediaKind): "image" | "audio" | "document" {
   if (kind === "image") return "image";
@@ -345,11 +379,21 @@ export async function attachMedia(
       continue;
     }
 
+    let mime = file.mime || attachment.mime;
+    let filename = attachment.filename;
+    if (!mime || mime === "application/octet-stream") {
+      const sniffed = sniffContentType(file.bytes);
+      if (sniffed) {
+        mime = sniffed.mime;
+        filename ??= `document.${sniffed.extension}`;
+      }
+    }
+
     const id = deps.store.put({
       kind: attachment.kind,
-      mime: file.mime || attachment.mime,
+      mime,
       size: file.bytes.length,
-      ...(attachment.filename ? { filename: attachment.filename } : {}),
+      ...(filename ? { filename } : {}),
       ...(attachment.caption ? { caption: attachment.caption } : {}),
       bytes: file.bytes,
     });
@@ -366,9 +410,9 @@ export async function attachMedia(
     urls.push(`${deps.baseUrl.replace(/\/$/, "")}/relay/media/${id}`);
     descriptors.push({
       kind: attachment.kind,
-      mime: file.mime || attachment.mime,
+      mime,
       size: file.bytes.length,
-      ...(attachment.filename ? { filename: attachment.filename } : {}),
+      ...(filename ? { filename } : {}),
       ...(attachment.caption ? { caption: attachment.caption } : {}),
     });
   }
