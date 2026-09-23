@@ -2193,7 +2193,7 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.fix = setup_fixture(self.conn, intake=FULL_NAME_ORGANIZER_INTAKE)
-        self.chat_id = "830000" + rnd(3)
+        self.chat_id = "830000" + str(secrets.randbelow(1000000)).zfill(6)
         # An interview conducted in a known, verified chat — and an owner with
         # NO telegram identity, which is what the password stopgap produces.
         # `enrollment_id` is required but nothing here reads it; the session
@@ -2228,6 +2228,11 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
         teardown_fixture(self.conn, self.fix)
 
     def test_the_interview_chat_binds_the_companion(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = '999999999' WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
         companion = FakeCompanionProfileAdapter()
         ProvisionerWorker(
             db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-interview-chat",
@@ -2248,6 +2253,45 @@ class InterviewChatIsTheOrganizerChatTests(unittest.TestCase):
             (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual((state["reachability"], state["unreachable_reason"]), ("reachable", None))
+
+        person = self.conn.execute(
+            "SELECT telegram_user_id FROM control_plane.trip_person_links WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(person["telegram_user_id"], self.chat_id)
+
+    def test_unverified_hint_cannot_bind_or_identify_an_organizer(self) -> None:
+        self.conn.execute(
+            "UPDATE control_plane.intake_sessions SET telegram_chat_id = NULL WHERE id = %s",
+            (self.session_id,),
+        )
+        self.conn.execute(
+            "UPDATE control_plane.trips SET notification_chat_id_hint = %s WHERE id = %s",
+            (self.chat_id, self.fix["trip_id"]),
+        )
+        self.conn.commit()
+        ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-unverified-hint",
+            companion=FakeCompanionProfileAdapter(),
+        ).run_once()
+
+        for table in ("telegram_chat_bindings", "trip_person_links"):
+            rows = self.conn.execute(
+                f"SELECT id FROM control_plane.{table} WHERE trip_id = %s",
+                (self.fix["trip_id"],),
+            ).fetchall()
+            self.assertEqual(rows, [], f"unverified hint must not create {table}")
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual((state["reachability"], state["unreachable_reason"]),
+                         ("unreachable", "NO_ORGANIZER_CHAT"))
+        notifications = self.conn.execute(
+            "SELECT kind, recipient FROM control_plane.notification_outbox WHERE trip_id = %s",
+            (self.fix["trip_id"],),
+        ).fetchall()
+        self.assertEqual(notifications, [{"kind": "provisioning_complete", "recipient": self.chat_id}])
 
     def test_a_verified_telegram_identity_still_wins(self) -> None:
         # Provenance order, not convenience: an identity on the account is a

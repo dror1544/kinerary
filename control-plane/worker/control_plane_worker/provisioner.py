@@ -106,6 +106,9 @@ UNREACHABLE_REASONS = {
     "BINDING_REFUSED",
     # The binding write itself failed.
     "BINDING_FAILED",
+    # The companion is installed but its trip-mcp bridge could not be wired —
+    # every trip tool will fail while the companion answers normally.
+    "TRIP_MCP_BRIDGE_FAILED",
 }
 
 
@@ -735,7 +738,7 @@ class _LeaseHeartbeat:
                 )
 
 
-def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
+def _organizer_chat_ids(cur: Any, trip_id: str) -> tuple[str | None, str | None]:
     """The chat a trip's organizer is reached in — see the preference order in `_complete`.
 
     One query for provisioning and for `reconcile_companion`, so a trip repaired
@@ -765,8 +768,16 @@ def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
     )
     row = cur.fetchone()
     if not row:
-        return None
-    return row["provider_subject_id"] or row["interview_chat_id"] or row["notification_chat_id_hint"]
+        return None, None
+    # Only these two values have authenticated provenance. The hint may receive
+    # a notification, but must never establish a routing or person identity.
+    verified = row["provider_subject_id"] or row["interview_chat_id"]
+    return verified, verified or row["notification_chat_id_hint"]
+
+
+def _organizer_recipient_chat_id(cur: Any, trip_id: str) -> str | None:
+    """The delivery recipient, which may use the unverified hint as fallback."""
+    return _organizer_chat_ids(cur, trip_id)[1]
 
 
 class ProvisionerWorker:
@@ -1387,7 +1398,7 @@ class ProvisionerWorker:
                 # known chat still ended with "no organizer chat id" and an
                 # unbindable companion. The chat was never unknown — it was in
                 # intake_sessions the whole time.
-                recipient_chat_id = _organizer_recipient_chat_id(cur, trip_id)
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
 
                 # The facts the organizer's introduction is composed from
                 # (docs/companion-introduction-design.md). Composed API-side,
@@ -1473,7 +1484,8 @@ class ProvisionerWorker:
         self._attach_companion(
             conn, trip_id=trip_id, slug=slug, config=config,
             intake_version_id=intake_version_id, private_url=private_url,
-            recipient_chat_id=recipient_chat_id, intro_facts=intro_facts,
+            recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+            intro_facts=intro_facts,
         )
 
     def reconcile_companion(self, trip_id: str) -> dict[str, Any]:
@@ -1530,11 +1542,12 @@ class ProvisionerWorker:
                 )
 
             with conn.cursor(row_factory=dict_row) as cur:
-                recipient_chat_id = _organizer_recipient_chat_id(cur, trip_id)
+                verified_organizer_chat_id, recipient_chat_id = _organizer_chat_ids(cur, trip_id)
             hermes_profile = self._attach_companion(
                 conn, trip_id=trip_id, slug=trip["slug"], config=config,
                 intake_version_id=version["id"], private_url=job["private_url"],
-                recipient_chat_id=recipient_chat_id, intro_facts=dict(trip["companion_intro"] or {}),
+                recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
+                intro_facts=dict(trip["companion_intro"] or {}),
                 introduce_once=True,
             )
             reach = conn.execute(
@@ -1561,6 +1574,7 @@ class ProvisionerWorker:
         intake_version_id: str,
         private_url: str,
         recipient_chat_id: str | None,
+        verified_organizer_chat_id: str | None,
         intro_facts: dict,
         introduce_once: bool = False,
     ) -> str | None:
@@ -1725,14 +1739,14 @@ class ProvisionerWorker:
             )
 
         # ── The chat binding, attempted whatever the companion did ──────────
-        if not recipient_chat_id:
+        if not verified_organizer_chat_id:
             if hermes_profile:
                 # A companion exists and nobody can talk to it. A different
                 # retry from every other reason here: nothing is broken, an
                 # organizer chat id is simply not known yet.
                 _record_reachability(
                     conn, trip_id, reachable=False, reason="NO_ORGANIZER_CHAT",
-                    consequence="a companion exists but no organizer chat id is known to bind it to",
+                    consequence="a companion exists but no verified organizer chat id is known to bind it to",
                 )
         else:
             try:
@@ -1744,9 +1758,9 @@ class ProvisionerWorker:
                 # Read BEFORE the call, unconditionally: bind_chat_to_trip
                 # closes the displaced row, so afterwards this query would
                 # find nothing (or the new trip) instead of what was lost.
-                previous_trip_id = _bound_trip_id(conn, recipient_chat_id)
+                previous_trip_id = _bound_trip_id(conn, verified_organizer_chat_id)
                 outcome = bind_chat_to_trip(
-                    conn, recipient_chat_id, trip_id, hermes_profile,
+                    conn, verified_organizer_chat_id, trip_id, hermes_profile,
                     allow_retarget=True,
                 )
                 if outcome == "retargeted":
@@ -1759,7 +1773,7 @@ class ProvisionerWorker:
                     # was taken.
                     logger.warning("provisioner.organizer_chat_retargeted", extra={
                         "trip_id": trip_id,
-                        "chat_id": recipient_chat_id,
+                        "chat_id": verified_organizer_chat_id,
                         "previous_trip_id": previous_trip_id,
                         "consequence": "the organizer's chat now talks to this trip; /trips moves back to the previous one",
                     })
@@ -1781,7 +1795,7 @@ class ProvisionerWorker:
                     )
                     try:
                         linked = link_organizer_person(
-                            conn, trip_id, recipient_chat_id,
+                            conn, trip_id, verified_organizer_chat_id,
                             organizer_username, organizer_display,
                         )
                         logger.info(
@@ -1821,7 +1835,7 @@ class ProvisionerWorker:
                     # group-binding token, and a second one is a second token.
                     if not (introduce_once and self._companion_intro_queued(conn, trip_id)):
                         self._enqueue_companion_intro(
-                            conn, trip_id, recipient_chat_id, intro_facts,
+                            conn, trip_id, verified_organizer_chat_id, intro_facts,
                         )
                     logger.info("provisioner.companion_profile_bound", extra={
                         "trip_id": trip_id,
