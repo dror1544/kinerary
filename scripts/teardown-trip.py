@@ -20,8 +20,11 @@ found a step that quietly undoes itself. This is that run's order, as a command:
   5. infra      Cloudflare DNS + ingress rule, NPM host, LXC — through the
                 worker's own provisioner (LxcProvisionAdapter), outside-in, so
                 auth and adapters are exactly provisioning's
-  6. database   close chat bindings (closed_reason 'trip_destroyed'), then
-                slug -> retired-<slug>-<yyyymmdd>, which frees the slug
+  6. database   revoke any still-live group-binding token FIRST (issue #175),
+                then close chat bindings (closed_reason 'trip_destroyed'),
+                then slug -> retired-<slug>-<yyyymmdd>, which frees the slug —
+                the revoke-first order avoids a real deadlock against a
+                concurrent redemption; see REVOKE_GROUP_TOKENS's comment
   7. deploy dir move kinerary-deploy/trips/<slug> out of trips/ — the IP
                 allocator claims every address it finds in there
   8. profile    hermes profile delete, then check it stays gone
@@ -289,6 +292,9 @@ def resolve(target: str) -> dict:
         raise Refused(f"profile {trip['profile']!r} is still bound to another trip's open chat")
     trip["open_bindings"] = int(psql(
         f"SELECT count(*) FROM control_plane.telegram_chat_bindings WHERE trip_id = '{trip['id']}' AND closed_at IS NULL") or 0)
+    trip["live_group_tokens"] = int(psql(
+        f"SELECT count(*) FROM control_plane.telegram_group_binding_tokens "
+        f"WHERE trip_id = '{trip['id']}' AND expires_at > now()") or 0)
     return trip
 
 
@@ -513,11 +519,55 @@ CLOSE_SESSIONS = ("UPDATE control_plane.intake_sessions SET expired_at = now() "
                   "WHERE trip_id = '{id}' AND expired_at IS NULL AND state <> 'confirmed'")
 
 
+# A group-binding token (issue #175, migration 0045) is issued into the
+# organizer's DM and stays redeemable for up to its own TTL — 7 to 30 days —
+# with nothing in `trips.lifecycle_state` to say the trip it names is gone.
+# `redeemGroupBindingToken` now refuses it once the trip's slug reads
+# `retired-...` (control-plane/api/src/group-binding.ts), but that still
+# leaves a live token sitting in the table for someone to try, and try again,
+# until it expires on its own. Revoking it here — the same moment its
+# bindings and sessions close — is the proactive half of the same fix.
+# `expires_at > now()` is not protecting a CHECK constraint (the table's
+# `expires_at > created_at` cannot actually fire from this UPDATE in
+# practice) — it is there so a token that is already expired is not written
+# again for no reason.
+#
+# ORDER MATTERS: this runs FIRST in both transaction branches below, before
+# the bindings-close and slug-rename, not after. `redeemGroupBindingToken`'s
+# `INSERT INTO telegram_chat_bindings` takes a `FOR KEY SHARE` lock on the
+# referenced `trips` row as a side effect of its foreign key — regardless of
+# that function's own `NOT EXISTS` subquery correctly avoiding a direct lock
+# on `trips`. With the revoke last, this transaction locked
+# `telegram_chat_bindings`/`trips` first and `telegram_group_binding_tokens`
+# last, while a concurrent `redeemGroupBindingToken` locked its token row
+# first (via its own `FOR UPDATE`) and then, through the FK, waited on
+# `trips` — tokens-then-trips here, trips-then-tokens there: a real
+# `40P01: deadlock detected`, reproduced against Postgres by
+# regression-planner. Revoking the token FIRST here matches the OTHER
+# transaction's own lock order (token row, then anything that touches
+# `trips`), so the two can only ever queue for the same row in the same
+# order rather than each other's.
+REVOKE_GROUP_TOKENS = ("UPDATE control_plane.telegram_group_binding_tokens SET expires_at = now() "
+                       "WHERE trip_id = '{id}' AND expires_at > now()")
+
+
 def retire_in_db(trip: dict) -> str:
     if trip["slug"].startswith("retired-"):
-        psql(f"UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed' "
-             f"WHERE trip_id = '{trip['id']}' AND closed_at IS NULL")
-        psql(CLOSE_SESSIONS.format(id=trip["id"]))
+        # One transaction, not three bare calls: three separate `psql()`
+        # calls can die between any two of them, and a process that dies
+        # between the binding-close and the token-revoke leaves exactly the
+        # gap this whole task exists to close — bindings and sessions gone,
+        # a live group-binding token still sitting in the table. Same
+        # BEGIN...COMMIT shape as the rename branch below, for the same
+        # reason. The revoke runs FIRST — see REVOKE_GROUP_TOKENS's comment
+        # for why the order avoids a real deadlock against
+        # redeemGroupBindingToken.
+        psql(f"""BEGIN;
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
+UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
+ WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
+{CLOSE_SESSIONS.format(id=trip['id'])};
+COMMIT;""")
         return trip["slug"]
     base = f"retired-{trip['orig']}-{datetime.now():%Y%m%d}"
     new = base
@@ -526,6 +576,7 @@ def retire_in_db(trip: dict) -> str:
             break
         new = f"{base}-{n}"
     psql(f"""BEGIN;
+{REVOKE_GROUP_TOKENS.format(id=trip['id'])};
 UPDATE control_plane.telegram_chat_bindings SET closed_at = now(), closed_reason = 'trip_destroyed'
  WHERE trip_id = '{trip['id']}' AND closed_at IS NULL;
 UPDATE control_plane.trips SET slug = '{new}', updated_at = now()
@@ -582,8 +633,10 @@ def main() -> int:
          (f"Cloudflare + NPM for {orig}; KEEP the container as {reference_name(orig)} "
           f"on http://{topo.proxy.forward_host}:{topo.proxy.forward_port}/" if args.keep_container
           else f"Cloudflare + NPM + LXC for {orig}") if topo else "never provisioned"),
-        ("database", trip["open_bindings"] > 0 or not trip["slug"].startswith("retired-"),
-         f"close {trip['open_bindings']} binding(s), retire slug {trip['slug']}"),
+        ("database", trip["open_bindings"] > 0 or trip["live_group_tokens"] > 0
+         or not trip["slug"].startswith("retired-"),
+         f"close {trip['open_bindings']} binding(s), revoke {trip['live_group_tokens']} live "
+         f"group-binding token(s), retire slug {trip['slug']}"),
         ("documents", originals > 0,
          f"archive and remove {originals} kept original(s); registry rows stay, marked unstored"),
         ("deploy dir", trip_dir.is_dir(),
