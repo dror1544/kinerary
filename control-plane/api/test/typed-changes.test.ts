@@ -9,7 +9,10 @@ import { identityFold, reconcileStructured, samePerson } from "../src/answer-mer
 import type { AnswerStore } from "../src/interview.js";
 import {
   applyOps,
+  applyPick,
+  heldRefLists,
   mergeOps,
+  openQuestion,
   parseOps,
   resolveRef,
   wordsOf,
@@ -385,5 +388,67 @@ describe("PINNED KNOWN GAP — the background itinerary fold can resurrect a rem
     const fromDocument = [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-24", "2026-05-27")];
     const merged = reconcileStructured(afterRemoval, fromDocument, {}).merged as { name: string }[];
     assert.deepEqual(merged.map((s) => s.name), ["Tokyo", "Kyoto"]);
+  });
+});
+
+describe("a question the words left open (#206, slice 3)", () => {
+  const rename = { op: "rename_stop", target: { name: "Hakone" }, name: "Nagoya" } as const;
+  const replace = { op: "replace_stop", target: { name: "Hakone" }, fields: { name: "Nagoya" } } as const;
+  const add = { op: "add_stop", fields: { name: "Nagoya" } } as const;
+  const held = () => store({ phases: [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Hakone", "2026-05-24", "2026-05-27")] });
+
+  test("choose parses with two or three complete options, and never nests", () => {
+    assert.equal(parseOps([{ op: "choose", options: [rename, replace, add] }]).ok, true);
+    assert.equal(parseOps([{ op: "choose", options: [rename] }]).ok, false);
+    assert.equal(parseOps([{ op: "choose", options: [rename, replace, add, add] }]).ok, false);
+    assert.equal(parseOps([{ op: "choose", options: [rename, { op: "choose", options: [replace, add] }] }]).ok, false);
+    assert.equal(parseOps([{ op: "choose", options: [rename, { op: "add_traveller", fields: { name: "Ella" } }] }]).ok, false, "one subject");
+  });
+
+  test("an unsettled choice is a question, before anything is validated or shown", () => {
+    const refused = bad(applyOps(held(), [{ op: "choose", options: [rename, replace, add] }]));
+    assert.deepEqual(keys(refused.blocked), ["blocked.chooseOne"]);
+    const open = openQuestion({ unresolved: refused.unresolved, blocked: refused.blocked });
+    assert.equal(open?.kind, "choose");
+    assert.deepEqual((open as { options: { op: string }[] }).options.map((o) => o.op), ["rename_stop", "replace_stop", "add_stop"]);
+  });
+
+  test("the person's pick REPLACES the choice with that operation, and a bad pick changes nothing", () => {
+    const ops: Op[] = [{ op: "choose", options: [rename, replace, add] }];
+    const refused = bad(applyOps(held(), ops));
+    const picked = applyPick(ops, refused, held(), 0)!;
+    assert.deepEqual(picked, [rename]);
+    assert.deepEqual(dataOf(ok(applyOps(held(), picked)), "phases")[1], stop("Nagoya", "2026-05-24", "2026-05-27"), "renamed, dates kept");
+    assert.deepEqual(dataOf(ok(applyOps(held(), applyPick(ops, refused, held(), 2)!)), "phases").map((s) => s.name), ["Tokyo", "Hakone", "Nagoya"], "the third reading adds");
+    assert.equal(applyPick(ops, refused, held(), 3), null);
+    assert.equal(applyPick(ops, refused, held(), -1), null);
+  });
+
+  test("an ambiguous reference: the pick is PINNED to that entry, so two identical names cannot be confused", () => {
+    const twice = store({ phases: [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-24", "2026-05-27"), stop("Tokyo", "2026-05-30", "2026-06-02")] });
+    const ops: Op[] = [{ op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-06-03" } }];
+    const refused = bad(applyOps(twice, ops));
+    const open = openQuestion({ unresolved: refused.unresolved, blocked: refused.blocked });
+    assert.equal(open?.kind, "reference");
+    const picked = applyPick(ops, refused, twice, 1)!;
+    assert.deepEqual(dataOf(ok(applyOps(twice, picked)), "phases").map((s) => s.end), ["2026-05-24", "2026-05-27", "2026-06-03"]);
+  });
+
+  test("a pin counts only while that entry still goes by that name", () => {
+    const list = [{ name: "Tokyo" }, { name: "Tokyo" }];
+    assert.deepEqual(resolveRef(list, { name: "Tokyo", pin: { index: 1, name: "Tokyo" } }, "stop"), { kind: "resolved", index: 1 });
+    assert.deepEqual(resolveRef([{ name: "Kyoto" }, { name: "Tokyo" }], { name: "Tokyo", pin: { index: 0, name: "Tokyo" } }, "stop"), { kind: "resolved", index: 1 }, "index 0 is Kyoto now: the pin is void and the name decides");
+    assert.equal(parseOps([{ op: "remove_stop", target: { name: "Tokyo", pin: { index: 0, name: "Tokyo" } } }]).ok, false, "the model cannot pin");
+  });
+
+  test("a follow-up about the same choice replaces it; the model is shown every held entry, with ids", () => {
+    const b = held();
+    const merged = mergeOps([{ op: "choose", options: [rename, replace] }], [{ op: "choose", options: [rename, replace] }], b);
+    assert.equal(merged.length, 1);
+    const lists = heldRefLists(store({ phases: [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto")], travelers: [{ name: "רות כהן", name_en: "Ruth Cohen", age: 70 }] }));
+    assert.deepEqual(lists.stops, [{ id: "s1", label: "Tokyo, 2026-05-19 to 2026-05-24" }, { id: "s2", label: "Kyoto, no dates" }]);
+    assert.deepEqual(lists.travellers, [{ id: "t1", label: "רות כהן (Ruth Cohen), age 70" }]);
+    const many = heldRefLists(store({ phases: Array.from({ length: 30 }, (_, i) => stop(`Stop ${i}`)) }));
+    assert.equal(many.stops.length, 30, "never cut");
   });
 });

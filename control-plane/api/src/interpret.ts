@@ -28,12 +28,12 @@ import {
   type AnswerStore,
 } from "./interview.js";
 import { addUsage, type ModelUsage, type RunnerFailure, type StructuredModelRunner } from "./model-runner.js";
+import { parseOps, type HeldItem, type Op } from "./typed-changes.js";
 import {
   identityFold,
   isRecord,
   mergeParts,
   reconcileStructured,
-  stripVisitMarkers,
   type FieldChange,
   type MergeAmbiguity,
   type MergeConflict,
@@ -81,6 +81,13 @@ export interface InterpretPayload {
   unclear: UnclearQuestion[];
   /** Entries the parser threw away. A non-zero count is a prompt problem. */
   malformed: number;
+  /**
+   * Changes to held stops or travellers, as operations (typed-changes.ts) — never
+   * a resulting list. Absent when the model said none.
+   */
+  ops?: Op[];
+  /** Set when the model gave operations that could not be used: the whole set is refused. */
+  opsError?: string;
 }
 
 export type InterpretResult =
@@ -201,7 +208,7 @@ function parseValue(raw: unknown): ProposedValue | null {
 export const INTERPRET_OUTPUT_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
-  required: ["proposals", "unclear"],
+  required: ["proposals", "unclear", "opsJson"],
   properties: {
     proposals: {
       type: "array",
@@ -266,6 +273,9 @@ export const INTERPRET_OUTPUT_SCHEMA: Record<string, unknown> = {
         properties: { questionId: { type: "string" }, why: { type: "string" } },
       },
     },
+    // Changes to stops or travellers already given: a JSON ARRAY OF OPERATIONS,
+    // as a string, for the reason `dataJson` is one (see `parseValue`), or null.
+    opsJson: { type: ["string", "null"] },
   },
 };
 
@@ -322,7 +332,23 @@ export function parseInterpretPayload(raw: unknown, allowedMessageIds: readonly 
     }
   }
 
-  return { proposals, unclear, malformed };
+  // Operations, if the model gave any: as an array (`ops`) or, for a provider
+  // held to a strict schema, as a string of JSON (`opsJson`). All or nothing —
+  // half a change the person never saw is what this feature exists to prevent.
+  let ops: Op[] | undefined;
+  let opsError: string | undefined;
+  const rawOps = root.ops !== undefined && root.ops !== null
+    ? root.ops
+    : typeof root.opsJson === "string" && root.opsJson.trim() !== "" ? parseDataJson(root.opsJson) : undefined;
+  if (Array.isArray(rawOps) && rawOps.length > 0) {
+    const parsed = parseOps(rawOps);
+    if (parsed.ok) ops = parsed.ops;
+    else opsError = parsed.error;
+  } else if (rawOps !== undefined && !Array.isArray(rawOps)) {
+    opsError = "ops must be a list";
+  }
+
+  return { proposals, unclear, malformed, ...(ops ? { ops } : {}), ...(opsError ? { opsError } : {}) };
 }
 
 // ── Evidence ─────────────────────────────────────────────────────────────────
@@ -545,6 +571,12 @@ export type RejectReason =
    * stated DIFFERENTLY is reported in `conflicts`, not applied.
    */
   | "NO_NEW_INFORMATION"
+  /**
+   * A typed proposal to REPLACE stops or travellers already held. That is a
+   * change, and a change is shown and confirmed (typed-changes.ts) — never written
+   * from a proposal, and never dropped without a word.
+   */
+  | "CHANGE_NEEDS_CONFIRMATION"
   /** Whatever `validateAnswer` said. */
   | "UNKNOWN_QUESTION"
   | "UNKNOWN_OPTION"
@@ -658,6 +690,13 @@ export interface ApplyProposalsContext {
    */
   allowCorrections?: boolean;
   /**
+   * Questions whose held answer a typed message may change ONLY through the
+   * confirmed-change flow (`typed-changes.ts`): a proposal for one of these that
+   * is already answered is refused as `CHANGE_NEEDS_CONFIRMATION`, whatever its
+   * confidence. Unanswered, the first answer is written as it always was.
+   */
+  changeQuestions?: readonly string[];
+  /**
    * The answers on record, so a correction to a structured one (the travellers,
    * the stops) is MERGED into it rather than replacing it with just the new part.
    * Required for corrections; without it a correction still writes, just whole.
@@ -770,16 +809,12 @@ function comparableAnswer(value: unknown): string | null {
  * replaces what an earlier part stated. A dated list comes back in date order,
  * because the parts arrive in the order they were read, not the order of the trip.
  */
-export function mergeOptionsFor(questionId: string): { people: boolean; visits: boolean } {
-  return { people: questionId === "travelers", visits: questionId === "phases" };
+export function mergeOptionsFor(questionId: string): { people: boolean } {
+  return { people: questionId === "travelers" };
 }
 
-export function mergeStructuredParts(parts: readonly unknown[], options: { people?: boolean; visits?: boolean } = {}): unknown {
+export function mergeStructuredParts(parts: readonly unknown[], options: { people?: boolean } = {}): unknown {
   return mergeParts(parts, options);
-}
-
-function withoutVisitMarker(p: ProposedAnswer): ProposedAnswer {
-  return p.value.kind === "structured" ? { ...p, value: { ...p.value, data: stripVisitMarkers(p.value.data) } } : p;
 }
 
 /** The one-for-one mapping onto `validateAnswer`'s parameter list. */
@@ -829,15 +864,13 @@ export function applyProposals(
     if (answer.kind !== "structured" || existing?.kind !== "structured" || proposal.value.kind !== "structured") {
       return answer;
     }
-    // Merged from the RAW proposal, not the validated answer: `validateAnswer`
-    // strips the additional-visit marker, which is what this merge reads. The
-    // merged list is then put through the same gate, so its rules and its
-    // marker-stripping still apply.
+    // Merged from the RAW proposal, and the merged list put through the same
+    // gate again, so its rules still apply to what is actually stored.
     const mergedData = mergeStructuredParts([existing.data, proposal.value.data], mergeOptionsFor(questionId));
     const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions);
     return again.ok && again.answer.kind === "structured"
       ? again.answer
-      : { ...answer, data: stripVisitMarkers(mergedData) };
+      : { ...answer, data: mergedData };
   };
 
   const accepted: AcceptedProposal[] = [];
@@ -879,9 +912,7 @@ export function applyProposals(
     if (usable.length === 0) return;
     const ordered = [...usable].sort((a, b) => b.confidence - a.confidence);
     const candidates = ordered.length > 1 ? [mergedProposal(ordered), ordered[0]!] : [ordered[0]!];
-    for (const raw of candidates) {
-      // The additional-visit marker steers a merge and is never offered or kept.
-      const candidate = withoutVisitMarker(raw);
+    for (const candidate of candidates) {
       const validated = validateProposed(candidate, questions);
       if (validated.ok) {
         suggested.push({ questionId: candidate.questionId, answer: validated.answer, proposal: candidate });
@@ -943,8 +974,12 @@ export function applyProposals(
   /** An accepted proposal for a question that already has an answer. */
   const correcting = (p: ProposedAnswer) => Boolean(ctx.allowCorrections) && answered.has(p.questionId);
 
+  const changeOnly = (p: ProposedAnswer) =>
+    ctx.held === undefined && answered.has(p.questionId) && (ctx.changeQuestions ?? []).includes(p.questionId);
+
   const ownMerits = (p: ProposedAnswer): { reason: RejectReason; detail?: string } | null => {
     if (RETIRED_QUESTION_IDS.has(p.questionId)) return { reason: "NOT_OUTSTANDING", detail: "retired question" };
+    if (changeOnly(p)) return { reason: "CHANGE_NEEDS_CONFIRMATION" };
     // Held and structured: reconciled below rather than refused here. The two
     // ways an answer on record can move are deliberately not the same one.
     const reconcilable = ctx.held?.[p.questionId] !== undefined;
@@ -1074,6 +1109,7 @@ export function applyProposals(
     }
 
     if (RETIRED_QUESTION_IDS.has(proposal.questionId)) return reject(proposal, "NOT_OUTSTANDING", "retired question");
+    if (changeOnly(proposal)) return reject(proposal, "CHANGE_NEEDS_CONFIRMATION");
     if (answered.has(proposal.questionId)) {
       if (ctx.allowCorrections) {
         // The organizer typed it. A confident read replaces what is on record;
@@ -1220,6 +1256,103 @@ function dataJsonExample(data: unknown): string {
   return `"dataJson":${JSON.stringify(JSON.stringify(data))}`;
 }
 
+function changesHeld(held: BuildInterpretPromptArgs["heldLists"]): boolean {
+  return Boolean(held && (held.stops.length > 0 || held.travellers.length > 0));
+}
+
+/**
+ * The part of the prompt that asks for OPERATIONS when there is something held
+ * to change (#206). The model names WHAT the person said and to WHICH entry; it
+ * never writes a resulting list, because a model asked for the whole list drops
+ * entries, and one asked only for what is new cannot express a removal. Which
+ * held entry a name means is decided in code, from the name, so the ids are hints.
+ *
+ * The examples are in both languages an interview is held in. They are
+ * illustrations: the model is told never to copy their values.
+ */
+export function changeSection(held: BuildInterpretPromptArgs["heldLists"]): string[] {
+  if (!held || !changesHeld(held)) return [];
+  const list = (title: string, items: readonly HeldItem[]) =>
+    items.length === 0 ? [] : [title, ...items.map((i) => `- ${i.id}: ${i.label}`)];
+  return [
+    `CHANGES TO STOPS OR TRAVELLERS ALREADY GIVEN`,
+    `The person has already told us these. This is how we hold them now, each under an id:`,
+    ...list(`Stops:`, held.stops),
+    ...list(`Travellers:`, held.travellers),
+    ``,
+    `If the message ADDS to, CHANGES or REMOVES something in one of these two lists, do NOT`,
+    `propose the "phases" or "travelers" question and do NOT write out a list. Instead put the`,
+    `operations in "opsJson", as a JSON array written as a STRING (escape it, as with dataJson).`,
+    `One operation per thing they said. Everything the message does not mention stays as it is,`,
+    `so leave it out. If the message changes nothing in these lists, "opsJson" is null.`,
+    ``,
+    `Every operation that is about an existing entry has a "target": {"id":"s2","name":"Kyoto"}.`,
+    `"name" is the name AS THE PERSON WROTE IT — never translate it, never complete it, never`,
+    `swap it for the name we hold. "id" is the id from the list above, when one plainly fits.`,
+    `If the name they used could be more than one entry (two Ruths), still give the name they`,
+    `used: we will ask them which.`,
+    ``,
+    `The operations — exactly these, with exactly these keys:`,
+    `- add_stop  {"op":"add_stop","fields":{"name":"Nara","start":"2026-09-27","end":"2026-09-28"},"after":{"name":"Kyoto"}}`,
+    `    A place or visit IN ADDITION to the ones listed: "we also want Nara", "another three days`,
+    `    at the end for Tokyo", "we come back to Tokyo", "Tokyo again". A RETURN to a place that is`,
+    `    already listed is add_stop — never update_stop. "after" and the dates are optional.`,
+    `- update_stop  {"op":"update_stop","target":{…},"fields":{"start":"…","end":"…"}}`,
+    `    New dates, hotel or planned places for a stop already listed: "actually Tokyo is 20 to 25`,
+    `    September". fields: start, end (ISO YYYY-MM-DD; with no year given, use the year of the`,
+    `    dates already listed), name_en, accommodation {"name","confirmation"}, planned [strings].`,
+    `- remove_stop  {"op":"remove_stop","target":{…}}   "we're not going to Kyoto anymore"`,
+    `- rename_stop  {"op":"rename_stop","target":{…},"name":"Kyoto"}`,
+    `    The SAME place under another name or spelling: "it's Kyoto, not Kioto".`,
+    `- replace_stop  {"op":"replace_stop","target":{…},"fields":{"name":"Nagoya"}}`,
+    `    A DIFFERENT place instead of a listed one: "instead of Hakone we're going to Nagoya".`,
+    `- move_stop  {"op":"move_stop","target":{…},"after":{…}}  (or "before")   "Kyoto after Osaka"`,
+    `- add_traveller  {"op":"add_traveller","fields":{"name":"Ella Cohen","age":9}}`,
+    `    Someone joining: "my daughter Ella Cohen, 9, is joining". fields: name, name_en, age, family.`,
+    `- update_traveller  {"op":"update_traveller","target":{…},"fields":{"age":71}}   "Ruth is 71"`,
+    `- remove_traveller  {"op":"remove_traveller","target":{…}}   "Avi isn't coming"`,
+    `- choose  {"op":"choose","options":[<operation>,<operation>]}`,
+    `    ONLY when the words honestly fit two or three different operations and nothing in the`,
+    `    message settles which — the classic is "change Hakone to Nagoya", which could be a rename,`,
+    `    a replacement, or one more stop. Give the complete operations as options, most likely`,
+    `    first, and we will ask. Never use it to hedge when the message is clear.`,
+    `Use no other operation, no other key, and never an "additional_visit" flag.`,
+    ``,
+    `In the reply the operations travel as one escaped string, exactly like dataJson:`,
+    `  ${`"opsJson":${JSON.stringify(JSON.stringify([{ op: "remove_stop", target: { name: "Kyoto" } }]))}`}`,
+    ``,
+    `Worked examples. They are illustrations: never copy their names, dates or ages.`,
+    `  "actually Tokyo is 20 to 25 September"`,
+    `     -> [{"op":"update_stop","target":{"id":"s1","name":"Tokyo"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
+    `  "another three days at the end for Tokyo"`,
+    `     -> [{"op":"add_stop","fields":{"name":"Tokyo"}}]`,
+    `  "we're not going to Kyoto anymore"`,
+    `     -> [{"op":"remove_stop","target":{"name":"Kyoto"}}]`,
+    `  "move Kyoto after Osaka"`,
+    `     -> [{"op":"move_stop","target":{"name":"Kyoto"},"after":{"name":"Osaka"}}]`,
+    `  "change Hakone to Nagoya"`,
+    `     -> [{"op":"choose","options":[{"op":"rename_stop","target":{"name":"Hakone"},"name":"Nagoya"},`,
+    `         {"op":"replace_stop","target":{"name":"Hakone"},"fields":{"name":"Nagoya"}},`,
+    `         {"op":"add_stop","fields":{"name":"Nagoya"}}]}]`,
+    `  "Ruth is 71"  (there may be two Ruths — give the name as written)`,
+    `     -> [{"op":"update_traveller","target":{"name":"Ruth"},"fields":{"age":71}}]`,
+    `  "my daughter Ella Cohen, 9, is joining"`,
+    `     -> [{"op":"add_traveller","fields":{"name":"Ella Cohen","age":9}}]`,
+    `  "Avi isn't coming"`,
+    `     -> [{"op":"remove_traveller","target":{"name":"Avi"}}]`,
+    `  "טוקיו זה מה-20 עד ה-25 בספטמבר"   (Tokyo is 20 to 25 September)`,
+    `     -> [{"op":"update_stop","target":{"name":"טוקיו"},"fields":{"start":"2026-09-20","end":"2026-09-25"}}]`,
+    `  "עוד שלושה ימים בסוף בטוקיו"   (another three days at the end, in Tokyo)`,
+    `     -> [{"op":"add_stop","fields":{"name":"טוקיו"}}]`,
+    `  "רות בת 71"   (Ruth is 71)`,
+    `     -> [{"op":"update_traveller","target":{"name":"רות"},"fields":{"age":71}}]`,
+    `  "אנחנו לא נוסעים לקיוטו"   (we are not going to Kyoto)`,
+    `     -> [{"op":"remove_stop","target":{"name":"קיוטו"}}]`,
+    `  "שנה את האקונה לנגויה"   (change Hakone to Nagoya) is the same "choose" as above.`,
+    ``,
+  ];
+}
+
 export interface BuildInterpretPromptArgs {
   sourceText: string;
   outstanding: readonly string[];
@@ -1235,6 +1368,14 @@ export interface BuildInterpretPromptArgs {
    * whether a proposal for one of these may be written (`allowCorrections`).
    */
   correctable?: readonly { id: string; current: string }[];
+  /**
+   * The stops and travellers already held, each with the id the model may quote
+   * back. Given, the model is asked to express a CHANGE to either as operations
+   * (`ops`) — never as a proposal for `phases` or `travelers` and never as a whole
+   * list. Absent or both empty: there is nothing to change yet, and the first
+   * answer is proposed as it always was.
+   */
+  heldLists?: { stops: readonly HeldItem[]; travellers: readonly HeldItem[] };
   /**
    * The question actually on the organizer's screen, if any.
    *
@@ -1290,20 +1431,19 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `- "confidence" is 0..1: how sure you are this is what they meant, not how sure`,
     `  you are that you understood the words.`,
     `- If the message gestures at a question without settling it, put it in "unclear".`,
-    `- For a list of stops: when the message says a visit is IN ADDITION to one already given`,
-    `  ("another three days at the end for Tokyo", "we come back to Tokyo", "Tokyo again"),`,
-    `  put "additional_visit": true on THAT stop's entry. Never set it for a plain statement`,
-    `  ("Tokyo, the 19th to the 24th"), which gives the dates of a stop already listed.`,
     ``,
     `Questions still outstanding:`,
     ...asked.map(describeQuestion),
     ``,
+    ...changeSection(args.heldLists),
     ...(args.correctable?.length
       ? [
           `Already answered — propose one of these ONLY if this message plainly corrects it`,
           `("actually…", "no, it's…", "add…", "make it…"). A passing mention is not a correction,`,
-          `and a message that merely repeats what they already said is not one either. For a list`,
-          `(the travellers, the stops), propose only what is being ADDED or CHANGED, not the whole list.`,
+          `and a message that merely repeats what they already said is not one either. For a list,`,
+          changesHeld(args.heldLists)
+            ? `propose only what is being ADDED or CHANGED, not the whole list. (The stops and the travellers are not here: change them with operations, above.)`
+            : `propose only what is being ADDED or CHANGED, not the whole list.`,
           ...args.correctable.map((q) => `- id: ${q.id}  (currently: ${q.current.replace(/\s+/g, " ").trim().slice(0, 160)})`),
           ``,
         ]
@@ -1311,7 +1451,7 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `Return exactly:`,
     `{"proposals":[{"questionId":"...","value":{"kind":"choice","optionId":"..."},`,
     ` "confidence":0.0,"evidence":"...","sourceMessageId":"..."}],`,
-    ` "unclear":[{"questionId":"...","why":"..."}]}`,
+    ` "unclear":[{"questionId":"...","why":"..."}]${changesHeld(args.heldLists) ? `,"opsJson":null}` : "}"}`,
     ``,
     `value kinds: {"kind":"choice","optionId":"x"} | {"kind":"choice_other","otherText":"x"}`,
     ` | {"kind":"multi_choice","optionIds":["x"]} | {"kind":"text","text":"x"}`,

@@ -87,7 +87,19 @@ import {
   suggestionLabel,
   type SuggestedAnswer,
   typedChoiceAnswer,
+  applyPendingChangeForChat,
 } from "../interview.js";
+import { heldRefLists, parseOps, questionOfOp, type Op } from "../typed-changes.js";
+import {
+  cancelDraft,
+  getDraft,
+  getOpenDraft,
+  pickForDraft,
+  proposeChange,
+  rebuildDraft,
+  type Draft,
+} from "../typed-changes-store.js";
+import { bareReply, confirmable, questionNoun, renderDraft } from "../typed-changes-render.js";
 import {
   applyProposals,
   DEFAULT_MIN_CONFIDENCE,
@@ -862,6 +874,37 @@ async function applyInterviewCallback(
     if (fresh.ok) await sendNextStep(fresh.view, decision.chatId, deps, strings);
   };
 
+  // A TYPED CHANGE WAITING FOR THE ORGANIZER (#206): apply it, cancel it, or
+  // answer what it asks. Answered on every path — a tap on a draft that is gone,
+  // settled or someone else's says so.
+  if (parsed.kind === "change") {
+    await ack();
+    if (parsed.choice === "pick") {
+      const now = await getSessionForChat(deps.db, decision.chatId);
+      const draft = await getDraft(deps.db, parsed.draftId);
+      if (!now.ok || !draft || draft.sessionId !== now.view.sessionId || draft.status !== "pending") {
+        await deps.telegram.sendMessage({
+          chatId: decision.chatId, text: uiString("change.gone", now.ok ? now.view.language : DEFAULT_LANGUAGE),
+        }).catch(() => {});
+        return;
+      }
+      const picked = await pickForDraft(deps.db, { draftId: draft.id, sessionId: now.view.sessionId, k: parsed.index ?? 0 });
+      if (!picked) {
+        await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.gone", now.view.language) }).catch(() => {});
+        return;
+      }
+      await showChangeDraft(deps, decision.chatId, now.view, picked);
+      return;
+    }
+    await settleChange(
+      deps,
+      { chatId: decision.chatId, draftId: parsed.draftId, choice: parsed.choice, ...(decision.messageId ? { messageId: decision.messageId } : {}) },
+      strings,
+      log,
+    );
+    return;
+  }
+
   // A DISAGREEMENT BETWEEN DOCUMENTS, settled. The decision is about one field
   // of one entry, and it applies only while that field still holds what the
   // question showed. A tap on a question that has stopped being true — someone
@@ -1301,6 +1344,9 @@ async function applyInterviewCallback(
         const language = sessionBeforeConfirm.ok ? sessionBeforeConfirm.view.language : DEFAULT_LANGUAGE;
         await ack(uiString("changePendingBlocksConfirm", language));
         await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("changePendingBlocksConfirm", language) });
+        // And the change itself, with its buttons — the way to settle it is one tap away.
+        const waiting = sessionBeforeConfirm.ok ? await getOpenDraft(deps.db, sessionBeforeConfirm.view.sessionId) : null;
+        if (waiting && sessionBeforeConfirm.ok) await showChangeDraft(deps, decision.chatId, sessionBeforeConfirm.view, waiting);
         return;
       }
       await ack("I couldn't confirm that yet.");
@@ -2228,6 +2274,183 @@ async function readDocumentsInto(
  *
  * Design: docs/interview-without-an-agent.md §3, §4, §6.
  */
+// ── A typed change to held stops or travellers (#206) ────────────────────────
+//
+// The organizer types "actually Tokyo is 20 to 25". The interpreter returns
+// operations, the store keeps ONE draft per session, and the organizer is SHOWN
+// what would change — and what would not — before anything is written. The
+// stored result is what is applied; the model is never asked again.
+
+/** The questions whose held answer a typed message can change only through that flow. */
+const CHANGE_QUESTIONS: readonly string[] = ["phases", "travelers"];
+
+/**
+ * The preview message last sent for each draft, so a later one (a follow-up
+ * merged into the draft, a stale confirmation rebuilt) can take the buttons off
+ * it: an old Yes would otherwise apply a change the person is no longer looking
+ * at. In memory, and best effort — a relay restart forgets it, and the apply is
+ * still refused when the answer moved (`STALE`), never applied blind.
+ */
+const shownPreviews = new Map<string, string>();
+
+/**
+ * Puts the draft in front of the organizer: the preview with Yes and No, or the
+ * question it is asking, or the conflict it found. Records `pc:<id>` as the
+ * prompt on screen — which is what lets a typed "yes" mean THIS change and
+ * nothing else, and what makes `boundaryOnScreen` and `onScreen` null while it
+ * is up.
+ */
+async function showChangeDraft(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  view: SessionView,
+  draft: Draft,
+  lead?: string,
+): Promise<boolean> {
+  const rendered = renderDraft(draft, view.language);
+  if (!(await takeFloor(chatId, view, deps))) return false;
+  const previous = shownPreviews.get(draft.id);
+  await recordLastPromptForChat(deps.db, chatId, `pc:${draft.id}`);
+  const sent = await deps.telegram.sendMessage({
+    chatId,
+    text: lead ? `${lead}\n\n${rendered.text}` : rendered.text,
+    replyMarkup: rendered.replyMarkup,
+  }) as { ok?: boolean; messageId?: string } | undefined;
+  if (sent?.ok && sent.messageId) shownPreviews.set(draft.id, sent.messageId);
+  if (previous && previous !== sent?.messageId) {
+    await deps.telegram
+      .editMessageText({ chatId, messageId: previous, text: rendered.text, replyMarkup: undefined })
+      .catch(() => {});
+  }
+  (deps.log ?? (() => {}))(structuredLog("info", "interview.change_shown", {
+    session_id: view.sessionId,
+    draft_id: draft.id,
+    confirmable: confirmable(draft),
+  }));
+  return true;
+}
+
+/** The interview, put back after a change resolved: what it displaced comes back, or the next step goes out. */
+async function resumeAfterChange(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  strings: DispatchStrings,
+  displaced: string | null,
+): Promise<void> {
+  await recordLastPromptForChat(deps.db, chatId, "");
+  const now = await getSessionForChat(deps.db, chatId);
+  if (!now.ok) return;
+  // The optional offer is sent ONCE (`sendOptionalOffer`), so once a change has
+  // covered it nothing would put it back — and the interview would go silent.
+  if (displaced === OPTIONAL_OFFER_PROMPT || displaced?.startsWith(`${BOUNDARY_CONFIRM_PROMPT}:`)) {
+    await markAwaitingMachine(deps.db, chatId);
+    const fresh = await getSessionForChat(deps.db, chatId);
+    if (fresh.ok && (await sendOptionalOffer(fresh.view, chatId, deps))) return;
+  }
+  await markAwaitingMachine(deps.db, chatId);
+  const fresh = await getSessionForChat(deps.db, chatId);
+  if (fresh.ok) await sendNextStep(fresh.view, chatId, deps, strings);
+}
+
+/**
+ * Applies or cancels the session's waiting change — from a tap or from a typed
+ * yes or no, which are the same act — says what happened, and puts the interview
+ * back. A draft that is not this session's, or is no longer waiting, is answered
+ * and never applied.
+ */
+async function settleChange(
+  deps: TripBotPollerDeps,
+  args: { chatId: string; draftId: string; choice: "apply" | "cancel"; messageId?: string },
+  strings: DispatchStrings,
+  log: (line: string) => void,
+): Promise<void> {
+  const say = (text: string) => deps.telegram.sendMessage({ chatId: args.chatId, text }).catch(() => undefined);
+  const session = await getSessionForChat(deps.db, args.chatId);
+  if (!session.ok) {
+    await say(uiString("change.gone", DEFAULT_LANGUAGE));
+    return;
+  }
+  const view = session.view;
+  const language = view.language;
+  const draft = await getDraft(deps.db, args.draftId);
+  if (!draft || draft.sessionId !== view.sessionId) {
+    log(structuredLog("warn", "interview.change_refused", { session_id: view.sessionId, reason: "NOT_THIS_SESSIONS" }));
+    await say(uiString("change.gone", language));
+    return;
+  }
+  if (draft.status !== "pending") {
+    await say(uiString(draft.status === "applied" ? "change.alreadyApplied" : "change.gone", language));
+    return;
+  }
+  const collapse = async (label: string) => {
+    const messageId = args.messageId ?? shownPreviews.get(draft.id);
+    if (!messageId) return;
+    await deps.telegram
+      .editMessageText({ chatId: args.chatId, messageId, text: `${renderDraft(draft, language).text}\n\n${label}`, replyMarkup: undefined })
+      .catch(() => {});
+  };
+
+  if (args.choice === "cancel") {
+    if (!(await cancelDraft(deps.db, { draftId: draft.id, sessionId: view.sessionId, by: "organizer" }))) {
+      await say(uiString("change.gone", language));
+      return;
+    }
+    log(structuredLog("info", "interview.change_cancelled", { session_id: view.sessionId, draft_id: draft.id }));
+    await collapse(`✖ ${uiString("change.cancelled", language)}`);
+    shownPreviews.delete(draft.id);
+    await say(uiString("change.cancelled", language));
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    return;
+  }
+
+  const applied = await applyPendingChangeForChat(deps.db, args.chatId, draft.id);
+  if (applied.ok) {
+    log(structuredLog("info", "interview.change_applied", {
+      session_id: view.sessionId, draft_id: draft.id, questions: applied.questions,
+    }));
+    await collapse(`✅ ${uiString("change.applied", language)}`);
+    shownPreviews.delete(draft.id);
+    await say(uiString("change.applied", language));
+    await resumeAfterChange(deps, args.chatId, strings, draft.displacedPrompt);
+    return;
+  }
+  log(structuredLog("info", "interview.change_not_applied", { session_id: view.sessionId, draft_id: draft.id, reason: applied.reason }));
+  switch (applied.reason) {
+    case "STALE": {
+      // Nothing was written. The stored operations are recomputed against what is
+      // held now and shown again — the old buttons come off first.
+      await collapse(`⚠️ ${uiString("change.stale", language)}`);
+      const rebuilt = await rebuildDraft(deps.db, { draftId: draft.id, sessionId: view.sessionId });
+      if (!rebuilt) {
+        await say(uiString("change.gone", language));
+        return;
+      }
+      shownPreviews.delete(draft.id);
+      await showChangeDraft(deps, args.chatId, view, rebuilt, uiString("change.stale", language));
+      return;
+    }
+    case "BLOCKED": {
+      await showChangeDraft(deps, args.chatId, view, draft, uiString("change.stillBlocked", language));
+      return;
+    }
+    case "ALREADY_APPLIED":
+      await say(uiString("change.alreadyApplied", language));
+      return;
+    case "INVALID":
+      await say(uiString("change.blocked.generic", language));
+      return;
+    default:
+      await say(uiString("change.gone", language));
+  }
+}
+
+/** Reasons a typed proposal for an answered question was refused that the organizer must hear about. */
+const ASK_ABOUT_REFUSED: ReadonlySet<string> = new Set([
+  "ALREADY_ANSWERED", "LOW_CONFIDENCE", "EVIDENCE_NOT_IN_SOURCE", "CHANGE_NEEDS_CONFIRMATION",
+  "DATA_REQUIRED", "DATA_WRONG_SHAPE", "INCOMPLETE_ANSWER", "TEXT_REQUIRED", "TEXT_TOO_LONG",
+  "UNKNOWN_OPTION", "CHOICE_REQUIRED", "OPTIONS_REQUIRED", "OTHER_TEXT_REQUIRED", "OTHER_NOT_ALLOWED",
+]);
+
 async function runInterpretPath(
   deps: TripBotPollerDeps,
   burst: { sessionId: string; chatId: string },
@@ -2409,8 +2632,39 @@ async function runInterpretPath(
   const interpretationId = claim.fresh ? claim.id : claim.row.id;
   let proposals: ProposedAnswer[];
   let malformed = 0;
+  let ops: Op[] | undefined;
+  let opsError: string | undefined;
+  let unclear: { questionId: string; why: string }[] = [];
 
-  if (!claim.fresh) {
+  // A TYPED CHANGE IS WAITING AND ITS PREVIEW IS ON SCREEN: a message that is
+  // nothing but a yes or a no answers IT. Exact and deterministic — no model —
+  // and only while the preview is what is on screen (`lastPrompt` is
+  // `pc:<id>`): a "yes" to any other question must never confirm a change, and
+  // the boundary reader is not asked, because the boundary is not on screen.
+  // Anything more than a bare yes or no ("yes, and add Nara", "no, make it 21")
+  // is interpreted and MERGED into the waiting change, never applied or dropped.
+  const waiting = session.ok ? await getOpenDraft(deps.db, burst.sessionId) : null;
+  if (waiting && session.ok && (session.view.lastPrompt ?? "").startsWith(`pc:${waiting.id}`)) {
+    const bare = bareReply(sourceText);
+    if (bare) {
+      await recordInterpretationResult(deps.db, interpretationId, { proposals: [], attempts: 0, durationMs: 0 });
+      await markInterpretationCommitted(deps.db, interpretationId, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
+      log(structuredLog("info", "interview.change_answered_in_words", { session_id: burst.sessionId, answer: bare }));
+      if (bare === "no") {
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel" }, deps.strings ?? DEFAULT_STRINGS, log);
+      } else if (confirmable(waiting)) {
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "apply" }, deps.strings ?? DEFAULT_STRINGS, log);
+      } else {
+        await showChangeDraft(deps, burst.chatId, session.view, waiting, uiString("change.stillBlocked", session.view.language));
+      }
+      return;
+    }
+  }
+
+  // The crash window: the model answered and the commit did not land. Its
+  // PROPOSALS were stored; its operations were not, so a stored reading with no
+  // proposals is asked again rather than resumed as "the model said nothing".
+  if (!claim.fresh && (claim.row.proposals.length > 0 || claim.row.failureReason)) {
     // The crash window: the model answered, the commit did not land. Resume
     // from what was stored rather than asking again — the answer is already
     // paid for and re-asking could return something different.
@@ -2468,16 +2722,23 @@ async function runInterpretPath(
       question_id: onScreen,
     }));
   } else {
+    // The stops and travellers already held, each under an id, so a CHANGE to
+    // either comes back as operations and not as a list (#206). Those two
+    // questions are not offered as plain corrections any more.
+    const held = recorded ? heldRefLists(recorded.answers) : { stops: [], travellers: [] };
     const result = await interpretBurst(deps.modelRunner, {
       sourceText,
       outstanding: state.outstanding,
       language,
       onScreen,
       messageIds,
+      heldLists: held,
       // What they have already told us, so "actually, it's only my wife" is
       // something the model can propose at all (2026-09-16).
       correctable: recorded
         ? buildRecap(recorded.answers, INTAKE_QUESTIONS, language)
+            .filter((entry) => !(entry.questionId === "phases" && held.stops.length > 0)
+              && !(entry.questionId === "travelers" && held.travellers.length > 0))
             .map((entry) => ({ id: entry.questionId, current: entry.answerLabel }))
         : [],
     });
@@ -2499,6 +2760,12 @@ async function runInterpretPath(
     }
     proposals = result.payload.proposals;
     malformed = result.payload.malformed;
+    // Validated here as well as in the parser: whatever a runner hands back, only
+    // operations that pass `parseOps` ever reach the store.
+    const checked = result.payload.ops === undefined ? null : parseOps(result.payload.ops);
+    ops = checked?.ok ? checked.ops : undefined;
+    opsError = checked && !checked.ok ? checked.error : result.payload.opsError;
+    unclear = result.payload.unclear;
     await recordInterpretationResult(deps.db, interpretationId, {
       proposals,
       attempts: result.attempts,
@@ -2527,10 +2794,13 @@ async function runInterpretPath(
     // the confidence floor must not send the router round again to ask it a
     // second time. See ApplyProposalsContext.pendingQuestionId.
     pendingQuestionId: onScreen,
+    // The stops and the travellers change only through the confirmed flow.
+    changeQuestions: CHANGE_QUESTIONS,
   });
 
   for (const accepted of decisions.accepted) {
-    // The MERGED answer, not the raw reading — see `submitArgsForAccepted`.
+    // The MERGED answer, not the raw reading — see `submitArgsForAccepted`. (The
+    // stops and travellers never reach here already answered: they are a change.)
     const args = submitArgsForAccepted(accepted);
     const written = await submitAnswerForChat(
       deps.db,
@@ -2601,6 +2871,74 @@ async function runInterpretPath(
     }
   }
   await markInterpretationCommitted(deps.db, interpretationId, storedOutcomes(decisions, malformed));
+
+  // A CHANGE TO THE STOPS OR THE TRAVELLERS: shown, never written. The operations
+  // go into the session's one waiting draft — merged with what is already
+  // waiting — and the organizer sees exactly what would change. The answers
+  // above (anything else the message said) were already written and read back.
+  // While a change is up the interview does not press on: what was on screen is
+  // remembered and comes back when the change is settled.
+  let draftShown = false;
+  if (ops && ops.length > 0 && session.ok) {
+    const proposed = await proposeChange(deps.db, {
+      sessionId: burst.sessionId,
+      tripId: session.view.tripId,
+      interpretationId,
+      ops,
+      displacedPrompt: (session.view.lastPrompt ?? "").startsWith("pc:") ? null : session.view.lastPrompt ?? null,
+    });
+    if (proposed.kind !== "no_session") {
+      const now = await getSessionForChat(deps.db, burst.chatId);
+      if (now.ok) draftShown = await showChangeDraft(deps, burst.chatId, now.view, proposed.draft);
+      log(structuredLog("info", "interview.change_proposed", {
+        session_id: burst.sessionId,
+        kind: proposed.kind,
+        ops: ops.length,
+        confirmable: confirmable(proposed.draft),
+        unresolved: proposed.draft.unresolved.length,
+        blocked: proposed.draft.blocked.length,
+      }));
+    }
+  }
+  if (draftShown) return;
+
+  // NEVER SILENT. A typed change to something already answered that the gate
+  // would not take — an unsure read, a quote that is not in the message, a value
+  // the writer refuses, operations that do not parse, a model that said it was
+  // unclear about the stops — is ASKED about, not dropped: dropped, the person
+  // is left believing it was recorded.
+  {
+    const covered = new Set((ops ?? []).map(questionOfOp));
+    const about = new Set<string>();
+    for (const r of decisions.rejected) {
+      if (state.answered.includes(r.questionId) && ASK_ABOUT_REFUSED.has(r.reason) && !covered.has(r.questionId as never)) {
+        about.add(r.questionId);
+      }
+    }
+    for (const u of unclear) {
+      if (CHANGE_QUESTIONS.includes(u.questionId) && state.answered.includes(u.questionId) && !covered.has(u.questionId as never)) {
+        about.add(u.questionId);
+      }
+    }
+    if (about.size > 0 || opsError) {
+      log(structuredLog("info", "interview.change_not_understood", {
+        session_id: burst.sessionId,
+        questions: [...about],
+        ops_error: opsError ? true : false,
+      }));
+      const now = await getSessionForChat(deps.db, burst.chatId);
+      if (now.ok && (await takeFloor(burst.chatId, now.view, deps))) {
+        const what = [...about].map((id) => questionNoun(id, now.view.language)).join(", ");
+        await deps.telegram.sendMessage({
+          chatId: burst.chatId,
+          text: what
+            ? uiString("change.notUnderstoodAbout", now.view.language).replace("{what}", what)
+            : uiString("change.notUnderstood", now.view.language),
+        });
+        return;
+      }
+    }
+  }
 
   // PACING. An OPTIONAL question that was on screen and did not get answered
   // is put behind us, so the interview moves to the next one.

@@ -32,6 +32,13 @@ import { INTAKE_QUESTIONS, organizerMatch, validateAnswer, type AnswerStore, typ
 export interface Ref {
   id?: string;
   name?: string;
+  /**
+   * SET BY THE ROUTER ONLY, never by the model: the person picked this entry
+   * from a list of candidates. It counts only while the entry at `index` still
+   * goes by `name` — a list that changed under a tap must not silently point at
+   * whoever sits at that position now.
+   */
+  pin?: { index: number; name: string };
 }
 
 export interface Fields {
@@ -54,13 +61,19 @@ export type Op =
   | { op: "update_stop"; target: Ref; fields: Fields }
   | { op: "add_traveller"; fields: Fields }
   | { op: "update_traveller"; target: Ref; fields: Fields }
-  | { op: "remove_traveller"; target: Ref };
+  | { op: "remove_traveller"; target: Ref }
+  /**
+   * The words honestly fit two or three different operations ("change Hakone to
+   * Nagoya": a rename, a replacement, or one more stop) and nothing settles
+   * which. The person is asked; their choice replaces this with that operation.
+   */
+  | { op: "choose"; options: Exclude<Op, { op: "choose" }>[] };
 
 export type Family = "stop" | "traveller";
 
 export const OP_NAMES = [
   "add_stop", "remove_stop", "rename_stop", "replace_stop", "move_stop", "update_stop",
-  "add_traveller", "update_traveller", "remove_traveller",
+  "add_traveller", "update_traveller", "remove_traveller", "choose",
 ] as const;
 
 const MAX_OPS = 20;
@@ -71,6 +84,11 @@ const ACCOMMODATION_KEYS = new Set(["name", "confirmation"]);
 
 export function familyOf(op: Op["op"]): Family {
   return op.endsWith("_traveller") ? "traveller" : "stop";
+}
+
+/** The question an operation is about. A choice is about what its options are about. */
+export function questionOfOp(op: Op): "phases" | "travelers" {
+  return questionOf(familyOf(op.op === "choose" ? op.options[0]!.op : op.op));
 }
 
 export function questionOf(family: Family): "phases" | "travelers" {
@@ -149,6 +167,7 @@ export function parseOps(raw: unknown): ParseResult {
     const name = item.op as Op["op"];
     if (!(OP_NAMES as readonly string[]).includes(name)) return { ok: false, error: `${where}: unknown operation ${String(item.op)}` };
     const allowedKeys: Record<Op["op"], string[]> = {
+      choose: ["options"],
       add_stop: ["fields", "after"], remove_stop: ["target"], rename_stop: ["target", "name"],
       replace_stop: ["target", "fields"], move_stop: ["target", "after", "before"], update_stop: ["target", "fields"],
       add_traveller: ["fields"], update_traveller: ["target", "fields"], remove_traveller: ["target"],
@@ -169,6 +188,17 @@ export function parseOps(raw: unknown): ParseResult {
     };
 
     switch (name) {
+      case "choose": {
+        if (!Array.isArray(item.options) || item.options.length < 2 || item.options.length > 3) {
+          return { ok: false, error: `${where}: a choice has two or three options` };
+        }
+        if (item.options.some((o) => isRecord(o) && o.op === "choose")) return { ok: false, error: `${where}: a choice cannot contain a choice` };
+        const inner = parseOps(item.options);
+        if (!inner.ok) return { ok: false, error: `${where}: ${inner.error}` };
+        if (new Set(inner.ops.map((o) => familyOf(o.op))).size !== 1) return { ok: false, error: `${where}: options must all be about stops, or all about travellers` };
+        ops.push({ op: "choose", options: inner.ops as Exclude<Op, { op: "choose" }>[] });
+        break;
+      }
       case "remove_stop":
       case "remove_traveller":
         ops.push({ op: name, target: target! });
@@ -266,6 +296,12 @@ export function resolveRef(list: readonly unknown[], ref: Ref, family: Family): 
     const index = Number(m[2]) - 1;
     return index >= 0 && index < list.length ? index : null;
   })();
+  if (ref.pin) {
+    const pinned = list[ref.pin.index];
+    if (pinned !== undefined && namesOf(pinned).some((n) => identityFold(n) === identityFold(ref.pin!.name))) {
+      return { kind: "resolved", index: ref.pin.index };
+    }
+  }
   const typed = ref.name === undefined ? [] : wordsOf(ref.name);
   if (typed.length === 0) return { kind: "unresolved", candidates: hinted === null ? [] : [hinted] };
 
@@ -391,9 +427,18 @@ export function applyOps(base: AnswerStore, ops: readonly Op[]): ApplyOutcome {
     }
   }
 
+  // An operation the words did not settle is a question, before anything else.
+  ops.forEach((op, opIndex) => {
+    if (op.op === "choose") {
+      blocked.push({ key: "blocked.chooseOne", params: { opIndex, options: op.options.map(optionSummary) } });
+    }
+  });
+  if (blocked.length > 0) return { ok: false, unresolved: [], blocked };
+
   // Resolve every reference first, against the held list.
   const resolved: Array<{ target?: number; after?: number; before?: number }> = ops.map(() => ({}));
   ops.forEach((op, opIndex) => {
+    if (op.op === "choose") return;
     const family = familyOf(op.op);
     const look = (role: Unresolved["role"], ref: Ref | undefined) => {
       if (!ref) return;
@@ -429,6 +474,7 @@ export function applyOps(base: AnswerStore, ops: readonly Op[]): ApplyOutcome {
   const find = (family: Family, origin: number): Item | undefined => work[family].find((i) => i.origin === origin);
 
   ops.forEach((op, opIndex) => {
+    if (op.op === "choose") return;
     const family = familyOf(op.op);
     touchedFamilies.add(family);
     const at = resolved[opIndex]!;
@@ -745,6 +791,7 @@ function describe(
  * that does not resolve keys on its folded words (the router asks about it).
  */
 function opKey(op: Op, base: AnswerStore): string {
+  if (op.op === "choose") return `choose:${canonical(op)}`;
   const family = familyOf(op.op);
   const list = listOf(base, questionOf(family));
   const of = (ref: Ref) => {
@@ -782,4 +829,87 @@ export function mergeOps(waiting: readonly Op[], incoming: readonly Op[], base: 
     }
   }
   return out;
+}
+
+// ── What a question to the person is about ───────────────────────────────────
+
+/** What one alternative of a `choose` amounts to, as data: the operation, what it names, and the new name. */
+function optionSummary(op: Exclude<Op, { op: "choose" }>): Param {
+  const from = "target" in op ? op.target.name ?? null : null;
+  const to = op.op === "rename_stop" ? op.name : "fields" in op ? op.fields.name ?? null : null;
+  return { op: op.op, from, to };
+}
+
+export type OpenQuestion =
+  | { kind: "choose"; opIndex: number; options: Array<{ op: string; from: string | null; to: string | null }> }
+  | { kind: "reference"; unresolved: Unresolved }
+  | null;
+
+/** The one thing a draft is asking, first — a choice before a reference. */
+export function openQuestion(draft: { unresolved: readonly Unresolved[]; blocked: readonly Line[] }): OpenQuestion {
+  const choose = draft.blocked.find((l) => l.key === "blocked.chooseOne");
+  if (choose) {
+    return { kind: "choose", opIndex: Number(choose.params.opIndex), options: choose.params.options as never };
+  }
+  const first = draft.unresolved[0];
+  return first ? { kind: "reference", unresolved: first } : null;
+}
+
+/**
+ * The operations after the person's answer to `openQuestion`: option `k` of a
+ * choice replaces it; candidate `k` of a reference is PINNED onto that
+ * reference. Null when `k` names nothing — a stale or forged tap changes nothing.
+ */
+export function applyPick(
+  ops: readonly Op[],
+  draft: { unresolved: readonly Unresolved[]; blocked: readonly Line[] },
+  held: AnswerStore,
+  k: number,
+): Op[] | null {
+  const open = openQuestion(draft);
+  if (!open || !Number.isInteger(k) || k < 0) return null;
+  if (open.kind === "choose") {
+    const chosen = (ops[open.opIndex] as Extract<Op, { op: "choose" }> | undefined)?.options?.[k];
+    if (!chosen) return null;
+    return ops.map((op, i) => (i === open.opIndex ? chosen : op));
+  }
+  const { opIndex, role, family, candidates } = open.unresolved;
+  const index = candidates[k];
+  const entry = index === undefined ? undefined : listOf(held, questionOf(family))[index];
+  const name = entry === undefined ? undefined : namesOf(entry)[0];
+  if (index === undefined || name === undefined) return null;
+  const target = ops[opIndex];
+  if (!target || target.op === "choose" || !(role in target)) return null;
+  return ops.map((op, i) => (i === opIndex ? { ...op, [role]: { name, pin: { index, name } } } as Op : op));
+}
+
+// ── What the model is shown ──────────────────────────────────────────────────
+
+export interface HeldItem {
+  id: string;
+  label: string;
+}
+
+/**
+ * The held stops and travellers, each under the id the model may quote back.
+ * Whole lists, never cut: a later stop the model cannot see is a stop it cannot
+ * change (the 160-character recap it was shown before hid them).
+ */
+export function heldRefLists(answers: AnswerStore): { stops: HeldItem[]; travellers: HeldItem[] } {
+  const label = (entry: Entry) => {
+    const names = namesOf(entry);
+    const name = names.length > 1 && names[0] !== names[1] ? `${names[0]} (${names[1]})` : names[0] ?? "?";
+    const bits: string[] = [];
+    if (typeof entry.start === "string" || typeof entry.end === "string") {
+      bits.push(`${typeof entry.start === "string" ? entry.start : "?"} to ${typeof entry.end === "string" ? entry.end : "?"}`);
+    }
+    if (typeof entry.age === "number") bits.push(`age ${entry.age}`);
+    return bits.length > 0 ? `${name}, ${bits.join(", ")}` : `${name}, no dates`;
+  };
+  const of = (questionId: string, family: Family): HeldItem[] =>
+    (listOf(answers, questionId).filter(isRecord) as Entry[]).map((entry, i) => ({
+      id: refId(family, i),
+      label: family === "traveller" && typeof entry.start !== "string" ? label(entry).replace(", no dates", "") : label(entry),
+    }));
+  return { stops: of("phases", "stop"), travellers: of("travelers", "traveller") };
 }

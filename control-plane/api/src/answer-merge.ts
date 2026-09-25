@@ -127,13 +127,6 @@ export interface MergeOptions {
    * names — see `samePerson` — rather than as place or booking names.
    */
   people?: boolean;
-  /**
-   * The list holds STOPS (`phases`), so an entry marked `additional_visit` is a
-   * second visit rather than the dates of a stop already held. Off for every
-   * other list: a spurious marker on a traveller, a hotel or an attraction is
-   * ignored, never a reason to duplicate the entry.
-   */
-  visits?: boolean;
 }
 
 /** Titles and passenger codes travel documents print beside a name. */
@@ -279,11 +272,6 @@ export function matchEntry(
   const type = typeOf(incoming);
   const ref = referenceOf(incoming);
   const candidates: number[] = [];
-  // A marked entry is a second visit unless a held entry is DATED and is that
-  // very visit: an undated held stop is the first visit, never this one.
-  const additional = options.visits === true && isAdditionalVisit(incoming);
-  const visitAgrees = (a: Record<string, unknown>, b: Record<string, unknown>) =>
-    additional ? startOf(a) !== null && startOf(b) !== null && sameVisit(a, b) : sameVisit(a, b);
 
   for (let i = 0; i < limit; i += 1) {
     const candidate = held[i];
@@ -296,11 +284,11 @@ export function matchEntry(
       if (SEGMENT_TYPES.has(type)) {
         agrees = namesAgree(candidate, incoming, options) || (startOf(candidate) !== null && startOf(candidate) === startOf(incoming));
       } else if (type === "hotel") {
-        agrees = visitAgrees(candidate, incoming);
+        agrees = sameVisit(candidate, incoming);
       } else {
         agrees =
           (nameOf(candidate) === null || nameOf(incoming) === null || namesAgree(candidate, incoming, options)) &&
-          visitAgrees(candidate, incoming);
+          sameVisit(candidate, incoming);
       }
       if (agrees) candidates.push(i);
       continue;
@@ -310,7 +298,7 @@ export function matchEntry(
       if (canonical(candidate) === canonical(incoming)) candidates.push(i);
       continue;
     }
-    if (namesAgree(candidate, incoming, options) && visitAgrees(candidate, incoming)) candidates.push(i);
+    if (namesAgree(candidate, incoming, options) && sameVisit(candidate, incoming)) candidates.push(i);
   }
 
   if (candidates.length === 0) return { kind: "new" };
@@ -680,27 +668,20 @@ export function applyConflictChoice(
   return ordered(out);
 }
 
-// ── The additional-visit marker ──────────────────────────────────────────────
+// ── A leftover marker ────────────────────────────────────────────────────────
 
 /**
- * An entry the organizer's own words called an ADDITIONAL visit ("another three
- * days at the end for Tokyo"). The entries alone cannot say whether new dates for
- * a city are its first stay's dates or a second stay — an undated held stop
- * "has nothing to contradict" them — so the words decide, and the interpreter
- * sets this only when they say so (#114 problem 5). Bounded, optional model
- * output; never stored (`stripVisitMarkers`).
+ * The key an earlier version of the interpreter asked the model to put on a stop
+ * that was an additional visit (#114). #206 replaced that with the `add_stop`
+ * operation, so nothing sets it any more; it is still STRIPPED at the one gate
+ * every write passes (`validateAnswer`), for one release, so a stored proposal or
+ * a reply from a model that has not caught up cannot leave it in an answer.
  */
 export const ADDITIONAL_VISIT = "additional_visit";
 
-function isAdditionalVisit(entry: Record<string, unknown>): boolean {
-  return entry[ADDITIONAL_VISIT] === true;
-}
-
 /**
- * The answer with the additional-visit marker removed from each entry of a list
- * (or from the answer itself, if it is one entry). It looks at an entry's own top
- * level only: the marker is asked for on a stop, never inside one, so a field
- * nested in a stop's `venues` is not the interpreter's contract and is not touched.
+ * The answer with that key removed from each entry of a list (or from the answer
+ * itself, if it is one entry). It looks at an entry's own top level only.
  */
 export function stripVisitMarkers(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripVisitMarkers);

@@ -14,7 +14,7 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
 import type { AnswerStore, IntakeAnswer } from "./interview.js";
-import { applyOps, familyOf, mergeOps, questionOf, type Line, type Op, type Unresolved } from "./typed-changes.js";
+import { applyOps, applyPick, mergeOps, questionOfOp, type Line, type Op, type Unresolved } from "./typed-changes.js";
 
 type Db = Pick<pg.Pool, "connect" | "query">;
 
@@ -75,7 +75,7 @@ export function draftStateFor(held: AnswerStore, ops: readonly Op[]) {
   const outcome = applyOps(held, ops);
   const questions = outcome.ok
     ? outcome.touched
-    : [...new Set(ops.map((op) => questionOf(familyOf(op.op))))];
+    : [...new Set(ops.map(questionOfOp))];
   const base: Draft["base"] = {};
   for (const questionId of questions) base[questionId] = held[questionId] ?? null;
   return outcome.ok
@@ -229,6 +229,49 @@ export async function rebuildDraft(db: Db, input: { draftId: string; sessionId: 
       RETURNING ${COLUMNS}`,
       [input.draftId, JSON.stringify(state.base), JSON.stringify(state.result), JSON.stringify(state.preview),
         JSON.stringify(state.unresolved), JSON.stringify(state.blocked)],
+    );
+    await client.query("COMMIT");
+    return toDraft(updated.rows[0]!);
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * The person's answer to what the draft is asking — option `k` of a choice, or
+ * candidate `k` of an ambiguous reference — folded into the draft's operations,
+ * and everything recomputed against what is held now. Null when the session has
+ * no such open draft, or `k` names nothing.
+ */
+export async function pickForDraft(
+  db: Db,
+  input: { draftId: string; sessionId: string; k: number },
+): Promise<Draft | null> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const held = await lockedAnswers(client, input.sessionId);
+    if (!held) { await client.query("ROLLBACK"); return null; }
+    const open = await client.query<DraftRow>(
+      `SELECT ${COLUMNS} FROM control_plane.intake_pending_changes
+        WHERE id = $1 AND session_id = $2 AND status = 'pending' FOR UPDATE`,
+      [input.draftId, input.sessionId],
+    );
+    const row = open.rows[0];
+    const ops = row ? applyPick(row.ops, row, held, input.k) : null;
+    if (!row || !ops) { await client.query("ROLLBACK"); return null; }
+    const state = draftStateFor(held, ops);
+    const updated = await client.query<DraftRow>(
+      `UPDATE control_plane.intake_pending_changes
+          SET ops = $2::jsonb, base = $3::jsonb, result = $4::jsonb, preview = $5::jsonb,
+              unresolved = $6::jsonb, blocked = $7::jsonb, updated_at = now()
+        WHERE id = $1
+      RETURNING ${COLUMNS}`,
+      [row.id, JSON.stringify(ops), JSON.stringify(state.base), JSON.stringify(state.result),
+        JSON.stringify(state.preview), JSON.stringify(state.unresolved), JSON.stringify(state.blocked)],
     );
     await client.query("COMMIT");
     return toDraft(updated.rows[0]!);

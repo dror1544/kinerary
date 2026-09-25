@@ -9,6 +9,7 @@ import {
   exampleEchoes,
   extractIntakeFromDocument,
   interpretBurst,
+  INTERPRET_OUTPUT_SCHEMA,
   parseInterpretPayload,
   submitArgsForAccepted,
   storedOutcomes,
@@ -1449,74 +1450,99 @@ describe("reading the boundary", () => {
   });
 });
 
-// #114 problem 5: the typed-message path. The model's reading carries the
-// additional-visit marker only when the organizer said the visit is in addition
-// to one already given. Models are faked; the reading is parsed and gated as live.
-describe("a return leg said in a typed message (#114)", () => {
+// #206: a change to held stops or travellers comes back as OPERATIONS, and the
+// gate never writes such a change from a proposal.
+describe("operations from the interpreter (#206)", () => {
   const STOPS_Q: IntakeQuestion[] = [
     ...QUESTIONS,
     { id: "phases", type: "structured", prompt: "Stops?", required: true, dataShape: "array" },
+    { id: "travelers2", type: "structured", prompt: "Who?", required: false, dataShape: "array" },
   ];
-  const heldStops = { kind: "structured", schema_version: 3, data: [{ name: "Tokyo" }, { name: "Hakone" }, { name: "Kyoto" }] } as never;
-  const decide = (text: string, entry: Record<string, unknown>) => {
-    const parsed = parseInterpretPayload({
-      proposals: [{ questionId: "phases", confidence: 0.9, evidence: text, value: { kind: "structured", dataJson: JSON.stringify([entry]) } }],
-      unclear: [],
-    }, ["101"])!;
-    return applyProposals(parsed.proposals, {
-      sourceText: text, outstanding: [], answered: ["phases"], answers: { phases: heldStops },
-      allowCorrections: true, questions: STOPS_Q,
-    } as never);
+  const held = {
+    stops: [{ id: "s1", label: "Tokyo, 2026-09-19 to 2026-09-24" }, { id: "s2", label: "Kyoto, no dates" }],
+    travellers: [{ id: "t1", label: "Ruth Cohen, age 70" }],
   };
-  const stops = (d: ReturnType<typeof applyProposals>) => (d.accepted[0]?.answer as { data: { name: string; start?: string }[] }).data;
+  const prompt = (heldLists?: typeof held) =>
+    buildInterpretPrompt({ language: "en", outstanding: ["phases"], sourceText: "x", questions: STOPS_Q, heldLists });
 
-  test("with the marker, Tokyo is added as a second stop and the first stays undated; no marker is stored", () => {
-    const text = "another three days at the end for Tokyo, 30 September to 3 October";
-    const d = decide(text, { name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true });
-    assert.equal(d.accepted.length, 1);
-    const tokyos = stops(d).filter((s) => s.name === "Tokyo");
-    assert.equal(tokyos.length, 2);
-    assert.equal(tokyos.filter((s) => s.start === undefined).length, 1);
-    assert.doesNotMatch(JSON.stringify(d.accepted[0]?.answer), /additional_visit/);
+  test("the prompt shows the held lists WITH ids, in full, and asks for operations, never a list", () => {
+    const p = prompt(held);
+    for (const line of ["- s1: Tokyo, 2026-09-19 to 2026-09-24", "- s2: Kyoto, no dates", "- t1: Ruth Cohen, age 70"]) {
+      assert.ok(p.includes(line), line);
+    }
+    assert.match(p, /do NOT\s+propose the "phases" or "travelers" question and do NOT write out a list/);
+    assert.match(p, /"opsJson"/);
+    assert.match(p, /,"opsJson":null\}/, "the return shape names opsJson");
   });
 
-  test("without the marker, the dates fill the one Tokyo", () => {
-    const text = "Tokyo, 19 to 24 September";
-    const d = decide(text, { name: "Tokyo", start: "2026-09-19", end: "2026-09-24" });
-    const tokyos = stops(d).filter((s) => s.name === "Tokyo");
-    assert.equal(tokyos.length, 1);
-    assert.equal(tokyos[0]!.start, "2026-09-19");
+  test("every operation is taught, with a worked example in English and in Hebrew", () => {
+    const p = prompt(held);
+    for (const op of ["add_stop", "update_stop", "remove_stop", "rename_stop", "replace_stop", "move_stop", "add_traveller", "update_traveller", "remove_traveller", "choose"]) {
+      assert.ok(p.includes(`"op":"${op}"`), `${op} is shown in an example`);
+    }
+    assert.match(p, /another three days\s+at the end for Tokyo/);
+    assert.match(p, /A RETURN to a place that is\s+already listed is add_stop — never update_stop/);
+    assert.match(p, /"op":"choose"[\s\S]*rename_stop[\s\S]*replace_stop[\s\S]*add_stop/, "the rename / replace / add ambiguity is worked");
+    assert.match(p, /two Ruths|there may be two Ruths/);
+    assert.match(p, /טוקיו זה מה-20 עד ה-25 בספטמבר/);
+    assert.match(p, /עוד שלושה ימים בסוף בטוקיו/);
+    assert.match(p, /never copy their names, dates or ages/);
+    assert.doesNotMatch(p, /additional_visit":\s*true/, "the round-2 marker is no longer asked for");
   });
 
-  test("the conversational prompt teaches the marker", () => {
-    const p = buildInterpretPrompt({ language: "en", outstanding: ["phases"], sourceText: "x", questions: STOPS_Q });
-    assert.match(p, /additional_visit/);
+  test("with nothing held there is no operations section, and the return shape is as before", () => {
+    for (const p of [prompt(), prompt({ stops: [], travellers: [] })]) {
+      assert.doesNotMatch(p, /CHANGES TO STOPS OR TRAVELLERS/);
+      assert.doesNotMatch(p, /opsJson/);
+    }
   });
 
-  test("a hesitant read is offered as a suggestion without the marker", () => {
-    const parsed = parseInterpretPayload({
-      proposals: [{
-        questionId: "phases", confidence: 0.4, evidence: "Tokyo again, 30 September to 3 October",
-        value: { kind: "structured", dataJson: JSON.stringify([{ name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true }]) },
-      }],
-      unclear: [],
-    }, ["101"])!;
-    const d = applyProposals(parsed.proposals, {
-      sourceText: "Tokyo again, 30 September to 3 October", outstanding: ["phases"], answered: [], questions: STOPS_Q,
-    } as never);
-    assert.equal(d.suggested.length, 1);
-    assert.doesNotMatch(JSON.stringify(d.suggested[0]), /additional_visit/);
+  test("the provider schema carries opsJson, required and nullable", () => {
+    const s = INTERPRET_OUTPUT_SCHEMA as { required: string[]; properties: Record<string, { type?: unknown }> };
+    assert.ok(s.required.includes("opsJson"));
+    assert.deepEqual(s.properties.opsJson?.type, ["string", "null"]);
   });
 
-  test("submitArgsForAccepted writes the merged answer for a list, and the proposal's own value otherwise", () => {
-    const text = "another three days at the end for Tokyo, 30 September to 3 October";
-    const d = decide(text, { name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true });
-    const args = submitArgsForAccepted(d.accepted[0]!);
-    assert.equal((args.structuredData as unknown[]).length, 4, "the three held stops plus the new one");
-    assert.doesNotMatch(JSON.stringify(args), /additional_visit/);
+  test("parse: operations as an array, or as a string of JSON, arrive typed; bad ones refuse ALL of them", () => {
+    const ops = [{ op: "update_traveller", target: { name: "Ruth" }, fields: { age: 71 } }];
+    assert.deepEqual(parseInterpretPayload({ proposals: [], unclear: [], ops })?.ops, ops);
+    assert.deepEqual(parseInterpretPayload({ proposals: [], unclear: [], opsJson: JSON.stringify(ops) })?.ops, ops);
+    assert.equal(parseInterpretPayload({ proposals: [], unclear: [], opsJson: null })?.ops, undefined);
+    for (const bad of [[{ op: "delete_everything" }], [{ op: "remove_stop", target: { name: "Kyoto" } }, { op: "nope" }], "remove Kyoto"]) {
+      const parsed = parseInterpretPayload({ proposals: [], unclear: [], ops: bad })!;
+      assert.equal(parsed.ops, undefined, JSON.stringify(bad));
+      assert.ok(parsed.opsError, JSON.stringify(bad));
+    }
   });
 
-  test("validateAnswer strips the marker whatever path proposed the data", () => {
+  test("a proposal to REPLACE held stops or travellers is refused whatever its confidence; the first answer is not", () => {
+    const answered = { phases: { kind: "structured", schema_version: 3, data: [{ name: "Tokyo" }] } } as never;
+    const proposalFor = () => proposal({
+      questionId: "phases", confidence: 0.99, evidence: "Tokyo",
+      value: { kind: "structured", data: [{ name: "Tokyo", start: "2026-09-20", end: "2026-09-25" }] } as never,
+    });
+    const ctx = { sourceText: "Tokyo", outstanding: [], answered: ["phases"], allowCorrections: true, questions: STOPS_Q, answers: answered, changeQuestions: ["phases", "travelers"] } as never;
+    const refused = applyProposals([proposalFor()], ctx);
+    assert.equal(refused.accepted.length, 0);
+    assert.equal(refused.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION");
+    const first = applyProposals([proposalFor()], { ...(ctx as object), answered: [], outstanding: ["phases"], answers: {} } as never);
+    assert.equal(first.accepted.length, 1, "unanswered, it is the first answer");
+    const document = applyProposals([proposalFor()], { ...(ctx as object), allowCorrections: false, held: answered } as never);
+    assert.notEqual(document.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION", "a document reconciles through `held`, as before");
+  });
+
+  test("another structured list (bookings) still merges into what is held and is written merged", () => {
+    const anchors = [{ type: "hotel", name: "Gion Inn", date: "2026-09-25", confirmation: "GI-77" }];
+    const Q: IntakeQuestion[] = [...QUESTIONS, { id: "travel_anchors", type: "structured", prompt: "Bookings?", required: false, dataShape: "array" }];
+    const d = applyProposals(
+      [proposal({ questionId: "travel_anchors", value: { kind: "structured", data: [{ type: "flight", name: "LY381", date: "2026-09-19" }] } as never, evidence: "LY381" })],
+      { sourceText: "LY381", outstanding: [], answered: ["travel_anchors"], allowCorrections: true, questions: Q, answers: { travel_anchors: { kind: "structured", schema_version: 3, data: anchors } }, changeQuestions: ["phases", "travelers"] } as never,
+    );
+    assert.equal(submitArgsForAccepted(d.accepted[0]!).structuredData instanceof Array, true);
+    assert.equal((submitArgsForAccepted(d.accepted[0]!).structuredData as unknown[]).length, 2, "the held booking is kept");
+  });
+
+  test("validateAnswer still strips a leftover additional_visit key, whatever path proposed the data", () => {
     const v = validateAnswer("phases", null, null, STOPS_Q, [{ name: "Tokyo", additional_visit: true }]);
     assert.ok(v.ok);
     assert.doesNotMatch(JSON.stringify(v), /additional_visit/);
