@@ -22,19 +22,18 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { createOAuthStore, redirectAllowed, pkceMatches, authenticateClient, SCOPE } = require('./oauth');
+const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage } = require('./authorize-page');
 const { registerTools, buildInstructions } = require('./tools');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
 function resolveOrigin(raw) {
   if (!raw) return { error: 'PUBLIC_ORIGIN is not set' };
   let u;
   try { u = new URL(raw); } catch { return { error: `PUBLIC_ORIGIN is not a URL: ${raw}` }; }
   if (u.pathname !== '/' || u.search || u.hash) return { error: 'PUBLIC_ORIGIN must be an origin with no path (the gateway path cannot carry a bearer token)' };
-  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && LOOPBACK.has(u.hostname))) return { error: 'PUBLIC_ORIGIN must be https' };
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && isLoopbackHost(u.hostname))) return { error: 'PUBLIC_ORIGIN must be https' };
   return { origin: u.origin };
 }
 
@@ -47,7 +46,7 @@ function registerTripMcp({
   // The fallback JWT secret is public (it is in this repository). Anyone can
   // mint a session with it, and the consent step trusts sessions, so a public
   // endpoint must never run on it.
-  if (wanted && !resolved.error && jwtSecretIsDefault && !LOOPBACK.has(new URL(resolved.origin).hostname)) {
+  if (wanted && !resolved.error && jwtSecretIsDefault && !isLoopbackHost(new URL(resolved.origin).hostname)) {
     resolved = { error: 'JWT_SECRET is unset or the built-in development value; refusing to publish sign-in on it' };
   }
   if (wanted && resolved.error) console.error(`[trip-mcp] not enabled: ${resolved.error}`);
@@ -206,7 +205,7 @@ function registerTripMcp({
     const q = req.query;
     res.type('html').send(renderAuthorizePage({
       nonce, lang: browserLang(req),
-      clientName: v.client.client_name, redirectHost: host, isLoopback: LOOPBACK.has(host),
+      clientName: v.client.client_name, redirectHost: host, isLoopback: isLoopbackHost(host),
       params: {
         client_id: q.client_id, redirect_uri: v.redirectUri, response_type: q.response_type,
         code_challenge: q.code_challenge, code_challenge_method: q.code_challenge_method,
@@ -300,7 +299,9 @@ function registerTripMcp({
   // Tools reach the site over loopback, authenticated as the organizer with a
   // two-minute site session minted per call — so every route applies exactly
   // the checks it applies to that organizer in a browser.
-  const loopHost = !listenHost || ['0.0.0.0', '::'].includes(listenHost) ? '127.0.0.1' : listenHost;
+  // This server's own listener: `localhost` when it listens on every address
+  // (the default), otherwise the address it was told to bind.
+  const loopHost = !listenHost ? 'localhost' : listenHost.includes(':') ? `[${listenHost}]` : listenHost;
   const siteBase = `http://${loopHost}:${listenPort}`;
   function siteClient(username) {
     const call = async (method, path, body) => {

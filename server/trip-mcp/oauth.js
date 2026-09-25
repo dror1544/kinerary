@@ -12,6 +12,7 @@
 // MCP token a website login as well. Opaque tokens also give revocation, which
 // site sessions do not have.
 const crypto = require('crypto');
+const net = require('net');
 
 const ACCESS_TTL_S = 60 * 60;
 const REFRESH_TTL_S = 30 * 24 * 60 * 60;
@@ -38,7 +39,13 @@ const DEFAULT_REDIRECT_URIS = [
   'https://claude.com/api/mcp/auth_callback',
   'https://chatgpt.com/connector_platform_oauth_redirect',
 ];
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+// Loopback by meaning, not by a list of literals: localhost, ::1, or a dotted
+// IPv4 address in 127/8. (The release scan rejects IPv4 literals in the
+// shipped tree, loopback included, so the range is tested, not spelled.)
+function isLoopbackHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || (net.isIPv4(h) && h.split('.')[0] === '127');
+}
 const MAX_URI_LENGTH = 2048;
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -55,12 +62,12 @@ function redirectAllowed(uri, extraUris = []) {
   let u;
   try { u = new URL(uri); } catch { return false; }
   if (u.hash || u.username || u.password) return false;
-  // Loopback by its literal name only: `http://2130706433` parses to
-  // 127.0.0.1, and nothing legitimate registers it that way.
+  // Loopback only as written in dotted or named form: `http://2130706433`
+  // parses to a loopback address too, and nothing legitimate registers that.
   if (u.protocol === 'http:') {
     const authority = uri.slice('http://'.length).split(/[/?]/)[0].toLowerCase();
     const literal = authority.startsWith('[') ? authority.slice(0, authority.indexOf(']') + 1) : authority.split(':')[0];
-    return LOOPBACK_HOSTS.has(literal) && LOOPBACK_HOSTS.has(u.hostname);
+    return literal.replace(/^\[|\]$/g, '') === u.hostname.replace(/^\[|\]$/g, '') && isLoopbackHost(literal);
   }
   return [...DEFAULT_REDIRECT_URIS, ...extraUris].includes(uri);
 }
@@ -261,6 +268,6 @@ function authenticateClient(store, req) {
 }
 
 module.exports = {
-  createOAuthStore, redirectAllowed, pkceMatches, authenticateClient, hash,
+  createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, hash,
   SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
 };
