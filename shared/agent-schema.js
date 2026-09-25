@@ -12,6 +12,8 @@
 // who the organizer is, which proactive messages this family opted into, and
 // the standing instructions specific to these people.
 
+const allow = require('./allow-list');
+
 const AGENT_TONES     = ['warm', 'playful', 'dry'];
 // Grammatical, not social. Hebrew conjugates verbs by gender, so the bot
 // literally cannot form a sentence without knowing which to use — this is a
@@ -73,25 +75,71 @@ function normalizeOrganizers(agent) {
   return [];
 }
 
-// The public view of the agent block: persona survives, organizer-only
-// standing instructions are removed entirely. Returns undefined for a missing
-// block so callers can leave the key off the payload rather than emit an
-// empty object (an empty `agent: {}` would itself signal "this trip has a bot
-// with instructions you can't see").
+// The public view of the agent block is an ALLOW-list (issue #172). Until
+// 2026-09-25 this deep-copied the block and fixed up tone, gender and the
+// standing instructions, so any other key anyone ever wrote into `agent` —
+// an internal profile name, a key, a note — was served to every family member.
+// Now only the keys below are served; anything else is dropped and reported
+// (see shared/allow-list.js).
+//
+// These are the keys the scaffolder's _derive_agent() writes plus the legacy
+// single `organizer`. What they are FOR on the public read path: `name` /
+// `name_en` are what the site calls the bot (trip-web App.tsx); the rest is
+// the persona the old deny-list already served and GET /api/config's tests
+// pin (gender survives because Hebrew needs it to conjugate). Anything
+// organizer-only belongs in GET /api/agent/brief, never here.
+const INSTRUCTION_PUBLIC = allow.object({ visibility: allow.scalar, text: allow.text });
+const AGENT_PUBLIC_FIELDS = {
+  name: allow.scalar,
+  name_en: allow.scalar,
+  // Normalized, never raw: an unrecognized value becomes the default, so a
+  // typo cannot put an arbitrary author-chosen string on the wire.
+  tone: allow.custom(v => normalizeTone(v)),
+  gender: allow.custom(v => normalizeGender(v)),
+  default_language: allow.scalar,
+  timezone: allow.scalar,
+  organizer: allow.scalar,
+  organizers: allow.list(allow.scalar),
+  // A closed set in the schema already (PROACTIVE_KEYS); an unknown key is a
+  // typo the boot warning reports, and is not served.
+  proactive: allow.object(Object.fromEntries(PROACTIVE_KEYS.map(k => [k, allow.scalar]))),
+  // Group-visible instructions only. An organizer-only one is WITHHELD — known
+  // and kept back on purpose — and a zero-length list drops its key: an empty
+  // array tells a reader that hidden instructions exist.
+  standing_instructions: allow.custom((value, report, path) => {
+    if (!Array.isArray(value)) { report.dropped.push(path); return allow.OMIT; }
+    const visible = [];
+    value.forEach((raw, i) => {
+      const at = `${path}[${i}]`;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { report.dropped.push(at); return; }
+      // Read once: the visibility that decides is the visibility that is
+      // served (see the same rule in config-visibility.js's needs).
+      const ins = allow.snapshot(raw);
+      if (normalizeInstructionVisibility(ins.visibility) === 'organizer') { report.withheld.push(at); return; }
+      const v = allow.project(ins, INSTRUCTION_PUBLIC, report, at);
+      if (v !== allow.OMIT) visible.push(v);
+    });
+    return visible.length ? visible : allow.OMIT;
+  }),
+};
+const AGENT_PUBLIC = allow.object(AGENT_PUBLIC_FIELDS);
+
+// Returns undefined for a missing block so callers can leave the key off the
+// payload rather than emit an empty object (an empty `agent: {}` would itself
+// signal "this trip has a bot with instructions you can't see").
+function projectAgent(agent, report = allow.newReport(), path = 'agent') {
+  if (!agent || typeof agent !== 'object' || Array.isArray(agent)) return undefined;
+  const a = allow.snapshot(agent);
+  const out = allow.project(a, AGENT_PUBLIC, report, path);
+  // tone and gender are always present on the public view, as they always
+  // were: a renderer never has to guess the default.
+  out.tone = normalizeTone(a.tone);
+  out.gender = normalizeGender(a.gender);
+  return out;
+}
+
 function publicAgent(agent) {
-  if (!agent || typeof agent !== 'object') return undefined;
-  const safe = JSON.parse(JSON.stringify(agent));
-  safe.tone   = normalizeTone(safe.tone);
-  safe.gender = normalizeGender(safe.gender);
-  if (Array.isArray(safe.standing_instructions)) {
-    const visible = safe.standing_instructions
-      .filter(i => normalizeInstructionVisibility(i.visibility) !== 'organizer');
-    // Same reasoning as the empty-object case above: a zero-length array tells
-    // a reader that hidden instructions exist. Drop the key instead.
-    if (visible.length) safe.standing_instructions = visible;
-    else delete safe.standing_instructions;
-  }
-  return safe;
+  return projectAgent(agent);
 }
 
 module.exports = {
@@ -104,5 +152,6 @@ module.exports = {
   normalizeTone,
   normalizeGender,
   normalizeOrganizers,
+  projectAgent,
   publicAgent,
 };
