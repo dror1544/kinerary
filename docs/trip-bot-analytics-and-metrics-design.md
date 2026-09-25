@@ -990,15 +990,19 @@ the setting unset the same week writes nothing.
   brief: the DB-backed test files reset with `DROP SCHEMA IF EXISTS
   control_plane CASCADE`, and a second schema would survive every reset.
 - **Unaddressed group messages are stored per message, as metadata only.** This
-  is the manager's *recommendation*, **pending Dror's confirmation** — not his
-  decision. His stated purpose is ambient listening to understand what a family
+  was the manager's recommendation and is now **confirmed by the owner
+  (Dror) on 2026-09-25 for the MVP** (family and friends); source: his
+  2026-09-25 comment on issue #177. His stated purpose is ambient listening to understand what a family
   needs and possibly intervene later. The reason recorded for per-message rows
   over aggregate-only counters is that aggregates cannot be re-cut later and
-  any proactive behaviour needs sequence and timing. It is safe to build
+  any proactive behaviour needs sequence and timing. It was safe to build
   because the emitter is off. It is the most sensitive signal in the slice —
-  *when a family talks among themselves*. The recommended stance is: allowed
-  columns only those in the table, retention 90 days (§10's lower bound). It
-  must be confirmed before enabling on any real family's group.
+  *when a family talks among themselves*. The confirmed stance is: allowed
+  columns only those in the table, retention 90 days (§10's lower bound). The
+  **family notice is deferred to full production** (owner decision, same
+  comment; tracked in #186); the MVP families are covered by the existing
+  alpha-tester consent. Confirmation of the stance does not enable anything:
+  the preconditions in §16.7 still stand.
 
 ### 16.4 Events: one per observed fact
 
@@ -1148,43 +1152,58 @@ comment in `analytics/emitter.ts` says the same.
 
 ### 16.7 Carry-forward
 
-Preconditions for enabling, and open items for later slices:
+The owner confirmed the metadata stance for the MVP on 2026-09-25 (§16.3) and
+deferred the family notice to full production (#186). The preconditions that
+still stand before recording is switched on anywhere (from the
+`regression-planner` and the reviews, as listed in #177's 2026-09-25 comment;
+enabling goes to the Mac first, then production, as decided there):
 
-1. **Schedule `purgeExpiredEvents`.** A precondition for enabling in
-   production (§10 requires deletion jobs). Not scheduled by this slice.
-2. **Confirm the metadata stance** (§16.3) with Dror — per-message rows for
-   unaddressed group messages, the allowed columns, 90-day retention — before
-   enabling on any real family's group.
-3. **Family notice / consent step** before it is enabled on any real family's
-   group. Not designed here.
-4. **`turn_id` for the Hermes slice** — keyed derivation over profile, chat and
+1. **Schedule `purgeExpiredEvents`.** A precondition for enabling
+   (§10 requires deletion jobs). Not scheduled by this slice.
+2. **Tests the planner named:** a boot test for `relay/server.ts`;
+   `handedOff(delivered=false)` through `applyDecision`; the connector's
+   `suppressed` and `{ok:false}` branches; the `runDocumentCorrection`
+   outcomes other than `failed_tool`, and the correction chain's catch path.
+3. **#178:** the dispatch-built `document_correction` descriptor is
+   unreachable today (see §16.1).
+4. **The compose `environment:` pass-through is a deploy decision.**
+   `ASSISTANT_EVENTS_ENABLED` is not in the compose relay `environment:` list,
+   so setting it in an env file does not reach the process; turning it on means
+   changing the deployment's configuration and restarting the relay, which is a
+   hard-rule-2 action. A boot check that the restart scripts do not enable
+   recording silently is also owed.
+5. **The Mac staging database has no timestamped migrations applied**, so a
+   rehearsal there needs it migrated first.
+6. **Metadata stance: confirmed for the MVP** (§16.3) — no longer open.
+7. **Family notice / consent / opt-out: deferred to full production, #186.**
+   Not an MVP precondition. Not designed here.
+
+Open items for later slices:
+
+8. **`turn_id` for the Hermes slice** — keyed derivation over profile, chat and
    message id with a shared secret, versus a relay-stamped wire field — is
    decided by that slice after inspecting the deployed `pre_gateway_dispatch`
    payload (§4.1). Until then the relay's `turn_id` cannot be joined to Hermes
    events.
-5. **Keyed pseudonyms and content fingerprints** (§5.3), which need the rotating
+9. **Keyed pseudonyms and content fingerprints** (§5.3), which need the rotating
    secret.
-6. **Enabling is a deploy decision.** `ASSISTANT_EVENTS_ENABLED` is not in the
-   compose relay `environment:` list, so setting it in an env file does not
-   reach the process; turning it on means changing the deployment's
-   configuration and restarting the relay, which is a hard-rule-2 action.
-7. **Not in this slice:** retry of dropped batches; deriving a trip's phase time
+10. **Not in this slice:** retry of dropped batches; deriving a trip's phase time
    zone for the rollup (§6.4); recording router-answered commands (`/help`,
    `/name`, …) and interview turns; the authenticated ingest route that would
    wrap `writeAssistantEvents`.
-8. **The organizer activity timeline (raised independently by both reviewers; a
+11. **The organizer activity timeline (raised independently by both reviewers; a
    finding, not a decision).** `trip_id` + `requester_role = 'organizer'` + a
    millisecond `occurred_at` is a per-person activity timeline for each trip's
    one organizer, because only organizers are linked (migration 0051); in a group
    with exactly one non-organizer member, `unknown` is that one person. "No
-   identifier is stored" holds for chat and user ids only. The family-notice
-   step in item 3 must cover this, and the owner should weigh it when confirming
-   the metadata stance in item 2.
-9. **A future ingest route** must mint `event_id` and `turn_id` server-side (any
+   identifier is stored" holds for chat and user ids only. The
+   owner confirmed the stance for the MVP without a notice (§16.3); the
+   full-production notice in item 7 (#186) must cover this timeline.
+12. **A future ingest route** must mint `event_id` and `turn_id` server-side (any
    well-formed UUID a client supplies is a 122-bit covert channel) and bound
    `occurred_at` (Postgres keeps 6 fractional digits and the schema now caps it at
    6, but the value is still client-chosen).
-10. **Persisting attribution** — open turns, or a relay-stamped id on the wire —
+13. **Persisting attribution** — open turns, or a relay-stamped id on the wire —
     to remove the restart limit in §16.5.
-11. **Splitting `other`** in `channel_type` (§16.3), once participants are
+14. **Splitting `other`** in `channel_type` (§16.3), once participants are
     linkable or a channel path exists.
