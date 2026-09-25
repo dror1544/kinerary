@@ -1,3 +1,7 @@
+> **ARCHIVED 2026-09-25** — the Telegram Login SSO route is ruled out for provisioned trip sites while they sit on per-trip subdomains; the owner may return to it as a Telegram Mini App idea once one domain (not sub-domains) serves the sites. The stand-alone site's `POST /api/auth/telegram-login` still exists (`server/server.js`).
+> Note: the stand-alone site login route still exists.
+> Live version: none
+
 # Telegram Login SSO
 
 Telegram Login is optional and disabled unless every required environment value

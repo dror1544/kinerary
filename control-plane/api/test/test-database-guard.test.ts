@@ -9,7 +9,7 @@ import {
 
 describe("test database guard", () => {
   test("accepts the documented scratch database", () => {
-    // docs/sprint5-next-session-brief.md — the URL every DB suite should use.
+    // CLAUDE.md, "The control-plane DB suites destroy the database they are given" — the URL every DB suite should use.
     assert.equal(testDatabaseUrl("postgres://postgres:test@127.0.0.1:5434/cptest"), "postgres://postgres:test@127.0.0.1:5434/cptest");
   });
 

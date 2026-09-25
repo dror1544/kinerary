@@ -1,6 +1,17 @@
 # Per-trip gateway processes — the companion runtime architecture
 
-**Status: proposed architecture, not yet implemented.** Written 2026-09-06.
+**Status (checked against the tree 2026-09-25): implemented — one Hermes
+gateway process per trip; multiplexing is retained only as a rejected
+alternative** (`hermes-multiplex-execution-boundary.md`). Provisioning starts
+each trip's gateway with `hermes_cli.main --profile <name> gateway run
+--replace` (`scripts/companion-install-host.sh`); the relay routes by gateway id
+(`control-plane/api/src/relay/connector.ts`) and answers `COMPANION_PENDING`
+when a trip's gateway has no socket (`relay/normalize.ts`). **Not fully
+finished:** the optional transitional fallback for a still-multiplexing gateway
+(`relay.multiplex_gateway_id` / `fallbackGatewayId`, `config.ts`,
+`connector.ts`) is still in the code, and §11 step 6 ("delete the multiplex
+path") is not marked built; whether any deployment still sets that key is
+unchecked. §11 steps 3 and 4 carry no BUILT mark either. Written 2026-09-06.
 
 Supersedes §4 of `hermes-multiplex-execution-boundary.md` (per-profile MCP
 inside one multiplexed gateway). That analysis stays where it is, and stays

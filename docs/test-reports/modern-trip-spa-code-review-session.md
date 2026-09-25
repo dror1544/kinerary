@@ -281,7 +281,7 @@ provisioning 34/34; organizer web 10/10; Modern 39/39; shared logout 3/3.
 Repository preflight passed; final framing/logout refinements passed their
 affected tests and production builds. DB tests used only `cptest` on port 5434.
 Configuration and migration requirements are in
-[runtime-session-exchange.md](runtime-session-exchange.md). No deployment or
+[runtime-session-exchange.md](../runtime-session-exchange.md). No deployment or
 PR approval was performed.
 
 ## PR #44 review fixes — 2026-09-11

@@ -3,6 +3,15 @@
 Status: implemented for test-environment acceptance
 Updated: 2026-08-25
 
+> **Note, 2026-09-25 — wording to be confirmed by the owner.** The plan's core
+> claim below, "Google OIDC is the only organizer web identity in the first
+> release", has been extended in the tree: an email account holds a credential
+> from birth, whichever way it is created — signup (`password-identity.ts`),
+> an operator invitation (`organizer-invite.ts`) or a verified Google sign-in
+> (`portal.ts`) — and all three resolve the address through
+> `resolveOrCreateEmailAccount`. Read the identity bullets below as the
+> 2026-08-25 design, not as current behaviour.
+
 ## Product and identity decisions
 
 The public landing page and organizer personal space are a standalone React/

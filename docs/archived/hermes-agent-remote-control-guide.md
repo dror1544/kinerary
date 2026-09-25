@@ -1,3 +1,6 @@
+> **ARCHIVED 2026-09-25** — reference guide verified 2026-08-04 against upstream Hermes docs; it is not the current runtime path.
+> Live version: none
+
 # Hermes Agent Remote-Control Guide
 
 Verified on 2026-08-04 against the public `NousResearch/hermes-agent` repository and current project documentation.

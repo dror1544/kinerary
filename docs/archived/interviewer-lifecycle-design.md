@@ -1,3 +1,6 @@
+> **ARCHIVED 2026-09-25** — SUPERSEDED as machinery on 2026-09-09 by `docs/interview-without-an-agent.md`: the agent-less interview removed the per-interview Hermes profile, its render/destroy lifecycle and the chat-id-in-profile write. NOT superseded and still open: (1) measurement of unfinished/abandoned interviews (which question people stop at, outcome by duration), homed in `interview-without-an-agent.md` §8b, no owner yet; (2) an offline judge of interview transcripts that proposes interview changes, not built and not restated since the switch; (3) #117's pre-summary coherence judge, a different thing, not built as of 2026-09-22; (4) un-namespaced Hermes session ids for companion profiles, a companion concern.
+> Live version: `docs/interview-without-an-agent.md`
+
 # Ephemeral interviewer, deterministic orchestrator, judging loop
 
 Design for how the intake interviewer should be *run*, as opposed to what it

@@ -228,9 +228,9 @@ need a contract.
 ### Sources
 
 The position paper (2026-09-05), plus the repo documents it cites:
-`docs/FamilyTrip-Agent-Handoff.md`, `docs/kinerary-trip-platform-handoff.md`,
-`docs/k3s-home-deployment-architecture.html`,
-`docs/k3s-home-deployment-sprint-plan.md`,
+`docs/archived/FamilyTrip-Agent-Handoff.md`, `docs/archived/kinerary-trip-platform-handoff.md`,
+`docs/future/k3s-home-deployment-architecture.html`,
+`docs/future/k3s-home-deployment-sprint-plan.md`,
 `docs/onboarding-mvp-sprint-plan.md`, and the Sprint 5 interview/relay work.
 
 Evidence cited from 2026-09-05 lives in `docs/test-reports/signup-test-run9..11-raw-notes.md`,

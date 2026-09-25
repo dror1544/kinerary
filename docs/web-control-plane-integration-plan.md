@@ -1,6 +1,6 @@
 # Kinerary web, control-plane, and trip-memory integration plan
 
-**Status:** proposed implementation plan
+**Status:** partly implemented (checked against the tree 2026-09-25). Built: the landing SPA and Google and password sign-in (see `web/README.md`). Of the nine account endpoints in §4.3, four exist, at different paths: `GET /v1/auth/google/start`, `GET /v1/auth/google/callback`, `GET /v1/me` (as written) and `POST /v1/logout` (plan: `/v1/auth/logout`); sign-in with a password is `POST /v1/auth/password` (plan: `/v1/auth/login`) — all in `control-plane/api/src/portal.ts`. Not built: `POST /v1/auth/register`, `/v1/auth/verify-email`, `/v1/auth/password/forgot`, `/v1/auth/password/reset` (no route found), so no email/password signup or recovery through this plan's flow — `web/src/App.tsx` redirects `/sign-up` and `/forgot-password` to `/sign-in`. Past-trip memories (`/v1/trips/:tripId/memories` etc.): no route found in `control-plane/api/src`. Note `web/README.md` says only the Google pair, `/v1/me` and `/v1/logout` exist, which omits the password sign-in route; that file is not owned by this pass. A separate `POST /v1/signup` (`app.ts`) belongs to the Telegram-approval signup flow, not this plan's account flow. The rest of this document is the original proposal.
 
 **Scope:** landing SPA, global account, trip creation, interview/control-plane handoff, active trip access, and completed-trip memories
 

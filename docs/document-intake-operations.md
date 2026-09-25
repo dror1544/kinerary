@@ -2,6 +2,10 @@
 
 Status, 2026-09-13: implemented on `feat/document-intake`
 (`.claude/worktrees/document-intake`). **Uncommitted, not merged, not deployed.**
+*Update, checked against the tree 2026-09-25: the work is now committed and merged
+on `integration/sprint-6` (PR #136 merge `2966cbd`; Slice B forward-port `ddf943c`).
+It is not on `main`; deployment status is not verified here.* The sentence above is
+the 2026-09-13 state.
 Scope and design: [`document-intake-feature-plan.md`](document-intake-feature-plan.md).
 
 ## What happens to an uploaded file

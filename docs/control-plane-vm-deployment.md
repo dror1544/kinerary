@@ -8,7 +8,7 @@ this page is the durable part.
 VM 110 `kinerary-cp` runs the whole Kinerary runtime under Docker Compose:
 PostgreSQL, migrations, API, provisioning worker, the relay (the router), the
 interview MCP sidecar, and Hermes. It is a stepping stone: when the k3s track
-(`k3s-home-deployment-sprint-plan.md` D1) builds `kinerary-prod`, workloads
+(`future/k3s-home-deployment-sprint-plan.md` D1) builds `kinerary-prod`, workloads
 move there and this VM is destroyed.
 
 ## Why the Mac is no longer needed

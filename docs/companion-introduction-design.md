@@ -1,6 +1,6 @@
 # The companion's first message
 
-**Status: design, not implemented.** Written 2026-09-07, from a live-run
+**Status: BUILT — composed by the control plane in `control-plane/api/src/companion-intro.ts`, sent from `control-plane/api/src/relay/dispatch.ts`; §7 (group binding) built 2026-09-07.** (Checked against the tree 2026-09-25. The paragraph below "Today it sits silent" describes the state when this was written.) Written 2026-09-07, from a live-run
 request: when a new trip companion comes to life it must introduce itself
 rather than sit silent until spoken to.
 
@@ -91,6 +91,12 @@ this message changes with it.
 
 **Decision needed:** password in the group message, or "ask <organizer> for the
 login" with the password only in the DM.
+
+*As built (checked 2026-09-25):* `groupIntroText` takes `includePassword`, and
+`relay/dispatch.ts` passes `options.groupIntroIncludesPassword ?? true` — so both
+variants exist and the default puts the password in the group message. Whether
+that default is the owner's ruling on this question is not recorded here — ask
+Dror.
 
 ## 5. The trigger
 

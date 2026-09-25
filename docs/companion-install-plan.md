@@ -1,5 +1,7 @@
 # B1 — the companion cannot be installed
 
+**Status (checked 2026-09-25): built via the SSH-bridge fork, not the tooled-worker recommendation in §2.** The worker SSHes out to the host and runs `scripts/companion-install-host.sh` (`control-plane/worker/control_plane_worker/companion_profile.py`). §3 describes the tooled-worker path that was not taken; it is not a plan for future work. Reason for the choice (Dror, 2026-09-25): the fastest route was taken; he has no preference for SSH; it was chosen for speed and was not compared against the tooled worker. He is open to doing it properly if that makes sense. Issue #127 tracks the checkout-selection weakness of the SSH forced command.
+
 **Scope: `activation-scope.md` §3 finding B1, and nothing beyond it.** Written
 2026-09-06 after run 13. This is a build plan; `activation-scope.md` remains
 the authority on what activation *is*, and its instruction stands — a
@@ -74,8 +76,10 @@ SSHes out to the host over a forced-command key
 (`control_plane_worker/companion_profile.py`) and runs
 `scripts/companion-install-host.sh`; `render_profile.py` never runs inside the
 worker container. Found and cross-checked 2026-09-22 while re-verifying A3 of
-`docs/onboarding-to-active-plan.md` (§2 there). Decided; reason not recorded
-in any commit message, PR or doc found so far — ask Dror. Recommendation left
+`docs/onboarding-to-active-plan.md` (§2 there). Decided; reason, given by Dror on
+2026-09-25: "we took the fastest route" — chosen for speed, not compared against
+the tooled worker, and he has no preference for SSH (open to doing it properly
+if it makes sense; #127). Recommendation left
 as written rather than rewritten, matching this repo's convention of
 annotating a superseded decision in place rather than editing history; §3
 below ("the work") describes the tooled-worker path that was not the one

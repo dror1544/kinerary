@@ -1,6 +1,20 @@
 # Who owns a trip's companion identity
 
-**Status: proposal, not implemented.** Written 2026-09-11, from the gap that
+**Status (checked against the tree 2026-09-25): partly implemented.** The trip now
+owns its companion profile: migration `20260922060000_organizer_invitations.sql`
+adds `trips.hermes_profile` ("THE COMPANION PROFILE BELONGS TO THE TRIP, NOT TO A
+CHAT"), `_record_trip_companion` (`control_plane_worker/provisioner.py`) writes it
+when the profile installs, and `/switch` (`organizer-trips.ts`) reads the trip's
+column first. Bindings keep their own `hermes_profile` column because routing
+reads it — a decision recorded in that migration. **Differs from §2:** the column
+is named `hermes_profile`, not `companion_profile`. **Remaining, still as
+proposed (verified as unbuilt): §4's "resolveChatRoute reads the trip's column"
+(it still selects `b.hermes_profile`, `chat-router.ts:355`); §7's deletions
+(`attach_profile_to_orphan_bindings` and `bind_chat_to_trip`'s `hermes_profile`
+parameter still exist in `provisioner.py` and its tests; `switchChatToTrip` still
+falls back to the bindings' profile), and the second migration dropping
+`telegram_chat_bindings.hermes_profile` (none found; 0043 only dropped NOT NULL).
+Unchecked: §5 (`italy-2026` backfill), §6, §8 and §9.** Written 2026-09-11, from the gap that
 `/switch` exposed: `italy-2026` has a working companion on disk
 (`~/.hermes/profiles/italy2026`) and no way to become active, because the only
 place the control plane ever recorded that name was a chat binding it never

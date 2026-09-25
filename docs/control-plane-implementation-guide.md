@@ -129,6 +129,8 @@ Per-trip isolated runtime
   └─ supervised health/readiness services
 ```
 
+> **Note, 2026-09-25:** "Telegram login verification" in the diagram above no longer exists. `GET /v1/auth/telegram` answers `410 TELEGRAM_WEB_AUTH_RETIRED` (`control-plane/api/src/app.ts:1562`, registered when the portal is configured). Web sign-in is Google or email/password through `portal.ts`. `GET /v1/signup/status` (`app.ts`) is still served. The diagram is left as the original target.
+
 The general architecture requires these roles, not a named local technology:
 
 | General role | Local MVP adapter | Future cloud adapter examples |
@@ -558,7 +560,7 @@ not required for lifecycle automation.
 Illustrative public operations:
 
 ```text
-POST /v1/auth/telegram
+POST /v1/auth/telegram   # RETIRED 2026-09: now GET, answers 410 TELEGRAM_WEB_AUTH_RETIRED
 POST /v1/trips
 POST /v1/trips/{tripId}/interview-enrollments
 GET  /v1/trips/{tripId}

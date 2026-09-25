@@ -1,3 +1,6 @@
+> **ARCHIVED 2026-09-25** — a 2026-08-07 architecture handoff, wrong on a current point (it calls Telegram SSO the primary login); superseded by `FRAMEWORK.md` and `CLAUDE.md`.
+> Live version: `FRAMEWORK.md`, `CLAUDE.md`
+
 # Kinerary Trip Platform — Architecture, Current State, and Claude Code Handoff
 
 **Purpose:** preserve the agreed architecture, live operational facts, current trip plans, implementation locations, and next actions so work can continue without rediscovering context.
@@ -207,7 +210,7 @@ The in-repo, untracked `telegram_manager/` code contains an early managed-bot an
 - `telegram_manager/main.py`: Bot API manager / managed-child-bot concept.
 - `telegram_manager/group_link.py`: signed, single-use `startgroup` payloads with expiration.
 - `telegram_manager/group_onboarding.py`: verifies the invite, organizer identity, and group context before writing a binding.
-- `docs/telegram-sso.md`: related SSO work (currently untracked).
+- `docs/archived/telegram-sso.md`: related SSO work (currently untracked).
 
 This is promising but is not yet verified as an operational deployment. Its `.env` and any database/token state must remain untracked.
 
@@ -217,7 +220,7 @@ The product has three ways for an already-known trip participant to authenticate
 
 | Method | Agreed production behavior | Current implementation status |
 |---|---|---|
-| **Telegram group-membership SSO (primary)** | The browser receives a signed Telegram Login payload. The server verifies its HMAC/freshness, performs a live `getChatMember` check against the canonical trip group, maps the Telegram numeric identity to an already-seeded participant, and issues the normal 30-day site JWT. The bot is limited admin solely to verify membership. No participant bot DMs are required. | Server route and focused local tests exist: `POST /api/auth/telegram-login`, documented in `docs/telegram-sso.md`. The test suite covers forged/expired callbacks, non-members, active members, JWT issuance, and non-leakage of Telegram IDs. The website login overlay does **not** yet show a Telegram Login Widget, so it has not been browser-tested on an authorized HTTPS domain/group. |
+| **Telegram group-membership SSO (primary)** | The browser receives a signed Telegram Login payload. The server verifies its HMAC/freshness, performs a live `getChatMember` check against the canonical trip group, maps the Telegram numeric identity to an already-seeded participant, and issues the normal 30-day site JWT. The bot is limited admin solely to verify membership. No participant bot DMs are required. | Server route and focused local tests exist: `POST /api/auth/telegram-login`, documented in `docs/archived/telegram-sso.md`. The test suite covers forged/expired callbacks, non-members, active members, JWT issuance, and non-leakage of Telegram IDs. The website login overlay does **not** yet show a Telegram Login Widget, so it has not been browser-tested on an authorized HTTPS domain/group. |
 | **Password fallback** | A known participant selects their existing identity and requests a **first-password enrollment**. The request is sent to the organizer's private Telegram approval flow. Only a signed, expiring organizer approval allows the participant to set a password; subsequent password login uses the participant's own bcrypt hash. | Username/password login and password-change endpoints/UI already exist, but they do **not** meet the agreed enrollment security model. The fresh database path currently seeds a shared default password (`1234`), and an existing authenticated session can change its password directly. Replace this before production; never expose a default/shared password. |
 | **Google identity (optional fallback)** | A signed Google ID token identifies a candidate Google account, but it must become a participant login only after a private organizer approval button accepts the proposed mapping to an existing participant. The approval must be one-time, expiring, auditable, and bound to trip + participant + Google `sub`; rejection must create no link. Later Google sign-in maps only the approved `sub` to the existing participant and issues the same JWT. | Google token verification, `google-link`, and `google-login` server paths plus Google Sign-In UI hooks exist. The current direct `google-link` path lets any already-authenticated user bind a Google identity immediately, so it must be replaced/gated by the organizer callback workflow before production. No organizer approval-bot callback workflow is yet verified. |
 
@@ -307,7 +310,7 @@ New/untracked material includes:
 
 ```text
 .env.example
-docs/telegram-sso.md
+docs/archived/telegram-sso.md
 intakes/
 provisioning/
 telegram_manager/
@@ -531,7 +534,7 @@ CLAUDE.md
 FRAMEWORK.md
 mcp/PROVISIONING.md
 docs/hermes-interviewer-agent.md
-docs/FamilyTrip-Agent-Handoff.md
+docs/archived/FamilyTrip-Agent-Handoff.md
 .agents/skills/create-trip/INTERVIEW.md
 .agents/skills/create-trip/driver.mjs
 provisioning/README.md

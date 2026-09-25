@@ -13,7 +13,7 @@ This file is the journey, end to end, and where it actually breaks.
 PR #44 contains the Modern work; the local parent integration branch was
 merged into it at `27a38bd`. The September 7 commit checkpoint below is
 historical. Map and direct-runtime MCP updates have been browser-verified;
-the detailed evidence is in `modern-trip-spa-code-review-session.md`.
+the detailed evidence is in `test-reports/modern-trip-spa-code-review-session.md`.
 
 Activation B3 is now implemented locally: the real runtime exchanges a
 trip-scoped portal identity for its existing local user's JWT. Disposable

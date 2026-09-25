@@ -32,7 +32,7 @@ it, that document is stale and is listed under track 4.
 | 5 — Exit gate | Prove the lifecycle end to end | The demo rehearsal and full-cycle re-provision. | last |
 
 So tracks 1, 3 and 4 fill from *outside* the sprint text: the Sprint 5
-carry-forward (`docs/sprint5-closeout-handoff.md:148`), §4.5 enrichment residue,
+carry-forward (`docs/test-reports/sprint5-closeout-handoff.md:148`), §4.5 enrichment residue,
 and the open issue list. Track 2 *is* Sprint 6.
 
 ---
@@ -768,7 +768,6 @@ Part of the goal, not a side effect. The known drift, all verified 2026-09-19:
   it before. `docs/companion-install-plan.md` also picked up an annotation
   (found during A3's re-check) that the SSH-bridge fork shipped, not its own
   "Recommendation: the tooled worker".
-- `docs/NEXT-TASKS.md` — from 2026-08-08, pre-control-plane, not a live source.
 - Sprint 6's own section previously had **no `— BUILT` markers at all** while
   §4.5 and Sprint 5 Track 8 did. The four-track split itself was already
   recorded in the plan (`onboarding-mvp-sprint-plan.md:1459-1483`, table +
@@ -795,7 +794,7 @@ in the file — better a small enforced set than a large unenforced one.
 
 ### Sprint 5 residue
 `docs/test-reports/vm-e2e-2026-09-14.md` was never written; step 7 of
-`docs/sprint5-closeout-handoff.md` remains "reported done, not confirmed".
+`docs/test-reports/sprint5-closeout-handoff.md` remains "reported done, not confirmed".
 
 ### Prerequisite for track 2's ship
 `kinerary-cp-release` is merged (`94e572d`) but **not installed on the VM**.

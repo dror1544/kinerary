@@ -1,6 +1,8 @@
-# Sprint 5 — Trip Bot router: design note and an open decision
+# Sprint 5 — Trip Bot router: design note and a decision (Option A, taken)
 
-Status: **decision needed before implementation.** Branch
+Status: **DECIDED — Option A taken 2026-08-31; built (`control-plane/api/src/relay/`) and live in a real family group since 2026-09-02** (source: `docs/onboarding-mvp-sprint-plan.md`, "Status as of 2026-09-02"). Kept for the reasoning and the live evidence. What follows the status line is the note as written before the decision: the branch, worktree, baseline and test count below are history, not the current tree.
+
+Original status: decision needed before implementation. Branch
 `sprint/5-organizer-profile-router`, worktree
 `.claude/worktrees/sprint-5-organizer-router`, based on `main` @ `fc809a0`
 (PR #10, Sprints 0–4.7). Baseline `cd tests && npm test`: 405 pass, 0 fail.

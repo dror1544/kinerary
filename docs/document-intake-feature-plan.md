@@ -1,12 +1,21 @@
 # Integrated document intake — dedicated feature plan
 
-Status: revised plan, 2026-09-12. Implementation and acceptance remain to be completed.
+Status (checked against the tree 2026-09-25): Slices A and B are built and merged on
+`integration/sprint-6` (Slice A: PR #136, merge `2966cbd`; Slice B forward-ported in
+`ddf943c`). Neither is on `main` (no ref containing `2966cbd` other than integration
+and carry branches); acceptance and release to `main` are outstanding.
+Original status line, 2026-09-12: revised plan; implementation and acceptance remain to be completed.
 This supersedes the previous isolated-module plan and its deferred integration stages.
 
 Implementation state, configuration, rollout/rollback and open decisions (2026-09-13):
 [`document-intake-operations.md`](document-intake-operations.md).
 
 ## Development and release boundary
+
+*History, as of 2026-09-25: this section describes how the work was set up on
+`feat/document-intake` against baseline `773603e`. The work has since been merged
+onto `integration/sprint-6` (see Status above); the baseline, branch and worktree
+bullets are no longer the current arrangement.*
 
 Document intake is an independent feature, **not Sprint 5 scope**.
 `origin/integration/sprint-5-plus` supplies the latest document/intake infrastructure;

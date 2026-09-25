@@ -891,7 +891,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > Merged into `integration/sprint-5-plus`: #66 (the VM stack, document
 > suggestions, the bot swap, the reply-thread fix) and #63. Still to land
 > before `main` (#40): #47 and #64, which conflict with integration — see
-> `docs/sprint5-closeout-handoff.md`. Follow-ups that do not block the sprint:
+> `docs/test-reports/sprint5-closeout-handoff.md`. Follow-ups that do not block the sprint:
 > #65, #67, #68, #69.
 >
 > The box below is the 2026-09-02 snapshot, kept for history.
@@ -899,7 +899,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > **Status as of 2026-09-02 — partially delivered, PR #29 open against
 > `integration/sprint-5-plus` (16 commits, unreviewed).** Working detail,
 > landmines and the bring-up runbook live in
-> `docs/sprint5-next-session-brief.md`; this box is only the scoreboard.
+> `docs/test-reports/sprint5-next-session-brief.md`; this box is only the scoreboard.
 >
 > **Built and in the PR:**
 > - the shared Trip Bot router — deterministic layer (`chat-router.ts`,
@@ -952,7 +952,7 @@ contexts and test groups without creating a per-trip Telegram bot.
 > **2026-09-04 — Track 4 supersedes Track 3, by Dror's decision.** Six live
 > runs in one day (`docs/test-reports/signup-test-run1..6-raw-notes.md`) reached a confirmed
 > intake twice, and one of those needed two manual database unblocks. The
-> analysis is `docs/interview-design-review.md`: these are not six unrelated
+> analysis is `docs/test-reports/interview-design-review.md`: these are not six unrelated
 > defects but four missing pieces of the contract between the router and the
 > interviewer. Track 3's remaining UX items are absorbed into Track 4 rather
 > than fixed one at a time — fixing them one at a time is what produced runs
@@ -1100,7 +1100,7 @@ buttons, less voice).
 
 **A1–A3+B all shipped and reached a clean `intake_confirmed` on run 9
 (2026-09-05)** — the first confirmation since run 4, and the first with no
-manual database intervention. `interview-design-review.md`'s exit gate
+manual database intervention. `docs/test-reports/interview-design-review.md`'s exit gate
 ("two consecutive live runs... no manual database intervention") is one run
 into two.
 
@@ -1140,7 +1140,7 @@ Automated tests:
 produces one turn and no duplicate question.
 
 **Track 5, live: two clean `intake_confirmed` runs in a row (run 9, run 10)**
-— `interview-design-review.md`'s exit gate ("two consecutive live runs... no
+— `docs/test-reports/interview-design-review.md`'s exit gate ("two consecutive live runs... no
 manual database intervention") is now met.
 
 Two small UX fixes shipped alongside Track 5 from run 10's report, both
@@ -1219,7 +1219,7 @@ answered. This is an onboarding-reliability issue and should be resolved
 **before live onboarding scales**.
 
 **But not by building more watchdog machinery.**
-`docs/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
+`docs/future/agent-runtime-position-paper-review.md` §4 puts Track 6's remaining work
 in its *Stop* column — "this is precisely what a graph migration deletes" — and
 §2.1 reads run 12's two `404 NOT_FOUND`s as an **`ExecutionContext` failure**,
 stated exactly: `/internal/interview/agent/current/*` resolves "which interview
@@ -1362,9 +1362,7 @@ Build:
   path work — the MCP tools stopped taking a chat id the agent provably cannot
   know, and the interview is addressed by the router's open turn instead. That
   is correct for **one organizer at a time**: two concurrent interviews resolve
-  ambiguously and are refused, by design. Making it correct for many is
-  `docs/interviewer-lifecycle-design.md`, scheduled as Sprint 6.5, and its
-  seven decision points are to be settled after Sprint 5 closes.
+  ambiguously and are refused, by design. *(Superseded 2026-09-09. The agent-less interview (`docs/interview-without-an-agent.md`, live by default since 2026-09-09) took the agent out of the default path. There is no open turn to resolve, and concurrent interviews are kept apart by chat (`intake_sessions_live_chat_idx`, migration 0049). The one-at-a-time limit survives only on the agent path, which ends when that document's §8 benchmark lets Hermes leave the intake path. The per-interview-profile design is archived at `docs/archived/interviewer-lifecycle-design.md`.)*
 
 Automated tests:
 
@@ -1674,93 +1672,9 @@ cutover:
   `.lan` zone.
 
 
-### Sprint 6.5 — Ephemeral interviewer, deterministic orchestrator, judging loop
+### Sprint 6.5 — Ephemeral interviewer, deterministic orchestrator, judging loop — WITHDRAWN (superseded 2026-09-09)
 
-**Full design, A/B and decision points: `docs/interviewer-lifecycle-design.md`.**
-Proposed by Dror 2026-09-03 after the first live end-to-end interview failed.
-Sequenced after Sprint 5 deliberately — Sprint 5 ships an interim that is
-correct for one organizer at a time; this is what makes it correct for many.
-
-**Goal:** give the agent layer the lifecycle every other part of the pipeline
-already has. An interviewer is rendered per interview, holds no state, is
-destroyed at handover, and every interview — finished or abandoned — is
-measured and judged.
-
-**Why, in one line:** on 2026-09-03 the deterministic layer did everything
-right and the interview still failed, because the profile had drifted for
-months, described a flow that no longer existed, and inherited another
-conversation's session. None of those are bugs code review could catch; they
-are properties of long-lived hand-maintained state.
-
-Build:
-
-- **Interview lifecycle in the control plane** — `pending → rendered →
-  interviewing → { confirmed | abandoned } → judged → reaped`, owned by the
-  existing worker. Deterministic: create, render, hand over, destroy, TTL,
-  sweep. No LLM decides a transition.
-- **Per-interview rendered profile**, reusing the provisioner's existing
-  `RenderProfileAdapter`. The chat id and session id are baked in at render
-  time — which is what makes the agent's write path work at all, since the
-  agent provably cannot learn its own chat id (verified 2026-09-03: nothing
-  renders it into the prompt). Note `source.profile` resolves via
-  `profile_exists()` on disk, NOT the allowlist, so this needs no allowlist
-  edit and no gateway restart per interview.
-- **Abandonment tracking** — today an organizer who stops answering leaves a
-  row in `interviewing` forever, indistinguishable from one still in progress.
-  Record where they stopped.
-- **Interview metrics**, folded into `docs/trip-bot-analytics-and-metrics-design.md`
-  §7/§8 with bounded labels: started/completed/abandoned, abandoned-at-question
-  (the drop-off point), duration by outcome, answers-recorded, unclosed turns,
-  write failures by reason, corrections per question.
-  `interview_answers_recorded_total` is the one that would have made the
-  2026-09-03 failure visible — a turn opened, zero answers written, and the
-  session declared complete.
-- **Judge agent (strong model), offline** — never in the organizer's path, so
-  it may be slow and expensive. Runs on abandoned interviews too, since that is
-  where the material is. Emits: what went wrong, whether the fault was
-  template/model/pipeline, a proposed template diff with rationale, and a
-  survey across recent interviews for the super admin.
-- **Gated template promotion** — the judge proposes, a human promotes, through
-  the candidate → eval → promotion shape the release pipeline already uses. A
-  judge editing the live template unattended reproduces the 2026-09-03 failure
-  mode with a faster loop.
-- **Localised question catalogue on the same loop (#41).** All 23 prompts and
-  every option label are literal English strings today. Localising them needs
-  per-language files plus an agent that realigns the others when the English
-  source changes — which is the judge loop with a different input, so it shares
-  the mechanism rather than growing a second one. `option_id` is NEVER
-  translated: ids land in the immutable intake and are what the transformer
-  reads, so only labels vary. A language file whose source has moved is worse
-  than a missing one, because nothing looks wrong — the organizer is simply
-  asked last month's question, so staleness has to be a gate condition.
-
-Automated tests:
-
-- lifecycle transitions, including TTL-driven abandonment and idempotent reap;
-- a rendered interviewer profile carries its chat/session binding and cannot be
-  rendered without one;
-- two concurrent interviews render two profiles and neither can read or write
-  the other's intake (the two-trip matrix shape, at profile level);
-- abandonment is recorded with the question the organizer stopped at;
-- metrics labels stay within `INTAKE_QUESTIONS` (bounded-label rule);
-- a judge-proposed template change cannot reach the live template without an
-  explicit promotion.
-
-Manual tests:
-
-- a real interview abandoned halfway shows the correct drop-off question;
-- the judge's suggestions on that interview are actionable by the super admin;
-- an organizer starting a second trip gets a genuinely fresh interviewer.
-
-**Open decision points before this can start** — all eight are stated in full
-in `docs/interviewer-lifecycle-design.md`, and each changes the shape of the
-build: whether the ephemeral path replaces or coexists with the shared one;
-the interview TTL and whether "abandoned" is terminal or resumable; who may
-promote a template change and against what eval; how much transcript the judge
-may see and for how long; per-interview vs batched judging; whether the render
-step reuses the provisioner's adapter; whether the judge owns translation alignment or that is a
-separate lane (#41); and whether the un-namespaced session id is worth fixing
-upstream for the long-lived companion profiles that keep it.
+Archived design: `docs/archived/interviewer-lifecycle-design.md`. It was proposed to give a Hermes interviewer a lifecycle. `docs/interview-without-an-agent.md` removed the interviewer instead, so most of this sprint has nothing left to act on: per-interview rendered profile, chat id written into it, render/destroy lifecycle — rejected (no agent on the default path; `SESSION_NOT_AGENT_WRITABLE` in app.ts); lifecycle and TTL — idle expiry with a warning (migration 0049), orthogonal to `state` by decision; concurrency — kept apart by chat on the default path, still refused (409 AMBIGUOUS) on the agent path until Hermes leaves the intake path (§8 benchmark); localised question catalogue (#41) — built as `intake-copy.ts` (en/he) with completeness tests; template promotion — interview behaviour is code, so promotion is a reviewed commit plus `kinerary-cp-release`. **Still open, not scheduled here:** (1) unfinished-interview measurement (the question people stop at, and outcome by duration) — a requirement (Dror, 2026-09-09) whose shape is undecided, homed in `docs/interview-without-an-agent.md` §8b, partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews` — NO OWNER YET (decision for the owner); (2) an offline judge of interview transcripts that proposes interview changes — not built, not restated since the agent-less switch; it is not `plan-review.ts` (which judges a deployed plan) and not #117's pre-summary pass (which judges one interview's content in the organizer's path) — the owner decides whether it is still wanted; (3) un-namespaced Hermes session ids for companion profiles — a companion concern, homed with the companion work.
 
 ### Sprint 7 — Post-trip debrief and reviewed learning
 

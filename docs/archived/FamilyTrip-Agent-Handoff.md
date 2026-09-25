@@ -1,3 +1,6 @@
+> **ARCHIVED 2026-09-25** — the original "Victor" agent behaviour/product contract handoff (2026-08); it predates the control plane and is kept as product-vision history.
+> Live version: none
+
 # FamilyTrip / “Victor” Agent — Product, Behavior, and Implementation Handoff
 
 **Purpose:** This document captures the role, behavioral contract, operating model, evolution, lessons learned, and recommended next steps for the FamilyTrip assistant. It is intended as a handoff to an implementation partner (for example, Claude) who will help generalize the agent into a product.

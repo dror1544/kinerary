@@ -29,14 +29,27 @@ table's own unique constraint.
 
 Every inbound update goes through one dispatcher,
 [dispatch.ts](../control-plane/api/src/relay/dispatch.ts), in a fixed order:
-`/start <token>` first, then a chat mid-interview, then a chat bound to a
-trip, then refusal. Three commands exist inside that:
+`/start <token>` first, then the router's own commands, then a chat mid-interview,
+then a chat bound to a trip, then refusal. *The table below was refreshed on
+2026-09-25 from `dispatch.ts` and `relay/command-menu.ts`; the original three-row
+table (`/start`, `/group`, `/done`) predates §3 and §4 being built.*
 
 | Command | Where | What it does |
 |---|---|---|
 | `/start <token>` | DM only | Exchanges a signed enrollment for an interview session. Never forwarded to an agent. |
-| `/group` / `/bind` | DM issues, group redeems | Issues a group-binding token; posting it in a group binds that group to the trip. |
-| `/done` / `/summary` | DM, mid-interview | Forces the intake recap, whatever the agent is doing. |
+| `/group` / `/bind` | DM issues, group redeems | Issues a group-binding token; posting it in a group binds that group to the trip. In the published menu. |
+| `/done` / `/summary` | DM, mid-interview | Forces the intake recap, whatever the agent is doing. Not in the published menu. |
+| `/trips` | DM only | Lists the sender's trips and which one this chat is on. Refused in a group. In the DM menu. |
+| `/switch` / `/select` `<trip>` | DM only | Points this chat at a different trip of the sender's. Refused in a group. In the DM menu. |
+| `/name` / `/rename` `<names>` | Any chat bound to a trip; not mid-interview | Shows or changes the assistant's name(s). In every menu. |
+| `/help` | A chat bound to a trip | The router answers with the companion's own help text (`companionHelpText`). In every menu. |
+| `/model` / `/models` | Super admin's own DM only | Shows or switches which model serves each task. For anyone else it is answered as an unknown command; not in any menu. |
+
+Any other command in a bound chat gets the same help text with the unknown
+command named; mid-interview it gets `notMyCommand`; nothing is forwarded to
+Hermes as a slash command. Published menus (`routerCommandMenus`): private chats
+and the default get `/help /name /group /trips /switch`; groups get `/help /name`.
+Whether every row's *where* was exercised live was not re-checked here.
 
 Two facts about the parse layer matter for everything below.
 
