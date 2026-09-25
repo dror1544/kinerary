@@ -149,6 +149,7 @@ function createOAuthStore(db) {
     insertToken: db.prepare('INSERT INTO mcp_oauth_tokens (token_hash, grant_id, kind, expires_at) VALUES (?,?,?,?)'),
     token: db.prepare('SELECT * FROM mcp_oauth_tokens WHERE token_hash = ?'),
     revokeToken: db.prepare('UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL'),
+    narrowGrant: db.prepare('UPDATE mcp_oauth_grants SET scope = ? WHERE id = ?'),
     revokeGrantAccess: db.prepare("UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND kind = 'access' AND revoked_at IS NULL"),
     pruneTokens: db.prepare('DELETE FROM mcp_oauth_tokens WHERE expires_at < ?'),
   };
@@ -207,7 +208,7 @@ function createOAuthStore(db) {
 
     // Rotation with reuse detection: presenting a refresh token that was
     // already rotated away means two parties hold it, so the whole grant goes.
-    rotateRefresh(refreshToken, clientId, stillAllowed) {
+    rotateRefresh(refreshToken, clientId, stillAllowed, lostWrite = () => false) {
       const row = q.token.get(hash(refreshToken));
       if (!row || row.kind !== 'refresh') return { error: 'invalid_grant' };
       const grant = q.grant.get(row.grant_id);
@@ -215,6 +216,7 @@ function createOAuthStore(db) {
       if (row.revoked_at) { revokeGrant(grant.id); return { error: 'invalid_grant' }; }
       if (row.expires_at < now()) return { error: 'invalid_grant' };
       if (!stillAllowed(grant.username)) { revokeGrant(grant.id); return { error: 'invalid_grant' }; }
+      if (grant.scope === SCOPE && lostWrite(grant.username)) { q.narrowGrant.run(READ_SCOPE, grant.id); grant.scope = READ_SCOPE; }
       // The refresh replaces the whole pair: the access token it was paired
       // with stops working now, not at the end of its hour.
       db.transaction(() => { q.revokeToken.run(now(), row.token_hash); q.revokeGrantAccess.run(now(), grant.id); })();
@@ -243,6 +245,8 @@ function createOAuthStore(db) {
     },
 
     revokeGrant,
+    // Narrowing only: a connection's scope can go down, never up.
+    narrowToRead: id => q.narrowGrant.run(READ_SCOPE, id),
     activeGrants: () => q.activeGrants.all(),
     grant: id => q.grant.get(String(id)),
     prune() { const t = now(); q.pruneTokens.run(t); q.pruneCodes.run(t - CODE_TTL_S); },

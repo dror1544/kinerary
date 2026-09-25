@@ -274,7 +274,7 @@ function registerTripMcp({
     }
     if (b.grant_type === 'refresh_token') {
       if (!b.refresh_token) return invalid();
-      const r = store.rotateRefresh(String(b.refresh_token), client.client_id, isParticipant);
+      const r = store.rotateRefresh(String(b.refresh_token), client.client_id, isParticipant, username => !isOrganizer(username));
       return r.error ? invalid() : res.json(r.tokens);
     }
     res.status(400).json({ error: 'unsupported_grant_type' });
@@ -301,6 +301,10 @@ function registerTripMcp({
     // Someone removed from the trip loses the connection here. Someone who is
     // no longer an organizer keeps it, read-only (canWrite, below).
     if (!isParticipant(grant.username)) { store.revokeGrant(grant.id); return challenge(res, 'invalid_token'); }
+    // An organizer who is no longer one keeps the connection, read-only — for
+    // good: promoting them again does not bring write access back without a
+    // new approval.
+    if (grant.scope === SCOPE && !isOrganizer(grant.username)) { store.narrowToRead(grant.id); grant.scope = READ_SCOPE; }
     req.mcpGrant = grant;
     next();
   }

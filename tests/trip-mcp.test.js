@@ -370,6 +370,21 @@ describe('trip MCP — upgrading a trip that ran an earlier version', () => {
     assert.ok(db.prepare('PRAGMA table_info(mcp_oauth_codes)').all().some(c => c.name === 'grant_id'));
     db.close();
   });
+
+  it('a connection\'s scope only ever narrows', async () => {
+    const { createRequire } = await import('node:module');
+    const require = createRequire(new URL('../server/package.json', import.meta.url));
+    const Database = require('better-sqlite3');
+    const { createOAuthStore } = require('./trip-mcp/oauth.js');
+    const db = new Database(':memory:');
+    const store = createOAuthStore(db);
+    const { grantId, tokens } = store.startGrant({ clientId: 'c', username: 'alice', scope: 'trip' });
+    assert.equal(tokens.scope, 'trip');
+    store.narrowToRead(grantId);
+    assert.equal(store.grant(grantId).scope, 'trip:read');
+    assert.equal(store.verifyAccess(tokens.access_token).scope, 'trip:read');
+    db.close();
+  });
 });
 
 // The configuration a real trip runs: a public https origin. The other suites
