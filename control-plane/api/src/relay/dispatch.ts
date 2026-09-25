@@ -32,6 +32,7 @@ import {
   renderQuestion,
   resolveChatRoute,
   startFromDeepLink,
+  type ChatRoute,
   type InlineKeyboard,
   migrateChatBinding,
   companionIntroFacts,
@@ -83,7 +84,7 @@ import { visionProcessingConfig } from "../document-vision.js";
 import { digestTelegramId } from "../identity.js";
 import type { StructuredModelRunner } from "../model-runner.js";
 import { handleModelCommand, isSwitchableRunner } from "../model-task-settings.js";
-import type { WireMessageEvent } from "./protocol.js";
+import type { ChatType, WireMessageEvent } from "./protocol.js";
 
 /** A message the connector should send itself, rather than routing to an agent. */
 export interface DirectReply {
@@ -398,6 +399,60 @@ export interface DispatchOptions {
    * the decision.
    */
   assistantEvents?: boolean;
+  /**
+   * Per-chat limit on the generic "assistant is down" line. Absent, the relay
+   * process's own is used; tests pass a fresh one.
+   */
+  outageNotices?: OutageNoticeLimiter;
+}
+
+/**
+ * At most one "the assistant is down" line per chat per window (#179).
+ *
+ * In memory, in the relay process, bounded: the oldest chat is evicted first.
+ * A relay restart forgets it and may repeat one line - accepted, because the
+ * alternative is a table for a courtesy. Deliberately a small object with one
+ * question (`allow`) and a clock, so an outage-state design (#187: tell the
+ * organizer once per outage, recover, escalate) can replace it without
+ * touching the router.
+ */
+export class OutageNoticeLimiter {
+  static readonly WINDOW_MS = 10 * 60 * 1000;
+  static readonly MAX_CHATS = 1000;
+  private readonly lastSent = new Map<string, number>();
+  private readonly now: () => number;
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
+
+  /** True, and starts the window, when this chat may be told now. */
+  allow(chatId: string): boolean {
+    const at = this.now();
+    const last = this.lastSent.get(chatId);
+    if (last !== undefined && at - last < OutageNoticeLimiter.WINDOW_MS) return false;
+    // Re-insert so Map order is "told longest ago first".
+    this.lastSent.delete(chatId);
+    this.lastSent.set(chatId, at);
+    while (this.lastSent.size > OutageNoticeLimiter.MAX_CHATS) {
+      const oldest = this.lastSent.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastSent.delete(oldest);
+    }
+    return true;
+  }
+}
+
+/** The relay process's own, used when a caller supplies none. */
+const processOutageNotices = new OutageNoticeLimiter();
+
+/** Whether a message replies to something the assistant itself sent. */
+function repliesToAssistant(message: TelegramMessage, botIdentity: BotIdentity): boolean {
+  const repliedTo = message.reply_to_message?.from;
+  if (!repliedTo) return false;
+  // Precise when we know our own id: a reply to some OTHER bot in the group is
+  // not a reply to us.
+  return botIdentity.id ? String(repliedTo.id) === botIdentity.id : Boolean(repliedTo.is_bot);
 }
 
 export async function dispatchUpdate(
@@ -808,14 +863,7 @@ export async function dispatchUpdate(
     // has to actually address the assistant, or the shared bot answers a
     // family talking among themselves. See addressing.ts for why this cannot
     // be left to Hermes's mention_patterns under the relay.
-    const repliedTo = message.reply_to_message?.from;
-    const isReplyToAssistant = repliedTo
-      ? botIdentity.id
-        // Precise when we know our own id: a reply to some OTHER bot in the
-        // group is not a reply to us.
-        ? String(repliedTo.id) === botIdentity.id
-        : Boolean(repliedTo.is_bot)
-      : false;
+    const isReplyToAssistant = repliesToAssistant(message, botIdentity);
 
     // Migration 0053: the assistant's own last message here may have asked a
     // question it wants answered, in which case the VERY NEXT message in this
@@ -928,19 +976,33 @@ export async function dispatchUpdate(
         chatId,
         chatType: message.chat?.type,
         fromId: message.from?.id === undefined ? undefined : String(message.from.id),
-        mediaKinds: (outcome.event.media ?? []).map((m) => m.kind),
-        hasMedia: (outcome.event.media_urls?.length ?? 0) > 0,
+        // The message's OWN attachment, as normalisation described it. The wire
+        // event has no media yet - `attachMedia` runs only once the turn is
+        // known to go somewhere - so asking it (as this did until #178) was
+        // always "no media", and this route never fired.
+        mediaKinds: outcome.attachment ? [outcome.attachment.kind] : [],
+        hasMedia: outcome.attachment !== null,
         hasRunner: Boolean(options.modelRunner),
         canReadImages: visionProcessingConfig(options.modelRunner) !== null,
       });
-      if (organizer) {
+      // The reader needs the file itself, so re-host it now. A download that
+      // failed leaves nothing to read: fall through to the companion, which
+      // tells the organizer it could not read the file.
+      const readable = organizer && outcome.attachment
+        ? await attachMedia(
+            outcome.event,
+            [{ ...outcome.attachment, ...(message.caption ? { caption: message.caption } : {}) }],
+            options.media,
+          )
+        : null;
+      if (organizer && readable && (readable.media_urls?.length ?? 0) > 0) {
         return {
           kind: "document_correction",
           chatId,
           tripId: outcome.route.tripId,
           sessionId: organizer.sessionId,
           language: organizer.language,
-          event: outcome.event,
+          event: readable,
           // The route itself proves the organizer: their own private chat,
           // from them, on the trip's confirmed interview chat.
           ...(await withAnalytics(options.assistantEvents, log, () => ({
@@ -1023,13 +1085,70 @@ export async function dispatchUpdate(
     }
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
-    case "COMPANION_PENDING":
+    case "COMPANION_PENDING": {
+      // Two different situations arrive here, and the family is owed different
+      // words for each:
+      //   - the trip has NO companion yet (never installed, or mid-install):
+      //     the honest "still finishing your assistant", said to whoever writes;
+      //   - the trip HAS one and its gateway is not connected right now (an
+      //     outage or a restart): the generic line - and never to a family
+      //     talking among themselves (#179).
+      const route = await resolveChatRoute(db, chatId);
+      const chatType = mapChatType(
+        message.chat?.type,
+        message.is_topic_message === true && message.message_thread_id !== undefined,
+      );
+      // The relevance gate's verdict, once, for the reply decision and for the
+      // record. The expects-reply window is not consulted (claiming it is a
+      // write): during an outage the assistant has said nothing to be replied to.
+      const gate = {
+        chatType,
+        text,
+        assistantNames: route.kind === "companion" ? route.assistantNames : [],
+        botUsername: botIdentity.username,
+        isReplyToAssistant: repliesToAssistant(message, botIdentity),
+      };
+      const addressed = route.kind === "companion" && isAddressedToAssistant(gate);
+      const facts = () => companionPendingFacts(db, route, message, gate, addressed);
+
+      // "Has this trip's assistant ever been announced as up?" - the organizer's
+      // `companion_ready` message, sent only after the companion exists. Without
+      // it a profile is merely stamped: a first-time organizer must not be told
+      // "I'm off for now" about an assistant that has not come up yet. Trips
+      // that predate that message also keep the honest wording during an outage
+      // (the safe direction).
+      const announced = route.kind === "companion" && route.hermesProfile
+        ? await companionAnnounced(db, route.tripId)
+        : false;
+      if (route.kind !== "companion" || !announced) {
+        return {
+          kind: "reply",
+          reply: { chatId, text: strings.companionPending },
+          ...(await withAnalytics(options.assistantEvents, log, facts)),
+        };
+      }
+
+      if (chatType !== "dm" && !addressed) {
+        // Chatter is never answered, outage or not.
+        return {
+          kind: "ignore",
+          reason: "NOT_ADDRESSED",
+          ...(await withAnalytics(options.assistantEvents, log, facts)),
+        };
+      }
+      if (chatType !== "dm" && !(options.outageNotices ?? processOutageNotices).allow(chatId)) {
+        // Addressed, but this chat was told a moment ago. NO analytics on
+        // purpose: an `ignore` carrying facts is recorded as chatter, and this
+        // was a lost turn - an absent event undercounts, a wrong one misleads.
+        return { kind: "ignore", reason: "COMPANION_UNAVAILABLE_NOTICE_LIMITED" };
+      }
+      const intro = await companionIntroFacts(db, route.tripId);
       return {
         kind: "reply",
-        reply: { chatId, text: strings.companionPending },
-        ...(await withAnalytics(options.assistantEvents, log, () =>
-          companionPendingFacts(db, message, chatId, text, botIdentity))),
+        reply: { chatId, text: uiString("companionUnavailable", intro?.language === "he" ? "he" : "en") },
+        ...(await withAnalytics(options.assistantEvents, log, facts)),
       };
+    }
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
@@ -1059,54 +1178,45 @@ async function withAnalytics(
   }
 }
 
+/** Whether the organizer has been told this trip's assistant is up (outbox `companion_ready`, delivered). */
+async function companionAnnounced(db: pg.Pool, tripId: string): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM control_plane.notification_outbox
+      WHERE trip_id = $1 AND notification_type = 'companion_ready' AND sent_at IS NOT NULL
+      LIMIT 1`,
+    [tripId],
+  );
+  return rows.length > 0;
+}
+
 /**
- * The facts of a message answered with `companionPending` — a lost turn when it
- * was addressed. `normalizeUpdate` answers this before the relevance gate runs,
- * so the gate's own predicate is asked here, for the RECORD only: the reply
- * window is not consulted (claiming it is a write), and nothing here changes
- * what the router sends. The inputs mirror the gate's in `dispatchUpdate`; a
- * drift between the two could mislabel a lost turn's trigger, never route one.
+ * The facts of a message the router answered, or deliberately did not, because
+ * the companion is not connected - a lost turn when it was addressed. The
+ * verdict is the caller's, computed once (see the COMPANION_PENDING case), so
+ * the record and the reply cannot disagree about who was addressed.
  */
 async function companionPendingFacts(
   db: pg.Pool,
+  route: ChatRoute,
   message: TelegramMessage,
-  chatId: string,
-  text: string,
-  botIdentity: BotIdentity,
+  gate: {
+    chatType: ChatType;
+    text: string;
+    assistantNames: readonly string[];
+    botUsername?: string;
+    isReplyToAssistant: boolean;
+  },
+  addressed: boolean,
 ): Promise<InboundFacts> {
-  const route = await resolveChatRoute(db, chatId);
   if (route.kind !== "companion") throw new Error("NOT_COMPANION_ROUTE");
-  const chatType = mapChatType(
-    message.chat?.type,
-    message.is_topic_message === true && message.message_thread_id !== undefined,
-  );
-  const repliedTo = message.reply_to_message?.from;
-  const isReplyToAssistant = repliedTo
-    ? botIdentity.id ? String(repliedTo.id) === botIdentity.id : Boolean(repliedTo.is_bot)
-    : false;
-  const addressed = isAddressedToAssistant({
-    chatType,
-    text,
-    assistantNames: route.assistantNames,
-    botUsername: botIdentity.username,
-    isReplyToAssistant,
-  });
   const senderId = message.from?.id === undefined ? null : String(message.from.id);
   return inboundFacts({
     tripId: route.tripId,
     telegramChatType: message.chat?.type,
-    trigger: classifyTrigger({
-      addressed,
-      capturedAsReply: false,
-      chatType,
-      text,
-      assistantNames: route.assistantNames,
-      botUsername: botIdentity.username,
-      isReplyToAssistant,
-    }),
+    trigger: classifyTrigger({ addressed, capturedAsReply: false, ...gate }),
     linkRole: senderId ? (await resolveTripPerson(db, route.tripId, senderId))?.role : null,
     attachmentKind: describeAttachment(message)?.kind ?? null,
-    textLength: text.length,
+    textLength: gate.text.length,
   });
 }
 
