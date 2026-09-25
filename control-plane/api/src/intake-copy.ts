@@ -522,6 +522,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentConflictKept: "Kept as it was.",
     documentConflictReplaced: "Updated.",
     documentConflictStale: "That one's already been settled.",
+    // A typed change is waiting for a yes or a no, and the interview cannot be
+    // confirmed over it (#206).
+    changePendingBlocksConfirm: "You have a change waiting — apply it or cancel it first, then we can finish.",
     // What a disputed field is called in the question. A field with no label
     // here is named generically rather than by its internal key.
     "conflictField.start": "the start date",
@@ -698,6 +701,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     documentConflictKept: "נשאר כמו שהיה.",
     documentConflictReplaced: "עודכן.",
     documentConflictStale: "זה כבר הוכרע.",
+    changePendingBlocksConfirm: "יש שינוי שממתין לאישור — אשרו אותו או בטלו אותו, ורק אז נסיים.",
     "conflictField.start": "תאריך ההתחלה",
     "conflictField.end": "תאריך הסיום",
     "conflictField.date": "התאריך",

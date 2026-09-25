@@ -2167,7 +2167,7 @@ export interface AnswerPrecondition {
 
 export type ConfirmIntakeResult =
   | { ok: true; sessionId: string; intakeVersionId: string; digest: string; versionNumber: number }
-  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT"; unsafePath?: string };
+  | { ok: false; reason: "NOT_FOUND" | "NOT_ALL_REQUIRED_ANSWERED" | "UNSAFE_ANSWER_CONTENT" | "PENDING_CHANGE"; unsafePath?: string };
 
 // A private Telegram chat id is always a positive integer in string form —
 // reject anything else rather than storing whatever an LLM tool-call
@@ -4006,6 +4006,127 @@ async function submitAnswerVia(
   }
 }
 
+export type ApplyPendingChangeResult =
+  | { ok: true; view: SessionView; questions: string[] }
+  | {
+      ok: false;
+      reason:
+        | "NOT_FOUND"
+        | "SESSION_CONFIRMED"
+        | "WRONG_SESSION"
+        | "NOT_PENDING"
+        | "ALREADY_APPLIED"
+        | "BLOCKED"
+        | "STALE"
+        | "INVALID";
+      detail?: string;
+    };
+
+/**
+ * Applies a waiting typed change (#206) — ONE transaction, all or nothing.
+ *
+ * The draft carries `base` (the held answer of each question it touches, as it
+ * was when the organizer was shown the change) and `result` (the validated
+ * answer that was shown). Applying is a compare-and-swap from one to the other,
+ * under the session's row lock and the draft's own:
+ *
+ *  - the draft must be `pending` and belong to THIS chat's live session — the
+ *    draft id arrives in a button's callback data, which proves nothing about
+ *    who tapped it;
+ *  - every touched question must still hold exactly what was shown as `base`;
+ *    otherwise nothing is written (`STALE`) and the caller rebuilds the change
+ *    against what is held now and shows it again;
+ *  - each `result` is validated once more, the writer's own gate;
+ *  - a draft with an open reference or a conflict cannot be applied (`BLOCKED`).
+ * A change touching two questions is applied together or not at all. A second
+ * tap finds the draft applied and says so (`ALREADY_APPLIED`), writing nothing.
+ *
+ * The model is never called here: what is committed is the stored result, not a
+ * fresh reading of the words that produced it.
+ */
+export async function applyPendingChangeForChat(
+  db: pg.Pool,
+  chatId: string,
+  draftId: string,
+): Promise<ApplyPendingChangeResult> {
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const session = await lockSession(client, { by: "chat", chatId });
+    if (!session) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+    if (session.state === "confirmed") { await client.query("ROLLBACK"); return { ok: false, reason: "SESSION_CONFIRMED" }; }
+
+    const found = await client.query<{
+      id: string;
+      session_id: string;
+      status: string;
+      base: Record<string, unknown>;
+      result: Record<string, IntakeAnswer>;
+      unresolved: unknown[];
+      blocked: unknown[];
+    }>(
+      `SELECT id, session_id, status, base, result, unresolved, blocked
+         FROM control_plane.intake_pending_changes WHERE id = $1 FOR UPDATE`,
+      [draftId],
+    );
+    const draft = found.rows[0];
+    if (!draft) { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_FOUND" }; }
+    if (draft.session_id !== session.id) { await client.query("ROLLBACK"); return { ok: false, reason: "WRONG_SESSION" }; }
+    if (draft.status === "applied") { await client.query("ROLLBACK"); return { ok: false, reason: "ALREADY_APPLIED" }; }
+    if (draft.status !== "pending") { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_PENDING" }; }
+
+    const questionIds = Object.keys(draft.result ?? {});
+    if (questionIds.length === 0 || draft.unresolved.length > 0 || draft.blocked.length > 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "BLOCKED" };
+    }
+    for (const questionId of questionIds) {
+      if (canonical(session.answers[questionId] ?? null) !== canonical(draft.base?.[questionId] ?? null)) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "STALE", detail: questionId };
+      }
+    }
+
+    const written: AnswerStore = {};
+    for (const questionId of questionIds) {
+      const shown = draft.result[questionId]!;
+      if (shown.kind !== "structured") { await client.query("ROLLBACK"); return { ok: false, reason: "INVALID", detail: questionId }; }
+      const checked = validateAnswer(questionId, null, null, INTAKE_QUESTIONS, shown.data);
+      if (!checked.ok) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "INVALID", detail: `${questionId}: ${checked.reason}` };
+      }
+      written[questionId] = checked.answer;
+    }
+
+    const updatedAnswers = canonicalized({ ...session.answers, ...written });
+    const ui = questionIds.reduce((u, questionId) => withoutSuggestion(u, questionId), parseUiState(session.ui_state));
+    const newState = deriveSessionState(updatedAnswers, INTAKE_QUESTIONS, ui);
+    await client.query(
+      "UPDATE control_plane.intake_sessions SET answers = $1, state = $2, ui_state = $3::jsonb, updated_at = now() WHERE id = $4",
+      [JSON.stringify(updatedAnswers), newState, serializeUiState(ui), session.id],
+    );
+    await client.query(
+      `UPDATE control_plane.intake_pending_changes
+          SET status = 'applied', resolved_at = now(), resolved_by = 'organizer', updated_at = now()
+        WHERE id = $1`,
+      [draft.id],
+    );
+    await client.query("COMMIT");
+
+    // Advancing the phase is its own step, as it is for every other writer.
+    await advancePhaseForChat(db, chatId);
+    const view = await getSessionForChat(db, chatId);
+    if (!view.ok) return { ok: false, reason: "NOT_FOUND" };
+    return { ok: true, view: view.view, questions: questionIds };
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
  * Confirms the intake: creates an immutable intake_versions row and transitions
  * the trip to 'intake_confirmed'. Idempotent: a second CONFIRM returns the
@@ -4065,6 +4186,20 @@ async function confirmIntakeVia(
       const [ver] = existing.rows;
       if (!ver) return { ok: false, reason: "NOT_FOUND" };
       return { ok: true, sessionId: session.id, intakeVersionId: ver.id, digest: ver.digest, versionNumber: ver.version };
+    }
+
+    // A CHANGE THE ORGANIZER HAS NOT SETTLED. Confirming now would lock in the
+    // answers the change is about to alter, or drop it unseen — never silently
+    // applied, never silently dropped. Checked here, under the session lock and
+    // before anything else, so BOTH callers are covered: the Confirm button
+    // (`confirmIntakeForChat`) and the web route (`confirmIntake`, app.ts).
+    const waiting = await client.query(
+      "SELECT 1 FROM control_plane.intake_pending_changes WHERE session_id = $1 AND status = 'pending' LIMIT 1",
+      [session.id],
+    );
+    if ((waiting.rowCount ?? 0) > 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "PENDING_CHANGE" };
     }
 
     // All required questions must be answered.

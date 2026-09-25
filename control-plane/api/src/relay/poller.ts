@@ -1294,6 +1294,15 @@ async function applyInterviewCallback(
         session_id: decision.sessionId,
         safe_error_code: result.reason,
       }));
+      // A change waiting for the organizer's answer is not an error and not a
+      // missing answer: it is said in the interview's own language, and it says
+      // what to do. Every other reason keeps its wording.
+      if (result.reason === "PENDING_CHANGE") {
+        const language = sessionBeforeConfirm.ok ? sessionBeforeConfirm.view.language : DEFAULT_LANGUAGE;
+        await ack(uiString("changePendingBlocksConfirm", language));
+        await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("changePendingBlocksConfirm", language) });
+        return;
+      }
       await ack("I couldn't confirm that yet.");
       await deps.telegram.sendMessage({
         chatId: decision.chatId,
