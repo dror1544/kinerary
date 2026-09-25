@@ -16,6 +16,8 @@ const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeV
 const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
 const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
+const { publicUser } = require('./public-user');
+const { createFileTokens, createShareTokens } = require('./file-token');
 
 const app = express();
 // Default (100kb) is too small for /api/bookings/extract, which the browser
@@ -59,6 +61,10 @@ app.use('/modern', express.static(path.join(SITE_DIR, 'modern'), { index: 'index
 const IMMICH_URL    = (process.env.IMMICH_URL || '').replace(/\/$/, '');
 const IMMICH_KEY    = process.env.IMMICH_API_KEY || '';
 const JWT_SECRET    = process.env.JWT_SECRET || 'trip-dev-secret-change-me';
+// Signed, short-lived photo-file links (server/file-token.js) — keyed from JWT_SECRET.
+const fileTokens = createFileTokens(JWT_SECRET);
+// Non-expiring capability links for /photo/:id (server/file-token.js), a different label.
+const shareTokens = createShareTokens(JWT_SECRET);
 const HERMES_KEY    = process.env.HERMES_API_KEY || '';
 // Optional shared onboarding password for a fresh DB's seeded users. Leave
 // unset in production once Telegram/Google login is live — each participant
@@ -680,6 +686,9 @@ dataReady.catch(console.error);
 const controlPlaneAuth = createControlPlaneAuth({ app, db, tripDir: TRIP_DIR, config: () => TRIP_CONFIG, ready: dataReady, jwtSecret: JWT_SECRET });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
+// The caller's OWN record, whole minus the password hash — /api/auth/me and
+// nothing else. Anything attached to ANOTHER member's activity goes through
+// publicUser() (server/public-user.js), an allow-list (#191).
 function getUser(username) {
   const u = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
   if (!u) return null;
@@ -1233,11 +1242,27 @@ require('./site-icons').registerSiteIcons(app, {
   tripDir: TRIP_DIR, siteDir: SITE_DIR, getLogo: () => TRIP_CONFIG.meta?.logo,
 });
 
+// Image extensions only. meta.logo is a config value, and realpath containment
+// alone still lets it name trip.config.json, .env or a script that sits INSIDE
+// the trip directory; the extension allow-list is what stops that.
+const LOGO_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp']);
+
 app.get('/api/trip/logo', (_req, res) => {
   const logoFile = TRIP_CONFIG.meta?.logo;
-  if (!logoFile) return res.status(404).end();
-  const logoPath = path.join(TRIP_DIR, logoFile);
-  if (!fs.existsSync(logoPath)) return res.status(404).end();
+  if (!logoFile || typeof logoFile !== 'string') return res.status(404).end();
+  // Public on purpose: the login page and the trivia TV screen draw it before
+  // any login. So the file must (1) resolve INSIDE the trip directory, symlinks
+  // followed (same check as site-icons.js) and (2) be an image by extension.
+  let logoPath;
+  try {
+    const root = fs.realpathSync(TRIP_DIR);
+    logoPath = fs.realpathSync(path.resolve(root, logoFile));
+    if (!logoPath.startsWith(root + path.sep)) return res.status(404).end();
+  } catch { return res.status(404).end(); }
+  const ext = path.extname(logoPath).toLowerCase();
+  if (!LOGO_EXTENSIONS.has(ext)) return res.status(404).end();
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (ext === '.svg') res.setHeader('Content-Security-Policy', 'sandbox');
   res.sendFile(logoPath);
 });
 
@@ -1404,7 +1429,7 @@ app.post('/api/auth/avatar/upload', authRequired,
 );
 
 // ── RATINGS ───────────────────────────────────────────────────────────────────
-app.get('/api/ratings', (_req, res) => {
+app.get('/api/ratings', authRequired, (_req, res) => {
   const rows = db.prepare('SELECT venue, username, stars FROM ratings').all();
   const result = {};
   for (const r of rows) {
@@ -1422,18 +1447,32 @@ app.post('/api/ratings', authRequired, (req, res) => {
 });
 
 // ── PHOTOS ────────────────────────────────────────────────────────────────────
+const PHOTO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif']);
+function photoExtension(originalname) {
+  const ext = path.extname(String(originalname || '')).toLowerCase();
+  return PHOTO_EXTENSIONS.has(ext) ? ext : '';
+}
 const photoUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+    // The stored name is built here from a fixed alphabet plus an extension
+    // from the allow-list — never a fragment of the uploader's originalname,
+    // which used to reach classic's inline onclick and the served Content-Type.
     filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname);
-      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${photoExtension(file.originalname)}`);
     }
   }),
+  // SVG and HTML are deliberately absent: both run script when opened.
+  fileFilter: (req, file, cb) => {
+    const ok = photoExtension(file.originalname) && /^image\//i.test(file.mimetype || '');
+    if (!ok) req.photoRejected = true;
+    cb(null, Boolean(ok));
+  },
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async (req, res) => {
+  if (req.photoRejected) return res.status(400).json({ error: 'unsupported_file_type' });
   if (!req.file) return res.status(400).json({ error: 'no_file' });
   const { phase, caption } = req.body || {};
   const now = new Date().toISOString();
@@ -1443,8 +1482,8 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
     'INSERT INTO photos (id, filename, original_name, phase, caption, username, uploaded_at) VALUES (?,?,?,?,?,?,?)'
   ).run(id, req.file.filename, req.file.originalname, phase || 'general', caption || '', req.user.username, now);
 
-  const safeUser = getUser(req.user.username) || { username: req.user.username };
-  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: req.user.username, uploadedAt: now, user: safeUser } });
+  const safeUser = publicUser(getUser(req.user.username)) || { username: req.user.username };
+  res.json({ ok: true, photo: { id, filename: req.file.filename, originalName: req.file.originalname, phase: phase || 'general', caption: caption || '', username: req.user.username, uploadedAt: now, url: photoFileUrl(req.file.filename), shareUrl: photoShareUrl(id), user: safeUser } });
 
   // Push to Immich in background (non-blocking)
   if (IMMICH_URL && IMMICH_KEY) {
@@ -1487,7 +1526,22 @@ app.post('/api/photos/upload', authRequired, photoUpload.single('photo'), async 
   }
 });
 
-app.get('/api/photos', (req, res) => {
+// A signed link for one gallery file: an <img> cannot send a bearer token, so
+// the (authenticated) listing carries the credential in the URL instead. The
+// file route below serves only a valid, unexpired one or an authenticated call.
+function photoFileUrl(filename, atMs) {
+  const { exp, sig } = fileTokens.sign(filename, atMs);
+  return `/api/photos/file/${encodeURIComponent(filename)}?exp=${exp}&sig=${sig}`;
+}
+
+// The link a member shares (Facebook button): /photo/<id>?s=<hmac of the id>.
+// Public by design — the crawler has no login — but not guessable, and only an
+// authenticated listing ever hands one out.
+function photoShareUrl(id) {
+  return `/photo/${encodeURIComponent(id)}?s=${shareTokens.sign(String(id))}`;
+}
+
+app.get('/api/photos', authRequired, (req, res) => {
   const { phase } = req.query;
   const rows = phase
     ? db.prepare('SELECT * FROM photos WHERE phase = ? ORDER BY uploaded_at DESC').all(phase)
@@ -1501,15 +1555,53 @@ app.get('/api/photos', (req, res) => {
     caption: p.caption,
     username: p.username,
     uploadedAt: p.uploaded_at,
-    user: getUser(p.username) || { username: p.username },
+    url: photoFileUrl(p.filename),
+    shareUrl: photoShareUrl(p.id),
+    user: publicUser(getUser(p.username)) || { username: p.username },
   }));
   res.json(photos);
 });
 
-app.get('/api/photos/file/:filename', (req, res) => {
-  const filePath = path.join(UPLOADS_DIR, path.basename(req.params.filename));
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'not_found' });
-  res.sendFile(filePath);
+// Credential is EITHER a valid signed link (exp+sig, from the listing above) OR
+// ordinary authentication (member JWT, agent key, gateway-injected session,
+// ?_t=). A link that is bad or expired never overrides authentication: it just
+// falls back to authRequired, which refuses when there is nothing else. (A
+// gallery left open past the link's hour must keep its images behind the
+// gateway, where the session is injected on every request.) A forged link with
+// no credential is refused, never served.
+function photoFileAccess(req, res, next) {
+  const { exp, sig } = req.query;
+  if (exp !== undefined || sig !== undefined) {
+    if (fileTokens.verify(req.params.filename, exp, sig)) return next();
+  }
+  return authRequired(req, res, next);
+}
+
+// Types that run script when a browser opens them. Files stored before uploads
+// were filtered may still carry these names; they are never sent with a
+// renderable type.
+const ACTIVE_CONTENT_EXTENSIONS = new Set(['.html', '.htm', '.xhtml', '.svg', '.xml', '.js', '.mjs']);
+
+app.get('/api/photos/file/:filename', photoFileAccess, (req, res) => {
+  // The name is never trusted as a path: it must be a bare filename, and the
+  // resolved file must still sit inside UPLOADS_DIR after symlinks are followed.
+  const name = req.params.filename;
+  if (!name || name !== path.basename(name)) return res.status(404).json({ error: 'not_found' });
+  let filePath;
+  try {
+    const root = fs.realpathSync(UPLOADS_DIR);
+    filePath = fs.realpathSync(path.join(root, name));
+    if (!filePath.startsWith(root + path.sep)) return res.status(404).json({ error: 'not_found' });
+  } catch { return res.status(404).json({ error: 'not_found' }); }
+  const safeName = name.replace(/[^A-Za-z0-9._-]/g, '_');
+  const headers = {
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': 'sandbox',
+    'Content-Disposition': `inline; filename="${safeName}"`,
+    'Cache-Control': 'private, max-age=300',
+  };
+  if (ACTIVE_CONTENT_EXTENSIONS.has(path.extname(name).toLowerCase())) headers['Content-Type'] = 'application/octet-stream';
+  res.sendFile(filePath, { headers, cacheControl: false });
 });
 
 app.delete('/api/photos/:id', authRequired, async (req, res) => {
@@ -1542,9 +1634,9 @@ app.delete('/api/photos/:id', authRequired, async (req, res) => {
 });
 
 // ── VENUE COMMENTS ────────────────────────────────────────────────────────────
-app.get('/api/comments/venue/:venueId', (req, res) => {
+app.get('/api/comments/venue/:venueId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM venue_comments WHERE venue = ? ORDER BY created_at ASC').all(req.params.venueId);
-  const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
+  const comments = rows.map(c => ({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } }));
   res.json(comments);
 });
 
@@ -1555,7 +1647,7 @@ app.post('/api/comments/venue/:venueId', authRequired, (req, res) => {
     "INSERT INTO venue_comments (venue, username, body, created_at) VALUES (?,?,?,datetime('now'))"
   ).run(req.params.venueId, req.user.username, body.trim());
   const row = db.prepare('SELECT * FROM venue_comments WHERE id = ?').get(result.lastInsertRowid);
-  res.json({ ...row, user: getUser(req.user.username) });
+  res.json({ ...row, user: publicUser(getUser(req.user.username)) });
 });
 
 app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
@@ -1567,9 +1659,9 @@ app.delete('/api/comments/venue/:id', authRequired, (req, res) => {
 });
 
 // ── RSVPs ─────────────────────────────────────────────────────────────────────
-app.get('/api/rsvps/:activityId', (req, res) => {
+app.get('/api/rsvps/:activityId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM rsvps WHERE activity = ?').all(req.params.activityId);
-  const rsvps = rows.map(r => ({ ...r, user: getUser(r.username) || { username: r.username } }));
+  const rsvps = rows.map(r => ({ ...r, user: publicUser(getUser(r.username)) || { username: r.username } }));
   res.json(rsvps);
 });
 
@@ -1584,7 +1676,7 @@ app.post('/api/rsvps/:activityId', authRequired, (req, res) => {
 
 // ── PHOTO REACTIONS ───────────────────────────────────────────────────────────
 // Bulk fetch — all reactions for all photos (or filtered by comma-separated IDs)
-app.get('/api/reactions', (req, res) => {
+app.get('/api/reactions', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions').all();
   const grouped = {};
   for (const r of rows) {
@@ -1595,13 +1687,13 @@ app.get('/api/reactions', (req, res) => {
   res.json(grouped);
 });
 
-app.get('/api/reactions/:photoId', (req, res) => {
+app.get('/api/reactions/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_reactions WHERE photo_id = ?').all(req.params.photoId);
   // Group by emoji: { '❤️': [{ username, user }], ... }
   const grouped = {};
   for (const r of rows) {
     if (!grouped[r.emoji]) grouped[r.emoji] = [];
-    grouped[r.emoji].push({ username: r.username, user: getUser(r.username) || { username: r.username } });
+    grouped[r.emoji].push({ username: r.username, user: publicUser(getUser(r.username)) || { username: r.username } });
   }
   res.json(grouped);
 });
@@ -1621,19 +1713,19 @@ app.post('/api/reactions/:photoId', authRequired, (req, res) => {
 
 // ── PHOTO COMMENTS ────────────────────────────────────────────────────────────
 // Bulk fetch — all photo comments (for gallery preload)
-app.get('/api/comments/photo', (req, res) => {
+app.get('/api/comments/photo', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments ORDER BY created_at ASC').all();
   const grouped = {};
   for (const c of rows) {
     if (!grouped[c.photo_id]) grouped[c.photo_id] = [];
-    grouped[c.photo_id].push({ ...c, user: getUser(c.username) || { username: c.username } });
+    grouped[c.photo_id].push({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } });
   }
   res.json(grouped);
 });
 
-app.get('/api/comments/photo/:photoId', (req, res) => {
+app.get('/api/comments/photo/:photoId', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM photo_comments WHERE photo_id = ? ORDER BY created_at ASC').all(req.params.photoId);
-  const comments = rows.map(c => ({ ...c, user: getUser(c.username) || { username: c.username } }));
+  const comments = rows.map(c => ({ ...c, user: publicUser(getUser(c.username)) || { username: c.username } }));
   res.json(comments);
 });
 
@@ -1644,7 +1736,7 @@ app.post('/api/comments/photo/:photoId', authRequired, (req, res) => {
     "INSERT INTO photo_comments (photo_id, username, body, created_at) VALUES (?,?,?,datetime('now'))"
   ).run(req.params.photoId, req.user.username, body.trim());
   const row = db.prepare('SELECT * FROM photo_comments WHERE id = ?').get(result.lastInsertRowid);
-  res.json({ ...row, user: getUser(req.user.username) });
+  res.json({ ...row, user: publicUser(getUser(req.user.username)) });
 });
 
 app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
@@ -1656,9 +1748,9 @@ app.delete('/api/comments/photo/:id', authRequired, (req, res) => {
 });
 
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
-app.get('/api/tasks/done', (req, res) => {
+app.get('/api/tasks/done', authRequired, (req, res) => {
   const rows = db.prepare('SELECT * FROM task_done ORDER BY done_at ASC').all();
-  res.json(rows.map(r => ({ ...r, user: getUser(r.done_by) })));
+  res.json(rows.map(r => ({ ...r, user: publicUser(getUser(r.done_by)) })));
 });
 
 app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
@@ -1670,7 +1762,7 @@ app.post('/api/tasks/:taskId/done', authRequired, (req, res) => {
   } else {
     db.prepare("INSERT OR REPLACE INTO task_done (task_id, done_by, done_at) VALUES (?,?,datetime('now'))").run(taskId, req.user.username);
     const row = db.prepare('SELECT * FROM task_done WHERE task_id = ?').get(taskId);
-    res.json({ done: true, ...row, user: getUser(req.user.username) });
+    res.json({ done: true, ...row, user: publicUser(getUser(req.user.username)) });
   }
 });
 
@@ -1728,14 +1820,16 @@ async function getOrCreateShareLink(phase) {
   return created2.key;
 }
 
-app.get('/api/album-share/:phase', async (req, res) => {
+app.get('/api/album-share/:phase', authRequired, async (req, res) => {
   if (!IMMICH_URL || !IMMICH_KEY) return res.status(503).json({ error: 'Immich not configured' });
   try {
     const key = await getOrCreateShareLink(req.params.phase);
     if (!key) return res.status(404).json({ error: 'Album not found' });
     res.json({ url: `${IMMICH_EXTERNAL}/share/${key}` });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // e.message carries the internal Immich URL on a connection failure; log it, do not serve it.
+    console.error('album-share failed:', e.message);
+    res.status(502).json({ error: 'album_unavailable' });
   }
 });
 
@@ -1822,12 +1916,18 @@ app.patch('/api/lost-found/:id', authRequired, (req, res) => {
 
 // ── PER-PHOTO SHARE PAGE (Open Graph tags for Facebook) ──────────────────────
 app.get('/photo/:id', (req, res) => {
-  const photo = db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id);
+  // Capability link: the signature is the credential. Unknown id, no signature,
+  // a bad one and another photo's all answer the same 404, so the page never
+  // confirms that an id exists.
+  const photo = shareTokens.verify(req.params.id, req.query.s)
+    ? db.prepare('SELECT * FROM photos WHERE id = ?').get(req.params.id) : null;
   if (!photo) return res.status(404).send('Not found');
   const origin = process.env.PUBLIC_ORIGIN || `${req.protocol}://${req.get('host')}`;
-  const imgUrl = `${origin}/api/photos/file/${encodeURIComponent(photo.filename)}`;
-  const pageUrl = `${origin}/photo/${photo.id}`;
-  const brand = TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip';
+  const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  // Signed like the listing's links: the raw file route is no longer public.
+  const imgUrl = esc(`${origin}${photoFileUrl(photo.filename)}`);
+  const pageUrl = esc(`${origin}${photoShareUrl(photo.id)}`);
+  const brand = esc(TRIP_CONFIG.meta?.brand || TRIP_CONFIG.meta?.title || 'Trip');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html><html><head>
 <meta charset="UTF-8">
@@ -3577,7 +3677,11 @@ function triviaPublicState() {
     pausedRemainingMs: triviaState.pausedRemainingMs,
     question,
     nextPersons: nextQ ? nextQ.persons : null,
-    players: triviaState.players,
+    // Built without `family`: this state also goes to the anonymous TV stream.
+    players: Object.fromEntries(Object.entries(triviaState.players).map(([u, p]) => {
+      const { family: _family, ...shown } = p;
+      return [u, shown];
+    })),
     myAnswer: null // client fills this in
   };
 }

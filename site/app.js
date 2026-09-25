@@ -143,12 +143,18 @@ function renderTaskDeadlines(lang) {
   });
 }
 
+// The social/gallery reads need a login (issues #191/#194): every one of them
+// goes through here so the bearer token travels with it.
+function authGet(url) {
+  return fetch(url, { headers: { Authorization: `Bearer ${localStorage.getItem('trip-token')}` } });
+}
+
 // ── TASK DONE ─────────────────────────────────────────────────────────────────
 let taskDoneCache = {};
 
 async function loadTaskDone() {
   try {
-    const res = await fetch('/api/tasks/done');
+    const res = await authGet('/api/tasks/done');
     const rows = await res.json();
     taskDoneCache = {};
     rows.forEach(r => { taskDoneCache[r.task_id] = r; });
@@ -1515,7 +1521,7 @@ let allRatings = {};
 
 async function loadRatings() {
   try {
-    const res = await fetch('/api/ratings');
+    const res = await authGet('/api/ratings');
     if (res.ok) allRatings = await res.json();
   } catch {}
   ['ratings-ny', 'ratings-dallas', 'ratings-colorado', 'ratings-wc'].forEach((id, i) => {
@@ -1606,7 +1612,7 @@ async function toggleVenueComments(venueId) {
 
   if (!venueCommentsCache[venueId]) {
     try {
-      const res = await fetch(`/api/comments/venue/${venueId}`);
+      const res = await authGet(`/api/comments/venue/${venueId}`);
       venueCommentsCache[venueId] = res.ok ? await res.json() : [];
     } catch { venueCommentsCache[venueId] = []; }
   }
@@ -1693,7 +1699,7 @@ async function loadRsvps(containerId, activities) {
   // Fetch all activities for this section in parallel
   await Promise.all(activities.map(async a => {
     try {
-      const res = await fetch(`/api/rsvps/${a.id}`);
+      const res = await authGet(`/api/rsvps/${a.id}`);
       rsvpCache[a.id] = res.ok ? await res.json() : [];
     } catch { rsvpCache[a.id] = []; }
   }));
@@ -1932,7 +1938,7 @@ const ALBUM_SHARE_URLS = {};
 async function loadAlbumShareLinks() {
   for (const phase of ['ny', 'dallas', 'colorado', 'wc']) {
     try {
-      const res = await fetch(`/api/album-share/${phase}`);
+      const res = await authGet(`/api/album-share/${phase}`);
       if (!res.ok) continue;
       const { url } = await res.json();
       ALBUM_SHARE_URLS[phase] = url;
@@ -1945,14 +1951,28 @@ async function loadAlbumShareLinks() {
   }
 }
 
+// Photos the gallery has drawn, by id. Buttons pass only the (server-built,
+// numeric) id; the filename and share link are looked up here rather than being
+// written into an inline onclick string.
+const photoIndex = {};
+
 function sharePhotoFacebook(photoId) {
-  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}/photo/${photoId}`)}`, '_blank');
+  const shareUrl = photoIndex[photoId]?.shareUrl;   // /photo/<id>?s=<capability>
+  if (!shareUrl) return;
+  window.open(`https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(`${location.origin}${shareUrl}`)}`, '_blank');
 }
 
-async function sharePhotoInstagram(filename) {
-  const photoUrl = `/api/photos/file/${filename}`;
+async function sharePhotoInstagram(photoId) {
+  const filename = photoIndex[photoId]?.filename;
+  if (!filename) return;
+  // The file route needs a login (issues #191/#194); an <img> carries a signed
+  // link, but this fetch carries the bearer token instead.
+  const photoUrl = `/api/photos/file/${encodeURIComponent(filename)}`;
+  let blob = null;
   try {
-    const blob = await fetch(photoUrl).then(r => r.blob());
+    const res = await authGet(photoUrl);
+    if (!res.ok) return;
+    blob = await res.blob();
     const ext = filename.split('.').pop() || 'jpg';
     const file = new File([blob], `photo.${ext}`, { type: blob.type });
     if (navigator.canShare?.({ files: [file] })) {
@@ -1960,9 +1980,11 @@ async function sharePhotoInstagram(filename) {
       return;
     }
   } catch (e) { if (e.name === 'AbortError') return; }
+  if (!blob) return;
   // Desktop fallback: download the image
   const a = document.createElement('a');
-  a.href = photoUrl; a.download = filename; a.click();
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 function askDeletePhoto(id) {
@@ -2002,6 +2024,7 @@ window.cancelDeletePhoto  = cancelDeletePhoto;
 window.confirmDeletePhoto = confirmDeletePhoto;
 
 function buildPhotoCard(p, reactions) {
+  photoIndex[p.id] = p;
   const tr     = T[currentLang] || T['he'];
   const color  = p.user?.color  || '#888';
   const name   = uname(p.username, p.user);
@@ -2024,7 +2047,7 @@ function buildPhotoCard(p, reactions) {
   const isOwner = currentUser?.username === p.username;
 
   return `<div class="pg-card" id="pgcard-${p.id}">
-    <img src="/api/photos/file/${p.filename}" loading="lazy" alt="">
+    <img src="${p.url || `/api/photos/file/${p.filename}`}" loading="lazy" alt="">
     ${isOwner ? `<div class="pg-delete-wrap" id="pgdel-${p.id}">
       <button class="pg-delete-btn" onclick="askDeletePhoto('${p.id}')" title="${tr.ph_delete}">🗑️</button>
     </div>` : ''}
@@ -2033,7 +2056,7 @@ function buildPhotoCard(p, reactions) {
       <div class="pg-info"><div class="pg-name">${escapeHtml(name)}</div><div>${date}</div></div>
       <div class="pg-share-btns">
         <button class="pg-share-btn pg-share-fb" onclick="sharePhotoFacebook('${p.id}')" title="${tr.ph_share_fb}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></button>
-        <button class="pg-share-btn pg-share-ig" onclick="sharePhotoInstagram('${p.filename}')" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
+        <button class="pg-share-btn pg-share-ig" onclick="sharePhotoInstagram('${p.id}')" title="${tr.ph_share_ig}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zm0-2.163c-3.259 0-3.667.014-4.947.072-4.358.2-6.78 2.618-6.98 6.98-.059 1.281-.073 1.689-.073 4.948 0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98 1.281.058 1.689.072 4.948.072 3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98-1.281-.059-1.69-.073-4.949-.073zm0 5.838c-3.403 0-6.162 2.759-6.162 6.162s2.759 6.163 6.162 6.163 6.162-2.759 6.162-6.163c0-3.403-2.759-6.162-6.162-6.162zm0 10.162c-2.209 0-4-1.79-4-4 0-2.209 1.791-4 4-4s4 1.791 4 4c0 2.21-1.791 4-4 4zm6.406-11.845c-.796 0-1.441.645-1.441 1.44s.645 1.44 1.441 1.44c.795 0 1.439-.645 1.439-1.44s-.644-1.44-1.439-1.44z"/></svg></button>
       </div>
     </div>
     <div class="pg-reaction-bar" id="pg-reactions-${p.id}">${reactionBar}</div>
@@ -2063,9 +2086,9 @@ async function loadPhaseAlbum(phase) {
   gallery.innerHTML = `<p style="color:var(--ink-2);padding:16px 0">${tr.album_loading || '...'}</p>`;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(`/api/photos?phase=${phase}`),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(`/api/photos?phase=${phase}`),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos      = photosRes.ok   ? await photosRes.json()   : [];
     const reactions   = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2087,9 +2110,9 @@ async function loadPhotosGallery(phase) {
   if (!gallery) return;
   try {
     const [photosRes, reactionsRes, commentsRes] = await Promise.all([
-      fetch(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
-      fetch('/api/reactions'),
-      fetch('/api/comments/photo'),
+      authGet(phase ? `/api/photos?phase=${phase}` : '/api/photos'),
+      authGet('/api/reactions'),
+      authGet('/api/comments/photo'),
     ]);
     const photos   = photosRes.ok   ? await photosRes.json()    : [];
     allPhotoReactions          = reactionsRes.ok ? await reactionsRes.json() : {};
@@ -2142,7 +2165,7 @@ async function togglePhotoComments(photoId) {
 
   if (!photoCommentsCache[photoId]) {
     try {
-      const res = await fetch(`/api/comments/photo/${photoId}`);
+      const res = await authGet(`/api/comments/photo/${photoId}`);
       photoCommentsCache[photoId] = res.ok ? await res.json() : [];
     } catch { photoCommentsCache[photoId] = []; }
   }

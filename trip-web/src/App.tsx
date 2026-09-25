@@ -2217,7 +2217,7 @@ export function PhotosView({ config, currentUser, lang }: { config?: TripConfig;
           const alt = photo.caption || copy(lang, `Photo by ${authorName}`, `תמונה מאת ${authorName}`);
           return (
             <article className="photo-card" key={photo.id}>
-              <img className="photo-image" src={safeFileUrl("/api/photos/file", photo.filename)} alt={alt} loading="lazy" />
+              <img className="photo-image" src={photo.url ? runtimeUrl(photo.url) : safeFileUrl("/api/photos/file", photo.filename)} alt={alt} loading="lazy" />
               <div className="photo-card-body">
                 <div className="photo-author"><PersonAvatar username={photo.username} name={authorName} color={photo.user.color} size="small" /><div><strong>{authorName}</strong><small>{new Date(photo.uploadedAt).toLocaleDateString(lang === "he" ? "he-IL" : "en-US", { month: "short", day: "numeric", year: "numeric" })} · {budgetPhaseName(photo.phase, config, lang)}</small></div></div>
                 {photo.caption ? <p className="photo-caption">{photo.caption}</p> : null}

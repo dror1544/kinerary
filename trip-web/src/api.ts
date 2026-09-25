@@ -252,6 +252,10 @@ const photoSchema = z.object({
   caption: z.string(),
   username: z.string(),
   uploadedAt: z.string(),
+  // Short-lived signed link to the file (an <img> cannot send a bearer token). Issues #191/#194.
+  url: z.string().optional(),
+  // Capability link for the public /photo/<id> share page (no client builds one yet).
+  shareUrl: z.string().optional(),
   user: photoUserSchema,
 });
 
