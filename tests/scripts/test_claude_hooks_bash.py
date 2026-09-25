@@ -92,5 +92,104 @@ class ASubagentIsRefused(Harness):
             self.assertEqual(self.hook(command, agent_type="developer"), {}, command)
 
 
+class DocsOnlyNeedsNoApprovalInTheMvpPhase(Harness):
+    """CLAUDE.md "MVP phase — lighter rules" (2026-09-25).
+
+    A docs-only commit, and the push of docs-only commits, on an integration or
+    docs branch, from the lead session, is not asked about. Everything the hook
+    cannot see stays a prompt: it inspects what is STAGED before the command
+    runs, so any command that could stage or widen something in the same breath
+    (`git add … && git commit`, `-a`, `--amend`, another directory) is asked.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.git("reset", "-q", "note.md")
+        (self.root / "note.md").unlink()
+        self.git("checkout", "-q", "-b", "integration/sprint-x")
+        (self.root / "msg.txt").write_text("docs: a change\n")
+
+    def git(self, *args):
+        subprocess.run(["git", *GIT_ID, *args], cwd=self.root, check=True, capture_output=True)
+
+    def stage(self, *paths):
+        for rel in paths:
+            f = self.root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x\n")
+        self.git("add", *paths)
+
+    def decision(self, command, **kw):
+        return self.hook(command, **kw).get("permissionDecision")
+
+    def test_a_docs_only_commit_is_allowed(self):
+        self.stage("docs/plan.md", "CHANGELOG.md")
+        self.assertEqual(self.decision("git commit -q -F msg.txt"), "allow")
+        self.assertEqual(self.decision("git commit -m 'docs: a change'"), "allow")
+
+    def test_the_allow_names_the_rule(self):
+        self.stage("docs/plan.md")
+        self.assertIn("MVP", self.hook("git commit -q -F msg.txt")["permissionDecisionReason"])
+
+    def test_anything_that_is_not_documentation_is_still_asked(self):
+        for staged in (["src/app.ts"], ["docs/plan.md", "src/app.ts"], ["CLAUDE.md"], ["docs/plan.md", "CLAUDE.md"],
+                       [".claude/settings.json"], ["scripts/other-tool.sh"],
+                       ["docs/diagram.html"], ["note.md"]):
+            self.git("reset", "-q")
+            self.stage(*staged)
+            self.assertEqual(self.decision("git commit -q -F msg.txt"), "ask", staged)
+
+    def test_only_an_integration_or_docs_branch_qualifies(self):
+        self.stage("docs/plan.md")
+        for branch, expected in (("main", "ask"), ("feature/x", "ask"), ("docs/regression-plans", "allow"),
+                                 ("integration/sprint-7", "allow")):
+            self.git("checkout", "-q", "-B", branch)
+            self.assertEqual(self.decision("git commit -q -F msg.txt"), expected, branch)
+
+    def test_a_command_that_could_change_what_is_committed_is_asked(self):
+        self.stage("docs/plan.md")
+        for command in ("git add src/app.ts && git commit -m x", "git commit -am x", "git commit -a -m x",
+                        "git commit --amend -m x", "git commit --no-verify -m x", "git commit -m x; git push",
+                        "git commit -m $(cat msg.txt)", "git -C /elsewhere commit -m x",
+                        "cd /elsewhere && git commit -m x", "git commit -m x docs/plan.md src/app.ts"):
+            self.assertEqual(self.decision(command), "ask", command)
+
+    def test_a_subagent_is_still_refused(self):
+        self.stage("docs/plan.md")
+        self.assertEqual(self.decision("git commit -q -F msg.txt", agent_type="developer"), "deny")
+
+    def test_a_docs_only_push_is_allowed(self):
+        remote = Path(tempfile.mkdtemp(prefix="hook-remote-"))
+        self.addCleanup(shutil.rmtree, remote, True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-q", "-u", "origin", "integration/sprint-x")
+        self.stage("docs/plan.md")
+        self.git("commit", "-q", "-m", "docs: plan")
+        for command in ("git push", "git push origin", "git push origin integration/sprint-x", "git push -u origin"):
+            self.assertEqual(self.decision(command), "allow", command)
+        for command in ("git push --force", "git push -f origin integration/sprint-x", "git push origin main",
+                        "git push origin HEAD:main", "git push origin :integration/sprint-x", "git push --tags",
+                        "git push origin integration/sprint-x --force-with-lease"):
+            self.assertEqual(self.decision(command), "ask", command)
+
+    def test_a_push_carrying_anything_but_docs_is_asked(self):
+        remote = Path(tempfile.mkdtemp(prefix="hook-remote-"))
+        self.addCleanup(shutil.rmtree, remote, True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-q", "-u", "origin", "integration/sprint-x")
+        self.stage("docs/plan.md")
+        self.git("commit", "-q", "-m", "docs: plan")
+        self.stage("src/app.ts")
+        self.git("commit", "-q", "-m", "feat: code")
+        self.assertEqual(self.decision("git push"), "ask")
+
+    def test_a_push_with_no_upstream_is_asked(self):
+        self.stage("docs/plan.md")
+        self.git("commit", "-q", "-m", "docs: plan")
+        self.assertEqual(self.decision("git push"), "ask")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ the one place the rules live, not two files kept in sync by hand.
 
 1. **Never `git commit` without explicit user approval.** Finish the change,
    summarize what's ready, then wait for "commit", "go ahead", or equivalent.
+   (One MVP-phase exception: docs-only commits — see "MVP phase" below.)
 2. **Never deploy a live trip site without explicit approval** — pushing code
    to a running container, `docker compose up -d --force-recreate`, restarting
    `trip-server`, etc. Ask "ready to deploy?" after committing; a commit
@@ -30,6 +31,41 @@ the one place the rules live, not two files kept in sync by hand.
    an SSH key, an `/opt` path, a chat id — and it belongs in `kinerary-deploy`,
    reached through an env var or a config file read at runtime. See
    "Two repositories" below for the shape and the escape hatch.
+
+## MVP phase — lighter rules (owner's decision, 2026-09-25)
+
+For as long as the product is an MVP running family-and-friends trips, two
+kinds of friction are removed. They remove a prompt, not a protection: every
+hard rule above still holds for code, deploys, binaries and this deployment's
+names.
+
+1. **Docs-only work needs no per-commit approval.** A commit whose every staged
+   path is documentation (`docs/**/*.md`, `CHANGELOG.md`, `FRAMEWORK.md`,
+   `README.md`), and the push of commits that are only that, on an
+   `integration/sprint-*` or `docs/*` branch, from the lead session, is not
+   prompted. `scripts/claude-hooks/pretooluse-bash.sh` implements it and
+   vouches only for one plain `git commit` (message from `-F <file>` or
+   `-m '<text>'`) or one plain `git push` to the branch's own upstream — never
+   `git add … && git commit`, `-a`, `--amend`, `--no-verify`, another directory,
+   a force, or a merge commit. `CLAUDE.md`, `AGENTS.md`, `.claude/`,
+   `.githooks/`, `.github/` and `scripts/` are policy, not documentation, and
+   always ask. Code commits, merges, pushes of anything else and deploys still
+   ask (rules 1 and 2). A subagent is still refused for all of them.
+2. **Read-only production probes need no per-probe approval.** Health checks,
+   versions, trip dates, dropped-config paths and similar reads against the
+   control-plane VM and the live trips. A probe may read a trip's key inside the
+   command to authenticate; it never prints, logs or writes the key, never puts
+   it on a command line (feed it to `curl --config -` on stdin, as
+   `companion-install-host.sh` does), and reports only the verdict. Anything
+   that writes, restarts, deploys or changes a config still needs approval, and
+   reading what travellers wrote is not a probe: the alpha-tester data policy
+   applies. The harness's own permission classifier is separate from this rule
+   and can still ask; a Bash permission rule in the *user's* settings, not in
+   this repo, is how to quiet it.
+
+Deliberately **not** lightened: the review gates for a merge (integrator,
+regression plan, boundary review for security paths) and the documentation
+sweep after merges. Rules 2–6 are untouched.
 
 ## What this repo is
 
@@ -126,13 +162,17 @@ Details: `mcp/README.md`, `mcp/PROVISIONING.md`.
 - `sanitizeConfig()` (`server/server.js`) and `GET /api/config/warnings` carry
   a **blanket** invariant: no raw `trip.config.json` value is ever served,
   full stop. Several real leaks came from judging individual fields
-  case-by-case as harmless — don't reintroduce that pattern. On 2026-09-22
-  (#156) a data-derived `origin` field carrying `hermes:<profile>` — an
-  internal identifier, not trip data — reached the same route by the same
-  "no renderer reads it" shortcut, because `sanitizeConfig()` is a deny-list
-  and passes anything it was never told to remove; fixed with an allow-list
-  at the producer before any deployment had a search profile configured to
-  make it live.
+  case-by-case as harmless — don't reintroduce that pattern. Since #172
+  (2026-09-25) `sanitizeConfig()` is an **allow-list**
+  (`shared/config-visibility.js`): a field it does not name is withheld,
+  silently and on purpose, and its path is logged at boot. A field missing on a
+  site is therefore a list entry to decide, never a reason to go back to
+  removing known-bad fields. On 2026-09-22 (#156) a data-derived `origin` field
+  carrying `hermes:<profile>` — an internal identifier, not trip data — reached
+  the same route by the same "no renderer reads it" shortcut, because the old
+  sanitizer was a deny-list and passed anything it was never told to remove;
+  fixed with an allow-list at the producer before any deployment had a search
+  profile configured to make it live.
 - `shared/needs-schema.js` / `shared/agent-schema.js` visibility rules fail
   **safe** by design: anything unrecognized resolves to the most restrictive
   option. An unknown value falling through to "public" is the bug class this
@@ -277,10 +317,13 @@ INTERPRET_PATH_DEFAULT=1
 INTERPRET_RUNNER=claude   INTERPRET_MODEL=claude-sonnet-5   INTERPRET_EFFORT=medium
 EXTRACT_RUNNER=claude     EXTRACT_MODEL=claude-sonnet-5     EXTRACT_EFFORT=medium
 ITINERARY_EXTRACT_TIMEOUT_MS=120000
-# Document reading, per task (benchmarked 2026-09-13 — docs/document-intake-operations.md):
-EXTRACT_INTAKE_RUNNER=codex      EXTRACT_INTAKE_MODEL=gpt-5.6-luna
-EXTRACT_ITINERARY_RUNNER=codex   EXTRACT_ITINERARY_MODEL=gpt-5.6-luna
 ```
+
+Documents are read with `EXTRACT_RUNNER=claude` — what runs on the Mac and the
+VM today (decided 2026-09-25: use what is running). A per-task Codex binding
+(`EXTRACT_INTAKE_*` / `EXTRACT_ITINERARY_*`, `gpt-5.6-luna`) was benchmarked on
+2026-09-13 (`docs/document-intake-operations.md`) but is not configured
+anywhere (#202); switching to it is a deliberate change, not a repair.
 
 **The harness behind those numbers reached this branch four days after the
 numbers did.** `tools/extract-eval.ts` — the benchmark script
@@ -288,15 +331,20 @@ numbers did.** `tools/extract-eval.ts` — the benchmark script
 Slice B's `tools/` files that a step-list handoff omitted, and it was restored
 only in `b4754ed` (2026-09-22,
 `docs/test-reports/sprint-6-integration-handoff-2026-09-22.md`). Between those
-dates the `EXTRACT_INTAKE_*`/`EXTRACT_ITINERARY_*` config above was live on the
-branch with no way to regenerate or re-check the evidence behind it.
+dates the per-task Codex numbers were on the branch with no way to regenerate
+or re-check the evidence behind them.
 
 **Set the effort.** Unset, a nested `claude -p` takes its effort from the
 settings in the relay's HOME — on the Mac, a personal `effortLevel: xhigh`, at
 which a 4-page PDF's day-by-day plan took 143s against a 60s limit and never
 arrived (2026-09-16). Set, the call also ignores personal settings, hooks and
-connectors. The VM takes `medium` from `CLAUDE_CONFIG_DIR` instead and is
-unaffected until it sets these too.
+connectors. Since #192, `extract_intake`, `extract_itinerary` and the vision
+task inherit `EXTRACT_EFFORT` like their runner and model (before, they looked
+up only their own name and ran under the personal settings), and an unset
+effort on a claude binding logs `model_runner.claude_effort_unset` at relay
+start. The VM takes `medium` from `CLAUDE_CONFIG_DIR` instead (`effortLevel:
+medium`, read 2026-09-25) and is unaffected; leaving it implicit there is
+deliberate for now, so those warnings appear on every VM boot.
 
 **Unset is not an error, it is a downgrade.** With no flag, new sessions are
 created on the agent path — which is a supported path, so nothing warns. With
@@ -313,6 +361,10 @@ Two reasons that hurts more than it looks:
   fall down their chain to `openai-codex`, which is metered. Editing a profile's
   model to a `claude-*` id does not fix it. The `claude` CLI *is* authenticated
   here, which is why `*_RUNNER=claude` is the configured path — it needs no key.
+  Every model child, Hermes included, now runs with an allow-listed environment
+  (#192): the relay's own keys are not forwarded, so a Hermes provider key
+  belongs in `~/.hermes/.env`, and proxy variables are not passed either. See
+  `docs/document-intake-operations.md`.
 - **The two paths write different shapes.** Agentless emits
   `phases[].planned: ["Tokyo Skytree"]`; the agent emits
   `phases[].venues: [{name, time}]`. `transformer.py` handles both now, but a
