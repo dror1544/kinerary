@@ -228,6 +228,35 @@ describe("applyOps — adding, removing, renaming, replacing, moving stops", () 
     assert.deepEqual((out.preview.find((l) => l.key === "preview.unchanged")?.params.entries as { name: string }[]).map((e) => e.name), ["Tokyo", "Kyoto"]);
   });
 
+  test("removing EVERY stop says so, in its own line; removing some does not", () => {
+    const all = ok(applyOps(three(), [
+      { op: "remove_stop", target: { name: "Tokyo" } },
+      { op: "remove_stop", target: { name: "Hakone" } },
+      { op: "remove_stop", target: { name: "Kyoto" } },
+    ]));
+    assert.deepEqual(dataOf(all, "phases"), []);
+    assert.deepEqual(all.preview.filter((l) => l.key === "warn.removesEverything").map((l) => l.params), [{ question: "phases" }]);
+    const some = ok(applyOps(three(), [{ op: "remove_stop", target: { name: "Tokyo" } }, { op: "remove_stop", target: { name: "Kyoto" } }]));
+    assert.equal(keys(some.preview).includes("warn.removesEverything"), false);
+    const swapped = ok(applyOps(three(), [
+      { op: "remove_stop", target: { name: "Tokyo" } },
+      { op: "remove_stop", target: { name: "Hakone" } },
+      { op: "remove_stop", target: { name: "Kyoto" } },
+      { op: "add_stop", fields: { name: "Nara" } },
+    ]));
+    assert.equal(keys(swapped.preview).includes("warn.removesEverything"), false, "a stop was added: the list is not empty");
+    // A list that was already empty is not "removed".
+    const nothing = ok(applyOps(store({ phases: [] }), [{ op: "add_stop", fields: { name: "Nara" } }]));
+    assert.equal(keys(nothing.preview).includes("warn.removesEverything"), false);
+  });
+
+  test("removing every traveller is refused by the gate before any warning is needed; some is fine and quiet", () => {
+    const two = store({ travelers: [{ name: "Ruth Cohen" }, { name: "Avi Cohen" }] });
+    bad(applyOps(two, [{ op: "remove_traveller", target: { name: "Ruth" } }, { op: "remove_traveller", target: { name: "Avi" } }]));
+    const one = ok(applyOps(two, [{ op: "remove_traveller", target: { name: "Avi" } }]));
+    assert.equal(keys(one.preview).includes("warn.removesEverything"), false);
+  });
+
   test("removing a stop names the days that go with it", () => {
     const b = store({ phases: [stop("Tokyo", "2026-05-19", "2026-05-24", { days: [{ date: "2026-05-20" }] })] });
     const out = ok(applyOps(b, [{ op: "remove_stop", target: { name: "Tokyo" } }]));

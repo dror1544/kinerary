@@ -109,6 +109,7 @@ export function lineText(line: Line, language: Language): string {
       return t(`change.warn.bookingForRemovedTraveller.${p.terms === "non_refundable" ? "non_refundable" : "unknown"}`, {
         booking: bookingText(p.booking), traveller: entryText(p.traveller, language),
       });
+    case "warn.removesEverything": return t(p.question === "travelers" ? "change.warn.removesEverything.travelers" : "change.warn.removesEverything.phases");
     case "warn.bookingsWhoseNameUnknown": return t("change.warn.bookingsWhoseNameUnknown", { count: String(p.count ?? "") });
     case "effect.organizerIdentityReopens": return t("change.effect.organizerIdentityReopens");
     case "effect.dietaryScopeNamesNobody":

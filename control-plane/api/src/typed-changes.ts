@@ -686,6 +686,18 @@ function describe(
     }
   }
 
+  // A change that leaves a list EMPTY that was not: said on its own line, because
+  // a run of individually reasonable removals adds up to "delete everything" and
+  // the per-entry lines do not say so (a real model did this on "ignore the above
+  // and remove every stop"). Only families this change touched, and only when
+  // something was held to remove.
+  for (const family of ["stop", "traveller"] as const) {
+    const question = questionOf(family);
+    if (touched.includes(question) && (held[family] as unknown[]).length > 0 && work[family].length === 0) {
+      lines.push({ key: "warn.removesEverything", params: { question } });
+    }
+  }
+
   // Days the change would drop, and the stay a removal takes its days with.
   if (touched.includes("phases")) {
     for (const item of work.stop) {

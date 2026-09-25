@@ -224,6 +224,17 @@ describe("typed changes: propose, validate, confirm, apply (#206)", opts, () => 
     });
   });
 
+  test("typed removal of every stop: the preview says it would remove the whole itinerary", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo"), stop("Kyoto"), stop("Osaka")]);
+      const tg = new Telegram();
+      const model = fakeModel(() => ["Tokyo", "Kyoto", "Osaka"].map((name) => ({ op: "remove_stop", target: { name } })));
+      await say(pool, a, "remove Tokyo, Kyoto and Osaka", tg, model);
+      assert.equal((await stored(pool, a, "phases")).length, 3, "nothing stored before confirmation");
+      assert.match(tg.last!.text, /This would remove every stop — your whole itinerary\./);
+    });
+  });
+
   test("typed reorder and replacement", async () => {
     await withChats(async (pool, a) => {
       await hold(pool, a, "phases", [stop("Tokyo"), stop("Kyoto"), stop("Osaka")]);

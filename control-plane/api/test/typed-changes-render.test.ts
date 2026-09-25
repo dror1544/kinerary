@@ -91,6 +91,8 @@ describe("the preview", () => {
       { key: "warn.bookingInRemovedStop", params: { stop: tokyo, terms: "non_refundable", booking: { type: "hotel", name: "Gion Inn", date: "2026-05-25", confirmation: "GI-77" } } },
       { key: "warn.bookingForRemovedTraveller", params: { traveller: { name: "Avi" }, terms: "unknown", booking: { type: "flight", name: "LY381", date: "2026-05-19", confirmation: "XR7T2Q" } } },
       { key: "warn.bookingsWhoseNameUnknown", params: { count: 2 } },
+      { key: "warn.removesEverything", params: { question: "phases" } },
+      { key: "warn.removesEverything", params: { question: "travelers" } },
       { key: "effect.organizerIdentityReopens", params: {} },
       { key: "effect.dietaryScopeNamesNobody", params: { need: "kosher_style", name: "Ruth" } },
     ];
@@ -102,6 +104,13 @@ describe("the preview", () => {
         assert.ok(!Object.keys(UI_STRINGS.en).includes(text), "not a raw key");
       }
     }
+  });
+
+  test("removing everything is said in plain words, in both languages", () => {
+    assert.equal(lineText({ key: "warn.removesEverything", params: { question: "phases" } }, "en"), "⚠️ This would remove every stop — your whole itinerary.");
+    assert.match(lineText({ key: "warn.removesEverything", params: { question: "travelers" } }, "en"), /every traveller/);
+    assert.match(lineText({ key: "warn.removesEverything", params: { question: "phases" } }, "he"), /כל העצירות/);
+    assert.match(lineText({ key: "warn.removesEverything", params: { question: "travelers" } }, "he"), /כל הנוסעים/);
   });
 
   test("refund terms are claimed only where the line says so", () => {
