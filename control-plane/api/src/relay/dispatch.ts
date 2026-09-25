@@ -1330,6 +1330,16 @@ async function dispatchCallback(
         ...(messageId !== undefined && messageId !== null ? { messageId: String(messageId) } : {}),
       };
     }
+    // A typed-change button (`pc:`) is ANSWERED, never dropped: an ignored tap
+    // leaves the button spinning for whoever pressed it (#206).
+    if (parsed.kind === "change") {
+      return {
+        kind: "callback_reply",
+        chatId: String(chatId),
+        callbackQueryId: callback.id,
+        text: uiString("change.gone", await resolveChatLanguage(db, String(chatId), callback.from?.language_code)),
+      };
+    }
     // An interview-shaped callback from a chat with no live interview is
     // stale — a button from a finished session. Not an approval token, so it
     // must not fall through to the approval path.

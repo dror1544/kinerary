@@ -5,14 +5,17 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { changeCallbackData, parseCallbackData, callbackDataFits } from "../src/chat-router.js";
-import { UI_STRINGS, uiString } from "../src/intake-copy.js";
-import type { Line } from "../src/typed-changes.js";
+import { UI_STRINGS, readableDate, uiString } from "../src/intake-copy.js";
+import { applyOps, type Op } from "../src/typed-changes.js";
+import type { AnswerStore } from "../src/interview.js";
+import { draftDigest, type Line } from "../src/typed-changes.js";
 import { bareReply, confirmable, lineText, renderDraft } from "../src/typed-changes-render.js";
 
 const ID = "pchg_0123456789abcdef0123456789abcdef";
 const draft = (over: Record<string, unknown> = {}) => ({
-  id: ID, preview: [] as Line[], unresolved: [], blocked: [] as Line[], base: {}, result: { phases: { kind: "structured" } }, ...over,
+  id: ID, preview: [] as Line[], unresolved: [], blocked: [] as Line[], base: {}, ops: [], result: { phases: { kind: "structured" } }, ...over,
 }) as never;
+const DG = (over: Record<string, unknown> = {}) => draftDigest(draft(over));
 const tokyo = { name: "Tokyo", start: "2026-05-19", end: "2026-05-24" };
 
 describe("the strings", () => {
@@ -37,15 +40,36 @@ describe("the strings", () => {
 
 describe("buttons", () => {
   test("callback data round-trips, fits Telegram's 64 bytes, and rejects anything else", () => {
-    for (const data of [changeCallbackData(ID, "apply"), changeCallbackData(ID, "cancel"), changeCallbackData(ID, "pick", 7)]) {
+    const dg = DG();
+    for (const data of [changeCallbackData(ID, dg, "apply"), changeCallbackData(ID, dg, "cancel"), changeCallbackData(ID, dg, "pick", 7)]) {
       assert.ok(callbackDataFits(data), data);
     }
-    assert.deepEqual(parseCallbackData(changeCallbackData(ID, "apply")), { kind: "change", draftId: ID, choice: "apply" });
-    assert.deepEqual(parseCallbackData(changeCallbackData(ID, "cancel")), { kind: "change", draftId: ID, choice: "cancel" });
-    assert.deepEqual(parseCallbackData(changeCallbackData(ID, "pick", 7)), { kind: "change", draftId: ID, choice: "pick", index: 7 });
-    for (const forged of [`pc:${ID}:x`, `pc:${ID}`, `pc:nope:a`, `pc:${ID}:r:`, `pc:${ID}:r:123`, `pc:${ID}:a:1`]) {
+    assert.deepEqual(parseCallbackData(changeCallbackData(ID, dg, "apply")), { kind: "change", draftId: ID, digest: dg, choice: "apply" });
+    assert.deepEqual(parseCallbackData(changeCallbackData(ID, dg, "cancel")), { kind: "change", draftId: ID, digest: dg, choice: "cancel" });
+    assert.deepEqual(parseCallbackData(changeCallbackData(ID, dg, "pick", 7)), { kind: "change", draftId: ID, digest: dg, choice: "pick", index: 7 });
+    // A button from before digests existed still parses, with no digest: it can never match one.
+    assert.deepEqual(parseCallbackData(`pc:${ID}:a`), { kind: "change", draftId: ID, digest: null, choice: "apply" });
+    for (const forged of [`pc:${ID}:x`, `pc:${ID}`, `pc:nope:a`, `pc:${ID}:r:`, `pc:${ID}:r:123`, `pc:${ID}:a:1`, `pc:${ID}:${dg}`, `pc:${ID}:${dg}:a:1`, `pc:${ID}:ZZZZZZZZ:a`, `pc:${ID}:${dg}0:a`]) {
       assert.equal(parseCallbackData(forged).kind, "unknown", forged);
     }
+  });
+
+  test("the widest callback_data that can be generated is under Telegram's 64 bytes", () => {
+    // Real ids are `pchg_` + 32 hex; the widest button is a pick with a two-digit index.
+    const widest = changeCallbackData(`pchg_${"f".repeat(32)}`, "f".repeat(8), "pick", 99);
+    assert.ok(Buffer.byteLength(widest) <= 54, `${Buffer.byteLength(widest)} bytes: ${widest}`);
+    assert.ok(callbackDataFits(widest));
+  });
+
+  test("the digest names the version: it changes with the operations, the result and the open question, and not otherwise", () => {
+    const one = { ops: [{ op: "remove_stop", target: { name: "Kyoto" } }], result: { phases: { kind: "structured", data: [1] } }, unresolved: [], blocked: [] };
+    assert.equal(draftDigest(one as never), draftDigest(JSON.parse(JSON.stringify(one))), "stable across a database round trip");
+    assert.match(draftDigest(one as never), /^[0-9a-f]{8}$/);
+    for (const changed of [
+      { ...one, ops: [...one.ops, { op: "remove_stop", target: { name: "Tokyo" } }] },
+      { ...one, result: { phases: { kind: "structured", data: [2] } } },
+      { ...one, blocked: [{ key: "blocked.overlap", params: {} }] },
+    ]) assert.notEqual(draftDigest(changed as never), draftDigest(one as never));
   });
 });
 
@@ -71,7 +95,7 @@ describe("the preview", () => {
     const en = renderDraft(draft({ preview }), "en");
     assert.match(en.text, /Tokyo \(May 19, 2026 – May 24, 2026\): end date May 24, 2026 → May 25, 2026/);
     assert.match(en.text, /Staying exactly as it is: Kyoto/);
-    assert.deepEqual(en.replyMarkup.inline_keyboard[0]!.map((b) => b.callback_data), [`pc:${ID}:a`, `pc:${ID}:c`]);
+    assert.deepEqual(en.replyMarkup.inline_keyboard[0]!.map((b) => b.callback_data), [`pc:${ID}:${DG({ preview })}:a`, `pc:${ID}:${DG({ preview })}:c`]);
     const he = renderDraft(draft({ preview }), "he");
     assert.ok(he.text.startsWith(uiString("change.header", "he")));
     assert.match(he.text, /נשאר בדיוק כמו שהוא: Kyoto/);
@@ -127,7 +151,7 @@ describe("questions and conflicts", () => {
       { op: "rename_stop", from: "Hakone", to: "Nagoya" }, { op: "replace_stop", from: "Hakone", to: "Nagoya" }, { op: "add_stop", from: null, to: "Nagoya" },
     ] } }];
     const r = renderDraft(draft({ blocked, result: {} }), "en");
-    assert.deepEqual(r.replyMarkup.inline_keyboard.map((row) => row[0]!.callback_data), [`pc:${ID}:r:0`, `pc:${ID}:r:1`, `pc:${ID}:r:2`, `pc:${ID}:c`]);
+    assert.deepEqual(r.replyMarkup.inline_keyboard.map((row) => row[0]!.callback_data), [`pc:${ID}:${DG({ blocked, result: {} })}:r:0`, `pc:${ID}:${DG({ blocked, result: {} })}:r:1`, `pc:${ID}:${DG({ blocked, result: {} })}:r:2`, `pc:${ID}:${DG({ blocked, result: {} })}:c`]);
     assert.match(r.replyMarkup.inline_keyboard[0]![0]!.text, /Rename Hakone to Nagoya/);
     assert.equal(r.replyMarkup.inline_keyboard.flat().some((b) => b.callback_data.endsWith(":a")), false);
   });
@@ -147,7 +171,7 @@ describe("questions and conflicts", () => {
     const r = renderDraft(draft({ blocked, result: {} }), "en");
     assert.match(r.text, /Tokyo[\s\S]*Kyoto/);
     assert.match(r.text, /tell me the dates you want for all of them — I won't move any of them myself/);
-    assert.deepEqual(r.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data), [`pc:${ID}:c`]);
+    assert.deepEqual(r.replyMarkup.inline_keyboard.flat().map((b) => b.callback_data), [`pc:${ID}:${DG({ blocked, result: {} })}:c`]);
   });
 
   test("confirmable: a result and nothing left to ask", () => {
@@ -156,4 +180,97 @@ describe("questions and conflicts", () => {
     assert.equal(confirmable(draft({ blocked: [{ key: "blocked.overlap", params: {} }] })), false);
     assert.equal(confirmable(draft({ unresolved: [{}] })), false);
   });
+});
+
+
+describe("what the preview says about names and refusals", () => {
+  test("placeholders are filled in one pass: a name that looks like one cannot rewrite the line (F)", () => {
+    const line: Line = { key: "preview.field", params: { question: "phases", entry: { name: "Kyoto {to}" }, field: "end", from: "2026-05-27", to: "2026-05-31" } };
+    const text = lineText(line, "en");
+    assert.match(text, /Kyoto \{to\}: end date/, text);
+    assert.match(text, /May 27, 2026 \u2192 May 31, 2026$/, "the real values are where they belong");
+    const swap: Line = { key: "preview.replace", params: { question: "phases", from: { name: "A {to}" }, to: { name: "B {from}" } } };
+    assert.equal(lineText(swap, "en"), "\ud83d\udd01 Replace A {to} with B {from}");
+  });
+
+  test("the writer's own refusal is never shown, in either language (G)", () => {
+    const raw = "travelers does not establish who is on this trip. Ask for the names directly.";
+    for (const language of ["en", "he"] as const) {
+      const text = lineText({ key: "blocked.invalid", params: { question: "travelers", reason: "INCOMPLETE_ANSWER", detail: raw } }, language);
+      assert.doesNotMatch(text, /establish|Ask for the names directly/);
+      assert.match(text, language === "en" ? /leave nobody on the trip/ : /[\u0590-\u05FF]/);
+      const other = lineText({ key: "blocked.invalid", params: { question: "phases", reason: "DATA_WRONG_SHAPE", detail: "raw validator text" } }, language);
+      assert.doesNotMatch(other, /raw validator text/);
+    }
+  });
+});
+
+describe("EVERY stored field is visible in the preview (C)", () => {
+  const structured = (data: unknown[]) => ({ kind: "structured", schema_version: 3, data }) as const;
+  const held = (): AnswerStore => ({
+    phases: structured([
+      { name: "Tokyo", start: "2026-05-19", end: "2026-05-24", accommodation: { name: "Old Inn", confirmation: "OI-1" }, planned: ["Skytree"] },
+      { name: "Kyoto", start: "2026-05-27", end: "2026-05-30" },
+    ]),
+    travelers: structured([{ name: "Ruth Cohen", age: 70 }, { name: "Avi Cohen" }]),
+  }) as unknown as AnswerStore;
+
+  const leaves = (value: unknown, out: string[] = []): string[] => {
+    if (Array.isArray(value)) for (const v of value) leaves(v, out);
+    else if (typeof value === "object" && value !== null) for (const v of Object.values(value)) leaves(v, out);
+    else if (value !== undefined && value !== null) out.push(String(value));
+    return out;
+  };
+  const dataOf = (a: AnswerStore, q: string) => ((a[q] as { data?: unknown[] } | undefined)?.data ?? []) as Record<string, unknown>[];
+
+  /** The fields of every entry the change added or altered, that the person has to be shown. */
+  const changedLeaves = (before: AnswerStore, after: Record<string, unknown>): string[] => {
+    const out: string[] = [];
+    for (const q of Object.keys(after)) {
+      const was = dataOf(before, q).map((e) => JSON.stringify(e));
+      for (const entry of dataOf(after as AnswerStore, q)) {
+        if (was.includes(JSON.stringify(entry))) continue;
+        const prior = dataOf(before, q).find((e) => e.name === entry.name);
+        for (const [key, value] of Object.entries(entry)) {
+          if (prior && JSON.stringify(prior[key]) === JSON.stringify(value)) continue;
+          out.push(...leaves(value));
+        }
+      }
+    }
+    return out;
+  };
+
+  const cases: Array<[string, Op[]]> = [
+    ["add_stop with everything", [{ op: "add_stop", fields: { name: "Nara", name_en: "Nara EN", start: "2026-05-30", end: "2026-06-01", accommodation: { name: "Shady Inn", confirmation: "ZZ-999" }, planned: ["Deer park", "Casino"] } }]],
+    ["replace_stop with hotel and places", [{ op: "replace_stop", target: { name: "Kyoto" }, fields: { name: "Osaka", accommodation: { name: "Hotel X", confirmation: "HX-1" }, planned: ["USJ"] } }]],
+    ["update_stop hotel and places", [{ op: "update_stop", target: { name: "Kyoto" }, fields: { accommodation: { name: "Inn K", confirmation: "K-7" }, planned: ["Fushimi", "Gion"] } }]],
+    ["update_stop replaces an existing hotel", [{ op: "update_stop", target: { name: "Tokyo" }, fields: { accommodation: { name: "New Inn", confirmation: "NI-2" }, end: "2026-05-25" } }]],
+    ["update_stop English name", [{ op: "update_stop", target: { name: "Kyoto" }, fields: { name_en: "Kyoto City" } }]],
+    ["add_traveller with family and English name", [{ op: "add_traveller", fields: { name: "Dana Levi", name_en: "Dana L", family: "Levi household", age: 30 } }]],
+    ["update_traveller family", [{ op: "update_traveller", target: { name: "Avi Cohen" }, fields: { family: "Cohen family", name_en: "Avi C" } }]],
+    ["update_traveller age", [{ op: "update_traveller", target: { name: "Ruth Cohen" }, fields: { age: 71 } }]],
+    ["two questions at once", [
+      { op: "add_stop", fields: { name: "Nara", planned: ["Deer park"] } },
+      { op: "add_traveller", fields: { name: "Ella Cohen", age: 9, family: "Cohen family" } },
+    ]],
+  ];
+
+  for (const [label, ops] of cases) {
+    test(label, () => {
+      const before = held();
+      const out = applyOps(before, ops);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      if (!out.ok) return;
+      const wanted = changedLeaves(before, out.result);
+      assert.ok(wanted.length > 0, "the case changes something");
+      for (const language of ["en", "he"] as const) {
+        const text = renderDraft({ id: ID, preview: out.preview, unresolved: [], blocked: [], base: {}, ops, result: out.result } as never, language).text;
+        for (const leaf of wanted) {
+          const shown = /^\d{4}-\d{2}-\d{2}$/.test(leaf) ? readableDate(leaf, language) ?? leaf : leaf;
+          assert.ok(text.includes(shown), `${language}: "${shown}" is stored but not in the preview:\n${text}`);
+        }
+        assert.doesNotMatch(text, /[{}]\s*"|":\s*"|\{"/, "no raw JSON");
+      }
+    });
+  }
 });

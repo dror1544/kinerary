@@ -89,15 +89,17 @@ import {
   typedChoiceAnswer,
   applyPendingChangeForChat,
 } from "../interview.js";
-import { heldRefLists, parseOps, questionOfOp, type Op } from "../typed-changes.js";
+import { draftDigest, heldRefLists, parseOps, questionOfOp, type Op } from "../typed-changes.js";
 import {
   cancelDraft,
   getDraft,
+  getDraftForInterpretation,
   getOpenDraft,
   pickForDraft,
   proposeChange,
   rebuildDraft,
   type Draft,
+  type ProposeResult,
 } from "../typed-changes-store.js";
 import { bareReply, confirmable, questionNoun, renderDraft } from "../typed-changes-render.js";
 import {
@@ -888,8 +890,19 @@ async function applyInterviewCallback(
         }).catch(() => {});
         return;
       }
-      const picked = await pickForDraft(deps.db, { draftId: draft.id, sessionId: now.view.sessionId, k: parsed.index ?? 0 });
-      if (!picked) {
+      // Checked again under the row lock inside `pickForDraft`; this read only
+      // spares the common case a write.
+      const picked = parsed.digest === draftDigest(draft)
+        ? await pickForDraft(deps.db, { draftId: draft.id, sessionId: now.view.sessionId, k: parsed.index ?? 0, expectedDigest: parsed.digest })
+        : "updated" as const;
+      if (picked === "updated") {
+        const current = await getDraft(deps.db, draft.id);
+        if (current && current.status === "pending") {
+          await showChangeDraft(deps, decision.chatId, now.view, current, uiString("change.updated", now.view.language));
+          return;
+        }
+      }
+      if (!picked || picked === "updated") {
         await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.gone", now.view.language) }).catch(() => {});
         return;
       }
@@ -898,7 +911,9 @@ async function applyInterviewCallback(
     }
     await settleChange(
       deps,
-      { chatId: decision.chatId, draftId: parsed.draftId, choice: parsed.choice, ...(decision.messageId ? { messageId: decision.messageId } : {}) },
+      // The digest names the version the person tapped on; null (a button from
+      // before digests existed) matches nothing, so it is never applied.
+      { chatId: decision.chatId, draftId: parsed.draftId, choice: parsed.choice, digest: parsed.digest, ...(decision.messageId ? { messageId: decision.messageId } : {}) },
       strings,
       log,
     );
@@ -2293,6 +2308,22 @@ const CHANGE_QUESTIONS: readonly string[] = ["phases", "travelers"];
  */
 const shownPreviews = new Map<string, string>();
 
+/** Test seam: what a relay restart does to the in-memory map above. Nothing depends on it being kept. */
+export function forgetShownPreviewsForTests(): void {
+  shownPreviews.clear();
+}
+
+/** The `lastPrompt` that says "this exact version of this draft is on the organizer's screen". */
+export function changePromptKey(draft: Pick<Draft, "id" | "ops" | "result" | "unresolved" | "blocked">): string {
+  return `pc:${draft.id}:${draftDigest(draft)}`;
+}
+
+/** The digest in a `pc:<id>[:<digest>]` prompt key, or null. */
+function promptDigest(lastPrompt: string | null | undefined, draftId: string): string | null {
+  const m = new RegExp(`^pc:${draftId}:([0-9a-f]{8})$`).exec(lastPrompt ?? "");
+  return m?.[1] ?? null;
+}
+
 /**
  * Puts the draft in front of the organizer: the preview with Yes and No, or the
  * question it is asking, or the conflict it found. Records `pc:<id>` as the
@@ -2310,13 +2341,26 @@ async function showChangeDraft(
   const rendered = renderDraft(draft, view.language);
   if (!(await takeFloor(chatId, view, deps))) return false;
   const previous = shownPreviews.get(draft.id);
-  await recordLastPromptForChat(deps.db, chatId, `pc:${draft.id}`);
   const sent = await deps.telegram.sendMessage({
     chatId,
     text: lead ? `${lead}\n\n${rendered.text}` : rendered.text,
     replyMarkup: rendered.replyMarkup,
   }) as { ok?: boolean; messageId?: string } | undefined;
-  if (sent?.ok && sent.messageId) shownPreviews.set(draft.id, sent.messageId);
+  if (!sent?.ok) {
+    // A refused send (a rate limit, the network, a text Telegram will not take)
+    // returns `ok: false` and does not throw. The organizer has seen NOTHING, so
+    // nothing may be confirmable by a typed "yes": `lastPrompt` is left as it
+    // was, and it names an older version's digest, which matches no current one.
+    (deps.log ?? (() => {}))(structuredLog("warn", "interview.change_show_failed", { session_id: view.sessionId, draft_id: draft.id }));
+    await deps.telegram
+      .sendMessage({ chatId, text: uiString("change.sendFailed", view.language) })
+      .catch(() => undefined);
+    return false;
+  }
+  // Recorded only now that it was delivered, and carrying the digest: a typed
+  // "yes" confirms exactly the version whose preview went out.
+  await recordLastPromptForChat(deps.db, chatId, changePromptKey(draft));
+  if (sent.messageId) shownPreviews.set(draft.id, sent.messageId);
   if (previous && previous !== sent?.messageId) {
     await deps.telegram
       .editMessageText({ chatId, messageId: previous, text: rendered.text, replyMarkup: undefined })
@@ -2360,7 +2404,14 @@ async function resumeAfterChange(
  */
 async function settleChange(
   deps: TripBotPollerDeps,
-  args: { chatId: string; draftId: string; choice: "apply" | "cancel"; messageId?: string },
+  args: {
+    chatId: string;
+    draftId: string;
+    choice: "apply" | "cancel";
+    messageId?: string;
+    /** The version the person confirmed. `undefined`: the caller just read the draft itself. `null`: a button from before digests. */
+    digest?: string | null;
+  },
   strings: DispatchStrings,
   log: (line: string) => void,
 ): Promise<void> {
@@ -2380,6 +2431,23 @@ async function settleChange(
   }
   if (draft.status !== "pending") {
     await say(uiString(draft.status === "applied" ? "change.alreadyApplied" : "change.gone", language));
+    return;
+  }
+  // A confirmation of a version that is not the current one applies NOTHING: the
+  // current preview is shown instead, with fresh buttons. The same comparison is
+  // made again under the row lock at apply, so a merge landing in between is
+  // caught there too.
+  const showCurrentInstead = async () => {
+    const current = await getDraft(deps.db, draft.id);
+    if (!current || current.status !== "pending") {
+      await say(uiString("change.gone", language));
+      return;
+    }
+    await showChangeDraft(deps, args.chatId, view, current, uiString("change.updated", language));
+  };
+  if (args.digest !== undefined && args.digest !== draftDigest(draft)) {
+    log(structuredLog("info", "interview.change_stale_tap", { session_id: view.sessionId, draft_id: draft.id }));
+    await showCurrentInstead();
     return;
   }
   const collapse = async (label: string) => {
@@ -2403,7 +2471,7 @@ async function settleChange(
     return;
   }
 
-  const applied = await applyPendingChangeForChat(deps.db, args.chatId, draft.id);
+  const applied = await applyPendingChangeForChat(deps.db, args.chatId, draft.id, args.digest === undefined ? draftDigest(draft) : (args.digest ?? ""));
   if (applied.ok) {
     log(structuredLog("info", "interview.change_applied", {
       session_id: view.sessionId, draft_id: draft.id, questions: applied.questions,
@@ -2433,6 +2501,12 @@ async function settleChange(
       await showChangeDraft(deps, args.chatId, view, draft, uiString("change.stillBlocked", language));
       return;
     }
+    case "UPDATED":
+      await showCurrentInstead();
+      return;
+    case "SESSION_CONFIRMED":
+      await say(uiString("change.sessionConfirmed", language));
+      return;
     case "ALREADY_APPLIED":
       await say(uiString("change.alreadyApplied", language));
       return;
@@ -2450,6 +2524,56 @@ const ASK_ABOUT_REFUSED: ReadonlySet<string> = new Set([
   "DATA_REQUIRED", "DATA_WRONG_SHAPE", "INCOMPLETE_ANSWER", "TEXT_REQUIRED", "TEXT_TOO_LONG",
   "UNKNOWN_OPTION", "CHOICE_REQUIRED", "OPTIONS_REQUIRED", "OTHER_TEXT_REQUIRED", "OTHER_NOT_ALLOWED",
 ]);
+
+/**
+ * Tells the organizer what came of a message's typed operations: the preview of
+ * the draft they went into, or - plainly - why there is none. True when a
+ * preview was delivered (the caller then stays quiet).
+ */
+async function announceChange(
+  deps: TripBotPollerDeps,
+  burst: { sessionId: string; chatId: string },
+  made: ProposeResult,
+  language: Language,
+  log: (line: string) => void,
+): Promise<boolean> {
+  if (made.kind === "no_session") return false;
+  const now = await getSessionForChat(deps.db, burst.chatId);
+  if (!now.ok) {
+    // A confirmed interview has no live session view, and that is exactly the
+    // case that must still be told: the change was typed while Confirm landed.
+    if (made.kind !== "confirmed") return false;
+    log(structuredLog("info", "interview.change_refused", { session_id: burst.sessionId, reason: "SESSION_CONFIRMED" }));
+    await deps.telegram.sendMessage({ chatId: burst.chatId, text: uiString("change.sessionConfirmed", language) }).catch(() => undefined);
+    return true;
+  }
+  const tell = async (text: string) => {
+    if (await takeFloor(burst.chatId, now.view, deps)) await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => undefined);
+    return true;
+  };
+  switch (made.kind) {
+    case "confirmed":
+      log(structuredLog("info", "interview.change_refused", { session_id: burst.sessionId, reason: "SESSION_CONFIRMED" }));
+      return tell(uiString("change.sessionConfirmed", language));
+    case "too_big":
+      log(structuredLog("info", "interview.change_refused", { session_id: burst.sessionId, reason: "TOO_BIG", merged: made.merged }));
+      return tell(uiString(made.merged ? "change.tooBig" : "change.tooBigFresh", language));
+    case "uneditable":
+      log(structuredLog("info", "interview.change_refused", { session_id: burst.sessionId, reason: "UNEDITABLE", question: made.question }));
+      return tell(uiString("change.uneditable", language).replace("{what}", questionNoun(made.question, language)));
+    default: {
+      log(structuredLog("info", "interview.change_proposed", {
+        session_id: burst.sessionId,
+        kind: made.kind,
+        confirmable: confirmable(made.draft),
+        unresolved: made.draft.unresolved.length,
+        blocked: made.draft.blocked.length,
+      }));
+      if (made.draft.status !== "pending") return false;
+      return showChangeDraft(deps, burst.chatId, now.view, made.draft);
+    }
+  }
+}
 
 async function runInterpretPath(
   deps: TripBotPollerDeps,
@@ -2572,6 +2696,19 @@ async function runInterpretPath(
         }
       }
     }
+    // A typed change this reading made may have been committed and never shown
+    // (the relay died between the two). It is in the database, waiting: show it,
+    // unless that version is already on screen.
+    const replaying = await getSessionForChat(deps.db, burst.chatId);
+    if (replaying.ok) {
+      const made = await getDraftForInterpretation(deps.db, burst.sessionId, claim.row.id);
+      if (made && made.status === "pending") {
+        if (replaying.view.lastPrompt !== changePromptKey(made)) {
+          await showChangeDraft(deps, burst.chatId, replaying.view, made);
+        }
+        return;
+      }
+    }
     // Committed already, but the organizer may never have seen the question
     // that followed — asking again is safe (the flood dedupe suppresses a
     // genuine repeat), staying silent is not.
@@ -2635,6 +2772,19 @@ async function runInterpretPath(
   let ops: Op[] | undefined;
   let opsError: string | undefined;
   let unclear: { questionId: string; why: string }[] = [];
+  // What came of this message's operations: the draft they went into (found, not
+  // re-made, on a replay), or the reason they could not.
+  let change: ProposeResult | null = null;
+  const proposeOps = async () => {
+    if (!ops || ops.length === 0 || !session.ok) return;
+    change = await proposeChange(deps.db, {
+      sessionId: burst.sessionId,
+      tripId: session.view.tripId,
+      interpretationId,
+      ops,
+      displacedPrompt: (session.view.lastPrompt ?? "").startsWith("pc:") ? null : session.view.lastPrompt ?? null,
+    });
+  };
 
   // A TYPED CHANGE IS WAITING AND ITS PREVIEW IS ON SCREEN: a message that is
   // nothing but a yes or a no answers IT. Exact and deterministic — no model —
@@ -2646,14 +2796,26 @@ async function runInterpretPath(
   const waiting = session.ok ? await getOpenDraft(deps.db, burst.sessionId) : null;
   if (waiting && session.ok && (session.view.lastPrompt ?? "").startsWith(`pc:${waiting.id}`)) {
     const bare = bareReply(sourceText);
+    // WHICH VERSION is on screen: the digest `showChangeDraft` recorded when the
+    // preview was delivered. A "yes" confirms that version and no other; a draft
+    // that has moved on since (a merge whose preview did not go out) is shown
+    // again instead of being applied unseen.
+    const onScreenDigest = promptDigest(session.view.lastPrompt, waiting.id);
+    if (bare && onScreenDigest !== draftDigest(waiting)) {
+      await recordInterpretationResult(deps.db, interpretationId, { proposals: [], attempts: 0, durationMs: 0 });
+      await markInterpretationCommitted(deps.db, interpretationId, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
+      log(structuredLog("info", "interview.change_answered_stale", { session_id: burst.sessionId, answer: bare }));
+      await showChangeDraft(deps, burst.chatId, session.view, waiting, uiString("change.updated", session.view.language));
+      return;
+    }
     if (bare) {
       await recordInterpretationResult(deps.db, interpretationId, { proposals: [], attempts: 0, durationMs: 0 });
       await markInterpretationCommitted(deps.db, interpretationId, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
       log(structuredLog("info", "interview.change_answered_in_words", { session_id: burst.sessionId, answer: bare }));
       if (bare === "no") {
-        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel" }, deps.strings ?? DEFAULT_STRINGS, log);
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel", digest: onScreenDigest }, deps.strings ?? DEFAULT_STRINGS, log);
       } else if (confirmable(waiting)) {
-        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "apply" }, deps.strings ?? DEFAULT_STRINGS, log);
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "apply", digest: onScreenDigest }, deps.strings ?? DEFAULT_STRINGS, log);
       } else {
         await showChangeDraft(deps, burst.chatId, session.view, waiting, uiString("change.stillBlocked", session.view.language));
       }
@@ -2669,10 +2831,15 @@ async function runInterpretPath(
     // from what was stored rather than asking again — the answer is already
     // paid for and re-asking could return something different.
     proposals = claim.row.proposals;
+    // The operations are not stored with the reading; the DRAFT they went into is
+    // (it is made before the reading is recorded, below), so it is looked up.
+    const already = session.ok ? await getDraftForInterpretation(deps.db, burst.sessionId, interpretationId) : null;
+    if (already) change = { kind: "replay", draft: already };
     log(structuredLog("info", "interview.interpret_resumed", {
       session_id: burst.sessionId,
       burst_key: key,
       proposals: proposals.length,
+      draft: already ? already.id : null,
     }));
   } else if (!deps.modelRunner) {
     await recordInterpretationResult(deps.db, interpretationId, {
@@ -2766,6 +2933,11 @@ async function runInterpretPath(
     ops = checked?.ok ? checked.ops : undefined;
     opsError = checked && !checked.ok ? checked.error : result.payload.opsError;
     unclear = result.payload.unclear;
+    // THE DRAFT FIRST. It is keyed by this interpretation, so making it twice is
+    // one draft; and until it exists nothing below may be recorded as done — a
+    // crash between the two used to lose the change for good, because the reading
+    // was already marked committed and the replay path only asks the next question.
+    await proposeOps();
     await recordInterpretationResult(deps.db, interpretationId, {
       proposals,
       attempts: result.attempts,
@@ -2879,27 +3051,8 @@ async function runInterpretPath(
   // While a change is up the interview does not press on: what was on screen is
   // remembered and comes back when the change is settled.
   let draftShown = false;
-  if (ops && ops.length > 0 && session.ok) {
-    const proposed = await proposeChange(deps.db, {
-      sessionId: burst.sessionId,
-      tripId: session.view.tripId,
-      interpretationId,
-      ops,
-      displacedPrompt: (session.view.lastPrompt ?? "").startsWith("pc:") ? null : session.view.lastPrompt ?? null,
-    });
-    if (proposed.kind !== "no_session") {
-      const now = await getSessionForChat(deps.db, burst.chatId);
-      if (now.ok) draftShown = await showChangeDraft(deps, burst.chatId, now.view, proposed.draft);
-      log(structuredLog("info", "interview.change_proposed", {
-        session_id: burst.sessionId,
-        kind: proposed.kind,
-        ops: ops.length,
-        confirmable: confirmable(proposed.draft),
-        unresolved: proposed.draft.unresolved.length,
-        blocked: proposed.draft.blocked.length,
-      }));
-    }
-  }
+  const made = change as ProposeResult | null;
+  if (made) draftShown = await announceChange(deps, burst, made, language, log);
   if (draftShown) return;
 
   // NEVER SILENT. A typed change to something already answered that the gate

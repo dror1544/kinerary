@@ -703,7 +703,7 @@ export type ParsedCallback =
   | { kind: "switch"; tripId: string }
   | { kind: "conflict"; conflictId: string; choice: "keep" | "replace" }
   | { kind: "correction"; proposalId: string; choice: "approve" | "reject" }
-  | { kind: "change"; draftId: string; choice: "apply" | "cancel" | "pick"; index?: number }
+  | { kind: "change"; draftId: string; digest: string | null; choice: "apply" | "cancel" | "pick"; index?: number }
   | { kind: "unknown" };
 
 /**
@@ -725,13 +725,19 @@ export function correctionCallbackData(proposalId: string, choice: "approve" | "
 }
 
 /**
- * `pc:<draftId>:a|c|r:<k>` — the organizer's answer to a typed change that is
- * waiting for them (#206): apply it, cancel it, or pick candidate/option `k` of
- * what it asks. The id names the draft, never the session: which session it
- * belongs to is checked against the chat the tap arrived in, when it is applied.
+ * `pc:<draftId>:<digest>:a|c|r:<k>` — the organizer's answer to a typed change
+ * that is waiting for them (#206): apply it, cancel it, or pick candidate/option
+ * `k` of what it asks. The id names the draft, never the session: which session
+ * it belongs to is checked against the chat the tap arrived in, when it is
+ * applied. The digest (`draftDigest`) names WHICH VERSION of the draft the
+ * person was looking at: a follow-up merges into the same draft under the same
+ * id, and without it the old Yes would apply the new, unseen one.
+ *
+ * Length: `pc:` + `pchg_`+32 hex (37) + `:` + 8 hex + `:r:NN` = 3+37+1+8+5 = 54
+ * bytes at the widest, under Telegram's 64.
  */
-export function changeCallbackData(draftId: string, choice: "apply" | "cancel" | "pick", index?: number): string {
-  return choice === "pick" ? `pc:${draftId}:r:${index ?? 0}` : `pc:${draftId}:${choice === "apply" ? "a" : "c"}`;
+export function changeCallbackData(draftId: string, digest: string, choice: "apply" | "cancel" | "pick", index?: number): string {
+  return choice === "pick" ? `pc:${draftId}:${digest}:r:${index ?? 0}` : `pc:${draftId}:${digest}:${choice === "apply" ? "a" : "c"}`;
 }
 
 /**
@@ -762,10 +768,14 @@ export function parseCallbackData(data: string): ParsedCallback {
     return { kind: "correction", proposalId: correction[1], choice: correction[2] === "a" ? "approve" : "reject" };
   }
 
-  const change = /^pc:([a-z]{2,12}_[A-Za-z0-9]{8,64}):(?:([ac])|r:(\d{1,2}))$/.exec(data);
+  // The digest is optional in the PARSE only so that a button sent before it
+  // existed is recognised as a change tap — and is then never applied (`null`
+  // matches no digest).
+  const change = /^pc:([a-z]{2,12}_[A-Za-z0-9]{8,64})(?::([0-9a-f]{8}))?:(?:([ac])|r:(\d{1,2}))$/.exec(data);
   if (change?.[1]) {
-    if (change[3] !== undefined) return { kind: "change", draftId: change[1], choice: "pick", index: Number(change[3]) };
-    return { kind: "change", draftId: change[1], choice: change[2] === "a" ? "apply" : "cancel" };
+    const digest = change[2] ?? null;
+    if (change[4] !== undefined) return { kind: "change", draftId: change[1], digest, choice: "pick", index: Number(change[4]) };
+    return { kind: "change", draftId: change[1], digest, choice: change[3] === "a" ? "apply" : "cancel" };
   }
 
   const pair = /^([at]):([A-Za-z0-9_]{1,64}):([A-Za-z0-9_]{1,64})$/.exec(data);

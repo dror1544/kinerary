@@ -245,8 +245,8 @@ describe("applying the draft: one transaction, compare-and-swap from base to res
     });
   });
 
-  test("the model is not involved: apply takes a database and an id, and nothing else", async () => {
-    assert.equal(applyPendingChangeForChat.length, 3);
+  test("the model is not involved: apply takes a database, a chat, a draft id and the digest of what was confirmed, and nothing else", async () => {
+    assert.equal(applyPendingChangeForChat.length, 4);
   });
 });
 

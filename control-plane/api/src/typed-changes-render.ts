@@ -18,7 +18,7 @@
 import { changeCallbackData } from "./chat-router.js";
 import { readableDate, recapLabel, uiString, type Language } from "./intake-copy.js";
 import { INTAKE_QUESTIONS } from "./interview.js";
-import { openQuestion, type Line, type Param, type Unresolved } from "./typed-changes.js";
+import { draftDigest, openQuestion, type Line, type Param, type Unresolved } from "./typed-changes.js";
 import type { Draft } from "./typed-changes-store.js";
 
 export interface RenderedChange {
@@ -26,8 +26,13 @@ export interface RenderedChange {
   replyMarkup: { inline_keyboard: { text: string; callback_data: string }[][] };
 }
 
+/**
+ * Placeholders are filled in ONE pass over the template: a value is never
+ * scanned again, so a name that itself contains "{to}" (or anything else that
+ * looks like a placeholder) is shown as typed and cannot rewrite the line.
+ */
 const fill = (template: string, params: Record<string, string>): string =>
-  Object.entries(params).reduce((text, [k, v]) => text.split(`{${k}}`).join(v), template);
+  template.replace(/\{(\w+)\}/g, (whole, key: string) => (Object.prototype.hasOwnProperty.call(params, key) ? params[key]! : whole));
 
 const isObject = (p: Param | undefined): p is { [key: string]: Param } =>
   typeof p === "object" && p !== null && !Array.isArray(p);
@@ -36,25 +41,42 @@ function dateText(value: string, language: Language): string {
   return readableDate(value, language) ?? value;
 }
 
-/** "Tokyo, 19 September 2026 – 24 September 2026" — a stop or a traveller, as a person would say it. */
-export function entryText(entry: Param | undefined, language: Language): string {
+/** A stored value in words: a hotel as "Name (code)", a list as "a, b" - never as raw JSON. */
+function plainText(value: Param | undefined, language: Language): string {
+  if (value === null || value === undefined) return uiString("change.value.none", language);
+  if (typeof value === "string") return /^\d{4}-\d{2}-\d{2}$/.test(value) ? dateText(value, language) : value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((v) => plainText(v, language)).join(", ");
+  const name = typeof value.name === "string" ? value.name : null;
+  const code = typeof value.confirmation === "string" ? value.confirmation : null;
+  if (name || code) return name && code ? `${name} (${code})` : (name ?? code)!;
+  return Object.values(value).map((v) => plainText(v, language)).join(", ");
+}
+
+/**
+ * "Tokyo (19 September 2026 - 24 September 2026)" - a stop or a traveller, as a
+ * person would say it. With `full`, EVERYTHING that would be stored for the
+ * entry follows (English name, hotel, planned places, family): an add or a
+ * replacement must not put anything into the answer the person was not shown.
+ */
+export function entryText(entry: Param | undefined, language: Language, full = false): string {
   if (!isObject(entry)) return typeof entry === "string" ? entry : "?";
   const name = typeof entry.name === "string" ? entry.name : "?";
   const bits: string[] = [];
   const start = typeof entry.start === "string" ? dateText(entry.start, language) : null;
   const end = typeof entry.end === "string" ? dateText(entry.end, language) : null;
-  if (start && end) bits.push(`${start} – ${end}`);
+  if (start && end) bits.push(`${start} \u2013 ${end}`);
   else if (start || end) bits.push((start ?? end)!);
   if (typeof entry.age === "number") bits.push(String(entry.age));
-  return bits.length > 0 ? `${name} (${bits.join(", ")})` : name;
+  const head = bits.length > 0 ? `${name} (${bits.join(", ")})` : name;
+  if (!full) return head;
+  const more = (["name_en", "accommodation", "planned", "family"] as const)
+    .filter((k) => entry[k] !== undefined && entry[k] !== null)
+    .map((k) => `${fieldLabel(k, language)}: ${plainText(entry[k], language)}`);
+  return more.length > 0 ? `${head} \u2014 ${more.join("; ")}` : head;
 }
 
-function valueText(value: Param | undefined, language: Language): string {
-  if (value === null || value === undefined) return uiString("change.value.none", language);
-  if (typeof value === "string") return /^\d{4}-\d{2}-\d{2}$/.test(value) ? dateText(value, language) : value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value);
-}
+const valueText = plainText;
 
 function bookingText(booking: Param | undefined): string {
   if (!isObject(booking)) return "?";
@@ -84,9 +106,9 @@ export function lineText(line: Line, language: Language): string {
         from: valueText(p.from, language),
         to: valueText(p.to, language),
       });
-    case "preview.add": return t("change.line.add", { entry: entryText(p.entry, language) });
+    case "preview.add": return t("change.line.add", { entry: entryText(p.entry, language, true) });
     case "preview.remove": return t("change.line.remove", { entry: entryText(p.entry, language) });
-    case "preview.replace": return t("change.line.replace", { from: entryText(p.from, language), to: entryText(p.to, language) });
+    case "preview.replace": return t("change.line.replace", { from: entryText(p.from, language), to: entryText(p.to, language, true) });
     case "preview.dropsField":
       return t("change.line.dropsField", { entry: entryText(p.entry, language), field: fieldLabel(String(p.field), language) });
     case "preview.reorder": return t("change.line.reorder", { order: listText(p.order, language) });
@@ -117,7 +139,12 @@ export function lineText(line: Line, language: Language): string {
     case "blocked.overlap": return t("change.blocked.overlap", { stops: listText(p.stops, language) });
     case "blocked.moveDated": return t("change.blocked.moveDated", { stop: entryText(p.stop, language) });
     case "blocked.datesReversed": return t("change.blocked.datesReversed", { stop: entryText(p.stop, language) });
-    case "blocked.invalid": return t("change.blocked.invalid", { detail: String(p.detail ?? p.reason ?? "") });
+    // The writer's own refusal text is written for an agent, in English, and is
+    // never shown: what the organizer hears is a localized reason.
+    case "blocked.invalid":
+      return t("change.blocked.invalid", {
+        detail: uiString(p.question === "travelers" && p.reason === "INCOMPLETE_ANSWER" ? "change.invalid.detail.travelers" : "change.invalid.detail.generic", language),
+      });
     case "blocked.possibleDuplicate":
       return t("change.blocked.possibleDuplicate", { name: String(p.name), candidates: listText(p.candidates, language) });
     case "blocked.chooseOne": return "";
@@ -134,8 +161,10 @@ export function questionNoun(questionId: string, language: Language): string {
   return q ? recapLabel(q, language) : questionId;
 }
 
-export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" | "blocked" | "base">, language: Language): RenderedChange {
-  const cancel = { text: uiString("change.cancel", language), callback_data: changeCallbackData(draft.id, "cancel") };
+export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" | "blocked" | "base" | "ops" | "result">, language: Language): RenderedChange {
+  const digest = draftDigest(draft);
+  const data = (choice: "apply" | "cancel" | "pick", index?: number) => changeCallbackData(draft.id, digest, choice, index);
+  const cancel = { text: uiString("change.cancel", language), callback_data: data("cancel") };
   const open = openQuestion(draft);
 
   if (open?.kind === "choose") {
@@ -145,7 +174,7 @@ export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" |
       text: uiString("change.ask.choose", language),
       replyMarkup: {
         inline_keyboard: [
-          ...open.options.map((o, k) => [{ text: option(o), callback_data: changeCallbackData(draft.id, "pick", k) }]),
+          ...open.options.map((o, k) => [{ text: option(o), callback_data: data("pick", k) }]),
           [cancel],
         ],
       },
@@ -164,7 +193,7 @@ export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" |
       const entry = held[index];
       return [{
         text: entryText(entry ? (entry as unknown as Param) : "?", language).slice(0, 60),
-        callback_data: changeCallbackData(draft.id, "pick", k),
+        callback_data: data("pick", k),
       }];
     });
     return { text, replyMarkup: { inline_keyboard: [...rows, [cancel]] } };
@@ -180,7 +209,7 @@ export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" |
     text: [uiString("change.header", language), "", ...lines, "", uiString("change.footer", language)].join("\n"),
     replyMarkup: {
       inline_keyboard: [[
-        { text: uiString("change.apply", language), callback_data: changeCallbackData(draft.id, "apply") },
+        { text: uiString("change.apply", language), callback_data: data("apply") },
         cancel,
       ]],
     },

@@ -481,3 +481,51 @@ describe("a question the words left open (#206, slice 3)", () => {
     assert.equal(many.stops.length, 30, "never cut");
   });
 });
+
+
+describe("model-supplied text cannot write into the preview (F)", () => {
+  const refused = (raw: unknown) => assert.equal(parseOps(raw).ok, false, JSON.stringify(raw));
+  test("newlines, control characters and bidi controls are refused wherever a name is accepted", () => {
+    const bad = [
+      "Nara\n\n\u2705 Done \u2014 that's updated.",
+      "Nara\u202Eevil",
+      "Nara\u2066x\u2069",
+      "Nara\u0007",
+      "Nara\u2028line",
+      "Nara\r\nStaying exactly as it is: Tokyo",
+    ];
+    for (const name of bad) {
+      refused([{ op: "add_stop", fields: { name } }]);
+      refused([{ op: "add_traveller", fields: { name } }]);
+      refused([{ op: "update_stop", target: { name }, fields: { end: "2026-05-25" } }]);
+      refused([{ op: "rename_stop", target: { name: "Kyoto" }, name }]);
+      refused([{ op: "add_stop", fields: { name: "Nara", planned: [name] } }]);
+      refused([{ op: "add_stop", fields: { name: "Nara", accommodation: { name } } }]);
+      refused([{ op: "add_traveller", fields: { name: "Dana", family: name } }]);
+    }
+  });
+
+  test("ordinary names, Hebrew, and the directional MARKS Hebrew uses are still accepted", () => {
+    for (const name of ["Nara", "Kyoto {to}", "\u05e0\u05d0\u05e8\u05d4", "Ho Chi Minh City \u2014 day trip", "\u200f\u05d8\u05d5\u05e7\u05d9\u05d5\u200f"]) {
+      assert.equal(parseOps([{ op: "add_stop", fields: { name } }]).ok, true, name);
+    }
+  });
+
+  test("the bounds that keep a preview bounded", () => {
+    assert.equal(parseOps([{ op: "add_stop", fields: { name: "x".repeat(81) } }]).ok, false);
+    assert.equal(parseOps([{ op: "add_stop", fields: { name: "x", planned: Array.from({ length: 13 }, () => "p") } }]).ok, false);
+    assert.equal(parseOps([{ op: "add_stop", fields: { name: "x", planned: Array.from({ length: 12 }, () => "p".repeat(80)) } }]).ok, true);
+  });
+});
+
+describe("held lists that are not all objects (H)", () => {
+  test("the model is shown ids that are POSITIONS in the held list, skipping what is not an entry", () => {
+    const lists = heldRefLists(store({ phases: ["Tokyo", stop("Kyoto", "2026-05-27", "2026-05-30"), 7, stop("Osaka")] }));
+    assert.deepEqual(lists.stops.map((i) => i.id), ["s2", "s4"], "Kyoto is s2 and Osaka s4, as resolveRef will count them");
+  });
+
+  test("a change to a list that cannot be edited is blocked as unsupportedShape, never applied", () => {
+    const out = bad(applyOps(store({ phases: ["Tokyo", stop("Kyoto")] }), [{ op: "update_stop", target: { name: "Kyoto" }, fields: { end: "2026-05-31" } }]));
+    assert.deepEqual(keys(out.blocked), ["blocked.unsupportedShape"]);
+  });
+});

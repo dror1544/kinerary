@@ -23,6 +23,7 @@
  * `{ key, params }` — not sentences: wording, and the person's language, are
  * the router's.
  */
+import { createHash } from "node:crypto";
 import { canonical, identityFold, isRecord, ordered } from "./answer-merge.js";
 import { INTAKE_QUESTIONS, organizerMatch, validateAnswer, type AnswerStore, type IntakeAnswer } from "./interview.js";
 
@@ -77,6 +78,11 @@ export const OP_NAMES = [
 ] as const;
 
 const MAX_OPS = 20;
+/** The most operations one waiting draft may hold once follow-ups are merged into it. */
+export const MAX_DRAFT_OPS = 40;
+// Bounds on model-supplied text, so a preview built from them is bounded too.
+const MAX_TEXT = 80;
+const MAX_PLANNED = 12;
 const STOP_FIELDS = new Set(["name", "name_en", "start", "end", "accommodation", "planned"]);
 const STOP_UPDATE_FIELDS = new Set(["name_en", "start", "end", "accommodation", "planned"]);
 const TRAVELLER_FIELDS = new Set(["name", "name_en", "age", "family"]);
@@ -97,11 +103,20 @@ export function questionOf(family: Family): "phases" | "travelers" {
 
 export type ParseResult = { ok: true; ops: Op[] } | { ok: false; error: string };
 
-function text(value: unknown, max = 200): string | null {
+/**
+ * Characters a name may never carry: control characters (a newline lets a name
+ * write its own lines into the preview), the line and paragraph separators, and
+ * the bidi embedding / override / isolate family (which reorders what follows).
+ * Marks such as RLM and LRM stay: Hebrew text uses them legitimately.
+ */
+const FORBIDDEN_TEXT = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069]/u;
+
+export function safeText(value: unknown, max = MAX_TEXT): string | null {
   if (typeof value !== "string") return null;
   const t = value.trim();
-  return t.length > 0 && t.length <= max ? t : null;
+  return t.length > 0 && t.length <= max && !FORBIDDEN_TEXT.test(t) ? t : null;
 }
+const text = safeText;
 
 function parseRef(raw: unknown, where: string): { ref: Ref } | { error: string } {
   if (!isRecord(raw)) return { error: `${where}: a reference is an object` };
@@ -130,7 +145,7 @@ function parseFields(raw: unknown, allowed: ReadonlySet<string>, where: string):
       if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 120) return { error: `${where}: bad age` };
       out.age = value;
     } else if (key === "planned") {
-      if (!Array.isArray(value) || value.length > 30 || !value.every((p) => text(p) !== null)) return { error: `${where}: bad planned` };
+      if (!Array.isArray(value) || value.length > MAX_PLANNED || !value.every((p) => text(p) !== null)) return { error: `${where}: bad planned` };
       out.planned = value.map((p) => (p as string).trim());
     } else if (key === "accommodation") {
       if (!isRecord(value)) return { error: `${where}: bad accommodation` };
@@ -388,10 +403,19 @@ function entryRef(entry: Entry): Param {
   return out;
 }
 
+/** An entry as an ADD or a REPLACEMENT shows it: everything that would be stored, not just the headline. */
+function entryFull(entry: Entry): Param {
+  const out = entryRef(entry) as Record<string, Param>;
+  if (isRecord(entry.accommodation)) out.accommodation = entry.accommodation as Param;
+  if (Array.isArray(entry.planned)) out.planned = entry.planned as Param;
+  if (typeof entry.family === "string") out.family = entry.family;
+  return out;
+}
+
 function shown(value: unknown): Param {
   if (value === undefined || value === null) return null;
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-  return canonical(value);
+  return JSON.parse(canonical(value)) as Param;
 }
 
 // ── Applying operations ──────────────────────────────────────────────────────
@@ -660,12 +684,12 @@ function describe(
 
     for (const item of items) {
       if (item.origin === null) {
-        lines.push({ key: "preview.add", params: { question, entry: entryRef(item.entry) } });
+        lines.push({ key: "preview.add", params: { question, entry: entryFull(item.entry) } });
         continue;
       }
       const before = heldList[item.origin]!;
       if (item.replaces) {
-        lines.push({ key: "preview.replace", params: { question, from: entryRef(before), to: entryRef(item.entry) } });
+        lines.push({ key: "preview.replace", params: { question, from: entryRef(before), to: entryFull(item.entry) } });
         for (const key of Object.keys(before)) {
           if (key !== "name" && key !== "name_en" && !DISPLAY_SKIP.has(key) && !(key in item.entry)) {
             lines.push({ key: "preview.dropsField", params: { question, entry: entryRef(before), field: key } });
@@ -795,6 +819,26 @@ function describe(
   return lines;
 }
 
+/**
+ * A short, stateless name for WHAT a draft would do right now: eight hex
+ * characters of a hash over its operations, its would-be result and whatever it
+ * is still asking. It travels in every button and in the on-screen marker, so a
+ * tap or a typed "yes" can only confirm the version the person was looking at —
+ * a follow-up that merges into the same draft (same id) changes it, and the old
+ * button then names a draft that no longer exists. No memory, no message edit.
+ */
+export function draftDigest(draft: {
+  ops: readonly Op[];
+  result: Record<string, unknown>;
+  unresolved: readonly unknown[];
+  blocked: readonly unknown[];
+}): string {
+  return createHash("sha256")
+    .update(canonical({ ops: draft.ops, result: draft.result, unresolved: draft.unresolved, blocked: draft.blocked }))
+    .digest("hex")
+    .slice(0, 8);
+}
+
 // ── Merging a follow-up into a waiting draft ─────────────────────────────────
 
 /**
@@ -918,10 +962,16 @@ export function heldRefLists(answers: AnswerStore): { stops: HeldItem[]; travell
     if (typeof entry.age === "number") bits.push(`age ${entry.age}`);
     return bits.length > 0 ? `${name}, ${bits.join(", ")}` : `${name}, no dates`;
   };
+  // Ids are POSITIONS in the held list (`resolveRef` reads them as such), so an
+  // entry that is not an object is skipped WITHOUT renumbering the rest.
   const of = (questionId: string, family: Family): HeldItem[] =>
-    (listOf(answers, questionId).filter(isRecord) as Entry[]).map((entry, i) => ({
-      id: refId(family, i),
-      label: family === "traveller" && typeof entry.start !== "string" ? label(entry).replace(", no dates", "") : label(entry),
-    }));
+    listOf(answers, questionId).flatMap((raw, i) => {
+      if (!isRecord(raw)) return [];
+      const entry = raw as Entry;
+      return [{
+        id: refId(family, i),
+        label: family === "traveller" && typeof entry.start !== "string" ? label(entry).replace(", no dates", "") : label(entry),
+      }];
+    });
   return { stops: of("phases", "stop"), travellers: of("travelers", "traveller") };
 }

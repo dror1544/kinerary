@@ -22,6 +22,7 @@ import {
 import { structuredLog } from "./redaction.js";
 import { listTripDocuments } from "./document-registry.js";
 import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
+import { draftDigest, type Op } from "./typed-changes.js";
 import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
 
 /**
@@ -4018,6 +4019,8 @@ export type ApplyPendingChangeResult =
         | "ALREADY_APPLIED"
         | "BLOCKED"
         | "STALE"
+        /** The draft is not the version the person confirmed: a follow-up merged into it since. */
+        | "UPDATED"
         | "INVALID";
       detail?: string;
     };
@@ -4048,6 +4051,12 @@ export async function applyPendingChangeForChat(
   db: pg.Pool,
   chatId: string,
   draftId: string,
+  /**
+   * The digest of the version the person was looking at (`draftDigest`). Compared
+   * under the lock, so a follow-up merged in between can never be applied by an
+   * older Yes. Omitted only by a caller that has just read the draft itself.
+   */
+  expectedDigest?: string,
 ): Promise<ApplyPendingChangeResult> {
   const client = await db.connect();
   try {
@@ -4061,11 +4070,12 @@ export async function applyPendingChangeForChat(
       session_id: string;
       status: string;
       base: Record<string, unknown>;
+      ops: Op[];
       result: Record<string, IntakeAnswer>;
       unresolved: unknown[];
       blocked: unknown[];
     }>(
-      `SELECT id, session_id, status, base, result, unresolved, blocked
+      `SELECT id, session_id, status, base, ops, result, unresolved, blocked
          FROM control_plane.intake_pending_changes WHERE id = $1 FOR UPDATE`,
       [draftId],
     );
@@ -4074,6 +4084,11 @@ export async function applyPendingChangeForChat(
     if (draft.session_id !== session.id) { await client.query("ROLLBACK"); return { ok: false, reason: "WRONG_SESSION" }; }
     if (draft.status === "applied") { await client.query("ROLLBACK"); return { ok: false, reason: "ALREADY_APPLIED" }; }
     if (draft.status !== "pending") { await client.query("ROLLBACK"); return { ok: false, reason: "NOT_PENDING" }; }
+
+    if (expectedDigest !== undefined && expectedDigest !== draftDigest(draft)) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "UPDATED" };
+    }
 
     const questionIds = Object.keys(draft.result ?? {});
     if (questionIds.length === 0 || draft.unresolved.length > 0 || draft.blocked.length > 0) {
