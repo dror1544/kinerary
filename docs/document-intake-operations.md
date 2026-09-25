@@ -338,8 +338,12 @@ Also measured:
   not re-run, and claude was not re-run on `multi`. Under the same prompt codex's
   evidence passed in 6 of 6 runs.
 
-**Default chosen:** codex gpt-5.6-luna for `extract_intake` and `extract_itinerary`
-(`compose.vm.yml`). It is as accurate as claude-sonnet-5 on every fixture metric and
+**Benchmark preference (2026-09-13), not what runs:** codex gpt-5.6-luna for
+`extract_intake` and `extract_itinerary`. It was chosen as the default at the time, but
+no deployment configures it: neither the VM's compose nor the Mac's `provisioning.env`
+sets `EXTRACT_INTAKE_*` / `EXTRACT_ITINERARY_*` (#202), so both read documents with
+`EXTRACT_RUNNER=claude`. Dror decided on 2026-09-25 to use what is running; switching to
+codex is a deliberate change with its own check, not a repair. It is as accurate as claude-sonnet-5 on every fixture metric and
 more accurate on the real document, at about a quarter of the latency. `interpret`
 was not benchmarked and keeps its deployed binding. Vision stays opt-in; claude CLI is
 the verified choice, and codex stays excluded.
