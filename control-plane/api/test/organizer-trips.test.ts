@@ -351,6 +351,26 @@ describe("/switch (DB)", { skip: SKIP }, () => {
     });
   });
 
+  test("a RETIRED trip the sender still holds a membership on is refused as NOT_YOURS, and binds nothing (#105)", async () => {
+    await withFixture(async ({ pool, italyId }) => {
+      // Ownership survives retirement: teardown renames the slug, it does not
+      // remove the membership or the organizer link. Called directly, bypassing
+      // the list that dispatch resolves the target from.
+      await pool.query(
+        "UPDATE control_plane.trips SET slug = 'retired-italy-2026-20260920' WHERE id = $1",
+        [italyId],
+      );
+      const outcome = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, italyId);
+      assert.deepEqual(outcome, { kind: "refused", reason: "NOT_YOURS" });
+      assert.equal(await openBinding(pool, ORGANIZER_CHAT), null, "no binding row was written");
+      const { rows } = await pool.query(
+        "SELECT 1 FROM control_plane.telegram_chat_bindings WHERE chat_id = $1 AND trip_id = $2",
+        [ORGANIZER_CHAT, italyId],
+      );
+      assert.equal(rows.length, 0, "not even a closed row");
+    });
+  });
+
   test("a trip that is not yours and a trip that does not exist get the SAME sentence", async () => {
     await withFixture(async ({ pool, strangerTripId }) => {
       const notMine = await switchChatToTrip(pool, ORGANIZER_CHAT, ORGANIZER_CHAT, strangerTripId);
