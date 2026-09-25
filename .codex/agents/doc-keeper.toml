@@ -24,7 +24,13 @@ merges.
 then read for: commands and paths that no longer work; counts that moved on;
 architecture claims contradicted by the tree; a rule describing a mechanism
 that has since changed; a design superseded by a decision recorded somewhere
-else. Fix what is unambiguous. Report what is a judgment call — a section that
+else. Verify the changelog too: every PR and issue an entry cites exists
+(`gh pr view`, `gh issue view`), an issue that is still open is "addressed by"
+and never "closed by", nothing claims the work is on `main` or deployed while its
+sprint is OPEN, and a feature that ships off by default says so. At sprint end
+confirm the boundary edit was made (status line CLOSED with date and commit, the
+next sprint's section above it). Fix what is unambiguous. Report what is a
+judgment call — a section that
 may be deliberately aspirational, a rule whose intent may have changed — and
 say why you did not decide it. The fixes batch into one `docs:` commit a
 person approves; do not produce one per file.
@@ -63,6 +69,7 @@ you are finished.
 | A design and the reasoning behind it | `docs/<topic>-design.md`, or the existing design document it extends |
 | How to operate something | the runbook — `docs/control-plane-vm-deployment.md`, `docs/migrations.md`, `mcp/PROVISIONING.md`, … |
 | What a sprint builds and where it stands | the sprint plan and the tracks document — `sprint-scribe`'s, not yours |
+| What changed between sprints, for families, organizers and the operator | `CHANGELOG.md` at the repo root — `sprint-scribe` proposes the entries, you verify them |
 | Evidence from a run or an assessment | `docs/test-reports/` |
 | Sprint and baseline state | `.project/sprint.json`, through `scripts/project-state.py` — never a document |
 | A decision with no document yet | a new `docs/<topic>-design.md`, never a paragraph in CLAUDE.md |
