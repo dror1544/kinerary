@@ -268,6 +268,7 @@ class ProxmoxLxcAdapter:
         trip_slug = spec.trip_slug
         app_dir = "/opt/kinerary"
         avatars_dir = f"{spec.nfs_mount_path}/media/avatars"
+        key_keep = shlex.quote(f"{spec.nfs_mount_path}/.hermes-api-key")
         # Appended with printf rather than written inside the heredoc above:
         # that heredoc is unquoted (it has to expand ${JWT_SECRET}), so a
         # password containing $ or ` would be mangled or executed there.
@@ -310,7 +311,19 @@ if [ ! -f {app_dir}/.env ]; then
   JWT_SECRET=$(head -c 32 /dev/urandom | base64)
   # Hex, not base64: setup-mcp.sh copies this value around by
   # `grep '^HERMES_API_KEY=' | cut -d= -f2-`, so it must not contain '='.
-  HERMES_API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n')
+  # A key already handed to this trip's bridge outlives this file: a second
+  # bootstrap (a container rebuilt on its NFS dir, a marker lost) must not
+  # mint another, or the wired bridge is left on a key the site rejects and
+  # every trip tool 401s while the companion stays fluent (issue #119). The
+  # copy lives on the trip's NFS mount, which survives the container. Only a
+  # well-formed value is reused; never printed.
+  HERMES_API_KEY=
+  if [ -s {key_keep} ]; then
+    HERMES_API_KEY=$(head -n 1 {key_keep} 2>/dev/null | tr -d ' \\r' || true)
+  fi
+  if ! printf '%s' "$HERMES_API_KEY" | grep -Eq '^[0-9a-f]{{64}}$'; then
+    HERMES_API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n')
+  fi
   cat > {app_dir}/.env <<ENVEOF
 TRIP_DIR={app_dir}/trips/{trip_slug}
 DATA_DIR={spec.nfs_mount_path}/server-data
@@ -322,6 +335,13 @@ HERMES_API_KEY=${{HERMES_API_KEY}}
 ENVEOF
 {seed_password_line}{exchange_key_line}  chmod 600 {app_dir}/.env
 fi
+
+# Keep a copy of whatever key the site is now using (also for a trip provisioned
+# before this existed). Best effort: a share that refuses the write must not
+# fail the bootstrap, it only means the next one cannot be stable.
+(umask 077; grep -E '^HERMES_API_KEY=[0-9a-f]{{64}}$' {app_dir}/.env | head -n 1 | cut -d= -f2- > {key_keep}.tmp \\
+  && mv {key_keep}.tmp {key_keep}) 2>/dev/null \\
+  || echo 'WARNING: could not keep this trip agent key on the NFS mount; a later re-bootstrap will mint a new one' >&2
 
 cat > /etc/systemd/system/kinerary-server.service <<'UNITEOF'
 [Unit]

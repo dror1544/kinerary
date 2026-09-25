@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 from provisioning.adapters import (
@@ -405,6 +408,65 @@ class AdapterTests(unittest.TestCase):
         adapter.delete(LXC_SPEC)
 
         self.assertFalse(any("pct stop" in c or "pct destroy" in c for c in ssh.commands))
+
+    # ── #119: the trip's agent key must survive a second bootstrap ───────────
+    def _env_block(self, tmp: str) -> str:
+        """The key-minting part of the real bootstrap script (from the `.env`
+        guard up to the systemd unit), retargeted at a temp directory, so the
+        test runs the shell the container would run rather than reading it."""
+        ssh = FakeProxmoxSsh(nextid="203")
+        spec = LxcSpec(
+            "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8,
+            "vmbr0", "192.0.2.60/24", "192.0.2.1", "192.0.2.2",
+            "/srv/nfs/tokyo-2026", f"{tmp}/nfs", "tokyo-2026",
+        )
+        ProxmoxLxcAdapter(ssh).create(spec)
+        script = ssh.commands[3].replace("/opt/kinerary", f"{tmp}/app")
+        start = script.index(f"if [ ! -f {tmp}/app/.env ]")
+        end = script.index("cat > /etc/systemd/system/kinerary-server.service")
+        return script[start:end]
+
+    def _run(self, block: str) -> str:
+        proc = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + block], capture_output=True, text=True, check=True,
+        )
+        return proc.stdout + proc.stderr
+
+    def _key(self, tmp: str) -> str:
+        with open(f"{tmp}/app/.env") as fh:
+            return re.search(r"^HERMES_API_KEY=(\S+)$", fh.read(), re.M).group(1)
+
+    def test_a_second_bootstrap_after_the_env_file_is_lost_keeps_the_same_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
+            block = self._env_block(tmp)
+            out1 = self._run(block)
+            first = self._key(tmp)
+            os.remove(f"{tmp}/app/.env")  # a rebuilt/half-built container
+            out2 = self._run(block)
+            self.assertEqual(self._key(tmp), first)
+            # A credential: never on stdout/stderr (which reach worker logs).
+            self.assertNotIn(first, out1 + out2)
+
+    def test_an_existing_env_is_left_alone_and_its_key_is_kept_for_later(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
+            with open(f"{tmp}/app/.env", "w") as fh:
+                fh.write("HERMES_API_KEY=" + "ab" * 32 + "\n")
+            block = self._env_block(tmp)
+            self._run(block)  # a trip provisioned before this fix
+            self.assertEqual(self._key(tmp), "ab" * 32)
+            os.remove(f"{tmp}/app/.env")
+            self._run(block)
+            self.assertEqual(self._key(tmp), "ab" * 32)
+
+    def test_a_malformed_kept_key_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
+            with open(f"{tmp}/nfs/.hermes-api-key", "w") as fh:
+                fh.write("not a key=\n")
+            self._run(self._env_block(tmp))
+            self.assertRegex(self._key(tmp), r"^[0-9a-f]{64}$")
 
     def test_needs_bootstrap_is_false_for_an_absent_container(self) -> None:
         adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())

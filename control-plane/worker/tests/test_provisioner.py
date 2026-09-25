@@ -1074,6 +1074,16 @@ class CompanionProfileTests(unittest.TestCase):
             "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual(job_state["state"], "succeeded")
+        # A FACT, and it survives the binding that succeeded after it: the
+        # 'reachable' write beside the binding used to erase it (issue #119).
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (state["reachability"], state["unreachable_reason"]),
+            ("unreachable", "TRIP_MCP_BRIDGE_FAILED"),
+        )
 
     def test_a_chat_already_serving_another_trip_is_not_taken(self) -> None:
         """The provisioner must not retarget a chat that is in force for another
