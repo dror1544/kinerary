@@ -15,6 +15,8 @@ const copy = (lang: Lang, en: string, he: string) => (lang === "he" ? he : en);
  * link. The person still reviews and confirms; nothing is added by the click.
  * https://claude.com/docs/connectors/custom/remote-mcp
  */
+export const CHATGPT_PLUGINS_URL = "https://chatgpt.com/settings/plugins-settings";
+
 export function claudeInstallLink(name: string, url: string) {
   const q = new URLSearchParams({ modal: "add-custom-connector", connectorName: name, connectorUrl: url });
   return `https://claude.ai/customize/connectors?${q}`;
@@ -55,12 +57,13 @@ export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: st
       /* the address stays visible to copy by hand */
     }
   }
-  // ChatGPT has no install link: copy the address first, then open ChatGPT,
-  // and say where it goes.
+  // ChatGPT has no install link that pre-fills the address, so copy it first
+  // and open ChatGPT's plugins page, where the app is created (found by Dror
+  // 2026-09-25; not a documented URL, hence the written steps as well).
   async function openChatGPT(url: string) {
     await copyUrl(url);
     setChatgptHint(true);
-    window.open("https://chatgpt.com/", "_blank", "noopener");
+    window.open(CHATGPT_PLUGINS_URL, "_blank", "noopener");
   }
   const when = (iso: string) => new Date(iso).toLocaleDateString(lang === "he" ? "he-IL" : "en-US", { month: "short", day: "numeric" });
 
@@ -84,8 +87,8 @@ export function AssistantConnect({ lang, tripName }: { lang: Lang; tripName?: st
       </div>
       {chatgptHint ? (
         <p className="assistant-connect-hint" role="status">{copy(lang,
-          "The address is copied. In ChatGPT on the web: Settings → Security and login → turn on Developer mode, then + to create an app, paste the address and choose OAuth.",
-          "הכתובת הועתקה. ב-ChatGPT באתר: הגדרות ← אבטחה והתחברות ← הפעלת מצב מפתח, ואז + ליצירת אפליקציה, הדביקו את הכתובת ובחרו OAuth.")}</p>
+          "The address is copied. On the ChatGPT page that opened, press + to create an app, paste the address and choose OAuth. No + button? Turn on Developer mode first: Settings → Security and login.",
+          "הכתובת הועתקה. בדף ChatGPT שנפתח, לחצו + ליצירת אפליקציה, הדביקו את הכתובת ובחרו OAuth. אין כפתור +? הפעילו קודם מצב מפתח: הגדרות ← אבטחה והתחברות.")}</p>
       ) : null}
       <p className="assistant-connect-note">{copy(lang,
         "After that, a page from this site opens: sign in with your trip account and allow.",

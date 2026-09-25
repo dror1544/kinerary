@@ -197,13 +197,13 @@ function renderConnectorInfoPage({ url, lang }) {
     title: 'כתובת לחיבור עוזר AI',
     lead: 'זו לא כתובת לדפדפן. זו הכתובת שמדביקים ב-Claude או ב-ChatGPT כדי לחבר אותם לטיול:',
     claude: 'Claude: הגדרות ← מחברים ← הוספת מחבר מותאם.',
-    chatgpt: 'ChatGPT (באתר): הגדרות ← אבטחה והתחברות ← מצב מפתח, ואז + ליצירת אפליקציה עם הכתובת, ובחרו OAuth.',
+    chatgpt: 'ChatGPT (באתר): chatgpt.com/settings/plugins-settings ← + ליצירת אפליקציה עם הכתובת, ובחרו OAuth (צריך מצב מפתח: הגדרות ← אבטחה והתחברות).',
     then: 'ייפתח דף מהאתר; התחברו עם חשבון הטיול ואשרו.',
   } : {
     title: 'AI assistant connector address',
     lead: 'This is not a web page. It is the address you paste into Claude or ChatGPT to connect them to this trip:',
     claude: 'Claude: Settings → Connectors → Add custom connector.',
-    chatgpt: 'ChatGPT (on the web): Settings → Security and login → Developer mode, then + to create an app with this address, and choose OAuth.',
+    chatgpt: 'ChatGPT (on the web): chatgpt.com/settings/plugins-settings → + to create an app with this address, and choose OAuth (needs Developer mode: Settings → Security and login).',
     then: 'A page from this site opens; sign in with your trip account and allow.',
   };
   return `<!doctype html><html lang="${he ? 'he' : 'en'}" dir="${he ? 'rtl' : 'ltr'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(t.title)}</title></head>

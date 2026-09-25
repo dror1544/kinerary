@@ -68,7 +68,7 @@ describe("connect your AI assistant", () => {
     expect(screen.getByText(/make the changes you can make here/i)).toBeInTheDocument();
   });
 
-  it("copies the address and opens ChatGPT, saying where to paste it", async () => {
+  it("copies the address and opens ChatGPT's plugins page, saying where to paste it", async () => {
     stubConnection({ enabled: true, url: URL_, access: "read_write", connections: [] });
     const writeText = vi.fn(async () => {});
     Object.assign(navigator, { clipboard: { writeText } });
@@ -76,7 +76,7 @@ describe("connect your AI assistant", () => {
     vi.stubGlobal("open", open);
     renderMore();
     fireEvent.click(await screen.findByRole("button", { name: /add to chatgpt/i }));
-    await waitFor(() => expect(open).toHaveBeenCalledWith("https://chatgpt.com/", "_blank", "noopener"));
+    await waitFor(() => expect(open).toHaveBeenCalledWith("https://chatgpt.com/settings/plugins-settings", "_blank", "noopener"));
     expect(writeText).toHaveBeenCalledWith(URL_);
     expect(screen.getByRole("status")).toHaveTextContent(/Developer mode/);
   });

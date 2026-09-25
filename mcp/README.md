@@ -141,10 +141,12 @@ The site's **More** tab has a "Connect your AI assistant" card:
 - **Add to Claude** opens Claude's documented install link
   (`https://claude.ai/customize/connectors?modal=add-custom-connector&connectorName=…&connectorUrl=…`),
   which pre-fills the "Add custom connector" dialog; the person confirms.
-- **Add to ChatGPT** copies the address and opens ChatGPT, with the steps:
-  on the web, Settings → Security and login → Developer mode, then **+** to
-  create an app with the address, authentication OAuth. ChatGPT has no
-  install link, and its phone app cannot create one.
+- **Add to ChatGPT** copies the address and opens ChatGPT's plugins page
+  (`https://chatgpt.com/settings/plugins-settings` — works, but not a
+  documented URL), with the steps: **+** to create an app with the address,
+  authentication OAuth; Developer mode (Settings → Security and login) must be
+  on first. ChatGPT has no install link that pre-fills the address, and its
+  phone app cannot create one.
 - Then a page on the trip site opens; they sign in with their normal site login
   (password or Google) and approve.
 
