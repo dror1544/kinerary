@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { publicPart } = require('../shared/config-visibility');
+const { projectAgent } = require('../shared/agent-schema');
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // "<phase>|<YYYY-MM-DD>|<index>" — the identity a config-imported item keeps
@@ -246,20 +248,75 @@ function schema(db) {
   db.prepare('INSERT OR IGNORE INTO trip_ui_settings (id, design_variant) VALUES (1, ?)').run(normalizeUiVariant(process.env.TRIP_DESIGN_VARIANT));
 }
 
-function dayContextForPhase(phase, date) {
-  const accommodation = phase?.accommodation || (Array.isArray(phase?.hotels) ? phase.hotels.find((h) => {
-    const from = h.date_from || h.check_in || h.from;
-    const to = h.date_to || h.check_out || h.to;
-    return (!from || from <= date) && (!to || date <= to);
-  }) : null);
+// What a day row says about where the family sleeps. These rows reach every
+// member through GET /api/itinerary/active (an organizer titling a new day,
+// restore-original, or a trip whose active plan is still the imported one), so
+// the phase is read through the same allow-list as GET /api/config (#172): the
+// raw phase used to be copied here — `pickup` whole, and the lodging name as
+// whatever object the config held.
+//
+// CHOOSE on the raw config, SERVE the projection. Which lodging applies to a
+// night is decided exactly as it was before the allow-list — on the raw
+// `accommodation` and the raw hotel date ranges — and only the chosen one is
+// then projected. Choosing among PROJECTED hotels changed the answer: a hotel
+// whose dates are wrong-shaped loses them to the allow-list and then matches
+// every night (the second boundary review measured it picking that hotel over
+// the right one).
+function dayContextForPhase(rawPhase, date) {
+  const rawAccommodation = rawPhase?.accommodation;
+  const rawHotels = rawPhase?.hotels;
+  let chosen = null;
+  if (rawAccommodation) chosen = { accommodation: rawAccommodation };
+  else if (Array.isArray(rawHotels)) {
+    const index = rawHotels.findIndex((h) => {
+      const from = h?.date_from || h?.check_in || h?.from;
+      const to = h?.date_to || h?.check_out || h?.to;
+      return (!from || from <= date) && (!to || date <= to);
+    });
+    if (index >= 0) chosen = { hotels: [rawHotels[index]] };
+  }
+  const projected = chosen ? publicPart('phase', chosen) : undefined;
+  const accommodation = projected?.accommodation || projected?.hotels?.[0] || null;
   return {
     lodging_context: accommodation ? JSON.stringify({
       name: accommodation.name || accommodation.hotel || accommodation.title || null,
       address: accommodation.address || null,
       location_url: accommodation.location_url || accommodation.url || null,
     }) : null,
-    pickup_context: phase?.pickup ? JSON.stringify(phase.pickup) : null,
+    // phases[].pickup is not on the allow-list: no producer writes it, nothing
+    // renders it, and it has no shape to allow. The column stays for rows
+    // already stored; nothing new is written to it.
+    pickup_context: null,
   };
+}
+
+// The member-facing view of a stored day's context. Rows written before the
+// import read the allow-list are still in the database (and restore-original
+// copies them forward), so the served shape is enforced here too.
+function publicDayContext(day) {
+  const lodging = day.lodging_context && typeof day.lodging_context === 'object' ? day.lodging_context : null;
+  const accommodation = lodging ? publicPart('phase', { accommodation: {
+    name: lodging.name, address: lodging.address, location_url: lodging.location_url,
+  } })?.accommodation : null;
+  return {
+    ...day,
+    lodging_context: accommodation && Object.keys(accommodation).length ? {
+      name: accommodation.name ?? null,
+      address: accommodation.address ?? null,
+      location_url: accommodation.location_url ?? null,
+    } : null,
+    pickup_context: null,
+  };
+}
+
+// The Hebrew half of a bilingual config text: a plain string is Hebrew (the
+// site's default language), an object gives its `he`. `text.he ?? text` used to
+// fall back to the whole OBJECT when `he` was missing — and the allow-list now
+// removes a wrong-shaped `he` — which printed "[object Object]" where the
+// English should have been used.
+function hebrewOf(value) {
+  if (value && typeof value === 'object') return value.he ?? '';
+  return value ?? '';
 }
 
 // A link worth rendering as an href, or nothing.
@@ -270,15 +327,24 @@ function httpOrNull(u) {
 function rowsFromConfig(config) {
   const days = [];
   const items = [];
+  // Iterate the RAW lists, so a day's and an item's index — which item_uid and
+  // source_ref are derived from — never shift; read every VALUE from the same
+  // element projected through the /api/config allow-list (#172), so nothing
+  // reaches an itinerary row that /api/config would not serve.
   for (const phase of config.phases || []) {
-    for (const [dayIndex, day] of (phase.days || []).entries()) {
+    // The phase id is bound into every row and served; a wrong-shaped one is
+    // skipped rather than bound (a one-element array binds as a plain value).
+    const phaseId = publicPart('phase', { id: phase?.id })?.id;
+    if (phaseId == null) continue;
+    for (const [dayIndex, rawDay] of (Array.isArray(phase?.days) ? phase.days : []).entries()) {
+      const day = publicPart('day', rawDay) || {};
       const date = day.date || null;
       if (!date || !ISO_DATE_RE.test(date)) continue;
-      const labelHe = stripTags(day.label?.he ?? day.label ?? '');
+      const labelHe = stripTags(hebrewOf(day.label));
       const labelEn = stripTags(day.label?.en ?? '');
       const context = dayContextForPhase(phase, date);
       days.push({
-        phase_id: phase.id,
+        phase_id: phaseId,
         date,
         label_he: labelHe || null,
         label_en: labelEn || null,
@@ -286,20 +352,21 @@ function rowsFromConfig(config) {
         pickup_context: context.pickup_context,
         sort_order: dayIndex,
       });
-      for (const [itemIndex, item] of (day.items || []).entries()) {
+      for (const [itemIndex, rawItem] of (Array.isArray(rawDay?.items) ? rawDay.items : []).entries()) {
+        const item = publicPart('dayItem', rawItem) || {};
         const rawTime = typeof item.time === 'string' ? item.time.trim() : '';
         const time = normalizeTime(rawTime);
-        const heText = stripTags(item.text?.he ?? item.text ?? '');
+        const heText = stripTags(hebrewOf(item.text));
         const enText = stripTags(item.text?.en ?? '');
         const prefix = rawTime && !time ? `${rawTime} - ` : '';
         const text = prefix + (heText || enText);
         if (!text) continue;
         const links = [...allConfigLinks(item.text?.he), ...allConfigLinks(item.text?.en)]
           .filter((link, i, arr) => arr.findIndex((other) => other.url === link.url) === i);
-        const ref = `${phase.id}|${date}|${itemIndex}`;
+        const ref = `${phaseId}|${date}|${itemIndex}`;
         items.push({
           item_uid: `cfg_${digest(ref).slice(0, 16)}`,
-          phase_id: phase.id,
+          phase_id: phaseId,
           date,
           time,
           time_sort: planTimeSort(time),
@@ -500,7 +567,10 @@ function serializeItinerary(db, rows, { includeOriginal = false } = {}) {
     kind: rows.version.kind,
     created_at: rows.version.created_at,
     source_config_version: rows.version.source_config_version,
-    days: rows.days,
+    // The participant-facing projection enforces the day-context shape on
+    // stored rows too; /api/itinerary/original (organizer-or-agent) is left as
+    // it was.
+    days: includeOriginal ? rows.days : rows.days.map(publicDayContext),
     items: rows.items.map((item) => ({
       ...item,
       booking: item.booking_id ? bookingsById.get(item.booking_id) || null : null,
@@ -790,7 +860,7 @@ function tripTimeZone(config) {
 function localClock(config, date = new Date()) {
   const timeZone = tripTimeZone(config);
   try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
+    const formatter = new Intl.DateTimeFormat('en-CA', {
       timeZone,
       year: 'numeric',
       month: '2-digit',
@@ -798,12 +868,16 @@ function localClock(config, date = new Date()) {
       hour: '2-digit',
       minute: '2-digit',
       hourCycle: 'h23',
-    }).formatToParts(date);
+    });
+    const parts = formatter.formatToParts(date);
     const pick = (type) => parts.find((part) => part.type === type)?.value;
     return {
       date: `${pick('year')}-${pick('month')}-${pick('day')}`,
       minutes: Number(pick('hour')) * 60 + Number(pick('minute')),
-      time_zone: timeZone,
+      // GET /api/today serves this to every member. The config's timezone keys
+      // are not on the /api/config allow-list (#172), so serve Intl's canonical
+      // name for the zone it accepted, never the config's own spelling.
+      time_zone: formatter.resolvedOptions().timeZone,
     };
   } catch {
     return {
@@ -1254,9 +1328,12 @@ function registerRoutes({ app, db, config, raw, fetchImpl, mediaDir, authRequire
   app.get('/api/hermes/status', authRequired, (_req, res) => {
     const issues = db.prepare("SELECT COUNT(*) AS count FROM trip_quality_issues WHERE status = 'open'").get().count;
     res.json({
+      // authRequired: every member reads this. The name comes through the same
+      // allow-list as GET /api/config (#172); `profile` is not served at all —
+      // it is an internal Hermes identifier (the `hermes:<profile>` shape #156
+      // was about), no client reads it, and no producer writes it.
       identity: {
-        name: config.agent?.name || 'Hermes',
-        profile: config.agent?.profile || null,
+        name: projectAgent(config.agent)?.name || 'Hermes',
       },
       available: Boolean(process.env.HERMES_URL || process.env.HERMES_API_KEY),
       ask_in_telegram: Boolean(process.env.TELEGRAM_BOT_USERNAME),
