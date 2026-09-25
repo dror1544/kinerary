@@ -79,6 +79,8 @@ export const PORTS = {
   planSingleSourceBoot:    38120,
   itineraryPlanLayerServer: 38118,
   configDayLinksServer:    38114,
+  configAllowList:         38126,  // tests/config-allow-list.test.js — hostile config, issue #172
+  configAllowListPromote:  38127,  // tests/config-allow-list.test.js — malformed plan config, issue #172
   // tests/trip-documents.test.js
   tripDocuments:           38299,
 
