@@ -768,8 +768,16 @@ function comparableAnswer(value: unknown): string | null {
  * replaces what an earlier part stated. A dated list comes back in date order,
  * because the parts arrive in the order they were read, not the order of the trip.
  */
-export function mergeStructuredParts(parts: readonly unknown[], options: { people?: boolean } = {}): unknown {
+export function mergeOptionsFor(questionId: string): { people: boolean; visits: boolean } {
+  return { people: questionId === "travelers", visits: questionId === "phases" };
+}
+
+export function mergeStructuredParts(parts: readonly unknown[], options: { people?: boolean; visits?: boolean } = {}): unknown {
   return mergeParts(parts, options);
+}
+
+function withoutVisitMarker(p: ProposedAnswer): ProposedAnswer {
+  return p.value.kind === "structured" ? { ...p, value: { ...p.value, data: stripVisitMarkers(p.value.data) } } : p;
 }
 
 /** The one-for-one mapping onto `validateAnswer`'s parameter list. */
@@ -813,12 +821,21 @@ export function applyProposals(
    * names one traveller and means six, not one; "we're also going to Naxos" adds
    * a stop. Anything else replaces, which is what a corrected date or name means.
    */
-  const corrected = (answer: IntakeAnswer, questionId: string): IntakeAnswer => {
+  const corrected = (answer: IntakeAnswer, proposal: ProposedAnswer): IntakeAnswer => {
+    const questionId = proposal.questionId;
     const existing = ctx.answers?.[questionId];
-    if (answer.kind !== "structured") return answer;
-    // The additional-visit marker steers the merge and is never stored.
-    if (existing?.kind !== "structured") return { ...answer, data: stripVisitMarkers(answer.data) };
-    return { ...answer, data: stripVisitMarkers(mergeStructuredParts([existing.data, answer.data])) };
+    if (answer.kind !== "structured" || existing?.kind !== "structured" || proposal.value.kind !== "structured") {
+      return answer;
+    }
+    // Merged from the RAW proposal, not the validated answer: `validateAnswer`
+    // strips the additional-visit marker, which is what this merge reads. The
+    // merged list is then put through the same gate, so its rules and its
+    // marker-stripping still apply.
+    const mergedData = mergeStructuredParts([existing.data, proposal.value.data], mergeOptionsFor(questionId));
+    const again = validateProposed({ ...proposal, value: { kind: "structured", data: mergedData } }, questions);
+    return again.ok && again.answer.kind === "structured"
+      ? again.answer
+      : { ...answer, data: stripVisitMarkers(mergedData) };
   };
 
   const accepted: AcceptedProposal[] = [];
@@ -860,7 +877,9 @@ export function applyProposals(
     if (usable.length === 0) return;
     const ordered = [...usable].sort((a, b) => b.confidence - a.confidence);
     const candidates = ordered.length > 1 ? [mergedProposal(ordered), ordered[0]!] : [ordered[0]!];
-    for (const candidate of candidates) {
+    for (const raw of candidates) {
+      // The additional-visit marker steers a merge and is never offered or kept.
+      const candidate = withoutVisitMarker(raw);
       const validated = validateProposed(candidate, questions);
       if (validated.ok) {
         suggested.push({ questionId: candidate.questionId, answer: validated.answer, proposal: candidate });
@@ -972,7 +991,7 @@ export function applyProposals(
     // stays and the disagreement is kept — it used to be dropped without a trace.
     // Travellers are people: the same person printed "BARAK, NOA" by one
     // ticket and "Noa Barak" by another is one entry, not two (answer-merge.ts).
-    const merging = { people: questionId === "travelers" };
+    const merging = mergeOptionsFor(questionId);
     let combined = mergeStructuredParts([dataOf(primary)], merging);
     for (const later of ordered.slice(1)) {
       const step = reconcileStructured(combined, dataOf(later), merging);
@@ -1019,7 +1038,7 @@ export function applyProposals(
     if (validated.ok) {
       accepted.push({
         questionId,
-        answer: corrected(validated.answer, questionId),
+        answer: corrected(validated.answer, merged),
         proposal: merged,
         ...(ordered.length > 1 ? { mergedFrom: ordered.length } : {}),
         ...(reconciled ? { reconciled } : {}),
@@ -1040,7 +1059,7 @@ export function applyProposals(
     for (const other of ordered.slice(1)) reject(other, "DUPLICATE_PROPOSAL", why);
     const alone = validateProposed(primary, questions);
     if (!alone.ok) return reject(primary, alone.reason, alone.detail);
-    accepted.push({ questionId, answer: corrected(alone.answer, questionId), proposal: primary, correction: correcting(primary) });
+    accepted.push({ questionId, answer: corrected(alone.answer, primary), proposal: primary, correction: correcting(primary) });
   };
 
   proposals.forEach((proposal, i) => {
@@ -1090,7 +1109,7 @@ export function applyProposals(
 
     const validated = validateProposed(proposal, questions);
     if (!validated.ok) return reject(proposal, validated.reason, validated.detail);
-    accepted.push({ questionId: proposal.questionId, answer: corrected(validated.answer, proposal.questionId), proposal, correction: correcting(proposal) });
+    accepted.push({ questionId: proposal.questionId, answer: corrected(validated.answer, proposal), proposal, correction: correcting(proposal) });
   });
 
   // Anything the model was unsure of, and anything we refused, is a question
@@ -1121,6 +1140,18 @@ export interface SubmitArgs {
  * an answer reaches storage, which is the property that made the gate above
  * cheap to trust in the first place.
  */
+/**
+ * What to WRITE for an accepted typed proposal. For a structured answer that is
+ * the merged, gated answer — a typed proposal carries only what is ADDED, and
+ * the write replaces the stored answer wholesale, so writing the raw proposal
+ * lost every held entry it did not repeat (#205). Anything else is the
+ * proposal's own value.
+ */
+export function submitArgsForAccepted(accepted: { answer: IntakeAnswer; proposal: ProposedAnswer }): SubmitArgs {
+  const args = submitArgsFor(accepted.proposal.value);
+  return accepted.answer.kind === "structured" ? { ...args, structuredData: accepted.answer.data } : args;
+}
+
 export function submitArgsFor(value: ProposedValue): SubmitArgs {
   switch (value.kind) {
     case "choice":

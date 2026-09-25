@@ -102,6 +102,7 @@ import {
   recordInterpretationResult,
   storedOutcomes,
   submitArgsFor,
+  submitArgsForAccepted,
   type BoundaryIntent,
   type ProposedAnswer,
   type InterpretPayload,
@@ -2520,7 +2521,8 @@ async function runInterpretPath(
   });
 
   for (const accepted of decisions.accepted) {
-    const args = submitArgsFor(accepted.proposal.value);
+    // The MERGED answer, not the raw reading — see `submitArgsForAccepted`.
+    const args = submitArgsForAccepted(accepted);
     const written = await submitAnswerForChat(
       deps.db,
       burst.chatId,

@@ -123,6 +123,13 @@ export interface MergeOptions {
    * names — see `samePerson` — rather than as place or booking names.
    */
   people?: boolean;
+  /**
+   * The list holds STOPS (`phases`), so an entry marked `additional_visit` is a
+   * second visit rather than the dates of a stop already held. Off for every
+   * other list: a spurious marker on a traveller, a hotel or an attraction is
+   * ignored, never a reason to duplicate the entry.
+   */
+  visits?: boolean;
 }
 
 /** Titles and passenger codes travel documents print beside a name. */
@@ -267,7 +274,7 @@ export function matchEntry(
   const candidates: number[] = [];
   // A marked entry is a second visit unless a held entry is DATED and is that
   // very visit: an undated held stop is the first visit, never this one.
-  const additional = isAdditionalVisit(incoming);
+  const additional = options.visits === true && isAdditionalVisit(incoming);
   const visitAgrees = (a: Record<string, unknown>, b: Record<string, unknown>) =>
     additional ? startOf(a) !== null && startOf(b) !== null && sameVisit(a, b) : sameVisit(a, b);
 

@@ -21,7 +21,7 @@ import {
 } from "./intake-copy.js";
 import { structuredLog } from "./redaction.js";
 import { listTripDocuments } from "./document-registry.js";
-import { canonical, entryIdentity } from "./answer-merge.js";
+import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
 import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
 
 /**
@@ -1086,7 +1086,9 @@ export function validateAnswer(
     // The one gate every path goes through — the model, the agent, a document
     // and a typed answer all arrive here — so a rule enforced at this point
     // cannot be bypassed by the route that produced the data.
-    const cleaned = question.sanitize ? question.sanitize(structuredData) : structuredData;
+    // The interpreter's additional-visit marker steers a merge and is never
+    // stored, whichever path proposed it.
+    const cleaned = stripVisitMarkers(question.sanitize ? question.sanitize(structuredData) : structuredData);
     return { ok: true, answer: { kind: "structured", schema_version: INTAKE_SCHEMA_VERSION, data: cleaned } };
   }
 

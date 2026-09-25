@@ -195,7 +195,7 @@ describe("a return leg to a city already held without dates (#114)", () => {
   const returnDates = { start: "2026-09-30", end: "2026-10-03" };
 
   test("marked as an additional visit, it is a second Tokyo and the first stays undated", () => {
-    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }], { visits: true });
     const tokyos = (out.merged as { name: string; start?: string }[]).filter((e) => e.name === "Tokyo");
     assert.equal(tokyos.length, 2, "two Tokyo stops");
     assert.equal(tokyos.filter((e) => e.start === undefined).length, 1, "the first is still undated");
@@ -206,13 +206,13 @@ describe("a return leg to a city already held without dates (#114)", () => {
   });
 
   test("the marker is removed by stripVisitMarkers", () => {
-    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }], { visits: true });
     assert.doesNotMatch(JSON.stringify(stripVisitMarkers(out.merged)), /additional_visit/);
   });
 
   test("the same marked visit said twice is one visit, not two", () => {
-    const once = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
-    const again = reconcileStructured(once.merged, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    const once = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }], { visits: true });
+    const again = reconcileStructured(once.merged, [{ name: "Tokyo", ...returnDates, additional_visit: true }], { visits: true });
     assert.equal((again.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 2);
   });
 
@@ -220,6 +220,7 @@ describe("a return leg to a city already held without dates (#114)", () => {
     const out = reconcileStructured(
       [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-24" }],
       [{ name: "Tokyo", ...returnDates, additional_visit: true }],
+      { visits: true },
     );
     assert.equal((out.merged as unknown[]).length, 2);
   });
@@ -239,5 +240,14 @@ describe("a return leg to a city already held without dates (#114)", () => {
       [{ name: "Tokyo", ...returnDates }],
     );
     assert.equal((out.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 2);
+  });
+
+  test("with the flag off (any list but stops) the marker is ignored — matched as if absent — and still strippable", () => {
+    const people = [{ name: "Avi Cohen" }];
+    const out = reconcileStructured(people, [{ name: "Avi Cohen", age: 41, additional_visit: true }], { people: true });
+    assert.equal((out.merged as unknown[]).length, 1, "one Avi, not two");
+    assert.doesNotMatch(JSON.stringify(out.merged), /additional_visit/, "and the marker is not filled onto the held entry");
+    const stops = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    assert.equal((stops.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 1, "no flag, no second visit");
   });
 });

@@ -10,6 +10,7 @@ import {
   extractIntakeFromDocument,
   interpretBurst,
   parseInterpretPayload,
+  submitArgsForAccepted,
   storedOutcomes,
   submitArgsFor,
   buildExtractIntakePrompt,
@@ -20,7 +21,7 @@ import {
   type ProposedAnswer,
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
-import { INTAKE_QUESTIONS, buildRecap, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
+import { INTAKE_QUESTIONS, buildRecap, partitionQuestions, validateAnswer, type IntakeQuestion } from "../src/interview.js";
 import { documentText, htmlToText, looksLikeIdentityDocument } from "../src/document-text.js";
 
 // A small question set standing in for INTAKE_QUESTIONS, so these tests say
@@ -1490,5 +1491,34 @@ describe("a return leg said in a typed message (#114)", () => {
   test("the conversational prompt teaches the marker", () => {
     const p = buildInterpretPrompt({ language: "en", outstanding: ["phases"], sourceText: "x", questions: STOPS_Q });
     assert.match(p, /additional_visit/);
+  });
+
+  test("a hesitant read is offered as a suggestion without the marker", () => {
+    const parsed = parseInterpretPayload({
+      proposals: [{
+        questionId: "phases", confidence: 0.4, evidence: "Tokyo again, 30 September to 3 October",
+        value: { kind: "structured", dataJson: JSON.stringify([{ name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true }]) },
+      }],
+      unclear: [],
+    }, ["101"])!;
+    const d = applyProposals(parsed.proposals, {
+      sourceText: "Tokyo again, 30 September to 3 October", outstanding: ["phases"], answered: [], questions: STOPS_Q,
+    } as never);
+    assert.equal(d.suggested.length, 1);
+    assert.doesNotMatch(JSON.stringify(d.suggested[0]), /additional_visit/);
+  });
+
+  test("submitArgsForAccepted writes the merged answer for a list, and the proposal's own value otherwise", () => {
+    const text = "another three days at the end for Tokyo, 30 September to 3 October";
+    const d = decide(text, { name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true });
+    const args = submitArgsForAccepted(d.accepted[0]!);
+    assert.equal((args.structuredData as unknown[]).length, 4, "the three held stops plus the new one");
+    assert.doesNotMatch(JSON.stringify(args), /additional_visit/);
+  });
+
+  test("validateAnswer strips the marker whatever path proposed the data", () => {
+    const v = validateAnswer("phases", null, null, STOPS_Q, [{ name: "Tokyo", additional_visit: true }]);
+    assert.ok(v.ok);
+    assert.doesNotMatch(JSON.stringify(v), /additional_visit/);
   });
 });
