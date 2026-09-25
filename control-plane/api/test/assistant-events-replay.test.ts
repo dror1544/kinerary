@@ -43,7 +43,8 @@ import {
 } from "../src/analytics/emitter.js";
 import { rollupAssistantEvents } from "../src/analytics/store.js";
 import { RelayConnector } from "../src/relay/connector.js";
-import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
+import { dispatchUpdate, DEFAULT_STRINGS, OutageNoticeLimiter } from "../src/relay/dispatch.js";
+import { uiString } from "../src/intake-copy.js";
 import { GroupContext } from "../src/relay/group-context.js";
 import { MediaStore } from "../src/relay/media-store.js";
 import type { TelegramMessage, TelegramUpdate } from "../src/relay/normalize.js";
@@ -222,6 +223,14 @@ async function withTrip(fn: (pool: pg.Pool, tripId: string) => Promise<void>): P
       "INSERT INTO control_plane.trip_memberships(id, trip_id, user_id, role, status) VALUES ($1, $2, $3, 'owner', 'active')",
       [id("memb"), tripId, userId],
     );
+    // The week is a trip whose assistant has been up: the organizer was told so.
+    // Without this the router treats an unreachable companion as a first install.
+    await pool.query(
+      `INSERT INTO control_plane.notification_outbox
+         (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state, sent_at)
+       VALUES ($1, $2, 'companion_ready', $3, '{}'::jsonb, NULL, 'companion_ready', 'provisioner', 'sent', now())`,
+      [id("nob"), tripId, ORGANIZER_ID],
+    );
     // A CONFIRMED trip: the organizer's DM is its interview chat.
     const enrollment = await issueEnrollment(pool, userId, tripId, { enrollmentTtlSeconds: 3600 });
     assert.ok(enrollment.ok);
@@ -319,6 +328,9 @@ async function playWeek(pool: pg.Pool, tripId: string, events: RelayAssistantEve
     log,
     ...(events ? { assistantEvents: events } : {}),
   };
+  // One window per replayed week: the relay's own is per process, and three
+  // tests replay the same chat within one.
+  const outageNotices = new OutageNoticeLimiter();
   /** One update, the way the poll loop handles it (startTripBotPoller's options). */
   const route = async (update: TelegramUpdate) => {
     const decision = await dispatchUpdate(pool, update, DEFAULT_STRINGS, log, BOT, {
@@ -326,6 +338,7 @@ async function playWeek(pool: pg.Pool, tripId: string, events: RelayAssistantEve
       pendingAttachments,
       groupContext,
       modelRunner: runner,
+      outageNotices,
       ...(deps.assistantEvents ? { assistantEvents: true } : {}),
       canReachProfile: (profile: string) => connector.canReachProfile(profile),
     });
@@ -339,9 +352,9 @@ async function playWeek(pool: pg.Pool, tripId: string, events: RelayAssistantEve
     // ── Monday, the organizer's DM: four documents, every read failing ──────
     //
     // These enter at applyDecision, as document-correction-flow.test.ts does,
-    // because at 4769a3f `dispatchUpdate` cannot produce a `document_correction`
-    // decision: it asks organizerDocumentRoute before any media is attached,
-    // so `hasMedia` is always false (reported on #177 as outside this brief).
+    // with a hand-built `document_correction` decision, so the replay controls
+    // exactly which documents are read. Since #178 `dispatchUpdate` can produce
+    // that decision itself (covered in document-correction-flow.test.ts).
     // The descriptor is built by the same `inboundFacts` dispatch uses.
     clock.ms = DM_MORNING;
     const session = await pool.query<{ id: string }>(
@@ -496,7 +509,7 @@ describe("the week, replayed through the relay", () => {
         { trigger_type: "not_addressed", n: 6 },
         { trigger_type: "reply_to_bot", n: 1 },
       ]);
-      assert.ok(world.telegram.sent.some((m) => m.text === DEFAULT_STRINGS.companionPending), "the lost turn was answered honestly");
+      assert.ok(world.telegram.sent.some((m) => m.text === uiString("companionUnavailable", "en")), "the lost turn was answered with the generic outage line");
     });
   });
 
@@ -629,6 +642,8 @@ describe("the week, replayed through the relay", () => {
       // Unreachable companion: the router's own answer, same either way.
       const down = (on: boolean) => dispatchUpdate(pool, groupMessage(ORGANIZER_ID, { text: WHILE_DOWN }), DEFAULT_STRINGS, () => {}, BOT, {
         canReachProfile: () => false,
+        // A fresh window per call: the same message twice must be answered twice here.
+        outageNotices: new OutageNoticeLimiter(),
         ...(on ? { assistantEvents: true } : {}),
       });
       const off = await down(false);
@@ -659,6 +674,7 @@ describe("the week, replayed through the relay", () => {
           pendingAttachments: new PendingAttachments(),
           groupContext: new GroupContext(),
           canReachProfile: () => reachable,
+          outageNotices: new OutageNoticeLimiter(),
           ...(on ? { assistantEvents: true } : {}),
         });
         const off = await decide(pool, false);

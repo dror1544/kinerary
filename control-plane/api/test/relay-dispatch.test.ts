@@ -11,7 +11,8 @@ import {
   CONFIRM_CALLBACK_DATA,
   setCompanionExpectsReply,
 } from "../src/chat-router.js";
-import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
+import { dispatchUpdate, DEFAULT_STRINGS, OutageNoticeLimiter } from "../src/relay/dispatch.js";
+import { uiString } from "../src/intake-copy.js";
 import { GroupContext } from "../src/relay/group-context.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
@@ -1189,6 +1190,163 @@ describe("overheard group context (R11)", { skip: SKIP }, () => {
       assert.deepEqual(next, { kind: "ignore", reason: "NOT_ADDRESSED" },
         "one-shot still means one-shot — context does not extend it");
       assert.equal(ctx.take(chatId).length, 1, "the ignored one was retained instead");
+    });
+  });
+});
+
+// #179 (core): an EXISTING companion that is unreachable (gateway stopped or
+// restarting) is an outage, not a first install. The family group is not told
+// about it unless it addresses the assistant, and then only once in a while.
+describe("dispatchUpdate — a companion that is down", () => {
+  const BOT = { username: "KineraryTestBot", id: "7000000001" };
+  const GROUP = "-1008880001";
+  const down = { canReachProfile: () => false };
+
+  function groupMsg(text: string, extra: Record<string, unknown> = {}): TelegramUpdate {
+    return {
+      update_id: 2,
+      message: {
+        message_id: 11,
+        from: { id: 555, first_name: "Noa" },
+        chat: { id: GROUP, type: "supergroup" },
+        text,
+        ...extra,
+      },
+    } as TelegramUpdate;
+  }
+
+  /** A companion the organizer was told is up (its `companion_ready` message was delivered). */
+  async function announceCompanion(fix: Fixture): Promise<void> {
+    await fix.pool.query(
+      `INSERT INTO control_plane.notification_outbox
+         (id, trip_id, kind, recipient, payload, signup_request_id, notification_type, adapter, state, sent_at)
+       VALUES ('nob_' || md5(random()::text), $1, 'companion_ready', '700000000', '{}'::jsonb, NULL, 'companion_ready', 'provisioner', 'sent', now())`,
+      [fix.tripId],
+    );
+  }
+
+  async function bindDown(fix: Fixture, chatId: string, language = "en"): Promise<void> {
+    await announceCompanion(fix);
+    await bindCompanion(fix, chatId, "companion-down");
+    await fix.pool.query(
+      "UPDATE control_plane.trips SET assistant_names = $2, companion_intro = $3 WHERE id = $1",
+      [fix.tripId, ["Rio"], JSON.stringify({ assistant_name: "Rio", language })],
+    );
+  }
+
+  const answered = (d: { kind: string }) => d.kind === "reply";
+
+  test("an unaddressed group message gets no reply at all", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, GROUP);
+      const limiter = new OutageNoticeLimiter();
+      const d = await dispatchUpdate(fix.pool, groupMsg("what time is dinner?"), undefined, () => {}, BOT, { ...down, outageNotices: limiter });
+      assert.equal(d.kind, "ignore");
+      assert.equal(d.kind === "ignore" && d.reason, "NOT_ADDRESSED");
+    });
+  });
+
+  test("addressed by name, by @mention or by replying: one generic line, then nothing inside the window", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, GROUP);
+      const limiter = new OutageNoticeLimiter();
+      const opts = { ...down, outageNotices: limiter };
+      const first = await dispatchUpdate(fix.pool, groupMsg("Rio, what time is dinner?"), undefined, () => {}, BOT, opts);
+      assert.equal(first.kind === "reply" && first.reply.text, uiString("companionUnavailable", "en"));
+      assert.doesNotMatch(first.kind === "reply" ? first.reply.text : "", /finishing/i);
+      const second = await dispatchUpdate(fix.pool, groupMsg("@KineraryTestBot hello?"), undefined, () => {}, BOT, opts);
+      assert.equal(answered(second), false, "a second addressed message inside the window is not answered");
+      assert.equal(second.kind === "ignore" && second.reason, "COMPANION_UNAVAILABLE_NOTICE_LIMITED");
+      const third = await dispatchUpdate(
+        fix.pool,
+        groupMsg("and now?", { reply_to_message: { message_id: 3, from: { id: 7000000001, is_bot: true } } }),
+        undefined, () => {}, BOT, opts,
+      );
+      assert.equal(answered(third), false);
+      // Another chat has its own window, and a later time re-opens this one.
+      let clock = 0;
+      const timed = new OutageNoticeLimiter({ now: () => clock });
+      assert.equal(timed.allow(GROUP), true);
+      assert.equal(timed.allow(GROUP), false);
+      clock += 10 * 60 * 1000 + 1;
+      assert.equal(timed.allow(GROUP), true);
+      assert.equal(timed.allow("other-chat"), true);
+    });
+  });
+
+  test("addressed by @mention or by reply alone gets the line too", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, GROUP);
+      const mention = await dispatchUpdate(fix.pool, groupMsg("@KineraryTestBot hello?"), undefined, () => {}, BOT, { ...down, outageNotices: new OutageNoticeLimiter() });
+      assert.equal(answered(mention), true);
+      const replied = await dispatchUpdate(
+        fix.pool,
+        groupMsg("and now?", { reply_to_message: { message_id: 3, from: { id: 7000000001, is_bot: true } } }),
+        undefined, () => {}, BOT, { ...down, outageNotices: new OutageNoticeLimiter() },
+      );
+      assert.equal(answered(replied), true);
+    });
+  });
+
+  test("a DM is still answered, with the generic wording, every time", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, "700000888");
+      const opts = { ...down, outageNotices: new OutageNoticeLimiter() };
+      for (let i = 0; i < 2; i += 1) {
+        const d = await dispatchUpdate(fix.pool, msg("700000888", "מתי הטיסה?"), undefined, () => {}, BOT, opts);
+        assert.equal(d.kind === "reply" && d.reply.text, uiString("companionUnavailable", "en"));
+      }
+    });
+  });
+
+  test("the generic line has a Hebrew form, chosen by the trip's language", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, "700000889", "he");
+      const d = await dispatchUpdate(fix.pool, msg("700000889", "שלום"), undefined, () => {}, BOT, { ...down, outageNotices: new OutageNoticeLimiter() });
+      assert.equal(d.kind === "reply" && d.reply.text, uiString("companionUnavailable", "he"));
+      assert.notEqual(uiString("companionUnavailable", "he"), uiString("companionUnavailable", "en"));
+    });
+  });
+
+  test("first install keeps its honest wording, in a DM and in a group, addressed or not", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, GROUP, null);
+      const opts = { ...down, outageNotices: new OutageNoticeLimiter() };
+      const g = await dispatchUpdate(fix.pool, groupMsg("what time is dinner?"), undefined, () => {}, BOT, opts);
+      assert.equal(g.kind === "reply" && g.reply.text, DEFAULT_STRINGS.companionPending);
+      await bindCompanion(fix, "700000890", null);
+      const dm = await dispatchUpdate(fix.pool, msg("700000890", "hi"), undefined, () => {}, BOT, opts);
+      assert.equal(dm.kind === "reply" && dm.reply.text, DEFAULT_STRINGS.companionPending);
+    });
+  });
+
+  test("a profile stamped but never announced up keeps the honest wording: DM, group addressed, group unaddressed", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindCompanion(fix, GROUP, "companion-new");
+      await bindCompanion(fix, "700000891", "companion-new");
+      await fix.pool.query("UPDATE control_plane.trips SET assistant_names = $2 WHERE id = $1", [fix.tripId, ["Rio"]]);
+      const opts = { ...down, outageNotices: new OutageNoticeLimiter() };
+      const cases: [string, TelegramUpdate][] = [
+        ["DM", msg("700000891", "hi")],
+        ["group, addressed", groupMsg("Rio, dinner?")],
+        ["group, unaddressed", groupMsg("what time is dinner?")],
+      ];
+      for (const [label, update] of cases) {
+        const d = await dispatchUpdate(fix.pool, update, undefined, () => {}, BOT, opts);
+        assert.equal(d.kind === "reply" && d.reply.text, DEFAULT_STRINGS.companionPending, label);
+      }
+    });
+  });
+
+  test("an unaddressed group message during an outage is still counted as chatter; an addressed one as a lost turn", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      await bindDown(fix, GROUP);
+      const opts = { ...down, outageNotices: new OutageNoticeLimiter(), assistantEvents: true };
+      const quiet = await dispatchUpdate(fix.pool, groupMsg("what time is dinner?"), undefined, () => {}, BOT, opts);
+      assert.equal(quiet.kind, "ignore");
+      assert.equal(quiet.kind === "ignore" && quiet.analytics?.triggerType, "not_addressed");
+      const lost = await dispatchUpdate(fix.pool, groupMsg("Rio, dinner?"), undefined, () => {}, BOT, opts);
+      assert.equal(lost.kind === "reply" && lost.analytics !== undefined, true);
     });
   });
 });

@@ -92,6 +92,7 @@ class Recorder {
   async sendChatAction() {}
   async getChatInfo() { return null; }
   async getMe() { return { id: "7000000001", username: "KineraryTestBot" }; }
+  async fetchFile(_fileId: string, _max: number) { return { bytes: Buffer.from("Tokyo 2026-09-19 to 2026-09-23\n", "utf8"), mime: "text/plain" }; }
   async getUpdates() { return []; }
   async deleteWebhookIfPresent() {}
 }
@@ -214,6 +215,22 @@ async function tap(trip: Trip, data: string, fromId = Number(CHAT)): Promise<voi
   await applyDecision(decision, trip.deps);
 }
 
+const BOT = { username: "KineraryTestBot", id: "7000000001" };
+
+/** A Telegram document message, as the poller hands it to dispatchUpdate. */
+function documentUpdate(chatId: string, chatType: string, fromId: string, caption?: string): TelegramUpdate {
+  return {
+    update_id: 21,
+    message: {
+      message_id: 31,
+      from: { id: Number(fromId), first_name: "Sender" },
+      chat: { id: chatId, type: chatType },
+      document: { file_id: "file_synthetic_1", file_name: "voucher.txt", mime_type: "text/plain" },
+      ...(caption ? { caption } : {}),
+    },
+  } as TelegramUpdate;
+}
+
 const count = async (pool: pg.Pool, sql: string, params: unknown[]) => Number((await pool.query<{ n: number }>(sql, params)).rows[0]?.n ?? 0);
 const lastButtons = (trip: Trip) => [...trip.telegram.sent].reverse().find((m) => m.buttons.length > 0)?.buttons ?? [];
 
@@ -329,6 +346,48 @@ describe("documents after confirmation", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
       assert.ok(await organizerDocumentRoute(trip.pool, { ...base, mediaKinds: ["image"], canReadImages: true }));
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, hasRunner: false }), null, "no model: the old route");
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, chatId: "880000777", fromId: "880000777" }), null, "not the confirmed chat");
+    });
+  });
+
+  // #178: the hop `organizerDocumentRoute`'s own test above cannot cover. The
+  // route decision used to read `event.media_urls`, which nothing has attached
+  // yet at that point, so a confirmed organizer's document never took it.
+  test("dispatch: the confirmed organizer's private-chat document is read by the relay, with its file attached", async () => {
+    await withConfirmedTrip(async (trip) => {
+      const decision = await dispatchUpdate(
+        trip.pool, documentUpdate(CHAT, "private", CHAT), undefined, () => {}, BOT,
+        { modelRunner: trip.runner, media: (trip.deps as { media: never }).media },
+      );
+      assert.equal(decision.kind, "document_correction");
+      if (decision.kind !== "document_correction") return;
+      assert.equal(decision.sessionId, trip.sessionId);
+      assert.equal(decision.event.media_urls?.length, 1, "the decision carries the re-hosted file the reader needs");
+      assert.equal(decision.event.media?.[0]?.kind, "document");
+    });
+  });
+
+  test("dispatch: a group member's document, and an unconfirmed sender's, keep the companion route", async () => {
+    await withConfirmedTrip(async (trip) => {
+      const options = { modelRunner: trip.runner, media: (trip.deps as { media: never }).media };
+      // A family group bound to the same trip; the organizer's id sends, addressing the assistant.
+      await trip.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, '-1009990001', $2, 'companion-test')",
+        [id("tcb"), trip.tripId],
+      );
+      const inGroup = await dispatchUpdate(
+        trip.pool, documentUpdate("-1009990001", "supergroup", CHAT, "@KineraryTestBot look"), undefined, () => {}, BOT, options,
+      );
+      assert.equal(inGroup.kind, "to_gateway", "a group's file is never the relay's to read");
+
+      // A private chat bound to the trip that is NOT the confirmed interview chat.
+      await trip.pool.query(
+        "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, '880000502', $2, 'companion-test')",
+        [id("tcb"), trip.tripId],
+      );
+      const stranger = await dispatchUpdate(
+        trip.pool, documentUpdate("880000502", "private", "880000502"), undefined, () => {}, BOT, options,
+      );
+      assert.equal(stranger.kind, "to_gateway", "an unconfirmed sender keeps the companion route");
     });
   });
 });

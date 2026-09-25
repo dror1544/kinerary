@@ -347,6 +347,9 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // Typed a command mid-interview. Router-owned like every other command:
     // the interview is a conversation with buttons, and the runtime's own
     // slash surface is not part of it — see companionHelpText.
+    // A trip's EXISTING assistant is unreachable (stopped or restarting) — not the
+    // first-install wording, and no promise of a time.
+    companionUnavailable: "I'm off for now — hoping to be back soon.",
     notMyCommand: "That isn't one of my commands — just answer in the chat, or use the buttons.",
     // THE FIRST THING ANYONE SEES.
     //
@@ -634,6 +637,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     skipOptional: "⤼ דלג",
     documentOffer: "לפני שנתחיל בפרטים — אם כבר יש לכם תוכנית, אישור הזמנה, כרטיסים או גיליון לטיול, שלחו אותו לכאן ואני אקרא אותו במקום שתקלידו הכל.",
     noDocument: "אין לי מסמך",
+    companionUnavailable: "אני לא זמין כרגע — מקווה לחזור בקרוב.",
     notMyCommand: "זו לא פקודה שלי — פשוט ענו כאן בצ'אט, או השתמשו בכפתורים.",
     introduction: [
       "היי 👋 אני עוזר הטיולים שלכם מבית Kinerary.",
