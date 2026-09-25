@@ -23,7 +23,7 @@ const fetch = require('node-fetch');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE } = require('./oauth');
-const { renderAuthorizePage, renderErrorPage } = require('./authorize-page');
+const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { registerTools, buildInstructions } = require('./tools');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
@@ -344,6 +344,14 @@ function registerTripMcp({
     }
   });
   app.options('/mcp', cors);
+  // A person who opens the address in a browser (or lands on /modern/mcp,
+  // because the site sends browsers to /modern/) gets an explanation instead
+  // of a raw error. Only for requests asking for HTML; clients get the 405.
+  app.get(['/mcp', '/modern/mcp'], (req, res, next) => {
+    if (req.accepts(['json', 'html']) !== 'html') return next();
+    res.set('Cache-Control', 'no-store');
+    res.type('html').send(renderConnectorInfoPage({ url: mcpUrl, lang: browserLang(req) }));
+  });
   app.all('/mcp', cors, (_req, res) => res.status(405).set('Allow', 'POST').json({ error: 'method_not_allowed' }));
 
   // ── The organizer's view of connected assistants ───────────────────────────

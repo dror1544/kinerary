@@ -85,6 +85,18 @@ describe('trip MCP — an organizer connects an assistant', () => {
     assert.match(r.headers.get('www-authenticate'), new RegExp(`resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`));
   });
 
+  it('explains itself to a person who opens the address in a browser', async () => {
+    for (const path of ['/mcp', '/modern/mcp']) {
+      const r = await fetch(base + path, { headers: { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' } });
+      assert.equal(r.status, 200, path);
+      const html = await r.text();
+      assert.match(html, /Claude/);
+      assert.ok(html.includes(`${base}/mcp`), path);
+      assert.doesNotMatch(html, /Test Trip 2027/, 'no trip data before sign-in');
+    }
+    assert.equal((await fetch(base + '/mcp', { headers: { accept: 'application/json' } })).status, 405, 'a client still gets the protocol answer');
+  });
+
   it('publishes resource and authorization-server metadata for this trip', async () => {
     const pr = await (await fetch(base + '/.well-known/oauth-protected-resource/mcp')).json();
     assert.equal(pr.resource, `${base}/mcp`);

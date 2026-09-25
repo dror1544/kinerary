@@ -181,4 +181,32 @@ function renderErrorPage(message) {
 <body style="font:16px/1.5 system-ui,sans-serif;padding:24px;max-width:480px;margin:auto"><h1 style="font-size:1.2rem">This connection request cannot be completed</h1><p>${escapeHtml(message)}</p></body></html>`;
 }
 
-module.exports = { renderAuthorizePage, renderErrorPage };
+// What a person sees on opening the connector address in a browser. It is an
+// address for Claude or ChatGPT, not a page — say so, and say where it goes.
+// Nothing from the trip is shown: this is served without sign-in.
+function renderConnectorInfoPage({ url, lang }) {
+  const he = lang === 'he';
+  const t = he ? {
+    title: 'כתובת לחיבור עוזר AI',
+    lead: 'זו לא כתובת לדפדפן. זו הכתובת שמדביקים ב-Claude או ב-ChatGPT כדי לחבר אותם לטיול:',
+    claude: 'Claude: הגדרות ← מחברים ← הוספת מחבר מותאם.',
+    chatgpt: 'ChatGPT: הגדרות ← אפליקציות ומחברים ← יצירה, ובחרו OAuth.',
+    then: 'ייפתח דף מהאתר; התחברו עם חשבון הטיול ואשרו.',
+  } : {
+    title: 'AI assistant connector address',
+    lead: 'This is not a web page. It is the address you paste into Claude or ChatGPT to connect them to this trip:',
+    claude: 'Claude: Settings → Connectors → Add custom connector.',
+    chatgpt: 'ChatGPT: Settings → Apps & Connectors → Create, and choose OAuth.',
+    then: 'A page from this site opens; sign in with your trip account and allow.',
+  };
+  return `<!doctype html><html lang="${he ? 'he' : 'en'}" dir="${he ? 'rtl' : 'ltr'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(t.title)}</title></head>
+<body style="font:16px/1.6 system-ui,sans-serif;padding:24px;max-width:520px;margin:auto">
+<h1 style="font-size:1.2rem">${escapeHtml(t.title)}</h1>
+<p>${escapeHtml(t.lead)}</p>
+<p><code dir="ltr" style="display:block;padding:10px;border:1px solid #ccc;border-radius:8px;overflow-wrap:anywhere">${escapeHtml(url)}</code></p>
+<ul><li>${escapeHtml(t.claude)}</li><li>${escapeHtml(t.chatgpt)}</li></ul>
+<p>${escapeHtml(t.then)}</p>
+</body></html>`;
+}
+
+module.exports = { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage };
