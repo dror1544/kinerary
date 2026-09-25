@@ -13,8 +13,9 @@ const livingJourney = require('./living-journey');
 const { createTripEvents } = require('./trip-events');
 const { createControlPlaneAuth } = require('./control-plane-auth');
 const { NEED_TYPES, NEED_SEVERITIES, VISIBILITIES, normalizeSeverity, normalizeVisibility } = require('../shared/needs-schema');
-const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, publicAgent, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
+const { AGENT_TONES, AGENT_GENDERS, PROACTIVE_KEYS, normalizeInstructionVisibility, normalizeTone, normalizeGender, normalizeOrganizers } = require('../shared/agent-schema');
 const { repairDayStamp, stampRest } = require('../shared/day-stamp');
+const { projectConfig, publicConfig, publicPart } = require('../shared/config-visibility');
 
 const app = express();
 // Default (100kb) is too small for /api/bookings/extract, which the browser
@@ -722,34 +723,30 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ── TRIP CONFIG ───────────────────────────────────────────────────────────────
-// Strip PIN codes, organizer-only needs, and organizer-only agent standing
-// instructions before serving to clients — every family member is authed,
-// including kids and one-off guests, so auth alone isn't a safety boundary for
-// any of these fields. Shared by /api/config and /api/config/versions/:version.
+// Every family member is authed, including kids and one-off guests, so auth
+// alone isn't a safety boundary for anything in trip.config.json. Shared by
+// /api/config and /api/config/versions/:version.
+//
+// An ALLOW-list since issue #172: shared/config-visibility.js names every
+// field that may be served; anything it does not name is not. This used to
+// deep-copy the config and delete PINs, telegram_id, organizer-only needs and
+// instructions — so every field added after that, by anyone, was served too.
 function sanitizeConfig(cfg) {
-  const safe = JSON.parse(JSON.stringify(cfg));
-  if (safe.phases) safe.phases.forEach(p => {
-    if (p.accommodation) delete p.accommodation.pin;
-    (p.hotels || []).forEach(h => delete h.pin);
-  });
-  if (safe.bookings?.hotels) safe.bookings.hotels.forEach(h => delete h.pin);
-  if (safe.participants) safe.participants.forEach(p => {
-    // Identity links are server-side authentication material, never trip UI data.
-    delete p.telegram_id;
-    delete p.pin;
-    if (p.needs) {
-      p.needs = p.needs
-        .filter(n => normalizeVisibility(n.visibility, n.type) !== 'organizer')
-        .map(n => ({ ...n, severity: normalizeSeverity(n.severity) }));
-      // An empty array is itself a disclosure: a participant with no `needs`
-      // key looks different from one whose needs were all filtered out, which
-      // tells an unauthenticated reader exactly who has something hidden.
-      if (!p.needs.length) delete p.needs;
-    }
-  });
-  if (safe.agent) safe.agent = publicAgent(safe.agent);
-  return safe;
+  return publicConfig(cfg);
 }
+
+// An allow-list fails the other way: a field the site needs that the list
+// does not name vanishes from the site, and nothing in the page says so. Make
+// that loud, once, at boot. Two audiences, as with the needs warnings above:
+// the server log (organizer-only by definition) gets the PATHS — never values;
+// /api/config/warnings, which every authed member can read, gets a count only,
+// because a key name is itself authored config text.
+(() => {
+  const { dropped } = projectConfig(TRIP_CONFIG);
+  if (!dropped.length) return;
+  console.warn(`trip.config.json: ${dropped.length} field(s) not on the served allow-list (shared/config-visibility.js) — withheld from every client: ${dropped.join(', ')}`);
+  CONFIG_WARNINGS.push({ scope: 'config', issue: `${dropped.length} config field(s) are not on the served allow-list and are withheld from the site (field names in the server log)` });
+})();
 
 app.get('/api/config', authRequired, (_req, res) => {
   const safe = sanitizeConfig(TRIP_CONFIG);
@@ -825,8 +822,13 @@ app.get('/api/currency-rates', authRequired, async (_req, res) => {
 // here — rather than reusing sanitizeConfig() — keeps the public surface
 // obvious at a glance instead of depending on a general-purpose sanitizer
 // that could grow more fields later.
+//
+// The four fields are hand-picked from the ALLOW-LISTED participants, not the
+// raw ones (#172): hand-picking chooses which keys, the allow-list decides what
+// shape a value may have — an object `name` an organizer or agent appended at
+// runtime used to be served whole, to anyone, until the next restart.
 app.get('/api/config/roster', (_req, res) => {
-  const roster = (TRIP_CONFIG.participants || []).map(p => ({
+  const roster = (publicConfig(TRIP_CONFIG).participants || []).map(p => ({
     username: p.username,
     name: p.name,
     name_en: p.name_en,
@@ -3120,6 +3122,14 @@ function stripTags(html) {
     .trim();
 }
 
+// The Hebrew half of a bilingual config text (same rule as living-journey.js):
+// a string is Hebrew, an object gives its `he` — never the object itself, which
+// `text.he ?? text` fell back to, printing "[object Object]".
+function hebrewOf(value) {
+  if (value && typeof value === 'object') return value.he ?? '';
+  return value ?? '';
+}
+
 function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
   const created = [];
   const skipped = [];
@@ -3160,18 +3170,31 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
     "                        THEN 'done' ELSE phase_plan_days.enrichment_status END"
   );
 
-  for (const phase of (TRIP_CONFIG.phases || [])) {
-    (phase.days || []).forEach((day, di) => {
+  // This import is the ACTIVE plan every member reads on a fresh trip (boot:
+  // importPlanOnce → here → syncFromLegacy), so it reads the config the way
+  // /api/config serves it (#172). It iterates the RAW lists, so a day's and an
+  // item's position — which config_ref and sort_order are built from — never
+  // shifts, and reads every VALUE from that element projected through the
+  // allow-list, so a wrong-shaped value is dropped rather than bound. Until
+  // 2026-09-25 it read the raw values: a one-element array passed httpOrNull's
+  // regex and bound in SQLite as a plain value (stored, then served), and a
+  // two-element one crashed boot with "Too many parameter values".
+  for (const rawPhase of (TRIP_CONFIG.phases || [])) {
+    const phaseId = publicPart('phase', { id: rawPhase?.id })?.id;
+    if (phaseId == null) continue;
+    (Array.isArray(rawPhase.days) ? rawPhase.days : []).forEach((rawDay, di) => {
+      const day = publicPart('day', rawDay) || {};
       // Carry the day's headline across. A day that has none is queued so the
       // worker can write one from the day's own items.
       if (day.date) {
-        const he = stripTags(day.label?.he ?? day.label ?? '');
+        const he = stripTags(hebrewOf(day.label));
         const en = stripTags(day.label?.en ?? '');
-        upsertDay.run(phase.id, day.date, he || null, en || null,
+        upsertDay.run(phaseId, day.date, he || null, en || null,
                       (he || en) ? 'done' : enrichSeed);
       }
-      (day.items || []).forEach((item, ii) => {
-        const ref = `${phase.id}|${day.date || `d${di}`}|${ii}`;
+      (Array.isArray(rawDay?.items) ? rawDay.items : []).forEach((rawItem, ii) => {
+        const item = publicPart('dayItem', rawItem) || {};
+        const ref = `${phaseId}|${day.date || `d${di}`}|${ii}`;
         const links = [...allConfigLinks(item.text?.he), ...allConfigLinks(item.text?.en)]
           .filter((l, i, arr) => arr.findIndex(x => x.url === l.url) === i);
         const linksJson = links.length ? JSON.stringify(links) : null;
@@ -3200,19 +3223,19 @@ function promoteConfigDays(createdBy, { queueEnrichment = true } = {}) {
         // item's time column can't represent. Keep it in the text rather than
         // dropping a detail the organizer wrote.
         const prefix = rawTime && !time ? `${rawTime} — ` : '';
-        const he = prefix + stripTags(item.text?.he ?? item.text ?? '');
+        const he = prefix + stripTags(hebrewOf(item.text));
         const en = prefix + stripTags(item.text?.en ?? '');
         if (!he && !en) { skipped.push({ config_ref: ref, reason: 'no text' }); return; }
 
         const info = insert.run(
-          phase.id, day.date || null, time, planTimeSort(time),
+          phaseId, day.date || null, time, planTimeSort(time),
           he || en, en || null,
           mapsHref, wazeHref, ticketHref,
           linksJson,
-          findMatchingBooking({ phase_id: phase.id, text_he: he, text_en: en }),
+          findMatchingBooking({ phase_id: phaseId, text_he: he, text_en: en }),
           di * 1000 + ii, createdBy, enrichSeed, ref
         );
-        if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phase.id, config_ref: ref });
+        if (info.changes) created.push({ id: info.lastInsertRowid, phase_id: phaseId, config_ref: ref });
         else skipped.push({ config_ref: ref, reason: 'already promoted' });
       });
     });
