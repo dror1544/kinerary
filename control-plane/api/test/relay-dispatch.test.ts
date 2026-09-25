@@ -569,17 +569,14 @@ describe("dispatchUpdate — callback routing", () => {
       });
       // Another organizer's chat (no interview of its own).
       const stranger = await dispatchUpdate(fix.pool, tap("700001599", PC));
-      assert.equal(stranger.kind, "callback_reply");
-      assert.equal((stranger as { text?: string }).text, "That change is no longer waiting.");
-      assert.equal((stranger as { chatId?: string }).chatId, "700001599");
+      assert.deepEqual(stranger, { kind: "callback_ack", callbackQueryId: "cbq_1", text: "That change is no longer waiting." });
       // A group.
       const group = await dispatchUpdate(fix.pool, inGroup("-1001234567890"));
-      assert.equal(group.kind, "callback_reply");
-      assert.equal((group as { callbackQueryId?: string }).callbackQueryId, "cbq_g");
+      assert.deepEqual(group, { kind: "callback_ack", callbackQueryId: "cbq_g", text: "That change is no longer waiting." });
       // The owning chat once its interview is confirmed.
       await fix.pool.query("UPDATE control_plane.intake_sessions SET state = 'confirmed' WHERE telegram_chat_id = $1", ["700001500"]);
       const confirmed = await dispatchUpdate(fix.pool, tap("700001500", PC));
-      assert.equal(confirmed.kind, "callback_reply");
+      assert.equal(confirmed.kind, "callback_ack");
       assert.equal((confirmed as { text?: string }).text, "That change is no longer waiting.");
     });
   });

@@ -148,8 +148,27 @@ function refusal(
 ): Extract<ProposeResult, { kind: "too_big" | "uneditable" }> | null {
   const shape = state.blocked.find((l) => l.key === "blocked.unsupportedShape");
   if (shape) return { kind: "uneditable", question: shape.params.question === "travelers" ? "travelers" : "phases" };
-  if (ops.length > MAX_DRAFT_OPS || previewLength({ ops, ...state }) > PREVIEW_BUDGET_CHARS) return { kind: "too_big", merged };
+  if (tooBig(ops, state)) return { kind: "too_big", merged };
   return null;
+}
+
+/** True when a computed draft is over the operation cap or would not fit one message. */
+function tooBig(ops: Op[], state: ReturnType<typeof draftStateFor>): boolean {
+  return ops.length > MAX_DRAFT_OPS || previewLength({ ops, ...state }) > PREVIEW_BUDGET_CHARS;
+}
+
+/**
+ * Ends a draft that has become too big to show, IN THE OPEN TRANSACTION. A draft
+ * that cannot be shown cannot be confirmed or cancelled by its buttons, and it
+ * would block Confirm for good: so it is dropped (and the caller says so).
+ */
+async function dropTooBig(client: pg.PoolClient, draftId: string): Promise<void> {
+  await client.query(
+    `UPDATE control_plane.intake_pending_changes
+        SET status = 'cancelled', resolved_at = now(), resolved_by = 'system', updated_at = now()
+      WHERE id = $1 AND status = 'pending'`,
+    [draftId],
+  );
 }
 
 export async function proposeChange(db: Db, input: ProposeInput): Promise<ProposeResult> {
@@ -264,7 +283,7 @@ export async function cancelDraft(db: Db, input: { draftId: string; sessionId: s
  * confirmation that found its `base` out of date. Nothing is applied; the
  * refreshed change is shown again. Null when the session has no such open draft.
  */
-export async function rebuildDraft(db: Db, input: { draftId: string; sessionId: string }): Promise<Draft | null> {
+export async function rebuildDraft(db: Db, input: { draftId: string; sessionId: string }): Promise<Draft | null | "too_big"> {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
@@ -277,6 +296,13 @@ export async function rebuildDraft(db: Db, input: { draftId: string; sessionId: 
     );
     if (!open.rows[0]) { await client.query("ROLLBACK"); return null; }
     const state = draftStateFor(held, open.rows[0].ops);
+    // What is held can have grown since (a document): the same budget applies as
+    // when the draft was made, and a draft over it is dropped, not left stuck.
+    if (tooBig(open.rows[0].ops, state)) {
+      await dropTooBig(client, input.draftId);
+      await client.query("COMMIT");
+      return "too_big";
+    }
     const updated = await client.query<DraftRow>(
       `UPDATE control_plane.intake_pending_changes
           SET base = $2::jsonb, result = $3::jsonb, preview = $4::jsonb, unresolved = $5::jsonb, blocked = $6::jsonb,
@@ -305,7 +331,7 @@ export async function rebuildDraft(db: Db, input: { draftId: string; sessionId: 
 export async function pickForDraft(
   db: Db,
   input: { draftId: string; sessionId: string; k: number; expectedDigest?: string },
-): Promise<Draft | null | "updated"> {
+): Promise<Draft | null | "updated" | "too_big"> {
   const client = await db.connect();
   try {
     await client.query("BEGIN");
@@ -326,6 +352,12 @@ export async function pickForDraft(
     const ops = row ? applyPick(row.ops, row, held, input.k) : null;
     if (!row || !ops) { await client.query("ROLLBACK"); return null; }
     const state = draftStateFor(held, ops);
+    // The pick can turn a short question ("which Tokyo?") into a long preview.
+    if (tooBig(ops, state)) {
+      await dropTooBig(client, row.id);
+      await client.query("COMMIT");
+      return "too_big";
+    }
     const updated = await client.query<DraftRow>(
       `UPDATE control_plane.intake_pending_changes
           SET ops = $2::jsonb, base = $3::jsonb, result = $4::jsonb, preview = $5::jsonb,

@@ -18,7 +18,7 @@
 import { changeCallbackData } from "./chat-router.js";
 import { readableDate, recapLabel, uiString, type Language } from "./intake-copy.js";
 import { INTAKE_QUESTIONS } from "./interview.js";
-import { draftDigest, openQuestion, type Line, type Param, type Unresolved } from "./typed-changes.js";
+import { cleanText, draftDigest, openQuestion, type Line, type Param, type Unresolved } from "./typed-changes.js";
 import type { Draft } from "./typed-changes-store.js";
 
 export interface RenderedChange {
@@ -32,7 +32,10 @@ export interface RenderedChange {
  * looks like a placeholder) is shown as typed and cannot rewrite the line.
  */
 const fill = (template: string, params: Record<string, string>): string =>
-  template.replace(/\{(\w+)\}/g, (whole, key: string) => (Object.prototype.hasOwnProperty.call(params, key) ? params[key]! : whole));
+  template.replace(/\{(\w+)\}/g, (whole, key: string) =>
+    // Every substituted value is cleaned: it may be a name that came from a
+    // document, and a name must never start a line of its own.
+    (Object.prototype.hasOwnProperty.call(params, key) ? cleanText(params[key]!) : whole));
 
 const isObject = (p: Param | undefined): p is { [key: string]: Param } =>
   typeof p === "object" && p !== null && !Array.isArray(p);
@@ -44,7 +47,7 @@ function dateText(value: string, language: Language): string {
 /** A stored value in words: a hotel as "Name (code)", a list as "a, b" - never as raw JSON. */
 function plainText(value: Param | undefined, language: Language): string {
   if (value === null || value === undefined) return uiString("change.value.none", language);
-  if (typeof value === "string") return /^\d{4}-\d{2}-\d{2}$/.test(value) ? dateText(value, language) : value;
+  if (typeof value === "string") return /^\d{4}-\d{2}-\d{2}$/.test(value) ? dateText(value, language) : cleanText(value);
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (Array.isArray(value)) return value.map((v) => plainText(v, language)).join(", ");
   const name = typeof value.name === "string" ? value.name : null;
@@ -60,8 +63,8 @@ function plainText(value: Param | undefined, language: Language): string {
  * replacement must not put anything into the answer the person was not shown.
  */
 export function entryText(entry: Param | undefined, language: Language, full = false): string {
-  if (!isObject(entry)) return typeof entry === "string" ? entry : "?";
-  const name = typeof entry.name === "string" ? entry.name : "?";
+  if (!isObject(entry)) return typeof entry === "string" ? cleanText(entry) : "?";
+  const name = typeof entry.name === "string" ? cleanText(entry.name) || "?" : "?";
   const bits: string[] = [];
   const start = typeof entry.start === "string" ? dateText(entry.start, language) : null;
   const end = typeof entry.end === "string" ? dateText(entry.end, language) : null;
@@ -94,6 +97,9 @@ function fieldLabel(field: string, language: Language): string {
   return label === key ? uiString("change.field.generic", language) : label;
 }
 
+/** How much of the preview "what stays as it is" may take before it says "and N more". */
+const UNCHANGED_BUDGET_CHARS = 400;
+
 /** One line of a draft, in words. Empty for a line this renderer does not know. */
 export function lineText(line: Line, language: Language): string {
   const p = line.params;
@@ -112,7 +118,22 @@ export function lineText(line: Line, language: Language): string {
     case "preview.dropsField":
       return t("change.line.dropsField", { entry: entryText(p.entry, language), field: fieldLabel(String(p.field), language) });
     case "preview.reorder": return t("change.line.reorder", { order: listText(p.order, language) });
-    case "preview.unchanged": return t("change.line.unchanged", { entries: listText(p.entries, language) });
+    case "preview.unchanged": {
+      // A long held list is SUMMARISED: the changed lines stay in full, but what
+      // is staying put must not be the reason a one-line change cannot be shown.
+      const all = Array.isArray(p.entries) ? p.entries : [];
+      const shown: string[] = [];
+      let length = 0;
+      for (const entry of all) {
+        const one = entryText(entry, language);
+        if (shown.length > 0 && length + one.length > UNCHANGED_BUDGET_CHARS) break;
+        shown.push(one);
+        length += one.length + 2;
+      }
+      return shown.length < all.length
+        ? t("change.line.unchangedMore", { entries: shown.join(", "), count: String(all.length - shown.length) })
+        : t("change.line.unchanged", { entries: shown.join(", ") });
+    }
     case "warn.daysDropped":
       return t("change.warn.daysDropped", {
         entry: entryText(p.entry, language),

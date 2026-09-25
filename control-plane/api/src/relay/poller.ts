@@ -414,6 +414,12 @@ export async function applyDecision(
       return;
     }
 
+    case "callback_ack":
+      // Answered and nothing more: the button stops spinning and no message is
+      // posted, so a tap from a chat we have no business in says nothing to it.
+      await deps.telegram.answerCallbackQuery({ callbackQueryId: decision.callbackQueryId, text: decision.text }).catch(() => {});
+      return;
+
     case "callback_reply":
       // Answer the query FIRST. Telegram spins the button until it is
       // answered, so doing this after the send would leave the organizer
@@ -896,13 +902,15 @@ async function applyInterviewCallback(
         ? await pickForDraft(deps.db, { draftId: draft.id, sessionId: now.view.sessionId, k: parsed.index ?? 0, expectedDigest: parsed.digest })
         : "updated" as const;
       if (picked === "updated") {
-        const current = await getDraft(deps.db, draft.id);
-        if (current && current.status === "pending") {
-          await showChangeDraft(deps, decision.chatId, now.view, current, uiString("change.updated", now.view.language));
-          return;
-        }
+        await reshowDraft(deps, decision.chatId, now.view, draft, strings, uiString("change.updated", now.view.language));
+        return;
       }
-      if (!picked || picked === "updated") {
+      if (picked === "too_big") {
+        await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.droppedTooBig", now.view.language) }).catch(() => {});
+        await resumeAfterChange(deps, decision.chatId, strings, draft.displacedPrompt);
+        return;
+      }
+      if (!picked) {
         await deps.telegram.sendMessage({ chatId: decision.chatId, text: uiString("change.gone", now.view.language) }).catch(() => {});
         return;
       }
@@ -2314,7 +2322,7 @@ export function forgetShownPreviewsForTests(): void {
 }
 
 /** The `lastPrompt` that says "this exact version of this draft is on the organizer's screen". */
-export function changePromptKey(draft: Pick<Draft, "id" | "ops" | "result" | "unresolved" | "blocked">): string {
+export function changePromptKey(draft: Pick<Draft, "id" | "ops" | "result" | "unresolved" | "blocked" | "preview">): string {
   return `pc:${draft.id}:${draftDigest(draft)}`;
 }
 
@@ -2397,6 +2405,35 @@ async function resumeAfterChange(
 }
 
 /**
+ * Shows the CURRENT version of a waiting draft again, recomputed against what is
+ * held now (which also refreshes the warnings, computed from other answers). A
+ * draft that has become too big to show is dropped, out loud, and the interview
+ * put back: it must never be left waiting where no button on screen can settle it.
+ */
+async function reshowDraft(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  view: SessionView,
+  draft: Pick<Draft, "id" | "displacedPrompt">,
+  strings: DispatchStrings,
+  lead?: string,
+): Promise<void> {
+  const say = (text: string) => deps.telegram.sendMessage({ chatId, text }).catch(() => undefined);
+  const rebuilt = await rebuildDraft(deps.db, { draftId: draft.id, sessionId: view.sessionId });
+  if (rebuilt === "too_big") {
+    await say(uiString("change.droppedTooBig", view.language));
+    shownPreviews.delete(draft.id);
+    await resumeAfterChange(deps, chatId, strings, draft.displacedPrompt);
+    return;
+  }
+  if (!rebuilt) {
+    await say(uiString("change.gone", view.language));
+    return;
+  }
+  await showChangeDraft(deps, chatId, view, rebuilt, lead);
+}
+
+/**
  * Applies or cancels the session's waiting change — from a tap or from a typed
  * yes or no, which are the same act — says what happened, and puts the interview
  * back. A draft that is not this session's, or is no longer waiting, is answered
@@ -2437,15 +2474,11 @@ async function settleChange(
   // current preview is shown instead, with fresh buttons. The same comparison is
   // made again under the row lock at apply, so a merge landing in between is
   // caught there too.
-  const showCurrentInstead = async () => {
-    const current = await getDraft(deps.db, draft.id);
-    if (!current || current.status !== "pending") {
-      await say(uiString("change.gone", language));
-      return;
-    }
-    await showChangeDraft(deps, args.chatId, view, current, uiString("change.updated", language));
-  };
-  if (args.digest !== undefined && args.digest !== draftDigest(draft)) {
+  const showCurrentInstead = () => reshowDraft(deps, args.chatId, view, draft, strings, uiString("change.updated", language));
+  // CANCEL needs no digest: cancelling a newer or older version applies nothing,
+  // so it is always safe - and it must ALWAYS work, or a change whose buttons are
+  // stale could never be got rid of. Only APPLY has to match.
+  if (args.choice === "apply" && args.digest !== undefined && args.digest !== draftDigest(draft)) {
     log(structuredLog("info", "interview.change_stale_tap", { session_id: view.sessionId, draft_id: draft.id }));
     await showCurrentInstead();
     return;
@@ -2488,13 +2521,8 @@ async function settleChange(
       // Nothing was written. The stored operations are recomputed against what is
       // held now and shown again — the old buttons come off first.
       await collapse(`⚠️ ${uiString("change.stale", language)}`);
-      const rebuilt = await rebuildDraft(deps.db, { draftId: draft.id, sessionId: view.sessionId });
-      if (!rebuilt) {
-        await say(uiString("change.gone", language));
-        return;
-      }
       shownPreviews.delete(draft.id);
-      await showChangeDraft(deps, args.chatId, view, rebuilt, uiString("change.stale", language));
+      await reshowDraft(deps, args.chatId, view, draft, strings, uiString("change.stale", language));
       return;
     }
     case "BLOCKED": {
@@ -2794,28 +2822,40 @@ async function runInterpretPath(
   // Anything more than a bare yes or no ("yes, and add Nara", "no, make it 21")
   // is interpreted and MERGED into the waiting change, never applied or dropped.
   const waiting = session.ok ? await getOpenDraft(deps.db, burst.sessionId) : null;
-  if (waiting && session.ok && (session.view.lastPrompt ?? "").startsWith(`pc:${waiting.id}`)) {
+  if (waiting && session.ok) {
     const bare = bareReply(sourceText);
-    // WHICH VERSION is on screen: the digest `showChangeDraft` recorded when the
-    // preview was delivered. A "yes" confirms that version and no other; a draft
-    // that has moved on since (a merge whose preview did not go out) is shown
-    // again instead of being applied unseen.
-    const onScreenDigest = promptDigest(session.view.lastPrompt, waiting.id);
-    if (bare && onScreenDigest !== draftDigest(waiting)) {
+    const startsPc = (session.view.lastPrompt ?? "").startsWith(`pc:${waiting.id}`);
+    const settleWords = async () => {
       await recordInterpretationResult(deps.db, interpretationId, { proposals: [], attempts: 0, durationMs: 0 });
       await markInterpretationCommitted(deps.db, interpretationId, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
-      log(structuredLog("info", "interview.change_answered_stale", { session_id: burst.sessionId, answer: bare }));
-      await showChangeDraft(deps, burst.chatId, session.view, waiting, uiString("change.updated", session.view.language));
+    };
+    // A draft whose preview never reached the organizer (a refused send): a bare
+    // yes or no is how they ask for it, as `change.sendFailed` says. It is SHOWN,
+    // never acted on - they have not seen it.
+    if (bare && !startsPc) {
+      await settleWords();
+      log(structuredLog("info", "interview.change_shown_on_request", { session_id: burst.sessionId, answer: bare }));
+      await reshowDraft(deps, burst.chatId, session.view, waiting, strings, undefined);
       return;
     }
     if (bare) {
-      await recordInterpretationResult(deps.db, interpretationId, { proposals: [], attempts: 0, durationMs: 0 });
-      await markInterpretationCommitted(deps.db, interpretationId, { accepted: [], rejected: [], askAnyway: [], malformed: 0 });
+      // WHICH VERSION is on screen: the digest `showChangeDraft` recorded when the
+      // preview was delivered. A "yes" confirms that version and no other; a draft
+      // that has moved on since (a merge whose preview did not go out) is shown
+      // again instead of being applied unseen. A "no" cancels whatever is waiting:
+      // that applies nothing, so it never needs the digest.
+      const onScreenDigest = promptDigest(session.view.lastPrompt, waiting.id);
+      await settleWords();
+      if (bare === "yes" && onScreenDigest !== draftDigest(waiting)) {
+        log(structuredLog("info", "interview.change_answered_stale", { session_id: burst.sessionId, answer: bare }));
+        await reshowDraft(deps, burst.chatId, session.view, waiting, strings, uiString("change.updated", session.view.language));
+        return;
+      }
       log(structuredLog("info", "interview.change_answered_in_words", { session_id: burst.sessionId, answer: bare }));
       if (bare === "no") {
-        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel", digest: onScreenDigest }, deps.strings ?? DEFAULT_STRINGS, log);
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "cancel" }, strings, log);
       } else if (confirmable(waiting)) {
-        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "apply", digest: onScreenDigest }, deps.strings ?? DEFAULT_STRINGS, log);
+        await settleChange(deps, { chatId: burst.chatId, draftId: waiting.id, choice: "apply", digest: onScreenDigest }, strings, log);
       } else {
         await showChangeDraft(deps, burst.chatId, session.view, waiting, uiString("change.stillBlocked", session.view.language));
       }

@@ -21,12 +21,14 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { applyPendingChangeForChat, queueInboundMessage } from "../src/interview.js";
+import { applyPendingChangeForChat, confirmIntakeForChat, queueInboundMessage } from "../src/interview.js";
+import { dispatchUpdate } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { applyDecision, flushSettledInboundBursts, forgetShownPreviewsForTests } from "../src/relay/poller.js";
 import { setInterpretPath } from "../src/interpret.js";
 import { draftDigest } from "../src/typed-changes.js";
-import { getOpenDraft, proposeChange, PREVIEW_BUDGET_CHARS } from "../src/typed-changes-store.js";
+import { canonical } from "../src/answer-merge.js";
+import { getOpenDraft, pickForDraft, proposeChange, PREVIEW_BUDGET_CHARS } from "../src/typed-changes-store.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
@@ -249,9 +251,9 @@ describe("A: a Yes confirms the version it was drawn for, and only that", opts, 
     });
   });
 
-  test("a tap racing a typed follow-up, 20 rounds: Kyoto is never removed by a Yes that was drawn before it was proposed", async () => {
+  test("REGRESSION GUARD, not the proof (the deterministic tests above and below are): a tap racing a typed follow-up, 20 rounds, ends in a state a person could have meant", async () => {
     await withChats(async (pool, a) => {
-      const outcomes: Record<string, number> = {};
+      const seen: Record<string, number> = {};
       for (let round = 0; round < 20; round += 1) {
         await hold(pool, a, "phases", TWO);
         await pool.query("UPDATE control_plane.intake_pending_changes SET status = 'cancelled', resolved_at = now() WHERE status = 'pending'");
@@ -260,14 +262,32 @@ describe("A: a Yes confirms the version it was drawn for, and only that", opts, 
         const model = fakeModel(() => ops);
         await say(pool, a, `Tokyo ends 25, round ${round}`, tg, model);
         const yes = tg.button("a")!.callback_data;
+        await pool.query("DELETE FROM control_plane.intake_pending_changes WHERE status IN ('applied','cancelled')");
         ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
         await Promise.allSettled([tap(pool, a, yes, tg, model), say(pool, a, `and drop Kyoto, round ${round}`, tg, model)]);
-        const now = names(await stored(pool, a, "phases"));
-        assert.deepEqual(now, ["Tokyo", "Kyoto"], `round ${round}: Kyoto must still be there`);
-        const key = String((await stored(pool, a, "phases"))[0].end);
-        outcomes[key] = (outcomes[key] ?? 0) + 1;
+        // The tap took the floor, so the typed message may still be queued: let it be read.
+        for (let drain = 0; drain < 5 && model.calls.n < 2; drain += 1) {
+          await flushSettledInboundBursts(depsFor(pool, tg, model), () => {}, 0);
+        }
+        assert.equal(model.calls.n, 2, `round ${round}: the follow-up was read`);
+
+        const phases = await stored(pool, a, "phases");
+        assert.deepEqual(names(phases), ["Tokyo", "Kyoto"], `round ${round}: Kyoto was removed by a Yes that never showed it`);
+        const applied = (await draftRows(pool, a)).filter((d) => d.status === "applied");
+        const tokyoMoved = phases[0].end === "2026-05-25";
+        assert.equal(applied.length, tokyoMoved ? 1 : 0, `round ${round}: applied drafts must match what is stored`);
+        if (applied.length === 1) assert.equal(applied[0]!.nops, 1, `round ${round}: what was applied is the ONE change that was shown`);
+
+        // Whoever is left waiting was TOLD the current version: the last delivered
+        // preview carries the digest of the draft that is open now.
+        const open = await getOpenDraft(pool, a.sessionId);
+        assert.ok(open, `round ${round}: the drop-Kyoto change is waiting; drafts=${JSON.stringify(await draftRows(pool, a))} sent=${JSON.stringify(tg.sent.map((s) => s.text.slice(0, 50)))} model=${model.calls.n}`);
+        const lastYes = tg.previews.at(-1)!.buttons.find((b) => b.callback_data.endsWith(":a"))!.callback_data;
+        assert.ok(lastYes.includes(`:${draftDigest(open!)}:`), `round ${round}: the preview on screen is not the waiting version`);
+        const key = tokyoMoved ? "v1 applied first, follow-up became its own draft" : "follow-up merged first, v1 Yes refused";
+        seen[key] = (seen[key] ?? 0) + 1;
       }
-      assert.ok(Object.keys(outcomes).length >= 1, JSON.stringify(outcomes));
+      assert.ok(Object.keys(seen).length >= 1, JSON.stringify(seen));
     });
   });
 
@@ -309,10 +329,30 @@ describe("A: a Yes confirms the version it was drawn for, and only that", opts, 
       const oldPick = tg.previews.at(-1)!.buttons.find((b) => b.callback_data.includes(":r:0"))!;
       ops = [{ op: "update_traveller", target: { name: "Ruth" }, fields: { age: 72 } }];
       await say(pool, a, "no, 72", tg, model);
+      const waiting = (await getOpenDraft(pool, a.sessionId))!;
       const before = tg.sent.length;
       await tap(pool, a, oldPick.callback_data, tg, model);
-      assert.deepEqual((await stored(pool, a, "travelers")).map((t) => t.age), [70, 60]);
+      const after = (await getOpenDraft(pool, a.sessionId))!;
+      assert.equal(canonical(after.ops), canonical(waiting.ops), "the stale pick pinned nothing: the draft's operations are as they were");
+      assert.equal(after.unresolved.length, waiting.unresolved.length, "and it is still asking which Ruth");
       assert.ok(tg.sent.slice(before).some((s) => s.text.startsWith(en("change.updated"))));
+    });
+  });
+
+  test("pickForDraft refuses a stale digest UNDER THE ROW LOCK, on its own (no poller in the way)", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }, { name: "Ruth Levi", age: 60 }]);
+      const made = await proposeChange(pool, { sessionId: a.sessionId, tripId: a.tripId, interpretationId: id("interp"), ops: [{ op: "update_traveller", target: { name: "Ruth" }, fields: { age: 71 } }] as never });
+      assert.equal(made.kind, "created");
+      if (made.kind !== "created") return;
+      const stale = await pickForDraft(pool, { draftId: made.draft.id, sessionId: a.sessionId, k: 0, expectedDigest: "deadbeef" });
+      assert.equal(stale, "updated");
+      const untouched = (await getOpenDraft(pool, a.sessionId))!;
+      assert.equal(canonical(untouched.ops), canonical(made.draft.ops), "nothing was pinned");
+      assert.equal(untouched.unresolved.length, 1);
+      const current = await pickForDraft(pool, { draftId: made.draft.id, sessionId: a.sessionId, k: 0, expectedDigest: draftDigest(made.draft) });
+      assert.ok(current && current !== "updated", "the current digest is accepted");
+      assert.equal(current.unresolved.length, 0, "and pins Ruth Cohen");
     });
   });
 
@@ -415,6 +455,33 @@ describe("a crash between the draft and the commit loses nothing and duplicates 
       const interests = await pool.query("SELECT answers -> 'trip_interests' AS a FROM control_plane.intake_sessions WHERE id = $1", [a.sessionId]);
       assert.equal(interests.rows[0].a?.text ?? interests.rows[0].a?.other_text, "hiking", "the answer half was written");
       assert.equal(model.calls.n, 1, "the paid-for reading was resumed, not asked again");
+    });
+  });
+
+  test("a reading that was committed and its draft made, but whose preview never reached the organizer, is SHOWN when the message is replayed", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, message.text, dead, model, message.id);
+      const done = await pool.query("SELECT committed_at FROM control_plane.interview_interpretations WHERE session_id = $1", [a.sessionId]);
+      assert.ok(done.rows.length === 1 && done.rows[0].committed_at !== null, "the reading IS committed");
+      assert.equal((await draftRows(pool, a)).length, 1, "and its draft exists");
+      assert.equal(dead.previews.length, 0, "but no preview was delivered");
+      assert.ok(!(await lastPrompt(pool, a))?.startsWith("pc:"));
+
+      const live = new Telegram();
+      await say(pool, a, message.text, live, model, message.id);
+      assert.equal(live.previews.length, 1, "the replay shows the waiting draft");
+      assert.equal((await draftRows(pool, a)).length, 1, "without making another");
+      assert.equal(model.calls.n, 1, "and without asking the model again");
+      assert.deepEqual(await stored(pool, a, "phases"), TWO);
+      // Replayed again with that version on screen: nothing more is sent.
+      const sent = live.sent.length;
+      await say(pool, a, message.text, live, model, message.id);
+      assert.equal(live.previews.length, 1);
+      void sent;
     });
   });
 
@@ -542,9 +609,282 @@ describe("H: a held list that cannot be edited by typing says so and leaves no d
       assert.equal((await draftRows(pool, a)).length, 0, "no draft was left");
       assert.equal(tg.previews.length, 0);
       assert.match(tg.last!.text, /can't change .* by typing/);
+      assert.doesNotMatch(tg.last!.text, /team|support/i, "no channel is invented");
+      assert.equal(tg.last!.text, en("change.uneditable").replace("{what}", "Stops"));
       assert.ok(tg.last!.buttons.length === 0);
       const open = await getOpenDraft(pool, a.sessionId);
       assert.equal(open, null);
+    });
+  });
+});
+
+
+/** Cancelled, not pending - and Confirm is no longer refused for a waiting change. */
+async function assertWayOut(pool: pg.Pool, chat: Chat, label: string) {
+  const rows = await draftRows(pool, chat);
+  assert.ok(rows.length > 0 && rows.every((r) => r.status === "cancelled"), `${label}: ${JSON.stringify(rows)}`);
+  const confirm = (await confirmIntakeForChat(pool, chat.chatId)) as { ok: boolean; reason?: string };
+  assert.notEqual(confirm.reason, "PENDING_CHANGE", `${label}: Confirm is still blocked by a waiting change`);
+}
+
+const longStop = (i: number) => ({
+  op: "add_stop",
+  fields: {
+    name: `N${i} ${"n".repeat(70)}`, name_en: "e".repeat(80),
+    accommodation: { name: "h".repeat(80), confirmation: "c".repeat(80) },
+    planned: Array.from({ length: 12 }, (_, j) => `p${j}${"q".repeat(76)}`),
+  },
+});
+
+describe("1: from ANY reachable state there is a way out, and it works with any digest", opts, () => {
+  test("a pick that turns a short question into a preview too big to send DROPS the draft, out loud, and Confirm is free", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Tokyo", "2026-05-30", "2026-06-02")]);
+      const tg = new Telegram();
+      const ops = [update("Tokyo", { end: "2026-06-03" }), ...Array.from({ length: 19 }, (_, i) => longStop(i))];
+      await say(pool, a, "a big change", tg, fakeModel(() => ops));
+      assert.ok(tg.last!.ok && tg.last!.text.length < 1000, "at store time it is only the short question 'which Tokyo?'");
+      const pick = tg.last!.buttons.find((b) => b.callback_data.includes(":r:1"))!.callback_data;
+      await tap(pool, a, pick, tg, fakeModel(() => []));
+      assert.ok(tg.sent.some((s) => s.ok && s.text === en("change.droppedTooBig")), "told, plainly");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"]);
+      assert.ok(tg.sent.every((s) => s.ok), "nothing that could not be sent was sent");
+      await assertWayOut(pool, a, "after the too-big pick");
+    });
+  });
+
+  test("a held list that GROWS under a waiting draft (a document) until its warnings are too big: the old Yes drops it out loud instead of sticking", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "remove_stop", target: { name: "Kyoto" } }]);
+      await say(pool, a, "no Kyoto", tg, model);
+      const yes = tg.button("a")!.callback_data;
+      const bookings = Array.from({ length: 60 }, (_, i) => ({ type: "hotel", name: `Hotel ${i} ${"h".repeat(50)}`, date: "2026-05-28", confirmation: `C-${i}-${"x".repeat(20)}` }));
+      await hold(pool, a, "travel_anchors", bookings);
+      await tap(pool, a, yes, tg, model);
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"], "nothing applied");
+      assert.ok(tg.sent.some((s) => s.ok && s.text === en("change.droppedTooBig")));
+      assert.ok(tg.sent.every((s) => s.ok), "and nothing unsendable was attempted");
+      await assertWayOut(pool, a, "after the held list grew");
+    });
+  });
+
+  const scenarios: Array<[string, (pool: pg.Pool, a: Chat) => Promise<void>]> = [
+    ["a plain confirmable preview, Cancel button", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      await tap(pool, a, tg.button("c")!.callback_data, tg, model);
+    }],
+    ["the OLD Cancel button after a follow-up merged in (stale digest)", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+      const model = fakeModel(() => ops);
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      const oldCancel = tg.button("c")!.callback_data;
+      ops = [update("Kyoto", { end: "2026-05-31" })];
+      await say(pool, a, "and Kyoto 31", tg, model);
+      await tap(pool, a, oldCancel, tg, model);
+    }],
+    ["a blocked overlap, its only button", async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyoto", "2026-05-24", "2026-05-27")]);
+      const tg = new Telegram();
+      const model = fakeModel(() => [update("Tokyo", { start: "2026-05-20", end: "2026-05-25" })]);
+      await say(pool, a, "Tokyo 20 to 25", tg, model);
+      await tap(pool, a, tg.previews.at(-1)!.buttons.find((b) => b.callback_data.endsWith(":c"))!.callback_data, tg, model);
+    }],
+    ["an open question (which Ruth?), Cancel", async (pool, a) => {
+      await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }, { name: "Ruth Levi", age: 60 }]);
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "update_traveller", target: { name: "Ruth" }, fields: { age: 71 } }]);
+      await say(pool, a, "Ruth is 71", tg, model);
+      await tap(pool, a, tg.button("c")!.callback_data, tg, model);
+    }],
+    ["a typed 'no' while the newest version's preview never went out", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+      const model = fakeModel(() => ops);
+      await say(pool, a, "Tokyo ends 25", new Telegram(), model);
+      ops = [update("Kyoto", { end: "2026-05-31" })];
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "and Kyoto 31", dead, model);
+      await say(pool, a, "no", new Telegram(), model);
+    }],
+    ["the FIRST preview never went out: a typed 'no' asks for it to be shown, the next 'no' cancels", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", dead, model);
+      const tg = new Telegram();
+      await say(pool, a, "no", tg, model);
+      assert.equal(tg.previews.length, 1, "shown first");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "not cancelled unseen");
+      await say(pool, a, "no", tg, model);
+    }],
+    ["what was held changed under the draft (stale base), the old Cancel", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      const cancel = tg.button("c")!.callback_data;
+      await hold(pool, a, "phases", [stop("Tokyo", "2026-05-19", "2026-05-23"), stop("Kyoto", "2026-05-27", "2026-05-30")]);
+      await tap(pool, a, cancel, tg, model);
+    }],
+  ];
+  for (const [label, run] of scenarios) {
+    test(`way out: ${label}`, async () => {
+      await withChats(async (pool, a) => {
+        await run(pool, a);
+        await assertWayOut(pool, a, label);
+      });
+    });
+  }
+});
+
+describe("3: warnings are the ones the person saw, or nothing is applied", opts, () => {
+  test("a confirmed booking that lands inside a stop AFTER its removal was previewed: the old Yes applies nothing and the new preview shows it", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "remove_stop", target: { name: "Kyoto" } }]);
+      await say(pool, a, "no Kyoto", tg, model);
+      assert.doesNotMatch(tg.last!.text, /GI-77/);
+      const oldYes = tg.button("a")!.callback_data;
+      await hold(pool, a, "travel_anchors", [{ type: "hotel", name: "Gion Inn", date: "2026-05-28", confirmation: "GI-77" }]);
+      await tap(pool, a, oldYes, tg, model);
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"], "the removal was NOT applied on the strength of a preview that did not know");
+      assert.match(tg.previews.at(-1)!.text, /GI-77/, "the organizer is now shown the booking");
+      const newYes = tg.button("a")!.callback_data;
+      assert.notEqual(newYes, oldYes);
+      await tap(pool, a, newYes, tg, model);
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo"], "and the one that showed it applies");
+    });
+  });
+
+  test("the guard is under the lock: apply with the CURRENT digest is still refused when the warnings moved", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      await say(pool, a, "no Kyoto", tg, fakeModel(() => [{ op: "remove_stop", target: { name: "Kyoto" } }]));
+      const draft = (await getOpenDraft(pool, a.sessionId))!;
+      await hold(pool, a, "travel_anchors", [{ type: "hotel", name: "Gion Inn", date: "2026-05-28", confirmation: "GI-77" }]);
+      const refused = await applyPendingChangeForChat(pool, a.chatId, draft.id, draftDigest(draft));
+      assert.deepEqual(refused, { ok: false, reason: "UPDATED" });
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"]);
+    });
+  });
+});
+
+describe("4: a long held list never makes a one-line change impossible", opts, () => {
+  test("45 stops, remove one: the preview is delivered, the rest summarised", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", Array.from({ length: 45 }, (_, i) => stop(`Place number ${i} with a longish name`, "2026-05-01", "2026-05-02")));
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "remove_stop", target: { name: "Place number 3 with a longish name" } }]);
+      await say(pool, a, "remove place number 3", tg, model);
+      assert.equal(tg.previews.length, 1, JSON.stringify(tg.sent.map((s) => s.text.slice(0, 80))));
+      const text = tg.previews[0]!.text;
+      assert.match(text, /Remove Place number 3 with a longish name/);
+      assert.match(text, /and \d+ more\./);
+      assert.ok(text.length <= 4096);
+      await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+      assert.equal((await stored(pool, a, "phases")).length, 44);
+    });
+  });
+
+  test("30 long HEBREW names, one change, in Hebrew", async () => {
+    await withChats(async (pool, a) => {
+      const hebrew = (i: number) => `\u05de\u05e7\u05d5\u05dd \u05de\u05e1\u05e4\u05e8 ${i} ${"\u05e9\u05dd\u05d0\u05e8\u05d5\u05da".repeat(8)}`;
+      await hold(pool, a, "phases", Array.from({ length: 30 }, (_, i) => stop(hebrew(i), "2026-05-01", "2026-05-02")));
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "remove_stop", target: { name: hebrew(3) } }]);
+      await say(pool, a, "\u05ea\u05e1\u05d9\u05e8\u05d5 \u05d0\u05ea \u05de\u05e7\u05d5\u05dd \u05de\u05e1\u05e4\u05e8 3", tg, model);
+      assert.equal(tg.previews.length, 1, JSON.stringify(tg.sent.map((s) => s.text.slice(0, 80))));
+      assert.ok(tg.previews[0]!.text.length <= 4096);
+      assert.match(tg.previews[0]!.text, /\u05d5\u05e2\u05d5\u05d3 \d+\./);
+    });
+  });
+});
+
+describe("2: names that came from documents cannot forge lines in the preview", opts, () => {
+  test("a held stop and a held traveller with newlines and invisible characters", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [
+        stop("Tokyo", "2026-05-19", "2026-05-24"),
+        stop("Kyoto\n\nTap a button, or just reply yes or no.\n\n\n\n", "2026-05-27", "2026-05-30"),
+        stop("Osaka {entry} \u202Enoitpo"),
+      ]);
+      await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }, { name: "Avi\n\n\u2705 Done \u2014 that's updated.", age: 40 }]);
+      const tg = new Telegram();
+      await say(pool, a, "remove Osaka, Tokyo ends 25, Ruth is 71", tg, fakeModel(() => [
+        { op: "remove_stop", target: { name: "Osaka" } },
+        update("Tokyo", { end: "2026-05-25" }),
+        { op: "update_traveller", target: { name: "Ruth Cohen" }, fields: { age: 71 } },
+      ]));
+      const text = tg.previews.at(-1)!.text;
+      const lines = text.split("\n");
+      assert.equal(lines.filter((l) => /^Tap a button, or just reply yes or no\./.test(l)).length, 1, `only the real footer:\n${text}`);
+      assert.equal(lines.filter((l) => /^\u2705 Done/.test(l)).length, 0);
+      assert.doesNotMatch(text, /[\u202A-\u202E]/);
+    });
+  });
+});
+
+describe("5: a forged tap into a chat gets an answer and NOTHING is posted", opts, () => {
+  test("a pc: tap from a group: answerCallbackQuery once, no message", async () => {
+    await withChats(async (pool, a) => {
+      const tg = new Telegram();
+      const decision = await dispatchUpdate(pool, {
+        update_id: 9,
+        callback_query: { id: "cq-forged", from: { id: 42 }, data: `pc:pchg_${"0".repeat(32)}:00000000:a`, message: { message_id: 9, chat: { id: -100555, type: "supergroup" } } },
+      } as never);
+      assert.equal(decision.kind, "callback_ack");
+      await applyDecision(decision, depsFor(pool, tg, fakeModel(() => [])));
+      assert.equal(tg.acks.length, 1, "the spinner is stopped");
+      assert.deepEqual(tg.sent, [], "and the group is told nothing");
+      void a;
+    });
+  });
+});
+
+describe("5c: 'send it again' actually works", opts, () => {
+  test("the first preview is refused: the organizer is told it is waiting; 'yes' shows it and applies nothing; 'no' then cancels it", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const tg = new Telegram();
+      tg.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      const told = tg.sent.find((x) => x.ok)!;
+      assert.equal(told.text, en("change.sendFailed"));
+      assert.match(told.text, /waiting/);
+      assert.equal((await draftRows(pool, a)).length, 1);
+      tg.failPreviews = false;
+      await say(pool, a, "yes", tg, model);
+      assert.deepEqual(await stored(pool, a, "phases"), TWO, "'yes' to an unseen change applied nothing");
+      assert.equal(tg.previews.length, 1, "it was shown");
+      await say(pool, a, "no", tg, model);
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"]);
+      assert.deepEqual(await stored(pool, a, "phases"), TWO);
+    });
+  });
+
+  test("a 'no' to a change that was never shown SHOWS it first: an unseen change is not cancelled either", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const tg = new Telegram();
+      tg.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      tg.failPreviews = false;
+      await say(pool, a, "no", tg, model);
+      assert.equal(tg.previews.length, 1, "shown");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "and still waiting for an answer to what they can now see");
     });
   });
 });

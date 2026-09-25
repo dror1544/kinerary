@@ -104,17 +104,33 @@ export function questionOf(family: Family): "phases" | "travelers" {
 export type ParseResult = { ok: true; ops: Op[] } | { ok: false; error: string };
 
 /**
- * Characters a name may never carry: control characters (a newline lets a name
- * write its own lines into the preview), the line and paragraph separators, and
- * the bidi embedding / override / isolate family (which reorders what follows).
- * Marks such as RLM and LRM stay: Hebrew text uses them legitimately.
+ * Characters a name may never carry, because they let a name draw its own lines
+ * or hide what it says: control characters (a newline), the line and paragraph
+ * separators, EVERY format character (zero-width space/joiner, word joiner, BOM,
+ * soft hyphen, the bidi embedding / override / isolate family, invisible
+ * operators, deprecated formats, tags), private use, variation selectors, and
+ * the Hangul and combining-grapheme fillers.
+ *
+ * Except the three directional MARKS - RLM, LRM, ALM: Hebrew and Arabic text uses
+ * them legitimately.
  */
-const FORBIDDEN_TEXT = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069]/u;
+export const FORBIDDEN_TEXT = /(?![\u200E\u200F\u061C])[\p{Cc}\p{Cf}\p{Co}\u2028\u2029\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u3164\uFE00-\uFE0F\uFFA0\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u;
+const FORBIDDEN_TEXT_ALL = new RegExp(FORBIDDEN_TEXT.source, "gu");
 
 export function safeText(value: unknown, max = MAX_TEXT): string | null {
   if (typeof value !== "string") return null;
   const t = value.trim();
   return t.length > 0 && t.length <= max && !FORBIDDEN_TEXT.test(t) ? t : null;
+}
+
+/**
+ * Text as it may be ECHOED to a person, whoever wrote it: every forbidden
+ * character becomes a space and runs of whitespace collapse, so a name read from
+ * a document (or written by the agent) cannot start a line of its own or forge
+ * one. The parse refuses such names from the model; this covers everything else.
+ */
+export function cleanText(value: string): string {
+  return value.replace(FORBIDDEN_TEXT_ALL, " ").replace(/\s+/g, " ").trim();
 }
 const text = safeText;
 
@@ -832,11 +848,23 @@ export function draftDigest(draft: {
   result: Record<string, unknown>;
   unresolved: readonly unknown[];
   blocked: readonly unknown[];
+  preview: readonly Line[];
 }): string {
   return createHash("sha256")
-    .update(canonical({ ops: draft.ops, result: draft.result, unresolved: draft.unresolved, blocked: draft.blocked }))
+    .update(canonical({
+      ops: draft.ops, result: draft.result, unresolved: draft.unresolved, blocked: draft.blocked,
+      // What the person was WARNED about, too: it is computed from answers the
+      // change does not touch (bookings, food needs, who the organizer is), which
+      // can move while a preview is on screen.
+      warnings: warningLines(draft.preview),
+    }))
     .digest("hex")
     .slice(0, 8);
+}
+
+/** The lines of a preview that warn about, or describe an effect on, the rest of the trip. */
+export function warningLines(preview: readonly Line[]): Line[] {
+  return preview.filter((l) => l.key.startsWith("warn.") || l.key.startsWith("effect."));
 }
 
 // ── Merging a follow-up into a waiting draft ─────────────────────────────────
@@ -953,7 +981,8 @@ export interface HeldItem {
  */
 export function heldRefLists(answers: AnswerStore): { stops: HeldItem[]; travellers: HeldItem[] } {
   const label = (entry: Entry) => {
-    const names = namesOf(entry);
+    // Cleaned: the model is shown these, and a name from a document must not be able to write to it.
+    const names = namesOf(entry).map(cleanText).filter((n) => n !== "");
     const name = names.length > 1 && names[0] !== names[1] ? `${names[0]} (${names[1]})` : names[0] ?? "?";
     const bits: string[] = [];
     if (typeof entry.start === "string" || typeof entry.end === "string") {

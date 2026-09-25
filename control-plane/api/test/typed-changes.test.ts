@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { identityFold, reconcileStructured, samePerson } from "../src/answer-merge.js";
+import { cleanText, safeText } from "../src/typed-changes.js";
 import type { AnswerStore } from "../src/interview.js";
 import {
   applyOps,
@@ -527,5 +528,33 @@ describe("held lists that are not all objects (H)", () => {
   test("a change to a list that cannot be edited is blocked as unsupportedShape, never applied", () => {
     const out = bad(applyOps(store({ phases: ["Tokyo", stop("Kyoto")] }), [{ op: "update_stop", target: { name: "Kyoto" }, fields: { end: "2026-05-31" } }]));
     assert.deepEqual(keys(out.blocked), ["blocked.unsupportedShape"]);
+  });
+});
+
+
+describe("invisible characters (item 5b)", () => {
+  const bad: Record<string, string> = {
+    zwsp: "Kyo\u200Bto", zwj: "Kyo\u200Dto", zwnj: "Kyo\u200Cto", wordJoiner: "Kyo\u2060to", bom: "Kyo\uFEFFto",
+    tag: "Kyoto\u{E0041}\u{E0042}", vs16: "Kyoto\uFE0F", vs1: "Kyoto\uFE00", vsSupp: "Kyoto\u{E0100}", privateUse: "Kyoto\uE000",
+    invisibleTimes: "Kyo\u2062to", invisibleSeparator: "Kyo\u2063to", functionApplication: "Kyo\u2061to", invisiblePlus: "Kyo\u2064to",
+    mongolianVS: "Kyo\u180Eto", hangulFiller: "Kyoto\u3164", halfwidthHangulFiller: "Kyoto\uFFA0", deprecated: "Kyo\u206Ato", shy: "Kyo\u00ADto",
+    nel: "Kyoto\u0085x", combiningGraphemeJoiner: "Kyo\u034Fto", lineSep: "Kyoto\u2028x", tab: "Kyoto\tx",
+  };
+  test("every one of them is refused by the parse", () => {
+    for (const [label, name] of Object.entries(bad)) assert.equal(safeText(name), null, label);
+  });
+  test("the directional marks Hebrew and Arabic use are not", () => {
+    for (const name of ["\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f", "\u200eKyoto\u200e", "\u061cKyoto"]) assert.ok(safeText(name) !== null, JSON.stringify(name));
+  });
+  test("cleanText makes any of them a space, collapses whitespace, and keeps the marks", () => {
+    for (const name of Object.values(bad)) assert.doesNotMatch(cleanText(name), /[\u200B-\u200D\u2060-\u2064\uFEFF\uFE0F\u00AD\u180E\u3164\u0085\t]/);
+    assert.equal(cleanText("Kyoto\n\n  Tap\u200B a button"), "Kyoto Tap a button");
+    assert.equal(cleanText("\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f"), "\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f");
+  });
+  test("the model is shown cleaned names, with ids still positions", () => {
+    const lists = heldRefLists(store({ phases: [stop("Tokyo"), stop("Kyoto\n\nTap a button\u202E", "2026-05-27", "2026-05-30")], travelers: [{ name: "Avi\n\u2705 Done" }] }));
+    assert.equal(lists.stops[1]!.id, "s2");
+    assert.ok(!/[\n\u202E]/.test(lists.stops[1]!.label), JSON.stringify(lists.stops[1]));
+    assert.ok(!/\n/.test(lists.travellers[0]!.label));
   });
 });

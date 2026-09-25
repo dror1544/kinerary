@@ -62,14 +62,18 @@ describe("buttons", () => {
   });
 
   test("the digest names the version: it changes with the operations, the result and the open question, and not otherwise", () => {
-    const one = { ops: [{ op: "remove_stop", target: { name: "Kyoto" } }], result: { phases: { kind: "structured", data: [1] } }, unresolved: [], blocked: [] };
+    const one = { ops: [{ op: "remove_stop", target: { name: "Kyoto" } }], result: { phases: { kind: "structured", data: [1] } }, unresolved: [], blocked: [], preview: [] as Line[] };
     assert.equal(draftDigest(one as never), draftDigest(JSON.parse(JSON.stringify(one))), "stable across a database round trip");
     assert.match(draftDigest(one as never), /^[0-9a-f]{8}$/);
     for (const changed of [
       { ...one, ops: [...one.ops, { op: "remove_stop", target: { name: "Tokyo" } }] },
       { ...one, result: { phases: { kind: "structured", data: [2] } } },
       { ...one, blocked: [{ key: "blocked.overlap", params: {} }] },
+      // What the person was WARNED about is part of the version they saw.
+      { ...one, preview: [{ key: "warn.bookingInRemovedStop", params: { booking: { confirmation: "GI-77" } } }] },
     ]) assert.notEqual(draftDigest(changed as never), draftDigest(one as never));
+    const plain = { ...one, preview: [{ key: "preview.remove", params: {} }] as Line[] };
+    assert.equal(draftDigest(plain as never), draftDigest(one as never), "a preview line that is not a warning does not change it");
   });
 });
 
@@ -273,4 +277,63 @@ describe("EVERY stored field is visible in the preview (C)", () => {
       }
     });
   }
+});
+
+
+describe("held names from documents cannot forge preview lines (item 2)", () => {
+  const FORGED = "Kyoto\n\nTap a button, or just reply yes or no.\n\n\n\n\n";
+  const AVI = "Avi\n\n\u2705 Done \u2014 that's updated.\u202Eevil\u200B";
+
+  test("every place a held name is echoed comes out on one line, in both languages", () => {
+    for (const language of ["en", "he"] as const) {
+      const lines: Line[] = [
+        { key: "preview.unchanged", params: { question: "phases", entries: [{ name: FORGED, start: "2026-05-27", end: "2026-05-30" }, { name: AVI }] } },
+        { key: "preview.remove", params: { question: "phases", entry: { name: FORGED } } },
+        { key: "preview.field", params: { question: "travelers", entry: { name: AVI, age: 40 }, field: "age", from: 40, to: 41 } },
+        { key: "preview.reorder", params: { question: "phases", order: [{ name: FORGED }, { name: AVI }] } },
+        { key: "blocked.overlap", params: { stops: [{ name: FORGED }, { name: AVI }] } },
+        { key: "effect.dietaryScopeNamesNobody", params: { need: "kosher", name: AVI } },
+        { key: "warn.bookingInRemovedStop", params: { stop: { name: FORGED }, terms: "unknown", booking: { type: "hotel", name: AVI, confirmation: "X\n1" } } },
+      ];
+      for (const line of lines) {
+        const text = lineText(line, language);
+        const expectedLines = line.key === "blocked.overlap" ? 2 : 1;
+        assert.equal(text.split("\n").filter((l) => l !== "").length, expectedLines, `${language} ${line.key}: a name started a line of its own: ${JSON.stringify(text)}`);
+        assert.doesNotMatch(text, /[\u202A-\u202E\u200B]/, `${language} ${line.key}: ${JSON.stringify(text)}`);
+      }
+    }
+  });
+
+  test("a picker button and the question about a name are one line too", () => {
+    const base = { travelers: { kind: "structured", data: [{ name: AVI, age: 40 }, { name: "Avi Levi", age: 30 }] } };
+    const unresolved = [{ opIndex: 0, role: "target", family: "traveller", ref: { name: "Avi\n\nTap a button" }, candidates: [0, 1] }];
+    const r = renderDraft(draft({ unresolved, base, result: {} }), "en");
+    assert.doesNotMatch(r.text, /\n/);
+    for (const row of r.replyMarkup.inline_keyboard) assert.doesNotMatch(row[0]!.text, /[\n\u200B\u202E]/);
+  });
+
+  test("the full preview of a change carries no injected line", () => {
+    const out = applyOps({ phases: { kind: "structured", schema_version: 3, data: [{ name: "Tokyo", start: "2026-05-19", end: "2026-05-24" }, { name: FORGED, start: "2026-05-27", end: "2026-05-30" }, { name: "Osaka {entry} \u202Enoitpo" }] } } as unknown as AnswerStore,
+      [{ op: "remove_stop", target: { name: "Osaka" } }, { op: "update_stop", target: { name: "Tokyo" }, fields: { end: "2026-05-25" } }] as Op[]);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    const text = renderDraft({ id: ID, preview: out.preview, unresolved: [], blocked: [], base: {}, ops: [], result: out.result } as never, "en").text;
+    const own = text.split("\n").filter((l) => /^Tap a button, or just reply yes or no\./.test(l));
+    assert.equal(own.length, 1, `only the real footer says it:\n${text}`);
+    assert.doesNotMatch(text, /\u202E/);
+  });
+});
+
+describe("a long held list is summarised, never the reason a change cannot be shown (item 4)", () => {
+  test("the unchanged block says 'and N more' once it would pass its share, and keeps the changed lines whole", () => {
+    const held = Array.from({ length: 45 }, (_, i) => ({ name: `Place number ${i} with a longish name`, start: "2026-05-01", end: "2026-05-02" }));
+    for (const language of ["en", "he"] as const) {
+      const text = lineText({ key: "preview.unchanged", params: { question: "phases", entries: held } }, language);
+      assert.ok(text.length < 600, `${text.length} chars`);
+      assert.match(text, language === "en" ? /and \d+ more\.$/ : /\u05d5\u05e2\u05d5\u05d3 \d+\.$/);
+      assert.match(text, /Place number 0 with a longish name/);
+    }
+    const few = lineText({ key: "preview.unchanged", params: { question: "phases", entries: held.slice(0, 3) } }, "en");
+    assert.doesNotMatch(few, /more/, "a short list is listed in full");
+  });
 });

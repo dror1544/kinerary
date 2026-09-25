@@ -22,7 +22,7 @@ import {
 import { structuredLog } from "./redaction.js";
 import { listTripDocuments } from "./document-registry.js";
 import { canonical, entryIdentity, stripVisitMarkers } from "./answer-merge.js";
-import { draftDigest, type Op } from "./typed-changes.js";
+import { applyOps, draftDigest, warningLines, type Line, type Op } from "./typed-changes.js";
 import { listAnswerSources, type SourceDisposition } from "./answer-provenance.js";
 
 /**
@@ -4072,10 +4072,11 @@ export async function applyPendingChangeForChat(
       base: Record<string, unknown>;
       ops: Op[];
       result: Record<string, IntakeAnswer>;
+      preview: Line[];
       unresolved: unknown[];
       blocked: unknown[];
     }>(
-      `SELECT id, session_id, status, base, ops, result, unresolved, blocked
+      `SELECT id, session_id, status, base, ops, result, preview, unresolved, blocked
          FROM control_plane.intake_pending_changes WHERE id = $1 FOR UPDATE`,
       [draftId],
     );
@@ -4100,6 +4101,18 @@ export async function applyPendingChangeForChat(
         await client.query("ROLLBACK");
         return { ok: false, reason: "STALE", detail: questionId };
       }
+    }
+
+    // The warnings on a preview (a confirmed booking a removal leaves behind, a
+    // dietary scope that would name nobody, an organizer who would un-match) are
+    // computed from answers this change does not touch, so `base` does not cover
+    // them. They are recomputed HERE, from the answers as they are now: if they
+    // differ from what the person was shown, nothing is applied and the caller
+    // shows the current preview.
+    const fresh = applyOps(session.answers, draft.ops);
+    if (fresh.ok && canonical(warningLines(fresh.preview)) !== canonical(warningLines(draft.preview))) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "UPDATED" };
     }
 
     const written: AnswerStore = {};
