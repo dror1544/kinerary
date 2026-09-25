@@ -131,7 +131,9 @@ which is why it leads.
      string.
    - **The hemisphere lookup's remaining coarseness is #167, deliberately last and still
      OPEN, not built here:** a city-only destination ("Sydney") resolves north; a
-     multi-country string resolves south if *any* part is southern; a Hebrew geresh
+     multi-country string is decided by its last comma-separated segment only ("Spain, Chile"
+     resolves south, "Chile, Spain" north; "and"-joined lists such as "Argentina and Chile"
+     are not split and resolve north); a Hebrew geresh
      variant ("צ׳ילה", U+05F3) does not match and resolves north (the ASCII-apostrophe
      form does). Everything unresolved defaults north.
 4. **No RSVP activities — BUILT (2026-09-23), #169, PR #171 (merge `0bba091`; feature commit `25805f1`).**

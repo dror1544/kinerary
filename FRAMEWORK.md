@@ -28,12 +28,12 @@ Most families plan trips in a WhatsApp group. This replaces that chaos with a pr
 | 8 | **Task management** | Pre-trip checklist with deadline badges; server-backed completion state |
 | 9 | **Venue ratings** | 5-star ratings per attraction with per-user chips |
 | 10 | **Venue comments** | Comment threads on any attraction |
-| 11 | **RSVP activities** | Sign up yes/no/maybe for optional activities; live response chips |
+| 11 | **RSVP activities** | Sign up yes/no/maybe for optional activities; live response chips. Cards come from `phases[].rsvp_activities[]` — hand-authored, or derived for a control-plane-provisioned trip from its unconfirmed attractions (see "What to fill in after scaffolding") |
 | 12 | **Photo gallery** | Drag-drop upload with progress; per-phase galleries |
 | 13 | **Immich sync** | Optional: auto-sync photos to self-hosted Immich; share links per phase |
 | 14 | **Photo reactions** | 5 emoji reactions on photos with toggle & counts |
 | 15 | **Photo comments** | Thread comments on any uploaded photo |
-| 16 | **Packing lists** | Per-phase checklists with localStorage persistence |
+| 16 | **Packing lists** | Per-phase checklists with localStorage persistence. A general list (`packing_general`, else a built-in 4-item fallback) plus each phase's `packing[]` — hand-authored, or derived per phase for a control-plane-provisioned trip (see "What to fill in after scaffolding") |
 | 17 | **Budget tracker** | Multi-phase expense breakdown; estimate vs. actual; per-person totals |
 | 18 | **Trivia game** | Real-time multiplayer family trivia via SSE; admin control; leaderboard |
 | 19 | **Booking confirmations** | All reservations with copy-to-clipboard conf codes; inline PDF viewer |
@@ -118,8 +118,8 @@ Everything trip-specific lives in **`trip/trip.config.json`**. The framework cod
     "accommodation": { "name": "Example Hotel", "confirmation": "ABC-123456", "weatherKey": "nyc" },
     "mapStop": { "lat": 40.7128, "lng": -74.006 },
     "venues": [{ "id": "ny-tms", "name": "Times Square", "url": "..." }],
-    "rsvp_activities": [],
-    "packing": []
+    "rsvp_activities": [{ "id": "ny-show", "title": { "he": "...", "en": "Broadway show" }, "date": "2027-03-12" }],
+    "packing": [[{ "he": "ביגוד", "en": "Clothing" }, { "he": "מעיל חם", "en": "Warm jacket" }]]
   }],
   "map": { "center": [38, -98], "zoom": 4, "stops": [] },
   "tasks": [],
@@ -268,6 +268,21 @@ docker compose up -d --build
 **What to fill in after scaffolding:**
 - `phases[].days[]` — day-by-day itinerary (optional, for itinerary display)
 - `phases[].venues[]` — points of interest with Maps/Waze URLs
+- `phases[].packing[]` — `[[{he,en} category, {he,en} item], ...]`. Optional by hand; a
+  control-plane-provisioned trip gets it derived (`transformer._derive_phase_packing`, #162):
+  a small fixed table picked by season bucket, from the destination's hemisphere and the
+  phase's start month. Deterministic — no weather call, no model. A phase with no destination
+  or no start date gets none (key absent). The hemisphere lookup is coarse and still open as
+  #167: a city-only destination resolves north, a multi-country string resolves by
+  which parts the country extraction picks up (checked: "Spain, Chile" resolves south,
+  "Chile, Spain" north), and a Hebrew geresh spelling of a country misses. The trip-level
+  `packing_general` is separate and keeps its own frontend fallback.
+- `phases[].rsvp_activities[]` — `{id, title, desc?, date?}` vote cards. Optional by hand; a
+  control-plane-provisioned trip gets them derived (`transformer.derive_rsvp_activities`,
+  #169) from its **unconfirmed** attraction-typed `travel_anchors` — a confirmed attraction is
+  already happening, so it is a Bookings row only. The id is a stable hash of what the anchor
+  is, because it is the vote's primary key in `rsvps`. Key absent, not `[]`, when a phase has none.
+  What was cut, and why: [`docs/sprint6-tracks.md`](docs/sprint6-tracks.md) Track 1a items 3–4.
 - `budget.seed_items[]` — initial budget estimates
 - `tasks[]` — pre-trip task list with deadlines
 - `bookings` — confirmed reservations with confirmation codes
