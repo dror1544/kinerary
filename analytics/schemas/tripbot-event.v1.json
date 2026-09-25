@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kinerary.invalid/analytics/schemas/tripbot-event.v1.json",
+  "title": "Trip Bot assistant event, v1",
+  "description": "One metadata-only fact about the Trip Bot's conversation with a family, as stored in control_plane.assistant_events. An ALLOW-LIST: every property is named here, additionalProperties is false, and there is deliberately no field that can carry text, a Telegram chat or user id, a name, a filename, a URL, a digest of any of those, or a tool argument/result. The relay writes delivery facts only and never an outcome of `answered` (design doc section 6.3: an emitter that cannot see tool results must not claim the task succeeded). Mirrored by control-plane/api/src/analytics/contract.ts; test/assistant-events-contract.test.ts fails if the two disagree.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "occurred_at", "source_service", "event_type", "outcome"],
+  "properties": {
+    "event_id": {
+      "description": "Random per-event id; the idempotency key. Writing the same id twice stores one row.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "trip_id": {
+      "description": "control_plane.trips.id. Every event type requires it (allOf below) and it must name an existing trip when written. The top-level type admits null only because a stored row's trip_id becomes null when its trip is deleted (ON DELETE SET NULL).",
+      "type": ["string", "null"],
+      "pattern": "^trip_[A-Za-z0-9]{8,64}$"
+    },
+    "occurred_at": {
+      "description": "An instant in strict RFC 3339: 'T' separator, 'Z' or '+hh:mm', at most six fractional digits (what Postgres keeps). The pattern bounds the shape; format date-time adds the calendar check (no 2026-02-30).",
+      "type": "string",
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d{1,6})?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$",
+      "format": "date-time"
+    },
+    "source_service": {
+      "description": "Who observed the fact. Only the relay emits in v1; a later emitter adds its own value.",
+      "enum": ["relay"]
+    },
+    "event_type": {
+      "enum": [
+        "ignored_not_addressed",
+        "request_forwarded",
+        "request_to_relay",
+        "turn_lost",
+        "reply_sent",
+        "relay_tool_completed"
+      ]
+    },
+    "turn_id": {
+      "description": "Opaque random id linking a request to the replies attributed to it. Random, never derived from a message, chat or person.",
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "channel_type": {
+      "enum": ["group", "organizer_dm", "other", "unclassified", null]
+    },
+    "trigger_type": {
+      "enum": ["dm", "mention", "name", "reply_to_bot", "reply_window", "not_addressed", "unclassified", null]
+    },
+    "requester_role": {
+      "enum": ["organizer", "participant", "unknown", "unclassified", null]
+    },
+    "outcome": {
+      "description": "A delivery fact or, where the relay itself did the work, the substantive outcome. `answered` is not in this set on purpose.",
+      "enum": [
+        "ignored_not_addressed",
+        "dispatched",
+        "lost_gateway_unavailable",
+        "lost_companion_unreachable",
+        "reply_delivered",
+        "failed_delivery",
+        "reply_suppressed",
+        "failed_tool",
+        "blocked_by_policy",
+        "correction_proposed",
+        "no_new_information"
+      ]
+    },
+    "response_latency_ms": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 86400000
+    },
+    "message_length_bucket": {
+      "enum": ["none", "1_40", "41_160", "161_640", "641_plus", null]
+    },
+    "media_kind": {
+      "enum": ["none", "photo", "document", "audio", "other", "unclassified", null]
+    },
+    "metadata": {
+      "description": "Bounded counts and flags for a document's fate. Numbers and booleans only, so nothing textual can ride in it.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attachments_joined": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "documents": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "document_held": { "type": "boolean" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event_type": { "const": "ignored_not_addressed" } } },
+      "then": {
+        "required": ["trip_id", "channel_type", "trigger_type", "requester_role", "message_length_bucket", "media_kind"],
+        "properties": {
+          "outcome": { "enum": ["ignored_not_addressed"] },
+          "trip_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "trigger_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "message_length_bucket": { "type": "string" },
+          "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "request_forwarded" } } },
+      "then": {
+        "required": ["trip_id", "turn_id", "channel_type", "trigger_type", "requester_role", "message_length_bucket", "media_kind"],
+        "properties": {
+          "outcome": { "enum": ["dispatched"] },
+          "trip_id": { "type": "string" },
+          "turn_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "trigger_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "message_length_bucket": { "type": "string" },
+          "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "request_to_relay" } } },
+      "then": {
+        "required": ["trip_id", "turn_id", "channel_type", "trigger_type", "requester_role", "message_length_bucket", "media_kind"],
+        "properties": {
+          "outcome": { "enum": ["dispatched"] },
+          "trip_id": { "type": "string" },
+          "turn_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "trigger_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "message_length_bucket": { "type": "string" },
+          "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "turn_lost" } } },
+      "then": {
+        "required": ["trip_id", "channel_type", "trigger_type", "requester_role", "message_length_bucket", "media_kind"],
+        "properties": {
+          "outcome": { "enum": ["lost_gateway_unavailable", "lost_companion_unreachable"] },
+          "trip_id": { "type": "string" },
+          "channel_type": { "type": "string" },
+          "trigger_type": { "type": "string" },
+          "requester_role": { "type": "string" },
+          "message_length_bucket": { "type": "string" },
+          "media_kind": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "reply_sent" } } },
+      "then": {
+        "required": ["trip_id", "message_length_bucket"],
+        "properties": {
+          "outcome": { "enum": ["reply_delivered", "failed_delivery", "reply_suppressed"] },
+          "trip_id": { "type": "string" },
+          "message_length_bucket": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "relay_tool_completed" } } },
+      "then": {
+        "required": ["trip_id", "turn_id"],
+        "properties": {
+          "outcome": { "enum": ["failed_tool", "blocked_by_policy", "correction_proposed", "no_new_information"] },
+          "trip_id": { "type": "string" },
+          "turn_id": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

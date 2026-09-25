@@ -46,6 +46,7 @@ import { startDocumentSweeper } from "../document-sweeper.js";
 import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model-runner.js";
 import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
+import { assistantEventsFromEnv } from "../analytics/emitter.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -280,6 +281,13 @@ async function main(): Promise<void> {
     : undefined;
   const mediaBaseUrl = `http://${runtime.host === "0.0.0.0" ? "127.0.0.1" : runtime.host}:${runtime.port}`;
 
+  // Assistant events (#177): metadata-only facts about each trip's
+  // conversation, written to the control-plane database. OFF unless
+  // ASSISTANT_EVENTS_ENABLED=1 — and unset is deliberately off, the opposite
+  // of INTERPRET_*: shipping this code must never be what switches recording
+  // on. Undefined here means every hook below records nothing.
+  const assistantEvents = assistantEventsFromEnv(process.env, runtime.db, log);
+
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
     telegram: runtime.telegram,
@@ -287,6 +295,7 @@ async function main(): Promise<void> {
     host: runtime.host,
     mediaStore,
     log,
+    ...(assistantEvents ? { assistantEvents } : {}),
     ...(runtime.multiplexGatewayId ? { fallbackGatewayId: runtime.multiplexGatewayId } : {}),
     // Track 4: on an interview chat the agent's words reach the organizer only
     // through `say_for_chat` / `ask_question_for_chat`, so the router keeps the
@@ -394,6 +403,7 @@ async function main(): Promise<void> {
       // without one still works: the router asks its own questions from
       // intake-copy.ts, which is slower, not broken.
       modelRunner,
+      ...(assistantEvents ? { assistantEvents } : {}),
       log,
     });
     // Clears interrupted document writes and claims — see document-sweeper.ts.
@@ -419,8 +429,10 @@ async function main(): Promise<void> {
       stopPolling?.();
       stopSweeping?.();
       stopOverrides?.();
-      void connector
-        .close()
+      // One last bounded write of what is queued; a failure only drops events.
+      void (assistantEvents?.stop() ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => connector.close())
         .then(() => runtime.db?.end())
         .then(() => process.exit(0))
         .catch(() => process.exit(1));
