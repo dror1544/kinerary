@@ -1667,6 +1667,10 @@ class ProvisionerWorker:
         # presenting as two. `hermes_profile` stays None when the companion
         # did not install, and the binding is opened anyway.
         hermes_profile: str | None = None
+        # Set when the trip-mcp bridge raised. Read where 'reachable' is
+        # written, so a successful chat binding cannot overwrite the fact that
+        # the companion cannot read its own trip (issue #119).
+        bridge_failed = False
         try:
             provenance = self._load_intake_provenance(conn, intake_version_id)
             handoff = build_companion_handoff(
@@ -1742,6 +1746,7 @@ class ProvisionerWorker:
                             },
                         )
                     except Exception:
+                        bridge_failed = True
                         logger.warning(
                             "provisioner.mcp_bridge_failed",
                             extra={"trip_id": trip_id, "hermes_profile": hermes_profile},
@@ -1916,7 +1921,14 @@ class ProvisionerWorker:
                     # that actually installed — never later, from the presence
                     # of a binding row. A binding can outlive the profile it
                     # points at, and can now legitimately exist without one.
-                    _record_reachability(conn, trip_id, reachable=True)
+                    #
+                    # Except after a bridge that raised: that run already wrote
+                    # TRIP_MCP_BRIDGE_FAILED, and a bound chat says nothing
+                    # about whether the companion can read the trip. Writing
+                    # 'reachable' here erased the fact in the common case, so
+                    # the fleet monitor never saw it (issue #119).
+                    if not bridge_failed:
+                        _record_reachability(conn, trip_id, reachable=True)
                 else:
                     logger.info("provisioner.chat_bound_without_companion", extra={
                         "trip_id": trip_id,

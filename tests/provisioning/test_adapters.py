@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 from provisioning.adapters import (
@@ -405,6 +408,60 @@ class AdapterTests(unittest.TestCase):
         adapter.delete(LXC_SPEC)
 
         self.assertFalse(any("pct stop" in c or "pct destroy" in c for c in ssh.commands))
+
+    # ── #119: what a second bootstrap does to the site's agent key ───────────
+    def _env_block(self, tmp: str) -> str:
+        """The `.env`-minting part of the real bootstrap script (from its guard
+        to the systemd unit), retargeted at a temp directory, so the test runs
+        the shell the container would run rather than reading it."""
+        ssh = FakeProxmoxSsh(nextid="203")
+        spec = LxcSpec(
+            "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8,
+            "vmbr0", "192.0.2.60/24", "192.0.2.1", "192.0.2.2",
+            "/srv/nfs/tokyo-2026", f"{tmp}/nfs", "tokyo-2026",
+        )
+        ProxmoxLxcAdapter(ssh).create(spec)
+        script = ssh.commands[3].replace("/opt/kinerary", f"{tmp}/app")
+        start = script.index(f"if [ ! -f {tmp}/app/.env ]")
+        end = script.index("cat > /etc/systemd/system/kinerary-server.service")
+        return script[start:end]
+
+    def _key(self, tmp: str) -> str:
+        with open(f"{tmp}/app/.env") as fh:
+            return re.search(r"^HERMES_API_KEY=(\S+)$", fh.read(), re.M).group(1)
+
+    def test_a_bootstrap_after_the_env_file_is_lost_mints_a_new_key_and_prints_none(self) -> None:
+        """Documents WHY the worker must re-run the bridge after a bootstrap
+        (the key changes) and that nothing the script prints carries a key
+        (its stdout reaches RuntimeError text, and so worker logs)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
+            block = self._env_block(tmp)
+            outs = []
+            keys = []
+            for _ in range(2):
+                proc = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + block],
+                    capture_output=True, text=True, check=True,
+                )
+                outs.append(proc.stdout + proc.stderr)
+                keys.append(self._key(tmp))
+                os.remove(f"{tmp}/app/.env")
+            self.assertNotEqual(keys[0], keys[1])
+            for out in outs:
+                for k in keys:
+                    self.assertNotIn(k, out)
+            # No key is kept anywhere but the site's own .env (no stored copy).
+            self.assertEqual(os.listdir(f"{tmp}/nfs"), [])
+
+    def test_the_bootstrap_script_never_traces_or_echoes_the_key(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        script = ssh.commands[3]
+        self.assertNotIn("set -x", script)
+        for line in script.splitlines():
+            if "HERMES_API_KEY" in line:
+                self.assertNotRegex(line, r"\b(echo|printf|tee|logger)\b", line)
 
     def test_needs_bootstrap_is_false_for_an_absent_container(self) -> None:
         adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())

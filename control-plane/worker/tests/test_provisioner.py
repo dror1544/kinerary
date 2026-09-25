@@ -1051,6 +1051,63 @@ class CompanionProfileTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
 
+    def test_the_bridge_is_re_run_after_every_deploy_never_before_it(self) -> None:
+        """Issue #119, design (d): no stored copy of the trip's agent key. The
+        bridge re-reads the container's CURRENT key each time its setup runs,
+        so what keeps it fresh is ORDER: a deploy (which may bootstrap, and
+        so mint a key) is always followed by exactly one bridge setup, in the
+        same run, and never preceded by one that would then go stale."""
+        events: list[str] = []
+
+        class OrderedDeploy(FakeDeployAdapter):
+            def deploy(self, slug, config, **kw):
+                events.append("deploy")
+                return super().deploy(slug, config, **kw)
+
+        class OrderedBridge(FakeMcpBridgeAdapter):
+            def setup(self, slug, profile_name):
+                events.append("bridge")
+                return super().setup(slug, profile_name)
+
+        bridge = OrderedBridge()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=OrderedDeploy(), worker_id="test-bridge-order",
+            companion=FakeCompanionProfileAdapter(), mcp_bridge=bridge,
+        )
+        self.assertTrue(worker.run_once())
+        self.assertEqual(events, ["deploy", "bridge"])
+        self.assertEqual(len(bridge.calls), 1)
+
+    def test_no_bridge_run_when_the_deploy_did_not_complete(self) -> None:
+        bridge = FakeMcpBridgeAdapter()
+        worker = ProvisionerWorker(
+            db_url=DB_URL, deploy=FakeDeployAdapter(fail=True), worker_id="test-bridge-nodeploy",
+            companion=FakeCompanionProfileAdapter(), mcp_bridge=bridge,
+        )
+        worker.run_once()
+        self.assertEqual(bridge.calls, [])
+
+    def test_a_bridge_failure_is_not_logged_with_a_key(self) -> None:
+        key = "ab" * 32
+
+        class LeakyBridge:
+            def setup(self, slug, profile_name):
+                # What the adapter raises is the bridge's own stderr tail; the
+                # worker must record a reason, not repeat detail.
+                raise RuntimeError("trip-mcp bridge over ssh exited 1: boom")
+
+        with self.assertLogs("control_plane_worker.provisioner", level="WARNING") as cm:
+            ProvisionerWorker(
+                db_url=DB_URL, deploy=FakeDeployAdapter(), worker_id="test-bridge-nokey",
+                companion=FakeCompanionProfileAdapter(), mcp_bridge=LeakyBridge(),
+            ).run_once()
+        self.assertNotIn(key, "\n".join(cm.output))
+        state = self.conn.execute(
+            "SELECT unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(state["unreachable_reason"], "TRIP_MCP_BRIDGE_FAILED")
+
     def test_a_failing_bridge_does_not_block_the_chat_binding_or_the_job(self) -> None:
         companion = FakeCompanionProfileAdapter()
 
@@ -1074,6 +1131,16 @@ class CompanionProfileTests(unittest.TestCase):
             "SELECT state FROM control_plane.jobs WHERE trip_id = %s", (self.fix["trip_id"],),
         ).fetchone()
         self.assertEqual(job_state["state"], "succeeded")
+        # A FACT, and it survives the binding that succeeded after it: the
+        # 'reachable' write beside the binding used to erase it (issue #119).
+        state = self.conn.execute(
+            "SELECT reachability, unreachable_reason FROM control_plane.trips WHERE id = %s",
+            (self.fix["trip_id"],),
+        ).fetchone()
+        self.assertEqual(
+            (state["reachability"], state["unreachable_reason"]),
+            ("unreachable", "TRIP_MCP_BRIDGE_FAILED"),
+        )
 
     def test_a_chat_already_serving_another_trip_is_not_taken(self) -> None:
         """The provisioner must not retarget a chat that is in force for another
