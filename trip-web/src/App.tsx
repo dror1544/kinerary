@@ -12,6 +12,7 @@ import { Readiness, CurrencyConverter } from "./readiness";
 import { GroupActivities, LostFound, ActivityRsvp, VenueFeedback } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
+import { AssistantConnect } from "./assistant-connect";
 import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
@@ -2328,6 +2329,8 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
           <MemberLogins config={config} lang={lang} />
         </section>
       ) : null}
+      {/* Everyone on the trip: organizers connect read-and-write, members read only. */}
+      <AssistantConnect lang={lang} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
       <div className="workflow-grid">
         {isOrganizer ? (
           <a className="workflow-link organizer-only" href={classicHref()}>

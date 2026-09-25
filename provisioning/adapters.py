@@ -356,6 +356,35 @@ server {{
     client_max_body_size 500m;
   }}
 
+  # An organizer's own Claude or ChatGPT (server/trip-mcp). Express answers
+  # 404 on all of these unless the trip set TRIP_MCP_ENABLED, so routing them
+  # on every trip exposes nothing; without these blocks they are static 404s
+  # and the feature cannot be switched on without editing nginx by hand.
+  location = /mcp {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Connection '';
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_read_timeout 300s;
+    client_max_body_size 5m;
+  }}
+
+  location ^~ /oauth/ {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    # Registration and token requests are a few hundred bytes.
+    client_max_body_size 64k;
+  }}
+
+  location ^~ /.well-known/oauth- {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }}
+
   location /photo/ {{
     proxy_pass http://127.0.0.1:3000;
     proxy_set_header Host $host;
