@@ -515,13 +515,20 @@ export function structuringChildEnv(
  * CLAUDE_CODE_OAUTH_TOKEN did exactly that on the VM on 2026-09-11.
  * CLAUDE_CONFIG_DIR stays for the same reason — the VM takes its effort from
  * the settings.json there, and losing it falls back to the CLI's default.
+ *
+ * USER and LOGNAME stay too, for the same reason: on macOS the CLI finds its
+ * login in the Keychain under the account name taken from USER, so without it
+ * every call answers "Not logged in" and the task returns FAILED. That is what
+ * the allow-list did to the Mac after #192 — found 2026-09-25 by running the
+ * real-model harness (HOME and PATH alone: "Not logged in"; plus USER: works;
+ * LOGNAME alone: does not). Neither is a secret: they name who runs the relay.
  */
 export function claudeChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return structuringChildEnv(
     [
       "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
       "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-      "XDG_CACHE_HOME",
+      "XDG_CACHE_HOME", "USER", "LOGNAME",
     ],
     source,
   );

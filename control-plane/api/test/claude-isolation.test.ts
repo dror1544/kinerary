@@ -31,6 +31,11 @@ const MAY_REACH_THE_CHILD = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
   "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
   "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+  // Who is logged in — not a secret. On macOS the CLI finds its login in the
+  // Keychain by account name, taken from USER: without it every call answers
+  // "Not logged in" and the task returns FAILED (found 2026-09-25, running the
+  // real-model harness on the Mac after #192 narrowed the environment).
+  "USER", "LOGNAME",
   "TMPDIR", "TMP", "TEMP",
   "LANG", "LC_ALL", "LC_CTYPE",
   "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
