@@ -106,8 +106,59 @@ which is why it leads.
    *per-country-per-month* rather than per-trip, which is the difference between
    a cost that grows with customers and one that grows with the world.
 2. **No pre-trip tasks** — Readiness reads `config.tasks`; the transformer never emits it. FRAMEWORK feature #8. Undocumented anywhere until now.
-3. **No per-phase packing lists** — `phase.packing` never emitted; a hardcoded 4-item fallback shows. FRAMEWORK #16.
-4. **No RSVP activities** — `phase.rsvp_activities` never emitted, so the whole RSVP surface is invisible. FRAMEWORK #11. Corroborated by the live-trip report: *"RSVP/trivia features: unused"*.
+3. **No per-phase packing lists — BUILT (2026-09-23), #162, PR #165 (merge `20f7419`; feature commit `28e4ec7`).**
+   `phase.packing` never emitted; a hardcoded 4-item fallback shows. FRAMEWORK #16.
+   **What shipped:** `transformer._derive_phase_packing` emits `phase.packing` — `[{he,en}
+   category, {he,en} item]` pairs, the shape `readiness.tsx` reads at `:58` — from a
+   coarse season bucket (`_season_bucket`: cold / rainy / hot / moderate) of the trip
+   destination's hemisphere crossed with the phase's **start month**, mapped to a small
+   fixed bilingual table (`_PACKING_ITEMS_BY_SEASON`). Deterministic: no network, no model.
+   The hemisphere (`_destination_hemisphere`) resolves through the file's existing
+   `_country_keys()` / `_COUNTRY_ALIASES` — the path the currency and timezone lookups
+   already use — after review showed the first pass (a raw substring list) read every
+   Hebrew-typed destination as north and matched "peru" inside "Perugia, Italy"; eleven
+   Hebrew southern-hemisphere aliases were added for it, and `_KNOWN_COUNTRY_HEMISPHERE`
+   lists eleven southern countries. `destination` is threaded into `_derive_phases`
+   as the raw typed answer, so "no destination" suppresses packing.
+   **Deliberately NOT built (cut, not dropped):**
+   - No packing for a phase with no destination or no start date — it gets nothing
+     rather than a guessed season.
+   - The trip-level `config.packing_general` is untouched; it keeps its own frontend fallback.
+   - No live weather, no per-destination climate (no monsoon calendars, desert vs
+     rainforest); spring is "rainy" and autumn "moderate" in both hemispheres.
+   - A phase spanning several months is bucketed on its start month alone.
+   - One hemisphere per **trip**, not per phase: every phase uses the trip's destination
+     string.
+   - **The hemisphere lookup's remaining coarseness is #167, deliberately last and still
+     OPEN, not built here:** a city-only destination ("Sydney") resolves north; a
+     multi-country string resolves south if *any* part is southern; a Hebrew geresh
+     variant ("צ׳ילה", U+05F3) does not match and resolves north (the ASCII-apostrophe
+     form does). Everything unresolved defaults north.
+4. **No RSVP activities — BUILT (2026-09-23), #169, PR #171 (merge `0bba091`; feature commit `25805f1`).**
+   `phase.rsvp_activities` never emitted, so the whole RSVP surface is invisible. FRAMEWORK #11. Corroborated by the live-trip report: *"RSVP/trivia features: unused"*.
+   **What shipped:** `transformer.derive_rsvp_activities`, called from `transform_intake`
+   beside the anchor-derived days, writes `phases[].rsvp_activities[]` (`{id, title,
+   desc?, date?}`) from the **unconfirmed, attraction-typed `travel_anchors`** (read
+   through `_ANCHOR_TYPE_MAP`, not a second word list). It is not exclusive with
+   `derive_bookings`: the same anchor stays a Bookings row and also becomes a vote. An
+   anchor with no date, or a date in no phase, parks on the first phase. The vote id is
+   a stable hash (`_stable_id("rsvp", name, parsed date, detail)`), because the `rsvps`
+   table keys votes by that string alone and a moving id orphans votes silently. Three
+   behaviour-preserving extractions came with it (`_stable_id`, `_first_phase_id`,
+   `_anchor_label_text`); `derive_bookings`' `seed_key`s are pinned byte-identical by
+   literal-value tests. The site already rendered it (`site/app.js:3215`, `:4362`;
+   `trip-web/src/activity-rsvp.ts`).
+   **Deliberately NOT built (cut, not dropped):**
+   - A **confirmed** attraction is never a vote (it is already happening; Bookings only).
+   - Only `attraction`-typed anchors: nothing is voted on from flights, hotels, cars, or
+     from `phases[].venues[]` / extracted `days[]` items.
+   - `item_uid` is left unset (no day-plan item to link); `activity-rsvp.ts` matches on
+     phase + date + exact title instead.
+   - The three anchor walks (`derive_days_from_anchors`, `derive_bookings`,
+     `derive_rsvp_activities`) are **not** unified into one traversal — a recorded
+     carry-forward from #169's review, to be revisited only if a fourth consumer appears.
+   - A phase with no such anchor has the key absent, not `[]`; an existing
+     `rsvp_activities` on a phase is never overwritten.
 5. **#62** — `travel_anchors` offers only flight/hotel/car, so booked tickets and attractions lose their confirmations. The transformer already accepts them; the interview question contract does not offer them.
 6. **#77** — companion never sees `trip_interests`.
 
