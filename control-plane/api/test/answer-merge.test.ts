@@ -13,6 +13,7 @@ import {
   matchEntry,
   mergeParts,
   reconcileStructured,
+  stripVisitMarkers,
 } from "../src/answer-merge.js";
 
 const tokyoFirst = { name: "Tokyo", start: "2026-09-19", end: "2026-09-23" };
@@ -183,5 +184,60 @@ describe("order independence", () => {
     const merged = mergeParts([[kyoto], [tokyoFirst], [{ ...kyoto, planned: ["Fushimi Inari"] }]]) as Record<string, unknown>[];
     assert.deepEqual(merged.map((p) => p.name), ["Tokyo", "Kyoto"]);
     assert.deepEqual(merged[1]!.planned, ["Fushimi Inari"]);
+  });
+});
+
+// #114 problem 5: "another three days at the end for Tokyo", said after Tokyo was
+// given with no dates, used to REPLACE Tokyo's first stay — the dated proposal was
+// filled onto the only held Tokyo and nothing recorded the first stay as gone.
+describe("a return leg to a city already held without dates (#114)", () => {
+  const held = [{ name: "Tokyo" }, { name: "Hakone" }, { name: "Kyoto" }, { name: "Osaka" }];
+  const returnDates = { start: "2026-09-30", end: "2026-10-03" };
+
+  test("marked as an additional visit, it is a second Tokyo and the first stays undated", () => {
+    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    const tokyos = (out.merged as { name: string; start?: string }[]).filter((e) => e.name === "Tokyo");
+    assert.equal(tokyos.length, 2, "two Tokyo stops");
+    assert.equal(tokyos.filter((e) => e.start === undefined).length, 1, "the first is still undated");
+    assert.equal(tokyos.filter((e) => e.start === "2026-09-30").length, 1);
+    assert.equal(out.added.length, 1);
+    assert.deepEqual(out.filled, []);
+    assert.deepEqual(out.ambiguous, []);
+  });
+
+  test("the marker is removed by stripVisitMarkers", () => {
+    const out = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    assert.doesNotMatch(JSON.stringify(stripVisitMarkers(out.merged)), /additional_visit/);
+  });
+
+  test("the same marked visit said twice is one visit, not two", () => {
+    const once = reconcileStructured(held, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    const again = reconcileStructured(once.merged, [{ name: "Tokyo", ...returnDates, additional_visit: true }]);
+    assert.equal((again.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 2);
+  });
+
+  test("a marked visit never lands on a held stop that already has different dates", () => {
+    const out = reconcileStructured(
+      [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-24" }],
+      [{ name: "Tokyo", ...returnDates, additional_visit: true }],
+    );
+    assert.equal((out.merged as unknown[]).length, 2);
+  });
+
+  test("without the marker the dates are filled onto the one Tokyo, exactly as before", () => {
+    const out = reconcileStructured(held, [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-24" }]);
+    const tokyos = (out.merged as { name: string; start?: string }[]).filter((e) => e.name === "Tokyo");
+    assert.equal(tokyos.length, 1);
+    assert.equal(tokyos[0]!.start, "2026-09-19");
+    assert.deepEqual(out.added, []);
+    assert.deepEqual(out.filled.map((f) => f.path), ["start", "end"]);
+  });
+
+  test("a dated first Tokyo plus a dated return is two stops (unchanged)", () => {
+    const out = reconcileStructured(
+      [{ name: "Tokyo", start: "2026-09-19", end: "2026-09-24" }, { name: "Kyoto", start: "2026-09-24", end: "2026-09-27" }],
+      [{ name: "Tokyo", ...returnDates }],
+    );
+    assert.equal((out.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 2);
   });
 });

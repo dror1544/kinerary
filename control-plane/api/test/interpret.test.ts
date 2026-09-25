@@ -1447,3 +1447,48 @@ describe("reading the boundary", () => {
     assert.equal(runner.calls[0]?.task, "interpret");
   });
 });
+
+// #114 problem 5: the typed-message path. The model's reading carries the
+// additional-visit marker only when the organizer said the visit is in addition
+// to one already given. Models are faked; the reading is parsed and gated as live.
+describe("a return leg said in a typed message (#114)", () => {
+  const STOPS_Q: IntakeQuestion[] = [
+    ...QUESTIONS,
+    { id: "phases", type: "structured", prompt: "Stops?", required: true, dataShape: "array" },
+  ];
+  const heldStops = { kind: "structured", schema_version: 3, data: [{ name: "Tokyo" }, { name: "Hakone" }, { name: "Kyoto" }] } as never;
+  const decide = (text: string, entry: Record<string, unknown>) => {
+    const parsed = parseInterpretPayload({
+      proposals: [{ questionId: "phases", confidence: 0.9, evidence: text, value: { kind: "structured", dataJson: JSON.stringify([entry]) } }],
+      unclear: [],
+    }, ["101"])!;
+    return applyProposals(parsed.proposals, {
+      sourceText: text, outstanding: [], answered: ["phases"], answers: { phases: heldStops },
+      allowCorrections: true, questions: STOPS_Q,
+    } as never);
+  };
+  const stops = (d: ReturnType<typeof applyProposals>) => (d.accepted[0]?.answer as { data: { name: string; start?: string }[] }).data;
+
+  test("with the marker, Tokyo is added as a second stop and the first stays undated; no marker is stored", () => {
+    const text = "another three days at the end for Tokyo, 30 September to 3 October";
+    const d = decide(text, { name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true });
+    assert.equal(d.accepted.length, 1);
+    const tokyos = stops(d).filter((s) => s.name === "Tokyo");
+    assert.equal(tokyos.length, 2);
+    assert.equal(tokyos.filter((s) => s.start === undefined).length, 1);
+    assert.doesNotMatch(JSON.stringify(d.accepted[0]?.answer), /additional_visit/);
+  });
+
+  test("without the marker, the dates fill the one Tokyo", () => {
+    const text = "Tokyo, 19 to 24 September";
+    const d = decide(text, { name: "Tokyo", start: "2026-09-19", end: "2026-09-24" });
+    const tokyos = stops(d).filter((s) => s.name === "Tokyo");
+    assert.equal(tokyos.length, 1);
+    assert.equal(tokyos[0]!.start, "2026-09-19");
+  });
+
+  test("the conversational prompt teaches the marker", () => {
+    const p = buildInterpretPrompt({ language: "en", outstanding: ["phases"], sourceText: "x", questions: STOPS_Q });
+    assert.match(p, /additional_visit/);
+  });
+});

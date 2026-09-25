@@ -265,6 +265,11 @@ export function matchEntry(
   const type = typeOf(incoming);
   const ref = referenceOf(incoming);
   const candidates: number[] = [];
+  // A marked entry is a second visit unless a held entry is DATED and is that
+  // very visit: an undated held stop is the first visit, never this one.
+  const additional = isAdditionalVisit(incoming);
+  const visitAgrees = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+    additional ? startOf(a) !== null && startOf(b) !== null && sameVisit(a, b) : sameVisit(a, b);
 
   for (let i = 0; i < limit; i += 1) {
     const candidate = held[i];
@@ -277,11 +282,11 @@ export function matchEntry(
       if (SEGMENT_TYPES.has(type)) {
         agrees = namesAgree(candidate, incoming, options) || (startOf(candidate) !== null && startOf(candidate) === startOf(incoming));
       } else if (type === "hotel") {
-        agrees = sameVisit(candidate, incoming);
+        agrees = visitAgrees(candidate, incoming);
       } else {
         agrees =
           (nameOf(candidate) === null || nameOf(incoming) === null || namesAgree(candidate, incoming, options)) &&
-          sameVisit(candidate, incoming);
+          visitAgrees(candidate, incoming);
       }
       if (agrees) candidates.push(i);
       continue;
@@ -291,7 +296,7 @@ export function matchEntry(
       if (canonical(candidate) === canonical(incoming)) candidates.push(i);
       continue;
     }
-    if (namesAgree(candidate, incoming, options) && sameVisit(candidate, incoming)) candidates.push(i);
+    if (namesAgree(candidate, incoming, options) && visitAgrees(candidate, incoming)) candidates.push(i);
   }
 
   if (candidates.length === 0) return { kind: "new" };
@@ -545,7 +550,7 @@ export function reconcileStructured(held: unknown, incoming: unknown, options: M
         acc.ambiguous.push({ entryKey: entryIdentity(entry), incoming: entry, candidates: match.candidates });
       } else {
         const target = base[match.index] as Record<string, unknown>;
-        base[match.index] = mergeRecordFields("", target, entry, acc, entryIdentity(target));
+        base[match.index] = mergeRecordFields("", target, stripVisitMarkers(entry) as Record<string, unknown>, acc, entryIdentity(target));
       }
     }
     return done(ordered(base));
@@ -659,4 +664,35 @@ export function applyConflictChoice(
   const out = [...held];
   out[index] = updated;
   return ordered(out);
+}
+
+// ── The additional-visit marker ──────────────────────────────────────────────
+
+/**
+ * An entry the organizer's own words called an ADDITIONAL visit ("another three
+ * days at the end for Tokyo"). The entries alone cannot say whether new dates for
+ * a city are its first stay's dates or a second stay — an undated held stop
+ * "has nothing to contradict" them — so the words decide, and the interpreter
+ * sets this only when they say so (#114 problem 5). Bounded, optional model
+ * output; never stored (`stripVisitMarkers`).
+ */
+export const ADDITIONAL_VISIT = "additional_visit";
+
+function isAdditionalVisit(entry: Record<string, unknown>): boolean {
+  return entry[ADDITIONAL_VISIT] === true;
+}
+
+/**
+ * The answer with the additional-visit marker removed from each entry of a list
+ * (or from the answer itself, if it is one entry). It looks at an entry's own top
+ * level only: the marker is asked for on a stop, never inside one, so a field
+ * nested in a stop's `venues` is not the interpreter's contract and is not touched.
+ */
+export function stripVisitMarkers(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripVisitMarkers);
+  if (isRecord(value) && ADDITIONAL_VISIT in value) {
+    const { [ADDITIONAL_VISIT]: _marker, ...rest } = value;
+    return rest;
+  }
+  return value;
 }

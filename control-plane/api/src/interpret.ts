@@ -33,6 +33,7 @@ import {
   isRecord,
   mergeParts,
   reconcileStructured,
+  stripVisitMarkers,
   type FieldChange,
   type MergeAmbiguity,
   type MergeConflict,
@@ -814,8 +815,10 @@ export function applyProposals(
    */
   const corrected = (answer: IntakeAnswer, questionId: string): IntakeAnswer => {
     const existing = ctx.answers?.[questionId];
-    if (answer.kind !== "structured" || existing?.kind !== "structured") return answer;
-    return { ...answer, data: mergeStructuredParts([existing.data, answer.data]) };
+    if (answer.kind !== "structured") return answer;
+    // The additional-visit marker steers the merge and is never stored.
+    if (existing?.kind !== "structured") return { ...answer, data: stripVisitMarkers(answer.data) };
+    return { ...answer, data: stripVisitMarkers(mergeStructuredParts([existing.data, answer.data])) };
   };
 
   const accepted: AcceptedProposal[] = [];
@@ -1254,6 +1257,10 @@ export function buildInterpretPrompt(args: BuildInterpretPromptArgs): string {
     `- "confidence" is 0..1: how sure you are this is what they meant, not how sure`,
     `  you are that you understood the words.`,
     `- If the message gestures at a question without settling it, put it in "unclear".`,
+    `- For a list of stops: when the message says a visit is IN ADDITION to one already given`,
+    `  ("another three days at the end for Tokyo", "we come back to Tokyo", "Tokyo again"),`,
+    `  put "additional_visit": true on THAT stop's entry. Never set it for a plain statement`,
+    `  ("Tokyo, the 19th to the 24th"), which gives the dates of a stop already listed.`,
     ``,
     `Questions still outstanding:`,
     ...asked.map(describeQuestion),
