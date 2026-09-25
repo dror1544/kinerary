@@ -44,6 +44,7 @@ import {
 } from "../chat-router.js";
 import { listOrganizerTrips, switchChatToTrip, type OrganizerTrip } from "../organizer-trips.js";
 import { isAddressedToAssistant } from "./addressing.js";
+import { classifyTrigger, inboundFacts, type InboundFacts } from "../analytics/relay-facts.js";
 import { coerceLanguage, uiString, type Language } from "../intake-copy.js";
 import {
   companionHelpText,
@@ -65,6 +66,7 @@ import {
   attachMedia,
   botJoinedGroup,
   describeAttachment,
+  mapChatType,
   migrationOf,
   normalizeUpdate,
   toWireEventWithMedia,
@@ -92,9 +94,12 @@ export interface DirectReply {
 
 export type DispatchDecision =
   /** Hand this turn to the Hermes gateway as an `inbound` frame. */
-  | { kind: "to_gateway"; event: WireMessageEvent }
-  /** The connector answers this one itself. */
-  | { kind: "reply"; reply: DirectReply }
+  | { kind: "to_gateway"; event: WireMessageEvent; analytics?: InboundFacts }
+  /**
+   * The connector answers this one itself. `analytics` is set only on the
+   * companion-unreachable answer, which is a lost turn (#177).
+   */
+  | { kind: "reply"; reply: DirectReply; analytics?: InboundFacts }
   | {
       /**
        * The bot has just been added to a group bound to a trip: send the
@@ -195,6 +200,7 @@ export type DispatchDecision =
       sessionId: string;
       language: Language;
       event: WireMessageEvent;
+      analytics?: InboundFacts;
     }
   /** The organizer's Approve / Keep on one of those proposals. */
   | {
@@ -208,7 +214,7 @@ export type DispatchDecision =
   /** A signup-approval callback — the pre-existing telegram-poller path. */
   | { kind: "approval_callback"; callbackQueryId: string; data: string; fromId: string }
   /** Nothing to do. */
-  | { kind: "ignore"; reason: string };
+  | { kind: "ignore"; reason: string; analytics?: InboundFacts };
 
 /**
  * Who the assistant is on this platform, for the group relevance gate.
@@ -381,6 +387,17 @@ export interface DispatchOptions {
   superAdminSubjectDigest?: string;
   /** The relay's runner. `/model` can switch it only when it is switchable. */
   modelRunner?: StructuredModelRunner;
+  /**
+   * Attach an `analytics` descriptor — metadata only, see
+   * analytics/relay-facts.ts — to the companion-route decisions, for the
+   * relay's assistant events (#177). Absent or false, the default: every
+   * decision is exactly what it was before this option existed, and no extra
+   * lookup is made. True adds one read (the sender's trip person link) for an
+   * unaddressed group message and one (the chat's route) for a
+   * companion-unreachable answer; a failed read drops the descriptor, never
+   * the decision.
+   */
+  assistantEvents?: boolean;
 }
 
 export async function dispatchUpdate(
@@ -822,6 +839,31 @@ export async function dispatchUpdate(
         isReplyToAssistant,
       });
     const senderId = outcome.event.source.user_id;
+    // #177: the gate's verdict, as metadata. Only ever called through
+    // `withAnalytics`, which never calls it while assistant events are off.
+    // The text is taken here, before anything is prefixed to it.
+    const heardText = outcome.event.text;
+    const routedTripId = outcome.route.kind === "companion" ? outcome.route.tripId : null;
+    const seen = (linkRole: string | null | undefined): InboundFacts => {
+      if (!routedTripId) throw new Error("NOT_COMPANION_ROUTE");
+      return inboundFacts({
+        tripId: routedTripId,
+        // Telegram's own type for the channel; the gate's mapped one for the trigger.
+        telegramChatType: message.chat?.type,
+        trigger: classifyTrigger({
+          addressed,
+          capturedAsReply,
+          chatType: outcome.event.source.chat_type,
+          text: heardText,
+          assistantNames: outcome.route.kind === "companion" ? outcome.route.assistantNames : [],
+          botUsername: botIdentity.username,
+          isReplyToAssistant,
+        }),
+        linkRole,
+        attachmentKind: outcome.attachment?.kind ?? null,
+        textLength: heardText.length,
+      });
+    };
     if (!addressed) {
       // Not for the assistant, so nothing is downloaded. A DOCUMENT is still
       // remembered, by reference, for its sender's next addressed message —
@@ -839,13 +881,21 @@ export async function dispatchUpdate(
           outcome.event.text,
         );
       }
+      const held = Boolean(options.pendingAttachments && senderId && outcome.attachment?.kind === "document");
       if (options.pendingAttachments && senderId && outcome.attachment?.kind === "document") {
         options.pendingAttachments.hold(chatId, senderId, outcome.attachment, {
           ...(message.caption ? { caption: message.caption } : {}),
         });
         log(structuredLog("info", "trip_bot.attachment_held", { kind: outcome.attachment.kind }));
       }
-      return { kind: "ignore", reason: "NOT_ADDRESSED" };
+      return {
+        kind: "ignore",
+        reason: "NOT_ADDRESSED",
+        ...(await withAnalytics(options.assistantEvents, log, async () => ({
+          ...seen(senderId && routedTripId ? (await resolveTripPerson(db, routedTripId, senderId))?.role : null),
+          ...(held ? { documentHeld: true } : {}),
+        }))),
+      };
     }
 
     // WHOSE VOICE THIS IS, when the trip knows. `user_name` arrives from
@@ -857,10 +907,12 @@ export async function dispatchUpdate(
     // update carries. Unknown senders keep their Telegram name: it is what
     // their family calls them, and the alternative is a blank where a person
     // should be.
+    let senderLinkRole: string | null = null;
     if (outcome.route.kind === "companion" && outcome.event.source.user_id) {
       const person = await resolveTripPerson(
         db, outcome.route.tripId, outcome.event.source.user_id,
       );
+      senderLinkRole = person?.role ?? null;
       if (person?.displayName) {
         outcome.event.source.user_name = person.displayName;
         log(structuredLog("info", "trip_bot.sender_identified", { role: person.role }));
@@ -889,6 +941,12 @@ export async function dispatchUpdate(
           sessionId: organizer.sessionId,
           language: organizer.language,
           event: outcome.event,
+          // The route itself proves the organizer: their own private chat,
+          // from them, on the trip's confirmed interview chat.
+          ...(await withAnalytics(options.assistantEvents, log, () => ({
+            ...seen("organizer"),
+            documents: outcome.attachment ? 1 : 0,
+          }))),
         };
       }
     }
@@ -918,7 +976,16 @@ export async function dispatchUpdate(
         replied: attachments.replied,
       }));
     }
-    return { kind: "to_gateway", event: await attachMedia(outcome.event, attachments.list, options.media) };
+    const forwarded = await attachMedia(outcome.event, attachments.list, options.media);
+    return {
+      kind: "to_gateway",
+      event: forwarded,
+      ...(await withAnalytics(options.assistantEvents, log, () => ({
+        ...seen(senderLinkRole),
+        attachmentsJoined: attachments.joined,
+        documents: (forwarded.media ?? []).filter((m) => m.kind === "document").length,
+      }))),
+    };
   }
 
   switch (outcome.reason) {
@@ -957,10 +1024,90 @@ export async function dispatchUpdate(
     case "UNROUTED":
       return { kind: "reply", reply: { chatId, text: strings.unbound } };
     case "COMPANION_PENDING":
-      return { kind: "reply", reply: { chatId, text: strings.companionPending } };
+      return {
+        kind: "reply",
+        reply: { chatId, text: strings.companionPending },
+        ...(await withAnalytics(options.assistantEvents, log, () =>
+          companionPendingFacts(db, message, chatId, text, botIdentity))),
+      };
     default:
       return { kind: "ignore", reason: outcome.reason };
   }
+}
+
+/**
+ * The `analytics` field to spread into a decision — or nothing (#177).
+ *
+ * Off, it returns `{}` without calling `build`, so the decision is exactly
+ * what it was before assistant events existed. On, a `build` that throws (a
+ * failed lookup, a route that is not a companion's) costs the descriptor and
+ * a log line, never the decision.
+ */
+async function withAnalytics(
+  enabled: boolean | undefined,
+  log: (line: string) => void,
+  build: () => InboundFacts | Promise<InboundFacts>,
+): Promise<{ analytics?: InboundFacts }> {
+  if (!enabled) return {};
+  try {
+    return { analytics: await build() };
+  } catch (error) {
+    log(structuredLog("warn", "trip_bot.assistant_event_facts_failed", {
+      safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+    }));
+    return {};
+  }
+}
+
+/**
+ * The facts of a message answered with `companionPending` — a lost turn when it
+ * was addressed. `normalizeUpdate` answers this before the relevance gate runs,
+ * so the gate's own predicate is asked here, for the RECORD only: the reply
+ * window is not consulted (claiming it is a write), and nothing here changes
+ * what the router sends. The inputs mirror the gate's in `dispatchUpdate`; a
+ * drift between the two could mislabel a lost turn's trigger, never route one.
+ */
+async function companionPendingFacts(
+  db: pg.Pool,
+  message: TelegramMessage,
+  chatId: string,
+  text: string,
+  botIdentity: BotIdentity,
+): Promise<InboundFacts> {
+  const route = await resolveChatRoute(db, chatId);
+  if (route.kind !== "companion") throw new Error("NOT_COMPANION_ROUTE");
+  const chatType = mapChatType(
+    message.chat?.type,
+    message.is_topic_message === true && message.message_thread_id !== undefined,
+  );
+  const repliedTo = message.reply_to_message?.from;
+  const isReplyToAssistant = repliedTo
+    ? botIdentity.id ? String(repliedTo.id) === botIdentity.id : Boolean(repliedTo.is_bot)
+    : false;
+  const addressed = isAddressedToAssistant({
+    chatType,
+    text,
+    assistantNames: route.assistantNames,
+    botUsername: botIdentity.username,
+    isReplyToAssistant,
+  });
+  const senderId = message.from?.id === undefined ? null : String(message.from.id);
+  return inboundFacts({
+    tripId: route.tripId,
+    telegramChatType: message.chat?.type,
+    trigger: classifyTrigger({
+      addressed,
+      capturedAsReply: false,
+      chatType,
+      text,
+      assistantNames: route.assistantNames,
+      botUsername: botIdentity.username,
+      isReplyToAssistant,
+    }),
+    linkRole: senderId ? (await resolveTripPerson(db, route.tripId, senderId))?.role : null,
+    attachmentKind: describeAttachment(message)?.kind ?? null,
+    textLength: text.length,
+  });
 }
 
 /**

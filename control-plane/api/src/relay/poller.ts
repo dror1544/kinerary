@@ -149,6 +149,7 @@ import { extractItinerary, foldExtractedIntoPhases, ITINERARY_TRUNCATED_WARNING 
 import { parkDeferredVenueLinks } from "../venue-links.js";
 import { provisionOnConfirm } from "../planner.js";
 import type { RosterChoice } from "../organizer-identity.js";
+import type { RelayAssistantEvents, RelayToolOutcome } from "../analytics/emitter.js";
 
 /**
  * Reading a booking PDF and turning it into answers took ~94 seconds on the
@@ -261,6 +262,12 @@ export interface TripBotPollerDeps {
    * only person who may switch a task's model from a chat (`/model`).
    */
   superAdminSubjectDigest?: string;
+  /**
+   * The relay's assistant-event emitter (#177), or absent — the default, and
+   * then nothing is recorded and dispatch attaches no descriptor. Every call
+   * into it is synchronous and cannot throw; see analytics/emitter.ts.
+   */
+  assistantEvents?: RelayAssistantEvents;
   log?: (line: string) => void;
 }
 
@@ -371,10 +378,15 @@ export async function applyDecision(
         text: decision.reply.text,
         replyMarkup: decision.reply.replyMarkup,
       });
+      // Carried only by the companion-unreachable answer: a lost turn.
+      if (decision.analytics) deps.assistantEvents?.companionUnreachable(decision.reply.chatId, decision.analytics);
       return;
 
     case "to_gateway": {
       const delivered = deps.connector.pushInbound(decision.event);
+      if (decision.analytics) {
+        deps.assistantEvents?.handedOff(decision.event.source.chat_id, decision.analytics, delivered, decision.event.message_id);
+      }
       if (delivered) return;
       // Nothing queues. The gateway being down means this turn is gone, so the
       // organizer is told rather than left waiting on an answer that is never
@@ -410,12 +422,17 @@ export async function applyDecision(
       // other chat's messages would queue behind one upload. One chat's
       // uploads are still read one after another, in the order they came.
       const previous = correctionChains.get(decision.chatId) ?? Promise.resolve();
+      const relayTurn = decision.analytics ? deps.assistantEvents?.toRelay(decision.chatId, decision.analytics) ?? null : null;
       const next = previous
-        .then(() => runDocumentCorrection(decision, deps, log))
+        .then(async () => {
+          const read = await runDocumentCorrection(decision, deps, log);
+          deps.assistantEvents?.relayToolCompleted(relayTurn, read.outcome, read.documents);
+        })
         .catch((error) => {
           log(structuredLog("error", "trip_bot.document_correction_failed", {
             detail: String((error as Error)?.message ?? error).slice(0, 200),
           }));
+          deps.assistantEvents?.relayToolCompleted(relayTurn, "failed_tool", 0);
         });
       correctionChains.set(decision.chatId, next);
       void next.finally(() => {
@@ -610,6 +627,8 @@ export async function applyDecision(
 
     case "ignore":
       log(structuredLog("info", "trip_bot.ignored", { reason: decision.reason }));
+      // Carried only by NOT_ADDRESSED group messages.
+      if (decision.analytics) deps.assistantEvents?.notAddressed(decision.analytics);
       return;
   }
 }
@@ -631,7 +650,7 @@ async function runDocumentCorrection(
   decision: Extract<DispatchDecision, { kind: "document_correction" }>,
   deps: TripBotPollerDeps,
   log: (line: string) => void,
-): Promise<void> {
+): Promise<{ outcome: RelayToolOutcome; documents: number }> {
   const { chatId, tripId, language } = decision;
   const say = async (text: string, replyMarkup?: InlineKeyboard) => {
     await deps.telegram.sendMessage({ chatId, text, ...(replyMarkup ? { replyMarkup } : {}) }).catch(() => {});
@@ -639,17 +658,20 @@ async function runDocumentCorrection(
   await say(uiString("correctionReading", language));
 
   const documents = documentsInBurst(decision.event, deps);
+  // What the read came to, for the relay's assistant events (#177). Here the
+  // relay IS the tool, so this is a substantive outcome, not a delivery fact.
+  const read = (outcome: RelayToolOutcome) => ({ outcome, documents: documents.length });
   const { registered, identity, unreadable } = await ingestBurstDocuments(
     deps, { sessionId: decision.sessionId, chatId }, tripId, documents, log, "pending",
   );
   if (identity > 0) await say(uiString("documentIdentity", language));
   if (registered.length === 0) {
     if (identity === 0) await say(uiString(unreadable > 0 ? "documentUnreadable" : "documentNothing", language));
-    return;
+    return read(identity > 0 ? "blocked_by_policy" : "failed_tool");
   }
   if (registered.some(readPartially)) await say(uiString("documentPartial", language));
   const runner = deps.modelRunner;
-  if (!runner) return;
+  if (!runner) return read("failed_tool");
 
   const extracted = await extractRegisteredDocuments(
     { db: deps.db, runner, tripId, language, timeoutMs: DOCUMENT_EXTRACT_TIMEOUT_MS, log },
@@ -658,7 +680,7 @@ async function runDocumentCorrection(
   const usable = extracted.flatMap((e) => (e.kind === "ok" ? [e] : []));
   if (usable.length === 0) {
     await say(uiString("documentExtractFailed", language));
-    return;
+    return read("failed_tool");
   }
 
   const outcome = await proposeCorrectionsFromReadings(deps.db, {
@@ -667,11 +689,11 @@ async function runDocumentCorrection(
     readings: usable.map((e) => ({ documentId: e.documentId, text: e.text, payload: e.payload })),
     documentIds: registered.map((d) => d.documentId),
   });
-  if (outcome.kind === "no_version") return;
+  if (outcome.kind === "no_version") return read("failed_tool");
   if (outcome.corrections.length === 0) {
     await reviewDeliveries(deps.db, tripId, registered.map((d) => d.documentId), "approved");
     await say(uiString("correctionNothingNew", language));
-    return;
+    return read("no_new_information");
   }
   for (const correction of outcome.corrections) {
     if (correction.status !== "pending") {
@@ -687,6 +709,7 @@ async function runDocumentCorrection(
     proposals: outcome.corrections.length,
     new_proposals: outcome.created.filter(Boolean).length,
   }));
+  return read("correction_proposed");
 }
 
 /**
@@ -4110,6 +4133,8 @@ export function startTripBotPoller(
             groupContext,
             ...(deps.superAdminSubjectDigest ? { superAdminSubjectDigest: deps.superAdminSubjectDigest } : {}),
             ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
+            // Descriptors only when something will record them (#177).
+            ...(deps.assistantEvents ? { assistantEvents: true } : {}),
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the
             // organizer's turn on a socket that is gone.

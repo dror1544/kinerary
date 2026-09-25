@@ -35,6 +35,7 @@ import {
   type WireMessageEvent,
 } from "./protocol.js";
 import type { TelegramClient } from "./telegram-api.js";
+import type { ReplyObserver } from "../analytics/emitter.js";
 
 /**
  * A `Content-Disposition` value that Node will actually accept.
@@ -140,6 +141,13 @@ export interface ConnectorOptions {
    * `interviewChat`/`interviewSay`: the connector's job is the wire.
    */
   setExpectsReply?: (chatId: string, expects: boolean) => Promise<void>;
+  /**
+   * The relay's assistant-event emitter (#177), told what became of each
+   * companion `send` once Telegram has answered. Synchronous and unable to
+   * throw, so the reply's own result is never delayed by it. Absent — the
+   * default — records nothing. Never called for an interview chat.
+   */
+  assistantEvents?: ReplyObserver;
 }
 
 export class RelayConnector {
@@ -432,11 +440,14 @@ export class RelayConnector {
           this.log(structuredLog("warn", "relay.internal_leak_suppressed", {
             matched: leak.term ?? "",
           }));
+          this.options.assistantEvents?.replySent(action.chat_id, "suppressed", action.content.length, action.reply_to);
           // Reported as delivered on purpose: the gateway's per-request future
           // has to resolve, and this is not a transport failure it could
           // usefully retry.
           return { success: true };
         }
+        // A send that THROWS is a failed delivery too: recorded, then rethrown
+        // untouched so onOutbound answers the gateway exactly as before.
         const sent = await telegram.sendMessage({
           chatId: action.chat_id,
           // Agent-authored, so it is written in the dialect TELEGRAM_DESCRIPTOR
@@ -463,7 +474,13 @@ export class RelayConnector {
           text: action.content,
           replyTo: action.reply_to,
           parseMode: "MarkdownV2",
+        }).catch((error: unknown) => {
+          this.options.assistantEvents?.replySent(action.chat_id, "failed", action.content.length, action.reply_to);
+          throw error;
         });
+        this.options.assistantEvents?.replySent(
+          action.chat_id, sent.ok ? "delivered" : "failed", action.content.length, action.reply_to,
+        );
         // Only a message that actually reached Telegram may open (or clear) a
         // capture window — a failed send asked nothing, so nothing here
         // should change. A write failure is logged and swallowed: the send

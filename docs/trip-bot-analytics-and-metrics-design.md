@@ -2,7 +2,10 @@
 
 **Status:** Work in progress. This document does not authorize enabling
 production telemetry, changing Hermes or messaging configuration, installing
-collectors, or exposing a dashboard.
+collectors, or exposing a dashboard. Slice 1 of §11 Phase 1 — the relay's own
+events — is built but **off by default and enabled nowhere**; §16 says what it
+records, what it deliberately does not, and where it departs from this
+document.
 
 **Goal:** Measure the complete trip-product lifecycle—from signup and interview
 through provisioning, activation, live companion usage, upgrade/rollback and
@@ -219,6 +222,10 @@ The analytics plugin must derive categories from the trip's private configuratio
 
 For the first version, only count a group message as a bot request when the deployed group policy accepts it (e.g., explicit mention, reply to bot, or defined command). This avoids treating the family’s ordinary conversation as bot usage.
 
+*Slice 1 (§16) resolves these fields from the relay's own knowledge and uses a
+narrower vocabulary than this table — notably `requester_role: unknown`, not
+`participant`, for a sender the trip has no link for.*
+
 ### 4.4 Event correlation
 
 Generate an opaque `event_id` for every telemetry event and a `turn_id` when a message becomes an agent turn. Derive correlation from the message ID + profile + session/turn metadata, not from text.
@@ -250,6 +257,10 @@ The plugin must never send analytics synchronously in the Telegram reply path.
 6. Enforce disk-size and retention caps. If the outbox is full, drop the oldest non-critical diagnostic events first, record a local loss counter, and never block the bot.
 
 This makes analytics resilient to an ingest-service outage and enables exactly-once effective storage through at-least-once delivery plus idempotent ingest.
+
+*Slice 1 (§16) does not build this outbox. The relay emitter holds a bounded
+in-memory queue and writes straight to the database, with no retry; the
+durability above is owed by the Hermes-plugin slice and by any ingest route.*
 
 ---
 
@@ -825,4 +836,355 @@ bounded live operational metrics. A separate PostgreSQL schema and
 least-privilege roles may initially share the control-plane database cluster;
 analytics must not gain authority to mutate trip lifecycle state.
 
+*Slice 1 (§16) took the "share the cluster" option one step further: its table
+is in the `control_plane` schema itself, not a separate schema, and there is no
+ingest service yet.*
+
 Implement deterministic event capture and rule-based categories first. Treat LLM classification as an asynchronous, opt-in enrichment for ambiguity—not as the analytics foundation.
+
+---
+
+## 16. Implementation status — slice 1: relay-side events (built 2026-09-25, off by default)
+
+Issue #177, Track 2 of Sprint 6. This is the first part of §11 Phase 1 that
+exists in code. It does not authorize enabling anything: the header still
+governs, and nothing here is switched on in any deployment.
+
+### 16.1 What is built
+
+- **The contract** — `analytics/schemas/tripbot-event.v1.json` (where §14 puts
+  it), mirrored in TypeScript by `control-plane/api/src/analytics/contract.ts`.
+  Both are allow-lists: `additionalProperties: false`, every field named. The
+  relay validates against the TS copy because a deployed container may not
+  carry the JSON file (the build's `rootDir` is `src`, so it cannot read the
+  repo-root file at runtime); `test/assistant-events-contract.test.ts` fails if
+  the two disagree on properties, required fields, enums or per-type rules, and
+  runs both validators (the TS one and Ajv against the JSON Schema) over a corpus
+  of good and bad events.
+- **The table** — `control_plane.assistant_events`, migration
+  `20260925143012_assistant_events.sql` (`rollback: compatible`). Every value
+  column is CHECKed against a closed set; `trip_id` is `ON DELETE SET NULL`, as
+  `funnel_events` does. The table's CHECKs enforce the contract's rules on their
+  own, as the second line behind the validator: a `metadata` allow-list; separate
+  CHECKs requiring `documents` and `attachments_joined` to be JSON numbers
+  matching `^[0-9]{1,2}$` and between 0 and 20 (each written as a `CASE`, because
+  Postgres does not promise `AND` evaluation order and an out-of-order cast would
+  raise a cast error instead of failing the check); a per-event-type outcome
+  CHECK; and a per-event-type NOT-NULL-when-required CHECK. The one field the
+  contract requires that the table cannot is `trip_id`, which `ON DELETE SET NULL`
+  needs to be nullable. `response_latency_ms` keeps only its 0..86400000 range.
+  Both reviewers found the first version's CHECKs weaker than the contract; the
+  migration was edited in place because it had never been applied. A test
+  compares the table's columns with a checked-in list, so adding a column is a
+  reviewed change.
+- **The writer** — `writeAssistantEvents` (`analytics/store.ts`): validates each
+  event itself, inserts idempotently on `event_id`, and checks that the `trip_id`
+  exists *in the same statement* as the insert (a CTE selecting the trips
+  `FOR KEY SHARE`, then `INSERT … JOIN known … ON CONFLICT DO NOTHING`), so a
+  trip deleted concurrently cannot fail the batch on the foreign key, and no
+  query runs before `statement_timeout`/`lock_timeout` (5 s each) are set as the
+  transaction's first statements. It is the function a later ingest route would
+  wrap.
+- **The emitter** — `RelayAssistantEvents` (`analytics/emitter.ts`), fed by
+  emission hooks in `relay/poller.ts` (`applyDecision`, `runDocumentCorrection`),
+  `relay/connector.ts` (after Telegram answers a companion `send`) and
+  `relay/server.ts` (wiring). `relay/dispatch.ts` stays free of I/O of its own:
+  it attaches an optional `analytics` descriptor to the decision and the poller
+  emits.
+- **The rollup** — `rollupAssistantEvents`: per trip, per local day (the caller
+  names the time zone), computed from the table alone. Group messages addressed
+  vs not, requests handed on, replies delivered with latencies, turns lost,
+  turns with no delivered reply, by channel and role, and each document's fate
+  as far as the relay can see it.
+- **The purge** — `purgeExpiredEvents(db, olderThanDays = 90)`; refuses under
+  one day, since `0` would delete everything.
+
+`test/assistant-events-replay.test.ts` replays an anonymized week of the Nir
+trip through the real `dispatchUpdate` and `applyDecision` and checks the
+rollup against the counts the 2026-09-23 hand evaluation had to read
+transcripts for (the organizer's four DM document reads enter at `applyDecision`
+with a descriptor built by the same `inboundFacts()`, because `dispatchUpdate`
+cannot currently produce a `document_correction` decision; routing them through
+dispatch was rejected because the test would then assert that bug's behaviour),
+that no row contains an identifier or a word anyone wrote,
+that a throwing or hanging sink changes nothing the family sees, and that with
+the setting unset the same week writes nothing.
+
+### 16.2 What is deliberately not built
+
+- **No Hermes plugin.** `source_service` admits only `relay`; the plugin's
+  value is added with the plugin. Per-profile install, Hermes configuration,
+  secrets and a look at the deployed `pre_gateway_dispatch` payload (§4.1) are
+  all outside what the header allows.
+- **No ingest route, no outbox, no retry.** A batch the sink drops is gone (§16.5).
+- **No keyed pseudonyms, no content fingerprints** (§5.1, §5.3). They need a
+  keyed rotating secret. `digestTelegramId` is *not* a substitute: it is an
+  unkeyed SHA-256 of a numeric id, reversible by brute force and stable across
+  trips, which is exactly the cross-trip tracking §5.3 forbids.
+- **No category, no LLM, no Prometheus, no dashboard.** No `question_category`
+  is stored, because the relay never reads a message for its topic.
+- **Purge is not scheduled.** The function exists and is tested.
+- **Not enabled anywhere** (§16.6).
+
+### 16.3 Where this slice settles or changes the rest of the document
+
+- **`requester_role` is `unknown` for an unlinked sender, not `participant`.**
+  §4.3's row implies a group binding makes a sender a participant. Only
+  organizers are linked today (migration 0051), so an unlinked sender may be a
+  family member or an organizer on an account the trip never linked; guessing
+  either would produce a number that looks better than it is (comment on
+  `requesterRoleOf`). `organizer` is set only from a person link, or from the
+  organizer's own confirmed interview chat on the document route. Unlinked
+  people therefore all read `unknown` until participants are linkable.
+- **The relay never writes `answered`.** It sees whether Telegram accepted a
+  reply; it cannot see whether the tool behind it worked, and §6.3 says
+  `failed_tool` beats `answered`. The outcome set has no such value and a test
+  asserts its absence. A forwarded turn with a delivered reply is reported as
+  `reply_delivered_substantive_outcome_unknown`. The one exception is the
+  relay's own document read (`relay_tool_completed`): there the relay *is* the
+  tool, so it may record `failed_tool`, `blocked_by_policy`,
+  `correction_proposed` or `no_new_information`. The outcome vocabulary is
+  therefore delivery facts plus those four, and adds
+  `dispatched`, `lost_gateway_unavailable`, `lost_companion_unreachable`,
+  `reply_delivered`, `reply_suppressed` (the connector's internal-leak
+  suppression) to §6.3's table.
+- **No `schema_version` column or field, and `source_service` is `relay`
+  only.** Neither was on the recommended allow-list for this slice, so neither
+  exists; the version lives in the schema's file name (`tripbot-event.v1.json`).
+  (§5.1's example carries `"schema_version": 1`; this contract does not.) The
+  Hermes slice adds its own `source_service` value.
+- **`metadata` is JSON-typed with exactly three keys**, `attachments_joined`
+  (0–20), `documents` (0–20) and `document_held` (boolean) — numbers and one
+  boolean, so nothing textual can ride in it. Enforced by the validator and by
+  a CHECK on the table. Dedicated columns were the alternative; rejected
+  because a document's fate (held, then joined to a later addressed message,
+  then handed on) needs counts that fixed columns cannot hold.
+- **`answered` / `answered_with_tools` are absent everywhere in v1** — enum,
+  table CHECK and rollup. Writing them behind a "`source_service` is not
+  `relay`" rule was the rejected alternative: no emitter that may legitimately
+  write them exists yet, so the Hermes slice adds them with its own rule.
+- **Vocabulary narrower than §4.3.** `channel_type` is `group`, `organizer_dm`,
+  `other`, `unclassified`, derived from Telegram's **raw `chat.type`**, not the
+  router's mapped wire type: `mapChatType` turns every unknown type into
+  `group`, which had made `unclassified` unreachable. A private chat from a
+  linked organizer is `organizer_dm`; any other private chat is `other`; `group`
+  and `supergroup` (forums included) are `group`; `channel` is `other`; anything
+  else is `unclassified`. `other` is not split, for two reasons the developer
+  gave in hindsight (round 1 had used the brief's three-value set and recorded no
+  reason): a `participant_dm` cannot be asserted while only organizers are linked
+  (migration 0051 — an unlinked DM sender may be an organizer on an unlinked
+  account), and a channel split would name traffic the poll loop never receives
+  (`allowedUpdates` is `message`, `callback_query`, `my_chat_member`; no
+  `channel_post`). Both are carry-forward. `requester_role` has
+  `unclassified` in place of `unauthorized`. `trigger_type` adds `name`
+  (addressed by the assistant's name), `reply_window` (the one-shot reply
+  window, migration 0053) and `not_addressed`. In every field an input the
+  mapper does not recognise becomes `unclassified` — never a real bucket — so
+  a new chat type or attachment kind shows up as a visible count.
+- **The gate is recorded, never re-decided.** `addressed` comes from dispatch;
+  `classifyTrigger` only names which of the gate's reasons applied, with the
+  gate's own predicates in the gate's order (fed the mapped type the gate itself
+  saw), and reports `unclassified` if they
+  ever drift.
+- **Store in `control_plane`, not a separate schema.** Reason from the task
+  brief: the DB-backed test files reset with `DROP SCHEMA IF EXISTS
+  control_plane CASCADE`, and a second schema would survive every reset.
+- **Unaddressed group messages are stored per message, as metadata only.** This
+  is the manager's *recommendation*, **pending Dror's confirmation** — not his
+  decision. His stated purpose is ambient listening to understand what a family
+  needs and possibly intervene later. The reason recorded for per-message rows
+  over aggregate-only counters is that aggregates cannot be re-cut later and
+  any proactive behaviour needs sequence and timing. It is safe to build
+  because the emitter is off. It is the most sensitive signal in the slice —
+  *when a family talks among themselves*. The recommended stance is: allowed
+  columns only those in the table, retention 90 days (§10's lower bound). It
+  must be confirmed before enabling on any real family's group.
+
+### 16.4 Events: one per observed fact
+
+The relay writes an event for each thing it actually observes, and
+`turn_id` links them:
+
+| `event_type` | Observed |
+|---|---|
+| `ignored_not_addressed` | a group message the relevance gate did not address (with `document_held` when a document was kept for its sender's next addressed message) |
+| `request_forwarded` | an addressed message handed to the companion gateway, with the count of documents and of held/replied-to files it brought along |
+| `request_to_relay` | an organizer's document after confirmation, which the relay handles itself |
+| `turn_lost` | an addressed message no one could take: gateway down (`lost_gateway_unavailable`) or the companion not running (`lost_companion_unreachable`) |
+| `reply_sent` | a companion message sent through the connector, and whether Telegram accepted it (`reply_delivered`, `failed_delivery`) or the connector suppressed it |
+| `relay_tool_completed` | the substantive result of the relay's own document read |
+
+§4.4's chain (`message_received → message_authorized → … → response_completed`)
+is not adopted: the relay cannot observe authorization, agent, LLM or tool
+stages, and inventing them would claim knowledge it lacks. The alternative
+weighed and rejected for this table was a single `message_received` row whose
+outcome is updated later. Each fact is observed at a different moment by a
+different component (the poller or the connector), and rows stay append-only.
+
+**Lost turns.** A turn is lost either when no gateway socket takes the frame
+(`pushInbound` false: `lost_gateway_unavailable`) or when the router answers
+"still finishing your assistant" because the companion is not running
+(`COMPANION_PENDING`: `lost_companion_unreachable`). The poll loop passes
+`canReachProfile`, so a gateway that is down almost always surfaces as the
+second; recording only the first would systematically undercount lost turns.
+That router answer comes before the relevance gate, so a family's chatter can
+arrive as `turn_lost` too: it is recorded with trigger `not_addressed` and the
+rollup counts it as chatter, not as a lost turn. This path only asks the gate's
+predicate for the record; it does not claim the one-shot reply window, because
+claiming is a write.
+
+**The relay's own document read.** `runDocumentCorrection` returns
+`{outcome, documents}` at each of its existing exits and the caller emits one
+`relay_tool_completed` (six emission points inside the function were rejected).
+The outcome: an upload that was only identity documents is `blocked_by_policy`;
+unreadable, nothing found, no runner, extraction failed, no intake version, or a
+thrown error is `failed_tool`; nothing new is `no_new_information`; proposals
+raised is `correction_proposed`.
+
+### 16.5 Correlation, latency and delivery limits
+
+- **Reply attribution.** In `RelayAssistantEvents.replySent`, in order:
+  (1) a `reply_to` naming an open request answers that request; (2) a `reply_to`
+  naming the request just answered is the rest of that answer (a continuation,
+  within 10 minutes); (3) a `reply_to` naming neither is recorded with **no**
+  turn and claims nothing — it is a reply to something the emitter is not
+  tracking, and crediting whichever request happens to be waiting would give it
+  an answer it never got (round 1 did exactly that); (4) with no `reply_to`, the
+  oldest open request; (5) with no `reply_to` and nothing open, the continuation;
+  (6) otherwise proactive: no `turn_id`. An open request expires after 30
+  minutes, and per-chat and total tracking is bounded. Only a message Telegram
+  accepted answers a request — a failed or suppressed one is recorded against it
+  and leaves it waiting. (The rework also fixed a stale-copy bug: pruning
+  returned a filtered copy, so removing an answered request never touched the
+  stored list and it stayed "oldest waiting".) A reply to a chat with no known
+  trip is counted in memory (`unattributedReplies`) and writes no row; rows with
+  a null trip were rejected as meaningless noise. The ignore decision carries no
+  chat id, so a chat that only ever chats never becomes attributable — a chat id
+  was deliberately not added to it. Proactive sends are attributed best-effort,
+  from recent chat memory only. Unverified: that Hermes sets `reply_to` to the
+  inbound message id on a companion `send` (the fake gateway in the tests does).
+  Without it the emitter falls back to oldest-waiting matching, and a
+  multi-message answer sent while another request is pending can be attributed to
+  the wrong turn: counts stay right, latency may not.
+- **`turn_id` is minted randomly at hand-off**, when the gateway accepts the
+  frame. It is never derived from a message, chat or person, so the table cannot
+  be joined back to Telegram. It is held in memory only long enough to match
+  replies. How a later Hermes plugin will reproduce it is unsettled (below).
+- **Latency.** For the companion: hand-off (`pushInbound`) to Telegram accepting
+  a reply, per reply, in milliseconds (clamped to 0–24 h); the rollup takes the
+  first delivered reply of each replied turn. It excludes the relay's own media
+  download before hand-off and the person's send time. For the relay's own
+  reads: from `toRelay()`, which runs when the decision is applied, so a read
+  queued behind an earlier upload in the same chat's correction chain includes
+  that wait. The rollup takes an IANA `timeZone` (default UTC) because the
+  control plane holds no trip time zone yet (§6.4). A turn is counted on the
+  local day it was handed off, and its replies are read by the window's
+  `turn_id`s with **no upper time bound** (round 1 lost a reply landing past the
+  window's edge: a turn answered 23:58 to 00:03 read "unanswered").
+  "Unanswered" is derived from the table, not from a timer event. **Known
+  limit:** a relay restart loses the in-memory attribution, so on a day the relay
+  restarted `unanswered` is an upper bound; fixing it needs persisted open turns
+  or a relay-stamped id on the wire.
+- **Validation runs twice**: at enqueue, so a bug surfaces early (logged by
+  field name, never by value), and again in the writer, for the later ingest
+  route. Where the two validators differed the **JSON Schema is authoritative**
+  and was tightened rather than the TS one loosened: `occurred_at` is a strict
+  RFC 3339 pattern (`T`, `Z` or `±hh:mm`, at most 6 fractional digits, hours
+  00–23) on top of `format: date-time`, plus a real days-in-month check in TS.
+  Loosening TS to ajv's `date-time` was rejected: it accepts a space separator,
+  `+0900`, `+09` and leap seconds no emitter here produces. `metadata: null` is
+  refused on both sides; absent becomes `{}`. `validateAssistantEvent`
+  snapshots its input once and checks and returns only the snapshot, because an
+  accessor property could otherwise pass the check and return different text on
+  a later read (shown live by the boundary audit); a throwing getter is
+  `INVALID`.
+- **Fail open.** Every method the relay calls is synchronous, returns nothing to
+  await and never throws; it appends to a bounded queue (1,000 events) and a
+  timer flushes batches of 200 every 2 seconds, each write abandoned after 10
+  seconds and bounded database-side by the 5 s timeouts above. **At most one sink
+  write exists at a time, an abandoned one included:** while it is outstanding
+  the queue fills and drops. Starting a new write per tick was rejected — it piled
+  up hung connections on the relay's shared pool. Connection acquisition
+  (`pool.connect()`) is not itself bounded by the writer; it is bounded in effect
+  by there never being more than one write outstanding (bounding it with
+  `connectionTimeoutMillis` is a relay-wide pool change outside this slice).
+  Retry of dropped batches was rejected to keep the slice simple — the
+  idempotent writer would make it safe. The write-timeout timer is deliberately
+  not `unref`'d: the tests showed a hung write must still time out when nothing
+  else keeps the event loop alive. `stop()` has its own 2 s deadline, writes
+  batch by batch, and drops the rest with code `STOP_DEADLINE`. All emitter
+  logging goes through a try/catch (`safeLog`) and error codes are
+  identifier-shaped `error.name` only. A throwing or hanging sink costs events,
+  not replies, and a replay test asserts the same Telegram messages in the same
+  order. A Telegram send that *throws*, rather than returning `ok: false`, is
+  recorded as `failed_delivery` and rethrown unchanged, so the gateway's
+  `outbound_result` is identical (tested). The limits: the queue lives in
+  process memory, so a crash loses it; a dropped batch is not retried; a write
+  abandoned at the timeout may still land, which `event_id` idempotency makes
+  harmless; and the drop counter is visible only in a warning log line at most
+  once a minute — nothing reads `stats` and no metric is exported yet. Events
+  that fail contract validation are counted as rejected and logged as a bug.
+
+### 16.6 Default off — and why unset means OFF
+
+The emitter exists only when the relay is started with
+`ASSISTANT_EVENTS_ENABLED=1`. Unset, empty, `0` or anything else is off, and an
+unrecognized value logs that it was not understood; the boot log always says
+which state was chosen. Off, `dispatch` attaches no descriptor and makes no
+extra lookup, so every decision is exactly what it was before. Always attaching
+the descriptor was rejected: it would add reads on every group message and
+break existing `deepEqual` tests. A descriptor read that fails
+drops only the descriptor, never the decision, and is logged by error class,
+never by value (tested). Only `1` enables it (surrounding whitespace
+ignored); other values are off and logged as not understood, so a typo in the
+enabling direction is visible.
+
+This is deliberately the **opposite** of the `INTERPRET_*` settings in
+`CLAUDE.md`, where unset silently downgrades a working path and is therefore
+the dangerous state. Here the danger is the other direction: a sprint-end
+upgrade must not switch on the recording of when a family talks among
+themselves as a side effect of code shipping. Do not "fix" the default. The code
+comment in `analytics/emitter.ts` says the same.
+
+### 16.7 Carry-forward
+
+Preconditions for enabling, and open items for later slices:
+
+1. **Schedule `purgeExpiredEvents`.** A precondition for enabling in
+   production (§10 requires deletion jobs). Not scheduled by this slice.
+2. **Confirm the metadata stance** (§16.3) with Dror — per-message rows for
+   unaddressed group messages, the allowed columns, 90-day retention — before
+   enabling on any real family's group.
+3. **Family notice / consent step** before it is enabled on any real family's
+   group. Not designed here.
+4. **`turn_id` for the Hermes slice** — keyed derivation over profile, chat and
+   message id with a shared secret, versus a relay-stamped wire field — is
+   decided by that slice after inspecting the deployed `pre_gateway_dispatch`
+   payload (§4.1). Until then the relay's `turn_id` cannot be joined to Hermes
+   events.
+5. **Keyed pseudonyms and content fingerprints** (§5.3), which need the rotating
+   secret.
+6. **Enabling is a deploy decision.** `ASSISTANT_EVENTS_ENABLED` is not in the
+   compose relay `environment:` list, so setting it in an env file does not
+   reach the process; turning it on means changing the deployment's
+   configuration and restarting the relay, which is a hard-rule-2 action.
+7. **Not in this slice:** retry of dropped batches; deriving a trip's phase time
+   zone for the rollup (§6.4); recording router-answered commands (`/help`,
+   `/name`, …) and interview turns; the authenticated ingest route that would
+   wrap `writeAssistantEvents`.
+8. **The organizer activity timeline (raised independently by both reviewers; a
+   finding, not a decision).** `trip_id` + `requester_role = 'organizer'` + a
+   millisecond `occurred_at` is a per-person activity timeline for each trip's
+   one organizer, because only organizers are linked (migration 0051); in a group
+   with exactly one non-organizer member, `unknown` is that one person. "No
+   identifier is stored" holds for chat and user ids only. The family-notice
+   step in item 3 must cover this, and the owner should weigh it when confirming
+   the metadata stance in item 2.
+9. **A future ingest route** must mint `event_id` and `turn_id` server-side (any
+   well-formed UUID a client supplies is a 122-bit covert channel) and bound
+   `occurred_at` (Postgres keeps 6 fractional digits and the schema now caps it at
+   6, but the value is still client-chosen).
+10. **Persisting attribution** — open turns, or a relay-stamped id on the wire —
+    to remove the restart limit in §16.5.
+11. **Splitting `other`** in `channel_type` (§16.3), once participants are
+    linkable or a channel path exists.
