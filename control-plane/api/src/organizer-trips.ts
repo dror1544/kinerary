@@ -308,8 +308,14 @@ export async function switchChatToTrip(
     const owned = await client.query(
       `SELECT 1
          FROM control_plane.trip_memberships m
+         JOIN control_plane.trips t ON t.id = m.trip_id
         WHERE m.trip_id = $1
           AND m.status = 'active'
+          -- Ownership survives retirement (teardown renames the slug, it keeps
+          -- the membership), so membership alone would bind a chat to a
+          -- retired trip. Same predicate as group-binding and the trip list;
+          -- deliberately no lock — see #175 (40P01 against retire_in_db).
+          AND ${NOT_RETIRED_SQL}
           AND m.user_id IN (
                 SELECT user_id FROM control_plane.telegram_organizer_links
                  WHERE telegram_subject_digest = $2)
