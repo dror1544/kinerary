@@ -26,6 +26,7 @@ import { execFile } from "node:child_process";
 // One implementation, already exported, already the one model-runner uses for
 // exactly this salvage. A fourth copy was the alternative.
 export { firstJsonObject } from "./model-runner.js";
+import { hermesChildEnv } from "./model-runner.js";
 
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 
@@ -71,7 +72,7 @@ export function runHermesWebSearch({ profile, prompt, timeoutMs }: HermesSearchA
     execFile(
       HERMES_BIN,
       ["-p", profile, "chat", "-q", prompt, "-Q", "--ignore-rules", "-t", "web"],
-      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, env: hermesChildEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout));
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {

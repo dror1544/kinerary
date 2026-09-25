@@ -17,7 +17,7 @@
  * `{ ok: false }` — the interviewer proceeds without `days[]`, never blocked.
  */
 import { execFile } from "node:child_process";
-import { modelRunnerFromEnv, type StructuredModelRunner } from "./model-runner.js";
+import { hermesChildEnv, modelRunnerFromEnv, type StructuredModelRunner } from "./model-runner.js";
 
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || "";
@@ -386,7 +386,7 @@ function runExtract(prompt: string): Promise<string> {
       // discards the profile's model config, which is where the
       // kinerary-extract fallback chain (quota escalation) lives.
       ["-p", HERMES_EXTRACT_PROFILE, "chat", "-q", prompt, "-Q", "--ignore-rules", "--reasoning", "none"],
-      { timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, env: hermesChildEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout));
         if ((err as NodeJS.ErrnoException).code === "ENOENT") {
@@ -423,7 +423,7 @@ function runVenueLinkSearch(prompt: string): Promise<string> {
       // ("never guess a domain" only holds if it can look); --ignore-rules for
       // a clean run without dropping the profile's fallback chain.
       ["-p", HERMES_SEARCH_PROFILE, "chat", "-q", prompt, "-Q", "--ignore-rules", "-t", "web"],
-      { timeout: VENUE_LINK_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: VENUE_LINK_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024, env: hermesChildEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve(String(stdout));
         // Keep stdout too — a rate-limit notice often comes back as model text,

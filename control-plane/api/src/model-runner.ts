@@ -27,6 +27,7 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { structuredLog } from "./redaction.js";
 
 export type RunnerFailure =
   /** No runner configured for this task — the caller proceeds without a model. */
@@ -208,7 +209,7 @@ export interface CliSpec {
   timeoutMs: number;
   /** Attempts in total, including the first. Never a different model. */
   maxAttempts: number;
-  /** Where to run it. Defaults to a neutral directory — see `hermeticEnv`. */
+  /** Where to run it. Defaults to a neutral directory, not the relay's own checkout. */
   cwd?: string;
   /** How `describe` names this CLI. Defaults to the binary's own name. */
   provider?: string;
@@ -231,10 +232,10 @@ export interface CliSpec {
   /**
    * The environment the child gets. Declared per spec because the adapters do
    * not agree on what a child legitimately needs: the Claude CLI needs its own
-   * login and nothing else, while `hermesSpec` runs an agent that reaches its
-   * providers through the relay's own configuration. Unset means `hermeticEnv`,
-   * which is inheritance minus session state — correct for Hermes, and not
-   * enough for anything structuring untrusted text.
+   * login, Hermes its own config directory. Unset means the base allow-list of
+   * `structuringChildEnv` (PATH, HOME, locale, temp dirs, certificates) — never
+   * the relay's whole environment, so a spec that forgets to declare one gets
+   * less, not everything. Every CLI here reads untrusted text.
    */
   env?: (source?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 }
@@ -259,6 +260,31 @@ export function claudeEffort(name: string, env: NodeJS.ProcessEnv = process.env)
   if ((CLAUDE_EFFORT_LEVELS as readonly string[]).includes(raw)) return raw as ClaudeEffort;
   throw new Error(`${name}=${JSON.stringify(env[name])} is not an effort level (${CLAUDE_EFFORT_LEVELS.join("|")})`);
 }
+
+/**
+ * The variables a task's claude effort may come from, most specific first: its
+ * own `<PREFIX>_EFFORT`, then the `<INHERITS>_EFFORT` of the binding it
+ * inherits runner and model from. Taken from MODEL_TASKS, not from the task
+ * name: `read_image`'s prefix is `VISION`, and `extract_intake` inherits
+ * `EXTRACT`. Looking up only `<TASK>_EFFORT` left every inheriting task
+ * without an effort — and so without `--setting-sources ""` and
+ * `--strict-mcp-config` — while its sibling `extract` had both.
+ */
+export function claudeEffortNames(task: string): string[] {
+  const spec = MODEL_TASKS.find((t) => t.task === task);
+  if (!spec) return [`${task.toUpperCase()}_EFFORT`];
+  return [`${spec.prefix}_EFFORT`, ...(spec.inherits ? [`${spec.inherits}_EFFORT`] : [])];
+}
+
+export function claudeEffortForTask(task: string, env: NodeJS.ProcessEnv = process.env): ClaudeEffort | undefined {
+  for (const name of claudeEffortNames(task)) {
+    const effort = claudeEffort(name, env);
+    if (effort) return effort;
+  }
+  return undefined;
+}
+
+const warnedEffortUnset = new Set<string>();
 
 /**
  * The Claude CLI in print mode. `-p` prints one response and exits, which is
@@ -390,6 +416,7 @@ export function hermesSpec(profile: string, timeoutMs = DEFAULT_TIMEOUT_MS, bin 
     model: profile,
     timeoutMs,
     maxAttempts: 2,
+    env: hermesChildEnv,
     args: (prompt, p) => ["-p", p, "chat", "-q", prompt, "-Q", "--ignore-rules", "--reasoning", "none"],
   };
 }
@@ -426,34 +453,56 @@ type RunOnce = { ok: true; stdout: string; usage?: ModelUsage } | { ok: false; r
  * the CLI's only credential, and stripping it made every interpret call exit
  * non-zero — FAILED — until the interview stalled on its first typed answer
  * (2026-09-11).
+ *
+ * This used to be `hermeticEnv()`, a DENY-list that stripped those session
+ * variables and passed everything else through. It was removed rather than
+ * kept: its signature matched `CliSpec.env`, so it type-checked there while
+ * handing a child the relay's tokens, database URL, LD_PRELOAD and
+ * SSH_AUTH_SOCK. Every spawn now builds an allow-list through
+ * `structuringChildEnv`; the two lessons above are what `claudeChildEnv`
+ * has to keep honouring (CLAUDE_CODE_OAUTH_TOKEN in, session state out) and
+ * `test/model-runner-env.test.ts` pins both.
  */
-export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(source)) {
-    if (k === "CLAUDE_CODE_OAUTH_TOKEN") {
-      env[k] = v;
-      continue;
-    }
-    if (k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PID" || k === "CLAUDE_EFFORT") continue;
-    env[k] = v;
-  }
-  return env;
-}
 
 /**
- * The minimal environment a nested Codex CLI needs to locate its executable,
- * authentication/config directory and system certificates. In particular,
- * provider keys, bot tokens and other relay configuration never reach a model
- * process that is structuring untrusted organizer input.
+ * The variables EVERY structuring child may see: how to find its own
+ * executable, a place to write, a locale, and certificates. Nothing here is a
+ * credential.
  */
+const STRUCTURING_BASE_ENV: readonly string[] = [
+  "PATH", "HOME", "XDG_CONFIG_HOME",
+  "TMPDIR", "TMP", "TEMP",
+  "LANG", "LC_ALL", "LC_CTYPE",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+];
+
+/**
+ * The one allow-list builder for a child that reads untrusted organizer or
+ * document text: the base set above plus `extra`, the CLI's OWN credentials or
+ * config location, and nothing else the relay holds. An allow-list, because a
+ * deny-list cannot be audited — a secret the relay gains later
+ * is withheld by default rather than by remembering to add it. Codex, Claude
+ * and Hermes each express their environment through this, so there is one
+ * mechanism to check rather than three.
+ */
+export function structuringChildEnv(
+  extra: readonly string[] = [],
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const allowed = new Set([...STRUCTURING_BASE_ENV, ...extra]);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  );
+}
+
 /**
  * The minimal environment a nested Claude CLI needs: its own login, a place to
  * run, and certificates. Everything else the relay holds — provider keys for
  * other services, bot tokens, database URLs — is withheld, on the same grounds
  * as `codexChildEnv`.
  *
- * This is an allowlist, and that is the whole point. `hermeticEnv` is a
- * denylist: it strips session state and passes the rest through, so every
+ * This is an allowlist, and that is the whole point. The `hermeticEnv` it
+ * replaced was a denylist: it strips session state and passes the rest through, so every
  * secret the relay held reached a `claude -p` that was being handed untrusted
  * organizer text. Codex was isolated for that reason (#58) while the runner
  * the production configuration actually uses was not, and a denylist cannot be
@@ -468,30 +517,44 @@ export function hermeticEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.Pro
  * the settings.json there, and losing it falls back to the CLI's default.
  */
 export function claudeChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const allowed = new Set([
-    "PATH", "HOME",
-    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
-    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-    "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
-    "TMPDIR", "TMP", "TEMP",
-    "LANG", "LC_ALL", "LC_CTYPE",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
-  ]);
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
+  return structuringChildEnv(
+    [
+      "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+      "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+      "XDG_CACHE_HOME",
+    ],
+    source,
   );
 }
 
+/**
+ * The minimal environment a nested Codex CLI needs to locate its executable,
+ * authentication/config directory and system certificates. In particular,
+ * provider keys, bot tokens and other relay configuration never reach a model
+ * process that is structuring untrusted organizer input.
+ */
 export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const allowed = new Set([
-    "PATH", "HOME", "CODEX_HOME", "XDG_CONFIG_HOME",
-    "TMPDIR", "TMP", "TEMP",
-    "LANG", "LC_ALL", "LC_CTYPE",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
-  ]);
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
-  );
+  return structuringChildEnv(["CODEX_HOME"], source);
+}
+
+/**
+ * The Hermes CLI's environment: how to run, and where its own config lives
+ * (`HERMES_HOME`, the same kind of variable as `CODEX_HOME` — a location, not
+ * a credential). Hermes keeps its provider keys in `~/.hermes/.env`, which it
+ * reads itself, so none of the relay's variables are needed and none are passed.
+ */
+export function hermesChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return structuringChildEnv(["HERMES_HOME"], source);
+}
+
+/**
+ * The one place a CliSpec's environment becomes a child's. `?? {}` matters:
+ * Node treats `env: undefined` as "inherit everything", so an env function that
+ * returned nothing would otherwise hand the child the relay's whole environment.
+ * Empty is the safe reading of "no variables".
+ */
+export function specEnv(spec: Pick<CliSpec, "env">): NodeJS.ProcessEnv {
+  return (spec.env ?? (() => structuringChildEnv()))() ?? {};
 }
 
 function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
@@ -499,7 +562,7 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
     execFile(
       spec.bin,
       spec.args(prompt, spec.model),
-      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: (spec.env ?? hermeticEnv)() },
+      { timeout: spec.timeoutMs, maxBuffer: 10 * 1024 * 1024, cwd: spec.cwd ?? tmpdir(), env: specEnv(spec) },
       (err, stdout, stderr) => {
         if (!err) {
           if (!spec.output) return resolve({ ok: true, stdout: String(stdout) });
@@ -526,7 +589,7 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
  * them. Same hermetic directory and environment as `runOnce`, same failure
  * vocabulary.
  *
- * Same `spec.env ?? hermeticEnv` policy as `runOnce`, applied here during
+ * Same `spec.env ?? structuringChildEnv` policy as `runOnce`, applied here during
  * integration of #144 (which predates this function): this is the path an
  * organizer-uploaded document actually travels — `claudeSpec()`'s
  * `attachments` block is only consumed here — so it is the one #144's own
@@ -536,7 +599,7 @@ function runOnce(spec: CliSpec, prompt: string): Promise<RunOnce> {
  */
 function runWithInput(spec: CliSpec, args: string[], input: string): Promise<RunOnce> {
   return new Promise((resolve) => {
-    const child = spawn(spec.bin, args, { cwd: spec.cwd ?? tmpdir(), env: (spec.env ?? hermeticEnv)(), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(spec.bin, args, { cwd: spec.cwd ?? tmpdir(), env: specEnv(spec), stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
     let settled = false;
@@ -675,23 +738,24 @@ export const CODEX_ISOLATION_ARGS: readonly string[] = [
  * loudly if the answer is not a clean match — never running codex with a
  * shorter list.
  *
- * NOTHING CALLS THIS ON SLICE A, and the difference matters when reading it.
- * `CODEX_ISOLATION_ARGS` IS applied to every codex call (`codexSpec`), so the
- * isolation itself is in force; what is absent is the startup check that this
- * machine's codex understands the list, because that call lives in
- * `relay/server.ts`, which is Slice B. Until Slice B lands, a version mismatch
- * shows up as codex failing every call rather than as a refusal at startup —
- * noisy, not silent, which is the safe direction, but not the intended one.
+ * Fail-safe by construction: "cannot run `codex features list`" (binary
+ * missing, non-zero exit, timeout) is a PROBLEM string, never null, so a codex
+ * that cannot be checked is refused rather than trusted.
  *
- * The full isolation for #58 is PR #91 (an env allowlist and
- * `--ignore-user-config`), which is still open. This probe is what #92 has that
- * #91 does not, and the agreed plan is to land #91 first and keep this. Neither
- * half is finished while the other is open, so do not read the presence of this
- * function as #58 being closed.
+ * WIRED: `relay/server.ts` calls this once at startup when any `*_RUNNER` is
+ * codex, and on a problem sets `KINERARY_CODEX_ISOLATION_UNVERIFIED=1`, which
+ * `runnerForBinding` reads to make codex no binding at all. The probe runs
+ * under `codexChildEnv()` like the real call, not the relay's whole environment.
+ * Known limit: the startup check only runs when codex is bound by ENV; a super
+ * admin's runtime `/model` override to codex on a relay where no env task is
+ * codex is not checked (see the handover's carry-forward).
+ *
+ * #58 is the pair: the `--disable` list and `--ignore-user-config` (PR #91)
+ * plus this probe (PR #92), both now on this branch.
  */
 export function codexIsolationProblem(bin = "codex", timeoutMs = 20_000): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(bin, ["features", "list"], { timeout: timeoutMs, cwd: tmpdir(), env: hermeticEnv(), maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    execFile(bin, ["features", "list"], { timeout: timeoutMs, cwd: tmpdir(), env: codexChildEnv(), maxBuffer: 1024 * 1024 }, (err, stdout) => {
       if (err) {
         resolve(`cannot run "${bin} features list": ${String((err as NodeJS.ErrnoException).code ?? err.message).slice(0, 120)}`);
         return;
@@ -732,7 +796,7 @@ async function runCodexOnce(spec: CodexSpec, req: { prompt: string; schema?: Rec
       // spawn, not execFile: stdin must be closed. Codex waits on it for extra
       // instructions otherwise, and a call that hangs on an empty pipe is worse
       // than one that fails.
-      // codexChildEnv, not hermeticEnv: an allowlist, so a secret the relay
+      // codexChildEnv, not a denylist: an allowlist, so a secret the relay
       // gains later is withheld by default rather than by remembering to add it.
       const child = spawn(spec.bin, args, {
         cwd: spec.cwd,
@@ -1301,9 +1365,19 @@ export function runnerForBinding(
   // is not an error, just a slower and differently-behaved model (see
   // claudeSpec, and the 143s-against-a-60s-limit run of 2026-09-16).
   if (kind === "claude") {
-    return cliRunner({
-      [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude", claudeEffort(`${task.toUpperCase()}_EFFORT`, env)),
-    });
+    const effort = claudeEffortForTask(task, env);
+    // Unset is not an error, it is a downgrade: the call then runs on the
+    // process's personal settings.json, hooks and MCP connectors. Said once
+    // per task per process, because this is rebuilt often.
+    if (!effort && !warnedEffortUnset.has(task)) {
+      warnedEffortUnset.add(task);
+      console.warn(structuredLog("warn", "model_runner.claude_effort_unset", {
+        task,
+        variable: claudeEffortNames(task).join(" or "),
+        consequence: "claude -p runs on this process's personal settings, hooks and MCP connectors",
+      }));
+    }
+    return cliRunner({ [task]: claudeSpec(model, timeoutMs, env.CLAUDE_BIN || "claude", effort) });
   }
   if (kind === "hermes") return cliRunner({ [task]: hermesSpec(model, timeoutMs, env.HERMES_BIN || "hermes") });
   return undefined;
