@@ -409,11 +409,11 @@ class AdapterTests(unittest.TestCase):
 
         self.assertFalse(any("pct stop" in c or "pct destroy" in c for c in ssh.commands))
 
-    # ── #119: the trip's agent key must survive a second bootstrap ───────────
+    # ── #119: what a second bootstrap does to the site's agent key ───────────
     def _env_block(self, tmp: str) -> str:
-        """The key-minting part of the real bootstrap script (from the `.env`
-        guard up to the systemd unit), retargeted at a temp directory, so the
-        test runs the shell the container would run rather than reading it."""
+        """The `.env`-minting part of the real bootstrap script (from its guard
+        to the systemd unit), retargeted at a temp directory, so the test runs
+        the shell the container would run rather than reading it."""
         ssh = FakeProxmoxSsh(nextid="203")
         spec = LxcSpec(
             "trip-tokyo-2026", "pve", "local:vztmpl/debian.tar.zst", "local-lvm", 2, 1024, 8,
@@ -426,47 +426,42 @@ class AdapterTests(unittest.TestCase):
         end = script.index("cat > /etc/systemd/system/kinerary-server.service")
         return script[start:end]
 
-    def _run(self, block: str) -> str:
-        proc = subprocess.run(
-            ["bash", "-c", "set -euo pipefail\n" + block], capture_output=True, text=True, check=True,
-        )
-        return proc.stdout + proc.stderr
-
     def _key(self, tmp: str) -> str:
         with open(f"{tmp}/app/.env") as fh:
             return re.search(r"^HERMES_API_KEY=(\S+)$", fh.read(), re.M).group(1)
 
-    def test_a_second_bootstrap_after_the_env_file_is_lost_keeps_the_same_key(self) -> None:
+    def test_a_bootstrap_after_the_env_file_is_lost_mints_a_new_key_and_prints_none(self) -> None:
+        """Documents WHY the worker must re-run the bridge after a bootstrap
+        (the key changes) and that nothing the script prints carries a key
+        (its stdout reaches RuntimeError text, and so worker logs)."""
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
             block = self._env_block(tmp)
-            out1 = self._run(block)
-            first = self._key(tmp)
-            os.remove(f"{tmp}/app/.env")  # a rebuilt/half-built container
-            out2 = self._run(block)
-            self.assertEqual(self._key(tmp), first)
-            # A credential: never on stdout/stderr (which reach worker logs).
-            self.assertNotIn(first, out1 + out2)
+            outs = []
+            keys = []
+            for _ in range(2):
+                proc = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + block],
+                    capture_output=True, text=True, check=True,
+                )
+                outs.append(proc.stdout + proc.stderr)
+                keys.append(self._key(tmp))
+                os.remove(f"{tmp}/app/.env")
+            self.assertNotEqual(keys[0], keys[1])
+            for out in outs:
+                for k in keys:
+                    self.assertNotIn(k, out)
+            # No key is kept anywhere but the site's own .env (no stored copy).
+            self.assertEqual(os.listdir(f"{tmp}/nfs"), [])
 
-    def test_an_existing_env_is_left_alone_and_its_key_is_kept_for_later(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
-            with open(f"{tmp}/app/.env", "w") as fh:
-                fh.write("HERMES_API_KEY=" + "ab" * 32 + "\n")
-            block = self._env_block(tmp)
-            self._run(block)  # a trip provisioned before this fix
-            self.assertEqual(self._key(tmp), "ab" * 32)
-            os.remove(f"{tmp}/app/.env")
-            self._run(block)
-            self.assertEqual(self._key(tmp), "ab" * 32)
-
-    def test_a_malformed_kept_key_is_not_reused(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(f"{tmp}/app"); os.makedirs(f"{tmp}/nfs")
-            with open(f"{tmp}/nfs/.hermes-api-key", "w") as fh:
-                fh.write("not a key=\n")
-            self._run(self._env_block(tmp))
-            self.assertRegex(self._key(tmp), r"^[0-9a-f]{64}$")
+    def test_the_bootstrap_script_never_traces_or_echoes_the_key(self) -> None:
+        ssh = FakeProxmoxSsh(nextid="203")
+        ProxmoxLxcAdapter(ssh).create(LXC_SPEC)
+        script = ssh.commands[3]
+        self.assertNotIn("set -x", script)
+        for line in script.splitlines():
+            if "HERMES_API_KEY" in line:
+                self.assertNotRegex(line, r"\b(echo|printf|tee|logger)\b", line)
 
     def test_needs_bootstrap_is_false_for_an_absent_container(self) -> None:
         adapter = ProxmoxLxcAdapter(FakeProxmoxSsh())
