@@ -405,6 +405,14 @@ measured.** What data to collect is deliberately not settled here; this records
 the requirement and what already exists to answer it, so the discussion starts
 from facts rather than from scratch.
 
+**Owner: Track 2 (Dror, 2026-09-25).** Measuring unfinished interviews belongs to
+Track 2. An **offline judge** that reads each whole interview transcript after it
+ends — was data missed, was data given late, can it now change the captured plan —
+is also wanted, in Sprint 6, and is tracked as #198. It is the offline sibling of
+#117's pre-summary judge and is to be designed together with it; which track owns
+the pair, and whether its findings may touch a confirmed (immutable) intake
+version, are not decided.
+
 An abandoned interview is the failure mode nobody sees. A wrong answer gets
 corrected on the recap and a stall gets reported within minutes, but somebody
 who stops at question nine and never comes back leaves no complaint — and by

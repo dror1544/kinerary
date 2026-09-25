@@ -106,36 +106,44 @@ which is why it leads.
    *per-country-per-month* rather than per-trip, which is the difference between
    a cost that grows with customers and one that grows with the world.
 2. **No pre-trip tasks** — Readiness reads `config.tasks`; the transformer never emits it. FRAMEWORK feature #8. Undocumented anywhere until now.
-3. **No per-phase packing lists — BUILT (2026-09-23), #162, PR #165 (merge `20f7419`; feature commit `28e4ec7`).**
+3. **No per-phase packing lists — BUILT (2026-09-23), reworked to abstain when unsure (2026-09-25); #162, PR #165 (merge `20f7419`); #167 CLOSED by PR #197 (merge `283ca64`, fix commit `5c78064`).**
    `phase.packing` never emitted; a hardcoded 4-item fallback shows. FRAMEWORK #16.
-   **What shipped:** `transformer._derive_phase_packing` emits `phase.packing` — `[{he,en}
-   category, {he,en} item]` pairs, the shape `readiness.tsx` reads at `:58` — from a
-   coarse season bucket (`_season_bucket`: cold / rainy / hot / moderate) of the trip
-   destination's hemisphere crossed with the phase's **start month**, mapped to a small
-   fixed bilingual table (`_PACKING_ITEMS_BY_SEASON`). Deterministic: no network, no model.
-   The hemisphere (`_destination_hemisphere`) resolves through the file's existing
-   `_country_keys()` / `_COUNTRY_ALIASES` — the path the currency and timezone lookups
-   already use — after review showed the first pass (a raw substring list) read every
-   Hebrew-typed destination as north and matched "peru" inside "Perugia, Italy"; eleven
-   Hebrew southern-hemisphere aliases were added for it, and `_KNOWN_COUNTRY_HEMISPHERE`
-   lists eleven southern countries. `destination` is threaded into `_derive_phases`
-   as the raw typed answer, so "no destination" suppresses packing.
-   **Deliberately NOT built (cut, not dropped):**
-   - No packing for a phase with no destination or no start date — it gets nothing
-     rather than a guessed season.
-   - The trip-level `config.packing_general` is untouched; it keeps its own frontend fallback.
-   - No live weather, no per-destination climate (no monsoon calendars, desert vs
-     rainforest); spring is "rainy" and autumn "moderate" in both hemispheres.
-   - A phase spanning several months is bucketed on its start month alone.
-   - One hemisphere per **trip**, not per phase: every phase uses the trip's destination
-     string.
-   - **The hemisphere lookup's remaining coarseness is #167, deliberately last and still
-     OPEN, not built here:** a city-only destination ("Sydney") resolves north; a
-     multi-country string is decided by its last comma-separated segment only ("Spain, Chile"
-     resolves south, "Chile, Spain" north; "and"-joined lists such as "Argentina and Chile"
-     are not split and resolve north); a Hebrew geresh
-     variant ("צ׳ילה", U+05F3) does not match and resolves north (the ASCII-apostrophe
-     form does). Everything unresolved defaults north.
+   **What is built now:** `transformer._derive_phase_packing` emits `phase.packing` — `[{he,en}
+   category, {he,en} item]` pairs, the shape `readiness.tsx` reads at `:58` — only when
+   `packing_climate.decide()` (`control-plane/worker/control_plane_worker/packing_climate.py`) is sure of
+   the place AND of the season in every month the phase covers. The season bucket
+   (`season_bucket`: winter "cold" / spring "rainy" / summer "hot" / autumn "moderate") is
+   crossed with a small fixed bilingual table (`_PACKING_ITEMS_BY_SEASON`). Deterministic: no
+   network, no model. **There is no default hemisphere any more**: the first pass (#165) resolved a
+   trip-level hemisphere from the typed destination and defaulted north; that lookup and
+   `_KNOWN_COUNTRY_HEMISPHERE` are gone. The owner's rule (quoted in the module): "Seasons and areas have to be
+   treated right -- if not sure, better not to say anything than be unreasonable."
+   - **Only a named city ever gets a list.** The phase's own names are read; a country is never
+     precise enough, and nothing is inherited from the trip's destination (it is used only to reject a
+     contradiction, confirm a namesake, or explain an abstention). A phase naming no place the table
+     knows ("Stop", "Road trip", an unlisted town or island) gets nothing.
+   - A city qualifies only if it is not arid or tropical, has no dry season, and has a real
+     winter and summer; then **every month** the phase covers must sit in one season bucket and
+     pass that bucket's temperature test with a 0.5 C margin. Otherwise the phase abstains with a
+     named reason (`REASONS`: no dates, no destination, unresolved, ambiguous multi-place, conflicts
+     with destination, namesake, climate varies by area, shoulder month, spans seasons, tropical,
+     arid, mediterranean, summer rain, mild winter, cool summer, subpolar). The reason goes to a log
+     line (`transformer.packing_abstained`) and to tests only. The site then shows what it already
+     shows for a phase with no `packing`.
+   - Namesakes (Perth, Toronto, Naples...) are believed only when the destination or the phase text
+     confirms the country. Islands and territories with their own climate are recorded so they
+     abstain by name; the UK stays temperate, with the Isles of Scilly as the named exception
+     (Dror, 2026-09-25).
+   - Consequence: this only ever **removes** packing output relative to what #165 emitted.
+   **Still not built (cut, not dropped):** lists for non-temperate regimes (Sydney, Rome, Seoul in
+   their good months), a richer season-to-items table, the geocoder-latitude idea (that is #188, the
+   shared place resolver), and any measurement of coverage on real destinations. The trip-level
+   `config.packing_general` is untouched; it keeps its own frontend fallback. **Remaining scope is
+   tracked in #201** — source-check the eight emitting entries within 0.7 C of a threshold before the VM is
+   upgraded to a release carrying this; confirm no live trip already carries `phase.packing`; the
+   abstention reason not reaching the production log; and an open owner question on autumn and
+   spring having no warm ceiling (Tokyo in late September). Also from #201: #162 must not reach
+   `main` or a hotfix branch without #197.
 4. **No RSVP activities — BUILT (2026-09-23), #169, PR #171 (merge `0bba091`; feature commit `25805f1`).**
    `phase.rsvp_activities` never emitted, so the whole RSVP surface is invisible. FRAMEWORK #11. Corroborated by the live-trip report: *"RSVP/trivia features: unused"*.
    **What shipped:** `transformer.derive_rsvp_activities`, called from `transform_intake`
@@ -223,7 +231,7 @@ rather than left implicit:
 
 **Two things not to lose, both from kinerary-09:**
 
-- **#114's problem 5 is NOT covered by #117** — a flat `phases` list of unique names cannot hold Tokyo twice. That is a data-model gap, not a conversational one, and #117 is about the organizer's experience. **It still needs an owner.**
+- **#114's problem 5 is NOT covered by #117** — a flat `phases` list of unique names cannot hold Tokyo twice. That is a data-model gap, not a conversational one, and #117 is about the organizer's experience. ~~It still needs an owner.~~ **Update 2026-09-25 (Dror): see "Decisions taken (2026-09-25)", item 3 — the "cannot hold Tokyo twice" half was stale, the live defect was a silent overwrite fixed in open PR #199, and the manager owns it.**
 
   *Corrected 2026-09-20:* an earlier version of this line sent problem 5 to #115 as "the same theme, likely solved together". Both halves were wrong. #115 contains no such observation — it is a **booking-type taxonomy** gap, where a booked train falls through to `"other"` for want of a canonical scheduled-transport type. Three distinct gaps get confused here:
 
@@ -343,6 +351,7 @@ Sprint plan `:1479-1496`.
 - Then the five derived rates, grouped by trip/phase/day/channel/role/topic; the daily control-plan report; and the missing-information control loop.
 - Also routed here from the live-run ledger: **per-user Telegram info-message logging** (`:1351-1353`).
 - Sprint 7 keeps the weighted 1–5 scoring and repeated-question reduction.
+- **Unfinished-interview measurement is owned here (Dror, 2026-09-25)** — the question people stop at and outcome by duration, `docs/interview-without-an-agent.md` §8b; partial coverage today in `fleet-mcp.mjs` `statistics`/`stalled_interviews`. The sprint plan's Sprint 6.5 WITHDRAWN section, which said it had no owner, now points here.
 
 #### #114 — the interview cannot hold an organizer thinking out loud
 
@@ -413,8 +422,8 @@ problem might share a fix. They do not. `ae397fd` touches five files —
 tests — and **none of the phases model, the schema or the transformer**
 (verified). #112 was the *destination string* being an itinerary and getting
 concatenated into a place query, fixed by splitting on commas, de-duplicating
-and anchoring on the country tail. #114's problem 5 is the *phases list* being
-unable to hold Tokyo twice. A phases model that expressed a returning leg would
+and anchoring on the country tail. #114's problem 5 was described as the *phases list* being
+unable to hold Tokyo twice (that half was found stale on 2026-09-25: the transformer already keeps two non-adjacent visits; the live defect was a silent overwrite of an undated first visit, PR #199, open). A phases model that expressed a returning leg would
 not have fixed #112, and #112's fix does nothing for a returning leg.
 
 The real shared theme is weaker and worth stating only as an observation:
@@ -739,7 +748,7 @@ bindings schema are working against a branch, not against `main`.
 - `cptest` is shared across sessions: a mid-run `42P01` on `schema_migrations` means another run reset it.
 
 ### Open defects not owned by tracks 1–3
-**#105 — BUILT (2026-09-25), CLOSED on GitHub** (a chat binding against a torn-down trip; five guards: group link, operator invitation, gateway wait and trip list via PR #174/#176, `/switch` via PR #180, merge `70371d6`; teardown revokes live group tokens, #175). **Left, deliberate:** a narrow unlocked race between the ownership check and the insert, documented in the code (a lock caused #175's deadlock); candidate follow-ups named in the #105 closing comment are not filed. · **#103** companion replies containing Hermes's slash surface are dropped · **#78** completed background delegations never delivered · **#37** approval callback logs nothing on success · **#30** approval poller stands down with no relay liveness check · **#31** `multiplex_profiles` template stamp · **#33** PR #29 review residue · **#106**/**#107** (operator-facing: usage telemetry to the fleet monitor, audited password recovery).
+**#172 — BUILT (2026-09-25), CLOSED on GitHub** (trip config is served through an allow-list instead of `sanitizeConfig()`'s deny-list: `shared/config-visibility.js`, `shared/allow-list.js`, `server/server.js`, `server/living-journey.js`, `shared/agent-schema.js`; PR #196, merge `3cd2191`, fix commit `0bcf763`). **Changes nothing anyone sees until a release carrying it is promoted to `available` and each existing trip is redeployed by hand** (new trips get it from the promoted release; existing trips keep their pinned release). **Left, tracked in #200:** redeploy decisions for live trips (CT200 `trip-usa2026` would lose 40 fields of 12 kinds; the Japan trip after 3 Oct; the Orlando trip's dates unknown), who reads the dropped-field warnings (Dror's direction: the fleet monitor reads `scope:'config'`), and small defects found by the audit. · **#153 and #58 — BUILT (2026-09-25), both CLOSED on GitHub** (every model subprocess — Codex, Claude, Hermes — runs with an allow-listed environment, `model-runner.ts`; the Codex isolation check is exercised on the `/model` path; PR #192, merge `3b623d6`, fix commit `dbe2c4a`). This is the change Task zero's "Land #91 first for #58" was waiting for. **Left, tracked in #202:** the `/model codex` probe timeout and memoising a passing probe, whether the VM's relay should carry explicit `*_EFFORT`, quality of Mac document reading at `medium` (never measured), and runbook drift on `EXTRACT_INTAKE_*`. A running relay picks this up only after the API is rebuilt and restarted. · **#105 — BUILT (2026-09-25), CLOSED on GitHub** (a chat binding against a torn-down trip; five guards: group link, operator invitation, gateway wait and trip list via PR #174/#176, `/switch` via PR #180, merge `70371d6`; teardown revokes live group tokens, #175). **Left, deliberate:** a narrow unlocked race between the ownership check and the insert, documented in the code (a lock caused #175's deadlock); candidate follow-ups named in the #105 closing comment are not filed. · **#103** companion replies containing Hermes's slash surface are dropped · **#78** completed background delegations never delivered · **#37** approval callback logs nothing on success · **#30** approval poller stands down with no relay liveness check · **#31** `multiplex_profiles` template stamp · **#33** PR #29 review residue · **#106**/**#107** (operator-facing: usage telemetry to the fleet monitor, audited password recovery).
 
 ### Docs in order and aligned with the code
 Part of the goal, not a side effect. The known drift, all verified 2026-09-19:
@@ -851,6 +860,19 @@ folded into any of them — burying it makes the sprint's exit criterion invisib
 - PR #92: **risk-assess with `regression-planner` before deciding to land or split.**
 - The guard against re-fixing is **mechanical** — extend `scripts/preflight-checks.sh`, following the `.agents/hermes-sync.tsv` pattern.
 - Weight: **front-loaded, then small.**
+
+## Decisions taken (2026-09-25)
+
+All from Dror, 2026-09-25, recorded as given. Where a reason was not given, none is written.
+
+1. **#117's pre-summary judge stays in Sprint 6, to be designed together with an offline judge of whole interview transcripts (#198)** — the offline judge looks for data missed or given late that could be added or changed, so a chronic or plan-less interviewer improves. The pair gets a discussion of its own before anything is built. **Which track owns the pair is undecided:** #117 sits in track 1 (1c-bis), measurement is track 2; the seam is noted, not decided.
+2. **Measuring unfinished interviews (`docs/interview-without-an-agent.md` §8b) is owned by Track 2** (see the data-gathering section above).
+3. **#114 problem 5:** the "cannot hold Tokyo twice" half was stale (the transformer already keeps two non-adjacent visits). The live defect was a silent overwrite of an undated first visit, fixed in **open PR #199** (not merged; under integration review). The manager owns it. Problems 1–4 and 6 stay answered by #117.
+4. **#159 is folded into #188** (the shared place resolver: resolve each phase's location once, with confidence, and abstain when unsure). #159 stays open until #188 shows the requirement.
+5. **Packing:** the UK stays temperate, with the Isles of Scilly as the named exception (already in #197; see 1a item 3).
+6. **#190 (release channels and per-trip version pinning) — the "crown jewel"** is an organizer's own spin-off, deployed only for their trip, from which the product learns. It has a concept document, `docs/future/release-channels-and-organizer-spinoffs.md` (uncommitted as of this entry). **Nothing in it is scheduled beyond slice 1 (#127 option 1).**
+7. **Deferred by the owner until he decides:** #110, #125, #130.
+8. **Hermes upgrade (#189): Mac first, VM second, after confirming.** Read-only version and release-notes findings are posted on the issue.
 
 ## Delta against Sprint 6 as written
 

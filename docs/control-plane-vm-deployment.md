@@ -100,11 +100,13 @@ interview stalled. The relay and sidecar therefore get
 per interpret call at default effort, 15.2 s with it (Mac: 13.1 s), and the
 mapping matched the Mac's.
 
-The relay's credential is `CLAUDE_CODE_OAUTH_TOKEN`. `model-runner.ts`'s
-`hermeticEnv` strips a calling Claude Code session's `CLAUDE_CODE_*` variables
-from the nested CLI but keeps that one — on the Mac the CLI uses the keychain,
-here the token is its only credential, and losing it made every interpret call
-`FAILED`.
+The relay's credential is `CLAUDE_CODE_OAUTH_TOKEN`. The nested CLI gets an
+allow-listed environment (`claudeChildEnv` over `structuringChildEnv` in
+`model-runner.ts`; see "Environment of every model child" in
+`docs/document-intake-operations.md`), which carries that token and
+`CLAUDE_CONFIG_DIR` but none of a calling Claude Code session's other
+`CLAUDE_CODE_*` variables — on the Mac the CLI uses the keychain, here the token
+is its only credential, and losing it made every interpret call `FAILED`.
 
 ### Checks that actually answer the question
 

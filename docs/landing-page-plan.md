@@ -1,16 +1,7 @@
 # Kinerary landing SPA and control-plane integration
 
 Status: implemented for test-environment acceptance
-Updated: 2026-08-25
-
-> **Note, 2026-09-25 — wording to be confirmed by the owner.** The plan's core
-> claim below, "Google OIDC is the only organizer web identity in the first
-> release", has been extended in the tree: an email account holds a credential
-> from birth, whichever way it is created — signup (`password-identity.ts`),
-> an operator invitation (`organizer-invite.ts`) or a verified Google sign-in
-> (`portal.ts`) — and all three resolve the address through
-> `resolveOrCreateEmailAccount`. Read the identity bullets below as the
-> 2026-08-25 design, not as current behaviour.
+Updated: 2026-09-25 (identity section rewritten to match the tree; the rest is the 2026-08-25 plan)
 
 ## Product and identity decisions
 
@@ -18,8 +9,27 @@ The public landing page and organizer personal space are a standalone React/
 TypeScript SPA in `web/`. The existing per-trip application in `site/` remains
 the runtime UI and data owner; it is not merged into React.
 
-- Google OIDC is the only organizer web identity in the first release.
-- A first verified Google login creates a provider-neutral user immediately.
+- An organizer's identity is an **email account** in the control plane, and one
+  address is one user. There are three ways in: a verified Google sign-in, the
+  email-and-password signup, and an operator's invitation. All three resolve the
+  address through one function, `resolveOrCreateEmailAccount`, so a second way
+  in never starts a second user.
+- A first Google sign-in whose address Google has verified attaches to the
+  account that address already names — one the person signed up for, or one an
+  operator invited. An unverified or missing address starts a fresh account.
+- Every email account holds a credential from birth: the password the person
+  chose, or, for an invitation or a Google sign-in, one built from random bytes
+  nobody keeps. That is what stops an account being claimed by whoever signs up
+  with its address first. Until password recovery ships, an organizer who never
+  chose a password uses Google on the web; the Telegram bot needs no password.
+- What the SPA itself wires today (checked 2026-09-25): the personal space
+  (`/app`, `ProductApp.tsx`) starts Google sign-in through
+  `/v1/auth/google/start`. The public `/sign-in` and `/sign-up` screens
+  (`AuthPage.tsx`) and the forgot-password screen are **UI only** — they call no
+  API and say so on screen; the email-and-password signup above is the control
+  plane's `POST /v1/signup`, which no SPA screen calls yet. The password login the
+  SPA does call, `/v1/auth/password`, is a trip participant's runtime login
+  (trip id, runtime username), not an organizer email login.
 - Telegram is only the shared-bot planning interview and Hermes channel. A web
   profile returns `410 TELEGRAM_WEB_AUTH_RETIRED` from historical Telegram
   organizer-auth routes.
@@ -47,8 +57,8 @@ control-plane API on the same organizer origin.
 
 ## End-to-end control flow
 
-1. The organizer signs in with OIDC authorization code + PKCE, state, and
-   nonce. The API issues rotating opaque `Secure`, `HttpOnly`, `SameSite=Lax`
+1. The organizer signs in. Google sign-in uses OIDC authorization code + PKCE,
+   state, and nonce. The API issues rotating opaque `Secure`, `HttpOnly`, `SameSite=Lax`
    sessions plus a double-submit CSRF token for mutations.
 2. The organizer creates a draft containing destination, approximate dates,
    and trip type. Anonymous starter fields remain in `sessionStorage` only.
@@ -95,6 +105,6 @@ until SSE, large uploads/downloads, Google participant linking, password joins,
 and mobile iframe behavior pass test-domain acceptance. New onboarding must
 present only the personal-space route after cutover.
 
-Deferred: organizer email/password accounts, billing, rename/archive/delete,
-full operational history, memories/community/commerce, and rewriting the legacy
-runtime in React.
+Deferred: password recovery (the landing SPA's screen for it sends nothing
+yet), billing, rename/archive/delete, full operational history,
+memories/community/commerce, and rewriting the legacy runtime in React.

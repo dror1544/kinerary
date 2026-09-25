@@ -270,12 +270,23 @@ docker compose up -d --build
 - `phases[].venues[]` — points of interest with Maps/Waze URLs
 - `phases[].packing[]` — `[[{he,en} category, {he,en} item], ...]`. Optional by hand; a
   control-plane-provisioned trip gets it derived (`transformer._derive_phase_packing`, #162):
-  a small fixed table picked by season bucket, from the destination's hemisphere and the
-  phase's start month. Deterministic — no weather call, no model. A phase with no destination
-  or no start date gets none (key absent). The hemisphere lookup is coarse and still open as
-  #167: a city-only destination resolves north, a multi-country string resolves by
-  which parts the country extraction picks up (checked: "Spain, Chile" resolves south,
-  "Chile, Spain" north), and a Hebrew geresh spelling of a country misses. The trip-level
+  a small fixed table picked by season bucket. Deterministic — no weather call, no model.
+  **It abstains unless the place and the season are both known** (#167, owner's rule
+  2026-09-25: "if not sure, better not to say anything than be unreasonable"). The gate is
+  `packing_climate.decide()`: only a phase that names a **city** in its table can get a list —
+  a country, region, island or territory never does, and nothing is inherited from the trip's
+  destination (the destination is used only to reject a contradicting phase and to confirm a
+  namesake such as Perth or Naples). The city must have a real winter and summer (no
+  tropical, arid, Mediterranean, monsoon, mild-winter or subpolar climate), and **every month
+  the phase covers** must fall in one season and clear that season's temperature test with a
+  0.5 °C margin; a phase that spans a season boundary, or names two places that disagree,
+  abstains. Abstaining means the `packing` key is absent, both sites fall back to the trip's
+  general list, and the transformer logs `transformer.packing_abstained` with a machine-readable
+  reason (`packing_climate.REASONS`; the worker's log format currently drops that `extra=`, so
+  the log shows that a phase abstained but not why — tracked in #201). The climate table (Köppen type and monthly means per
+  city) is recalled from published tables, not read from a dataset — source-checking its
+  borderline months is open in #201. Summer lists for non-temperate cities in their good
+  months, and a geocoder-latitude fallback (#188), are not built. The trip-level
   `packing_general` is separate and keeps its own frontend fallback.
 - `phases[].rsvp_activities[]` — `{id, title, desc?, date?}` vote cards. Optional by hand; a
   control-plane-provisioned trip gets them derived (`transformer.derive_rsvp_activities`,
@@ -465,6 +476,17 @@ hasn't been connected to any username yet — the response is meant to prompt
 - Guest endpoints: lost & found form, photo file downloads, public trivia TV view
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
 - Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
+- **Trip config is served through an allow-list** (#172): `/api/config`, `/api/config/versions/:version`,
+  the public `/api/config/roster`, `/api/hermes/status`, the plan importers and the served itinerary all
+  project `trip.config.json` through `shared/config-visibility.js` (engine: `shared/allow-list.js`).
+  Being signed in is not a reason to see a field; being on the list is. A field the list does not
+  name is **withheld silently, on purpose** — a deny-list serves every field added after it was
+  written, which is how #172 leaked. The only signals are the server log at boot (the dropped
+  *paths*, never values) and `GET /api/config/warnings`, which carries a **count only**, because a key
+  name is itself authored config text. A new field a producer writes must be added to the list
+  (`tests/config-allow-list.test.js` fails until it is); an organizer-only field belongs in
+  `GET /api/agent/brief`. Redeploying an existing trip can hide fields it shows today — run
+  `projectConfig` on its config and read the boot log first (#200).
 - Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
 
 ---

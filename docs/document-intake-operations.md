@@ -114,8 +114,8 @@ All environment. Unset is never an error — it is the previous behaviour, excep
 | `DOCUMENT_STORE_REQUIRED=1` | relay, worker | Refuse to start unless the store is ready (below) |
 | `PROVISIONER_TRIP_NFS_LOCAL_BASE` | worker | The trips' NFS export as the worker sees it; originals are hard-linked into `<base>/<slug>/documents` |
 | `TRIP_DOCUMENTS_DIR` | trip runtime | Where the site reads originals; written into new containers' `.env` as `<nfs mount>/documents` |
-| `EXTRACT_INTAKE_RUNNER` / `_MODEL` / `_TIMEOUT_MS` | relay | Document answer extraction; inherits `EXTRACT_*` whole |
-| `EXTRACT_ITINERARY_RUNNER` / `_MODEL` / `_TIMEOUT_MS` | relay | The day-by-day pass; inherits `EXTRACT_*` whole |
+| `EXTRACT_INTAKE_RUNNER` / `_MODEL` / `_TIMEOUT_MS` | relay | Document answer extraction; inherits `EXTRACT_*` whole (runner, model, timeout and effort) |
+| `EXTRACT_ITINERARY_RUNNER` / `_MODEL` / `_TIMEOUT_MS` | relay | The day-by-day pass; inherits `EXTRACT_*` whole (runner, model, timeout and effort) |
 | `ITINERARY_EXTRACT_TIMEOUT_MS` | relay | Per-call day-by-day timeout, default **60 s** — overrides the task timeout; too short for claude-sonnet-5 on a 4-page docket |
 | `VISION_RUNNER=claude\|openrouter`, `VISION_MODEL` | relay | Photos and scanned PDFs; inherits nothing |
 | `OPENROUTER_API_KEY` or `OPENROUTER_API_KEY_FILE` | relay | The file may be an env file: only its `OPENROUTER_API_KEY=` line is read (`~/.hermes/.env` on the Mac, `/opt/agent-auth/openrouter.env` on the VM) |
@@ -193,7 +193,7 @@ The runner fixes this on every call:
 - `--disable` for every tool feature
 - `-c mcp_servers={}`, `plugins={}`, `apps={}`
 - `shell_environment_policy.inherit="none"`
-- the scrubbed environment
+- the allow-listed environment (next section)
 
 The login's own `CODEX_HOME` is kept, because a private copy could lock the refresh
 token out. The model then lists only `exec`/`wait`/`request_user_input`, and `exec`
@@ -203,7 +203,62 @@ Codex **exits** on an unknown feature name, so the relay runs `codex features li
 at startup whenever a task is bound to codex. On a mismatch it logs
 `relay.codex_isolation_unverified` and refuses codex bindings. Re-check the list
 (`test/codex-isolation.test.ts` probes the installed codex) whenever the codex CLI
-changes, including on the VM.
+changes, including on the VM. The same probe now also runs before `/model` saves a
+codex binding, and overrides already stored in the database are verified at each
+30-second refresh while any of them names codex (a failure is remembered; a pass is
+re-run — memoising it, and a shorter timeout for the probe on the request path, are
+follow-ups in #202). A codex that cannot be verified is refused.
+
+**Environment of every model child (#153, #58, PR #192).** Every CLI the relay
+spawns to read untrusted organizer or document text starts with an **allow-listed
+environment**, built in one place — `structuringChildEnv()` in `model-runner.ts` —
+not the relay's own. The base set is `PATH`, `HOME`, `XDG_CONFIG_HOME`, the temp
+directories, `LANG`/`LC_*`, and the certificate variables; each CLI adds only its
+own location or login:
+
+| Child | Adds |
+|---|---|
+| Codex | `CODEX_HOME` |
+| Claude | `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `XDG_CACHE_HOME` |
+| Hermes | `HERMES_HOME` |
+
+An allow-list rather than a deny-list because a deny-list cannot be audited: a
+secret the relay gains later is withheld by default instead of by someone
+remembering to add it. The earlier deny-list `hermeticEnv` stripped only
+`CLAUDE_CODE_*` session variables and passed the rest through, so a bot token, the
+database URL, Proxmox/Cloudflare tokens and a planted `DYLD_INSERT_LIBRARIES`
+reached the Hermes children (`itinerary-extract.ts`, `hermes-search.ts`); it is
+removed. A spec whose env function returns nothing gets an **empty** environment,
+never inheritance (`specEnv`, `?? {}`), and the same applies to a spec that
+declares no env. The Claude login variables stay because withholding them breaks
+the call, not because they are harmless: without `CLAUDE_CODE_OAUTH_TOKEN` every
+call on the VM failed on 2026-09-11.
+
+Two consequences are deliberate:
+- **A Hermes provider key that only the relay holds is no longer forwarded.**
+  Hermes reads its own provider keys from `~/.hermes/.env`; that is where such a key
+  belongs. Before, the deny-list forwarded (for example) the VM relay's
+  `claude.env` token, so a Hermes call could authenticate with it. Now, if Hermes
+  has no key of its own, its provider chain can fall through silently to the next
+  provider, which on the Mac is the metered one.
+- **Proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, ...) are not in the base set, so
+  no model child receives them** — for Hermes that means a deployment that needs a
+  proxy now fails Hermes calls loudly instead of working. Decided; the reason for
+  choosing failure over a wider list is not recorded beyond "allow-list, nothing
+  else the relay holds" — ask Dror.
+
+Not covered: `mcp/mcp.js` `runHermesExtract` has the same full-environment pattern
+and is live on trip bridges (#183). Reaches a running relay only after an API
+rebuild and relay restart.
+
+**Effort follows the runner.** `extract_intake`, `extract_itinerary` and the vision
+task inherit their runner and model from `EXTRACT_*` / `VISION_*`, but used to look
+up only `<TASK>_EFFORT`, so `EXTRACT_EFFORT` never applied to them and `claude -p`
+read documents under the operator's personal `settings.json` (effortLevel `xhigh`,
+hooks, MCP connectors). They now inherit effort too, and a claude binding with no
+effort configured logs `model_runner.claude_effort_unset` at startup — the loud
+signal, because silence is what hid it. Which effort the VM should carry, and
+document quality at `medium` on the Mac, are open in #202.
 
 **Usage and cost.** Results carry `usage` wherever the provider reports it:
 - OpenRouter gives tokens and billed cost.
