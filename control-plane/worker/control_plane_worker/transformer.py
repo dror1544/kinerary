@@ -85,7 +85,9 @@ import logging
 import re
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from . import packing_climate
 
 logger = logging.getLogger(__name__)
 
@@ -366,26 +368,11 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "אנגליה": "uk", "בריטניה": "uk", "אנגליה ובריטניה": "uk",
     "תאילנד": "thailand",
     "ישראל": "israel",
-    # Hemisphere-only additions (see _KNOWN_COUNTRY_HEMISPHERE below): none of
-    # these have a currency/timezone row, so a destination that resolves
-    # through one of these keys still resolves for hemisphere only — the
-    # "both or neither" promise above is about keeping the CURRENCY and
-    # TIMEZONE tables in step with each other, not about every consumer of
-    # this alias table having a row in both of them. Values with a Hebrew
-    # geresh (Chile, Fiji) are stored WITHOUT it, matching what `_country_keys`
-    # actually looks up: it strips ASCII quote characters from the typed text
-    # before checking this dict, so a key that still has one could never match.
-    "אוסטרליה": "australia",
-    "ניו זילנד": "new zealand",
-    "דרום אפריקה": "south africa",
-    "ארגנטינה": "argentina",
-    "צילה": "chile",
-    "ברזיל": "brazil",
-    "פרו": "peru",
-    "אורוגוואי": "uruguay",
-    "פרגוואי": "paraguay",
-    "בוליביה": "bolivia",
-    "פיגי": "fiji",
+    # The hemisphere-only spellings that used to follow (Australia, Chile,
+    # Peru, ...) moved with the climate lookup to `packing_climate`, which
+    # keeps its own Hebrew names; tests/test_packing_climate.py holds every
+    # entry here to resolve there to the same country, so the two cannot
+    # drift apart silently.
 }
 
 
@@ -1536,54 +1523,21 @@ def _open_day_phases(
     return out
 
 
-# Southern-hemisphere destinations worth flipping the season on, keyed the
-# same way _KNOWN_COUNTRY_CURRENCY/_KNOWN_COUNTRY_TIMEZONE are -- exact
-# _country_keys() output, never a raw substring test. A raw substring match
-# was tried first and shipped a real bug: "peru" matches inside "Perugia,
-# Italy" (an Italian city, not Peru), and a typed-Hebrew destination never
-# matched at all since the set only held English names. Both are fixed by
-# routing through the same extraction (_destination_head/tail-split) and the
-# same _COUNTRY_ALIASES Hebrew->English translation the currency/timezone
-# lookups already use, rather than re-deriving either.
-#
-# Everything else -- every entry below missing, and any destination
-# _country_keys() resolves to a key not in this dict -- defaults north, which
-# is also where nearly every trip on this platform has gone so far. This is a
-# coarse floor for a packing hint, not a claim about where the equator
-# actually runs.
-_KNOWN_COUNTRY_HEMISPHERE: dict[str, str] = {
-    "australia": "south",
-    "new zealand": "south",
-    "south africa": "south",
-    "argentina": "south",
-    "chile": "south",
-    "brazil": "south",
-    "peru": "south",
-    "uruguay": "south",
-    "paraguay": "south",
-    "bolivia": "south",
-    "fiji": "south",
-}
-
-
-def _destination_hemisphere(destination: str) -> str:
-    """"north" or "south" -- looked up the same way `_lookup_known_currency`
-    resolves a destination: through `_country_keys()`'s exact, extracted
-    keys, never a raw substring test on the typed text. Unresolved (no key
-    in `_KNOWN_COUNTRY_HEMISPHERE`, including "Unknown Destination" and every
-    known-northern destination) defaults north."""
-    for key in _country_keys(destination):
-        if _KNOWN_COUNTRY_HEMISPHERE.get(key) == "south":
-            return "south"
-    return "north"
+# Whether a phase's season is knowable at all -- and in which hemisphere -- is
+# `packing_climate.decide()`'s question, not this module's (issue #167). Until
+# 2026-09-25 it was answered here by a southern-country list with everything
+# else defaulting north: Thailand in January got "Warm jacket, Gloves", a trip
+# to "Sydney" was read as northern, "Chile, Spain" and "Spain, Chile" landed in
+# opposite hemispheres, and one hemisphere served every phase of a trip. The
+# owner's rule replaced the default: if not sure, say nothing.
 
 
 def _season_bucket(month: int, hemisphere: str) -> str:
     """A coarse meteorological-season bucket for one calendar month in one
-    hemisphere -- "cold"/"hot"/"rainy"/"moderate", never a destination-
-    specific climate (no monsoon calendars, no desert-vs-rainforest
-    knowledge). Southern-hemisphere months are shifted by six to reuse the
-    northern mapping below: south's December is north's June, both summer.
+    hemisphere -- "cold"/"hot"/"rainy"/"moderate". It lives in
+    `packing_climate.season_bucket`, because the gate that decides whether a
+    bucket is reasonable for a place has to test the SAME months against it;
+    this name stays for the callers and tests that use it.
 
     Winter -> cold and summer -> hot swap between hemispheres, as real
     seasons do. Spring keeps "rainy" and autumn keeps "moderate" in BOTH
@@ -1591,15 +1545,23 @@ def _season_bucket(month: int, hemisphere: str) -> str:
     swap to instead, and inventing one would be exactly the destination-
     specific guessing this bucket is deliberately not doing.
     """
-    if hemisphere == "south":
-        month = (month + 5) % 12 + 1
-    if month in (12, 1, 2):
-        return "cold"
-    if month in (3, 4, 5):
-        return "rainy"
-    if month in (6, 7, 8):
-        return "hot"
-    return "moderate"
+    return packing_climate.season_bucket(month, hemisphere)
+
+
+def _phase_months(start: date | None, end: date | None) -> list[int]:
+    """Every calendar month a phase touches, start to end, at most twelve.
+    Each list covers three months and a phase can straddle two lists, so the
+    gate has to see all of them, not the start month alone."""
+    if start is None:
+        return []
+    if end is None or end < start:
+        end = start
+    months: list[int] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month) and len(months) < 12:
+        months.append(month)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return months
 
 
 # [{he,en} category, {he,en} item] pairs, the exact tuple shape
@@ -1628,28 +1590,48 @@ _PACKING_ITEMS_BY_SEASON: dict[str, list[tuple[dict[str, str], dict[str, str]]]]
 }
 
 
-def _derive_phase_packing(
-    destination: str, start: date | None, end: date | None,
-) -> list[list[dict[str, str]]]:
-    """A phase's climate-appropriate packing additions, layered on top of the
-    trip-level general list (readiness.tsx's `config.packing_general`, which
-    already has its own frontend fallback and is out of this function's
-    scope). Deterministic only: a small fixed item table keyed on a coarse
-    season bucket derived from the trip destination's hemisphere and the
-    phase's start month -- never a live weather call, never a model call.
+def _phase_packing_decision(
+    destination: str, start: date | None, end: date | None, phase_names: Sequence[str] = (),
+    fallback_names: Sequence[str] = (),
+) -> tuple[list[list[dict[str, str]]], str | None]:
+    """A phase's climate-appropriate packing additions AND, when there are
+    none, why: `(items, None)` or `([], reason)`, the reason drawn from
+    `packing_climate.REASONS`. The reason is for logs and tests only; it is
+    never written into the trip config.
 
-    A phase with no destination or no start date gets nothing, on purpose:
-    fail toward "nothing shown" (which an absent/empty `phase.packing` already
-    degrades to on the site) rather than toward a guessed season. A phase
-    spanning several months is bucketed on its start month alone -- coarse,
-    same as the season bucket itself.
+    The additions layer on top of the trip-level general list (readiness.tsx's
+    `config.packing_general`, which has its own frontend fallback and is out
+    of this function's scope). Deterministic only: a small fixed item table
+    keyed on a coarse season bucket (hemisphere x month) -- never a live
+    weather call, never a model call, never a network call.
+
+    Emitted ONLY when `packing_climate.decide()` is sure of the place and its
+    season in EVERY month the phase covers (issue #167): a phase that
+    straddles two season buckets, or has one month the bucket is wrong for,
+    abstains. `phase_names` are the phase's FULL names and `fallback_names`
+    the shortened forms, read only when no full name places anything -- so
+    "Perth, Scotland" decides before the "Perth" it shortens to can. A Tokyo
+    phase in a trip to "Japan" gets a list; a phase that names no known city
+    never does, whatever the destination. Everything else abstains, and an absent
+    `phase.packing` is what both sites already degrade to: readiness.tsx and
+    classic app.js render a phase's packing only when it has items.
     """
-    if not destination or not start:
-        return []
-    hemisphere = _destination_hemisphere(destination)
-    bucket = _season_bucket(start.month, hemisphere)
+    decision = packing_climate.decide(
+        destination, phase_names, _phase_months(start, end), fallback_names=fallback_names,
+    )
+    if decision.reason is not None or decision.hemisphere is None or start is None:
+        return [], decision.reason or packing_climate.UNRESOLVED
+    bucket = _season_bucket(start.month, decision.hemisphere)
     items = _PACKING_ITEMS_BY_SEASON.get(bucket) or []
-    return [[dict(category), dict(item)] for category, item in items]
+    return [[dict(category), dict(item)] for category, item in items], None
+
+
+def _derive_phase_packing(
+    destination: str, start: date | None, end: date | None, phase_names: Sequence[str] = (),
+    fallback_names: Sequence[str] = (),
+) -> list[list[dict[str, str]]]:
+    """The items half of `_phase_packing_decision` -- `[]` means abstain."""
+    return _phase_packing_decision(destination, start, end, phase_names, fallback_names)[0]
 
 
 def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, Any]]:
@@ -1661,7 +1643,7 @@ def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, A
 
     `destination` is the trip's raw (pre-"Unknown Destination"-fallback)
     typed answer, threaded through only so each phase's `packing` additions
-    (see _derive_phase_packing) know the hemisphere; nothing else here reads
+    (see _phase_packing_decision) can place the phase; nothing else here reads
     it. Passing "" is the "no destination" case that suppresses packing.
 
     Consecutive stops that shorten to the same location (a group split like
@@ -1744,9 +1726,22 @@ def _derive_phases(phases: list[Any], destination: str = "") -> list[dict[str, A
         if venues:
             phase["venues"] = venues
 
-        packing = _derive_phase_packing(destination, entry["start"], entry["end"])
+        packing, abstained = _phase_packing_decision(
+            destination, entry["start"], entry["end"],
+            # Full names decide: shortening cuts at the comma, and "Perth,
+            # Scotland" shortened is a city on the other side of the world.
+            phase_names=(entry["full_en"], entry["full_he"]),
+            fallback_names=(entry["short_en"], entry["short_he"]),
+        )
         if packing:
             phase["packing"] = packing
+        else:
+            # The only trace of an abstention: the site simply shows no
+            # per-phase list, which is also what a bug would look like.
+            logger.info(
+                "transformer.packing_abstained",
+                extra={"phase": phase_id, "reason": abstained},
+            )
 
         acc_for_note = phase.get("accommodation") or {}
         hotel_he = str(acc_for_note.get("name") or "")
