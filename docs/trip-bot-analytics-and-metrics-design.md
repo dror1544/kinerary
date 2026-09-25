@@ -903,9 +903,11 @@ governs, and nothing here is switched on in any deployment.
 trip through the real `dispatchUpdate` and `applyDecision` and checks the
 rollup against the counts the 2026-09-23 hand evaluation had to read
 transcripts for (the organizer's four DM document reads enter at `applyDecision`
-with a descriptor built by the same `inboundFacts()`, because `dispatchUpdate`
-cannot currently produce a `document_correction` decision; routing them through
-dispatch was rejected because the test would then assert that bug's behaviour),
+with a descriptor built by the same `inboundFacts()`; when the test was written
+`dispatchUpdate` could not produce a `document_correction` decision, and routing
+them through dispatch was rejected because the test would then assert that bug's
+behaviour. Since #178 (PR #215) dispatch produces it, and the test keeps the
+hand-built decision so it controls exactly which documents are read),
 that no row contains an identifier or a word anyone wrote,
 that a throwing or hanging sink changes nothing the family sees, and that with
 the setting unset the same week writes nothing.
@@ -1027,8 +1029,17 @@ different component (the poller or the connector), and rows stay append-only.
 
 **Lost turns.** A turn is lost either when no gateway socket takes the frame
 (`pushInbound` false: `lost_gateway_unavailable`) or when the router answers
-"still finishing your assistant" because the companion is not running
-(`COMPANION_PENDING`: `lost_companion_unreachable`). The poll loop passes
+because the companion is not running (`COMPANION_PENDING`:
+`lost_companion_unreachable`). Since #179 (PR #215) that answer is "still
+finishing your assistant" only for a trip whose assistant was never announced as
+up; for an announced one, a group message that is not addressed is ignored
+(recorded as chatter, with the same facts), an addressed one gets the generic
+"I'm off for now" line at most once per chat per ten minutes, and an addressed
+message the limiter suppressed is deliberately recorded with **no** event: an
+`ignore` carrying facts counts as chatter, and this was a lost turn, so an
+absent event undercounts and a wrong one misleads. The text that follows
+describes the router as it was written and still holds for the never-announced
+case. The poll loop passes
 `canReachProfile`, so a gateway that is down almost always surfaces as the
 second; recording only the first would systematically undercount lost turns.
 That router answer comes before the relevance gate, so a family's chatter can
@@ -1164,8 +1175,10 @@ enabling goes to the Mac first, then production, as decided there):
    `handedOff(delivered=false)` through `applyDecision`; the connector's
    `suppressed` and `{ok:false}` branches; the `runDocumentCorrection`
    outcomes other than `failed_tool`, and the correction chain's catch path.
-3. **#178:** the dispatch-built `document_correction` descriptor is
-   unreachable today (see §16.1).
+3. **#178 — done (PR #215):** the dispatch-built `document_correction`
+   descriptor is now reachable; the route asked whether the wire event had
+   media before any was attached, and now asks the message's own attachment.
+   It has not been walked end to end on a real trip (#217).
 4. **The compose `environment:` pass-through is a deploy decision.**
    `ASSISTANT_EVENTS_ENABLED` is not in the compose relay `environment:` list,
    so setting it in an env file does not reach the process; turning it on means

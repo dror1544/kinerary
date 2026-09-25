@@ -198,7 +198,7 @@ same discipline that comment is defending.
 | State | Behaviour |
 |---|---|
 | `companion_profile IS NULL` | Route resolves `companion` with a null profile — unchanged from today. `normalize.ts` drops with `COMPANION_PENDING`; the organizer is told the assistant is still being finished. Binding and switching still work. |
-| Set, but no gateway connected for it | Already handled: `canReachProfile` → the trip is reported unreachable rather than served by another trip's process (`relay.multiplex_gateway_id` is the declared exception). |
+| Set, but no gateway connected for it | Already handled: `canReachProfile` → the trip is reported unreachable rather than served by another trip's process (`relay.multiplex_gateway_id` is the declared exception). What the chat is then told depends on whether the assistant was ever announced as up: see `per-trip-gateway-architecture.md` §7 (#179). |
 | Set, but the profile does not exist on the host | Same as above — no gateway ever connects under that id. Detectable, and worth a `reachability` reason rather than silence. |
 | Backfill could not determine a name | Left NULL. **Never derived at read time.** A `reconcile-companion` worker task — `install()` is idempotent and returns the name — is the recovery, and it is a normal provisioning operation rather than a database edit. |
 

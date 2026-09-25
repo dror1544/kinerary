@@ -473,7 +473,45 @@ hasn't been connected to any username yet — the response is meant to prompt
 
 ### Security Model
 - JWT tokens (30-day expiry); `authRequired` middleware on all private routes
-- Guest endpoints: lost & found form, photo file downloads, public trivia TV view
+- Guest endpoints (no login): the lost & found form (`POST /api/lost-found` — no rate limit, #207), the
+  public trivia TV view and its SSE stream, `GET /api/trip/logo`, `GET /api/config/roster`, and the
+  `/photo/:id?s=` share page (below). Everything else in the gallery and social surface needs a login
+  (#191, #194).
+- **Gallery and social routes need a login, and one member sees only a projection of another** (#191,
+  #194, PR #211). `/api/photos`, `/api/ratings`, `/api/reactions[/:id]`, `/api/comments/venue|photo[...]`,
+  `/api/rsvps/:id`, `/api/tasks/done` and `/api/album-share/:phase` sit behind `authRequired` — so a
+  member's JWT, the agent key or a gateway-injected session, **not** an organizer check. Anything that
+  attaches another member to a record goes through `publicUser()` (`server/public-user.js`), an
+  **allow-list** of `username`, `name`, `name_en`, `color`, `avatar_file`; a `users` column nobody names
+  there (Telegram id, Google email/sub, age, family) is never attached, whatever is added to the table
+  later. `getUser()` (the whole row minus the password hash) is for a caller's own record
+  (`/api/auth/me`) only. By design `/api/config` still gives every signed-in member `age` and `family`,
+  because the config allow-list names them (#172); that is a separate decision from `publicUser`.
+  The anonymous trivia stream's `players` are built without `family`.
+- **Photo files and share links are HMAC capabilities, not sessions** (`server/file-token.js`). Both keys
+  are derived from `JWT_SECRET` under separate labels (`kinerary:photo-file:v1`, `kinerary:photo-share:v1`),
+  so neither signature can be replayed as the other or as anything else keyed by that secret; no new
+  secret exists.
+  - *File link* — the authenticated `/api/photos` listing (and the upload response) hands out
+    `/api/photos/file/<name>?exp=&sig=` per photo, valid one hour, because an `<img>` cannot send a
+    bearer token. A missing, malformed, expired or wrong link **falls back to `authRequired`** rather than
+    being served or hard-refused itself, so a gallery left open past the hour keeps working behind the
+    gateway, which injects the session on every request; with no other credential it is a 401.
+  - *Share link* — `/photo/<id>?s=<hmac of the id>` (Facebook's crawler has no login) does **not expire**
+    and works for anyone holding it; unknown id, no signature, and a bad one all answer the same 404. Only
+    the authenticated listing hands one out. Owner decision, 2026-09-25: the link is open to everyone in
+    the group. The page's own image URL is a freshly signed one-hour file link, and its metadata is
+    HTML-escaped.
+  - **Rotating `JWT_SECRET` revokes every outstanding file and share link and logs every member out.**
+- **Uploads and served files cannot run script.** `/api/photos/upload` accepts only
+  `jpg/jpeg/png/gif/webp/heic/heif` with an `image/*` type (SVG and HTML are refused, 400
+  `unsupported_file_type`) and stores it under a server-built name (timestamp, random, allow-listed
+  extension) — never a fragment of the uploader's filename. The file route serves only a bare filename
+  that still resolves inside the uploads directory after symlinks, with `nosniff`, `Content-Security-Policy:
+  sandbox`, and `application/octet-stream` for any active-content extension (older stored files may
+  carry those names). `/api/trip/logo` stays public (the login page draws it) but serves only an image
+  extension (`png jpg jpeg gif svg webp`) whose real path is inside the trip directory, with `nosniff`
+  and, for SVG, `sandbox`.
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
 - Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
 - **Trip config is served through an allow-list** (#172): `/api/config`, `/api/config/versions/:version`,
