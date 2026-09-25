@@ -10,7 +10,7 @@ import { describe, test } from "node:test";
 import { parseInbound } from "../src/chat-router.js";
 import type { RunnerResult, StructuredModelRequest, StructuredModelRunner } from "../src/model-runner.js";
 import { MODEL_TASKS, runnerForBinding, taskTimeoutMs } from "../src/model-runner.js";
-import { handleModelCommand, isSwitchableRunner, parseBinding, switchableRunner } from "../src/model-task-settings.js";
+import { handleModelCommand, isSwitchableRunner, parseBinding, switchableRunner, verifyCodexOverrides } from "../src/model-task-settings.js";
 
 /** A runner that names itself and answers with its own name. */
 function named(provider: string, model: string, gate?: Promise<void>): StructuredModelRunner & { calls: number } {
@@ -105,6 +105,53 @@ describe("/model refusals", () => {
     assert.match(reply, /read_image sends files, which only claude or openrouter can take/);
     assert.match(reply, /Nothing changed/);
     assert.deepEqual(runner.effective("read_image"), { binding: { runner: "claude", model: "claude-sonnet-5" }, source: "environment" });
+  });
+});
+
+describe("/model codex is verified before it is saved (#58)", () => {
+  const touchedDb = () => new Proxy({}, { get: () => { throw new Error("DB-TOUCHED"); } }) as never;
+  const codexRunnerFor = () =>
+    switchableRunner(named("claude", "claude-sonnet-5"), (task, b) => runnerForBinding(b.runner, b.model, taskTimeoutMs(task), task, {}));
+  const admin = "sha256:" + "0".repeat(64);
+
+  test("a codex that fails the isolation probe is refused and nothing is recorded", async () => {
+    const reply = await handleModelCommand(
+      touchedDb(), codexRunnerFor(), { name: "model", args: "extract_intake codex:gpt-5.6-luna" }, admin,
+      () => {}, async () => "codex does not know isolation feature(s): shell_tool",
+    );
+    assert.match(reply, /cannot serve calls/);
+    assert.match(reply, /shell_tool/);
+    assert.match(reply, /Nothing changed/);
+  });
+
+  test("a codex that cannot be probed at all is refused, not trusted", async () => {
+    const reply = await handleModelCommand(
+      touchedDb(), codexRunnerFor(), { name: "model", args: "extract_intake codex:gpt-5.6-luna" }, admin,
+      () => {}, async () => 'cannot run "codex features list": ENOENT',
+    );
+    assert.match(reply, /Nothing changed/);
+  });
+
+  test("a verified codex passes the gate (and only then reaches the database)", async () => {
+    await assert.rejects(
+      handleModelCommand(
+        touchedDb(), codexRunnerFor(), { name: "model", args: "extract_intake codex:gpt-5.6-luna" }, admin,
+        () => {}, async () => null,
+      ),
+      /DB-TOUCHED/,
+    );
+  });
+
+  test("overrides loaded from the database are verified, and an unverifiable codex latches the refusal", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const lines: string[] = [];
+    await verifyCodexOverrides(new Map([["extract_intake", { runner: "codex", model: "gpt-5.6-luna" }]]), (l) => lines.push(l), async () => "no codex", env);
+    assert.equal(env.KINERARY_CODEX_ISOLATION_UNVERIFIED, "1");
+    assert.match(lines.join(""), /codex_isolation_unverified/);
+    // No codex among the overrides: nothing probed, nothing latched.
+    const clean: NodeJS.ProcessEnv = {};
+    await verifyCodexOverrides(new Map([["interpret", { runner: "claude", model: "m" }]]), () => {}, async () => { throw new Error("probed"); }, clean);
+    assert.equal(clean.KINERARY_CODEX_ISOLATION_UNVERIFIED, undefined);
   });
 });
 

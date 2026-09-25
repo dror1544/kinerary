@@ -20,6 +20,7 @@ import {
   ATTACHMENT_RUNNERS,
   ATTACHMENT_TASKS,
   FORBIDDEN_MODELS,
+  codexIsolationProblem,
   type RunnerResult,
   type StructuredModelRequest,
   type StructuredModelRunner,
@@ -164,19 +165,54 @@ export function switchableRunner(
   };
 }
 
+/** How a codex install is checked: null when it knows every isolation feature, else what is wrong. */
+export type CodexProbe = (bin: string) => Promise<string | null>;
+
+/**
+ * The relay's startup check (relay/server.ts) only runs when a `*_RUNNER` ENV
+ * variable names codex. An override saved in the database — or one loaded at
+ * boot on a relay with no codex in its env — reaches codex without it. This is
+ * the same check for that path: if any override names codex and it has not been
+ * ruled out yet, probe, and on a problem set the same
+ * `KINERARY_CODEX_ISOLATION_UNVERIFIED` flag the startup check sets, so
+ * `runnerForBinding` then refuses codex bindings. Fail-safe: a probe that
+ * cannot run is a problem, never a pass.
+ */
+export async function verifyCodexOverrides(
+  overrides: ReadonlyMap<string, TaskBinding>,
+  log: (line: string) => void,
+  probe: CodexProbe = codexIsolationProblem,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  if (env.KINERARY_CODEX_ISOLATION_UNVERIFIED === "1") return;
+  if (![...overrides.values()].some((binding) => binding.runner === "codex")) return;
+  const problem = await probe(env.CODEX_BIN || "codex");
+  if (!problem) return;
+  env.KINERARY_CODEX_ISOLATION_UNVERIFIED = "1";
+  log(structuredLog("error", "relay.codex_isolation_unverified", {
+    detail: problem,
+    source: "task_override",
+    hint: "codex bindings are refused until the isolation list in model-runner.ts matches this codex",
+  }));
+}
+
 /** Load the overrides now and every `intervalMs` after. Returns the stop function. */
 export function startTaskOverrideRefresh(
   db: pg.Pool,
   runner: SwitchableRunner,
   log: (line: string) => void,
   intervalMs = 30_000,
+  codexProbe: CodexProbe = codexIsolationProblem,
 ): () => void {
   let refreshing = false;
   const refresh = () => {
     if (refreshing) return;
     refreshing = true;
     loadTaskOverrides(db)
-      .then((overrides) => runner.apply(overrides))
+      .then(async (overrides) => {
+        await verifyCodexOverrides(overrides, log, codexProbe);
+        runner.apply(overrides);
+      })
       .catch((error) => {
         // A failed read keeps the overrides already in force rather than
         // dropping to the environment: silently reverting a recorded decision
@@ -222,6 +258,7 @@ export async function handleModelCommand(
   command: { name: string; argument?: string | null; args?: string },
   changedBy: string,
   log: (line: string) => void = () => {},
+  codexProbe: CodexProbe = codexIsolationProblem,
 ): Promise<string> {
   if (!runner) return "Model switching is not available on this relay: no model runner is configured.";
   const words = (command.argument ?? command.args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -246,6 +283,14 @@ export async function handleModelCommand(
         ? ` (${task} sends files, which only ${[...ATTACHMENT_RUNNERS].join(" or ")} can take)`
         : binding.runner === "openrouter" ? " (no OpenRouter key)" : "";
       return `${binding.runner}:${binding.model} cannot serve calls on this relay${why}. Nothing changed.`;
+    }
+    // canServe is synchronous and only reads the flag the startup check sets,
+    // which that check sets only for an env-bound codex. Ask codex itself.
+    if (binding.runner === "codex") {
+      const problem = await codexProbe(process.env.CODEX_BIN || "codex");
+      if (problem) {
+        return `${binding.runner}:${binding.model} cannot serve calls on this relay (${problem}). Nothing changed.`;
+      }
     }
     await setTaskOverride(db, { task: task as SwitchableTask, binding, changedBy });
   }
