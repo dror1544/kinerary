@@ -12,6 +12,7 @@ import { Readiness, CurrencyConverter } from "./readiness";
 import { GroupActivities, LostFound, ActivityRsvp, VenueFeedback } from "./group-utilities";
 import { Account, GoogleSignIn, Enrollment } from "./account";
 import { PlanTools } from "./plan-tools";
+import { AssistantConnect } from "./assistant-connect";
 import { Trivia } from "./trivia";
 import { heroCandidates, useHeroPhoto } from "./hero-photo";
 import { useTripUpdates, useLiveEditGuard } from "./live-updates";
@@ -2326,6 +2327,7 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
           <MemberLogins config={config} lang={lang} />
+          <AssistantConnect lang={lang} />
         </section>
       ) : null}
       <div className="workflow-grid">

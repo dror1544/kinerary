@@ -950,6 +950,22 @@ app.post('/api/ui-settings/hero', organizerOrAgentRequired, heroUpload.single('h
 journey.registerRoutes(app, { authRequired, organizerOrAgentRequired });
 require('./companion-conversation').registerCompanionConversation({ app, db, authRequired, organizerOrAgentRequired });
 require('./companion-control').registerCompanionControl({ app, authRequired, organizerOrAgentRequired, fetchImpl: fetch });
+// An organizer's own Claude or ChatGPT, signed in through OAuth. Off unless
+// TRIP_MCP_ENABLED and PUBLIC_ORIGIN are set — see server/trip-mcp/index.js.
+// An optional feature must never take the site down with it: if it cannot
+// start, it stays off and says why, and the trip keeps serving.
+try { require('./trip-mcp').registerTripMcp({
+  app, db, jwt, jwtSecret: JWT_SECRET, jwtSecretIsDefault: JWT_SECRET === 'trip-dev-secret-change-me',
+  validManagedPayload: payload => controlPlaneAuth.validManagedPayload(payload),
+  organizers: () => normalizeOrganizers(TRIP_CONFIG.agent),
+  userExists: username => Boolean(getUser(username)) && (TRIP_CONFIG.participants || []).some(p => p.username === username),
+  // Never the raw config: whatever the connector says about the trip is what
+  // /api/config already says to a signed-in member.
+  getPublicConfig: () => sanitizeConfig(TRIP_CONFIG),
+  organizerOrAgentRequired,
+  listenPort: process.env.PORT || 3000,
+  listenHost: process.env.HOST,
+}); } catch (err) { console.error(`[trip-mcp] failed to start, left off: ${err.message}`); }
 
 app.get('/api/agent/brief', organizerOrAgentRequired, (_req, res) => {
   const agent = TRIP_CONFIG.agent || null;
