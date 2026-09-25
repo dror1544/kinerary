@@ -608,7 +608,7 @@ describe("the identity link the commands depend on (DB)", { skip: SKIP }, () => 
  * every step of getting them across to it used to lose the one fact that makes
  * the new trip usable: which companion serves it.
  */
-describe("a returning organizer's second trip", () => {
+describe("a returning organizer's second trip (DB)", { skip: SKIP }, () => {
   test("a switch finds the companion on the trip, not only on a binding", async () => {
     await withFixture(async ({ pool, italyId, japanId }) => {
       // Exactly the state a returning organizer's second trip is left in: the
