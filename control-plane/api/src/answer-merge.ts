@@ -57,6 +57,10 @@ export function identityFold(text: string): string {
     .replace(DASHES, "-")
     .replace(SINGLE_QUOTES, "'")
     .replace(DOUBLE_QUOTES, '"')
+    // Hebrew geresh and gershayim are the abbreviation and acronym marks a
+    // keyboard cannot type; people write ' and " instead, and ג'ורג' is one name.
+    .replace(/\u05F3/g, "'")
+    .replace(/\u05F4/g, '"')
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
@@ -155,7 +159,7 @@ function cutShort(part: string, whole: string, fromEnd: boolean): boolean {
  * together ("MOSHEYOSSI"), or as one word cut short. At most one word may be cut
  * short, and one cut at its END needs two other words to agree exactly.
  */
-function accountedFor(names: readonly string[], other: readonly string[]): boolean {
+function accountedFor(names: readonly string[], other: readonly string[], clip: boolean): boolean {
   if (names.length < 2) return false;
   const forms = new Set(other);
   for (let i = 0; i + 1 < other.length; i += 1) forms.add(`${other[i]}${other[i + 1]}`);
@@ -166,8 +170,8 @@ function accountedFor(names: readonly string[], other: readonly string[]): boole
     if (forms.has(word)) exact += 1;
     // Either printing may be the clipped one: "Noa Barak" and a clipped
     // "ARAK/NOALEE" are one person, a middle name and a cut apart.
-    else if (other.some((w) => cutShort(word, w, false) || cutShort(w, word, false))) cutAtStart += 1;
-    else if (other.some((w) => cutShort(word, w, true) || cutShort(w, word, true))) cutAtEnd += 1;
+    else if (clip && other.some((w) => cutShort(word, w, false) || cutShort(w, word, false))) cutAtStart += 1;
+    else if (clip && other.some((w) => cutShort(word, w, true) || cutShort(w, word, true))) cutAtEnd += 1;
     else return false;
   }
   if (cutAtStart + cutAtEnd > 1) return false;
@@ -190,13 +194,16 @@ function accountedFor(names: readonly string[], other: readonly string[]): boole
  * than merging. One word may be cut short (see `cutShort`). A different
  * transliteration of a surname is NOT matched: telling "Cohen" from "Kohen" apart
  * from two different families needs a person, not a letter count.
+ *
+ * `clip: false` drops the cut-short tolerance. It exists for a PDF clipped at its
+ * margin; a person TYPING a name has not clipped it, and "Ella" is not "Bella".
  */
-export function samePerson(a: string, b: string): boolean {
+export function samePerson(a: string, b: string, clip = true): boolean {
   const x = personWords(a);
   const y = personWords(b);
   if (x.length === 0 || y.length === 0) return false;
   if ([...x].sort().join(" ") === [...y].sort().join(" ")) return true;
-  return accountedFor(x, y) || accountedFor(y, x);
+  return accountedFor(x, y, clip) || accountedFor(y, x, clip);
 }
 
 /** Every name an entry is given under, English spelling first. */
@@ -509,7 +516,7 @@ function mergeNestedList(path: string, held: unknown[], incoming: unknown[], acc
 }
 
 /** Dated lists come back in date order, with a stable tie-break, so arrival order leaves no trace. */
-function ordered(list: unknown[]): unknown[] {
+export function ordered(list: unknown[]): unknown[] {
   if (list.length === 0 || !list.every((e) => isRecord(e) && startOf(e) !== null)) return list;
   return [...list].sort((a, b) => {
     const byDate = startOf(a as Record<string, unknown>)!.localeCompare(startOf(b as Record<string, unknown>)!);

@@ -699,8 +699,10 @@ export interface ApplyProposalsContext {
    * the stay the plan already named.
    *
    * Absent, answered means refused, exactly as before. The typed-message path
-   * does not pass it: an organizer retyping an answer is making a change, and a
-   * change is theirs to make through the recap, not something to merge.
+   * does not pass it: it passes `answers` and `allowCorrections` instead, and
+   * `corrected` folds a typed change to a list into the held one. (Under #206 a
+   * typed change to held stops or travellers becomes a confirmed diff —
+   * `typed-changes.ts`; this describes the path that exists today.)
    */
   held?: Readonly<Record<string, unknown>>;
   /**
@@ -1131,16 +1133,6 @@ export interface SubmitArgs {
 }
 
 /**
- * An accepted proposal, as `submitAnswerForChat` takes it.
- *
- * The answer is written through the ordinary router write path rather than
- * inserted directly, so it re-runs `validateAnswer` and picks up phase
- * advancement, derivations and the digest exactly as a tapped button does.
- * The second validation is not redundant: it means there is still only ONE way
- * an answer reaches storage, which is the property that made the gate above
- * cheap to trust in the first place.
- */
-/**
  * What to WRITE for an accepted typed proposal. For a structured answer that is
  * the merged, gated answer — a typed proposal carries only what is ADDED, and
  * the write replaces the stored answer wholesale, so writing the raw proposal
@@ -1152,6 +1144,16 @@ export function submitArgsForAccepted(accepted: { answer: IntakeAnswer; proposal
   return accepted.answer.kind === "structured" ? { ...args, structuredData: accepted.answer.data } : args;
 }
 
+/**
+ * An accepted proposal, as `submitAnswerForChat` takes it.
+ *
+ * The answer is written through the ordinary router write path rather than
+ * inserted directly, so it re-runs `validateAnswer` and picks up phase
+ * advancement, derivations and the digest exactly as a tapped button does.
+ * The second validation is not redundant: it means there is still only ONE way
+ * an answer reaches storage, which is the property that made the gate above
+ * cheap to trust in the first place.
+ */
 export function submitArgsFor(value: ProposedValue): SubmitArgs {
   switch (value.kind) {
     case "choice":
