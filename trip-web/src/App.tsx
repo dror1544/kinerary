@@ -2327,9 +2327,10 @@ export function MoreView({ config, currentUser, isOrganizer, lang, openModule }:
             <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={uploadHero} disabled={busy} />
           </label>
           <MemberLogins config={config} lang={lang} />
-          <AssistantConnect lang={lang} />
         </section>
       ) : null}
+      {/* Everyone on the trip: organizers connect read-and-write, members read only. */}
+      <AssistantConnect lang={lang} tripName={typeof config?.meta?.title === "string" ? config.meta.title : undefined} />
       <div className="workflow-grid">
         {isOrganizer ? (
           <a className="workflow-link organizer-only" href={classicHref()}>

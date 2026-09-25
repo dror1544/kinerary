@@ -63,8 +63,8 @@ describe('trip MCP — an organizer connects an assistant', () => {
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }),
   });
-  async function connect() {
-    const d = await decide(aliceSession);
+  async function connect(session = aliceSession) {
+    const d = await decide(session);
     assert.equal(d.status, 200);
     const code = new URL((await d.json()).redirect_to).searchParams.get('code');
     const t = await tokenRequest({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: client.client_id, redirect_uri: CLAUDE_CALLBACK });
@@ -142,10 +142,15 @@ describe('trip MCP — an organizer connects an assistant', () => {
     assert.equal(new URL(noPkce.headers.get('location')).searchParams.get('error'), 'invalid_request');
   });
 
-  it('only an organizer can consent', async () => {
+  it('anyone on the trip can consent; nobody else can', async () => {
     assert.equal((await decide(null)).status, 401);
-    assert.equal((await decide(bobSession)).status, 403);
     assert.equal((await decide('not-a-jwt')).status, 401);
+    // A validly signed session for someone who is not on this trip.
+    const { createRequire } = await import('node:module');
+    const jwt = createRequire(new URL('../server/package.json', import.meta.url))('jsonwebtoken');
+    const outsider = jwt.sign({ username: 'zed' }, 'test-secret-000', { expiresIn: 60 });
+    assert.equal((await decide(outsider)).status, 403);
+    assert.equal((await decide(bobSession)).status, 200, 'a member may connect (read only)');
   });
 
   it('a denial goes back to the assistant as access_denied', async () => {
@@ -248,11 +253,50 @@ describe('trip MCP — an organizer connects an assistant', () => {
     const conn = view.connections.find(c => c.client === 'Claude');
     assert.ok(conn);
     assert.equal(conn.username, 'alice');
-    assert.equal((await api('/api/mcp/connection', { token: bobSession })).status, 403, 'members cannot see connections');
+    const bobView = await (await api('/api/mcp/connection', { token: bobSession })).json();
+    assert.equal(bobView.access, 'read');
+    assert.ok(!bobView.connections.some(c => c.username === 'alice'), 'a member sees only their own connections');
+    assert.equal((await api(`/api/mcp/connections/${conn.id}`, { method: 'DELETE', token: bobSession })).status, 404, 'nor can they end someone else\'s');
 
     const del = await api(`/api/mcp/connections/${conn.id}`, { method: 'DELETE', token: aliceSession });
     assert.equal(del.status, 200);
     assert.equal((await rpc(tokens.access_token, 'tools/list')).status, 401);
+  });
+
+  it('a member connects read-only: no write tools, no organizer briefing', async () => {
+    const t = await connect(bobSession);
+    assert.equal(t.scope, 'trip:read');
+    const init = await (await rpc(t.access_token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } })).json();
+    assert.match(init.result.instructions, /READ-ONLY/);
+    const names = (await (await rpc(t.access_token, 'tools/list')).json()).result.tools.map(x => x.name);
+    for (const n of ['get_config', 'get_today', 'get_bookings', 'get_phase_plan', 'get_budget', 'get_rsvps']) assert.ok(names.includes(n), n);
+    for (const n of ['add_booking', 'delete_booking', 'add_plan_item', 'add_budget_item', 'post_venue_comment', 'add_participant', 'get_trip_briefing', 'publish_daily_message']) {
+      assert.ok(!names.includes(n), `${n} must not be offered to a member`);
+    }
+    const call = await (await rpc(t.access_token, 'tools/call', { name: 'add_budget_item', arguments: { phase: 'general', category: 'x', description: 'nope', amount: 1 } })).json();
+    assert.ok(call.error || call.result?.isError, 'calling a write tool anyway fails');
+    assert.doesNotMatch(JSON.stringify(await (await api('/api/budget', { token: aliceSession })).json()), /nope/);
+
+    // The member manages their own connection.
+    const mine = (await (await api('/api/mcp/connection', { token: bobSession })).json()).connections;
+    assert.equal(mine.length, 1);
+    assert.equal(mine[0].access, 'read');
+    assert.equal((await api(`/api/mcp/connections/${mine[0].id}`, { method: 'DELETE', token: bobSession })).status, 200);
+    assert.equal((await rpc(t.access_token, 'tools/list')).status, 401);
+  });
+
+  it('other people reach the assistant as a name, never a Telegram id, age or email', async () => {
+    await api('/api/rsvps/mcp-rsvp', { method: 'POST', token: aliceSession, body: { status: 'yes' } });
+    await api('/api/comments/venue/mcp-venue', { method: 'POST', token: aliceSession, body: { body: 'lovely' } });
+    for (const session of [aliceSession, bobSession]) {
+      const t = await connect(session);
+      for (const [name, args] of [['get_rsvps', { activityId: 'mcp-rsvp' }], ['get_venue_comments', { venueId: 'mcp-venue' }]]) {
+        const r = await (await rpc(t.access_token, 'tools/call', { name, arguments: args })).json();
+        const rows = JSON.parse(r.result.content[0].text);
+        assert.ok(rows.length, `${name} returned rows`);
+        for (const row of rows) assert.deepEqual(Object.keys(row.user).sort().filter(k => !['username', 'name', 'name_en', 'color'].includes(k)), [], `${name}: ${JSON.stringify(row.user)}`);
+      }
+    }
   });
 
   it('the assistant can revoke its own connection', async () => {

@@ -17,7 +17,13 @@ const net = require('net');
 const ACCESS_TTL_S = 60 * 60;
 const REFRESH_TTL_S = 30 * 24 * 60 * 60;
 const CODE_TTL_S = 5 * 60;
+// What a connection may do, fixed when it is approved: an organizer grants
+// read and write, anyone else on the trip grants read only. A grant never
+// widens later — a member promoted to organizer keeps a read-only connection
+// until they approve a new one, so nobody holds write access they did not see
+// on the consent page.
 const SCOPE = 'trip';
+const READ_SCOPE = 'trip:read';
 // Registration is unauthenticated by design (every MCP client registers itself
 // on first connect), so it is bounded instead. A client that has not finished a
 // sign-in within this window is dropped (a code only lives five minutes), and
@@ -115,6 +121,9 @@ function createOAuthStore(db) {
   // missing column throws at boot — so every later column is added here.
   const columns = table => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
   if (!columns('mcp_oauth_codes').has('grant_id')) db.exec('ALTER TABLE mcp_oauth_codes ADD COLUMN grant_id TEXT');
+  // Rows from before scopes existed were all organizer grants.
+  if (!columns('mcp_oauth_codes').has('scope')) db.exec(`ALTER TABLE mcp_oauth_codes ADD COLUMN scope TEXT NOT NULL DEFAULT '${SCOPE}'`);
+  if (!columns('mcp_oauth_grants').has('scope')) db.exec(`ALTER TABLE mcp_oauth_grants ADD COLUMN scope TEXT NOT NULL DEFAULT '${SCOPE}'`);
 
   const q = {
     client: db.prepare('SELECT * FROM mcp_oauth_clients WHERE client_id = ?'),
@@ -124,17 +133,17 @@ function createOAuthStore(db) {
       SELECT client_id FROM mcp_oauth_clients WHERE client_id NOT IN (SELECT client_id FROM mcp_oauth_grants WHERE revoked_at IS NULL)
       ORDER BY created_at ASC LIMIT 1)`),
     insertClient: db.prepare('INSERT INTO mcp_oauth_clients (client_id, client_secret_hash, client_name, redirect_uris, token_endpoint_auth_method, created_at) VALUES (?,?,?,?,?,?)'),
-    insertCode: db.prepare('INSERT INTO mcp_oauth_codes (code_hash, client_id, username, redirect_uri, code_challenge, resource, expires_at) VALUES (?,?,?,?,?,?,?)'),
+    insertCode: db.prepare('INSERT INTO mcp_oauth_codes (code_hash, client_id, username, redirect_uri, code_challenge, resource, expires_at, scope) VALUES (?,?,?,?,?,?,?,?)'),
     code: db.prepare('SELECT * FROM mcp_oauth_codes WHERE code_hash = ?'),
     useCode: db.prepare('UPDATE mcp_oauth_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL'),
     linkCode: db.prepare('UPDATE mcp_oauth_codes SET grant_id = ? WHERE code_hash = ?'),
     pruneCodes: db.prepare('DELETE FROM mcp_oauth_codes WHERE expires_at < ?'),
-    insertGrant: db.prepare('INSERT INTO mcp_oauth_grants (id, client_id, username, created_at) VALUES (?,?,?,?)'),
+    insertGrant: db.prepare('INSERT INTO mcp_oauth_grants (id, client_id, username, created_at, scope) VALUES (?,?,?,?,?)'),
     grant: db.prepare('SELECT * FROM mcp_oauth_grants WHERE id = ?'),
     touchGrant: db.prepare('UPDATE mcp_oauth_grants SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)'),
     revokeGrant: db.prepare('UPDATE mcp_oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'),
     revokeGrantTokens: db.prepare('UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL'),
-    activeGrants: db.prepare(`SELECT g.id, g.username, g.created_at, g.last_used_at, c.client_name, c.redirect_uris
+    activeGrants: db.prepare(`SELECT g.id, g.username, g.scope, g.created_at, g.last_used_at, c.client_name, c.redirect_uris
       FROM mcp_oauth_grants g LEFT JOIN mcp_oauth_clients c ON c.client_id = g.client_id
       WHERE g.revoked_at IS NULL ORDER BY g.created_at DESC`),
     insertToken: db.prepare('INSERT INTO mcp_oauth_tokens (token_hash, grant_id, kind, expires_at) VALUES (?,?,?,?)'),
@@ -149,11 +158,11 @@ function createOAuthStore(db) {
     db.transaction(() => { q.revokeGrant.run(t, id); q.revokeGrantTokens.run(t, id); })();
   }
 
-  function issueTokens(grantId) {
+  function issueTokens(grantId, scope) {
     const access = randomToken(), refresh = randomToken(), t = now();
     q.insertToken.run(hash(access), grantId, 'access', t + ACCESS_TTL_S);
     q.insertToken.run(hash(refresh), grantId, 'refresh', t + REFRESH_TTL_S);
-    return { access_token: access, token_type: 'Bearer', expires_in: ACCESS_TTL_S, refresh_token: refresh, scope: SCOPE };
+    return { access_token: access, token_type: 'Bearer', expires_in: ACCESS_TTL_S, refresh_token: refresh, scope };
   }
 
   return {
@@ -169,10 +178,10 @@ function createOAuthStore(db) {
       return { clientId, clientSecret: secret, issuedAt: t };
     },
 
-    createCode({ clientId, username, redirectUri, codeChallenge, resource }) {
+    createCode({ clientId, username, redirectUri, codeChallenge, resource, scope }) {
       const code = randomToken();
       q.pruneCodes.run(now() - CODE_TTL_S);
-      q.insertCode.run(hash(code), clientId, username, redirectUri, codeChallenge, resource || null, now() + CODE_TTL_S);
+      q.insertCode.run(hash(code), clientId, username, redirectUri, codeChallenge, resource || null, now() + CODE_TTL_S, scope);
       return code;
     },
 
@@ -189,11 +198,11 @@ function createOAuthStore(db) {
       return row;
     },
 
-    startGrant({ clientId, username, codeHash }) {
+    startGrant({ clientId, username, codeHash, scope }) {
       const id = `grant_${randomToken(12)}`;
-      q.insertGrant.run(id, clientId, username, now());
+      q.insertGrant.run(id, clientId, username, now(), scope);
       if (codeHash) q.linkCode.run(id, codeHash);
-      return { grantId: id, tokens: issueTokens(id) };
+      return { grantId: id, tokens: issueTokens(id, scope) };
     },
 
     // Rotation with reuse detection: presenting a refresh token that was
@@ -209,7 +218,7 @@ function createOAuthStore(db) {
       // The refresh replaces the whole pair: the access token it was paired
       // with stops working now, not at the end of its hour.
       db.transaction(() => { q.revokeToken.run(now(), row.token_hash); q.revokeGrantAccess.run(now(), grant.id); })();
-      return { tokens: issueTokens(grant.id) };
+      return { tokens: issueTokens(grant.id, grant.scope) };
     },
 
     // Resolves a bearer token to the grant it belongs to, or null.
@@ -269,5 +278,5 @@ function authenticateClient(store, req) {
 
 module.exports = {
   createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, hash,
-  SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
+  SCOPE, READ_SCOPE, ACCESS_TTL_S, DEFAULT_REDIRECT_URIS, MAX_URI_LENGTH,
 };

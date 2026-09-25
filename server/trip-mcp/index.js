@@ -1,4 +1,5 @@
-// The trip site's own MCP endpoint, for an organizer's Claude or ChatGPT.
+// The trip site's own MCP endpoint, for a trip member's own Claude or ChatGPT:
+// read and write for an organizer, read only for everyone else.
 //
 // Off unless this trip's environment turns it on:
 //   TRIP_MCP_ENABLED=1
@@ -22,7 +23,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE } = require('./oauth');
+const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { registerTools, buildInstructions } = require('./tools');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
@@ -39,7 +40,7 @@ function resolveOrigin(raw) {
 
 function registerTripMcp({
   app, db, env = process.env, jwt, jwtSecret, jwtSecretIsDefault, validManagedPayload, organizers, userExists,
-  getPublicConfig, organizerOrAgentRequired, listenPort, listenHost,
+  getPublicConfig, authRequired, listenPort, listenHost,
 }) {
   const wanted = ['1', 'true'].includes(String(env.TRIP_MCP_ENABLED || '').toLowerCase());
   let resolved = wanted ? resolveOrigin(env.PUBLIC_ORIGIN) : {};
@@ -53,7 +54,7 @@ function registerTripMcp({
   const enabled = wanted && !resolved.error;
 
   if (!enabled) {
-    app.get('/api/mcp/connection', organizerOrAgentRequired, (req, res) =>
+    app.get('/api/mcp/connection', authRequired, (req, res) =>
       (req.user?.isAgent ? res.status(403).json({ error: 'organizer_only' }) : res.json({ enabled: false })));
     return { enabled: false };
   }
@@ -65,7 +66,12 @@ function registerTripMcp({
   const store = createOAuthStore(db);
   setInterval(() => store.prune(), 60 * 60 * 1000).unref();
 
-  const isOrganizer = username => organizers().includes(username) && userExists(username);
+  // Anyone on the trip may connect; organizers get read and write, everyone
+  // else read only. What a connection may do is the smaller of what was
+  // approved and what the person is now — see SCOPE in oauth.js.
+  const isParticipant = username => userExists(username);
+  const isOrganizer = username => organizers().includes(username) && isParticipant(username);
+  const canWrite = grant => grant.scope === SCOPE && isOrganizer(grant.username);
   // For an already-authenticated organizer only (the MCP server's own name).
   const tripTitle = () => {
     const t = getPublicConfig().meta?.title;
@@ -104,7 +110,7 @@ function registerTripMcp({
   const protectedResource = (_req, res) => res.json({
     resource: mcpUrl,
     authorization_servers: [origin],
-    scopes_supported: [SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE],
     bearer_methods_supported: ['header'],
   });
   app.all(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], cors, protectedResource);
@@ -119,7 +125,7 @@ function registerTripMcp({
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
     revocation_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
-    scopes_supported: [SCOPE],
+    scopes_supported: [SCOPE, READ_SCOPE],
     authorization_response_iss_parameter_supported: true,
   }));
 
@@ -236,13 +242,16 @@ function registerTripMcp({
     if (v.redirectError) return res.json({ redirect_to: redirectWith(v.redirectUri, { error: v.redirectError, state: v.state }) });
     const username = sessionUser(req);
     if (!username) return res.status(401).json({ error: 'unauthorized' });
-    if (!isOrganizer(username)) return res.status(403).json({ error: 'organizer_only' });
+    if (!isParticipant(username)) return res.status(403).json({ error: 'not_on_this_trip' });
     if (b.decision !== 'allow') return res.json({ redirect_to: redirectWith(v.redirectUri, { error: 'access_denied', state: v.state }) });
+    // Decided here, from who approved — never from the scope the app asked
+    // for, which is whatever it chose to send.
+    const scope = isOrganizer(username) ? SCOPE : READ_SCOPE;
     const code = store.createCode({
       clientId: v.client.client_id, username, redirectUri: v.redirectUri,
-      codeChallenge: v.codeChallenge, resource: v.resource,
+      codeChallenge: v.codeChallenge, resource: v.resource, scope,
     });
-    console.log(`[trip-mcp] ${username} approved ${v.client.client_name || v.client.client_id} (${new URL(v.redirectUri).hostname})`);
+    console.log(`[trip-mcp] ${username} approved ${v.client.client_name || v.client.client_id} (${new URL(v.redirectUri).hostname}, ${scope})`);
     res.json({ redirect_to: redirectWith(v.redirectUri, { code, state: v.state }) });
   });
 
@@ -260,12 +269,12 @@ function registerTripMcp({
       if (b.redirect_uri && b.redirect_uri !== row.redirect_uri) return invalid('redirect_uri mismatch');
       if (!pkceMatches(b.code_verifier, row.code_challenge)) return invalid('code_verifier mismatch');
       if (b.resource && !sameResource(b.resource)) return res.status(400).json({ error: 'invalid_target' });
-      if (!isOrganizer(row.username)) return invalid('no longer an organizer of this trip');
-      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash }).tokens);
+      if (!isParticipant(row.username)) return invalid('no longer on this trip');
+      return res.json(store.startGrant({ clientId: client.client_id, username: row.username, codeHash: row.code_hash, scope: row.scope }).tokens);
     }
     if (b.grant_type === 'refresh_token') {
       if (!b.refresh_token) return invalid();
-      const r = store.rotateRefresh(String(b.refresh_token), client.client_id, isOrganizer);
+      const r = store.rotateRefresh(String(b.refresh_token), client.client_id, isParticipant);
       return r.error ? invalid() : res.json(r.tokens);
     }
     res.status(400).json({ error: 'unsupported_grant_type' });
@@ -289,16 +298,16 @@ function registerTripMcp({
     if (!m) return challenge(res);
     const grant = store.verifyAccess(m[1]);
     if (!grant) return challenge(res, 'invalid_token');
-    // Organizer status lives in the trip config and can be taken away; a
-    // connection made by someone who is no longer an organizer ends here.
-    if (!isOrganizer(grant.username)) { store.revokeGrant(grant.id); return challenge(res, 'invalid_token'); }
+    // Someone removed from the trip loses the connection here. Someone who is
+    // no longer an organizer keeps it, read-only (canWrite, below).
+    if (!isParticipant(grant.username)) { store.revokeGrant(grant.id); return challenge(res, 'invalid_token'); }
     req.mcpGrant = grant;
     next();
   }
 
-  // Tools reach the site over loopback, authenticated as the organizer with a
-  // two-minute site session minted per call — so every route applies exactly
-  // the checks it applies to that organizer in a browser.
+  // Tools reach the site over loopback, authenticated as the person who
+  // connected with a two-minute site session minted per call — so every route
+  // applies exactly the checks it applies to that person in a browser.
   // This server's own listener: `localhost` when it listens on every address
   // (the default), otherwise the address it was told to bind.
   const loopHost = !listenHost ? 'localhost' : listenHost.includes(':') ? `[${listenHost}]` : listenHost;
@@ -328,11 +337,12 @@ function registerTripMcp({
   // Stateless: a fresh server per request, so nothing about one organizer's
   // session can leak into another's, and a restart loses nothing.
   app.post('/mcp', cors, requireAccess, async (req, res) => {
+    const write = canWrite(req.mcpGrant);
     const server = new McpServer(
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
-      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent)))(getPublicConfig()) },
+      { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username));
+    registerTools(server, siteClient(req.mcpGrant.username), { write });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
@@ -354,37 +364,46 @@ function registerTripMcp({
   });
   app.all('/mcp', cors, (_req, res) => res.status(405).set('Allow', 'POST').json({ error: 'method_not_allowed' }));
 
-  // ── The organizer's view of connected assistants ───────────────────────────
-  // A person, never the agent key: the companion's context is full of text
-  // travellers typed, and one crafted message must not be able to disconnect
-  // an organizer's assistant.
-  const organizerOnly = (req, res, next) => organizerOrAgentRequired(req, res, () =>
-    (req.user?.isAgent ? res.status(403).json({ error: 'organizer_only' }) : next()));
-  app.get('/api/mcp/connection', organizerOnly, (_req, res) => {
+  // ── Each person's view of connected assistants ─────────────────────────────
+  // Organizers see and can disconnect every connection on the trip; anyone
+  // else sees and disconnects their own. A person, never the agent key: the
+  // companion's context is full of text travellers typed, and one crafted
+  // message must not be able to disconnect somebody's assistant.
+  const person = (req, res, next) => authRequired(req, res, () =>
+    (req.user?.isAgent ? res.status(403).json({ error: 'person_only' }) : next()));
+  app.get('/api/mcp/connection', person, (req, res) => {
+    const me = req.user.username, organizer = isOrganizer(me);
     res.set('Cache-Control', 'no-store');
     res.json({
       enabled: true,
       url: mcpUrl,
-      // Someone who is no longer an organizer has lost their connection
-      // already (requireAccess ends it on next use); do not list it as live.
-      connections: store.activeGrants().filter(g => isOrganizer(g.username)).map(g => {
-        let host = null;
-        try { host = new URL(JSON.parse(g.redirect_uris || '[]')[0]).hostname; } catch { /* client pruned */ }
-        return {
-          id: g.id, username: g.username,
-          // The name is whatever the app registered with; the host is where
-          // its codes go, and is the part nobody can choose freely.
-          client: g.client_name || host || 'Unknown app',
-          host,
-          connected_at: new Date(g.created_at * 1000).toISOString(),
-          last_used_at: g.last_used_at ? new Date(g.last_used_at * 1000).toISOString() : null,
-        };
-      }),
+      access: organizer ? 'read_write' : 'read',
+      // Someone removed from the trip has lost their connection already
+      // (requireAccess ends it on next use); do not list it as live.
+      connections: store.activeGrants()
+        .filter(g => isParticipant(g.username) && (organizer || g.username === me))
+        .map(g => {
+          let host = null;
+          try { host = new URL(JSON.parse(g.redirect_uris || '[]')[0]).hostname; } catch { /* client pruned */ }
+          return {
+            id: g.id, username: g.username,
+            // The name is whatever the app registered with; the host is where
+            // its codes go, and is the part nobody can choose freely.
+            client: g.client_name || host || 'Unknown app',
+            host,
+            access: canWrite(g) ? 'read_write' : 'read',
+            connected_at: new Date(g.created_at * 1000).toISOString(),
+            last_used_at: g.last_used_at ? new Date(g.last_used_at * 1000).toISOString() : null,
+          };
+        }),
     });
   });
-  app.delete('/api/mcp/connections/:id', organizerOnly, (req, res) => {
+  app.delete('/api/mcp/connections/:id', person, (req, res) => {
     const grant = store.grant(req.params.id);
     if (!grant || grant.revoked_at) return res.status(404).json({ error: 'not_found' });
+    // Someone else's connection is "not found" to a member, not "forbidden":
+    // the id says nothing about whether it exists.
+    if (grant.username !== req.user.username && !isOrganizer(req.user.username)) return res.status(404).json({ error: 'not_found' });
     store.revokeGrant(grant.id);
     console.log(`[trip-mcp] ${req.user.username} disconnected ${grant.id} (${grant.username})`);
     res.json({ ok: true });

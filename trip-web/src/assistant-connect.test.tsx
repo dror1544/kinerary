@@ -33,7 +33,7 @@ function stubConnection(state: unknown) {
     const method = init?.method || "GET";
     calls.push({ url, method });
     if (method === "DELETE") {
-      current = { enabled: true, url: URL_, connections: [] };
+      current = { enabled: true, url: URL_, access: "read_write", connections: [] };
       return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
     }
     const body = url.includes("/api/mcp/connection") ? current : {};
@@ -50,24 +50,40 @@ describe("connect your AI assistant", () => {
     expect(screen.queryByRole("heading", { name: /connect your ai assistant/i })).toBeNull();
   });
 
-  it("is absent for a member", () => {
-    stubConnection({ enabled: true, url: URL_, connections: [] });
+  it("shows a member the read-only version", async () => {
+    stubConnection({ enabled: true, url: URL_, access: "read", connections: [] });
     renderMore(false);
-    expect(screen.queryByRole("heading", { name: /connect your ai assistant/i })).toBeNull();
+    expect(await screen.findByRole("heading", { name: /connect your ai assistant/i })).toBeInTheDocument();
+    expect(screen.getByText(/can read the trip, not change it/i)).toBeInTheDocument();
   });
 
-  it("gives the organizer the address and the steps for Claude and ChatGPT", async () => {
-    stubConnection({ enabled: true, url: URL_, connections: [] });
+  it("gives Claude's install link, pre-filled with this trip's address", async () => {
+    stubConnection({ enabled: true, url: URL_, access: "read_write", connections: [] });
     renderMore();
-    expect(await screen.findByRole("heading", { name: /connect your ai assistant/i })).toBeInTheDocument();
-    expect(screen.getByText(URL_)).toBeInTheDocument();
-    expect(screen.getByText(/Claude: Settings → Connectors/)).toBeInTheDocument();
-    expect(screen.getByText(/ChatGPT: Settings/)).toBeInTheDocument();
+    const link = await screen.findByRole("link", { name: /add to claude/i });
+    const href = new URL(link.getAttribute("href")!);
+    expect(href.origin + href.pathname).toBe("https://claude.ai/customize/connectors");
+    expect(href.searchParams.get("modal")).toBe("add-custom-connector");
+    expect(href.searchParams.get("connectorUrl")).toBe(URL_);
+    expect(screen.getByText(/make the changes you can make here/i)).toBeInTheDocument();
+  });
+
+  it("copies the address and opens ChatGPT, saying where to paste it", async () => {
+    stubConnection({ enabled: true, url: URL_, access: "read_write", connections: [] });
+    const writeText = vi.fn(async () => {});
+    Object.assign(navigator, { clipboard: { writeText } });
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    renderMore();
+    fireEvent.click(await screen.findByRole("button", { name: /add to chatgpt/i }));
+    await waitFor(() => expect(open).toHaveBeenCalledWith("https://chatgpt.com/", "_blank", "noopener"));
+    expect(writeText).toHaveBeenCalledWith(URL_);
+    expect(screen.getByRole("status")).toHaveTextContent(/Developer mode/);
   });
 
   it("lists connected assistants and disconnects one", async () => {
     const calls = stubConnection({
-      enabled: true, url: URL_,
+      enabled: true, url: URL_, access: "read_write",
       connections: [{ id: "grant_1", username: "alice", client: "Claude", connected_at: "2026-09-25T10:00:00Z", last_used_at: null }],
     });
     renderMore();

@@ -14,28 +14,32 @@ const STRINGS = {
   en: {
     title: 'Connect an AI assistant',
     wants: 'wants to manage this trip as you',
+    wantsRead: 'wants to read this trip as you',
     callsItself: 'calls itself',
     shared: 'Everything it reads — including notes about travellers, such as health needs — is sent to the company that runs that assistant.',
     can: 'It will be able to read the trip and change bookings, the plan, the budget and participants — the same things you can do on the site. You can disconnect it at any time from the site\'s menu.',
+    canRead: 'It will be able to read the trip — the plan, bookings, budget and what others posted — but not change anything. You can disconnect it at any time from the site\'s menu.',
     signIn: 'Sign in with your trip account',
     username: 'Username', password: 'Password', submit: 'Sign in',
     as: 'Signed in as', other: 'Use a different account',
     allow: 'Allow', deny: 'Cancel',
-    notOrganizer: 'Only the trip\'s organizers can connect an assistant. This account is not an organizer.',
+    notOrganizer: 'This account is not on this trip.',
     wrong: 'Wrong username or password.', failed: 'Something went wrong. Try again.',
     local: 'an app on this computer',
   },
   he: {
     title: 'חיבור עוזר AI',
     wants: 'מבקש לנהל את הטיול הזה בשמך',
+    wantsRead: 'מבקש לקרוא את הטיול הזה בשמך',
     callsItself: 'מציג את עצמו בשם',
     shared: 'כל מה שהוא קורא — כולל הערות על המטיילים, כמו צרכים רפואיים — נשלח לחברה שמפעילה את העוזר הזה.',
     can: 'הוא יוכל לקרוא את הטיול ולשנות הזמנות, את התוכנית, את התקציב ואת המשתתפים — אותם דברים שאתם יכולים לעשות באתר. אפשר לנתק אותו בכל עת מהתפריט באתר.',
+    canRead: 'הוא יוכל לקרוא את הטיול — התוכנית, ההזמנות, התקציב ומה שאחרים כתבו — אבל לא לשנות דבר. אפשר לנתק אותו בכל עת מהתפריט באתר.',
     signIn: 'התחברו עם חשבון הטיול',
     username: 'שם משתמש', password: 'סיסמה', submit: 'התחברות',
     as: 'מחוברים בתור', other: 'חשבון אחר',
     allow: 'אישור', deny: 'ביטול',
-    notOrganizer: 'רק מארגני הטיול יכולים לחבר עוזר. החשבון הזה אינו של מארגן.',
+    notOrganizer: 'החשבון הזה אינו חלק מהטיול הזה.',
     wrong: 'שם משתמש או סיסמה שגויים.', failed: 'משהו השתבש. נסו שוב.',
     local: 'אפליקציה במחשב הזה',
   },
@@ -95,8 +99,8 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
   </section>
 
   <section id="consent" hidden>
-    <p><strong>${dest}</strong>${claim} ${escapeHtml(t.wants)}.</p>
-    <p class="muted">${escapeHtml(t.can)}</p>
+    <p><strong>${dest}</strong>${claim} <span id="wants"></span>.</p>
+    <p class="muted" id="can"></p>
     <p class="muted">${escapeHtml(t.shared)}</p>
     <p class="muted">${escapeHtml(t.as)} <strong id="who"></strong> · <button class="link" id="switch" type="button">${escapeHtml(t.other)}</button></p>
     <div class="row">
@@ -110,7 +114,7 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
 <script nonce="${nonce}">
 (() => {
   const PARAMS = ${scriptJson(params)};
-  const T = ${scriptJson({ wrong: t.wrong, failed: t.failed, notOrganizer: t.notOrganizer })};
+  const T = ${scriptJson({ wrong: t.wrong, failed: t.failed, notOrganizer: t.notOrganizer, wants: t.wants, wantsRead: t.wantsRead, can: t.can, canRead: t.canRead })};
   const $ = id => document.getElementById(id);
   let session = null;
   const stored = () => { try { return localStorage.getItem('trip-token') || localStorage.getItem('tripToken'); } catch { return null; } };
@@ -124,7 +128,10 @@ function renderAuthorizePage({ nonce, lang, clientName, redirectHost, isLoopback
   async function adopt(token) {
     const me = await json('/api/auth/me', { headers: { authorization: 'Bearer ' + token } });
     if (!me.ok) return false;
-    if (!me.body.is_organizer) { fail(T.notOrganizer); show('login'); return true; }
+    // Organizers grant read and write, everyone else read only; the server
+    // decides the same way, this only says it before they click.
+    $('wants').textContent = me.body.is_organizer ? T.wants : T.wantsRead;
+    $('can').textContent = me.body.is_organizer ? T.can : T.canRead;
     session = token; fail('');
     // The trip's name is shown only to someone signed in, and only as the
     // sanitized /api/config serves it.
@@ -190,13 +197,13 @@ function renderConnectorInfoPage({ url, lang }) {
     title: 'כתובת לחיבור עוזר AI',
     lead: 'זו לא כתובת לדפדפן. זו הכתובת שמדביקים ב-Claude או ב-ChatGPT כדי לחבר אותם לטיול:',
     claude: 'Claude: הגדרות ← מחברים ← הוספת מחבר מותאם.',
-    chatgpt: 'ChatGPT: הגדרות ← אפליקציות ומחברים ← יצירה, ובחרו OAuth.',
+    chatgpt: 'ChatGPT (באתר): הגדרות ← אבטחה והתחברות ← מצב מפתח, ואז + ליצירת אפליקציה עם הכתובת, ובחרו OAuth.',
     then: 'ייפתח דף מהאתר; התחברו עם חשבון הטיול ואשרו.',
   } : {
     title: 'AI assistant connector address',
     lead: 'This is not a web page. It is the address you paste into Claude or ChatGPT to connect them to this trip:',
     claude: 'Claude: Settings → Connectors → Add custom connector.',
-    chatgpt: 'ChatGPT: Settings → Apps & Connectors → Create, and choose OAuth.',
+    chatgpt: 'ChatGPT (on the web): Settings → Security and login → Developer mode, then + to create an app with this address, and choose OAuth.',
     then: 'A page from this site opens; sign in with your trip account and allow.',
   };
   return `<!doctype html><html lang="${he ? 'he' : 'en'}" dir="${he ? 'rtl' : 'ltr'}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>${escapeHtml(t.title)}</title></head>

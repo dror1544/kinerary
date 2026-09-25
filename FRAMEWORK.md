@@ -354,12 +354,14 @@ it's config-driven (start with the `get_config` tool to discover that
 trip's actual phase/venue/participant ids; nothing is hardcoded). One
 instance talks to one trip via `API_BASE_URL`.
 
-The site also serves its **own** MCP endpoint, for an organizer's Claude or
-ChatGPT rather than the companion (`server/trip-mcp/`, off unless
-`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set). It is its own OAuth 2.1
-authorization server: the organizer pastes `<site>/mcp`, signs in with their
-site login, and approves. Tools call the site's routes as that organizer, not
-as the agent. Details: `mcp/README.md`, "Organizer connector".
+The site also serves its **own** MCP endpoint, for a trip member's own Claude
+or ChatGPT rather than the companion (`server/trip-mcp/`, off unless
+`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set): read and write for an
+organizer, read only for everyone else. It is its own OAuth 2.1 authorization
+server: the person adds `<site>/mcp` (the More tab has an "Add to Claude"
+install link), signs in with their site login, and approves. Tools call the
+site's routes as that person, not as the agent. Details: `mcp/README.md`,
+"Trip connector".
 
 ### Original plan vs active plan — the vocabulary
 
@@ -453,7 +455,7 @@ hasn't been connected to any username yet — the response is meant to prompt
 - Admin: `meta.admin` in `trip.config.json` (falls back to the first participant if unset); controls trivia start/reveal/reset
 - Passwords: bcrypt-hashed; PIN codes for hotel check-in (served from config, never stored in DB)
 - Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
-- Organizer connector (optional, `server/trip-mcp/`): OAuth 2.1 with PKCE, dynamic registration limited to the hosted assistants' callbacks and loopback; opaque, hashed, revocable tokens that are never site sessions (and site sessions are never MCP tokens); organizers only, re-checked on every call
+- Trip connector (optional, `server/trip-mcp/`): OAuth 2.1 with PKCE, dynamic registration limited to the hosted assistants' callbacks and loopback; opaque, hashed, revocable tokens that are never site sessions (and site sessions are never MCP tokens); anyone on the trip, read-only unless an organizer approved, re-checked on every call
 
 ---
 

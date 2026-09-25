@@ -932,6 +932,19 @@ textarea { min-height: 132px; resize: vertical; }
 .assistant-connect h4 { margin: 14px 0 6px; font-weight: 800; }
 .assistant-connect p, .assistant-connect ol { margin: 0 0 12px; color: var(--kit-ink-soft); line-height: 1.6; }
 .assistant-connect ol { padding-inline-start: 20px; }
+.assistant-connect-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.assistant-connect-button {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--kit-teal);
+  border-radius: 999px;
+  padding: 7px 13px;
+  color: white;
+  background: var(--kit-teal);
+  font-weight: 700;
+  text-decoration: none;
+}
+.assistant-connect .assistant-connect-hint, .assistant-connect .assistant-connect-note { font-size: .92rem; }
 .assistant-connect-url { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; min-width: 0; }
 .assistant-connect-url code {
   flex: 1;

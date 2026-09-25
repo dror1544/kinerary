@@ -8,9 +8,9 @@ and the growable question bank). See the tool list at the top of
 This is optional. The site works fully without it — it only matters if you
 want an agent (not a human clicking around the site) to manage the trip.
 
-> **An organizer connecting their own Claude or ChatGPT does not use this
-> server.** The trip site serves its own MCP endpoint for that, with a normal
-> sign-in — see [Organizer connector](#organizer-connector-claude-chatgpt)
+> **Someone on the trip connecting their own Claude or ChatGPT does not use
+> this server.** The trip site serves its own MCP endpoint for that, with a
+> normal sign-in — see [Trip connector](#trip-connector-claude-chatgpt)
 > below. This server is the companion agent's bridge, and it authenticates
 > with the agent key.
 
@@ -118,7 +118,7 @@ already shares with this server) — see `requireSiteOrAgentKey` in `mcp.js`.
 
 ### 3. Connect Claude Cowork
 
-For an organizer, use the [Organizer connector](#organizer-connector-claude-chatgpt)
+For a person on the trip, use the [Trip connector](#trip-connector-claude-chatgpt)
 instead. Claude's custom connectors take a URL and OAuth; they have no field for
 an `X-API-Key` header, so this server can only be reached from one with the key
 in the URL (`https://your-domain/sse?key=<MCP_API_KEY>`). That puts the agent
@@ -130,16 +130,26 @@ Multiple concurrent sessions (a local agent and a remote connector at the
 same time) are supported — each `/sse` connection gets its own MCP server
 instance server-side.
 
-## Organizer connector (Claude, ChatGPT)
+## Trip connector (Claude, ChatGPT)
 
-The trip site itself serves an MCP endpoint at `<site>/mcp` for the trip's
-**organizers**. Code: [`server/trip-mcp/`](../server/trip-mcp/). An organizer
-connects by pasting the address into Claude (**Settings → Connectors → Add
-custom connector**) or ChatGPT (**Settings → Apps & Connectors → Create**,
-authentication OAuth). A page on the trip site opens; they sign in with their
-normal site login (password or Google) and approve. The site's **More** tab
-shows organizers the address, the steps, and every connected assistant with a
-**Disconnect** button.
+The trip site itself serves an MCP endpoint at `<site>/mcp` for **everyone on
+the trip**: an organizer's connection can read and change the trip, anyone
+else's can only read it. Code: [`server/trip-mcp/`](../server/trip-mcp/).
+
+The site's **More** tab has a "Connect your AI assistant" card:
+
+- **Add to Claude** opens Claude's documented install link
+  (`https://claude.ai/customize/connectors?modal=add-custom-connector&connectorName=…&connectorUrl=…`),
+  which pre-fills the "Add custom connector" dialog; the person confirms.
+- **Add to ChatGPT** copies the address and opens ChatGPT, with the steps:
+  on the web, Settings → Security and login → Developer mode, then **+** to
+  create an app with the address, authentication OAuth. ChatGPT has no
+  install link, and its phone app cannot create one.
+- Then a page on the trip site opens; they sign in with their normal site login
+  (password or Google) and approve.
+
+The card also lists connected assistants with **Disconnect**: organizers see
+everyone's, anyone else sees their own.
 
 **Turning it on for a trip** — both in that trip's `.env`, then restart:
 
@@ -182,8 +192,17 @@ three `location` blocks added (copy them from `provisioning/adapters.py`).
   to; the name an app registers with is shown only as a claim.
 - A replayed code ends the connection it produced; a refresh ends the access
   token it replaced; only the client a token belongs to can revoke it.
-- Only an organizer can approve, and organizer status is re-checked on every
-  call: someone removed from `agent.organizers` loses the connection.
+- Anyone on the trip can approve; nobody else can. What a connection may do is
+  fixed when it is approved — `trip` (read and write) for an organizer,
+  `trip:read` for anyone else, decided by the server from who approved, never
+  from the scope the app asked for — and on each call it is the smaller of that
+  and the person's current role: an organizer who is demoted drops to read
+  only, a member who is promoted stays read only until they approve again, and
+  someone removed from the trip loses the connection. A read-only connection is
+  never offered a write tool or the organizer briefing.
+- Other people reach the assistant as username, name and colour only: the
+  connector strips Telegram ids, ages and emails from RSVP and comment rows,
+  whatever the underlying route returns.
 - Tokens are opaque and stored hashed. An MCP token is not a site session and a
   site session is not an MCP token.
 - Tools call the site's own routes **as the organizer** (a two-minute session
