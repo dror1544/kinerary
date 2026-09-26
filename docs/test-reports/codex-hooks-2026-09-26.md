@@ -386,3 +386,128 @@ these results in a throwaway repository on this Mac, 2026-09-26:
 | `claude.md` as `developer` | allowed (no output) |
 
 This is a finding for the owner, not part of this PR.
+
+## 10. Review round 3 (PR #260)
+
+**What regressed.** Round 2's `checked_paths` returned only the on-disk
+spelling of the path. The shared rules are case-sensitive: `trip/*` at the
+root (preflight B3), `.project/sprint.json`, and `CLAUDE.md` for a subagent.
+
+- With an existing directory named `TRIP/`, `*** Add File: trip/proof.txt`
+  was rewritten to `TRIP/proof.txt`, which B3 does not match. 69f34ab denied
+  it, cdcf335 answered `{}`, and offline Codex writes `trip/proof.txt`.
+- With no trip directory at all, `TRIP/proof.txt` also went through. This half
+  is inherited from 69f34ab: nothing folds a component that does not exist.
+
+Reproduced on 2026-09-27, through the real shared hooks in a throwaway
+repository with the offline engine in a scratch directory:
+
+| Initial state | Patch | cdcf335 | This fix | Engine |
+|---|---|---|---|---|
+| empty `TRIP/` | Add `trip/proof.txt` | `{}` | deny, hard rule 4 | exit 0, `trip/proof.txt` reads `proof` |
+| nothing | Add `TRIP/proof.txt` | `{}` | deny | exit 0 |
+| nothing | Add `Trip/proof.txt` | `{}` | deny | exit 0 |
+
+**Fix.** `checked_paths` returns every spelling that can name the file,
+de-duplicated, in this order:
+
+1. the path as written;
+2. its resolved (symlink) destination;
+3. the on-disk spelling of each;
+4. the case-folded form of each of those (`str.casefold()` on every component
+   below the root, which also folds U+017F to `s`).
+
+The shared hook runs once per spelling and the first deny wins. The existing
+checks all still apply: outside the repository, symlink destinations, and
+refusal of an ambiguous hard link.
+
+- **No filesystem detection.** On a case-sensitive filesystem the folded form
+  may over-deny, which fails closed.
+- **Near-misses stay allowed:** `docs/TRIP/x.md`, `docs/trip-notes.md`,
+  `tripwire.md`, `Docs/readme.md`, `trips/…` and `TRIPS/…`. B3 is a prefix
+  rule on `trip/` at the root only.
+
+**Why round 2's tests missed it.** They asserted a denial only for an alias
+spelling of a path the disk already spelled the way the rule does: they
+pre-created lowercase `trip/`. One test even pinned `checked_paths` to return
+only the on-disk spelling. None of them put the disk's spelling and the
+rule's spelling apart. Round 3 adds that class of test:
+`test_trip_is_denied_whatever_the_disk_calls_it` covers an existing `TRIP/`,
+`trip/` or `Trip/`, and no directory, each by Add, Move to and a plain
+`file_path`. `test_near_misses_of_protected_paths_stay_allowed` covers the
+other direction.
+
+**Oracle.** A differential check that goes beyond path lists.
+
+- Each patch runs through the offline engine in a scratch tree, starting from
+  one of four initial states: `trip/proof.txt`, `TRIP/proof.txt`, an empty
+  `TRIP/`, or no trip directory. Every state also holds `.project/sprint.json`
+  and `CLAUDE.md`.
+- The oracle then asks whether a protected file was created, modified or
+  deleted, comparing names with `casefold`.
+- The same patch goes to the adapter through the real shared hooks, from the
+  same initial state: as the lead, and as `developer` when it mentions CLAUDE.
+- The corpus is 840 patches: 40 targeted and 800 generated. The generated
+  patches use every alias spelling of each protected target, legitimate
+  near-misses, and Add, Update, Delete and Move to.
+
+| Adapter | Codex applied | Protected-file writes by Codex | Protected writes not denied | False denies (of 339 applied, legitimate patches) |
+|---|---|---|---|---|
+| This fix | 673 | 366 | **0** | **0** |
+| cdcf335 | 673 | 366 | 72 | 0 |
+| 69f34ab | 673 | 366 | 221 | 75 |
+
+## 11. PR #264 residual file-identity fixes (2026-09-27)
+
+Base: `27c7260`. Scope: adapter, regression tests, this report. No shared
+policy, hook configuration or runtime settings changed.
+
+The review reproduced two inherited bypasses: a developer's Add to
+`Claude.MD` when the root policy file was absent or spelled `claude.md`, and
+an Update to `docs/alias.txt` hard-linked to `.project/sprint.json`. Both
+returned `{}` before the offline engine wrote the protected file.
+
+The adapter now adds the canonical root `CLAUDE.md` spelling when any checked
+root spelling folds to `claude.md`. The shared rule still decides whether
+the caller's role may write it. This deliberately reserves root policy-name
+aliases even on case-sensitive filesystems, consistently with the existing
+conservative treatment of `trip/`; nested `docs/CLAUDE.md` is unaffected.
+
+Existing regular files with `st_nlink > 1` are refused before invoking shared
+hooks, including paths reached through symlinks. A bounded local scan cannot
+establish all other names of an inode, including names outside the checkout.
+This intentionally refuses ordinary hard-linked files too, for all write
+operations and the legacy route. Remove the extra link or use an independent
+copy before editing. Single-link ordinary files remain allowed. Directory
+link counts are not used as evidence of a file alias.
+
+Test-first: the two added tests failed on the base with five failing
+assertions/subtests and passed after the fix. They cover absent/lowercase/
+canonical policy files, Add/Update/Delete/Move and legacy requests, lead
+versus developer, benign nested names, direct and symlinked hard links,
+and restoration of ordinary-file access when the extra link is removed.
+
+This remains a pre-tool pathname check, not atomic filesystem confinement.
+The previously recorded runtime and workdir limitations and #262/#263/#265
+remain separate follow-ups. No merge or deployment was performed.
+
+Independent verifier results (Python 3.9.6):
+
+- Adapter discovery: 54 tests passed (64.616 s).
+- Adapter dotted module: 54 tests passed (65.168 s).
+- Shared bash hooks: 50 tests passed (64.605 s).
+- Shared write hooks: 4 tests passed (0.483 s).
+- `git diff --check` and staged preflight passed. Preflight emitted only
+  existing undeployed skill-profile warnings.
+
+Offline Codex 0.153.2 replay on this APFS volume: 93 cases, 71 protected
+mutations, zero patch-route or legacy-route bypasses, zero denials among
+ten benign cases. Engine writes ran in disposable non-repository directories;
+policy requests used the real shared hooks in isolated fixture repositories.
+The replay covered trip-directory spellings and missing directories, sprint
+aliases including long S, root policy file spellings and absence, symlinks,
+hard links, Hebrew filenames, spaces, and composed/decomposed Unicode.
+Local evidence: `/private/tmp/kinerary-hooks-identity-oracle/`; verifier logs:
+`/private/tmp/codex-final-{adapter,bash,write,dotted}.txt`.
+
+Commit and push are pending explicit policy-file approval under CLAUDE.md.

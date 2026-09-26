@@ -333,12 +333,15 @@ class CodexAdapter(Harness):
                     "*** Begin Patch\n*** %s File: %s%s\n*** End Patch" % (op, value, body), **extra))
                 self.assertDenied(self.call("write", {"tool_input": {"file_path": value}, **extra}))
 
-    def test_a_new_leaf_under_an_alias_directory_takes_the_directory_spelling(self):
+    def test_a_new_leaf_under_an_alias_directory_is_checked_in_every_spelling(self):
+        # Round 3: the spelling as written, the on-disk spelling and the
+        # case-folded one are all checked; round 2 kept only the on-disk one.
         self.seed_protected()
         root, adapter = self.root.resolve(), self.adapter()
         self.assertEqual(adapter.checked_paths(str(root / ".PROJECT/newfile")),
-                         [str(root / ".project/newfile")])
-        self.assertEqual(adapter.checked_paths(str(root / "docs/New.md")), [str(root / "docs/New.md")])
+                         [str(root / ".PROJECT/newfile"), str(root / ".project/newfile")])
+        self.assertEqual(adapter.checked_paths(str(root / "docs/New.md")),
+                         [str(root / "docs/New.md"), str(root / "docs/new.md")])
 
     def test_an_alias_matching_two_directory_entries_fails_closed(self):
         self.seed_protected()
@@ -346,6 +349,115 @@ class CodexAdapter(Harness):
         os.link(root / ".project/sprint.json", root / ".project/Other.json")
         with self.assertRaises(ValueError):
             self.adapter().checked_paths(str(root / ".project/OTHER.json"))
+
+    # Review round 3 (PR #260). The shared rules are case-sensitive: trip/* at
+    # the repository root (preflight B3), .project/sprint.json and, for a
+    # subagent, CLAUDE.md (pretooluse-write.sh). Round 2's tests only ever
+    # had the disk spell the protected directory the way the rule does, so
+    # rewriting to the on-disk spelling looked safe. These put the disk's
+    # spelling and the rule's spelling apart, in both directions, and with
+    # no directory at all.
+    def reset_trip(self, spelling):
+        for name in os.listdir(self.root):
+            if name.casefold() == "trip":
+                shutil.rmtree(self.root / name)
+        if spelling:
+            (self.root / spelling).mkdir()
+
+    def assertEveryRouteDenied(self, value, **extra):
+        self.assertDenied(self.patch(
+            "*** Begin Patch\n*** Add File: %s\n+proof\n*** End Patch" % value, **extra))
+        self.assertDenied(self.patch(
+            "*** Begin Patch\n*** Update File: docs/a.md\n*** Move to: %s\n@@\n-old\n+new\n"
+            "*** End Patch" % value, **extra))
+        self.assertDenied(self.call("write", {"tool_input": {"file_path": value}, **extra}))
+
+    def test_codex_round3_repro_existing_uppercase_trip_directory(self):
+        self.reset_trip("TRIP")
+        result = self.patch("*** Begin Patch\n*** Add File: trip/proof.txt\n+proof\n*** End Patch")
+        self.assertDenied(result)
+        self.assertIn("hard rule 4", result["permissionDecisionReason"])
+
+    def test_trip_is_denied_whatever_the_disk_calls_it(self):
+        cases = (("TRIP", ("trip/proof.txt", "TRIP/proof.txt", "Trip/x.txt")),
+                 ("trip", ("TRIP/proof.txt", "Trip/x.txt", "trip/x.txt")),
+                 ("Trip", ("trip/x.txt", "TRIP/x.txt")),
+                 (None, ("TRIP/proof.txt", "Trip/proof.txt", "trip/proof.txt", "tRiP/a/b.txt")))
+        for existing, values in cases:
+            for value in values:
+                with self.subTest(existing=existing, path=value):
+                    self.reset_trip(existing)
+                    self.assertEveryRouteDenied(value)
+
+    def test_sprint_lock_and_policy_aliases_are_denied_by_every_route(self):
+        (self.root / ".project").mkdir()
+        (self.root / ".project/sprint.json").write_text("old\n")
+        (self.root / "CLAUDE.md").write_text("old\n")
+        for value in (".project/sprint.json", ".PROJECT/sprint.json", ".project/SPRINT.JSON",
+                      ".project/\u017fprint.json"):
+            with self.subTest(path=value):
+                self.assertEveryRouteDenied(value)
+                self.assertDenied(self.patch(
+                    "*** Begin Patch\n*** Delete File: %s\n*** End Patch" % value))
+        if self.case_insensitive():  # claude.md is another file where case matters
+            for value in ("CLAUDE.md", "claude.md", "Claude.MD"):
+                with self.subTest(path=value, role="developer"):
+                    self.assertEveryRouteDenied(value, agent_type="developer")
+
+    def test_near_misses_of_protected_paths_stay_allowed(self):
+        (self.root / "docs").mkdir()
+        (self.root / "docs/readme.md").write_text("old\n")
+        for existing in ("trip", "TRIP", None):
+            for value in ("docs/TRIP/x.md", "docs/trip/x.md", "docs/trip-notes.md", "tripwire.md",
+                          "Trip-notes.md", "Docs/readme.md", "trips/demo/x.md", "TRIPS/demo/x.md",
+                          ".project/other.json", "docs/.project/sprint.json", "docs/CLAUDE.md"):
+                with self.subTest(existing=existing, path=value):
+                    self.reset_trip(existing)
+                    self.assertAllowed(self.patch(
+                        "*** Begin Patch\n*** Add File: %s\n+x\n*** End Patch" % value,
+                        agent_type="developer"))
+                    self.assertAllowed(self.call("write", {"tool_input": {"file_path": value}}))
+
+    def test_root_policy_aliases_without_canonical_disk_spelling(self):
+        # Reserved root name on all filesystems, just like the trip aliases.
+        for existing in (None, "claude.md", "CLAUDE.md"):
+            for p in self.root.iterdir():
+                if p.name.casefold() == "claude.md":
+                    p.unlink()
+            if existing:
+                (self.root / existing).write_text("old\n")
+            for value in ("claude.md", "Claude.MD", "CLAUDE.md"):
+                with self.subTest(existing=existing, value=value):
+                    self.assertEveryRouteDenied(value, agent_type="developer")
+                    for op, body in (("Update", "\n@@\n-old\n+new"), ("Delete", "")):
+                        self.assertDenied(self.patch(
+                            "*** Begin Patch\n*** %s File: %s%s\n*** End Patch" % (op, value, body),
+                            agent_type="developer"))
+                    self.assertEqual(self.call("write", {"tool_input": {"file_path": value}}), {})
+        for value in ("docs/claude.md", "docs/CLAUDE.md", "claude.md.notes"):
+            self.assertEqual(self.call("write", {"agent_type": "developer",
+                             "tool_input": {"file_path": value}}), {})
+
+    def test_direct_hard_links_fail_closed_on_both_routes(self):
+        (self.root / ".project").mkdir()
+        (self.root / "docs").mkdir()
+        target = self.root / ".project/sprint.json"
+        target.write_text("old\n")
+        alias = self.root / "docs/alias.txt"
+        os.link(target, alias)
+        self.assertEqual(alias.stat().st_ino, target.stat().st_ino)
+        self.assertGreater(alias.stat().st_nlink, 1)
+        self.assertEveryRouteDenied("docs/alias.txt")
+        self.assertDenied(self.patch(
+            "*** Begin Patch\n*** Update File: docs/alias.txt\n@@\n-old\n+new\n*** End Patch"))
+        (self.root / "docs/symlink.txt").symlink_to("alias.txt")
+        self.assertDenied(self.call("write", {"tool_input": {"file_path": "docs/symlink.txt"}}))
+        # Ordinary hard links are deliberately refused too: their other names
+        # cannot be established with a bounded repository-local scan.
+        target.unlink()
+        self.assertEqual(self.call("write", {"tool_input": {"file_path": "docs/alias.txt"}}), {})
+        os.link(alias, self.root / "docs/other.txt")
+        self.assertDenied(self.call("write", {"tool_input": {"file_path": "docs/alias.txt"}}))
 
     def test_legacy_file_path_is_checked(self):
         self.assertDenied(self.call("write", {
