@@ -47,6 +47,7 @@ import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model
 import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
 import { assistantEventsFromEnv } from "../analytics/emitter.js";
+import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
 
@@ -288,6 +289,14 @@ async function main(): Promise<void> {
   // on. Undefined here means every hook below records nothing.
   const assistantEvents = assistantEventsFromEnv(process.env, runtime.db, log);
 
+  // The organizer's private-chat document route (#178): a file they send
+  // after confirmation is read here and proposed back, and an Approve
+  // re-provisions the site — a redeploy, for a live trip. OFF unless
+  // ORGANIZER_DOCUMENT_ROUTE_ENABLED=1 (exactly), so shipping this code never
+  // switches it on; off, such a file goes to the companion as before. Read
+  // once, and its state logged either way (`relay.organizer_document_route`).
+  const organizerDocumentRoute = organizerDocumentRouteFromEnv(process.env, log);
+
   const connector = new RelayConnector({
     gatewaySecrets: runtime.gatewaySecrets,
     telegram: runtime.telegram,
@@ -404,6 +413,7 @@ async function main(): Promise<void> {
       // intake-copy.ts, which is slower, not broken.
       modelRunner,
       ...(assistantEvents ? { assistantEvents } : {}),
+      ...(organizerDocumentRoute ? { organizerDocumentRoute: true } : {}),
       log,
     });
     // Clears interrupted document writes and claims — see document-sweeper.ts.

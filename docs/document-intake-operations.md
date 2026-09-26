@@ -70,6 +70,7 @@ documents received after confirmation (`document-correction.ts`, migration 0055)
   - the file was re-hosted
   - it is a document, or an image where a runner reads images
   - the relay has a model runner
+  - the route is switched on: `ORGANIZER_DOCUMENT_ROUTE_ENABLED=1` (below)
 - **Read.** Same ingest (delivery `review_status = 'pending'`), same per-document
   extraction, then the gate against the trip's **latest confirmed intake version**.
 - **Propose.** One proposal for everything that adds or fills, and one `replace`
@@ -89,6 +90,38 @@ documents received after confirmation (`document-correction.ts`, migration 0055)
   - A trip mid-build answers "try again shortly" and the proposal stays pending.
 - **Keep as it is** (`dc:<id>:r`). Nothing changes, and the deliveries close as
   `rejected`.
+
+#### Off unless `ORGANIZER_DOCUMENT_ROUTE_ENABLED` is set
+
+The organizer's private-chat route into this flow runs only when the relay's
+environment has `ORGANIZER_DOCUMENT_ROUTE_ENABLED=1`: exactly `1`, with no
+whitespace. Unset, empty and `0` are off. Any other value is also off, and the relay
+logs `relay.organizer_document_route_setting_unrecognized` at start. When the route is
+off, the organizer's file goes to the companion gateway, as it did before #178. The
+relay downloads the file once, for the companion, and reads and proposes nothing.
+Owner's decision, 2026-09-26 (Release A).
+
+- **Why it is off.** An Approve re-provisions the site through
+  `provisionOnConfirm`, from the newest `available` release. `ready_private` is a
+  correctable state, so on a live trip that is a redeploy in the middle of the holiday.
+  Live trips are redeployed only after they end (`docs/sprint6-tracks.md` decisions
+  11 and 28; decision 12 excludes CT200). A rollback of the release does not undo a
+  rebuild.
+- **How to read its state.** The relay logs
+  `relay.organizer_document_route {"enabled":true|false}` once at start. While the
+  route is off, each file it would have read logs
+  `trip_bot.organizer_document_route_off {"trip_id":…}`. That line carries no chat,
+  sender or file.
+- **Before turning it on anywhere real:** walk #217 on a **throwaway**
+  `ready_private` trip. The walk is a PDF to the organizer's DM, the proposal,
+  Approve and the rebuild, a DM photo, and the outage line with the gateway stopped.
+  Also wait until every live trip on that relay has ended: Orlando after 1 Oct,
+  Japan after 3 Oct. The flag is per relay, not per trip.
+- **Not gated, on purpose.** An Approve or Keep tap (`dc:<id>:a|r`) still reaches
+  `applyCorrectionCallback`. That tap needs a proposal row, and only this route
+  creates one (`trip_document_corrections`, migration `20260918110132`, which is new
+  in Release A). A relay that has never had the route on has no proposal to tap. The
+  web `POST /v1/trips/:id/intake/correct` predates this flow and is unchanged.
 
 **Legacy fallback.** `trip-confirmation-intake` still handles what this flow does not
 take: files posted in groups or by other members, and relays with no model runner.

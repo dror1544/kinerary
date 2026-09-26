@@ -285,6 +285,12 @@ export interface TripBotPollerDeps {
    * into it is synchronous and cannot throw; see analytics/emitter.ts.
    */
   assistantEvents?: RelayAssistantEvents;
+  /**
+   * The organizer's private-chat document route, from
+   * ORGANIZER_DOCUMENT_ROUTE_ENABLED (document-correction.ts). Absent — the
+   * default — is off: passed to dispatch only when exactly `true`.
+   */
+  organizerDocumentRoute?: boolean;
   log?: (line: string) => void;
 }
 
@@ -5125,6 +5131,7 @@ export function startTripBotPoller(
             ...(deps.modelRunner ? { modelRunner: deps.modelRunner } : {}),
             // Descriptors only when something will record them (#177).
             ...(deps.assistantEvents ? { assistantEvents: true } : {}),
+            ...(deps.organizerDocumentRoute === true ? { organizerDocumentRoute: true } : {}),
             // Asked per update rather than cached: a gateway can stop between
             // one message and the next, and a stale "reachable" spends the
             // organizer's turn on a socket that is gone.

@@ -16,7 +16,12 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { startFromDeepLink } from "../src/chat-router.js";
-import { organizerDocumentRoute } from "../src/document-correction.js";
+import {
+  organizerDocumentRoute,
+  organizerDocumentRouteFromEnv,
+  organizerDocumentRouteSetting,
+  ORGANIZER_DOCUMENT_ROUTE_SETTING,
+} from "../src/document-correction.js";
 import { filesystemDocumentStore } from "../src/document-store.js";
 import { issueEnrollment } from "../src/enrollment.js";
 import { correctIntake } from "../src/intake-correction.js";
@@ -26,7 +31,8 @@ import { applyMigrations } from "../src/migrations.js";
 import type { RunnerResult, StructuredModelRequest, StructuredModelRunner } from "../src/model-runner.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
-import { applyDecision, settleDocumentCorrections } from "../src/relay/poller.js";
+import type { WireMessageEvent } from "../src/relay/protocol.js";
+import { applyDecision, settleDocumentCorrections, startTripBotPoller } from "../src/relay/poller.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
@@ -92,8 +98,15 @@ class Recorder {
   async sendChatAction() {}
   async getChatInfo() { return null; }
   async getMe() { return { id: "7000000001", username: "KineraryTestBot" }; }
-  async fetchFile(_fileId: string, _max: number) { return { bytes: Buffer.from("Tokyo 2026-09-19 to 2026-09-23\n", "utf8"), mime: "text/plain" }; }
-  async getUpdates() { return []; }
+  /** Downloads asked of Telegram: each is the relay re-hosting a file. */
+  fetches = 0;
+  async fetchFile(_fileId: string, _max: number) {
+    this.fetches += 1;
+    return { bytes: Buffer.from("Tokyo 2026-09-19 to 2026-09-23\n", "utf8"), mime: "text/plain" };
+  }
+  /** Batches handed to the poll loop, one per getUpdates call; then nothing. */
+  queued: TelegramUpdate[][] = [];
+  async getUpdates() { return this.queued.shift() ?? []; }
   async deleteWebhookIfPresent() {}
 }
 
@@ -114,6 +127,8 @@ interface Trip {
   telegram: Recorder;
   media: MediaStore;
   runner: ReturnType<typeof scriptedRunner>;
+  /** What reached the companion gateway: the route a file had before #178. */
+  pushed: WireMessageEvent[];
   deps: never;
 }
 
@@ -169,16 +184,17 @@ async function withConfirmedTrip(fn: (trip: Trip) => Promise<void>): Promise<voi
     const telegram = new Recorder();
     const media = new MediaStore();
     const runner = scriptedRunner();
+    const pushed: WireMessageEvent[] = [];
     const deps = {
       db: pool,
       telegram,
-      connector: { pushInbound: () => true },
+      connector: { pushInbound: (event: WireMessageEvent) => { pushed.push(event); return true; } },
       modelRunner: runner,
       documentStore: filesystemDocumentStore(root),
       media: { telegram, store: media, baseUrl: "http://127.0.0.1:4312", log: () => {} },
       log: () => {},
     } as never;
-    await fn({ pool, tripId, sessionId: started.kind === "started" ? started.sessionId : "", telegram, media, runner, deps });
+    await fn({ pool, tripId, sessionId: started.kind === "started" ? started.sessionId : "", telegram, media, runner, pushed, deps });
   } finally {
     await pool.end();
     await rm(root, { recursive: true, force: true });
@@ -336,28 +352,57 @@ describe("documents after confirmation", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
     });
   });
 
-  test("routing: only the organizer's private chat, from the organizer, with a readable file", async () => {
+  test("routing (flag on): only the organizer's private chat, from the organizer, with a readable file", async () => {
     await withConfirmedTrip(async (trip) => {
-      const base = { tripId: trip.tripId, chatId: CHAT, chatType: "private", fromId: CHAT, mediaKinds: ["document"], hasMedia: true, hasRunner: true, canReadImages: false };
+      const base = { tripId: trip.tripId, chatId: CHAT, chatType: "private", fromId: CHAT, mediaKinds: ["document"], hasMedia: true, hasRunner: true, canReadImages: false, enabled: true };
       assert.equal((await organizerDocumentRoute(trip.pool, base))?.sessionId, trip.sessionId);
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, chatType: "supergroup" }), null, "a group keeps its route");
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, fromId: "700000999" }), null, "someone else");
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, mediaKinds: ["image"] }), null, "a photo, with no vision runner");
       assert.ok(await organizerDocumentRoute(trip.pool, { ...base, mediaKinds: ["image"], canReadImages: true }));
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, hasRunner: false }), null, "no model: the old route");
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, hasMedia: false, mediaKinds: [] }), null, "no file: the old route");
       assert.equal(await organizerDocumentRoute(trip.pool, { ...base, chatId: "880000777", fromId: "880000777" }), null, "not the confirmed chat");
+      await trip.pool.query("UPDATE control_plane.intake_sessions SET state = 'awaiting_confirmation' WHERE id = $1", [trip.sessionId]);
+      assert.equal(await organizerDocumentRoute(trip.pool, base), null, "an unconfirmed session");
+    });
+  });
+
+  // ORGANIZER_DOCUMENT_ROUTE_ENABLED (Release A, 2026-09-26): an Approve here
+  // re-provisions the site, which for a live trip is a mid-trip redeploy. Off
+  // unless configured, so shipping this code changes nothing for anyone.
+  test("routing (flag off): every case that would have routed does not, and says so once, with the trip id only", async () => {
+    await withConfirmedTrip(async (trip) => {
+      const lines: string[] = [];
+      const log = (line: string) => lines.push(line);
+      const base = { tripId: trip.tripId, chatId: CHAT, chatType: "private", fromId: CHAT, mediaKinds: ["document"], hasMedia: true, hasRunner: true, canReadImages: false, enabled: false, log };
+      assert.equal(await organizerDocumentRoute(trip.pool, base), null, "a document");
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, mediaKinds: ["image"], canReadImages: true }), null, "a photo a runner could read");
+      assert.equal(lines.length, 2, "one line for each file that would have been read");
+      for (const line of lines) {
+        assert.deepEqual(JSON.parse(line), { level: "info", event: "trip_bot.organizer_document_route_off", trip_id: trip.tripId });
+      }
+      // What would not have routed anyway is not reported as held back.
+      lines.length = 0;
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, chatType: "supergroup" }), null);
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, fromId: "700000999" }), null);
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, hasRunner: false }), null);
+      assert.equal(await organizerDocumentRoute(trip.pool, { ...base, chatId: "880000777", fromId: "880000777" }), null);
+      assert.deepEqual(lines, []);
     });
   });
 
   // #178: the hop `organizerDocumentRoute`'s own test above cannot cover. The
   // route decision used to read `event.media_urls`, which nothing has attached
   // yet at that point, so a confirmed organizer's document never took it.
-  test("dispatch: the confirmed organizer's private-chat document is read by the relay, with its file attached", async () => {
+  test("dispatch (flag on): the confirmed organizer's private-chat document is read by the relay, with its file attached", async () => {
     await withConfirmedTrip(async (trip) => {
+      const lines: string[] = [];
       const decision = await dispatchUpdate(
-        trip.pool, documentUpdate(CHAT, "private", CHAT), undefined, () => {}, BOT,
-        { modelRunner: trip.runner, media: (trip.deps as { media: never }).media },
+        trip.pool, documentUpdate(CHAT, "private", CHAT), undefined, (line) => lines.push(line), BOT,
+        { modelRunner: trip.runner, media: (trip.deps as { media: never }).media, organizerDocumentRoute: true },
       );
+      assert.equal(lines.some((l) => l.includes("organizer_document_route_off")), false, "on: nothing held back");
       assert.equal(decision.kind, "document_correction");
       if (decision.kind !== "document_correction") return;
       assert.equal(decision.sessionId, trip.sessionId);
@@ -366,9 +411,9 @@ describe("documents after confirmation", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
     });
   });
 
-  test("dispatch: a group member's document, and an unconfirmed sender's, keep the companion route", async () => {
+  test("dispatch (flag on): a group member's document, and an unconfirmed sender's, keep the companion route", async () => {
     await withConfirmedTrip(async (trip) => {
-      const options = { modelRunner: trip.runner, media: (trip.deps as { media: never }).media };
+      const options = { modelRunner: trip.runner, media: (trip.deps as { media: never }).media, organizerDocumentRoute: true };
       // A family group bound to the same trip; the organizer's id sends, addressing the assistant.
       await trip.pool.query(
         "INSERT INTO control_plane.telegram_chat_bindings(id, chat_id, trip_id, hermes_profile) VALUES ($1, '-1009990001', $2, 'companion-test')",
@@ -389,5 +434,105 @@ describe("documents after confirmation", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
       );
       assert.equal(stranger.kind, "to_gateway", "an unconfirmed sender keeps the companion route");
     });
+  });
+
+  // Release A: the route is off unless ORGANIZER_DOCUMENT_ROUTE_ENABLED=1. Off,
+  // the organizer's file goes where it went before #178 — to the companion,
+  // downloaded once, for the companion — and nothing is proposed or rebuilt.
+  test("dispatch (flag unset): the confirmed organizer's document goes to the companion, exactly as with no model at all", async () => {
+    await withConfirmedTrip(async (trip) => {
+      const media = (trip.deps as { media: never }).media;
+      const lines: string[] = [];
+      const off = await dispatchUpdate(
+        trip.pool, documentUpdate(CHAT, "private", CHAT, "our boarding pass"), undefined, (line) => lines.push(line), BOT,
+        { modelRunner: trip.runner, media },
+      );
+      assert.equal(off.kind, "to_gateway", "the companion route, not document_correction");
+      assert.equal(trip.telegram.fetches, 1, "the file is fetched once, for the companion — never a second time for the relay to read");
+      if (off.kind !== "to_gateway") return;
+      assert.equal(off.event.media_urls?.length, 1, "the companion still gets the file");
+      assert.equal(off.event.media?.[0]?.kind, "document");
+
+      // The route this message took before #178: the reader's conditions
+      // failing (no model), so dispatch never considered it. Same decision.
+      const old = await dispatchUpdate(
+        trip.pool, documentUpdate(CHAT, "private", CHAT, "our boarding pass"), undefined, () => {}, BOT,
+        { media, organizerDocumentRoute: true },
+      );
+      const keyless = (d: unknown) => JSON.parse(JSON.stringify(d).replace(/\/relay\/media\/[A-Za-z0-9_-]+/g, "/relay/media/KEY")) as unknown;
+      assert.deepEqual(keyless(off), keyless(old));
+
+      const held = lines.filter((l) => l.includes("organizer_document_route_off"));
+      assert.equal(held.length, 1, "the operator can see a file that would have been read");
+      assert.deepEqual(JSON.parse(held[0]!), { level: "info", event: "trip_bot.organizer_document_route_off", trip_id: trip.tripId });
+      for (const secret of [CHAT, "boarding pass", "voucher.txt", "file_synthetic_1"]) {
+        assert.equal(held[0]!.includes(secret), false, `the line carries no ${secret}`);
+      }
+      assert.equal(trip.runner.calls, 0, "nothing was read");
+      assert.equal(await count(trip.pool, "SELECT count(*)::int AS n FROM control_plane.trip_document_corrections WHERE trip_id = $1", [trip.tripId]), 0);
+    });
+  });
+
+  test("the poll loop: the flag reaches dispatch — on, the relay reads the file; absent, the companion gets it", async () => {
+    for (const on of [false, true]) {
+      await withConfirmedTrip(async (trip) => {
+        trip.telegram.queued = [[documentUpdate(CHAT, "private", CHAT)]];
+        const stop = startTripBotPoller(
+          { ...(trip.deps as object), ...(on ? { organizerDocumentRoute: true } : {}) } as never,
+          { longPollSeconds: 0, maxBackoffMs: 10, deliverIntervalMs: 20 },
+        );
+        const reading = () => trip.telegram.sent.some((m) => m.text === uiString("correctionReading", "en"));
+        try {
+          for (let i = 0; i < 150 && trip.pushed.length === 0 && !reading(); i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        } finally {
+          stop();
+        }
+        await settleDocumentCorrections();
+        if (on) {
+          assert.equal(trip.pushed.length, 0, "on: the relay reads it, the companion does not get it");
+          assert.equal(reading(), true);
+        } else {
+          assert.equal(trip.pushed.length, 1, "off: the companion gets it");
+          assert.equal(trip.pushed[0]!.media?.[0]?.kind, "document");
+          assert.equal(reading(), false);
+          assert.equal(await count(trip.pool, "SELECT count(*)::int AS n FROM control_plane.trip_document_corrections WHERE trip_id = $1", [trip.tripId]), 0);
+        }
+      });
+    }
+  });
+});
+
+describe("ORGANIZER_DOCUMENT_ROUTE_ENABLED", () => {
+  test("only the exact value 1 turns it on; unset, empty and 0 are off quietly, anything else off loudly", () => {
+    assert.equal(ORGANIZER_DOCUMENT_ROUTE_SETTING, "ORGANIZER_DOCUMENT_ROUTE_ENABLED");
+    const at = (value: string | undefined) =>
+      organizerDocumentRouteSetting(value === undefined ? {} : { ORGANIZER_DOCUMENT_ROUTE_ENABLED: value });
+    assert.deepEqual(at("1"), { enabled: true, unrecognized: false });
+    assert.deepEqual(at(undefined), { enabled: false, unrecognized: false });
+    assert.deepEqual(at(""), { enabled: false, unrecognized: false });
+    assert.deepEqual(at("0"), { enabled: false, unrecognized: false });
+    for (const value of [" 1", "1 ", " 1 ", "1\n", " ", "\t", "false", "no", "off", "yes", "true", "TRUE", "on", "01", "1.0", "2", "enabled"]) {
+      assert.deepEqual(at(value), { enabled: false, unrecognized: true }, JSON.stringify(value));
+    }
+  });
+
+  test("the relay's start line says which state it chose, and nothing else", () => {
+    const run = (env: NodeJS.ProcessEnv) => {
+      const lines: string[] = [];
+      const enabled = organizerDocumentRouteFromEnv(env, (line) => lines.push(line));
+      return { enabled, lines: lines.map((l) => JSON.parse(l) as Record<string, unknown>) };
+    };
+    assert.deepEqual(run({}), { enabled: false, lines: [{ level: "info", event: "relay.organizer_document_route", enabled: false }] });
+    assert.deepEqual(run({ ORGANIZER_DOCUMENT_ROUTE_ENABLED: "1" }), { enabled: true, lines: [{ level: "info", event: "relay.organizer_document_route", enabled: true }] });
+    const typo = run({ ORGANIZER_DOCUMENT_ROUTE_ENABLED: "yes-please" });
+    assert.equal(typo.enabled, false);
+    assert.deepEqual(typo.lines.map((l) => [l.level, l.event]), [
+      ["warn", "relay.organizer_document_route_setting_unrecognized"],
+      ["info", "relay.organizer_document_route"],
+    ]);
+    assert.equal(JSON.stringify(typo.lines).includes("yes-please"), false, "the raw value is not echoed");
+    assert.equal(typo.lines[1]!.enabled, false);
   });
 });
