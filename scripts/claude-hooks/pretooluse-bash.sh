@@ -110,10 +110,10 @@ emit() {  # emit <allow|deny|ask> <reason>
 # that could stage or widen a commit in the same breath — `git add … && git
 # commit`, `-a`, `--amend`, `--no-verify`, another directory — falls through to
 # the ordinary prompt. Policy files are not documentation here: CLAUDE.md,
-# AGENTS.md, .claude/, .githooks/, .github/ and scripts/ always ask.
+# AGENTS.md, .claude/, .codex/, .githooks/, .github/ and scripts/ always ask.
 is_policy_path() {
   case "$1" in
-    CLAUDE.md|AGENTS.md|.claude/*|.githooks/*|.github/*|scripts/*|.preflight-allow) return 0 ;;
+    CLAUDE.md|AGENTS.md|.claude/*|.codex/*|.githooks/*|.github/*|scripts/*|.preflight-allow) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -291,6 +291,12 @@ class FeatureBranchWork(Harness):
             self.stage(self.root, "src/app.ts", staged)
             self.assertIn(self.decision("git commit -m 'x'"), ("ask", "deny"), staged)
 
+    def test_a_codex_hooks_only_commit_requires_approval(self):
+        # Keep this index policy-only: another protected file must not mask a
+        # missing .codex/ classification, and hooks.json is not an agent mirror.
+        self.stage(self.root, ".codex/hooks.json", content="{}\n")
+        self.assertEqual(self.decision("git commit -m 'fix: Codex hooks'"), "ask")
+
     def test_a_command_that_could_widen_the_commit_is_asked(self):
         self.stage(self.root, "src/app.ts")
         self.assertEqual(self.decision("git commit -m 'x'"), "allow")  # the plain form, so each ask below is earned
