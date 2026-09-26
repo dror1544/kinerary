@@ -97,6 +97,32 @@ MERGE = re.compile(
 # force push rewrites what they already had.
 PUSH = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+push(?![\w-])')
 
+# --normalize: rewrite the inert shapes sessions actually type into the plain form
+# the hook's exemptions match (2026-09-26, from the decision log: 8 of 9 prompts
+# in 90 minutes were for commits the exemptions meant to allow). Only two things
+# are rewritten, and both are inert:
+#   * a heredoc message with a QUOTED delimiter -- -m "$(cat <<'EOF' ... EOF)" --
+#     whose body the shell passes through literally, becomes -m 'msg';
+#   * a trailing output filter -- 2>&1, | tail -N, | head -N, | grep -v '<text>' --
+#     is dropped: it only shapes what is printed, never what is committed.
+# Anything else is left as it is, so it fails the exemption and is asked.
+QUOTED_HEREDOC_MSG = re.compile(
+    r'"\$\(cat <<\s*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\n.*?\n\2\n\s*\)"', re.S)
+FILTER = (r'(?:\s*2>&1'
+          r'|\s*\|\s*(?:tail|head)\s+-n?\s*\d+'
+          r"|\s*\|\s*grep\s+-[vEiF]*v[vEiF]*\s+'[^'\n]*')")
+TRAILING_FILTERS = re.compile(r'(?:' + FILTER + r')+\s*$')
+
+
+def normalize(cmd: str) -> str:
+    out = QUOTED_HEREDOC_MSG.sub("'msg'", cmd.strip())
+    return TRAILING_FILTERS.sub("", out).strip()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--normalize":
+    sys.stdout.write(normalize(sys.stdin.read()))
+    sys.exit(0)
+
 raw = strip_heredocs(sys.stdin.read())
 
 # Asymmetric on purpose. Deploy verbs are matched with quotes intact, because a

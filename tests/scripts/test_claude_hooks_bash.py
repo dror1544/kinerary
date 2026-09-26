@@ -375,5 +375,60 @@ class FeatureBranchWork(Harness):
         self.assertIn("could not read", d["permissionDecisionReason"])
 
 
+class TheFormsSessionsActuallyUse(Harness):
+    """2026-09-26, from the decision log: in 90 minutes the lead was asked 9 times and
+    only one of those needed asking (it staged CLAUDE.md). The exemptions matched only
+    the plain `git commit -m 'x'` / `git push origin <b>`, and nobody types that: Claude
+    Code writes a message as a quoted heredoc, and sessions add -q and an output
+    filter. Those shapes are inert, so they are normalised to the plain form first;
+    anything else about the line still asks."""
+
+    HEREDOC = "git commit -m \"$(cat <<'EOF'\nfix: the thing\n\nBody with $(not run) and `ticks`.\nEOF\n)\""
+
+    def setUp(self):
+        super().setUp()
+        self.git("reset", "-q", "note.md")
+        (self.root / "note.md").unlink()
+        self.git("checkout", "-q", "-b", "fix/one")
+        (self.root / "src").mkdir()
+        (self.root / "src/app.ts").write_text("x\n")
+        self.git("add", "src/app.ts")
+
+    def git(self, *args):
+        subprocess.run(["git", *GIT_ID, *args], cwd=self.root, check=True, capture_output=True)
+
+    def decision(self, command):
+        return self.hook(command).get("permissionDecision")
+
+    def test_a_quoted_heredoc_message_is_allowed(self):
+        self.assertEqual(self.decision(self.HEREDOC), "allow")
+        self.assertEqual(self.decision(self.HEREDOC.replace("<<'EOF'", '<<"EOF"')), "allow")
+
+    def test_an_unquoted_heredoc_is_asked_because_its_body_would_expand(self):
+        self.assertEqual(self.decision(self.HEREDOC.replace("<<'EOF'", "<<EOF")), "ask")
+
+    def test_quiet_flags_and_output_filters_are_allowed(self):
+        for command in ("git commit -q -m 'x' 2>&1 | tail -3", "git commit -m 'x' 2>&1 | grep -v 'warn'",
+                        "git commit -m 'x' 2>&1 | grep -vE '^ *(warn|fix:)'", "git commit -m 'x' 2>&1",
+                        self.HEREDOC + " 2>&1 | tail -1"):
+            self.assertEqual(self.decision(command), "allow", command)
+
+    def test_any_other_pipe_or_chain_is_asked(self):
+        for command in ("git commit -m 'x' | sh", "git commit -m 'x' 2>&1 | tail -3 | sh",
+                        "git commit -m 'x' | grep -v \"$(id)\"", "git commit -m 'x' | tee /tmp/f",
+                        "git commit -m 'x'; git push", self.HEREDOC + "; rm -rf /tmp/x"):
+            self.assertEqual(self.decision(command), "ask", command)
+
+    def test_a_quiet_push_of_the_feature_branch_is_allowed(self):
+        remote = Path(tempfile.mkdtemp(prefix="hook-remote-"))
+        self.addCleanup(shutil.rmtree, remote, True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        self.git("commit", "-q", "-m", "fix: one")
+        for command in ("git push -q -u origin fix/one", "git push -u -q origin fix/one 2>&1 | tail -2"):
+            self.assertEqual(self.decision(command), "allow", command)
+        self.assertEqual(self.decision("git push -q origin main"), "ask")
+
+
 if __name__ == "__main__":
     unittest.main()
