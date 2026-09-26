@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { describe, test } from "node:test";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
@@ -20,12 +21,37 @@ import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
 import { digestTelegramId } from "../src/identity.js";
-import { runnerForBinding, type StructuredModelRunner } from "../src/model-runner.js";
+import { CODEX_ISOLATION_FEATURES, runnerForBinding, type StructuredModelRunner } from "../src/model-runner.js";
+import { withFakeBinDir, withPlantedEnv, writeFakeBin } from "./support/child-env-harness.js";
 import { switchableRunner } from "../src/model-task-settings.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
+
+/**
+ * `/model ... codex:` runs the real isolation probe (`codex features list`, #192)
+ * through $CODEX_BIN before it saves anything. A test that relies on whatever
+ * codex the host has passes on a laptop and fails on a CI runner, so these two
+ * helpers give the probe a codex the test controls, in both directions.
+ */
+async function withProbedCodex<T>(kind: "verified" | "missing" | "broken", fn: () => Promise<T>): Promise<T> {
+  return withFakeBinDir("kinerary-dispatch-codex-", async (dir) => {
+    let bin = join(dir, "no-such-codex");
+    if (kind === "verified") {
+      // Knows every feature the isolation list disables: what a matching codex prints.
+      bin = await writeFakeBin(dir, "codex", [
+        `const features = ${JSON.stringify(CODEX_ISOLATION_FEATURES)};`,
+        "if (process.argv[2] === 'features' && process.argv[3] === 'list') {",
+        "  process.stdout.write(features.map((f) => f + '  stable  false').join('\\n') + '\\n');",
+        "} else process.exit(2);",
+      ]);
+    } else if (kind === "broken") {
+      bin = await writeFakeBin(dir, "codex", ["process.stderr.write('boom'); process.exit(1);"]);
+    }
+    return withPlantedEnv({ CODEX_BIN: bin }, fn);
+  });
+}
 
 function testId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -164,7 +190,7 @@ describe("dispatchUpdate — the branch table", () => {
   });
 
   test("the super admin switches a task's model from their own DM, and it is recorded", { skip: SKIP }, async () => {
-    await withFixture(async (fix) => {
+    await withProbedCodex("verified", () => withFixture(async (fix) => {
       await bindCompanion(fix, "700000560", "companion-japan");
       const superAdmin = digestTelegramId("777");
       const pinned: StructuredModelRunner = {
@@ -210,8 +236,34 @@ describe("dispatchUpdate — the branch table", () => {
         fix.pool.query("DELETE FROM control_plane.model_task_setting_history"),
         /append-only/,
       );
-    });
+    }));
   });
+
+  for (const [kind, why] of [["missing", "no codex to run"], ["broken", "a codex whose probe exits non-zero"]] as const) {
+    test(`a codex that cannot be verified is refused, not trusted: ${why} (#192)`, { skip: SKIP }, async () => {
+      await withProbedCodex(kind, () => withFixture(async (fix) => {
+        await bindCompanion(fix, "700000562", "companion-japan");
+        const pinned: StructuredModelRunner = {
+          describe: () => ({ provider: "claude", model: "claude-sonnet-5" }),
+          run: async () => ({ ok: false, error: "NOT_CONFIGURED", attempts: 0, ms: 0 }) as never,
+        };
+        const runner = switchableRunner(pinned, (task, b) => runnerForBinding(b.runner, b.model, 90_000, task, {}));
+        const options = { superAdminSubjectDigest: digestTelegramId("777"), modelRunner: runner };
+
+        const set = await dispatchUpdate(
+          fix.pool, msg("700000562", "/model extract_intake codex:gpt-5.6-luna"), DEFAULT_STRINGS, () => {}, {}, options,
+        );
+        assert.equal(set.kind, "reply");
+        if (set.kind !== "reply") return;
+        assert.match(set.reply.text, /codex:gpt-5\.6-luna cannot serve calls on this relay \(.*\)\. Nothing changed\./);
+        assert.deepEqual(runner.describe?.("extract_intake"), { provider: "claude", model: "claude-sonnet-5" }, "still the environment's binding");
+        const written = await fix.pool.query("SELECT 1 FROM control_plane.model_task_settings");
+        assert.equal(written.rowCount, 0, "nothing saved");
+        const history = await fix.pool.query("SELECT 1 FROM control_plane.model_task_setting_history");
+        assert.equal(history.rowCount, 0, "nothing recorded");
+      }));
+    });
+  }
 
   test("/model is nobody else's, and nowhere else: it answers like any unknown command", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
