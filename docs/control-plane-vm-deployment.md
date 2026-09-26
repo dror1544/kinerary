@@ -485,6 +485,28 @@ Every new migration declares `-- rollback: compatible — <why>` or
 `control-plane/api/test/migration-rollback.test.ts`. The tool treats an
 undeclared one as breaking.
 
+**Ordering on the Mac stack.** On the VM the tool migrates before it restarts
+the relay (step 4). By hand, do the same: a relay started against a schema
+without a table it reads fails on every message that reads it. For typed
+interview changes (PR #199, `20260925180000_intake_pending_changes.sql`) that is
+`42P01` on every typed interview message. Rebuild and start the API first, then
+restart the relay.
+
+**Rolling back past PR #199.** The migration is `compatible`, so the database
+is kept, and the old relay never reads `intake_pending_changes`. A `pending`
+change is then orphaned unseen, and the old Confirm does not check for one, so
+an organizer who confirms loses a waiting change without being told. Before
+rolling back, count them:
+`SELECT count(*) FROM control_plane.intake_pending_changes WHERE status='pending'`,
+and tell any organizer who has one (cancelling drafts is a write and needs
+approval). Rolling forward again is harmless. Source: the regression plan
+`docs/test-reports/regression-plan-2026-09-26-pr199-round3.md` §3, whose reading
+of the VM release order was carried from an earlier pass, not re-read.
+
+After the first real interview on a build that has #199, grep the relay log for
+`interview.change_floor_taken_back`, `interview.change_dropped_unshowable` and
+`trip_bot.floor_lost`.
+
 A code-only rollback keeps the newer database, and old code tolerates it only
 because the migrations said so. It also means **the newest `available` site
 release may be newer than the rolled-back worker**; the tool warns when that

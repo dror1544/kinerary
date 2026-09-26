@@ -201,7 +201,15 @@ its own prior rather than from what the organizer wrote.
   wrong answer.
 - **Already answered** → a change, not a write. Mid-interview overwrites are not
   applied silently; the router confirms. (Distinct from the post-confirmation
-  path, which is `intake-correction.ts` and creates a new intake version.)
+  path, which is `intake-correction.ts` and creates a new intake version.) For a
+  typed change to the held **stops or travellers** (#206, PR #199) that
+  confirmation is a stored draft, not a guess: the model proposes a short list
+  of operations, code resolves each reference against what is held and validates
+  the result, the person is shown exactly that difference, and exactly that is
+  applied only after they say yes. The draft lives in
+  `control_plane.intake_pending_changes` (`typed-changes.ts`,
+  `typed-changes-store.ts`), and while one waits the recap's Confirm is refused
+  and the change is shown instead. Nothing else in this section changed.
 - **`unclear[]`** → the router asks that question next, which is what it would
   have done anyway. `unclear` is a scheduling hint, not an error.
 - **`{ ok: false }`** → the router proceeds on its own copy. The interview
