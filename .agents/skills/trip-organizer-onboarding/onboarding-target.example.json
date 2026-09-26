@@ -1,0 +1,25 @@
+{
+  "//": [
+    "Where the onboarding tool is allowed to run create-trip-link. Copy to",
+    "~/kinerary-deploy/onboarding-target.json and fill in. Real values never",
+    "live in this repo — same rule as fleet-stacks.json and issue-target.json.",
+    "",
+    "'command' is the path to the create-trip-link WRAPPER (not the repo",
+    "script) — the wrapper is what supplies the real host, bot, ssh key and",
+    "credential store. It is resolved relative to this config file, so '~/'",
+    "and a bare relative path both work.",
+    "",
+    "There is nothing else to fill in here: create-trip-link itself refuses",
+    "to run if its own env is unset, so this file only has to point at it."
+  ],
+
+  "command": "~/kinerary-deploy/create-trip-link",
+
+  "//maxPerHour": [
+    "A ceiling, not a target. One operator confirming one email at a time",
+    "does not approach this in an hour; hitting it means something is",
+    "looping, and the tool refuses rather than minting more accounts. Raise",
+    "it only when you have seen the rate be real."
+  ],
+  "maxPerHour": 6
+}
