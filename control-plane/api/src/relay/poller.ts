@@ -1991,25 +1991,35 @@ async function renderConflictQuestion(
 
 /**
  * Ask the oldest open disagreement, if there is one and it is not already on
- * screen. Returns whether a message was sent.
+ * screen. `spoke` when this turn is spoken for (asked, or owed to the step
+ * retry); `skipped` when Telegram refused it for good and the caller must go on
+ * to the next step; `none` when there was nothing to ask.
  */
-async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotPollerDeps): Promise<boolean> {
+async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotPollerDeps): Promise<"spoke" | "skipped" | "none"> {
   const conflict = await nextOpenConflict(deps.db, view.tripId);
-  if (!conflict) return false;
+  if (!conflict) return "none";
   const key = `cfl:${conflict.id}`;
   // Already asked and still on screen: its buttons are there to tap. Asking it
   // again would bury the question under copies of itself, and holding back
   // everything else until it is answered would make a disagreement block the
   // interview, which it must never do.
-  if (view.lastPrompt === key) return false;
-  if (!(await takeFloor(chatId, view, deps))) return false;
+  if (view.lastPrompt === key) return "none";
+  if (!(await takeFloor(chatId, view, deps))) return "none";
   const rendered = await renderConflictQuestion(deps.db, chatId, conflict, view.language);
   // Through `deliverStep`, like the router's other questions (#225 item 9): this
   // recorded `cfl:` AFTER a send whose result it never read, so a refused ask was
   // marked as on screen and never asked again. Delivered, or owed to the step
   // retry - either way this turn is spoken for.
-  await deliverStep(view, chatId, deps, key, { text: rendered.text, replyMarkup: rendered.replyMarkup });
-  return true;
+  //
+  // EXCEPT a refusal for good (#225 round 2). Un-named like a question, it would
+  // be asked first on every later pass, refused every time, and nothing after it
+  // would ever be said - a disagreement blocking the interview, which it must
+  // never do. So its key stays recorded, exactly as before #225 (the next pass
+  // dedupes it), and the caller goes on to the next step. The disagreement itself
+  // stays open with the held value standing, and is offered again only once
+  // `lastPrompt` has moved on - as it was before; nothing else surfaces it.
+  const outcome = await deliverStep(view, chatId, deps, key, { text: rendered.text, replyMarkup: rendered.replyMarkup }, { skipOnPermanent: true });
+  return outcome === "skipped" ? "skipped" : "spoke";
 }
 
 /**
@@ -4401,7 +4411,8 @@ let stepRetryBaseMs = STEP_RETRY_BASE_MS;
 export function setStepRetryBaseMsForTests(ms: number = STEP_RETRY_BASE_MS): void {
   stepRetryBaseMs = ms;
 }
-function stepRetryDelayMs(attempts: number): number {
+/** The wait after the `attempts`-th failure in a row. Exported for the tests, which pin the sequence. */
+export function stepRetryDelayMs(attempts: number): number {
   return Math.min(stepRetryBaseMs * 2 ** (attempts - 1), STEP_RETRY_MAX_MS);
 }
 
@@ -4422,14 +4433,22 @@ function stepRetryDelayMs(attempts: number): number {
  *
  * The caller has already taken the floor. A step that did not arrive is handed to
  * `stepNotDelivered`, which decides whether and when it is tried again.
+ *
+ * `skipOnPermanent` is for a step the interview must be able to go on WITHOUT - a
+ * disagreement between documents, which never blocks anything. Refused for good,
+ * it is not un-named (its key stays recorded, so the next pass dedupes it, as
+ * before #225) and the floor is handed back so the caller's next step can speak:
+ * `skipped`. A transient failure is handled like any other step.
  */
+type StepOutcome = "delivered" | "not_delivered" | "skipped";
 async function deliverStep(
   view: SessionView,
   chatId: string,
   deps: TripBotPollerDeps,
   promptKey: string,
   message: { text: string; replyMarkup?: InlineKeyboard },
-): Promise<boolean> {
+  options: { skipOnPermanent?: boolean } = {},
+): Promise<StepOutcome> {
   const previousPrompt = view.lastPrompt ?? "";
   if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
   let sent: SendResult | undefined;
@@ -4441,10 +4460,12 @@ async function deliverStep(
   }
   if (sent?.ok) {
     stepRetriesFor(deps).delete(chatId);
-    return true;
+    return "delivered";
   }
-  await stepNotDelivered(view, chatId, deps, promptKey, previousPrompt, isPermanentRefusal(sent));
-  return false;
+  const permanent = isPermanentRefusal(sent);
+  const skip = permanent && options.skipOnPermanent === true;
+  const ours = await stepNotDelivered(view, chatId, deps, promptKey, previousPrompt, permanent, skip);
+  return skip && ours ? "skipped" : "not_delivered";
 }
 
 /**
@@ -4462,7 +4483,8 @@ async function stepNotDelivered(
   promptKey: string,
   previousPrompt: string,
   permanent: boolean,
-): Promise<void> {
+  skip = false,
+): Promise<boolean> {
   const log = deps.log ?? (() => {});
   const retries = stepRetriesFor(deps);
   // The key's first two parts only: a question key can carry an unsettled answer's text after them.
@@ -4473,19 +4495,27 @@ async function stepNotDelivered(
     log(structuredLog("warn", "trip_bot.step_send_failed", {
       session_id: view.sessionId, prompt, permanent, retry: false, reason: "SPOKEN_SINCE",
     }));
-    return;
+    return false;
+  }
+  if (skip) {
+    // Kept named, so it is not asked again on the next pass; the floor goes back
+    // to the machine so the step after it can be said now (see `deliverStep`).
+    retries.delete(chatId);
+    await markAwaitingMachine(deps.db, chatId);
+    log(structuredLog("warn", "trip_bot.step_send_failed", { session_id: view.sessionId, prompt, permanent, retry: false, skipped: true }));
+    return true;
   }
   if (promptKey) await recordLastPromptForChat(deps.db, chatId, previousPrompt);
   if (permanent) {
     retries.delete(chatId);
     log(structuredLog("warn", "trip_bot.step_send_failed", { session_id: view.sessionId, prompt, permanent, retry: false }));
-    return;
+    return true;
   }
   const attempts = (retries.get(chatId)?.attempts ?? 0) + 1;
   if (attempts >= STEP_RETRY_MAX_ATTEMPTS) {
     retries.delete(chatId);
     log(structuredLog("error", "trip_bot.step_send_abandoned", { session_id: view.sessionId, prompt, attempts }));
-    return;
+    return true;
   }
   const delay = stepRetryDelayMs(attempts);
   retries.set(chatId, { attempts, notBefore: Date.now() + delay });
@@ -4495,6 +4525,7 @@ async function stepNotDelivered(
   log(structuredLog("warn", "trip_bot.step_send_failed", {
     session_id: view.sessionId, prompt, permanent, retry: true, attempt: attempts, retry_in_ms: delay,
   }));
+  return true;
 }
 
 /**
@@ -4609,7 +4640,18 @@ export async function sendNextStep(
   // Re-enabled as part of the same step that added the four b2e3051
   // migrations (control_plane.trip_answer_conflicts now exists) — see the
   // #145 forward-port note on `askOpenConflict` for why this was held back.
-  if (await askOpenConflict(view, chatId, deps)) return true;
+  const disagreement = await askOpenConflict(view, chatId, deps);
+  if (disagreement === "spoke") return true;
+  if (disagreement === "skipped") {
+    // Refused for good and kept named: read again, and say the next thing. The
+    // fresh view names the disagreement, so `askOpenConflict` dedupes it and this
+    // does not come back here for it; if something else was put on screen in
+    // between, that speaker has the turn and nothing more is said.
+    const next = await getSessionForChat(deps.db, chatId);
+    return next.ok && (next.view.lastPrompt ?? "").startsWith("cfl:")
+      ? sendNextStep(next.view, chatId, deps, _strings)
+      : true;
+  }
 
   // THE BOUNDARY. Nothing required left to ask, but a required answer is still
   // missing — one that stepped aside after a reply did not answer it. Bring the
@@ -4939,7 +4981,7 @@ export async function sendNextStep(
   // says why. Not delivered is still `true`: the step is owed to the step retry,
   // or (refused for good) to the organizer's next message, and a caller that
   // read `false` as "nothing was said" would say "I didn't follow" over it.
-  if (!(await deliverStep(view, chatId, deps, promptKey, { text, replyMarkup }))) return true;
+  if ((await deliverStep(view, chatId, deps, promptKey, { text, replyMarkup })) !== "delivered") return true;
   if (askedNomination) {
     // Only if it is still THIS nomination: one made while the send was in
     // flight is a new one, and is not ours to clear.

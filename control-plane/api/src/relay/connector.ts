@@ -34,7 +34,29 @@ import {
   type OutboundResult,
   type WireMessageEvent,
 } from "./protocol.js";
-import type { TelegramClient } from "./telegram-api.js";
+import { TIMEOUT_ERROR, type TelegramClient } from "./telegram-api.js";
+
+/**
+ * What the gateway is told when a send or edit to Telegram TIMED OUT (#225,
+ * round 2). Not the client's bare word "TIMEOUT": Hermes reads the error string
+ * with its own classifier (gateway/platforms/base.py, `_is_timeout_error` and
+ * `_is_retryable_error`), and "timeout" is neither - so it fell to the
+ * plain-text fallback and re-sent the reply, prefixed "(Response formatting
+ * failed, plain text:)". A timed-out send may well have been delivered, so the
+ * family could see the reply twice. "timed out" is what Hermes reads as a
+ * timeout - returned as-is, never retried, never re-sent, exactly as its own 30 s
+ * "relay outbound timed out" was before - and the phrase carries none of its
+ * retryable words ("network", "connecttimeout" and the rest). Fixed, like the
+ * word it replaces: no URL, no token. Only the gateway sees it; the interview
+ * reads the client's result directly and still gets a transient failure.
+ */
+export const GATEWAY_TIMEOUT_ERROR = "telegram call timed out";
+
+/** The client's error, in words the gateway classifies correctly. */
+function gatewayError(error: string | undefined, fallback: string): string {
+  if (error === TIMEOUT_ERROR) return GATEWAY_TIMEOUT_ERROR;
+  return error ?? fallback;
+}
 import type { ReplyObserver } from "../analytics/emitter.js";
 
 /**
@@ -498,7 +520,7 @@ export class RelayConnector {
         }
         return sent.ok
           ? { success: true, message_id: sent.messageId }
-          : { success: false, error: sent.error ?? "SEND_FAILED" };
+          : { success: false, error: gatewayError(sent.error, "SEND_FAILED") };
       }
       case "edit": {
         const edited = await telegram.editMessageText({
@@ -510,7 +532,7 @@ export class RelayConnector {
           text: action.content,
           parseMode: "MarkdownV2",
         });
-        return edited.ok ? { success: true } : { success: false, error: edited.error ?? "EDIT_FAILED" };
+        return edited.ok ? { success: true } : { success: false, error: gatewayError(edited.error, "EDIT_FAILED") };
       }
       case "typing":
         await telegram.sendChatAction({ chatId: action.chat_id });

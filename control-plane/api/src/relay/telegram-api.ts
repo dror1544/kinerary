@@ -82,9 +82,16 @@ export const RETRY_AFTER_CAP_SECONDS = 3;
  * Telegram answers in well under a second (sendMessage, editMessageText,
  * answerCallbackQuery, getFile's metadata, getMe, setMyCommands...). File BYTES
  * are downloaded by `fetchFile`'s own fetch and long polls by `getUpdates`'s;
- * neither goes through here. And it keeps the worst single call - hung, a 429
- * waited out, hung again - at 2 x 10 + 3 = 23 s, under the 30 s a Hermes gateway
- * waits for an outbound send (`_OUTBOUND_TIMEOUT_S`); 15 s would not.
+ * neither goes through here. Ten, not more, because every second of a hang is a
+ * second the relay's sequential loops hold everything behind it.
+ *
+ * The longest one `sendMessage` can now take: a timed-out attempt is never
+ * retried (only a short 429 is), and a timeout is not a parse error, so nothing
+ * follows a hang. The worst is a connector MarkdownV2 send - a 429, a 3 s wait,
+ * then a parse error; then the plain-text fallback with a 429, a 3 s wait and a
+ * 10 s hang - about 16 s plus round trips. That is under the 30 s a Hermes gateway
+ * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`), a figure read only in
+ * the Mac's Hermes checkout (`ab0d98414`), not in the VM's image.
  *
  * A constant, not a setting: nothing about a deployment makes Telegram slower.
  */

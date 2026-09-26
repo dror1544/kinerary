@@ -30,6 +30,8 @@ import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
   foldItineraryFromDocument,
+  STEP_RETRY_MAX_ATTEMPTS,
+  stepRetryDelayMs,
   suggestionConfirmedText,
 } from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
@@ -960,9 +962,30 @@ describe("#225 item 7: a confirmed reading's edit fits Telegram's limit, whateve
     }
   });
 
+  test("round 2 (R7c): an astral character straddling the 3000-unit boundary (an ODD offset) is left out whole, not split", () => {
+    // One BMP character first puts every emoji on an odd offset, so unit 3000 is
+    // the high half of one: a plain .slice(0, 3000) leaves a lone surrogate.
+    const label = `a${"🎌".repeat(2000)}`;
+    const text = suggestionConfirmedText(destination, label, "en");
+    assert.ok(wellFormed(text), "no half of a surrogate pair");
+    assert.ok(text.endsWith("🎌"), "the cut ends on a whole character");
+    assert.ok(text.length <= 4096, String(text.length));
+  });
+
   test("an ordinary label is shown whole", () => {
     assert.equal(suggestionConfirmedText(destination, "Japan", "en"), `${askText(destination, "en")}\n\n✅ Japan`);
     assert.equal(suggestionConfirmedText(destination, null, "en"), `${askText(destination, "en")}\n\n✅ `);
+  });
+});
+
+describe("#225 item 9 (round 2, R7b): the step backoff, pinned", () => {
+  test("2 s, doubling, capped at 60 s: 2, 4, 8, 16, 32, 60, 60 - and 8 failures in a row end it", () => {
+    assert.deepEqual([1, 2, 3, 4, 5, 6, 7].map(stepRetryDelayMs), [2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]);
+    assert.equal(STEP_RETRY_MAX_ATTEMPTS, 8);
+    // What that adds up to before the step is left to the organizer: the waits
+    // between 8 attempts (the round-2 figure for the relay-restart guard).
+    const waited = [1, 2, 3, 4, 5, 6, 7].reduce((sum, n) => sum + stepRetryDelayMs(n), 0);
+    assert.equal(waited, 182_000);
   });
 });
 

@@ -248,6 +248,56 @@ describe("#225 item 8: a hung connection is bounded, transient, and not retried"
     });
   }
 
+  for (const body of ["never settles", "rejects late"] as const) {
+    test(`round 2 (R2): headers arrive at once but the body ${body} - transient TIMEOUT within the bound, not retried, no token, no unhandled rejection`, async () => {
+      const calls: string[] = [];
+      const realFetch = globalThis.fetch;
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      process.on("unhandledRejection", onUnhandled);
+      // A response whose status line is in and whose body is not: the connection
+      // hangs after the headers. The stub does not wire the signal into the body,
+      // so only the bound on the body read can end the wait.
+      globalThis.fetch = (async (input: string | URL) => {
+        calls.push(String(input));
+        return {
+          ok: true,
+          status: 200,
+          text: () => new Promise<string>((_resolve, reject) => {
+            if (body === "rejects late") {
+              setTimeout(() => reject(new Error(`socket closed for ${String(input)}`)), SHORT_TIMEOUT_MS * 3);
+            }
+          }),
+        } as unknown as Response;
+      }) as typeof fetch;
+      const logs: string[] = [];
+      const waits: number[] = [];
+      try {
+        const c = new HttpTelegramClient(TOKEN, (line) => logs.push(line), undefined, {
+          sleep: async (ms) => { waits.push(ms); },
+          timeoutMs: SHORT_TIMEOUT_MS,
+        });
+        const started = Date.now();
+        const result = await c.sendMessage({ chatId: "900", text: "hello" });
+        const took = Date.now() - started;
+        // Long enough for the late rejection to land, and for an unhandled one to be reported.
+        await new Promise((r) => setTimeout(r, SHORT_TIMEOUT_MS * 6));
+        assert.equal(result.ok, false);
+        assert.equal(result.error, "TIMEOUT");
+        assert.equal(isPermanentRefusal(result), false);
+        assert.equal(calls.length, 1, "not retried");
+        assert.deepEqual(waits, []);
+        assert.ok(took < 2000, `${took}ms`);
+        for (const line of logs) assert.ok(!line.includes(TOKEN) && !line.includes("SECRET"), line);
+        assert.ok(!String(result.error).includes("SECRET"));
+        assert.deepEqual(unhandled, [], "no unhandled rejection");
+      } finally {
+        globalThis.fetch = realFetch;
+        process.off("unhandledRejection", onUnhandled);
+      }
+    });
+  }
+
   test("an edit carries the same bound and the same verdict", async () => {
     const { result, calls } = await sendHung({ honoursAbort: true }, "edit");
     assert.equal(result.ok, false);
@@ -256,9 +306,69 @@ describe("#225 item 8: a hung connection is bounded, transient, and not retried"
     assert.equal(calls.length, 1);
   });
 
-  test("the production bound is well above a normal send and below the gateway's 30 s outbound wait, even with a 429 waited out between two hung tries", () => {
+  test("round 2 (R7a): the request carries an abort signal, and the timer aborts it - the hung connection is CANCELLED, not merely abandoned (a late delivery would be a duplicate)", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    const realFetch = globalThis.fetch;
+    // Ignores the signal on purpose: the race ends the wait either way, so only
+    // looking at the signal tells whether the connection itself was cancelled.
+    globalThis.fetch = ((_input: string | URL, init?: RequestInit) => {
+      signals.push(init?.signal ?? undefined);
+      return new Promise<Response>(() => {});
+    }) as typeof fetch;
+    try {
+      const c = new HttpTelegramClient(TOKEN, () => {}, undefined, { timeoutMs: SHORT_TIMEOUT_MS });
+      const result = await c.sendMessage({ chatId: "900", text: "hello" });
+      assert.equal(result.error, "TIMEOUT");
+      assert.equal(signals.length, 1);
+      assert.ok(signals[0] instanceof AbortSignal, "the request was handed a signal");
+      assert.equal(signals[0]!.aborted, true, "and the timer aborted it");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("round 2 (R4): a MarkdownV2 send whose FIRST attempt hangs is not followed by the plain-text fallback (a timeout is not a parse error)", async () => {
+    const t = stubHungFetch({ honoursAbort: true });
+    try {
+      const c = new HttpTelegramClient(TOKEN, () => {}, undefined, { sleep: async () => {}, timeoutMs: SHORT_TIMEOUT_MS });
+      const result = await c.sendMessage({ chatId: "900", text: "hello.", parseMode: "MarkdownV2" });
+      assert.equal(result.error, "TIMEOUT");
+      assert.equal(t.calls.length, 1, "one attempt: no fallback, no retry");
+    } finally {
+      t.restore();
+    }
+  });
+
+  test("round 2 (R4): the longest sendMessage - MarkdownV2: 429, wait, parse error; plain fallback: 429, wait, hang - is 2 waits and ONE timeout, under the gateway's 30 s outbound wait", async () => {
+    // Scripted replies; the fourth call hangs. A hang is never retried and is not
+    // a parse error, so nothing follows it.
+    const script = [
+      rateLimited(RETRY_AFTER_CAP_SECONDS),
+      { status: 400, body: { ok: false, error_code: 400, description: "Bad Request: can't parse entities: bad" } },
+      rateLimited(RETRY_AFTER_CAP_SECONDS),
+      "hang" as const,
+    ];
+    const calls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: string | URL) => {
+      calls.push(String(input));
+      const reply = script[calls.length - 1] ?? "hang";
+      if (reply === "hang") return new Promise<Response>(() => {});
+      return Promise.resolve(new Response(JSON.stringify(reply.body), { status: reply.status }));
+    }) as typeof fetch;
+    const waits: number[] = [];
+    try {
+      const c = new HttpTelegramClient(TOKEN, () => {}, undefined, { sleep: async (ms) => { waits.push(ms); }, timeoutMs: SHORT_TIMEOUT_MS });
+      const result = await c.sendMessage({ chatId: "900", text: "hello.", parseMode: "MarkdownV2" });
+      assert.equal(result.error, "TIMEOUT");
+      assert.equal(calls.length, 4, "nothing after the hang");
+      assert.deepEqual(waits, [RETRY_AFTER_CAP_SECONDS * 1000, RETRY_AFTER_CAP_SECONDS * 1000]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    // In production: the waits above plus one REQUEST_TIMEOUT_MS (plus round trips).
     assert.ok(REQUEST_TIMEOUT_MS >= 5_000, String(REQUEST_TIMEOUT_MS));
-    assert.ok(2 * REQUEST_TIMEOUT_MS + RETRY_AFTER_CAP_SECONDS * 1000 < 30_000, String(REQUEST_TIMEOUT_MS));
+    assert.ok(2 * RETRY_AFTER_CAP_SECONDS * 1000 + REQUEST_TIMEOUT_MS < 30_000, String(REQUEST_TIMEOUT_MS));
   });
 
   test("a call that answers in time is untouched by the timer, and the timer does not outlive it", async () => {
