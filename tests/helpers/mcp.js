@@ -46,7 +46,7 @@ function startupFailure(what, port, stderr) {
     lines.push(
       `  ${port} is inside ${first}-${last}, where provisioned trips run their own`,
       `  trip-mcp bridge (3000 + vmid, so this is VMID ${port - 3000}). Test ports`,
-      '  belong above 38000 — see helpers/ports.js.',
+      '  belong in 28000-32767 — see helpers/ports.js.',
     );
   }
   const tail = (stderr || '').trim();
