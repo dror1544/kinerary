@@ -430,5 +430,50 @@ class TheFormsSessionsActuallyUse(Harness):
         self.assertEqual(self.decision("git push -q origin main"), "ask")
 
 
+class AHeredocEndsWhereTheShellEndsIt(TheFormsSessionsActuallyUse):
+    """Found in review of #242 (the lead, 2026-09-26): the shell ends a quoted heredoc
+    at the FIRST line equal to its delimiter, and anything after that line inside the
+    $( ) is EXECUTED. A normaliser that read to a later delimiter erased a hidden
+    `git push --force origin main` as "message body" and the hook allowed it. The
+    rewrite now happens only when the delimiter's first terminator line is followed
+    by nothing but the closing )", and otherwise the command is left as typed."""
+
+    def normalized(self, command):
+        return subprocess.run(["python3", str(REPO / "scripts/claude-hooks/match-command.py"), "--normalize"],
+                              input=command, capture_output=True, text=True).stdout
+
+    SMUGGLE = "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\ngit push --force origin main\nEOF\n)\""
+
+    def test_1_a_command_after_the_first_delimiter_is_asked_and_left_as_typed(self):
+        self.assertEqual(self.decision(self.SMUGGLE), "ask")
+        self.assertEqual(self.normalized(self.SMUGGLE), self.SMUGGLE)
+
+    def test_2_an_indented_or_padded_delimiter_line_counts_as_a_terminator(self):
+        for line in ("  EOF", "EOF  ", "\tEOF"):
+            cmd = self.SMUGGLE.replace("msg\nEOF\n", f"msg\n{line}\n", 1)
+            self.assertEqual(self.decision(cmd), "ask", repr(line))
+
+    def test_3_two_heredoc_messages_are_both_normalised(self):
+        body = "\"$(cat <<'EOF'\n{t}\nEOF\n)\""
+        cmd = "git commit -m " + body.format(t="subject") + " -m " + body.format(t="Co-Authored-By: x")
+        self.assertEqual(self.normalized(cmd), "git commit -m 'msg' -m 'msg'")
+        self.assertEqual(self.decision(cmd), "allow")
+
+    def test_4_the_delimiter_inside_a_line_is_body_text(self):
+        cmd = "git commit -m \"$(cat <<'EOF'\nfix: EOF handling, see EOF docs\nEOF\n)\""
+        self.assertEqual(self.decision(cmd), "allow")
+
+    def test_5_a_dash_heredoc_and_an_unquoted_one_are_left_alone(self):
+        for opener in ("<<-'EOF'", "<<EOF"):
+            cmd = self.HEREDOC.replace("<<'EOF'", opener)
+            self.assertEqual(self.normalized(cmd), cmd.strip(), opener)
+            self.assertEqual(self.decision(cmd), "ask", opener)
+
+    def test_6_filters_after_a_good_heredoc(self):
+        for tail, expected in ((" | tail -3", "allow"), (" 2>&1", "allow"), (" | grep -v 'x'", "allow"),
+                               (" | tail -3 | sh", "ask"), (" | tail -3; rm x", "ask")):
+            self.assertEqual(self.decision(self.HEREDOC + tail), expected, tail)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -88,7 +88,10 @@ Two branches carry names in this document. The **leading branch** is
    read as the plain form first, for this item and item 1 alike (2026-09-26: the
    decision log showed 8 of 9 prompts in 90 minutes were for commits meant to
    pass): a message written as a heredoc with a QUOTED delimiter
-   (`-m "$(cat <<'EOF' … EOF)"`, Claude Code's own style), `-q`, and a trailing
+   (`-m "$(cat <<'EOF' … EOF)"`, Claude Code's own style), rewritten only when
+   the delimiter's FIRST terminator line is followed by nothing but the closing
+   `)"` (the shell ends the heredoc there and would run anything after it), `-q`,
+   and a trailing
    `2>&1`, `| tail -N`, `| head -N` or `| grep -v '<text>'`. Any other pipe,
    chain or substitution still asks (`match-command.py --normalize`). The mechanical checks run
    first, from that worktree's own copy of `scripts/preflight-checks.sh`,
