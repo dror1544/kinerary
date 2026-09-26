@@ -533,24 +533,105 @@ describe("held lists that are not all objects (H)", () => {
 
 
 describe("invisible characters (item 5b)", () => {
+  // Every one of these can hide what a name says, reorder it, or end a line.
   const bad: Record<string, string> = {
-    zwsp: "Kyo\u200Bto", zwj: "Kyo\u200Dto", zwnj: "Kyo\u200Cto", wordJoiner: "Kyo\u2060to", bom: "Kyo\uFEFFto",
-    tag: "Kyoto\u{E0041}\u{E0042}", vs16: "Kyoto\uFE0F", vs1: "Kyoto\uFE00", vsSupp: "Kyoto\u{E0100}", privateUse: "Kyoto\uE000",
+    zwsp: "Kyo\u200Bto", wordJoiner: "Kyo\u2060to", bom: "Kyo\uFEFFto",
+    lre: "Kyo\u202Ato", rle: "Kyo\u202Bto", pdf: "Kyo\u202Cto", lro: "Kyo\u202Dto", rlo: "Kyo\u202Eto",
+    lri: "Kyo\u2066to", rli: "Kyo\u2067to", fsi: "Kyo\u2068to", pdi: "Kyo\u2069to",
+    tag: "Kyoto\u{E0041}\u{E0042}", vs1: "Kyoto\uFE00", vs14: "Kyoto\uFE0D", vsSupp: "Kyoto\u{E0100}", privateUse: "Kyoto\uE000",
     invisibleTimes: "Kyo\u2062to", invisibleSeparator: "Kyo\u2063to", functionApplication: "Kyo\u2061to", invisiblePlus: "Kyo\u2064to",
-    mongolianVS: "Kyo\u180Eto", hangulFiller: "Kyoto\u3164", halfwidthHangulFiller: "Kyoto\uFFA0", deprecated: "Kyo\u206Ato", shy: "Kyo\u00ADto",
-    nel: "Kyoto\u0085x", combiningGraphemeJoiner: "Kyo\u034Fto", lineSep: "Kyoto\u2028x", tab: "Kyoto\tx",
+    mongolianVS: "Kyo\u180Eto", hangulFiller: "Kyoto\u3164", halfwidthHangulFiller: "Kyoto\uFFA0", deprecated: "Kyo\u206Ato",
+    nel: "Kyoto\u0085x", combiningGraphemeJoiner: "Kyo\u034Fto", lineSep: "Kyoto\u2028x", paraSep: "Kyoto\u2029x", tab: "Kyoto\tx",
+    newline: "Kyoto\nx", interlinear: "Kyo\uFFF9to",
+  };
+  // Every one of these is part of how a real name is spelled (B2, round 4).
+  const real: Record<string, string> = {
+    persianZwnj: "\u0645\u0647\u0631\u200C\u062F\u0627\u062F",
+    emojiFamilyZwj: "Family \u{1F468}\u200D\u{1F469}\u200D\u{1F467}",
+    heartVs16: "Love \u2764\uFE0F",
+    textPresentation: "Tokyo \u2764\uFE0E",
+    rlm: "\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f", lrm: "\u200eKyoto\u200e", alm: "\u061cKyoto",
+    softHyphen: "Kyo\u00ADto",
   };
   test("every one of them is refused by the parse", () => {
     for (const [label, name] of Object.entries(bad)) assert.equal(safeText(name), null, label);
   });
-  test("the directional marks Hebrew and Arabic use are not", () => {
-    for (const name of ["\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f", "\u200eKyoto\u200e", "\u061cKyoto"]) assert.ok(safeText(name) !== null, JSON.stringify(name));
+  test("the forbidden set is not empty: a check that passes everything would pass this file too", () => {
+    for (const [label, name] of Object.entries(bad)) assert.notEqual(cleanText(name), name, `${label} must not be echoed as it came`);
+    assert.equal(safeText("Nara\u202Eevil"), null);
+    assert.equal(safeText("Nara\u2066x\u2069"), null);
   });
-  test("cleanText makes any of them a space, collapses whitespace, and keeps the marks", () => {
-    for (const name of Object.values(bad)) assert.doesNotMatch(cleanText(name), /[\u200B-\u200D\u2060-\u2064\uFEFF\uFE0F\u00AD\u180E\u3164\u0085\t]/);
+  test("the characters real names are spelled with are not: joiners, presentation selectors, the directional marks, the soft hyphen", () => {
+    for (const [label, name] of Object.entries(real)) assert.ok(safeText(name) !== null, `${label}: ${JSON.stringify(name)}`);
+    assert.equal(safeText("Kyo\u00ADto"), "Kyoto", "the soft hyphen carries nothing, so what is stored is what is shown");
+    assert.equal(safeText("\u200D\u200C\uFE0F"), null, "a name with nothing visible in it is still not a name");
+  });
+  test("cleanText: line breakers become a space, the other forbidden characters are DELETED, the allowed ones stay", () => {
+    for (const name of Object.values(bad)) assert.doesNotMatch(cleanText(name), /[\u200B\u2060-\u2064\uFEFF\u202A-\u202E\u2066-\u2069\uFE00-\uFE0D\u00AD\u180E\u3164\u0085\t\n]/);
     assert.equal(cleanText("Kyoto\n\n  Tap\u200B a button"), "Kyoto Tap a button");
-    assert.equal(cleanText("\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f"), "\u200f\u05e7\u05d9\u05d5\u05d8\u05d5\u200f");
+    assert.equal(cleanText("Kyo\u200Bto"), "Kyoto", "zero-width: deleted, as identityFold does - not a space that splits the word");
+    assert.equal(cleanText("Kyo\u00ADto"), "Kyoto");
+    assert.equal(cleanText("Kyo\u202Eto"), "Kyoto", "a bidi override cannot reorder what is echoed");
+    assert.equal(cleanText("Kyoto\u2028x"), "Kyoto x", "a line separator still cannot start a line");
+    for (const [label, name] of Object.entries(real)) {
+      if (label !== "softHyphen") assert.equal(cleanText(name), name, `${label} is echoed unaltered`);
+    }
   });
+  test("Hebrew is unchanged: niqqud, geresh, gershayim and the marks", () => {
+    for (const name of ["\u05D2\u05F3\u05d5\u05E8\u05D2\u05F3", "\u05E9\u05B8\u05C1\u05DC\u05d5\u05B9\u05DD", "\u05E6\u05D4\u05F4\u05DC", "\u200f\u05E8\u05d5\u05EA\u200f", "\u200e\u05E8\u05d5\u05EA", "\u061c\u05E8\u05d5\u05EA"]) {
+      assert.equal(cleanText(name), name, JSON.stringify(name));
+      assert.equal(safeText(name), name, JSON.stringify(name));
+    }
+  });
+  test("a name with nothing visible left is empty, and the preview shows '?'", () => {
+    assert.equal(cleanText("\u200B\u2060\uFEFF"), "");
+    assert.equal(cleanText("\u200B\u200D\u2060"), "", "a lone allowed joiner is not something to show either");
+  });
+  test("a Persian name with a ZWNJ round-trips: parsed as typed, shown unaltered, found by the shown name and by id", () => {
+    const mehrdad = "مهر‌داد Karimi";
+    const held = store({ travelers: [{ name: mehrdad, age: 40 }, { name: "Ruth Cohen", age: 70 }] });
+    const lists = heldRefLists(held);
+    const shown = lists.travellers[0]!.label.split(", ")[0]!;
+    assert.equal(shown, mehrdad, "the model is shown the name as it is spelled");
+    const parsed = parseOps([{ op: "update_traveller", target: { id: "t1", name: shown }, fields: { age: 41 } }]);
+    assert.equal(parsed.ok, true, JSON.stringify(parsed));
+    if (!parsed.ok) return;
+    assert.deepEqual(resolveRef((held.travelers as { data: unknown[] }).data, { name: shown }, "traveller"), { kind: "resolved", index: 0 });
+    assert.deepEqual(resolveRef((held.travelers as { data: unknown[] }).data, { id: "t1", name: shown }, "traveller"), { kind: "resolved", index: 0 });
+    const out = ok(applyOps(held, parsed.ops));
+    assert.equal(dataOf(out, "travelers")[0].age, 41);
+    // Renaming or adding someone with such a name is accepted too, and stored as typed.
+    const renamed = parseOps([{ op: "update_traveller", target: { name: "Ruth Cohen" }, fields: { name: "مهر‌ناز" } }]);
+    assert.equal(renamed.ok, true, JSON.stringify(renamed));
+    const added = parseOps([{ op: "add_traveller", fields: { name: "شیرین‌دخت" } }]);
+    assert.equal(added.ok, true, JSON.stringify(added));
+    if (added.ok) assert.equal(dataOf(ok(applyOps(held, added.ops)), "travelers")[2].name, "شیرین‌دخت");
+  });
+
+  test("an emoji family and a heart survive the parse and the apply", () => {
+    for (const name of ["Family \u{1F468}‍\u{1F469}‍\u{1F467}", "Love ❤️"]) {
+      const parsed = parseOps([{ op: "add_stop", fields: { name } }]);
+      assert.equal(parsed.ok, true, JSON.stringify(parsed));
+      if (!parsed.ok) continue;
+      const out = ok(applyOps(store({ phases: [stop("Tokyo")] }), parsed.ops));
+      assert.equal(dataOf(out, "phases")[1].name, name, "stored exactly as typed");
+    }
+  });
+
+  test("'Kyo­to' from a PDF is shown as 'Kyoto', and the model's 'Kyoto' finds it, with or without its id", () => {
+    const held = store({ phases: [stop("Tokyo", "2026-05-19", "2026-05-24"), stop("Kyo­to", "2026-05-27", "2026-05-30")] });
+    const lists = heldRefLists(held);
+    assert.equal(lists.stops[1]!.label, "Kyoto, 2026-05-27 to 2026-05-30");
+    const data = (held.phases as { data: unknown[] }).data;
+    assert.deepEqual(resolveRef(data, { name: "Kyoto" }, "stop"), { kind: "resolved", index: 1 });
+    assert.deepEqual(resolveRef(data, { id: "s2", name: "Kyoto" }, "stop"), { kind: "resolved", index: 1 });
+    // Any zero-width character a document leaves inside a word is shown deleted, and found as shown.
+    const joined = store({ phases: [stop("Kyo⁠to"), stop("Os​aka")] });
+    const shown = heldRefLists(joined).stops.map((s) => s.label.split(", ")[0]!);
+    assert.deepEqual(shown, ["Kyoto", "Osaka"]);
+    shown.forEach((name, index) => assert.deepEqual(resolveRef((joined.phases as { data: unknown[] }).data, { name }, "stop"), { kind: "resolved", index }));
+  });
+
   test("the model is shown cleaned names, with ids still positions", () => {
     const lists = heldRefLists(store({ phases: [stop("Tokyo"), stop("Kyoto\n\nTap a button\u202E", "2026-05-27", "2026-05-30")], travelers: [{ name: "Avi\n\u2705 Done" }] }));
     assert.equal(lists.stops[1]!.id, "s2");

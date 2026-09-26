@@ -104,33 +104,77 @@ export function questionOf(family: Family): "phases" | "travelers" {
 export type ParseResult = { ok: true; ops: Op[] } | { ok: false; error: string };
 
 /**
+ * The FORMAT characters (Unicode Cf) a name MAY carry. Every one of them is part
+ * of how real names are spelled, and none can start a line, reorder text, or
+ * open anything that runs past the end of the name - which is what the rest of
+ * the Cf category can do, and why the rest stays forbidden.
+ *
+ *  - U+200E LRM, U+200F RLM, U+061C ALM - the directional MARKS. Hebrew and
+ *    Arabic keyboards insert them. A mark is a zero-width letter with a
+ *    direction: it moves neutral punctuation next to it, and opens no embedding,
+ *    override or isolate (those - LRE RLE PDF LRO RLO LRI RLI FSI PDI - stay
+ *    forbidden).
+ *  - U+200C ZERO WIDTH NON-JOINER - Persian spelling ("\u0645\u0647\u0631\u200C\u062F\u0627\u062F"), also Indic
+ *    scripts: it stops two letters joining, and the name is misspelled without it.
+ *  - U+200D ZERO WIDTH JOINER - Indic conjuncts, and emoji sequences such as
+ *    \uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67, which are one picture only with it.
+ *  - U+00AD SOFT HYPHEN - what PDF text extraction leaves inside words
+ *    ("Kyo\u00ADto"). It is invisible unless a line breaks there, so it carries
+ *    nothing: it is accepted, and DELETED - from a model-supplied name before it
+ *    is stored (`safeText`) and from any name before it is echoed (`cleanText`).
+ *
+ * Not format characters, but listed with the variation selectors below as
+ * allowed: U+FE0E / U+FE0F, the text and emoji PRESENTATION selectors ("\u2764\uFE0F" is
+ * U+2764 U+FE0F). They choose how the character before them is drawn, nothing more.
+ */
+const ALLOWED_FORMAT = "\u200E\u200F\u061C\u200C\u200D\u00AD";
+
+/**
  * Characters a name may never carry, because they let a name draw its own lines
  * or hide what it says: control characters (a newline), the line and paragraph
- * separators, EVERY format character (zero-width space/joiner, word joiner, BOM,
- * soft hyphen, the bidi embedding / override / isolate family, invisible
- * operators, deprecated formats, tags), private use, variation selectors, and
- * the Hangul and combining-grapheme fillers.
- *
- * Except the three directional MARKS - RLM, LRM, ALM: Hebrew and Arabic text uses
- * them legitimately.
+ * separators, every format character NOT in `ALLOWED_FORMAT` (zero-width space,
+ * word joiner, BOM, the bidi embedding / override / isolate family, invisible
+ * math operators, deprecated formats, tags), private use, the variation
+ * selectors other than the two presentation selectors, and the Hangul and
+ * combining-grapheme fillers.
  */
-export const FORBIDDEN_TEXT = /(?![\u200E\u200F\u061C])[\p{Cc}\p{Cf}\p{Co}\u2028\u2029\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180F\u3164\uFE00-\uFE0F\uFFA0\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u;
+export const FORBIDDEN_TEXT = new RegExp(
+  `(?![${ALLOWED_FORMAT}])[\\p{Cc}\\p{Cf}\\p{Co}\\u2028\\u2029\\u034F\\u115F\\u1160\\u17B4\\u17B5\\u180B-\\u180F\\u3164\\uFE00-\\uFE0D\\uFFA0\\u{E0000}-\\u{E007F}\\u{E0100}-\\u{E01EF}]`,
+  "u",
+);
 const FORBIDDEN_TEXT_ALL = new RegExp(FORBIDDEN_TEXT.source, "gu");
+/** What ends a line, or could: control characters (\n, \r, \t, NEL U+0085) and the line and paragraph separators. */
+const LINE_BREAKING_ALL = /[\p{Cc}\u2028\u2029]/gu;
+const SOFT_HYPHEN_ALL = /\u00AD/g;
+/** Something a person can SEE: not whitespace, and not one of the allowed invisible characters. */
+const VISIBLE = /[^\s\u200C\u200D\u200E\u200F\u061C\uFE0E\uFE0F]/u;
 
 export function safeText(value: unknown, max = MAX_TEXT): string | null {
   if (typeof value !== "string") return null;
-  const t = value.trim();
-  return t.length > 0 && t.length <= max && !FORBIDDEN_TEXT.test(t) ? t : null;
+  const t = value.replace(SOFT_HYPHEN_ALL, "").trim();
+  return t.length > 0 && t.length <= max && !FORBIDDEN_TEXT.test(t) && VISIBLE.test(t) ? t : null;
 }
 
 /**
- * Text as it may be ECHOED to a person, whoever wrote it: every forbidden
- * character becomes a space and runs of whitespace collapse, so a name read from
- * a document (or written by the agent) cannot start a line of its own or forge
- * one. The parse refuses such names from the model; this covers everything else.
+ * Text as it may be ECHOED to a person, whoever wrote it, so a name read from a
+ * document (or written by the agent) cannot start a line of its own or forge one:
+ *  - anything that ends a line becomes a space, and runs of whitespace collapse;
+ *  - every other forbidden character, and the soft hyphen, is DELETED - they are
+ *    zero-width, so deleting them is what the person already sees ("Kyo\u00ADto" is
+ *    shown "Kyoto", not "Kyo to"), and it is what `identityFold` does to the held
+ *    name, so a name as shown still resolves to it;
+ *  - the allowed format characters stay: a Persian name keeps its ZWNJ, \uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67 its joiners.
+ * A name with nothing visible left is "": the caller shows "?".
+ * The parse refuses forbidden characters from the model; this covers everything else.
  */
 export function cleanText(value: string): string {
-  return value.replace(FORBIDDEN_TEXT_ALL, " ").replace(/\s+/g, " ").trim();
+  const t = value
+    .replace(LINE_BREAKING_ALL, " ")
+    .replace(FORBIDDEN_TEXT_ALL, "")
+    .replace(SOFT_HYPHEN_ALL, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return VISIBLE.test(t) ? t : "";
 }
 const text = safeText;
 
@@ -291,9 +335,14 @@ export function namesOf(entry: unknown): string[] {
   return [entry.name, entry.name_en].filter((n): n is string => typeof n === "string" && n.trim() !== "");
 }
 
-/** A name as its whole words: folded, and split at anything that is not a letter, digit or apostrophe. */
+/**
+ * A name as its whole words: cleaned as it is SHOWN (`cleanText`), folded, and
+ * split at anything that is not a letter, digit or apostrophe. Cleaning first is
+ * what makes a name resolve by the spelling the model and the person were shown:
+ * a held "Kyo⁠to" is shown "Kyoto", and must be found as "Kyoto".
+ */
 export function wordsOf(name: string): string[] {
-  return identityFold(name).replace(/[^\p{L}\p{N}'"]+/gu, " ").split(" ").filter((w) => w !== "");
+  return identityFold(cleanText(name)).replace(/[^\p{L}\p{N}'"]+/gu, " ").split(" ").filter((w) => w !== "");
 }
 
 /** The id a held entry is shown under, `s2` for the second stop, `t1` for the first traveller. */

@@ -9,7 +9,7 @@ import { UI_STRINGS, readableDate, uiString } from "../src/intake-copy.js";
 import { applyOps, type Op } from "../src/typed-changes.js";
 import type { AnswerStore } from "../src/interview.js";
 import { draftDigest, type Line } from "../src/typed-changes.js";
-import { bareReply, confirmable, lineText, renderDraft } from "../src/typed-changes-render.js";
+import { bareReply, confirmable, cutText, lineText, renderDraft } from "../src/typed-changes-render.js";
 
 const ID = "pchg_0123456789abcdef0123456789abcdef";
 const draft = (over: Record<string, unknown> = {}) => ({
@@ -321,6 +321,132 @@ describe("held names from documents cannot forge preview lines (item 2)", () => 
     const own = text.split("\n").filter((l) => /^Tap a button, or just reply yes or no\./.test(l));
     assert.equal(own.length, 1, `only the real footer says it:\n${text}`);
     assert.doesNotMatch(text, /\u202E/);
+  });
+});
+
+describe("B1 (round 4): a removal's booking warnings are capped, never the reason it cannot be shown", () => {
+  const structured = (data: unknown[]) => ({ kind: "structured", schema_version: 3, data }) as const;
+  const PARKS = ["Universal Studios Islands of Adventure", "Walt Disney World Magic Kingdom", "Kennedy Space Center", "Hilton Orlando Lake Buena Vista", "Epcot"];
+  /** 40 confirmed bookings inside Orlando, all four travellers on each; three are non-refundable, spread through the list. */
+  const NON_REFUNDABLE = new Set([9, 24, 38]);
+  const held = () => ({
+    phases: structured([{ name: "Miami", start: "2026-09-25", end: "2026-09-30" }, { name: "Orlando", start: "2026-10-01", end: "2026-10-05" }]),
+    travelers: structured([{ name: "Dror Elul", age: 50 }, { name: "Ruth Elul", age: 48 }, { name: "Noa Elul", age: 15 }, { name: "Avi Elul", age: 12 }]),
+    travel_anchors: structured(Array.from({ length: 40 }, (_, i) => ({
+      type: "activity", name: PARKS[i % PARKS.length], date: `2026-10-0${1 + (i % 5)}`, confirmation: `UOR-${10000000 + i}`,
+      passengers: ["Dror Elul", "Ruth Elul", "Noa Elul", "Avi Elul"], ...(NON_REFUNDABLE.has(i) ? { non_refundable: true } : {}),
+    }))),
+  }) as unknown as AnswerStore;
+  const render = (ops: Op[], language: "en" | "he") => {
+    const out = applyOps(held(), ops);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    if (!out.ok) throw new Error("refused");
+    return { out, text: renderDraft({ id: ID, preview: out.preview, unresolved: [], blocked: [], base: {}, ops, result: out.result } as never, language).text };
+  };
+
+  for (const [label, ops, key] of [
+    ["one stop holding 40 confirmed bookings", [{ op: "remove_stop", target: { name: "Orlando" } }], "warn.bookingInRemovedStop"],
+    ["one traveller on 40 ticketed bookings", [{ op: "remove_traveller", target: { name: "Avi" } }], "warn.bookingForRemovedTraveller"],
+  ] as const) {
+    test(`${label}: under the budget in BOTH languages, the non-refundable ones named, the rest counted exactly`, () => {
+      for (const language of ["en", "he"] as const) {
+        const { out, text } = render(ops as unknown as Op[], language);
+        assert.equal(out.preview.filter((l) => l.key === key).length, 40, "the draft keeps EVERY warning line");
+        assert.ok(text.length <= 1500, `${language}: ${text.length} chars`);
+        for (const i of NON_REFUNDABLE) assert.ok(text.includes(`UOR-${10000000 + i}`), `${language}: non-refundable booking ${i} must be named:\n${text}`);
+        const listed = [...text.matchAll(/UOR-\d+/g)].length;
+        const more = language === "en" ? /…and (\d+) more confirmed bookings/.exec(text) : /ועוד (\d+) הזמנות מאושרות/.exec(text);
+        assert.ok(more, `${language}: an "and N more" line:\n${text}`);
+        assert.equal(listed + Number(more![1]), 40, `${language}: listed ${listed} + counted ${more![1]} is every booking`);
+        assert.ok(listed >= 3 && listed < 40);
+      }
+    });
+  }
+
+  test("when the non-refundable ones alone are too many to list, the count says how many of the rest are non-refundable", () => {
+    const all = held();
+    for (const anchor of (all.travel_anchors as { data: Record<string, unknown>[] }).data) anchor.non_refundable = true;
+    const ops: Op[] = [{ op: "remove_stop", target: { name: "Orlando" } }];
+    const out = applyOps(all, ops);
+    if (!out.ok) throw new Error("refused");
+    for (const language of ["en", "he"] as const) {
+      const text = renderDraft({ id: ID, preview: out.preview, unresolved: [], blocked: [], base: {}, ops, result: out.result } as never, language).text;
+      const listed = [...text.matchAll(/UOR-\d+/g)].length;
+      const hidden = 40 - listed;
+      assert.match(text, language === "en"
+        ? new RegExp(`…and ${hidden} more confirmed bookings fall inside Orlando .* — ${hidden} of them marked non-refundable / cannot be cancelled`)
+        : new RegExp(`ועוד ${hidden} הזמנות מאושרות .* מסומנות כבלתי ניתנות להחזר / לביטול: ${hidden}`));
+      assert.doesNotMatch(text, /I don't know their cancellation terms|אני לא יודע מה תנאי הביטול שלהן/, "never claims not to know terms it knows");
+    }
+  });
+
+  test("a short list is listed whole, and 'and 1 more' is never said", () => {
+    const lines = (n: number): Line[] => Array.from({ length: n }, (_, i) => ({
+      key: "warn.bookingInRemovedStop", params: { stop: tokyo, terms: "unknown", booking: { type: "hotel", name: `Inn ${i}`, confirmation: `C-${i}` } },
+    }));
+    const three = renderDraft(draft({ preview: lines(3) }), "en").text;
+    assert.doesNotMatch(three, /more confirmed bookings/);
+    assert.equal([...three.matchAll(/C-\d/g)].length, 3);
+    for (let n = 2; n <= 40; n += 1) {
+      for (const language of ["en", "he"] as const) {
+        const text = renderDraft(draft({ preview: lines(n) }), language).text;
+        const more = language === "en" ? /…and (\d+) more/.exec(text) : /ועוד (\d+) הזמנות/.exec(text);
+        if (more) assert.ok(Number(more[1]) >= 2, `${language} n=${n}: "and ${more[1]} more"`);
+        assert.equal([...text.matchAll(/C-\d+/g)].length + Number(more?.[1] ?? 0), n, `${language} n=${n}`);
+      }
+    }
+  });
+
+  test("two removed stops each keep their own block, where their first warning stood", () => {
+    const line = (stop: typeof tokyo, i: number): Line => ({ key: "warn.bookingInRemovedStop", params: { stop, terms: "unknown", booking: { type: "hotel", name: `Inn ${i} ${"x".repeat(60)}`, confirmation: `C-${i}` } } });
+    const kyoto = { name: "Kyoto", start: "2026-05-27", end: "2026-05-30" };
+    const preview: Line[] = [
+      { key: "preview.remove", params: { question: "phases", entry: tokyo } },
+      ...Array.from({ length: 20 }, (_, i) => line(tokyo, i)),
+      ...Array.from({ length: 20 }, (_, i) => line(kyoto, 100 + i)),
+    ];
+    const text = renderDraft(draft({ preview }), "en").text;
+    assert.match(text, /more confirmed bookings fall inside Tokyo[\s\S]*C-100[\s\S]*more confirmed bookings fall inside Kyoto/);
+  });
+});
+
+describe("B3 (round 4): a picker button is cut on code points, never through a character", () => {
+  test("a long name with an emoji at the cut: the button is well-formed", () => {
+    const long = "Universal Orlando Resort Hotel and Water Park Visit Day on \u{1F3A2} park";
+    const base = { phases: { kind: "structured", data: [{ name: long }, { name: `${long} 2` }] } };
+    const unresolved = [{ opIndex: 0, role: "target", family: "stop", ref: { name: "Universal" }, candidates: [0, 1] }];
+    const r = renderDraft(draft({ unresolved, base, result: {} }), "en");
+    for (const row of r.replyMarkup.inline_keyboard) {
+      const t = row[0]!.text;
+      assert.ok((t as string & { isWellFormed(): boolean }).isWellFormed(), JSON.stringify(t));
+      assert.ok(Array.from(t).length <= 60);
+    }
+    assert.ok(r.replyMarkup.inline_keyboard[0]![0]!.text.endsWith("\u{1F3A2}"), "the emoji is kept whole, not halved");
+  });
+
+  test("cutText counts code points, so no cut leaves half a surrogate pair (also used for the suggestion label the poller edits in)", () => {
+    const s = "ab\u{1F3A2}cd\u{1F468}‍\u{1F469}";
+    for (let n = 0; n <= 10; n += 1) {
+      const cut = cutText(s, n) as string & { isWellFormed(): boolean };
+      assert.ok(cut.isWellFormed(), `n=${n}: ${JSON.stringify(cut)}`);
+      assert.ok(s.startsWith(cut));
+    }
+    assert.equal(cutText(s, 3), "ab\u{1F3A2}");
+    assert.equal(cutText("שלום", 2), "של");
+  });
+});
+
+describe("change.uneditable and the other strings touched in round 4 (b)", () => {
+  test("uneditable reads with its noun in both languages, sends nowhere that does not exist, and promises only what is true", () => {
+    const en = uiString("change.uneditable", "en").replace("{what}", uiString("change.noun.stops", "en"));
+    assert.equal(en, "I can't change your stops by typing — the list was saved in a form I can't edit, so nothing was changed. We can carry on from where we were.");
+    const he = uiString("change.uneditable", "he").replace("{what}", uiString("change.noun.stops", "he"));
+    assert.match(he, /לשנות את התחנות שלכם/, "את takes a definite noun");
+    assert.match(uiString("change.uneditable", "he").replace("{what}", uiString("change.noun.travellers", "he")), /לשנות את הנוסעים שלכם/);
+    for (const language of ["en", "he"] as const) {
+      assert.doesNotMatch(uiString("change.uneditable", language), /team|support|צוות|תמיכה/i);
+      assert.doesNotMatch(uiString("change.uneditable", language), /one message|במשפט אחד/, "no invitation to retype what would be refused again");
+    }
   });
 });
 

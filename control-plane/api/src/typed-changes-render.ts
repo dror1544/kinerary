@@ -15,6 +15,7 @@
  *  - a conflict (an overlap, a dated stop asked to move): what collides and what
  *    is wanted from them, in words — no Yes, because nothing is proposed yet.
  */
+import { canonical } from "./answer-merge.js";
 import { changeCallbackData } from "./chat-router.js";
 import { readableDate, recapLabel, uiString, type Language } from "./intake-copy.js";
 import { INTAKE_QUESTIONS } from "./interview.js";
@@ -36,6 +37,16 @@ const fill = (template: string, params: Record<string, string>): string =>
     // Every substituted value is cleaned: it may be a name that came from a
     // document, and a name must never start a line of its own.
     (Object.prototype.hasOwnProperty.call(params, key) ? cleanText(params[key]!) : whole));
+
+/**
+ * The first `max` CODE POINTS of `text`. Never `text.slice(0, max)`: that counts
+ * UTF-16 units, and a cut through an emoji (or any character outside the Basic
+ * Multilingual Plane) leaves half of a surrogate pair - a string that is not
+ * valid UTF-8, which Telegram refuses, so the message carrying it is never sent.
+ */
+export function cutText(text: string, max: number): string {
+  return Array.from(text).slice(0, max).join("");
+}
 
 const isObject = (p: Param | undefined): p is { [key: string]: Param } =>
   typeof p === "object" && p !== null && !Array.isArray(p);
@@ -173,6 +184,81 @@ export function lineText(line: Line, language: Language): string {
   }
 }
 
+/**
+ * How much of the preview the bookings behind ONE removed stop (or ONE removed
+ * traveller) may take before the rest are counted rather than listed. A removal
+ * is one operation and cannot be sent in smaller pieces, so its warnings must
+ * never be what makes it too big to show (#206, round 4: a stop holding 17
+ * confirmed bookings could not be removed by typing at all).
+ */
+const BOOKINGS_BUDGET_CHARS = 700;
+const BOOKING_WARNINGS: ReadonlySet<string> = new Set(["warn.bookingInRemovedStop", "warn.bookingForRemovedTraveller"]);
+const nonRefundable = (line: Line) => line.params.terms === "non_refundable";
+
+/**
+ * One removed stop's (or traveller's) booking warnings, capped: the ones the
+ * data says are non-refundable / cannot be cancelled first, then the rest, while
+ * they fit the budget - then ONE line counting what was not listed, which says
+ * how many of those are non-refundable too, so the cap never hides that such a
+ * booking exists. "And 1 more" is never said: a single remaining line is listed.
+ *
+ * Only the WORDS are capped. The draft keeps every warning line, and the digest
+ * and the apply-time recompute (`draftDigest`, `applyPendingChangeForChat`) are
+ * over all of them: a booking that lands after the preview, listed or counted,
+ * still stops an old Yes.
+ */
+function bookingBlock(lines: readonly Line[], language: Language): string[] {
+  const ordered = [...lines.filter(nonRefundable), ...lines.filter((l) => !nonRefundable(l))];
+  const shown: string[] = [];
+  let length = 0;
+  for (const line of ordered) {
+    const one = lineText(line, language);
+    if (shown.length > 0 && length + one.length > BOOKINGS_BUDGET_CHARS) break;
+    shown.push(one);
+    length += one.length + 1;
+  }
+  if (ordered.length - shown.length === 1) shown.push(lineText(ordered[shown.length]!, language));
+  const hidden = ordered.slice(shown.length);
+  if (hidden.length === 0) return shown;
+  const first = lines[0]!;
+  const inStop = first.key === "warn.bookingInRemovedStop";
+  const hiddenNonRefundable = hidden.filter(nonRefundable).length;
+  const key = `change.warn.${inStop ? "bookingInRemovedStop" : "bookingForRemovedTraveller"}.${hiddenNonRefundable > 0 ? "moreNonRefundable" : "more"}`;
+  return [...shown, fill(uiString(key, language), {
+    count: String(hidden.length),
+    nonRefundable: String(hiddenNonRefundable),
+    ...(inStop ? { stop: entryText(first.params.stop, language) } : { traveller: entryText(first.params.traveller, language) }),
+  })];
+}
+
+/**
+ * A preview's lines in words. Every line as `lineText` says it, except the
+ * booking warnings, which are gathered per removed stop or traveller (where the
+ * first of them stood) and capped by `bookingBlock`.
+ */
+export function previewText(preview: readonly Line[], language: Language): string[] {
+  const groupOf = (line: Line) =>
+    `${line.key}\u0000${canonical(line.key === "warn.bookingInRemovedStop" ? line.params.stop : line.params.traveller)}`;
+  const groups = new Map<string, Line[]>();
+  for (const line of preview) {
+    if (BOOKING_WARNINGS.has(line.key)) groups.set(groupOf(line), [...(groups.get(groupOf(line)) ?? []), line]);
+  }
+  const out: string[] = [];
+  const done = new Set<string>();
+  for (const line of preview) {
+    if (!BOOKING_WARNINGS.has(line.key)) {
+      const text = lineText(line, language);
+      if (text) out.push(text);
+      continue;
+    }
+    const group = groupOf(line);
+    if (done.has(group)) continue;
+    done.add(group);
+    out.push(...bookingBlock(groups.get(group)!, language));
+  }
+  return out;
+}
+
 const noun = (family: Unresolved["family"], language: Language) =>
   uiString(family === "stop" ? "change.noun.stops" : "change.noun.travellers", language);
 
@@ -213,7 +299,7 @@ export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" |
     const rows = u.candidates.slice(0, 8).map((index, k) => {
       const entry = held[index];
       return [{
-        text: entryText(entry ? (entry as unknown as Param) : "?", language).slice(0, 60),
+        text: cutText(entryText(entry ? (entry as unknown as Param) : "?", language), 60),
         callback_data: data("pick", k),
       }];
     });
@@ -225,7 +311,7 @@ export function renderDraft(draft: Pick<Draft, "id" | "preview" | "unresolved" |
     return { text: blocked.join("\n\n"), replyMarkup: { inline_keyboard: [[cancel]] } };
   }
 
-  const lines = draft.preview.map((l) => lineText(l, language)).filter(Boolean);
+  const lines = previewText(draft.preview, language);
   return {
     text: [uiString("change.header", language), "", ...lines, "", uiString("change.footer", language)].join("\n"),
     replyMarkup: {

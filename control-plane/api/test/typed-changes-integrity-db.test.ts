@@ -20,8 +20,8 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink } from "../src/chat-router.js";
-import { applyPendingChangeForChat, confirmIntakeForChat, queueInboundMessage } from "../src/interview.js";
+import { CONFIRM_CALLBACK_DATA, startFromDeepLink } from "../src/chat-router.js";
+import { applyPendingChangeForChat, confirmIntakeForChat, queueInboundMessage, setLanguageForChat } from "../src/interview.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { applyDecision, flushSettledInboundBursts, forgetShownPreviewsForTests } from "../src/relay/poller.js";
@@ -105,11 +105,17 @@ interface Sent { text: string; buttons: Button[]; ok: boolean }
 class Telegram {
   readonly sent: Sent[] = [];
   readonly acks: unknown[] = [];
-  /** Refuse any message that carries buttons (a preview), the way a 429 or a network error would. */
+  /**
+   * Refuse any message that carries a change's buttons (a preview), the way a 429,
+   * a network error, or a text Telegram will not take would. Only previews: the
+   * interview's own questions still go out, so what happens AFTER a refused
+   * preview can be seen.
+   */
   failPreviews = false;
   async sendMessage(p: { text: string; replyMarkup?: { inline_keyboard: Button[][] } }) {
     const buttons = (p.replyMarkup?.inline_keyboard ?? []).flat();
-    const ok = !(this.failPreviews && buttons.length > 0) && p.text.length <= 4096;
+    const preview = buttons.some((b) => b.callback_data.startsWith("pc:"));
+    const ok = !(this.failPreviews && preview) && p.text.length <= 4096;
     this.sent.push({ text: p.text, buttons, ok });
     return ok ? { ok: true as const, messageId: String(this.sent.length) } : { ok: false as const, error: "Bad Request" };
   }
@@ -288,6 +294,39 @@ describe("A: a Yes confirms the version it was drawn for, and only that", opts, 
         seen[key] = (seen[key] ?? 0) + 1;
       }
       assert.ok(Object.keys(seen).length >= 1, JSON.stringify(seen));
+    });
+  });
+
+  test("the race test's failing interleaving, made deterministic: the Yes lands WHILE the follow-up is read - the follow-up's preview still goes out, after the tap's next question", async () => {
+    // Round 4 root cause of the intermittent 'the preview on screen is not the
+    // waiting version': the tap applied v1 and its next question took the floor
+    // while this message was being read; the new draft's preview then lost the
+    // floor and was never sent. Nothing replied to the organizer's message.
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const tg = new Telegram();
+      let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+      let during: () => Promise<void> = async () => {};
+      const model = fakeModel(() => ops, () => ({}), () => during());
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      const yes = tg.button("a")!.callback_data;
+      ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
+      during = async () => { during = async () => {}; await tap(pool, a, yes, tg, model); };
+      const before = tg.sent.length;
+      await say(pool, a, "and drop Kyoto", tg, model);
+
+      assert.equal(model.calls.n, 2);
+      assert.equal((await stored(pool, a, "phases"))[0].end, "2026-05-25", "the Yes applied v1, which it showed");
+      const open = (await getOpenDraft(pool, a.sessionId))!;
+      assert.ok(open, "the follow-up is its own waiting draft");
+      const after = tg.sent.slice(before);
+      const done = after.findIndex((s) => s.text === en("change.applied"));
+      const preview = after.findIndex((s) => s.ok && s.buttons.some((b) => b.callback_data.startsWith(`pc:${open.id}:${draftDigest(open)}:`)));
+      assert.ok(done >= 0, JSON.stringify(after.map((s) => s.text.slice(0, 40))));
+      assert.ok(preview > done, `the follow-up's preview was delivered, after the tap's answer: ${JSON.stringify(after.map((s) => s.text.slice(0, 40)))}`);
+      assert.equal(after.filter((s) => s.buttons.some((b) => b.callback_data.startsWith(`pc:${open.id}:`))).length, 1, "once");
+      await say(pool, a, "yes", tg, model);
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo"], "and a yes to it applies it");
     });
   });
 
@@ -610,7 +649,7 @@ describe("H: a held list that cannot be edited by typing says so and leaves no d
       assert.equal(tg.previews.length, 0);
       assert.match(tg.last!.text, /can't change .* by typing/);
       assert.doesNotMatch(tg.last!.text, /team|support/i, "no channel is invented");
-      assert.equal(tg.last!.text, en("change.uneditable").replace("{what}", "Stops"));
+      assert.equal(tg.last!.text, en("change.uneditable").replace("{what}", "your stops"), "a lower-case noun, mid-sentence");
       assert.ok(tg.last!.buttons.length === 0);
       const open = await getOpenDraft(pool, a.sessionId);
       assert.equal(open, null);
@@ -653,7 +692,9 @@ describe("1: from ANY reachable state there is a way out, and it works with any 
     });
   });
 
-  test("a held list that GROWS under a waiting draft (a document) until its warnings are too big: the old Yes drops it out loud instead of sticking", async () => {
+  test("a held list that GROWS under a waiting draft (a document) by 60 bookings: the old Yes applies nothing, the new preview counts what it cannot list, and ITS Yes applies", async () => {
+    // Round 3 pinned the opposite here - the draft dropped as too big - which made
+    // one removal impossible to do by typing, however it was sent (B1, round 4).
     await withChats(async (pool, a) => {
       await hold(pool, a, "phases", TWO);
       const tg = new Telegram();
@@ -663,10 +704,18 @@ describe("1: from ANY reachable state there is a way out, and it works with any 
       const bookings = Array.from({ length: 60 }, (_, i) => ({ type: "hotel", name: `Hotel ${i} ${"h".repeat(50)}`, date: "2026-05-28", confirmation: `C-${i}-${"x".repeat(20)}` }));
       await hold(pool, a, "travel_anchors", bookings);
       await tap(pool, a, yes, tg, model);
-      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"], "nothing applied");
-      assert.ok(tg.sent.some((s) => s.ok && s.text === en("change.droppedTooBig")));
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"], "nothing applied on the strength of a preview that did not know");
+      assert.ok(!tg.sent.some((s) => s.text === en("change.droppedTooBig")), "not dropped: a removal cannot be sent in smaller pieces");
       assert.ok(tg.sent.every((s) => s.ok), "and nothing unsendable was attempted");
-      await assertWayOut(pool, a, "after the held list grew");
+      const reshown = tg.previews.at(-1)!;
+      assert.ok(reshown.text.startsWith(en("change.updated")), reshown.text.slice(0, 80));
+      assert.ok(reshown.text.length <= PREVIEW_BUDGET_CHARS, `${reshown.text.length} chars`);
+      const listed = [...reshown.text.matchAll(/C-\d+-x+/g)].length;
+      const more = /…and (\d+) more confirmed bookings fall inside Kyoto/.exec(reshown.text);
+      assert.ok(more && listed + Number(more[1]) === 60, `listed ${listed} + counted ${more?.[1]} = 60:\n${reshown.text}`);
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"]);
+      await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+      assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo"], "the preview that counted them applies");
     });
   });
 
@@ -703,7 +752,7 @@ describe("1: from ANY reachable state there is a way out, and it works with any 
       await say(pool, a, "Ruth is 71", tg, model);
       await tap(pool, a, tg.button("c")!.callback_data, tg, model);
     }],
-    ["a typed 'no' while the newest version's preview never went out", async (pool, a) => {
+    ["a typed 'no' while the newest version's preview never went out: it is shown first, the next 'no' cancels", async (pool, a) => {
       await hold(pool, a, "phases", TWO);
       let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
       const model = fakeModel(() => ops);
@@ -712,7 +761,19 @@ describe("1: from ANY reachable state there is a way out, and it works with any 
       const dead = new Telegram();
       dead.failPreviews = true;
       await say(pool, a, "and Kyoto 31", dead, model);
-      await say(pool, a, "no", new Telegram(), model);
+      const tg = new Telegram();
+      await say(pool, a, "no", tg, model);
+      assert.equal(tg.previews.length, 1, "the merged version is shown");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "the merge they never saw is not cancelled unseen");
+      await say(pool, a, "no", tg, model);
+    }],
+    ["a preview EVERY send rejects: a typed 'no' drops it out loud and the interview goes on", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", dead, model);
+      await say(pool, a, "no", dead, model);
     }],
     ["the FIRST preview never went out: a typed 'no' asks for it to be shown, the next 'no' cancels", async (pool, a) => {
       await hold(pool, a, "phases", TWO);
@@ -778,6 +839,57 @@ describe("3: warnings are the ones the person saw, or nothing is applied", opts,
       assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo", "Kyoto"]);
     });
   });
+});
+
+describe("B1 (round 4): one removal is never refused for the bookings it warns about", opts, () => {
+  const PARKS = ["Universal Studios Islands of Adventure", "Walt Disney World Magic Kingdom", "Kennedy Space Center", "Hilton Orlando Lake Buena Vista", "Epcot"];
+  const ORLANDO = [stop("Miami", "2026-09-25", "2026-09-30"), stop("Orlando", "2026-10-01", "2026-10-05")];
+  const FAMILY = [{ name: "Dror Elul", age: 50 }, { name: "Ruth Elul", age: 48 }, { name: "Noa Elul", age: 15 }, { name: "Avi Elul", age: 12 }];
+  const booking = (i: number, more: Record<string, unknown> = {}) => ({
+    type: "activity", name: PARKS[i % PARKS.length], date: `2026-10-0${1 + (i % 5)}`, confirmation: `UOR-${10000000 + i}`,
+    passengers: FAMILY.map((f) => f.name), ...more,
+  });
+  const forty = () => Array.from({ length: 40 }, (_, i) => booking(i, i === 33 ? { cancellable: false } : {}));
+
+  for (const [label, ops, language] of [
+    ["remove one stop holding 40 confirmed bookings", [{ op: "remove_stop", target: { name: "Orlando" } }], "en"],
+    ["remove one traveller on 40 ticketed bookings", [{ op: "remove_traveller", target: { name: "Avi" } }], "en"],
+    ["remove one stop holding 40 confirmed bookings, in Hebrew", [{ op: "remove_stop", target: { name: "Orlando" } }], "he"],
+    ["remove one traveller on 40 ticketed bookings, in Hebrew", [{ op: "remove_traveller", target: { name: "Avi" } }], "he"],
+  ] as const) {
+    test(`${label}: proposed, delivered under the limit, the non-refundable one named; a booking landing after the preview still stops the old Yes`, async () => {
+      await withChats(async (pool, a) => {
+        await hold(pool, a, "phases", ORLANDO);
+        await hold(pool, a, "travelers", FAMILY);
+        await hold(pool, a, "travel_anchors", forty());
+        await setLanguageForChat(pool, a.chatId, language);
+        const tg = new Telegram();
+        const model = fakeModel(() => [...ops]);
+        await say(pool, a, "a removal", tg, model);
+        assert.ok(!tg.sent.some((s) => s.text === uiString("change.tooBigFresh", language)), "not refused as too big");
+        assert.equal(tg.previews.length, 1, JSON.stringify(tg.sent.map((s) => s.text.slice(0, 60))));
+        const text = tg.previews[0]!.text;
+        assert.ok(text.length <= PREVIEW_BUDGET_CHARS, `${text.length} chars`);
+        assert.ok(text.includes("UOR-10000033"), `the booking the data says cannot be cancelled is named:\n${text}`);
+        const draft = (await getOpenDraft(pool, a.sessionId))!;
+        assert.equal(draft.preview.filter((l) => l.key.startsWith("warn.booking")).length, 40, "the draft keeps every warning");
+
+        // A 41st booking lands AFTER the preview. It would be one of the COUNTED
+        // ones, not a listed one - and the old Yes must still apply nothing.
+        await hold(pool, a, "travel_anchors", [...forty(), booking(40)]);
+        assert.deepEqual(await applyPendingChangeForChat(pool, a.chatId, draft.id, draftDigest(draft)), { ok: false, reason: "UPDATED" }, "the guard is over every warning, not the listed ones");
+        await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+        assert.deepEqual(await stored(pool, a, "phases"), ORLANDO, "nothing applied");
+        assert.deepEqual(await stored(pool, a, "travelers"), FAMILY);
+        const reshown = tg.previews.at(-1)!;
+        assert.ok(reshown.text.startsWith(uiString("change.updated", language)));
+        assert.ok(reshown.text.length <= PREVIEW_BUDGET_CHARS);
+        await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+        const [key, left] = ops[0].op === "remove_stop" ? ["phases", 1] : ["travelers", 3];
+        assert.equal((await stored(pool, a, key)).length, left, "and the preview that knew applies");
+      });
+    });
+  }
 });
 
 describe("4: a long held list never makes a one-line change impossible", opts, () => {
@@ -866,9 +978,14 @@ describe("5c: 'send it again' actually works", opts, () => {
       assert.equal((await draftRows(pool, a)).length, 1);
       tg.failPreviews = false;
       await say(pool, a, "yes", tg, model);
+      // The bare reply went to the waiting change without the model: this fake
+      // returns the same operation for ANY text, so a preview would be shown
+      // either way - only the call count tells the two paths apart.
+      assert.equal(model.calls.n, 1, "the bare 'yes' was not sent to the model (only the original change was)");
       assert.deepEqual(await stored(pool, a, "phases"), TWO, "'yes' to an unseen change applied nothing");
       assert.equal(tg.previews.length, 1, "it was shown");
       await say(pool, a, "no", tg, model);
+      assert.equal(model.calls.n, 1, "nor was the 'no'");
       assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"]);
       assert.deepEqual(await stored(pool, a, "phases"), TWO);
     });
@@ -883,8 +1000,96 @@ describe("5c: 'send it again' actually works", opts, () => {
       await say(pool, a, "Tokyo ends 25", tg, model);
       tg.failPreviews = false;
       await say(pool, a, "no", tg, model);
+      assert.equal(model.calls.n, 1, "the bare 'no' was not sent to the model (only the original change was)");
       assert.equal(tg.previews.length, 1, "shown");
       assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "and still waiting for an answer to what they can now see");
+    });
+  });
+});
+
+describe("B3 (round 4): a preview Telegram refuses every time still has a way out", opts, () => {
+  for (const language of ["en", "he"] as const) {
+    test(`a typed 'no' drops it out loud (${language}), applies nothing, and the interview resumes`, async () => {
+      await withChats(async (pool, a) => {
+        await hold(pool, a, "phases", TWO);
+        await setLanguageForChat(pool, a.chatId, language);
+        const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+        const dead = new Telegram();
+        dead.failPreviews = true;
+        await say(pool, a, "Tokyo ends 25", dead, model);
+        assert.equal(dead.last!.text, uiString("change.sendFailed", language));
+        const before = dead.sent.length;
+        await say(pool, a, language === "he" ? "לא" : "no", dead, model);
+        const after = dead.sent.slice(before);
+        assert.equal(after.filter((s) => s.buttons.some((b) => b.callback_data.startsWith("pc:"))).length, 1, "the re-show was attempted once");
+        assert.ok(!after.some((s) => s.text === uiString("change.sendFailed", language)), "not told to reply again: it will not work");
+        const told = after.findIndex((s) => s.ok && s.text === uiString("change.droppedUnshown", language));
+        assert.ok(told >= 0, `told, plainly, in ${language}: ${JSON.stringify(after.map((s) => s.text.slice(0, 60)))}`);
+        assert.ok(after.slice(told + 1).some((s) => s.ok), "and the interview carries on after it");
+        assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"]);
+        assert.deepEqual(await stored(pool, a, "phases"), TWO, "nothing applied");
+        const prompt = await lastPrompt(pool, a);
+        assert.ok(prompt && !prompt.startsWith("pc:"), `the screen holds the interview again: ${prompt}`);
+        assert.equal(model.calls.n, 1);
+      });
+    });
+  }
+
+  test("a typed 'yes' to it keeps it waiting (it was asked for), and says so; 'no' still gets out", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", dead, model);
+      await say(pool, a, "yes", dead, model);
+      assert.equal(dead.last!.text, en("change.sendFailed"));
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"]);
+      await say(pool, a, "no", dead, model);
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"]);
+      assert.deepEqual(await stored(pool, a, "phases"), TWO);
+    });
+  });
+
+  test("Confirm blocked by a change whose preview cannot be sent: the change is dropped out loud and Confirm is free", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "Tokyo ends 25", dead, model);
+      const before = dead.sent.length;
+      await tap(pool, a, CONFIRM_CALLBACK_DATA, dead, model);
+      const after = dead.sent.slice(before).map((s) => s.text);
+      assert.ok(after.includes(uiString("changePendingBlocksConfirm", "en")), JSON.stringify(after));
+      assert.ok(after.includes(en("change.droppedUnshown")), JSON.stringify(after));
+      await assertWayOut(pool, a, "after Confirm met an unsendable change");
+    });
+  });
+});
+
+describe("B4 (round 4): nothing happens to a change the organizer has not seen - yes and no alike", opts, () => {
+  test("a follow-up merged in and ITS preview never went out: a typed 'no' shows the merge and cancels nothing; the next 'no' cancels both", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+      const model = fakeModel(() => ops);
+      await say(pool, a, "Tokyo ends 25", new Telegram(), model);
+      ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
+      const dead = new Telegram();
+      dead.failPreviews = true;
+      await say(pool, a, "and drop Kyoto", dead, model);
+      assert.equal(dead.last!.text, en("change.sendFailed"), "they were told it is waiting, and to reply yes or no to see it");
+      const tg = new Telegram();
+      await say(pool, a, "no", tg, model);
+      assert.equal(model.calls.n, 2, "the 'no' was not interpreted");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "what they never saw was not cancelled");
+      assert.equal(tg.previews.length, 1);
+      assert.ok(tg.previews[0]!.text.startsWith(en("change.updated")), "shown as the newer version of what they saw");
+      assert.match(tg.previews[0]!.text, /Remove Kyoto/, "the merge is on screen now");
+      await say(pool, a, "no", tg, model);
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"], "a 'no' to what IS on screen cancels it");
+      assert.deepEqual(await stored(pool, a, "phases"), TWO);
     });
   });
 });
