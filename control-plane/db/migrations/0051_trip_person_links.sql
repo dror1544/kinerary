@@ -19,7 +19,7 @@
 --
 -- Both halves of the missing join were in hand in the same transaction:
 -- `_resolve_organizers` had already matched the organizer_identity answer to a
--- participant ("ניר סולומון" -> `nirsolomon`, which is what writes
+-- participant ("רון מרגולין" -> `ronmargolin`, which is what writes
 -- agent.organizers), and the provisioner had the chat id it was about to bind.
 -- Nothing joined them, so `participants[].telegram_id` on the site stayed NULL
 -- on every trip ever provisioned, and `set_telegram_group` — which refuses
@@ -50,11 +50,11 @@ CREATE TABLE IF NOT EXISTS control_plane.trip_person_links (
   -- The sender, as Telegram identifies them on every update. Private-chat
   -- shape only: a group id is not a person, and the writer enforces it.
   telegram_user_id  text NOT NULL,
-  -- The site's own username for them — `nirsolomon`. The join key to the
+  -- The site's own username for them — `ronmargolin`. The join key to the
   -- trip: participants, plan authorship, and `agent.organizers` all speak it.
   participant_username text NOT NULL,
   -- What to CALL them, in the trip's language. The router stamps this over the
-  -- Telegram display name, so the assistant hears "ניר סולומון" rather than
+  -- Telegram display name, so the assistant hears "רון מרגולין" rather than
   -- whatever the sender has set as their Telegram name this week.
   display_name      text,
   -- 'organizer' | 'participant'. Only the organizer is written today; the

@@ -16,10 +16,10 @@ const roster = (people: unknown[]): IntakeAnswer => ({ kind: "structured", schem
 
 describe("the organizer question, answered from the roster", () => {
   test("the roster is offered as buttons, and each tap parses back to the organizer question", () => {
-    const choices = rosterChoices([{ name: "ניר סולומון", name_en: "Nir Solomon" }, { name: "Maya" }]);
+    const choices = rosterChoices([{ name: "רון מרגולין", name_en: "Ron Margolin" }, { name: "Maya" }]);
     const rendered = renderQuestion(organizer, [], "en", null, { choices });
     const buttons = rendered.replyMarkup!.inline_keyboard.flat();
-    assert.deepEqual(buttons.map((b) => b.text), ["ניר סולומון (Nir Solomon)", "Maya"]);
+    assert.deepEqual(buttons.map((b) => b.text), ["רון מרגולין (Ron Margolin)", "Maya"]);
     buttons.forEach((button, i) => {
       assert.deepEqual(parseCallbackData(button.callback_data), {
         kind: "answer", questionId: "organizer_identity", optionId: choices[i]!.id,

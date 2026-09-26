@@ -523,10 +523,10 @@ an organizer checks before committing, and it came out like this:
 
 ```
 • יעד            Japan
-• נוסעים          Nir Solomon, Ela, Noa, Maya, Shai
+• נוסעים          Ron Margolin, Tali, Yael, Dana, Gal
 • אזור זמן        Asia/Tokyo
 • תאריך יציאה     2026-09-19
-• למי זה נוגע     kosher_style: everyone, lactose_free: Noa
+• למי זה נוגע     kosher_style: everyone, lactose_free: Yael
 ```
 
 Hebrew labels, English values, and one line of raw option ids. The organizer

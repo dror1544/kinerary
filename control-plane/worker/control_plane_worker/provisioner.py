@@ -1496,7 +1496,7 @@ class ProvisionerWorker:
                     "login_password": self._seed_password or None,
                     # WHO to log in as. The seed password is shared, so the
                     # username is the only thing telling two travellers apart —
-                    # and it is derived from their name (`ella`, `nirsolomon`),
+                    # and it is derived from their name (`tali`, `ronmargolin`),
                     # not chosen, so it cannot be guessed from the site. The
                     # modern site has no name picker either, which on
                     # 2026-09-12 left an organizer with a password and no idea

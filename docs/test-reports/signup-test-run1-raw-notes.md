@@ -115,7 +115,7 @@ accommodation, `travel_info` with JPY):
   ENOENT on every start. `create-trip` generates trivia for hand-made trips; the
   control-plane transformer does not, and the interview collects neither.
 - **Family name has no transliteration** — `families[0]` is
-  `{"he": "סולומון", "en": "סולומון"}`. Same root cause as your general note 4:
+  `{"he": "מרגולין", "en": "מרגולין"}`. Same root cause as your general note 4:
   non-Latin input needs an LLM pass, not a deterministic copy. It is also what
   produced the slug bug below.
 - **Slug derivation can't handle non-Latin input.** `destination` was answered as

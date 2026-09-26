@@ -125,7 +125,7 @@ Hermes to mark the message first. Not done during the run.
 
 > After I switced to hebrew it did too, but after it changed back to english
 > after asked a similar unanswered question in hebrew
-> "רשמתי — משפחת סולומון, 5 נוסעים.
+> "רשמתי — משפחת מרגולין, 5 נוסעים.
 >
 > עכשיו התחנות — לאן אתם הולכים ביפן? אם יש כמה ערים, ספר לי את הסדר ואת
 > התאריכים בערך (לא חייב לדייק).

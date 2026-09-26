@@ -29,7 +29,7 @@ When `get_interview_for_chat` returns a completely different `sessionId` and
 of the previous session. Do not carry over any data (traveler names, destination,
 dates, etc.) from the old session. Start fresh.
 
-This happened in session 2026-09-07: after the Solomons' Japan intake session
+This happened in session 2026-09-07: after an earlier Japan intake session
 was submitted for confirmation, the next call to `get_interview_for_chat`
 returned an entirely different session for the Elul family's USA trip.
 

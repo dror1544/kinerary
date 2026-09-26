@@ -56,9 +56,9 @@ describe("organizer identity", () => {
   });
 
   test("roster buttons carry the roster's spelling and show the English one beside it", () => {
-    const choices = rosterChoices([{ name: "ניר סולומון", name_en: "Nir Solomon" }, { name: "Maya" }]);
+    const choices = rosterChoices([{ name: "רון מרגולין", name_en: "Ron Margolin" }, { name: "Maya" }]);
     assert.deepEqual(choices.map(({ label, value }) => ({ label, value })), [
-      { label: "ניר סולומון (Nir Solomon)", value: "ניר סולומון" },
+      { label: "רון מרגולין (Ron Margolin)", value: "רון מרגולין" },
       { label: "Maya", value: "Maya" },
     ]);
     // Position plus a fingerprint of the name: a valid callback token, and a

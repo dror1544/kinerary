@@ -277,7 +277,7 @@ export type PhotoComments = Record<string, PhotoComment[]>;
  * Who can sign in, before anyone has.
  *
  * The accounts are the travellers and their usernames are DERIVED from their
- * names (`ella`, `nirsolomon`), so a person cannot guess their own — and on
+ * names (`tali`, `ronmargolin`), so a person cannot guess their own — and on
  * 2026-09-12 an organizer with the trip's password sat at this form with
  * nothing to type. `/api/config/roster` is deliberately public for exactly
  * this: names and usernames, no credentials. Classic has used it for its

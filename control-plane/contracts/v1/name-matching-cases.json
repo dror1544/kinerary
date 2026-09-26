@@ -9,7 +9,7 @@
   ],
   "alike": [
     ["ניר", "Nir"],
-    ["ניר סולומון", "Nir Solomon"],
+    ["רון מרגולין", "Ron Margolin"],
     ["דוד", "David"],
     ["חיים", "Chaim"],
     ["חיים", "Haim"],
@@ -30,7 +30,7 @@
     ["אלה", "Ella"],
     ["Nir", "Nira"],
     ["ניר", "ניר"],
-    ["סולומון", "Nir"]
+    ["מרגולין", "Nir"]
   ],
   "resolve": [
     {
@@ -77,14 +77,14 @@
     },
     {
       "why": "a family name names a household, not a person, in any alphabet",
-      "roster": [{"name": "Nir", "family": "Solomon"}, {"name": "Maya", "family": "Solomon"}],
-      "answer": "סולומון",
+      "roster": [{"name": "Ron", "family": "Margolin"}, {"name": "Dana", "family": "Margolin"}],
+      "answer": "מרגולין",
       "expect": null
     },
     {
       "why": "a full name across alphabets",
-      "roster": [{"name": "Nir Solomon"}, {"name": "Maya Solomon"}],
-      "answer": "ניר סולומון",
+      "roster": [{"name": "Ron Margolin"}, {"name": "Dana Margolin"}],
+      "answer": "רון מרגולין",
       "expect": 0
     }
   ]

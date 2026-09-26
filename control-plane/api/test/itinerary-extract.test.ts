@@ -292,11 +292,11 @@ describe("buildExtractPrompt", () => {
     const prompt = buildExtractPrompt({
       destination: "Japan",
       phases: PHASES,
-      travelers: ["Nir", "Ella"],
+      travelers: ["Ron", "Tali"],
       documentText: "Day 1: land at Narita, transfer to Asakusa.",
     });
     assert.match(prompt, /Tokyo: 2026-09-19 to 2026-09-23/);
-    assert.match(prompt, /Travelers: Nir, Ella/);
+    assert.match(prompt, /Travelers: Ron, Tali/);
     assert.match(prompt, /"phases": \[ \{ "name"/);
     assert.match(prompt, /land at Narita/);
     assert.match(prompt, /BOTH "he" \(Hebrew\) and "en"/);

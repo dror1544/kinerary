@@ -102,7 +102,7 @@ describe("the trip a companion may rename is its own", { skip: !databaseUrl }, (
 
   test("a rename changes the caller's trip and leaves every other family's alone", async () => {
     await withDb(async (pool) => {
-      const mine = await trip(pool, ["סולומון"]);
+      const mine = await trip(pool, ["מרגולין"]);
       const theirs = await trip(pool, ["Luca"]);
       await bind(pool, mine, "japan2026");
       await bind(pool, theirs, "italy2026");

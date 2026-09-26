@@ -176,12 +176,12 @@ describe("document registry", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL
         digest: DIGEST,
         provider: "telegram",
         sourceRef: "chat:830000001:msg:99",
-        filename: "/Users/dror/Downloads/ Solomon- Yapan Tours.pdf",
+        filename: "/Users/dror/Downloads/ Margolin- Yapan Tours.pdf",
         reviewStatus: "approved",
         provenance: { note: "Authorization: Bearer abc123", path: "/Users/dror/secret" },
       });
       const row = await pool.query("SELECT filename, provenance FROM control_plane.source_artifacts WHERE id = $1", [out.artifactId]);
-      assert.equal(row.rows[0].filename, "/Users/dror/Downloads/ Solomon- Yapan Tours.pdf");
+      assert.equal(row.rows[0].filename, "/Users/dror/Downloads/ Margolin- Yapan Tours.pdf");
       assert.deepEqual(row.rows[0].provenance, {});
     });
   });

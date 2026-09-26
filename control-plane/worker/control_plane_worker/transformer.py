@@ -856,8 +856,8 @@ def _apply_dietary(
 def _normalize_identity(value: Any) -> str:
     """Casefolded, whitespace-collapsed form used to compare stated names.
 
-    Internal whitespace is collapsed rather than merely stripped so "ניר
-    סולומון" and "ניר  סולומון" are the same needle. A name is typed by a
+    Internal whitespace is collapsed rather than merely stripped so "רון
+    מרגולין" and "רון  מרגולין" are the same needle. A name is typed by a
     person, once, into a chat.
     """
     return " ".join(str(value or "").split()).casefold()
@@ -870,13 +870,13 @@ def _identity_forms(
 
     `aliases` carries the raw intake traveler entry for the same person, and
     is not optional decoration: `_build_participants` SLUGIFIES `family`
-    ("סולומון" becomes "solomon") and drops `family_en` altogether, so by the
+    ("מרגולין" becomes "margolin") and drops `family_en` altogether, so by the
     time a participant exists the roster no longer holds the household label
     in the form the organizer actually typed. Matching the transformed
-    participant alone finds "ניר solomon" and misses "ניר סולומון" — which is
+    participant alone finds "רון margolin" and misses "רון מרגולין" — which is
     the same bug in a second dimension, found while fixing the first.
 
-    Deliberately excludes the bare family/household label: "סולומון" names a
+    Deliberately excludes the bare family/household label: "מרגולין" names a
     household of five, not a person, and matching it would pick whichever of
     them the roster happened to list first — precisely the silent
     wrong-person failure `_resolve_organizers` exists to avoid.
