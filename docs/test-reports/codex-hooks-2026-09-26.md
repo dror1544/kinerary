@@ -510,4 +510,4 @@ hard links, Hebrew filenames, spaces, and composed/decomposed Unicode.
 Local evidence: `/private/tmp/kinerary-hooks-identity-oracle/`; verifier logs:
 `/private/tmp/codex-final-{adapter,bash,write,dotted}.txt`.
 
-Commit and push are pending explicit policy-file approval under CLAUDE.md.
+Committed as `e3a22e5` (by the owner) and merged through #264 (`5b158dc`) into #260, which merged into `integration/sprint-6` as `8b86e96` (2026-09-27). The primary checkout was moved to that commit the same day, so Codex loads this adapter.
