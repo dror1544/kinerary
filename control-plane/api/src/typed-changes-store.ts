@@ -127,7 +127,11 @@ export interface ProposeInput {
   /** The interpretation this came from: the idempotency key. */
   interpretationId: string;
   ops: readonly Op[];
-  /** The prompt this change puts off the screen, to restore when it resolves. Kept from the first proposal. */
+  /**
+   * The prompt this change puts off the screen, to restore when it resolves. Kept
+   * from the first proposal - unless a preview later goes out over something else
+   * (`recordDisplacedPrompt`).
+   */
   displacedPrompt?: string | null;
 }
 
@@ -265,6 +269,23 @@ export async function getDraft(db: Db, draftId: string): Promise<Draft | null> {
     [draftId],
   );
   return row.rows[0] ? toDraft(row.rows[0]) : null;
+}
+
+/**
+ * What a waiting draft's preview went out OVER, when that is not what the draft
+ * was proposed under (#225). The prompt recorded at proposal time comes from the
+ * session as it was when the message ARRIVED; a tap answered during the read can
+ * have put something else on screen - the boundary offer, which is sent once and
+ * comes back only if it is named here. False when the draft is no longer waiting.
+ */
+export async function recordDisplacedPrompt(db: Db, input: { draftId: string; sessionId: string; prompt: string }): Promise<boolean> {
+  const res = await db.query(
+    `UPDATE control_plane.intake_pending_changes
+        SET displaced_prompt = $3, updated_at = now()
+      WHERE id = $1 AND session_id = $2 AND status = 'pending'`,
+    [input.draftId, input.sessionId, input.prompt],
+  );
+  return (res.rowCount ?? 0) > 0;
 }
 
 /** Ends the session's open draft without applying it. False when this session has no such draft. */

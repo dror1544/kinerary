@@ -45,6 +45,33 @@ export interface SendResult {
   ok: boolean;
   messageId?: string;
   error?: string;
+  /**
+   * True only when Telegram refused THIS request as malformed (HTTP 400, "Bad
+   * Request: …" - a text it will not take, a chat it cannot find): sending the
+   * same thing again fails the same way. Absent for everything that may pass on
+   * a later try - a rate limit (429), a 5xx, the network - and for a client that
+   * cannot tell. A caller that gives up on something for good must ask for this,
+   * never for `!ok` alone: a 429 in a burst of messages is not a verdict (#225).
+   */
+  permanent?: boolean;
+}
+
+/**
+ * The longest `retry_after` a 429 is waited out for, inside the one call, before
+ * it is retried ONCE. Longer than this and the call fails at once as transient,
+ * and the caller's own way to try again applies.
+ *
+ * Small on purpose: the relay's poll loop handles every chat's updates one after
+ * another and awaits each send, so a wait here holds all of them. Telegram's
+ * per-chat burst limit asks for a second or two - which is what the up-to-five
+ * messages of a Confirm tap run into; a flood wait of tens of seconds is not
+ * something to sit out in-process.
+ */
+export const RETRY_AFTER_CAP_SECONDS = 3;
+
+/** Is this a refusal Telegram will repeat for the same request? (Not `!ok`: see `SendResult.permanent`.) */
+export function isPermanentRefusal(result: Pick<SendResult, "ok" | "permanent"> | undefined | null): boolean {
+  return result?.ok === false && result.permanent === true;
 }
 
 export interface ChatInfo {
@@ -134,20 +161,43 @@ export interface TelegramClient {
 
 export class HttpTelegramClient implements TelegramClient {
   private readonly apiRoot: string;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(
     private readonly botToken: string,
     private readonly log: (line: string) => void = () => {},
     apiRoot: string = TELEGRAM_API_ROOT,
+    /** Tests only: how a 429's `retry_after` is waited out. */
+    options: { sleep?: (ms: number) => Promise<void> } = {},
   ) {
     this.apiRoot = telegramApiRoot(apiRoot);
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   private url(method: string): string {
     return `${this.apiRoot}/bot${this.botToken}/${method}`;
   }
 
-  private async post(method: string, body: unknown): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  /**
+   * One Bot API call. A 429 whose `retry_after` is at most
+   * RETRY_AFTER_CAP_SECONDS is waited out and retried ONCE; anything else is
+   * returned as it came, with `permanent` saying whether it would come again.
+   */
+  private async post(method: string, body: unknown): Promise<{ ok: boolean; result?: unknown; error?: string; permanent?: boolean }> {
+    const first = await this.postOnce(method, body);
+    const wait = first.retryAfter;
+    if (first.ok || wait === undefined) return first.res;
+    const retried = wait <= RETRY_AFTER_CAP_SECONDS;
+    this.log(structuredLog("warn", "telegram_api.rate_limited", { method, retry_after: wait, retried }));
+    if (!retried) return first.res;
+    await this.sleep(wait * 1000);
+    return (await this.postOnce(method, body)).res;
+  }
+
+  private async postOnce(
+    method: string,
+    body: unknown,
+  ): Promise<{ ok: boolean; res: { ok: boolean; result?: unknown; error?: string; permanent?: boolean }; retryAfter?: number }> {
     try {
       const response = await fetch(this.url(method), {
         method: "POST",
@@ -155,7 +205,7 @@ export class HttpTelegramClient implements TelegramClient {
         body: JSON.stringify(body),
       });
       const text = await response.text();
-      let parsed: { ok?: boolean; result?: unknown; description?: string } = {};
+      let parsed: { ok?: boolean; result?: unknown; description?: string; error_code?: number; parameters?: { retry_after?: unknown } } = {};
       try {
         parsed = text ? JSON.parse(text) : {};
       } catch {
@@ -172,9 +222,17 @@ export class HttpTelegramClient implements TelegramClient {
             detail: (parsed.description ?? text).slice(0, 300),
           }),
         );
-        return { ok: false, error: parsed.description ?? `HTTP ${response.status}` };
+        // Telegram puts the code in the body as well as the status line; the body
+        // wins when it is there (a proxy in front can change the status).
+        const code = typeof parsed.error_code === "number" ? parsed.error_code : response.status;
+        const retryAfter = Number(parsed.parameters?.retry_after);
+        return {
+          ok: false,
+          res: { ok: false, error: parsed.description ?? `HTTP ${response.status}`, ...(code === 400 ? { permanent: true } : {}) },
+          ...(code === 429 && Number.isFinite(retryAfter) && retryAfter >= 0 ? { retryAfter } : {}),
+        };
       }
-      return { ok: true, result: parsed.result };
+      return { ok: true, res: { ok: true, result: parsed.result } };
     } catch (error) {
       this.log(
         structuredLog("warn", "telegram_api.call_threw", {
@@ -182,7 +240,7 @@ export class HttpTelegramClient implements TelegramClient {
           safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
         }),
       );
-      return { ok: false, error: "NETWORK" };
+      return { ok: false, res: { ok: false, error: "NETWORK" } };
     }
   }
 
@@ -225,7 +283,7 @@ export class HttpTelegramClient implements TelegramClient {
       body.text = params.text;
       res = await this.post("sendMessage", body);
     }
-    if (!res.ok) return { ok: false, error: res.error };
+    if (!res.ok) return { ok: false, error: res.error, ...(res.permanent ? { permanent: true } : {}) };
     const messageId = (res.result as { message_id?: number } | undefined)?.message_id;
     return { ok: true, messageId: messageId !== undefined ? String(messageId) : undefined };
   }
@@ -258,7 +316,9 @@ export class HttpTelegramClient implements TelegramClient {
       body.text = params.text;
       res = await this.post("editMessageText", body);
     }
-    return res.ok ? { ok: true, messageId: params.messageId } : { ok: false, error: res.error };
+    return res.ok
+      ? { ok: true, messageId: params.messageId }
+      : { ok: false, error: res.error, ...(res.permanent ? { permanent: true } : {}) };
   }
 
   async sendChatAction(params: { chatId: string; action?: string }): Promise<void> {

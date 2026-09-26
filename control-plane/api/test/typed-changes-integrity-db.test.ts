@@ -20,8 +20,8 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { CONFIRM_CALLBACK_DATA, startFromDeepLink } from "../src/chat-router.js";
-import { applyPendingChangeForChat, confirmIntakeForChat, queueInboundMessage, setLanguageForChat } from "../src/interview.js";
+import { CONFIRM_CALLBACK_DATA, FINISH_CALLBACK_DATA, startFromDeepLink } from "../src/chat-router.js";
+import { applyPendingChangeForChat, confirmIntakeForChat, INTAKE_QUESTIONS, queueInboundMessage, setLanguageForChat } from "../src/interview.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import { uiString } from "../src/intake-copy.js";
 import { applyDecision, flushSettledInboundBursts, forgetShownPreviewsForTests } from "../src/relay/poller.js";
@@ -29,6 +29,7 @@ import { setInterpretPath } from "../src/interpret.js";
 import { draftDigest } from "../src/typed-changes.js";
 import { canonical } from "../src/answer-merge.js";
 import { getOpenDraft, pickForDraft, proposeChange, PREVIEW_BUDGET_CHARS } from "../src/typed-changes-store.js";
+import { HttpTelegramClient } from "../src/relay/telegram-api.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
@@ -101,23 +102,43 @@ async function lastPrompt(pool: pg.Pool, chat: Chat): Promise<string | null> {
 type Button = { text: string; callback_data: string };
 interface Sent { text: string; buttons: Button[]; ok: boolean }
 
-/** Mirrors the Bot API: a refused send returns ok:false, it does not throw. */
+/** Why the fake refuses a preview: for good (`true`, a 400 "Bad Request"), or only for now. */
+type PreviewFailure = false | true | "rate_limited" | "server_error" | "network" | "throws";
+
+/** Mirrors the Bot API client: a refused send returns ok:false (and says whether it is for good), it does not throw. */
 class Telegram {
   readonly sent: Sent[] = [];
   readonly acks: unknown[] = [];
   /**
-   * Refuse any message that carries a change's buttons (a preview), the way a 429,
-   * a network error, or a text Telegram will not take would. Only previews: the
-   * interview's own questions still go out, so what happens AFTER a refused
-   * preview can be seen.
+   * Refuse any message that carries a change's buttons (a preview). Only
+   * previews: the interview's own questions still go out, so what happens AFTER
+   * a refused preview can be seen.
+   *
+   *  - `true`: a text Telegram will never take (HTTP 400, `permanent: true`).
+   *  - `"rate_limited"` / `"server_error"` / `"network"`: what `HttpTelegramClient`
+   *    returns for a 429 it did not wait out, a 5xx, a fetch that failed -
+   *    `ok: false` and NOT permanent: the same message may go through later.
+   *  - `"throws"`: a client that throws instead (the poller must treat it as transient).
    */
-  failPreviews = false;
+  failPreviews: PreviewFailure = false;
+  /** Refuse `change.sendFailed` too, transiently (in any language): the notice that the change is waiting never arrives. */
+  failSendFailed = false;
   async sendMessage(p: { text: string; replyMarkup?: { inline_keyboard: Button[][] } }) {
     const buttons = (p.replyMarkup?.inline_keyboard ?? []).flat();
     const preview = buttons.some((b) => b.callback_data.startsWith("pc:"));
-    const ok = !(this.failPreviews && preview) && p.text.length <= 4096;
+    if (this.failSendFailed && (p.text === uiString("change.sendFailed", "en") || p.text === uiString("change.sendFailed", "he"))) {
+      this.sent.push({ text: p.text, buttons, ok: false });
+      return { ok: false as const, error: "Too Many Requests: retry after 30" };
+    }
+    const failing = this.failPreviews !== false && preview;
+    const tooLong = p.text.length > 4096;
+    const ok = !failing && !tooLong;
     this.sent.push({ text: p.text, buttons, ok });
-    return ok ? { ok: true as const, messageId: String(this.sent.length) } : { ok: false as const, error: "Bad Request" };
+    if (ok) return { ok: true as const, messageId: String(this.sent.length) };
+    if (tooLong || this.failPreviews === true) return { ok: false as const, error: "Bad Request: message is too long", permanent: true };
+    if (this.failPreviews === "throws") throw new Error("socket hang up");
+    const error = { rate_limited: "Too Many Requests: retry after 30", server_error: "Internal Server Error", network: "NETWORK" }[this.failPreviews as "rate_limited" | "server_error" | "network"];
+    return { ok: false as const, error };
   }
   async editMessageText() { return { ok: true as const }; }
   async sendChatAction() {}
@@ -787,6 +808,18 @@ describe("1: from ANY reachable state there is a way out, and it works with any 
       assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "not cancelled unseen");
       await say(pool, a, "no", tg, model);
     }],
+    ["a preview Telegram only rate-limits (a transient failure, #225): Confirm keeps it waiting and says so; a typed 'no' then cancels it", async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const tg = new Telegram();
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      tg.failPreviews = "rate_limited";
+      await tap(pool, a, CONFIRM_CALLBACK_DATA, tg, model);
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "kept: the organizer has seen it and Telegram was only busy");
+      assert.equal(tg.last!.text, en("change.sendFailed"));
+      tg.failPreviews = false;
+      await say(pool, a, "no", tg, model);
+    }],
     ["what was held changed under the draft (stale base), the old Cancel", async (pool, a) => {
       await hold(pool, a, "phases", TWO);
       const tg = new Telegram();
@@ -1090,6 +1123,397 @@ describe("B4 (round 4): nothing happens to a change the organizer has not seen -
       await say(pool, a, "no", tg, model);
       assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["cancelled"], "a 'no' to what IS on screen cancels it");
       assert.deepEqual(await stored(pool, a, "phases"), TWO);
+    });
+  });
+});
+
+// ── #225: the three defects the round-4 audit said must land before the VM ──
+
+/**
+ * Every required question answered, the optional phase entered and its offer
+ * still owed: the interview's next step IS the boundary offer ("a few more
+ * questions, or the summary?") - which is sent ONCE (`sendOptionalOffer`).
+ */
+async function atTheBoundary(pool: pg.Pool, chat: Chat) {
+  for (const q of INTAKE_QUESTIONS.filter((x) => x.required)) {
+    const value = q.id === "phases" ? structured(TWO)
+      : q.id === "travelers" ? structured([{ name: "Ruth Cohen", age: 70 }])
+      : { kind: "text", schema_version: 3, text: q.id === "organizer_identity" ? "Ruth Cohen" : "x" };
+    await pool.query(
+      "UPDATE control_plane.intake_sessions SET answers = answers || jsonb_build_object($2::text, $3::jsonb) WHERE id = $1",
+      [chat.sessionId, q.id, JSON.stringify(value)],
+    );
+  }
+  await pool.query(
+    "UPDATE control_plane.intake_sessions SET phase = 'optional', ui_state = ui_state || jsonb_build_object('pending_entry', 'optional') WHERE id = $1",
+    [chat.sessionId],
+  );
+}
+
+const texts = (list: Sent[]) => JSON.stringify(list.map((s) => s.text.slice(0, 50)));
+
+type Outgoing = { text: string; replyMarkup?: { inline_keyboard: Button[][] } };
+
+/** One held send: `reached` resolves when a matching message is IN FLIGHT, `release()` lets it complete. */
+interface Hold { reached: Promise<void>; release: () => void }
+
+/**
+ * A fake Telegram that can hold messages IN FLIGHT until released - the send has
+ * been made and Telegram has not answered yet - which forces the interleavings a
+ * scheduler only produces under load. Holds are matched by exact text or by a
+ * predicate (a preview's text is not known in advance), each catches one message,
+ * and several can be armed at once.
+ */
+class GatedTelegram extends Telegram {
+  private holds: Array<{ match: (p: Outgoing) => boolean; hit: () => void; gate: Promise<void> }> = [];
+  private last_: Hold = { reached: Promise.resolve(), release: () => {} };
+  /** The most recent hold's arrival - kept for the tests that arm one. */
+  get reached() { return this.last_.reached; }
+  holdOn(match: string | ((p: Outgoing) => boolean)): Hold {
+    let hit!: () => void;
+    let open!: () => void;
+    const reached = new Promise<void>((resolve) => { hit = resolve; });
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    this.holds.push({ match: typeof match === "string" ? (p) => p.text === match : match, hit, gate });
+    this.last_ = { reached, release: open };
+    return this.last_;
+  }
+  release() { this.last_.release(); }
+  override async sendMessage(p: Outgoing) {
+    const i = this.holds.findIndex((h) => h.match(p));
+    if (i >= 0) {
+      const [held] = this.holds.splice(i, 1);
+      held!.hit();
+      await held!.gate;
+    }
+    return super.sendMessage(p);
+  }
+}
+
+describe("#225 item 1: a boundary offer a change preview covered comes back when the change is settled", opts, () => {
+  for (const answer of ["yes", "no"] as const) {
+    test(`the tap's next step IS the offer and the follow-up's preview takes the floor back over it; settled by '${answer}', the offer is put back and no optional question is walked unasked`, async () => {
+      await withChats(async (pool, a) => {
+        await atTheBoundary(pool, a);
+        const tg = new Telegram();
+        let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+        let during: () => Promise<void> = async () => {};
+        const model = fakeModel(() => ops, () => ({}), () => during());
+        await say(pool, a, "Tokyo ends 25", tg, model);
+        const yes = tg.button("a")!.callback_data;
+        ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
+        // The deterministic interleaving: the Yes on v1 lands WHILE the follow-up is read.
+        during = async () => { during = async () => {}; await tap(pool, a, yes, tg, model); };
+        const before = tg.sent.length;
+        await say(pool, a, "and drop Kyoto", tg, model);
+
+        const after = tg.sent.slice(before);
+        const open = (await getOpenDraft(pool, a.sessionId))!;
+        assert.ok(open, "the follow-up is its own waiting draft");
+        const offer = after.findIndex((s) => s.text === en("essentialsDone"));
+        const preview = after.findIndex((s) => s.ok && s.buttons.some((b) => b.callback_data.startsWith(`pc:${open.id}:`)));
+        assert.ok(offer >= 0, `precondition: the tap's next step was the boundary offer: ${texts(after)}`);
+        assert.ok(preview > offer, `the follow-up's preview went out over the offer: ${texts(after)}`);
+
+        const mark = tg.sent.length;
+        await say(pool, a, answer, tg, model);
+        const settled = tg.sent.slice(mark);
+        assert.equal(model.calls.n, 2, "the bare reply settled the change without the model");
+        assert.ok(settled.some((s) => s.text === en(answer === "yes" ? "change.applied" : "change.cancelled")), texts(settled));
+        assert.equal(settled.at(-1)?.text, en("essentialsDone"), `the offer is put back, last: ${texts(settled)}`);
+        assert.equal(await lastPrompt(pool, a), "optional_offer", "and it is what is on screen - the choice is still open");
+      });
+    });
+  }
+
+  for (const how of ["its button", "a typed 'yes' (twice: the first one shows it)"] as const) {
+    test(`the other order - the follow-up's preview goes out FIRST and the tap's offer lands over it; settled by ${how}, the offer is put back`, async () => {
+      await withChats(async (pool, a) => {
+        await atTheBoundary(pool, a);
+        const tg = new GatedTelegram();
+        let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+        let during: () => Promise<void> = async () => {};
+        const model = fakeModel(() => ops, () => ({}), () => during());
+        await say(pool, a, "Tokyo ends 25", tg, model);
+        const yes = tg.button("a")!.callback_data;
+        ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
+        // The tap applies v1 during the read and is held just before its "Done",
+        // so the follow-up's preview is shown first; only then does the tap speak.
+        let tapping: Promise<void> = Promise.resolve();
+        during = async () => {
+          during = async () => {};
+          tg.holdOn(en("change.applied"));
+          tapping = tap(pool, a, yes, tg, model);
+          await tg.reached;
+        };
+        const before = tg.sent.length;
+        await say(pool, a, "and drop Kyoto", tg, model);
+        const open = (await getOpenDraft(pool, a.sessionId))!;
+        assert.ok(open && tg.sent.slice(before).some((s) => s.ok && s.buttons.some((b) => b.callback_data.startsWith(`pc:${open.id}:`))), "v2's preview went out");
+        assert.ok(!tg.sent.slice(before).some((s) => s.text === en("essentialsDone")), "before the tap said anything");
+        tg.release();
+        await tapping;
+        assert.equal(tg.last!.text, en("essentialsDone"), `precondition: the tap's offer is now the latest message: ${texts(tg.sent.slice(before))}`);
+        assert.equal(await lastPrompt(pool, a), "optional_offer");
+
+        const mark = tg.sent.length;
+        if (how === "its button") {
+          await tap(pool, a, tg.previews.at(-1)!.buttons.find((b) => b.callback_data.endsWith(":a"))!.callback_data, tg, model);
+        } else {
+          await say(pool, a, "yes", tg, model);
+          assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["applied", "pending"], "the first 'yes' only showed it (it was not the latest thing on screen)");
+          await say(pool, a, "yes", tg, model);
+        }
+        const settled = tg.sent.slice(mark);
+        assert.deepEqual(names(await stored(pool, a, "phases")), ["Tokyo"], "v2 applied");
+        assert.equal(settled.at(-1)?.text, en("essentialsDone"), `the offer is put back: ${texts(settled)}`);
+        assert.equal(await lastPrompt(pool, a), "optional_offer");
+      });
+    });
+  }
+
+  for (const answer of ["yes", "no"] as const) {
+    test(`the OVERLAP (round 2): the tap's offer is sent WHILE the follow-up's preview is still in flight; settled by '${answer}', the offer is put back and no optional question is walked unasked`, async () => {
+      await withChats(async (pool, a) => {
+        await atTheBoundary(pool, a);
+        const tg = new GatedTelegram();
+        let ops: unknown[] = [update("Tokyo", { end: "2026-05-25" })];
+        let during: () => Promise<void> = async () => {};
+        const model = fakeModel(() => ops, () => ({}), () => during());
+        await say(pool, a, "Tokyo ends 25", tg, model);
+        const yes = tg.button("a")!.callback_data;
+        const v1 = (await getOpenDraft(pool, a.sessionId))!.id;
+        ops = [{ op: "remove_stop", target: { name: "Kyoto" } }];
+
+        // The Yes on v1 lands while the follow-up is read, and is held just before
+        // its "Done". The follow-up's preview (v2, a new draft: v1 is applied by
+        // then) takes the floor, notes what is on screen, and is held IN FLIGHT.
+        // Only then does the tap speak - "Done", then the boundary offer, which
+        // records `optional_offer` before it is sent. Then the preview's send returns.
+        const isV2Preview = (p: Outgoing) => (p.replyMarkup?.inline_keyboard ?? []).flat()
+          .some((b) => b.callback_data.startsWith("pc:") && !b.callback_data.startsWith(`pc:${v1}:`));
+        let tapping: Promise<void> = Promise.resolve();
+        let tapDone: Hold | null = null;
+        during = async () => {
+          during = async () => {};
+          tapDone = tg.holdOn(en("change.applied"));
+          tapping = tap(pool, a, yes, tg, model);
+          await tapDone.reached;
+        };
+        const preview = tg.holdOn(isV2Preview);
+        const before = tg.sent.length;
+        const following = say(pool, a, "and drop Kyoto", tg, model);
+        await preview.reached;
+        tapDone!.release();
+        await tapping;
+        assert.equal(await lastPrompt(pool, a), "optional_offer", `precondition: the tap's offer went out while the preview was in flight: ${texts(tg.sent.slice(before))}`);
+        preview.release();
+        await following;
+        const after = tg.sent.slice(before);
+        const open = (await getOpenDraft(pool, a.sessionId))!;
+        assert.ok(open && open.id !== v1, "the follow-up is its own waiting draft");
+        const offer = after.findIndex((s) => s.text === en("essentialsDone"));
+        const shown = after.findIndex((s) => s.ok && s.buttons.some((b) => b.callback_data.startsWith(`pc:${open.id}:`)));
+        assert.ok(offer >= 0 && shown > offer, `precondition: the offer, then v2's preview (whose send began first): ${texts(after)}`);
+
+        const mark = tg.sent.length;
+        await say(pool, a, answer, tg, model);
+        const settled = tg.sent.slice(mark);
+        assert.equal(model.calls.n, 2, "the bare reply settled the change without the model");
+        assert.ok(settled.some((s) => s.text === en(answer === "yes" ? "change.applied" : "change.cancelled")), texts(settled));
+        assert.equal(settled.at(-1)?.text, en("essentialsDone"), `the offer is put back, last: ${texts(settled)}`);
+        assert.equal(await lastPrompt(pool, a), "optional_offer", "and it is what is on screen - the choice is still open");
+      });
+    });
+  }
+
+  test("the screen moved on AFTER the preview (the old offer's Finish was tapped, the summary is up): settling the change puts the summary back, not the offer it once covered", async () => {
+    await withChats(async (pool, a) => {
+      await atTheBoundary(pool, a);
+      await pool.query(
+        "UPDATE control_plane.intake_sessions SET ui_state = (ui_state - 'pending_entry') || jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true) WHERE id = $1",
+        [a.sessionId],
+      );
+      const tg = new Telegram();
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      const yes = tg.button("a")!.callback_data;
+      await tap(pool, a, FINISH_CALLBACK_DATA, tg, model);
+      assert.equal(await lastPrompt(pool, a), "recap", `precondition: the summary is on screen: ${texts(tg.sent)}`);
+      const mark = tg.sent.length;
+      await tap(pool, a, yes, tg, model);
+      const settled = tg.sent.slice(mark);
+      assert.ok(settled.some((s) => s.text === en("change.applied")), texts(settled));
+      assert.ok(!settled.some((s) => s.text === en("essentialsDone")), `the offer is not put back over the summary: ${texts(settled)}`);
+      assert.equal(await lastPrompt(pool, a), "recap", "the summary is what is on screen");
+    });
+  });
+});
+
+describe("#225 item 3: a message that loses the floor to a concurrent tap is still answered, once, after the tap's reply", opts, () => {
+  const tells: Array<[string, () => string, (pool: pg.Pool, a: Chat) => Promise<void>, unknown[]]> = [
+    ["too big to show", () => en("change.tooBigFresh"), async () => {}, Array.from({ length: 20 }, (_, i) => longStop(i))],
+    ["a held list that cannot be edited by typing", () => en("change.uneditable").replace("{what}", "your stops"),
+      async (pool, a) => { await hold(pool, a, "phases", ["Tokyo", stop("Kyoto", "2026-05-27", "2026-05-30")]); },
+      [update("Kyoto", { end: "2026-05-31" })]],
+    ["operations that do not parse (not understood)", () => en("change.notUnderstood"), async () => {}, [{ op: "delete_everything" }]],
+  ];
+  for (const [label, expected, arrange, followUp] of tells) {
+    test(`${label}: the tell is delivered once, as the last message, after the tap's own reply`, async () => {
+      await withChats(async (pool, a) => {
+        // v1 is a change to the TRAVELLERS, so the follow-up can be about the stops.
+        await hold(pool, a, "phases", TWO);
+        await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }]);
+        const tg = new Telegram();
+        let ops: unknown[] = [{ op: "update_traveller", target: { name: "Ruth Cohen" }, fields: { age: 71 } }];
+        let during: () => Promise<void> = async () => {};
+        const model = fakeModel(() => ops, () => ({}), () => during());
+        await say(pool, a, "Ruth is 71", tg, model);
+        const yes = tg.button("a")!.callback_data;
+        await arrange(pool, a);
+        ops = followUp;
+        during = async () => { during = async () => {}; await tap(pool, a, yes, tg, model); };
+        const before = tg.sent.length;
+        await say(pool, a, "the follow-up", tg, model);
+
+        const after = tg.sent.slice(before);
+        const done = after.findIndex((s) => s.text === en("change.applied"));
+        assert.ok(done >= 0 && after.length > done + 1, `precondition: the tap applied v1 and its next step went out: ${texts(after)}`);
+        assert.equal(after.filter((s) => s.text === expected()).length, 1, `the tell, once: ${texts(after)}`);
+        assert.equal(after.at(-1)!.text, expected(), `after the tap's reply: ${texts(after)}`);
+        assert.equal((await stored(pool, a, "travelers"))[0].age, 71, "the tap's change was applied");
+        assert.equal(await getOpenDraft(pool, a.sessionId), null, "nothing is left waiting");
+      });
+    });
+  }
+});
+
+describe("#225 item 5: a change is dropped only when Telegram refuses it for good", opts, () => {
+  for (const failure of ["rate_limited", "server_error", "network", "throws"] as const) {
+    test(`Confirm meets a preview Telegram cannot take RIGHT NOW (${failure}): the change the organizer saw stays waiting, they are told so, nothing is dropped - and once Telegram recovers it is settled`, async () => {
+      await withChats(async (pool, a) => {
+        await hold(pool, a, "phases", TWO);
+        const tg = new Telegram();
+        const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+        await say(pool, a, "Tokyo ends 25", tg, model);
+        tg.failPreviews = failure;
+        const before = tg.sent.length;
+        await tap(pool, a, CONFIRM_CALLBACK_DATA, tg, model);
+        const after = tg.sent.slice(before);
+        assert.ok(after.some((s) => s.text === uiString("changePendingBlocksConfirm", "en")), texts(after));
+        assert.equal(after.filter((s) => s.buttons.some((b) => b.callback_data.startsWith("pc:"))).length, 1, "the re-show was attempted");
+        assert.ok(!after.some((s) => s.text === en("change.droppedUnshown")), `not dropped: ${texts(after)}`);
+        assert.ok(after.some((s) => s.ok && s.text === en("change.sendFailed")), `told it is waiting: ${texts(after)}`);
+        assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "the change they saw is still waiting");
+        assert.deepEqual(await stored(pool, a, "phases"), TWO, "and nothing was applied");
+
+        tg.failPreviews = false;
+        await tap(pool, a, CONFIRM_CALLBACK_DATA, tg, model);
+        await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+        assert.equal((await stored(pool, a, "phases"))[0].end, "2026-05-25", "shown again once Telegram recovered, and its Yes applies");
+      });
+    });
+  }
+
+  for (const [status, description, dropped] of [
+    [403, "Forbidden: bot was blocked by the user", false],
+    [404, "Not Found", false],
+    [400, "Bad Request: message is too long", true],
+  ] as const) {
+    test(`end to end through the REAL client (round 2): Telegram answers the preview with ${status} - ${dropped ? "only a 400 drops it, out loud" : "the change is kept waiting, and the organizer is told"}`, async () => {
+      await withChats(async (pool, a) => {
+        await hold(pool, a, "phases", TWO);
+        const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+        await say(pool, a, "Tokyo ends 25", new Telegram(), model);
+        const delivered: string[] = [];
+        const realFetch = globalThis.fetch;
+        globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+          const method = String(input).split("/").at(-1);
+          const body = JSON.parse(String(init?.body ?? "{}")) as { text?: string; reply_markup?: { inline_keyboard?: Button[][] } };
+          const preview = (body.reply_markup?.inline_keyboard ?? []).flat().some((b) => b.callback_data.startsWith("pc:"));
+          if (method === "sendMessage" && preview) {
+            return new Response(JSON.stringify({ ok: false, error_code: status, description }), { status });
+          }
+          if (method === "sendMessage") delivered.push(body.text ?? "");
+          return new Response(JSON.stringify({ ok: true, result: method === "sendMessage" ? { message_id: delivered.length } : true }));
+        }) as typeof fetch;
+        try {
+          const client = new HttpTelegramClient("123456:test-token", () => {}, undefined, { sleep: async () => {} });
+          await applyDecision(
+            { kind: "interview_callback", chatId: a.chatId, callbackQueryId: "cq-real", data: CONFIRM_CALLBACK_DATA, sessionId: a.sessionId } as never,
+            { db: pool, telegram: client, connector: { pushInbound: () => true }, modelRunner: model.runner, log: () => {} } as never,
+          );
+        } finally {
+          globalThis.fetch = realFetch;
+        }
+        assert.ok(delivered.includes(uiString("changePendingBlocksConfirm", "en")), JSON.stringify(delivered));
+        assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), [dropped ? "cancelled" : "pending"], JSON.stringify(delivered));
+        assert.equal(delivered.includes(en("change.droppedUnshown")), dropped, JSON.stringify(delivered));
+        assert.equal(delivered.includes(en("change.sendFailed")), !dropped, JSON.stringify(delivered));
+        assert.deepEqual(await stored(pool, a, "phases"), TWO, "nothing applied");
+      });
+    });
+  }
+
+  for (const when of ["the change's first preview", "Confirm's re-show of a change the organizer saw"] as const) {
+    test(`round 2: ${when} fails for now AND so does 'change.sendFailed' - nothing is told, nothing is lost: the next Confirm is refused with the reason, shows the change, and its Yes applies`, async () => {
+      await withChats(async (pool, a) => {
+        await hold(pool, a, "phases", TWO);
+        const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+        const tg = new Telegram();
+        if (when === "the change's first preview") {
+          tg.failPreviews = "rate_limited";
+          tg.failSendFailed = true;
+          await say(pool, a, "Tokyo ends 25", tg, model);
+        } else {
+          await say(pool, a, "Tokyo ends 25", tg, model);
+          assert.equal(tg.previews.length, 1, "seen");
+          tg.failPreviews = "rate_limited";
+          tg.failSendFailed = true;
+          await tap(pool, a, CONFIRM_CALLBACK_DATA, tg, model);
+        }
+        assert.ok(tg.sent.some((s) => !s.ok && s.text === en("change.sendFailed")), `the notice was attempted and failed: ${texts(tg.sent)}`);
+        assert.ok(!tg.sent.some((s) => s.ok && s.text === en("change.sendFailed")), "so the organizer was not told");
+        assert.ok(!tg.sent.some((s) => s.text === en("change.droppedUnshown")), "and nothing was dropped");
+        assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"], "the change is still waiting");
+        assert.deepEqual(await stored(pool, a, "phases"), TWO);
+
+        // Telegram recovers. The organizer taps Confirm, believing all is well.
+        tg.failPreviews = false;
+        tg.failSendFailed = false;
+        const shownBefore = tg.previews.length;
+        const mark = tg.sent.length;
+        await tap(pool, a, CONFIRM_CALLBACK_DATA, tg, model);
+        const after = tg.sent.slice(mark);
+        assert.ok(after.some((s) => s.ok && s.text === uiString("changePendingBlocksConfirm", "en")), `Confirm is refused, with the reason: ${texts(after)}`);
+        assert.equal(tg.previews.length, shownBefore + 1, "and the change is shown");
+        const confirmed = await pool.query("SELECT state FROM control_plane.intake_sessions WHERE id = $1", [a.sessionId]);
+        assert.notEqual(confirmed.rows[0].state, "confirmed", "the interview was NOT confirmed without the change");
+        await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+        assert.equal((await stored(pool, a, "phases"))[0].end, "2026-05-25", "its Yes applies it");
+      });
+    });
+  }
+
+  test("a typed 'no' whose re-show is rate-limited keeps the unseen change waiting and says so; it is not dropped as if Telegram would never take it", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      const tg = new Telegram();
+      tg.failPreviews = "rate_limited";
+      await say(pool, a, "Tokyo ends 25", tg, model);
+      assert.equal(tg.last!.text, en("change.sendFailed"));
+      const before = tg.sent.length;
+      await say(pool, a, "no", tg, model);
+      const after = tg.sent.slice(before);
+      assert.ok(!after.some((s) => s.text === en("change.droppedUnshown")), texts(after));
+      assert.equal(after.at(-1)!.text, en("change.sendFailed"), "told it is still waiting");
+      assert.deepEqual((await draftRows(pool, a)).map((d) => d.status), ["pending"]);
+      tg.failPreviews = false;
+      await say(pool, a, "no", tg, model);
+      assert.equal(tg.previews.length, 1, "shown once Telegram recovered (it was never seen, so the 'no' shows it first)");
+      await say(pool, a, "no", tg, model);
+      await assertWayOut(pool, a, "after a rate-limited re-show");
     });
   });
 });

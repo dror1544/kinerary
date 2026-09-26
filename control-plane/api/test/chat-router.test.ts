@@ -733,6 +733,23 @@ describe("a document's unsure answer, asked as a question", () => {
     const rendered = renderSuggestion(findQuestion("phases")!, "x".repeat(10_000), "en");
     assert.ok(rendered.text.length < 4096);
   });
+
+  test("#225: the cut never leaves half an emoji (a lone surrogate Telegram refuses), and still fits", () => {
+    // Every alignment of an astral character against the cut, and a label of nothing but emoji.
+    for (const label of [
+      `${"x".repeat(2999)}${"\u{1F3A2}".repeat(10)}`,
+      `${"x".repeat(2998)}${"\u{1F3A2}".repeat(10)}`,
+      `${"ש".repeat(2999)}\u{1F1EE}\u{1F1F1}${"y".repeat(50)}`,
+      "\u{1F3A2}".repeat(4000),
+    ]) {
+      for (const language of ["en", "he"] as const) {
+        const rendered = renderSuggestion(findQuestion("phases")!, label, language);
+        assert.ok((rendered.text as string & { isWellFormed(): boolean }).isWellFormed(), `well-formed at the cut: …${JSON.stringify(rendered.text.slice(-6))}`);
+        assert.ok(rendered.text.length < 4096, `${rendered.text.length} UTF-16 units`);
+        assert.ok(rendered.text.endsWith("…"), "and it says it was cut");
+      }
+    }
+  });
 });
 
 describe("companion reply-capture window (migration 0053)", () => {
