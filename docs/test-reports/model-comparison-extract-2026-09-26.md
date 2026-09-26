@@ -78,3 +78,52 @@ Reproduce: in a clean build of `control-plane/api`, set `EXTRACT_RUNNER`,
 `EXTRACT_MODEL` (and `EXTRACT_EFFORT` for claude; `OPENROUTER_API_KEY_FILE` for
 openrouter), then `node tools/extract-intake-eval.mjs --modules dist --docs
 <make_documents output> --label <label> --runs 2 --concurrency 3 --today 2026-09-26`.
+
+---
+
+## Round 2 — OpenRouter only, billed, under a $5 cap (2026-09-26, later the same day)
+
+Asked for by Dror after round 1: re-test Gemini on more runs, try DeepSeek (drop it
+if it fails), and meter Claude for a real price. Same harness and scenarios, build
+`545819d`, everything through OpenRouter so every cost is **billed**. Models ran one
+at a time, and each was started only if actual spend plus its estimate stayed under
+$5. **Spent: $2.33.** (Round 1 plus round 2: $3.05.)
+
+| Model | Runs | Checks passed | Clean runs | Median / p90 / max | Calls over 120 s | $ per clean run |
+|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | 5 per scenario | **680/680** | **70/70** | 22 / 55 / 170 s | 1 of 70 | **0.018** |
+| Claude Sonnet 5 (OpenRouter) | 2 | 271/273 | 26/28 | 20 / 44 / 61 s | 0 | 0.036 |
+| DeepSeek v4.1 Flash | 2 | 266/267 | 26/28 | **98 / 194 / 236 s** | **12 of 28** | 0.0035 |
+| DeepSeek v4 Pro | 2 | 255/264 | 23/28 | 44 / 93 / 240 s | 1 of 28 | 0.0029 |
+
+**A correction to round 1's method:** `EXTRACT_TIMEOUT_MS=120000` did not stop
+calls in this harness (calls ran to 240 s). "Calls over 120 s" is therefore the
+count production's 120 s limit would have cut off, not a count of timeouts that
+happened.
+
+Failures:
+- **Claude Sonnet 5:** `partial_people` twice (lost travellers). This differs from
+  round 1, where it missed `repeated_city`, so its misses vary between runs.
+- **DeepSeek v4.1 Flash:** one run failed outright (`partial_people`), and one
+  traveller was invented from a booking name.
+- **DeepSeek v4 Pro:** lost an entire Japan itinerary (every stop and hotel) in one
+  run, one run failed outright, invented travellers from booking names, and
+  guessed a stop.
+- **Gemini 3.8 Flash:** none in 70 runs.
+
+## Revised reading
+
+1. **Gemini 3.8 Flash is the most cost-effective model for this job.** It had no
+   failure in 70 runs and costs half of metered Claude. Round 1's 182 s call was
+   the tail, not the rule: 1 call in 70 exceeded 120 s.
+2. **Claude's metered cost is about 40% above the round-1 estimate**: $0.033 per
+   document billed, against the $0.023 API-equivalent figure `model-runner.ts`
+   computed. The estimate should not be used for budgeting.
+3. **DeepSeek is out.** v4.1 Flash is the cheapest, but production would cut off
+   43% of its calls. v4 Pro fails on quality.
+
+**Recommendation (replaces round 1's):** pilot Gemini 3.8 Flash as the extraction
+model on staging, with Claude kept as the fallback for a timeout, and measure the
+timeout rate on real documents before any production change. Switching the
+production runner is a configuration change and a deploy, so it is the owner's
+decision through the normal release, not part of this report.
