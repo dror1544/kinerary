@@ -127,3 +127,5 @@ model on staging, with Claude kept as the fallback for a timeout, and measure th
 timeout rate on real documents before any production change. Switching the
 production runner is a configuration change and a deploy, so it is the owner's
 decision through the normal release, not part of this report.
+
+**Decision (2026-09-26):** the owner chose Gemini 3.8 Flash for production document reading, falling back to the Claude CLI only on a quota limit; testing stays on the Claude CLI. Recorded as decision 48 in `docs/sprint6-tracks.md`.
