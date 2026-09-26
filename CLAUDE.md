@@ -69,9 +69,13 @@ Two branches carry names in this document. The **leading branch** is
    this repo, is how to quiet it.
 3. **Feature-branch work needs no per-commit or per-push approval; the merge
    into the leading branch is the approval (owner's decision, 2026-09-26).**
-   Before this, one change cost three prompts — commit, push, merge — and PRs
-   merged 24–45 minutes after they opened (#192, #196, #197, #211, #215), so
-   the time went on the prompts, not on review. A commit on a `fix/`, `feat/`, `carry/`
+   Before this, one change cost three prompts — commit, push, merge; across
+   Sprint 6's first 43 PRs that was 96 commit prompts plus their pushes. Those
+   prompts were friction more than delay: a PR opened a median of 0.0 hours
+   after its first commit, and the wait is after it opens — median 2.4 hours
+   open-to-merge, 30 hours at the 75th percentile. The baseline and what is
+   re-measured are in
+   `docs/test-reports/process-baseline-2026-09-26.md`. A commit on a `fix/`, `feat/`, `carry/`
    or `chore/` branch from the lead session, and the push of that branch to its
    own name on origin, are not prompted: nothing reaches anyone until the branch
    is merged. `pretooluse-bash.sh` vouches only for one plain `git commit`
