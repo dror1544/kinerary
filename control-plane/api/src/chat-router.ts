@@ -923,7 +923,7 @@ const SUGGESTION_LABEL_MAX = 3000;
  * Not `cutText` (typed-changes-render.ts, which imports this module): that counts
  * code points, so a label of emoji could come out at twice this budget.
  */
-function cutWhole(text: string, max: number): string {
+export function cutWhole(text: string, max: number): string {
   let cut = "";
   for (const ch of text) {
     if (cut.length + ch.length > max) break;

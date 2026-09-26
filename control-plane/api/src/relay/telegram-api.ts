@@ -69,6 +69,37 @@ export interface SendResult {
  */
 export const RETRY_AFTER_CAP_SECONDS = 3;
 
+/**
+ * How long ONE Bot API method call may take - request and response body -
+ * before it is abandoned as a transient failure (#225 item 8).
+ *
+ * Without it a half-open connection is waited on until undici's own default
+ * (minutes), and the relay's poll loop awaits every send in turn: one hung
+ * socket silenced every chat behind it - the interview and the live trips'
+ * companions alike.
+ *
+ * Ten seconds: every method that goes through `post` is a small JSON call
+ * Telegram answers in well under a second (sendMessage, editMessageText,
+ * answerCallbackQuery, getFile's metadata, getMe, setMyCommands...). File BYTES
+ * are downloaded by `fetchFile`'s own fetch and long polls by `getUpdates`'s;
+ * neither goes through here. Ten, not more, because every second of a hang is a
+ * second the relay's sequential loops hold everything behind it.
+ *
+ * The longest one `sendMessage` can now take: a timed-out attempt is never
+ * retried (only a short 429 is), and a timeout is not a parse error, so nothing
+ * follows a hang. The worst is a connector MarkdownV2 send - a 429, a 3 s wait,
+ * then a parse error; then the plain-text fallback with a 429, a 3 s wait and a
+ * 10 s hang - about 16 s plus round trips. That is under the 30 s a Hermes gateway
+ * waits for an outbound send (`_OUTBOUND_TIMEOUT_S = 30.0`), a figure read only in
+ * the Mac's Hermes checkout (`ab0d98414`), not in the VM's image.
+ *
+ * A constant, not a setting: nothing about a deployment makes Telegram slower.
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
+/** The error of a call abandoned at REQUEST_TIMEOUT_MS. Fixed, like "NETWORK": never the URL, which carries the token. */
+export const TIMEOUT_ERROR = "TIMEOUT";
+
 /** Is this a refusal Telegram will repeat for the same request? (Not `!ok`: see `SendResult.permanent`.) */
 export function isPermanentRefusal(result: Pick<SendResult, "ok" | "permanent"> | undefined | null): boolean {
   return result?.ok === false && result.permanent === true;
@@ -162,16 +193,22 @@ export interface TelegramClient {
 export class HttpTelegramClient implements TelegramClient {
   private readonly apiRoot: string;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly timeoutMs: number;
 
   constructor(
     private readonly botToken: string,
     private readonly log: (line: string) => void = () => {},
     apiRoot: string = TELEGRAM_API_ROOT,
-    /** Tests only: how a 429's `retry_after` is waited out. */
-    options: { sleep?: (ms: number) => Promise<void> } = {},
+    /**
+     * Tests only: how a 429's `retry_after` is waited out, and how long one call
+     * may hang (REQUEST_TIMEOUT_MS otherwise) - a suite must not sit out ten
+     * real seconds to prove a timeout.
+     */
+    options: { sleep?: (ms: number) => Promise<void>; timeoutMs?: number } = {},
   ) {
     this.apiRoot = telegramApiRoot(apiRoot);
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   }
 
   private url(method: string): string {
@@ -198,13 +235,33 @@ export class HttpTelegramClient implements TelegramClient {
     method: string,
     body: unknown,
   ): Promise<{ ok: boolean; res: { ok: boolean; result?: unknown; error?: string; permanent?: boolean }; retryAfter?: number }> {
+    // THE BOUND (#225 item 8). The signal aborts a fetch that honours it, as
+    // undici does, and the race below ends the wait even for one that does not:
+    // the relay must get its turn back whatever the connection is doing.
+    const controller = new AbortController();
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        reject(new Error(TIMEOUT_ERROR));
+      }, this.timeoutMs);
+    });
+    // Never an unhandled rejection when the call settles first and the timer is cleared.
+    expired.catch(() => {});
     try {
-      const response = await fetch(this.url(method), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const text = await response.text();
+      const response = await Promise.race([
+        fetch(this.url(method), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        }),
+        expired,
+      ]);
+      // The body is part of the call: a connection can hang after the headers.
+      const text = await Promise.race([response.text(), expired]);
       let parsed: { ok?: boolean; result?: unknown; description?: string; error_code?: number; parameters?: { retry_after?: unknown } } = {};
       try {
         parsed = text ? JSON.parse(text) : {};
@@ -234,6 +291,13 @@ export class HttpTelegramClient implements TelegramClient {
       }
       return { ok: true, res: { ok: true, result: parsed.result } };
     } catch (error) {
+      if (timedOut) {
+        // Transient (no `permanent`), and not retried here: only a short 429 is.
+        // The caller's own way to try again applies. The method and the bound
+        // only - the error's own text could carry the URL, and the URL the token.
+        this.log(structuredLog("warn", "telegram_api.call_timed_out", { method, timeout_ms: this.timeoutMs }));
+        return { ok: false, res: { ok: false, error: TIMEOUT_ERROR } };
+      }
       this.log(
         structuredLog("warn", "telegram_api.call_threw", {
           method,
@@ -241,6 +305,8 @@ export class HttpTelegramClient implements TelegramClient {
         }),
       );
       return { ok: false, res: { ok: false, error: "NETWORK" } };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

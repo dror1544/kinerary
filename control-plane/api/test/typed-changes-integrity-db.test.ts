@@ -20,11 +20,35 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { CONFIRM_CALLBACK_DATA, FINISH_CALLBACK_DATA, startFromDeepLink } from "../src/chat-router.js";
-import { applyPendingChangeForChat, confirmIntakeForChat, INTAKE_QUESTIONS, queueInboundMessage, setLanguageForChat } from "../src/interview.js";
-import { dispatchUpdate } from "../src/relay/dispatch.js";
-import { uiString } from "../src/intake-copy.js";
-import { applyDecision, flushSettledInboundBursts, forgetShownPreviewsForTests } from "../src/relay/poller.js";
+import { CONFIRM_CALLBACK_DATA, FINISH_CALLBACK_DATA, MORE_CALLBACK_DATA, startFromDeepLink } from "../src/chat-router.js";
+import {
+  applyPendingChangeForChat,
+  confirmIntakeForChat,
+  deferQuestionForChat,
+  INTAKE_QUESTIONS,
+  markAwaitingMachine,
+  openAgentTurn,
+  queueInboundMessage,
+  recordLastPromptForChat,
+  setLanguageForChat,
+} from "../src/interview.js";
+import { DEFAULT_STRINGS, dispatchUpdate } from "../src/relay/dispatch.js";
+import { askText, uiString } from "../src/intake-copy.js";
+import {
+  advanceRouterOwnedQuestions,
+  applyDecision,
+  flushSettledInboundBursts,
+  forgetShownPreviewsForTests,
+  recoverStalledInterviews,
+  renderDueRouterPrompts,
+  retryFailedSteps,
+  setStepRetryBaseMsForTests,
+  startTripBotPoller,
+  STEP_RETRY_MAX_ATTEMPTS,
+} from "../src/relay/poller.js";
+import { openConflict } from "../src/answer-provenance.js";
+import { reserveDocument } from "../src/document-registry.js";
+import { contentDigest } from "../src/document-store.js";
 import { setInterpretPath } from "../src/interpret.js";
 import { draftDigest } from "../src/typed-changes.js";
 import { canonical } from "../src/answer-merge.js";
@@ -1514,6 +1538,467 @@ describe("#225 item 5: a change is dropped only when Telegram refuses it for goo
       assert.equal(tg.previews.length, 1, "shown once Telegram recovered (it was never seen, so the 'no' shows it first)");
       await say(pool, a, "no", tg, model);
       await assertWayOut(pool, a, "after a rate-limited re-show");
+    });
+  });
+});
+
+/** Like `crashOnce`, but only from the moment `arm()` is called: the relay failing at one seam, at one moment. */
+function armedCrash(pool: pg.Pool, match: RegExp): { db: pg.Pool; arm: () => void } {
+  let armed = false;
+  const guard = (query: (...a: any[]) => Promise<unknown>) => async (sql: unknown, params?: unknown) => {
+    if (armed && typeof sql === "string" && match.test(sql)) {
+      armed = false;
+      throw new Error("the read failed");
+    }
+    return query(sql, params);
+  };
+  const db = new Proxy(pool, {
+    get(target, prop) {
+      if (prop === "query") return guard(target.query.bind(target) as never);
+      if (prop === "connect") {
+        return async () => {
+          const client = await target.connect();
+          return new Proxy(client, {
+            get(c, p) {
+              if (p === "query") return guard(c.query.bind(c) as never);
+              const v = (c as any)[p];
+              return typeof v === "function" ? v.bind(c) : v;
+            },
+          });
+        };
+      }
+      const v = (target as any)[prop];
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  return { db, arm: () => { armed = true; } };
+}
+
+const SESSION_READ = /SELECT id, trip_id, state, phase, awaiting, answers, ui_state, language\s+FROM control_plane\.intake_sessions/;
+
+describe("#225 F-b: the read after a delivered preview cannot lose the preview", opts, () => {
+  test("the session re-read throws once the preview has gone out: the preview is still recorded as on screen (pc:), the change waits, nothing is dropped", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const { db, arm } = armedCrash(pool, SESSION_READ);
+      class ArmingTelegram extends Telegram {
+        override async sendMessage(p: Outgoing) {
+          const result = await super.sendMessage(p);
+          // The preview is delivered; the NEXT session read is the one after the send.
+          if (result.ok && (p.replyMarkup?.inline_keyboard ?? []).flat().some((b) => b.callback_data.startsWith("pc:"))) arm();
+          return result;
+        }
+      }
+      const tg = new ArmingTelegram();
+      const model = fakeModel(() => [update("Tokyo", { end: "2026-05-25" })]);
+      await say(db, a, "Tokyo ends 25", tg, model);
+      assert.equal(tg.previews.length, 1, `the preview was delivered: ${texts(tg.sent)}`);
+      const open = (await getOpenDraft(pool, a.sessionId))!;
+      assert.ok(open, "the change is waiting");
+      assert.ok((await lastPrompt(pool, a))?.startsWith(`pc:${open.id}:`), `and recorded as on screen: ${await lastPrompt(pool, a)}`);
+      assert.ok(!tg.sent.some((s) => s.text === en("change.droppedUnshown") || s.text === en("change.sendFailed")), texts(tg.sent));
+      // What the record is for: a typed "yes" confirms the preview that went out.
+      await say(pool, a, "yes", tg, model);
+      assert.equal((await stored(pool, a, "phases"))[0].end, "2026-05-25", "the typed yes applied the change it was shown");
+    });
+  });
+});
+
+/**
+ * Refuses the messages `refuse` matches, the way `HttpTelegramClient` reports it:
+ * `ok: false`, not a throw, and `permanent` only for a 400.
+ */
+class RefusingTelegram extends Telegram {
+  refuse: { match: (p: Outgoing) => boolean; permanent: boolean } | null = null;
+  override async sendMessage(p: Outgoing) {
+    if (this.refuse?.match(p)) {
+      this.sent.push({ text: p.text, buttons: (p.replyMarkup?.inline_keyboard ?? []).flat(), ok: false });
+      return this.refuse.permanent
+        ? { ok: false as const, error: "Bad Request: something about this message", permanent: true }
+        : { ok: false as const, error: "Too Many Requests: retry after 30" };
+    }
+    return super.sendMessage(p);
+  }
+}
+
+/** Every required question answered but `leave`, which is therefore the next thing to ask. */
+async function allRequiredBut(pool: pg.Pool, chat: Chat, leave: string) {
+  for (const q of INTAKE_QUESTIONS.filter((x) => x.required && x.id !== leave)) {
+    const value = q.id === "phases" ? structured(TWO)
+      : q.id === "travelers" ? structured([{ name: "Ruth Cohen", age: 70 }])
+      : { kind: "text", schema_version: 3, text: q.id === "organizer_identity" ? "Ruth Cohen" : "x" };
+    await pool.query(
+      "UPDATE control_plane.intake_sessions SET answers = answers || jsonb_build_object($2::text, $3::jsonb) WHERE id = $1",
+      [chat.sessionId, q.id, JSON.stringify(value)],
+    );
+  }
+}
+async function awaitingOf(pool: pg.Pool, chat: Chat): Promise<string> {
+  return (await pool.query("SELECT awaiting FROM control_plane.intake_sessions WHERE id = $1", [chat.sessionId])).rows[0]?.awaiting;
+}
+
+describe("#225 item 9: a question or summary Telegram did not take is asked again - and never forever", opts, () => {
+  const destination = INTAKE_QUESTIONS.find((q) => q.id === "destination")!;
+  const asksDestination = (p: { text: string }) => p.text.includes(askText(destination, "en"));
+  const stableDeps = (pool: pg.Pool, tg: Telegram, logs: string[] = []) =>
+    ({ db: pool, telegram: tg, connector: { pushInbound: () => true }, log: (l: string) => logs.push(l) }) as never;
+  const LATER = () => Date.now() + 3_600_000;
+  const offerOnScreen = (pool: pg.Pool, a: Chat) => pool.query(
+    "UPDATE control_plane.intake_sessions SET ui_state = (ui_state - 'pending_entry') || jsonb_build_object('last_prompt', 'optional_offer', 'offered_more', true) WHERE id = $1",
+    [a.sessionId],
+  );
+  const isSummary = (p: { text: string }) => p.text.includes(en("recapHeader"));
+  /**
+   * Nothing else scheduled to speak: a router prompt the tap left due would re-run
+   * `sendNextStep` ONCE, three seconds on, and is then spent - after that, a
+   * summary that still has not arrived is owed to the step retry alone.
+   */
+  const dueFlagSpent = (pool: pg.Pool, a: Chat) =>
+    pool.query("UPDATE control_plane.intake_sessions SET router_prompt_due_at = NULL WHERE id = $1", [a.sessionId]);
+
+  test("a required question refused FOR NOW: un-named, the machine still owes it, the tick does not hammer it, and after the backoff it is asked - once", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const tg = new RefusingTelegram();
+      const logs: string[] = [];
+      const deps = stableDeps(pool, tg, logs);
+      tg.refuse = { match: asksDestination, permanent: false };
+      const before = await lastPrompt(pool, a);
+      await markAwaitingMachine(pool, a.chatId);
+
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksDestination).length, 1, `attempted: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), before, "un-named: the dedupe must not take it for on screen");
+      assert.equal(await awaitingOf(pool, a), "machine", "the machine still owes the organizer this message");
+      assert.ok(logs.some((l) => l.includes("trip_bot.step_send_failed") && l.includes('"retry":true')), logs.join("\n"));
+
+      // The tick comes round again at once (700 ms in production): nothing is sent while the backoff runs.
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "not hammered");
+
+      tg.refuse = null;
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      const delivered = tg.sent.filter((s) => s.ok && asksDestination(s));
+      assert.equal(delivered.length, 1, `asked once the backoff passed: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), "q:destination", "and now it IS on screen");
+      assert.equal(await awaitingOf(pool, a), "person", "and it is the organizer's turn");
+
+      // Nothing twice: every path that could speak again finds it on screen.
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, "sent once");
+    });
+  });
+
+  test("the SUMMARY refused for now after Finish: un-named, and re-sent once the backoff passes - the tick scan alone never would", async () => {
+    await withChats(async (pool, a) => {
+      await atTheBoundary(pool, a);
+      await offerOnScreen(pool, a);
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      tg.refuse = { match: isSummary, permanent: false };
+      await tap(pool, a, FINISH_CALLBACK_DATA, tg, fakeModel(() => []));
+      await dueFlagSpent(pool, a);
+      assert.equal(tg.sent.filter(isSummary).length, 1, `the summary was attempted: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), "optional_offer", "un-named: what is on screen is still the offer");
+      assert.equal(await awaitingOf(pool, a), "machine");
+
+      tg.refuse = null;
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter((s) => s.ok && isSummary(s)).length, 0, "not before the backoff, and the scan does not cover a summary");
+
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      const shown = tg.sent.filter((s) => s.ok && isSummary(s));
+      assert.equal(shown.length, 1, `the summary arrived: ${texts(tg.sent)}`);
+      assert.ok(shown[0]!.buttons.some((b) => b.callback_data === CONFIRM_CALLBACK_DATA), "with its Confirm button");
+      assert.equal(await lastPrompt(pool, a), "recap");
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && isSummary(s)).length, 1, "sent once");
+    });
+  });
+
+  test("a PERMANENT refusal (a 400) is not retried automatically - no loop - and the organizer's next message tries it afresh", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const tg = new RefusingTelegram();
+      const logs: string[] = [];
+      const deps = stableDeps(pool, tg, logs);
+      tg.refuse = { match: asksDestination, permanent: true };
+      const before = await lastPrompt(pool, a);
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksDestination).length, 1);
+      assert.equal(await lastPrompt(pool, a), before, "un-named");
+      assert.equal(await awaitingOf(pool, a), "person", "not handed back: re-sending what Telegram refuses for good is a loop");
+      assert.ok(logs.some((l) => l.includes("trip_bot.step_send_failed") && l.includes('"permanent":true')), logs.join("\n"));
+
+      for (let i = 0; i < 3; i += 1) {
+        await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+        await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      }
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "no automatic retry");
+
+      // The organizer writes (anything): the machine owes a reply, and the question is not deduped away.
+      tg.refuse = null;
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, `asked on their next turn: ${texts(tg.sent)}`);
+    });
+  });
+
+  test("the first optional question after 'a few more questions', refused for now: the retry asks THAT question (the nomination is not spent by a send that did not arrive)", async () => {
+    await withChats(async (pool, a) => {
+      await atTheBoundary(pool, a);
+      await offerOnScreen(pool, a);
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      // The tap itself is answered with answerCallbackQuery; the one message it
+      // leads to is the first optional question, and that is what is refused.
+      tg.refuse = { match: () => true, permanent: false };
+      await tap(pool, a, MORE_CALLBACK_DATA, tg, fakeModel(() => []));
+      // The tap nominates the question; the router asks it on its next prompt.
+      await renderDueRouterPrompts(deps, DEFAULT_STRINGS, () => {}, 0);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      const attempted = tg.sent.filter((s) => !s.ok);
+      assert.equal(attempted.length, 1, `the first optional question was attempted: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), "optional_offer", "un-named");
+
+      tg.refuse = null;
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      const asked = tg.sent.filter((s) => s.ok && s.text === attempted[0]!.text);
+      assert.equal(asked.length, 1, `the same question arrived: ${texts(tg.sent)}`);
+      assert.ok((await lastPrompt(pool, a))?.startsWith("q:"), `and it is on screen: ${await lastPrompt(pool, a)}`);
+    });
+  });
+
+  test("a TYPED message whose reply is refused for now gets no 'I didn't follow' on top: the reply is owed to the retry, not replaced", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const tg = new RefusingTelegram();
+      tg.refuse = { match: asksDestination, permanent: false };
+      await say(pool, a, "hello there", tg, fakeModel(() => []));
+      assert.equal(tg.sent.filter(asksDestination).length, 1, `one attempt: ${texts(tg.sent)}`);
+      assert.ok(!tg.sent.some((s) => s.text.includes(en("didNotFollow"))), `no "didn't follow" over a reply Telegram did not take: ${texts(tg.sent)}`);
+      tg.refuse = null;
+      await retryFailedSteps(stableDeps(pool, tg), DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, texts(tg.sent));
+    });
+  });
+
+  test(`transient refusals in a row stop after ${STEP_RETRY_MAX_ATTEMPTS} attempts: the floor goes to the organizer and the log says so`, async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const tg = new RefusingTelegram();
+      const logs: string[] = [];
+      const deps = stableDeps(pool, tg, logs);
+      tg.refuse = { match: asksDestination, permanent: false };
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      for (let i = 0; i < STEP_RETRY_MAX_ATTEMPTS + 3; i += 1) {
+        await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      }
+      assert.equal(tg.sent.filter(asksDestination).length, STEP_RETRY_MAX_ATTEMPTS, texts(tg.sent));
+      assert.equal(await awaitingOf(pool, a), "person");
+      assert.equal(logs.filter((l) => l.includes("trip_bot.step_send_abandoned")).length, 1, logs.join("\n"));
+    });
+  });
+
+  test("the retry runs on the poller's own deliver tick (wired, not only callable)", async () => {
+    await withChats(async (pool, a) => {
+      await atTheBoundary(pool, a);
+      await offerOnScreen(pool, a);
+      const tg = new RefusingTelegram();
+      tg.refuse = { match: isSummary, permanent: false };
+      // BEFORE the failure (round 2, R3): the backoff is recorded when the send
+      // fails, so shortening it afterwards would still leave a real 2 s to wait.
+      // The poller starts only after, so the attempt is the tap's alone.
+      setStepRetryBaseMsForTests(20);
+      let stop = () => {};
+      try {
+        await tap(pool, a, FINISH_CALLBACK_DATA, tg, fakeModel(() => []));
+        await dueFlagSpent(pool, a);
+        assert.equal(tg.sent.filter(isSummary).length, 1, `attempted: ${texts(tg.sent)}`);
+        tg.refuse = null;
+        stop = startTripBotPoller(stableDeps(pool, tg), { longPollSeconds: 0, deliverIntervalMs: 10 });
+        const deadline = Date.now() + 5_000;
+        while (!tg.sent.some((s) => s.ok && isSummary(s)) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      } finally {
+        stop();
+        setStepRetryBaseMsForTests();
+        // Let the loops observe the stop before the fixture drops the pool.
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(tg.sent.filter((s) => s.ok && isSummary(s)).length, 1, texts(tg.sent));
+    });
+  });
+
+  test("askOpenConflict: a disagreement refused for now is not marked as asked, nothing goes out in its place, and it is asked once the backoff passes", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", TWO);
+      const bytes = new TextEncoder().encode("voucher");
+      const { document } = await reserveDocument(pool, { tripId: a.tripId, digest: contentDigest(bytes), byteSize: bytes.length });
+      const { conflict } = await openConflict(pool, {
+        tripId: a.tripId, questionId: "phases", entryKey: "n:|tokyo|2026-05-19", path: "end",
+        held: "2026-05-24", incoming: "2026-05-25", documentId: document.id,
+      });
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      const buttonsOf = (p: Outgoing | Sent) => ("buttons" in p ? p.buttons : (p.replyMarkup?.inline_keyboard ?? []).flat());
+      const asksConflict = (p: Outgoing | Sent) => buttonsOf(p).some((b) => b.callback_data.includes(conflict.id));
+      tg.refuse = { match: asksConflict, permanent: false };
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksConflict).length, 1, `attempted: ${texts(tg.sent)}`);
+      assert.notEqual(await lastPrompt(pool, a), `cfl:${conflict.id}`, "not marked as asked");
+      assert.equal(tg.sent.filter((s) => s.ok).length, 0, "and nothing went out in its place");
+
+      tg.refuse = null;
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && asksConflict(s)).length, 1, texts(tg.sent));
+      assert.equal(await lastPrompt(pool, a), `cfl:${conflict.id}`);
+    });
+  });
+
+  /** An open disagreement on this chat's trip, and a predicate for the message that asks it. */
+  async function openDisagreement(pool: pg.Pool, a: Chat) {
+    const bytes = new TextEncoder().encode("voucher");
+    const { document } = await reserveDocument(pool, { tripId: a.tripId, digest: contentDigest(bytes), byteSize: bytes.length });
+    const { conflict } = await openConflict(pool, {
+      tripId: a.tripId, questionId: "phases", entryKey: "n:|tokyo|2026-05-19", path: "end",
+      held: "2026-05-24", incoming: "2026-05-25", documentId: document.id,
+    });
+    const asks = (p: Outgoing | Sent) => ("buttons" in p ? p.buttons : (p.replyMarkup?.inline_keyboard ?? []).flat())
+      .some((b) => b.callback_data.includes(conflict.id));
+    return { conflict, asks };
+  }
+
+  test("round 2 (R1): a disagreement Telegram refuses FOR GOOD never blocks the interview - it is skipped, the next question goes out, and it is not asked again on later ticks", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      await hold(pool, a, "phases", TWO);
+      const { asks } = await openDisagreement(pool, a);
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      tg.refuse = { match: (p) => asks(p), permanent: true };
+      await markAwaitingMachine(pool, a.chatId);
+
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asks).length, 1, `the disagreement was attempted once: ${texts(tg.sent)}`);
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, `and the interview went on - the next question arrived: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), "q:destination");
+      assert.equal(await awaitingOf(pool, a), "person", "the organizer's turn");
+
+      // Later ticks, and a due retry: nothing loops, nothing is asked again.
+      for (let i = 0; i < 3; i += 1) {
+        await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+        await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      }
+      assert.equal(tg.sent.filter(asks).length, 1, "the disagreement is not re-asked");
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "and the question is not repeated");
+    });
+  });
+
+  test("round 2 (R1): the refused disagreement's key stays recorded (the old dedupe), so a question that then fails for now is retried WITHOUT the disagreement being asked again", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      await hold(pool, a, "phases", TWO);
+      const { conflict, asks } = await openDisagreement(pool, a);
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      // The disagreement is refused for good; the question after it only for now.
+      let failQuestion = true;
+      const original = tg.sendMessage.bind(tg);
+      tg.sendMessage = (async (p: Outgoing) => {
+        const refused = asks(p) || (failQuestion && asksDestination(p));
+        if (!refused) return original(p);
+        tg.sent.push({ text: p.text, buttons: (p.replyMarkup?.inline_keyboard ?? []).flat(), ok: false });
+        return asks(p)
+          ? { ok: false as const, error: "Bad Request: something about this message", permanent: true }
+          : { ok: false as const, error: "Too Many Requests: retry after 30" };
+      }) as never;
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asks).length, 1);
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "the question was attempted after the skipped disagreement");
+      assert.equal(await lastPrompt(pool, a), `cfl:${conflict.id}`, "the question rolled back to the disagreement's key, which stays recorded");
+      assert.equal(await awaitingOf(pool, a), "machine", "the question is owed");
+
+      failQuestion = false;
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, `retried and delivered: ${texts(tg.sent)}`);
+      assert.equal(tg.sent.filter(asks).length, 1, "without asking the disagreement again");
+    });
+  });
+
+  test("round 2 (R6): a required answer RE-RAISED at the boundary, refused for now: un-named, owed, and asked once the backoff passes", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      // It stepped aside after a reply that did not answer it: nothing required is
+      // next, but a required answer is missing - the boundary brings it back.
+      await deferQuestionForChat(pool, a.chatId, "destination");
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg);
+      const reRaise = (p: { text: string }) => p.text.startsWith(en("beforeWeFinish"));
+      tg.refuse = { match: reRaise, permanent: false };
+      const before = await lastPrompt(pool, a);
+      await markAwaitingMachine(pool, a.chatId);
+
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(reRaise).length, 1, `the re-raise was attempted: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), before, "un-named");
+      assert.equal(await awaitingOf(pool, a), "machine", "still owed");
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "not hammered during the backoff");
+
+      tg.refuse = null;
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter((s) => s.ok && asksDestination(s)).length, 1, `asked, once: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), "q:destination");
+      assert.equal(await awaitingOf(pool, a), "person");
+    });
+  });
+
+  test("round 2 (R7d): a send that fails AFTER another speaker put something on screen does not un-name theirs or take the turn back", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const logs: string[] = [];
+      const tg = new RefusingTelegram();
+      const deps = stableDeps(pool, tg, logs);
+      // While the question is in flight, another speaker's message lands and is
+      // recorded; then Telegram refuses the question.
+      const original = tg.sendMessage.bind(tg);
+      tg.sendMessage = (async (p: Outgoing) => {
+        if (!asksDestination(p)) return original(p);
+        await recordLastPromptForChat(pool, a.chatId, "optional_offer");
+        tg.sent.push({ text: p.text, buttons: [], ok: false });
+        return { ok: false as const, error: "Too Many Requests: retry after 30" };
+      }) as never;
+      await markAwaitingMachine(pool, a.chatId);
+      await advanceRouterOwnedQuestions(deps, DEFAULT_STRINGS, () => {});
+      assert.equal(tg.sent.filter(asksDestination).length, 1);
+      assert.equal(await lastPrompt(pool, a), "optional_offer", "theirs stays named");
+      assert.equal(await awaitingOf(pool, a), "person", "and the turn is not taken back over it");
+      assert.ok(logs.some((l) => l.includes("trip_bot.step_send_failed") && l.includes("SPOKEN_SINCE")), logs.join("\n"));
+      await retryFailedSteps(deps, DEFAULT_STRINGS, () => {}, LATER());
+      assert.equal(tg.sent.filter(asksDestination).length, 1, "nothing owed to the retry");
+    });
+  });
+
+  test("recoverStalledInterviews: a recovery Telegram did not take is not recorded as on screen", async () => {
+    await withChats(async (pool, a) => {
+      await allRequiredBut(pool, a, "destination");
+      const tg = new RefusingTelegram();
+      const logs: string[] = [];
+      tg.refuse = { match: (p) => p.text.startsWith(en("resumed")), permanent: false };
+      const before = await lastPrompt(pool, a);
+      await openAgentTurn(pool, a.chatId, a.sessionId);
+      await markAwaitingMachine(pool, a.chatId);
+      await recoverStalledInterviews(stableDeps(pool, tg), DEFAULT_STRINGS, (l) => logs.push(l), 0);
+      assert.equal(tg.sent.filter((s) => s.text.startsWith(en("resumed"))).length, 1, `attempted: ${texts(tg.sent)}`);
+      assert.equal(await lastPrompt(pool, a), before, "a question nobody received is not on screen");
+      assert.ok(logs.some((l) => l.includes("trip_bot.stalled_turn_recovery_failed")), logs.join("\n"));
     });
   });
 });
