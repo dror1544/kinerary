@@ -59,7 +59,7 @@ Scope and design: [`document-intake-feature-plan.md`](document-intake-feature-pl
 ### After confirmation — the correction flow (owner of post-confirm documents)
 
 Decided 2026-09-13: the relay's correction flow is the **authoritative owner** of
-documents received after confirmation (`document-correction.ts`, migration 0055).
+documents received after confirmation (`document-correction.ts`, migration `20260918110132_document_corrections.sql`).
 
 - **Route.** A file the organizer sends in their own private chat with the bot, after
   confirmation, goes to this flow, not to the companion gateway. The conditions
@@ -122,6 +122,25 @@ Owner's decision, 2026-09-26 (Release A).
   creates one (`trip_document_corrections`, migration `20260918110132`, which is new
   in Release A). A relay that has never had the route on has no proposal to tap. The
   web `POST /v1/trips/:id/intake/correct` predates this flow and is unchanged.
+- **Turning it off again does not withdraw proposals already made.** A proposal stays
+  `pending` (a `not_now` result also puts its row back to `pending`), and the tap above
+  is not gated, so on a relay where the route has been on, an old proposal stays
+  approvable after the flag is switched off. Before switching it off on such a relay,
+  have the organizer press Keep on every pending proposal (or reject them through the
+  same code path); nothing expires them. A code follow-up (check the flag in
+  `applyCorrectionCallback`, or expire pending rows) is tracked on #217.
+- **On the VM the variable cannot be set from a values file.** The VM relay's
+  environment is an explicit list in `compose.vm.yml` plus two auth env files;
+  `vm.env` and `provisioning.env` feed only compose interpolation, so a value there
+  does nothing to the relay. Turning the route on for the VM therefore needs a
+  `compose.vm.yml` change, i.e. a release. On the Mac, `scripts/relay-restart.sh`
+  sources `provisioning.env` with `set -a`, so a line there turns it on for the Mac
+  relay only.
+- **The walk before 3 Oct runs on the Mac relay, never the VM's.** Setting the flag on
+  the VM relay while Orlando or Japan is live would put those organizers' chats on
+  this route; the two conditions above already forbid it, and this says it outright.
+  The Mac and the VM have separate databases and bots, so a walk on the Mac cannot
+  approve anything on the VM.
 
 **Legacy fallback.** `trip-confirmation-intake` still handles what this flow does not
 take: files posted in groups or by other members, and relays with no model runner.
