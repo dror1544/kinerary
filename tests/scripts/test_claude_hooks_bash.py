@@ -36,6 +36,8 @@ class Harness(unittest.TestCase):
             shutil.copy2(REPO / "scripts/claude-hooks" / name, self.root / "scripts/claude-hooks" / name)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         self.env["HERMES_HOME"] = self.hermes.name
+        self.log = self.root.parent / (self.root.name + "-decisions.tsv")
+        self.env["KINERARY_HOOK_LOG"] = str(self.log)  # never the real log
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
         subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
         subprocess.run(["git", *GIT_ID, "commit", "-qm", "first"], cwd=self.root, check=True)
@@ -49,6 +51,37 @@ class Harness(unittest.TestCase):
         out = subprocess.run(["bash", "scripts/claude-hooks/pretooluse-bash.sh"], cwd=self.root, env=self.env,
                              input=json.dumps(payload), capture_output=True, text=True, timeout=120).stdout.strip()
         return json.loads(out)["hookSpecificOutput"] if out else {}
+
+
+class EveryDecisionIsCounted(Harness):
+    """2026-09-26: the hook appends one line per decision to a local log outside the
+    repository, so "how many prompts does a change cost" is measured, not inferred
+    (docs/test-reports/process-baseline-2026-09-26.md). The command itself is never
+    written: it can carry a secret. A log that cannot be written never changes a
+    decision."""
+
+    def rows(self):
+        return [l.split("\t") for l in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def test_an_ask_and_a_deny_are_each_one_line(self):
+        self.hook("git commit -m 'note'")
+        self.hook("git commit -m 'note'", agent_type="developer")
+        rows = self.rows()
+        self.assertEqual([r[3:5] for r in rows], [["commit", "ask"], ["commit", "deny"]])
+        self.assertEqual([r[2] for r in rows], ["lead", "developer"])
+
+    def test_the_command_is_never_written(self):
+        self.hook("git commit -m 'token=s3cr3t-value'")
+        self.assertNotIn("s3cr3t", self.log.read_text())
+
+    def test_an_unclassified_command_is_not_logged(self):
+        self.hook("ls -la")
+        self.assertEqual(self.rows(), [])
+
+    def test_an_unwritable_log_changes_nothing(self):
+        self.env["KINERARY_HOOK_LOG"] = "/dev/null/cannot/exist.tsv"
+        d = self.hook("git commit -m 'note'")
+        self.assertEqual(d.get("permissionDecision"), "ask")
 
 
 class TheLeadSessionIsAsked(Harness):
