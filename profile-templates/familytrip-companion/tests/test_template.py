@@ -55,23 +55,41 @@ class Tests(unittest.TestCase):
 # told a real family a dinner had "nut-free options for Eitan". Whatever a
 # prompt shows as an example, a model can hand back as a fact.
 #
-# The checks work on QUOTED SPANS, because that is the shape a model copies —
-# a sentence in quotation marks is a sentence it has been shown how to say. A
-# span is "need-bearing" when it holds a health/dietary/mobility term. Three
+# The checks work on EXAMPLE SPANS, because that is the shape a model copies —
+# text set off as something to say. A span is any of:
+#   - a quotation on one line: "…", “…”, «…», „…“, '…', ‘…’ (a single quote
+#     counts only when no letter touches its outside, so "organizer's" never
+#     opens one);
+#   - a markdown blockquote line (`> …`) — this package's own idiom for a
+#     sample message (SOUL.md.tpl's escaping example);
+#   - a line inside a ``` fence — the skills' idiom for a message template;
+#   - what follows "e.g." / "for example" / "for instance" / «למשל» /
+#     «לדוגמה» up to the end of the sentence, quoted or not.
+# A span is "need-bearing" when it holds a health/dietary/mobility term. Three
 # things are then checked, deliberately not by string-matching the one bad
 # sentence (a rewording would pass that):
 #  (a) a need-bearing span names no one: no capitalised Latin word except one
-#      opening the span or a sentence in it, and no name from EXAMPLE_NAMES in
-#      either script. A person in
-#      such a span must be a placeholder (`<name>`), which is lower-case inside
-#      angle brackets and so never matches.
-#  (b) no name from EXAMPLE_NAMES appears anywhere in a rendered bundle unless
-#      the handoff put it there.
+#      opening the span or a sentence in it; no single-letter initial ("E.");
+#      no kin word pointing at a person ("for her son", «לבן שלה»); and no
+#      name from EXAMPLE_NAMES in either script, in any letter case. A person
+#      in such a span must be a placeholder (`<name>`), which is lower-case
+#      inside angle brackets and so never matches.
+#  (b) no name from EXAMPLE_NAMES appears anywhere in a rendered bundle, in any
+#      letter case, unless the handoff put it there.
 #  (c) (a) and (b) over the TEMPLATE SOURCES, so an edit is caught at the file
 #      that was edited rather than at whatever a render happens to include.
-# What this cannot see, and says so: a new invented name outside a
-# need-bearing span that is not on the list, and a Hebrew name inside a Hebrew
-# need-bearing span that is not on the list (Hebrew has no capital letters).
+# What this CANNOT see, every gap known on 2026-09-26 (each is pinned below as
+# a case the check lets through, so a change that closes one shows up):
+#  - a name not on EXAMPLE_NAMES that opens a sentence inside a need-bearing
+#    span ("…nut-free menu. Lior will love it"): at a sentence start a capital
+#    is grammar, and telling "Lior" from "Please" needs a name list;
+#  - a Hebrew name not on EXAMPLE_NAMES (Hebrew has no capital letters), with
+#    or without a prefix: «לליאור»;
+#  - a name not on the list outside any need-bearing span;
+#  - an example that is none of the span shapes above: plain prose with no
+#    quote, blockquote, fence or "e.g." marker, or a quotation broken across
+#    lines;
+#  - a need term the vocabulary below does not hold.
 # The list is the names this repo's own prompts use as examples (grep, #240
 # handover); the Hebrew half leaves out the ones that are also ordinary words
 # (גל wave, שי gift, אבי my father, אלה these, דנה judges), which would make
@@ -82,41 +100,58 @@ EXAMPLE_NAMES_HE=('נועה','שגיא','רות','יעל','עומרי','תומר
 # exactly what the fix tells a companion to say. So it counts only with a
 # prefix («לאיתן», for Eitan), which the preposition never takes.
 HE_LETTER='\u05d0-\u05ea'
-NAME_RE=re.compile(r'\b(?:'+'|'.join(EXAMPLE_NAMES_EN)+r')\b'
+NAME_RE=re.compile(r'(?i:\b(?:'+'|'.join(EXAMPLE_NAMES_EN)+r')\b)'
  +r'|(?<!['+HE_LETTER+r'])(?:[ולבהמשכ]?(?:'+'|'.join(EXAMPLE_NAMES_HE)+r')|[ולבהמשכ]איתן)(?!['+HE_LETTER+r'])')
 NEED_RE=re.compile(
  r'allerg|anaphyla|epi-?pen|\bnuts?\b|nut-free|peanut|tree.nut|sesame|shellfish|gluten|celiac|coeliac|lactose|dairy'
  r'|kosher|halal|vegan|vegetarian|pescatarian|diabet|insulin|asthma|wheelchair|mobility|medical|medication|dietary'
  r'|אלרג|אגוז|בוטנ|שומשום|גלוטן|צליאק|לקטוז|כשר|חלאל|טבעונ|צמחונ|סוכרת|אינסולין|אסתמה|כיסא גלגלים|תרופ',re.I)
-# A quoted span on one line: "…", “…”, «…», „…“. Bounded, so an unmatched
-# quote cannot swallow a page.
-QUOTE_RE=re.compile(r'"([^"\n]{3,300})"|“([^”\n]{3,300})”|«([^»\n]{3,300})»|„([^“\n]{3,300})“')
+# Bounded, so an unmatched quote cannot swallow a page.
+QUOTE_RE=re.compile(r'"([^"\n]{3,300})"|“([^”\n]{3,300})”|«([^»\n]{3,300})»|„([^“\n]{3,300})“'
+ r"|(?<![\w'])'([^'\n]{3,300})'(?![\w'])|‘([^’\n]{3,300})’")
+EXAMPLE_MARK_RE=re.compile(r'(?:\be\.g\.|\bfor (?:example|instance)\b|למשל|לדוגמה)[:,]?\s*(.{3,300}?)(?=[.;!?](?:\s|$)|$)',re.I)
+BLOCKQUOTE_RE=re.compile(r'^\s*>\s?(.{3,})$')
 CAPITAL_RE=re.compile(r'(?<![\w<`$])[A-Z][a-z]+')
+INITIAL_RE=re.compile(r'(?<![\w.])[A-Z]\.(?![\w.])')
+KIN_RE=re.compile(r'\b(?:his|her|their|your|my|our|the)\s+(?:son|daughter|kids?|child(?:ren)?|husband|wife|partner'
+ r'|mom|mum|mother|dad|father|grandma|grandmother|grandpa|grandfather|baby|toddler|brother|sister)\b'
+ # Hebrew kin needs the possessive: bare בן/בת is also "aged" («בן 12»).
+ r'|(?<!['+HE_LETTER+r'])[ולבהמשכ]?ה?(?:בן|בת|ילד|ילדה|אח|אחות)\s+של(?:ה|ו|כם|כן|ך|נו|י)(?!['+HE_LETTER+r'])'
+ r'|(?<!['+HE_LETTER+r'])[ולבהמשכ]?(?:בנה|בתה|בנו|בתו|סבתא|סבא)(?!['+HE_LETTER+r'])',re.I)
 TEXT_SUFFIXES={'.md','.tpl','.py','.json','.yaml','.txt'}
 
-def need_quote_problems(text):
- """(a): every quoted span that holds a need term and also names someone."""
- out=[]
+def example_spans(text):
+ """Every (line number, span) a model could take as a sentence to say."""
+ fenced=False
  for n,line in enumerate(text.splitlines(),1):
-  for m in QUOTE_RE.finditer(line):
-   span=next(g for g in m.groups() if g is not None)
-   if not NEED_RE.search(span): continue
-   # A capital that opens the span, a sentence or a bullet inside it is
-   # grammar, not a name. Anything else capitalised is someone.
-   named=[w.group(0) for w in CAPITAL_RE.finditer(span)
-          if not re.search(r'(^|[.!?:;—–]\s*)[\s(*_\'"•·-]*$',span[:w.start()])]
-   named+=NAME_RE.findall(span)
-   if named: out.append(f'line {n}: "{span}" names {sorted(set(named))}')
+  if line.lstrip().startswith('```'): fenced=not fenced; continue
+  if fenced and line.strip(): yield n,line.strip()
+  m=BLOCKQUOTE_RE.match(line)
+  if m: yield n,m.group(1)
+  for m in QUOTE_RE.finditer(line): yield n,next(g for g in m.groups() if g is not None)
+  for m in EXAMPLE_MARK_RE.finditer(line): yield n,m.group(1)
+
+def need_quote_problems(text):
+ """(a): every example span that holds a need term and also names someone."""
+ out=[]
+ for n,span in example_spans(text):
+  if not NEED_RE.search(span): continue
+  # A capital that opens the span, a sentence or a bullet inside it is
+  # grammar, not a name. Anything else capitalised is someone.
+  named=[w.group(0) for w in CAPITAL_RE.finditer(span)
+         if not re.search(r'(^|[.!?:;—–]\s*)[\s(*_\'"•·>-]*$',span[:w.start()])]
+  named+=INITIAL_RE.findall(span)+KIN_RE.findall(span)+NAME_RE.findall(span)
+  if named: out.append(f'line {n}: "{span}" names {sorted(set(named))}')
  return out
 
 def example_name_problems(text,roster=()):
  """(b): every example name in the text that the roster did not supply."""
- given={w for r in roster for w in r.split()}
+ given={w.casefold() for r in roster for w in r.split()}
  out=[]
  for n,line in enumerate(text.splitlines(),1):
   for m in NAME_RE.finditer(line):
    name=m.group(0)
-   if name in given or name[1:] in given: continue
+   if name.casefold() in given or name[1:].casefold() in given: continue
    out.append(f'line {n}: {name!r} in {line.strip()[:120]!r}')
  return out
 
@@ -149,10 +184,26 @@ class NoExamplePeople(unittest.TestCase):
   self.assertTrue(example_name_problems('a menu for Eitan'))
   self.assertTrue(example_name_problems('מתאים לאיתן'))
   self.assertEqual(example_name_problems('כדאי לוודא איתן לפני שיוצאים'),[])
+  # Round-2 rewordings of the incident, each one a shape the first lint let through.
+  for caught in ('"the ramen place has a nut-free menu for eitan"',
+                 '"the ramen place has a nut-free menu for E."',
+                 "so name it ('the ramen place has a nut-free menu for Lior')",
+                 '> the ramen place has a nut-free menu for Lior',
+                 '```\nthe ramen place has a nut-free menu for Lior\n```',
+                 'name it, e.g. the ramen place has a nut-free menu for Lior.',
+                 'למשל: יש שם תפריט ללא גלוטן לבן שלה',
+                 '"the ramen place has a nut-free menu for her son"'):
+   self.assertTrue(need_quote_problems(caught),caught)
+  # Known gaps, pinned so closing one is noticed (see the header).
+  for gap in ('"the ramen place has a nut-free menu. Lior will love it"',
+              '"יש שם תפריט ללא אגוזים לליאור"',
+              'the ramen place has a nut-free menu for Lior'):
+   self.assertEqual(need_quote_problems(gap),[],gap)
   # …and must NOT fire on the forms the fix uses, or on ordinary prose.
   self.assertEqual(need_quote_problems('"<venue>\'s site lists a <need> option for <name>; I couldn\'t confirm it"'),[])
   self.assertEqual(need_quote_problems('"Nut-free options are listed online; please check with the venue"'),[])
   self.assertEqual(need_quote_problems('"• Remember what people need — diets, allergies, preferences"'),[])
+  self.assertEqual(need_quote_problems("the organizer's choice; a need's visibility isn't 'group' by default"),[])
   self.assertEqual(example_name_problems('Galapagos, Avignon, Mayan ruins, gallery'),[])
   self.assertEqual(example_name_problems('Eitan, Noa',roster=('Eitan','Noa')),[])
 
@@ -190,7 +241,7 @@ class NoExamplePeople(unittest.TestCase):
   # new rules are present. Asserted on the RENDERED text, section by section.
   soul=(self.render_empty_needs()/'SOUL.md').read_text()
   privacy=soul.split('## Privacy and learning',1)[1].split('\n## ',1)[0]
-  self.assertIn('`"group"`: the family knows, so name',privacy)
+  self.assertIn('`"group"`: the family knows, so when it matters name the person by their roster name',privacy)
   self.assertIn('plan around it without naming the person or the need',privacy)
   self.assertIn('A `critical` one, an allergy, is never optional',privacy)
   self.assertIn('A need is a recorded fact, never an inference',privacy)
@@ -199,7 +250,13 @@ class NoExamplePeople(unittest.TestCase):
   # not a participant need; the rule must count it or it drops a real allergy.
   self.assertIn('is a `standing_instructions` entry',privacy)
   self.assertIn('never pin it on somebody',privacy)
-  self.assertIn('never name anyone who is not on it',privacy)
+  # Round 2: a need saved earlier (memory, a trip rule, the organizer's DM)
+  # still exists; a chat-told need is organizer-only; people who are named in
+  # the conversation but not on the roster can still be spoken of.
+  self.assertIn("or earlier and you saved it to this trip's memory or as a trip rule",privacy)
+  self.assertIn('A need told to you in chat has no `visibility` of its own: it is organizer-only',privacy)
+  self.assertIn('nor named to you in this conversation, and never introduce a person nobody named',privacy)
+  self.assertNotIn('never name anyone who is not on it',privacy)
   self.assertIn('never stated flatly',privacy)
 
 if __name__=='__main__': unittest.main()
