@@ -245,3 +245,144 @@ loaded source and review/trust the changed hooks through the normal UI.
 Native `ask` prompt parity with Claude is unavailable in the tested runtime;
 Codex blocks those actions and the owner must perform or authorize a supported
 workflow outside that denied call. No real push or deployment was attempted.
+
+## 8. Review round 1 (PR #260)
+
+Four review findings, each reproduced before the change and fixed on
+`fix/codex-hooks-r1` (base `69f34ab`). Every new test in
+`tests/scripts/test_codex_hook_adapter.py` below was run against 69f34ab's
+adapter (28 subtest failures) and against the fixed adapter (34 tests, OK).
+
+**Header whitespace.** Codex's `apply_patch` trims a header line before it
+takes the path, so `*** Update File: .project/sprint.json ` (trailing space,
+tab or NBSP; also `*** Move to:`) updated `.project/sprint.json` while the
+adapter checked the path with the whitespace and answered `{}`. Proven offline
+with codex-cli 0.153.2's own engine, no model, in a scratch directory that is
+not a repository: `codex --codex-run-as-apply-patch '<patch>'`, once per code
+point, trailing an `Update File` header on an existing `t.json`.
+
+- Codex trims exactly Unicode White_Space: U+0009, U+000B, U+000C, U+000D,
+  U+0020, U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F,
+  U+205F, U+3000 (U+000A splits lines). It keeps every other control and
+  format character (U+0001–U+0008, U+000E–U+001F, U+007F–U+009F bar U+0085,
+  U+00AD, U+200B–U+200F, U+202A–U+202E, U+2060–U+2064, U+2066–U+206F,
+  U+FEFF and the other format characters probed up to U+3000).
+  Python's `str.strip()` also strips U+001C–U+001F, which Codex keeps.
+- Indented headers (any trimmed character before `***`) are applied; a
+  leading U+001C/U+001F/U+200B/U+FEFF makes Codex reject the hunk.
+- Only the header line is trimmed: a space after `*** Add File: ` is kept
+  (`*** Add File:  a.md` wrote ` a.md`); a leading tab or CR after the prefix
+  wrote `a.md` while Codex reported `\ta.md`.
+- Header prefixes are exact: `*** Add File:a.md`, `***  Add File: a.md`,
+  `*** Add File:\ta.md` and `*** add file: a.md` are rejected.
+
+The adapter now splits on `\n` only, trims each line with that exact set, and
+refuses a header path that starts with whitespace or contains any whitespace
+other than U+0020 or any control/format character (Unicode category C). An
+interior ASCII space stays allowed; every character Codex might treat
+differently from the adapter is a denial, not a guess.
+
+**Empty deny reason.** A deny whose `permissionDecisionReason` is empty
+is treated by Codex as a failed hook and the call runs (string in the 0.153.2
+binary, found by the reviewer). `denied()` now always carries a non-empty
+reason.
+
+**Agent identity.** `agent_id` of `0`, `""` or `False` without a role, and
+`agent_type` of `"\n"` (which the shared hooks' `$(jq …)` strips to empty),
+were treated as the lead. The captured Codex payloads
+(`capture.jsonl`, 18 hook payloads) carry `agent_id` on 3, all from a
+subagent and all with `agent_type: "default"`; the other 15 carry neither key. The adapter now refuses a present `agent_type` that is not a non-empty
+string after strip, and a non-null `agent_id` without `agent_type`.
+
+**Test import.** `python3 -m unittest tests.scripts.test_codex_hook_adapter`
+failed (`No module named 'test_claude_hooks_bash'`); the test now puts its own
+directory on `sys.path`.
+
+Not done in this round (owner's decision): whether a command's `workdir`
+reaches the hook, a fail-closed command wrapper in `.codex/hooks.json`, hook
+files being writable through the hook, and CI not running `tests/scripts`.
+
+## 9. Review round 2 (PR #261)
+
+Three findings, each reproduced on `eb67fd1` before the change (end to end
+through the real shared hooks in a throwaway repository) and fixed on
+`fix/codex-hooks-r1`. The adapter suite runs 48 tests: 22 fail on eb67fd1's
+adapter, and all pass on the fix.
+
+**Header lookalikes in an Update hunk.** Round 1 trimmed every line, so a
+context line ` *** Update File: .project/sprint.json` in an edit of
+`docs/readme.md` was read as a second file operation, and the edit was denied.
+Offline Codex applies that patch and changes only `docs/readme.md`.
+`patch_paths` is now a state machine that follows Codex's parser. Each of
+these rules was measured with the offline engine:
+
+- A file header is read, after trimming, only at header position: after
+  `*** Begin Patch`, after an Add body (the raw `+` lines), or after a Delete.
+- An Update body runs to the first line whose raw text starts with `***`. A
+  line that trims to `*** End of File` stays inside it; Codex accepts one with
+  a trailing space. An indented or tab-prefixed header inside an Update body
+  is context, or a Codex error.
+- `*** Move to:` counts only as the raw line directly after its Update header.
+  Its value is trimmed at the end but keeps a leading space. An indented Move
+  line is context.
+- A blank line at header position is rejected by Codex, and the adapter now
+  refuses it too, along with any other non-header at that position.
+- A leading U+0020 in a path is kept by Codex (`*** Add File:  a.md` writes
+  ` a.md`, for Add, Update, Delete and Move alike). The adapter now checks
+  that literal path instead of refusing it.
+
+*Differential harness.* Every patch runs through
+`codex --codex-run-as-apply-patch` in a fresh scratch directory outside any
+repository, seeded with files that contain header-lookalike lines. The
+harness compares the files Codex created, changed or deleted with what
+`patch_paths` returns.
+
+The corpus has 3,256 patches: 56 targeted, 1,200 random and 2,000 random
+biased towards valid shapes. Codex applied 761 and rejected 2,495. 178 of
+the rejected patches still wrote files before failing, so the invariant is
+checked whenever anything changed, not only on success.
+
+Results for the adapter on this branch:
+- 0 dangerous disagreements: a file touched but neither listed nor refused.
+- 0 false positives: a patch Codex applies that the adapter refuses, or one
+  where it lists an untouched protected path.
+
+For comparison, eb67fd1 had 0 dangerous and 247 false positives on the same
+corpora. `DifferentialAgainstCodex` in the test file replays 18 key shapes
+through the engine when `codex` is runnable, and skips otherwise.
+
+**NUL in `agent_type`.** `"\u0000"`, `"\u0000\n"` and `"\u0000\u0000"`
+passed the round-1 blank check. Bash cannot hold NUL, so the shared hook read
+an empty role and treated the caller as the lead. On eb67fd1 a `fix/` commit
+logged `lead commit allow`, and a CLAUDE.md patch returned `{}`. The adapter
+now refuses any `agent_type` containing a Unicode category-C character, in
+addition to a blank one. `default`, `developer` and `doc keeper` still reach
+the shared hook as subagents.
+
+**Alias spellings on a case-insensitive filesystem.** On this Mac's APFS
+volume, `.PROJECT/sprint.json`, `.project/SPRINT.JSON` and
+`.project/<U+017F>print.json` open the existing `.project/sprint.json`.
+Likewise `claude.md` opens `CLAUDE.md` and `TRIP/proof.txt` opens
+`trip/proof.txt`. `Path.resolve()` keeps the given spelling, so on eb67fd1
+each of these returned `{}`.
+
+`checked_paths` now rewrites every existing component to the directory entry
+that is the same file (`os.path.samestat`). A component that does not exist
+stays as written, so `.PROJECT/newfile` becomes `.project/newfile`. A
+spelling that matches two entries (hard links) is refused. The tests skip on
+a case-sensitive filesystem.
+
+**The same weakness in Claude's own write hook (not changed here).** Fed
+`file_path` values directly, `scripts/claude-hooks/pretooluse-write.sh` gave
+these results in a throwaway repository on this Mac, 2026-09-26:
+
+| `file_path` | Decision |
+|---|---|
+| `.project/sprint.json` | deny |
+| `.PROJECT/sprint.json` | allowed (no output) |
+| `.project/<U+017F>print.json` | allowed (no output) |
+| `trip/x.txt` | deny |
+| `TRIP/x.txt` | allowed (no output) |
+| `claude.md` as `developer` | allowed (no output) |
+
+This is a finding for the owner, not part of this PR.
