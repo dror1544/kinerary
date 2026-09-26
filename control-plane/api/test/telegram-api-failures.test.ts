@@ -83,6 +83,24 @@ describe("#225: a failed send says whether it would fail again", () => {
     });
   }
 
+  test("ONLY a 400 is permanent: a 401, a 403 and a 404 are not (round 2) - the bot blocked, the token revoked or a chat gone is no verdict on THIS message", async () => {
+    for (const [status, description] of [
+      [401, "Unauthorized"],
+      [403, "Forbidden: bot was blocked by the user"],
+      [404, "Not Found"],
+      [409, "Conflict: terminated by other getUpdates request"],
+    ] as const) {
+      const { result, calls, waits } = await send([{ status, body: { ok: false, error_code: status, description } }]);
+      assert.equal(result.ok, false, String(status));
+      assert.notEqual(result.permanent, true, `${status} must be transient`);
+      assert.equal(isPermanentRefusal(result), false, String(status));
+      assert.equal(calls.length, 1, `${status}: not retried`);
+      assert.deepEqual(waits, [], `${status}: not waited on`);
+    }
+    const { result } = await send([badRequest]);
+    assert.equal(isPermanentRefusal(result), true, "and a 400 still is");
+  });
+
   test("a status of 400 without Telegram's body is still permanent; ok:false with no code at all is not", async () => {
     const plain = await send([{ status: 400, body: "not json" }]);
     assert.equal(plain.result.permanent, true);

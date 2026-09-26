@@ -2395,11 +2395,24 @@ async function showChangeDraft(
     }
     return permanent ? "refused" : "send_failed";
   }
-  if (covered && !covered.startsWith("pc:") && covered !== draft.displacedPrompt) {
-    await recordDisplacedPrompt(deps.db, { draftId: draft.id, sessionId: view.sessionId, prompt: covered });
+  // SOMETHING MAY HAVE BEEN SAID WHILE THIS WAS IN FLIGHT. The send is a round
+  // trip to Telegram - up to RETRY_AFTER_CAP_SECONDS longer when a 429 is waited
+  // out - and the floor is a flag, not a lease: a tap's next step (the boundary
+  // offer, sent ONCE) can take it and record itself in that window. The `pc:`
+  // key below then goes over it, so it is what this preview covers and has to
+  // come back when the change is settled (#225 round 2). A non-`pc:` prompt that
+  // differs from the one read before the send was said during it; anything else
+  // (unchanged, cleared, another preview) leaves `covered` as it was. What
+  // remains is the few DB round trips between this read and the `pc:` record.
+  const landed = await getSessionForChat(deps.db, chatId);
+  const during = landed.ok ? landed.view.lastPrompt ?? "" : "";
+  const displaced = during && !during.startsWith("pc:") && during !== covered ? during : covered;
+  if (displaced && !displaced.startsWith("pc:") && displaced !== draft.displacedPrompt) {
+    await recordDisplacedPrompt(deps.db, { draftId: draft.id, sessionId: view.sessionId, prompt: displaced });
     (deps.log ?? (() => {}))(structuredLog("info", "interview.change_displaced_moved", {
       // The key's first two parts only: a question key can carry an unsettled answer's text after them.
-      session_id: view.sessionId, draft_id: draft.id, displaced: covered.split(":").slice(0, 2).join(":"),
+      session_id: view.sessionId, draft_id: draft.id, displaced: displaced.split(":").slice(0, 2).join(":"),
+      during_send: displaced !== covered,
     }));
   }
   // Recorded only now that it was delivered, and carrying the digest: a typed
