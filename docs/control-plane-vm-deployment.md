@@ -507,6 +507,48 @@ After the first real interview on a build that has #199, grep the relay log for
 `interview.change_floor_taken_back`, `interview.change_dropped_unshowable` and
 `trip_bot.floor_lost`.
 
+**A chat whose Telegram sends keep failing can refuse a relay restart (PR #234,
+issue #225).** A router step Telegram will not take (a rate limit over the cap, a
+5xx, a timeout) is retried by the relay itself, and while it is being retried the
+chat is `awaiting = 'machine'`, which is exactly what `vm-relay-restart.sh` and
+`kinerary-cp-release`'s interview guard refuse on. The refusal runs from the
+first failure until the eighth (a retry episode) and then clears at once: giving
+up, or a permanent refusal (a 400), leaves the turn with the organizer, so there
+is no five-minute tail. **Derived from the code, not measured:** about 265 s, and
+278 s as a safe ceiling (the regression plan
+`docs/test-reports/regression-plan-2026-09-26-pr234-relay-send-hardening.md`,
+§4 of its round 2, has the arithmetic; not repeated here).
+
+- `kinerary-cp-release upgrade` checks the guard at step 2 while the **old**
+  relay, which has no retry machinery, still runs; it then restarts the relay
+  with `--force-live`. So Release A itself is unaffected by this. What can meet
+  it is a relay-only restart after Release A, `vm-interview-runner.sh`, the next
+  upgrade, or a rollback of Release A.
+- Checklist line: on a refusal saying "an interview is mid-turn (chat X)", wait 5
+  minutes and re-run `--dry-run`. If it is still refused after two re-runs,
+  `grep -E 'step_send_(failed|abandoned)'` on the relay log. Repeated failures
+  mean Telegram is failing that chat and a restart will not fix it: postpone. Use
+  `--force-live` only after the organizer has been told.
+- The retry record lives in the relay process, so a restart forgets it: a
+  refused summary is not re-sent after a restart until the organizer writes.
+
+**After a build that has #230 and #234, grep the relay log** (in addition to the
+three names above) for: `telegram_api.rate_limited`, `telegram_api.call_timed_out`,
+`trip_bot.step_send_failed` (carries `permanent` and `skipped`),
+`trip_bot.step_send_abandoned`, `trip_bot.step_retry_failed`,
+`stalled_turn_recovery_failed`, `interview.change_floor_taken_back` (carries
+`reply`), `interview.change_displaced_moved` (carries `during_send`),
+`interview.change_show_failed` (carries `permanent`) and `trip_bot.floor_lost`;
+and Hermes' own log for `trying plain-text fallback` and `relay outbound timed
+out`. Relay log lines carry **no timestamp**, so use `docker logs -t` on the
+running container **before the next restart**: `vm-relay-restart.sh` appends the
+outgoing relay's log to `/var/log/kinerary/relay.log` with `docker logs` and no
+`-t` (read in the script), so the timestamps are gone once it is archived. A
+healthy first interview shows none of the failure names; `"skipped":true` on a
+healthy bot would mean a 400 on a document disagreement's own text. What the
+retries do, and why the classification is the way it is, is in
+`docs/sprint6-tracks.md` decision 40, not here.
+
 A code-only rollback keeps the newer database, and old code tolerates it only
 because the migrations said so. It also means **the newest `available` site
 release may be newer than the rolled-back worker**; the tool warns when that
