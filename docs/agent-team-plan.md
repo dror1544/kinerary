@@ -698,9 +698,14 @@ Principles behind the table:
 11. **Feature-branch commits and pushes are not prompts; the merge into the
     leading branch is** (Dror, 2026-09-26; amends decision 1). Decision 1 said
     to count the prompts during Sprint 6 and that the count is the argument
-    either way. The count: #192, #196, #197, #211 and #215 merged 24–45 minutes
-    after they opened, so the time went on three prompts a change (commit,
-    push, merge), not on review. The merge prompt is where the integrator's
+    either way. The count, over Sprint 6's first 43 PRs: 96 commit prompts,
+    plus a push prompt and a merge prompt per PR. *Corrected the same day:* the
+    decision was first argued from five PRs that merged 24–45 minutes after
+    opening, which were the fast ones. Across all 43 the median is 2.4 hours
+    open-to-merge and 30 hours at the 75th percentile, while a PR opens a
+    median of 0.0 hours after its first commit. So the commit prompts were
+    friction, not the delay; the delay is review, integration and waiting for
+    the merge (`docs/test-reports/process-baseline-2026-09-26.md`). The merge prompt is where the integrator's
     report and CI exist; its text now carries the PR's base branch and check
     results. Decision 2 stands: Dror merges. *Form:* Dror chose option (b) —
     commit and push of `fix/`, `feat/`, `carry/`, `chore/` branches unprompted,
