@@ -92,9 +92,16 @@ emit() {  # emit <allow|deny|ask> <reason>
 # commit`, `-a`, `--amend`, `--no-verify`, another directory — falls through to
 # the ordinary prompt. Policy files are not documentation here: CLAUDE.md,
 # AGENTS.md, .claude/, .githooks/, .github/ and scripts/ always ask.
-is_docs_path() {
+is_policy_path() {
   case "$1" in
-    CLAUDE.md|AGENTS.md|.claude/*|.githooks/*|.github/*|scripts/*) return 1 ;;
+    CLAUDE.md|AGENTS.md|.claude/*|.githooks/*|.github/*|scripts/*|.preflight-allow) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_docs_path() {
+  is_policy_path "$1" && return 1
+  case "$1" in
     CHANGELOG.md|FRAMEWORK.md|README.md) return 0 ;;
     docs/*.md) return 0 ;;
     *) return 1 ;;
@@ -150,6 +157,99 @@ docs_only_push_ok() {
   return 0
 }
 
+# MVP phase, 2026-09-26: work on a feature branch needs no per-commit or per-push
+# approval; the merge into the leading branch is the one prompt.
+#
+# CLAUDE.md "MVP phase — lighter rules", item 3. The leading branch is
+# integration/sprint-N and the production branch is main: neither is ever exempted
+# here, and a feature-branch commit reaches nobody until someone merges it. The
+# decision moves to the merge, where the integrator's report and CI exist.
+#
+# Same discipline as the docs exemption above: one plain `git commit` (message from
+# -F/-m) or one plain `git push [-u] origin <branch>` naming the checked-out branch,
+# from the lead session, nothing else on the line. The one difference is WHERE: a
+# feature branch lives in its own worktree, so the command may start with `cd <dir> &&`
+# or `git -C <dir>`. <dir> must be a worktree of THIS repository — an unrelated
+# repository is not vouched for — and the mechanical checks run against that index.
+RE_FEATURE_BRANCH='^(fix|feat|carry|chore)/[A-Za-z0-9._-]+$'
+RE_FEATURE_PUSH='^git push( -u| --set-upstream)* origin ([A-Za-z0-9_./-]+)$'
+
+# Split a leading `cd <dir> && ` or `git -C <dir> ` off a command: sets TARGET (the
+# directory the command acts on) and REST (the command as if run there).
+target_of() {
+  local c="$1"
+  c="${c#"cd $REPO_ROOT && "}"
+  TARGET="$REPO_ROOT"; REST="$c"
+  if [[ "$c" =~ ^cd\ ([A-Za-z0-9_./-]+)\ \&\&\ (git\ .*)$ ]]; then
+    TARGET="${BASH_REMATCH[1]}"; REST="${BASH_REMATCH[2]}"
+  elif [[ "$c" =~ ^git\ -C\ ([A-Za-z0-9_./-]+)\ (.*)$ ]]; then
+    TARGET="${BASH_REMATCH[1]}"; REST="git ${BASH_REMATCH[2]}"
+  fi
+}
+
+same_repo() {
+  local a b
+  a="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  b="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+feature_branch_of() {  # feature_branch_of <dir> -> prints the branch when it qualifies
+  local b
+  b="$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 1
+  [[ "$b" =~ $RE_FEATURE_BRANCH ]] || return 1
+  printf '%s' "$b"
+}
+
+feature_commit_ok() {
+  local f n=0
+  target_of "$1"
+  [[ "$REST" =~ $RE_DOCS_COMMIT ]] || return 1
+  same_repo "$TARGET" || return 1
+  feature_branch_of "$TARGET" >/dev/null || return 1
+  # No copy of the checks in that worktree means nothing has inspected its index.
+  [ -x "$(git -C "$TARGET" rev-parse --show-toplevel)/scripts/preflight-checks.sh" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    is_policy_path "$f" && return 1
+  done < <(git -C "$TARGET" diff --cached --name-only 2>/dev/null)
+  [ "$n" -gt 0 ]
+}
+
+feature_push_ok() {
+  local named branch
+  target_of "$1"
+  [[ "$REST" =~ $RE_FEATURE_PUSH ]] || return 1
+  named="${BASH_REMATCH[2]}"
+  same_repo "$TARGET" || return 1
+  branch="$(feature_branch_of "$TARGET")" || return 1
+  [ "$named" = "$branch" ]
+}
+
+# What the person needs at the moment they approve a merge. Best effort: a GitHub
+# that cannot be read must never turn a prompt into a failure.
+merge_evidence() {
+  local n json base checks draft="" where
+  [[ "$1" =~ gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+([0-9]+) ]] || return 0
+  n="${BASH_REMATCH[1]}"
+  command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+  if ! json="$(gh pr view "$n" --json baseRefName,isDraft,statusCheckRollup 2>/dev/null)"; then
+    printf '\n\nPR #%s: could not read its state from GitHub — look before approving.' "$n"
+    return 0
+  fi
+  base="$(printf '%s' "$json" | jq -r '.baseRefName // "?"')"
+  checks="$(printf '%s' "$json" | jq -r '[.statusCheckRollup[]? | (.conclusion // .status // "pending") | ascii_downcase] | group_by(.) | map("\(.[0]) \(length)") | join(", ")')"
+  [ -n "$checks" ] || checks="none reported"
+  [ "$(printf '%s' "$json" | jq -r '.isDraft')" = "true" ] && draft=" It is a DRAFT."
+  case "$base" in
+    main) where="main (the PRODUCTION branch — this is the release path)" ;;
+    integration/sprint-*) where="$base (the leading branch)" ;;
+    *) where="$base" ;;
+  esac
+  printf '\n\nPR #%s -> %s. Checks: %s.%s' "$n" "$where" "$checks" "$draft"
+}
+
 if [ -n "$agent" ]; then
   case "$kind" in
     deploy) rule="hard rule 2 — never deploy a live trip site without explicit approval" ;;
@@ -163,11 +263,14 @@ case "$kind" in
     # Lands commits without the word "commit". A local merge runs the
     # git-side pre-merge-commit hook for the mechanical checks; `gh pr merge`
     # runs on GitHub and gets no hook at all. Either way, this is the approval.
-    emit ask "CLAUDE.md hard rule 1 — a merge, cherry-pick, revert, rebase or gh pr merge creates commits, so it needs the same explicit approval as git commit. Approve only if you meant to land this now."
+    emit ask "CLAUDE.md hard rule 1 — a merge, cherry-pick, revert, rebase or gh pr merge creates commits, so it needs the same explicit approval as git commit. Approve only if you meant to land this now.$(merge_evidence "$cmd")"
     ;;
   push)
     if docs_only_push_ok "$cmd"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-25): pushing docs-only commits on an integration or docs branch, to the branch's own upstream, needs no per-push approval. Every commit being pushed changes only documentation."
+    fi
+    if feature_push_ok "$cmd"; then
+      emit allow "MVP-phase rule (CLAUDE.md, 2026-09-26): pushing a feature branch (fix/, feat/, carry/, chore/) to its own name on origin needs no per-push approval; nothing lands until it is merged, and that merge is prompted."
     fi
     emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
     ;;
@@ -179,8 +282,15 @@ $(plan_note)"
     ;;
   commit)
     out=""
-    if [ -x "$CHECKS" ]; then
-      if ! out="$("$CHECKS" --staged 2>&1)"; then
+    # The checks read the index they are run in, so run them where the commit will
+    # happen: a feature branch usually lives in a sibling worktree of this repository.
+    # preflight-checks.sh inspects the checkout that CONTAINS the script, whatever the
+    # working directory, so it is that worktree's own copy that has to run.
+    target_of "$cmd"
+    check_script="$CHECKS"
+    if same_repo "$TARGET"; then check_script="$(git -C "$TARGET" rev-parse --show-toplevel)/scripts/preflight-checks.sh"; fi
+    if [ -x "$check_script" ]; then
+      if ! out="$("$check_script" --staged 2>&1)"; then
         emit deny "Commit refused by scripts/preflight-checks.sh (CLAUDE.md Hard Rules):
 
 $out
@@ -199,6 +309,9 @@ $changes"
     fi
     if docs_only_commit_ok "$cmd"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-25): a docs-only commit on an integration or docs branch needs no per-commit approval. Every staged path is documentation and the mechanical checks passed."
+    fi
+    if feature_commit_ok "$cmd"; then
+      emit allow "MVP-phase rule (CLAUDE.md, 2026-09-26): a commit on a feature branch (fix/, feat/, carry/, chore/) needs no per-commit approval. No staged path is policy and the mechanical checks passed; the approval comes at the merge into the leading branch."
     fi
     emit ask "CLAUDE.md hard rule 1 — never git commit without explicit user approval. Mechanical checks passed; this prompt is the approval."
     ;;
