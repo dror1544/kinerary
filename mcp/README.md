@@ -8,6 +8,12 @@ and the growable question bank). See the tool list at the top of
 This is optional. The site works fully without it — it only matters if you
 want an agent (not a human clicking around the site) to manage the trip.
 
+> **Someone on the trip connecting their own Claude or ChatGPT does not use
+> this server.** The trip site serves its own MCP endpoint for that, with a
+> normal sign-in — see [Trip connector](#trip-connector-claude-chatgpt)
+> below. This server is the companion agent's bridge, and it authenticates
+> with the agent key.
+
 ## Two ways to connect — same server either way
 
 | | Local always-on agent | Claude Cowork / remote connector |
@@ -112,19 +118,125 @@ already shares with this server) — see `requireSiteOrAgentKey` in `mcp.js`.
 
 ### 3. Connect Claude Cowork
 
-1. Get this server reachable over HTTPS first (see the table above — a
-   tunnel or reverse proxy in front of `MCP_PORT`).
-2. In Claude Cowork: **Settings → Connectors → Add custom connector**.
-3. **URL**: `https://your-domain/sse`
-4. **Header**: `X-API-Key: <MCP_API_KEY>`
-5. Save — Cowork can now call every tool in `mcp.js` (get/add bookings,
-   control trivia, add trivia questions, upload confirmations, etc.) as
-   part of a conversation, from anywhere, without your computer needing to
-   be on.
+For a person on the trip, use the [Trip connector](#trip-connector-claude-chatgpt)
+instead. Claude's custom connectors take a URL and OAuth; they have no field for
+an `X-API-Key` header, so this server can only be reached from one with the key
+in the URL (`https://your-domain/sse?key=<MCP_API_KEY>`). That puts the agent
+key — which can do everything the companion can — into proxy logs, and gives
+the connection no identity of its own. It is a stopgap for an operator, not a
+way to hand a trip to an organizer.
 
-Multiple concurrent sessions (a local agent and a Cowork connector at the
-same time, or several Cowork chats) are supported — each `/sse` connection
-gets its own MCP server instance server-side.
+Multiple concurrent sessions (a local agent and a remote connector at the
+same time) are supported — each `/sse` connection gets its own MCP server
+instance server-side.
+
+## Trip connector (Claude, ChatGPT)
+
+The trip site itself serves an MCP endpoint at `<site>/mcp` for **everyone on
+the trip**: an organizer's connection can read and change the trip, anyone
+else's can only read it. Code: [`server/trip-mcp/`](../server/trip-mcp/).
+
+The site's **More** tab has a "Connect your AI assistant" card:
+
+- **Add to Claude** opens Claude's documented install link
+  (`https://claude.ai/customize/connectors?modal=add-custom-connector&connectorName=…&connectorUrl=…`),
+  which pre-fills the "Add custom connector" dialog; the person confirms.
+- **Add to ChatGPT** copies the address and opens ChatGPT's plugins page
+  (`https://chatgpt.com/settings/plugins-settings` — works, but not a
+  documented URL), with the steps: **+** to create an app with the address,
+  authentication OAuth; Developer mode (Settings → Security and login) must be
+  on first. ChatGPT has no install link that pre-fills the address, and its
+  phone app cannot create one.
+- Then a page on the trip site opens; they sign in with their normal site login
+  (password or Google) and approve.
+
+The card also lists connected assistants with **Disconnect**: organizers see
+everyone's, anyone else sees their own.
+
+**Turning it on for a trip** — both in that trip's `.env`, then restart:
+
+```
+TRIP_MCP_ENABLED=1
+PUBLIC_ORIGIN=https://<the trip's public hostname>
+```
+
+`PUBLIC_ORIGIN` is required rather than read off the request: behind the tunnel
+and proxy the request says `http` and a LAN host. It must be the trip's direct
+hostname. Anything arriving through the managed gateway (`/t/<trip>`, marked
+by its `x-forwarded-prefix`) is refused: the gateway turns its cookie into an
+`Authorization` header, which would let any script on the shared gateway origin
+approve a connection. The endpoint also refuses to start on an unset or
+built-in development `JWT_SECRET`. The trip's nginx must route
+`/mcp`, `/oauth/` and `/.well-known/oauth-` to Express — the provisioning
+template does from this change on; a container built before it needs those
+three `location` blocks added (copy them from `provisioning/adapters.py`).
+
+**How it is kept safe:**
+
+- The site is its own OAuth 2.1 authorization server: discovery
+  (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`),
+  dynamic client registration, PKCE (S256 only), refresh-token rotation with
+  reuse detection, revocation.
+- Registration is open (every MCP client registers itself), so it is bounded
+  by storage, not by caller: URIs of at most 2 KB, five per client, unused
+  clients dropped after 15 minutes, and at the 200-client cap the oldest unused
+  one is evicted rather than the newcomer refused. There is deliberately no
+  per-address limit — behind the ingress every caller shares one address, so a
+  limit that refuses would let one stranger lock every organizer out. A client may only name an **exact** known callback
+  (`https://claude.ai/api/mcp/auth_callback`, the same on `claude.com`,
+  `https://chatgpt.com/connector_platform_oauth_redirect`) or a loopback
+  address for a local app (Claude Code, MCP Inspector). A refused callback is
+  logged; if a provider moves its callback, add the new one to
+  `TRIP_MCP_EXTRA_REDIRECT_URIS` (comma-separated exact URLs). An unknown
+  client or callback gets an error page, never a redirect.
+- The consent decision needs the site session as a Bearer header **and** this
+  trip's own `Origin`. The consent page names the app by the host its codes go
+  to; the name an app registers with is shown only as a claim.
+- A replayed code ends the connection it produced; a refresh ends the access
+  token it replaced; only the client a token belongs to can revoke it.
+- Anyone on the trip can approve; nobody else can. What a connection may do is
+  fixed when it is approved — `trip` (read and write) for an organizer,
+  `trip:read` for anyone else, decided by the server from who approved, never
+  from the scope the app asked for — and on each call it is the smaller of that
+  and the person's current role: an organizer who is demoted drops to read
+  only, a member who is promoted stays read only until they approve again, and
+  someone removed from the trip loses the connection. A read-only connection is
+  never offered a write tool or the organizer briefing. The narrowing is applied
+  when the connection is next used: one that was not used while its organizer
+  was demoted keeps its stored write scope, so it writes again if they are
+  promoted back.
+- An assistant sees what the site shows the person who connected, and no more.
+  In RSVP and comment rows other people appear as username, name and colour
+  only: the connector strips Telegram ids, ages and emails there, whatever the
+  underlying route returns. In `get_config`, the lost-and-found list and the
+  bookings they appear exactly as on the site, which includes participants'
+  ages, families and group-visible needs, emergency-contact and accommodation
+  phone numbers, and a lost-and-found reporter's name and phone (the reporter
+  need not be on the trip). No tool returns another person's Telegram id or
+  Google email (checked on the sprint-6 tree, 2026-09-26).
+- Tokens are opaque and stored hashed. An MCP token is not a site session and a
+  site session is not an MCP token.
+- Tools call the site's own routes **as the person who connected** (a
+  two-minute session minted per call, over loopback), never with the agent key.
+  Every route's own checks apply and every change is recorded under that
+  person's name.
+- The tool set is narrower than `mcp.js`: no companion-channel tools, no
+  password resets, login links or Telegram bindings (`add_participant` drops
+  the enrollment token; the organizer sends the link from the site), nothing
+  that takes a server file path.
+- Nothing is served from raw `trip.config.json`: the trip's name, phases and
+  instructions come from `sanitizeConfig()` and only after sign-in. The consent
+  page tells the organizer that what the assistant reads, travellers' needs
+  included, goes to that assistant's provider.
+- The agent key cannot see or disconnect an organizer's assistant.
+
+**What the assistant is told.** The connection carries instructions built from
+the trip (its name, phases and organizers, and how to work: read the briefing
+first, change the active plan rather than bookings, ask before deleting, never
+write organizer-only notes onto the site). The first tool it is told to call,
+`get_trip_briefing`, returns the organizer's standing instructions and the
+participants' needs with their visibility, the same briefing the companion
+reads.
 
 ## What this does *not* do
 

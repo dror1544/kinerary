@@ -199,6 +199,17 @@ class AdapterTests(unittest.TestCase):
         self.assertIn('location ~* ^/[^/]+\\.(js|css)$', bootstrap)
         self.assertIn("location ^~ /modern/assets/", bootstrap)
         self.assertIn("max-age=31536000, immutable", bootstrap)
+        # The organizer connector (server/trip-mcp) is switched on per trip
+        # through .env, but only works if nginx sends its paths to Express —
+        # otherwise they fall through to `location /` and are static 404s, and
+        # turning the feature on means hand-editing a live container's nginx.
+        # /mcp must not be buffered: a streamed MCP response would stall.
+        self.assertIn("location = /mcp", bootstrap)
+        mcp_block = bootstrap.split("location = /mcp", 1)[1].split("}", 1)[0]
+        self.assertIn("proxy_pass http://127.0.0.1:3000", mcp_block)
+        self.assertIn("proxy_buffering off", mcp_block)
+        self.assertIn("location ^~ /oauth/", bootstrap)
+        self.assertIn("location ^~ /.well-known/oauth-", bootstrap)
         # The debian-12 template generates only C.utf8, so every apt/perl call
         # emits multi-line "Setting locale failed" warnings. Harmless in
         # themselves, but they filled the truncated stderr this transport
