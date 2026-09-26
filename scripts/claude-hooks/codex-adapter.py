@@ -183,9 +183,15 @@ def checked_paths(value: str) -> list[str]:
         lexical.relative_to(ROOT)
     except ValueError:
         raise ValueError("Patch path is outside this repository")
-    # Preserve named policy paths as well as checking symlink destinations,
-    # each in the spelling the filesystem will actually write.
-    return list(dict.fromkeys(str(on_disk(p)) for p in (lexical, resolved)))
+    # The shared rules match one spelling, case-sensitively (trip/*,
+    # .project/sprint.json, CLAUDE.md). Check every spelling that can name
+    # the file: as written, its symlink destination, each as the disk spells
+    # it, and each case-folded (a protected directory that does not exist
+    # yet, or exists spelled differently). A spelling may only add a denial.
+    spellings = [lexical, resolved, on_disk(lexical), on_disk(resolved)]
+    spellings += [ROOT.joinpath(*(part.casefold() for part in p.relative_to(ROOT).parts))
+                  for p in spellings]
+    return list(dict.fromkeys(str(p) for p in spellings))
 
 
 def handle(mode: str, payload: dict) -> dict:

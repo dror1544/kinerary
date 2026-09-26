@@ -386,3 +386,73 @@ these results in a throwaway repository on this Mac, 2026-09-26:
 | `claude.md` as `developer` | allowed (no output) |
 
 This is a finding for the owner, not part of this PR.
+
+## 10. Review round 3 (PR #260)
+
+**What regressed.** Round 2's `checked_paths` returned only the on-disk
+spelling of the path. The shared rules are case-sensitive: `trip/*` at the
+root (preflight B3), `.project/sprint.json`, and `CLAUDE.md` for a subagent.
+
+- With an existing directory named `TRIP/`, `*** Add File: trip/proof.txt`
+  was rewritten to `TRIP/proof.txt`, which B3 does not match. 69f34ab denied
+  it, cdcf335 answered `{}`, and offline Codex writes `trip/proof.txt`.
+- With no trip directory at all, `TRIP/proof.txt` also went through. This half
+  is inherited from 69f34ab: nothing folds a component that does not exist.
+
+Reproduced on 2026-09-27, through the real shared hooks in a throwaway
+repository with the offline engine in a scratch directory:
+
+| Initial state | Patch | cdcf335 | This fix | Engine |
+|---|---|---|---|---|
+| empty `TRIP/` | Add `trip/proof.txt` | `{}` | deny, hard rule 4 | exit 0, `trip/proof.txt` reads `proof` |
+| nothing | Add `TRIP/proof.txt` | `{}` | deny | exit 0 |
+| nothing | Add `Trip/proof.txt` | `{}` | deny | exit 0 |
+
+**Fix.** `checked_paths` returns every spelling that can name the file,
+de-duplicated, in this order:
+
+1. the path as written;
+2. its resolved (symlink) destination;
+3. the on-disk spelling of each;
+4. the case-folded form of each of those (`str.casefold()` on every component
+   below the root, which also folds U+017F to `s`).
+
+The shared hook runs once per spelling and the first deny wins. The existing
+checks all still apply: outside the repository, symlink destinations, and
+refusal of an ambiguous hard link.
+
+- **No filesystem detection.** On a case-sensitive filesystem the folded form
+  may over-deny, which fails closed.
+- **Near-misses stay allowed:** `docs/TRIP/x.md`, `docs/trip-notes.md`,
+  `tripwire.md`, `Docs/readme.md`, `trips/…` and `TRIPS/…`. B3 is a prefix
+  rule on `trip/` at the root only.
+
+**Why round 2's tests missed it.** They asserted a denial only for an alias
+spelling of a path the disk already spelled the way the rule does: they
+pre-created lowercase `trip/`. One test even pinned `checked_paths` to return
+only the on-disk spelling. None of them put the disk's spelling and the
+rule's spelling apart. Round 3 adds that class of test:
+`test_trip_is_denied_whatever_the_disk_calls_it` covers an existing `TRIP/`,
+`trip/` or `Trip/`, and no directory, each by Add, Move to and a plain
+`file_path`. `test_near_misses_of_protected_paths_stay_allowed` covers the
+other direction.
+
+**Oracle.** A differential check that goes beyond path lists.
+
+- Each patch runs through the offline engine in a scratch tree, starting from
+  one of four initial states: `trip/proof.txt`, `TRIP/proof.txt`, an empty
+  `TRIP/`, or no trip directory. Every state also holds `.project/sprint.json`
+  and `CLAUDE.md`.
+- The oracle then asks whether a protected file was created, modified or
+  deleted, comparing names with `casefold`.
+- The same patch goes to the adapter through the real shared hooks, from the
+  same initial state: as the lead, and as `developer` when it mentions CLAUDE.
+- The corpus is 840 patches: 40 targeted and 800 generated. The generated
+  patches use every alias spelling of each protected target, legitimate
+  near-misses, and Add, Update, Delete and Move to.
+
+| Adapter | Codex applied | Protected-file writes by Codex | Protected writes not denied | False denies (of 339 applied, legitimate patches) |
+|---|---|---|---|---|
+| This fix | 673 | 366 | **0** | **0** |
+| cdcf335 | 673 | 366 | 72 | 0 |
+| 69f34ab | 673 | 366 | 221 | 75 |
