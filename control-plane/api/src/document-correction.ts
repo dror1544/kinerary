@@ -13,6 +13,11 @@
  * way confirming did. The skill stays a fallback for what this flow does not
  * take: files posted in groups or by other members, and relays with no model.
  *
+ * SWITCHED OFF UNLESS CONFIGURED (2026-09-26): the organizer's private-chat
+ * route into this flow runs only with ORGANIZER_DOCUMENT_ROUTE_ENABLED=1 on the
+ * relay. Off, the organizer's file keeps the companion route it had before
+ * #178 — see `ORGANIZER_DOCUMENT_ROUTE_SETTING` below for why.
+ *
  * WHAT A MODEL NEVER DECIDES HERE: whether anything changes (the organizer),
  * who the organizer is (the confirmed interview's own private chat, and the
  * sender Telegram delivered), and which version a change applies to (the one it
@@ -29,6 +34,7 @@ import { listTripDocuments } from "./document-registry.js";
 import { correctIntake } from "./intake-correction.js";
 import { readableDate, recapLabel, UI_STRINGS, uiString, type Language } from "./intake-copy.js";
 import { INTAKE_QUESTIONS, partitionQuestions, type AnswerStore } from "./interview.js";
+import { structuredLog } from "./redaction.js";
 
 type Db = Pick<pg.Pool, "query">;
 
@@ -137,12 +143,68 @@ export async function confirmedOrganizerChat(
   return row ? { sessionId: row.id, language: row.language === "he" ? "he" : "en" } : null;
 }
 
+// ── Whether this flow is switched on at all ──────────────────────────────────
+
+/**
+ * The relay setting that switches the organizer's private-chat route ON.
+ * Generic on purpose: it names no host, path or deployment.
+ *
+ * OFF UNLESS CONFIGURED (owner's decision, 2026-09-26, Release A). An Approve
+ * here writes a new intake version and re-provisions the site — for a trip
+ * that is `ready_private` that is a REDEPLOY, from whatever release is newest
+ * at the time, in the middle of the family's holiday. Live trips are
+ * redeployed only after they end (docs/sprint6-tracks.md decisions 11, 12,
+ * 28), so shipping this code must never be what switches it on. Off, such a
+ * file goes where it went before #178: to the companion. Like
+ * `ASSISTANT_EVENTS_ENABLED`, and unlike `INTERPRET_*`, unset is the safe
+ * state — do not "fix" this into default-on. What has to happen before it is
+ * turned on anywhere real: docs/document-intake-operations.md.
+ */
+export const ORGANIZER_DOCUMENT_ROUTE_SETTING = "ORGANIZER_DOCUMENT_ROUTE_ENABLED";
+
+/**
+ * Whether the route is on. ONLY the exact value `1` enables it — stricter
+ * than `ASSISTANT_EVENTS_ENABLED`, which forgives surrounding whitespace:
+ * this gate decides whether a live trip can be rebuilt, so " 1" from a
+ * hand-edited env file is off, and says so. Unset, empty and `0` are off
+ * quietly; anything else is off and flagged as unrecognized, so a typo in the
+ * enabling direction is visible rather than a silent no-op.
+ */
+export function organizerDocumentRouteSetting(env: NodeJS.ProcessEnv): { enabled: boolean; unrecognized: boolean } {
+  const raw = env[ORGANIZER_DOCUMENT_ROUTE_SETTING];
+  if (raw === "1") return { enabled: true, unrecognized: false };
+  const knownOff = raw === undefined || raw === "" || raw === "0";
+  return { enabled: false, unrecognized: !knownOff };
+}
+
+/**
+ * Read once, when the relay starts. Always logs the state it chose — the
+ * post-deploy log read proves the flag from this line — and never the raw
+ * value it was given.
+ */
+export function organizerDocumentRouteFromEnv(env: NodeJS.ProcessEnv, log: (line: string) => void): boolean {
+  const setting = organizerDocumentRouteSetting(env);
+  if (setting.unrecognized) {
+    log(structuredLog("warn", "relay.organizer_document_route_setting_unrecognized", {
+      setting: ORGANIZER_DOCUMENT_ROUTE_SETTING,
+      hint: "only 1 enables the organizer's private-chat document route; treating this as off",
+    }));
+  }
+  log(structuredLog("info", "relay.organizer_document_route", { enabled: setting.enabled }));
+  return setting.enabled;
+}
+
 /**
  * Whether an inbound companion message belongs to this flow: a private chat,
  * whose sender IS the chat, that is the organizer's confirmed interview chat,
  * carrying at least one re-hosted file this flow can read — a document, or an
- * image where a runner reads images — on a relay that has a model at all.
+ * image where a runner reads images — on a relay that has a model at all, and
+ * with the route switched on (`enabled`, from ORGANIZER_DOCUMENT_ROUTE_ENABLED).
  * Anything else keeps the route it had.
+ *
+ * `enabled` is required so no caller can reach this flow without deciding.
+ * Off, a message that WOULD have been routed is logged (trip id only — never
+ * the chat, the sender or the file) so the operator can see it happening.
  */
 export async function organizerDocumentRoute(
   db: Db,
@@ -155,13 +217,20 @@ export async function organizerDocumentRoute(
     hasMedia: boolean;
     hasRunner: boolean;
     canReadImages: boolean;
+    enabled: boolean;
+    log?: (line: string) => void;
   },
 ): Promise<{ sessionId: string; language: Language } | null> {
   if (!input.hasRunner || !input.hasMedia) return null;
   if (input.chatType !== "private" || !input.fromId || input.fromId !== input.chatId) return null;
   const readable = input.mediaKinds.some((kind) => kind === "document" || (kind === "image" && input.canReadImages));
   if (!readable) return null;
-  return confirmedOrganizerChat(db, input.tripId, input.chatId);
+  const organizer = await confirmedOrganizerChat(db, input.tripId, input.chatId);
+  if (organizer && !input.enabled) {
+    input.log?.(structuredLog("info", "trip_bot.organizer_document_route_off", { trip_id: input.tripId }));
+    return null;
+  }
+  return organizer;
 }
 
 export async function tripOwnerUserId(db: Db, tripId: string): Promise<string | null> {

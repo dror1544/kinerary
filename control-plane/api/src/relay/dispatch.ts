@@ -406,6 +406,15 @@ export interface DispatchOptions {
    * process's own is used; tests pass a fresh one.
    */
   outageNotices?: OutageNoticeLimiter;
+  /**
+   * The organizer's private-chat document route (#178) — a file the organizer
+   * sends after confirmation, read by the relay and proposed back to them,
+   * whose Approve re-provisions the site. ON only when exactly `true`, which
+   * the relay passes only for ORGANIZER_DOCUMENT_ROUTE_ENABLED=1
+   * (document-correction.ts). Absent or false, the default: such a file takes
+   * the companion route, exactly as before #178.
+   */
+  organizerDocumentRoute?: boolean;
 }
 
 /**
@@ -972,6 +981,11 @@ export async function dispatchUpdate(
     // proposed back to them for approval, never handed to the companion to
     // write onto the site on its own. Only the organizer's own private chat,
     // from the organizer; a group's or a member's file keeps its route.
+    // ONLY WITH THE ROUTE SWITCHED ON (ORGANIZER_DOCUMENT_ROUTE_ENABLED=1): an
+    // Approve re-provisions the site, which on a live trip is a mid-trip
+    // redeploy. Off — the default — `organizerDocumentRoute` answers null
+    // before anything is downloaded, and the file takes the companion route
+    // below exactly as it did before #178.
     if (outcome.route.kind === "companion") {
       const organizer = await organizerDocumentRoute(db, {
         tripId: outcome.route.tripId,
@@ -986,6 +1000,10 @@ export async function dispatchUpdate(
         hasMedia: outcome.attachment !== null,
         hasRunner: Boolean(options.modelRunner),
         canReadImages: visionProcessingConfig(options.modelRunner) !== null,
+        // Strictly `true`: absent — every caller that never heard of the flag —
+        // is off.
+        enabled: options.organizerDocumentRoute === true,
+        log,
       });
       // The reader needs the file itself, so re-host it now. A download that
       // failed leaves nothing to read: fall through to the companion, which
