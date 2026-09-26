@@ -996,6 +996,11 @@ Decision 47 is the lead's call, made when the owner said "prioritize it as you s
     - **Testing (Mac staging) stays on the Claude CLI**, as it already is. Codex was offered by the owner for testing, but it cannot read documents: `ATTACHMENT_RUNNERS` excludes it from attachment tasks because it dropped an image. It remains usable for text-only tasks.
     - **Not yet built.** It is a code change to `model-runner.ts` (Track 3 owns it) plus the production VM's configuration in `kinerary-deploy` (the OpenRouter key through `OPENROUTER_API_KEY_FILE`, because child environments are allow-listed since #192), then a release through the normal gates with a regression plan. Nothing changes in production until that release is deployed. (Dror, 2026-09-26; recorded with his consent by the process session)
 
+Decisions 49 and 50 are the owner's answers to two questions the lead put to him on 2026-09-26.
+
+49. **The quota-only Gemini fallback (decision 48) ships after 3 Oct, not in Release A.** It changes `model-runner.ts` and the production model configuration, so it gets its own regression plan and its own window once both live trips have ended; Release A keeps the plan's shape (no model-runner change). (Dror, 2026-09-26, answering the lead's question)
+50. **A finding about example data in tracked files is recorded in a handover note outside the repository, not here, because the repo is public; the owner chose to redact the tracked tree, and to decide separately whether history needs more.** The redaction is a `fix/` branch in flight; nothing about it is written in this file on purpose, as with decision 35. Consequence for #229 (the test reports to `main`): it must be rebuilt from the redacted tree before it goes anywhere near `main`, which the lead handles after the redaction merges. (Dror, 2026-09-26, answering the lead's question)
+
 ## Delta against Sprint 6 as written
 
 **Added** (none of this is in `docs/onboarding-mvp-sprint-plan.md:1438-1552`):
