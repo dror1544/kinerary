@@ -245,3 +245,59 @@ loaded source and review/trust the changed hooks through the normal UI.
 Native `ask` prompt parity with Claude is unavailable in the tested runtime;
 Codex blocks those actions and the owner must perform or authorize a supported
 workflow outside that denied call. No real push or deployment was attempted.
+
+## 8. Review round 1 (PR #260)
+
+Four review findings, each reproduced before the change and fixed on
+`fix/codex-hooks-r1` (base `69f34ab`). Every new test in
+`tests/scripts/test_codex_hook_adapter.py` below was run against 69f34ab's
+adapter (28 subtest failures) and against the fixed adapter (34 tests, OK).
+
+**Header whitespace.** Codex's `apply_patch` trims a header line before it
+takes the path, so `*** Update File: .project/sprint.json ` (trailing space,
+tab or NBSP; also `*** Move to:`) updated `.project/sprint.json` while the
+adapter checked the path with the whitespace and answered `{}`. Proven offline
+with codex-cli 0.153.2's own engine, no model, in a scratch directory that is
+not a repository: `codex --codex-run-as-apply-patch '<patch>'`, once per code
+point, trailing an `Update File` header on an existing `t.json`.
+
+- Codex trims exactly Unicode White_Space: U+0009, U+000B, U+000C, U+000D,
+  U+0020, U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F,
+  U+205F, U+3000 (U+000A splits lines). It keeps every other control and
+  format character (U+0001–U+0008, U+000E–U+001F, U+007F–U+009F bar U+0085,
+  U+00AD, U+200B–U+200F, U+202A–U+202E, U+2060–U+2064, U+2066–U+206F,
+  U+FEFF and the other format characters probed up to U+3000).
+  Python's `str.strip()` also strips U+001C–U+001F, which Codex keeps.
+- Indented headers (any trimmed character before `***`) are applied; a
+  leading U+001C/U+001F/U+200B/U+FEFF makes Codex reject the hunk.
+- Only the header line is trimmed: a space after `*** Add File: ` is kept
+  (`*** Add File:  a.md` wrote ` a.md`); a leading tab or CR after the prefix
+  wrote `a.md` while Codex reported `\ta.md`.
+- Header prefixes are exact: `*** Add File:a.md`, `***  Add File: a.md`,
+  `*** Add File:\ta.md` and `*** add file: a.md` are rejected.
+
+The adapter now splits on `\n` only, trims each line with that exact set, and
+refuses a header path that starts with whitespace or contains any whitespace
+other than U+0020 or any control/format character (Unicode category C). An
+interior ASCII space stays allowed; every character Codex might treat
+differently from the adapter is a denial, not a guess.
+
+**Empty deny reason.** A deny whose `permissionDecisionReason` is empty
+is treated by Codex as a failed hook and the call runs (string in the 0.153.2
+binary, found by the reviewer). `denied()` now always carries a non-empty
+reason.
+
+**Agent identity.** `agent_id` of `0`, `""` or `False` without a role, and
+`agent_type` of `"\n"` (which the shared hooks' `$(jq …)` strips to empty),
+were treated as the lead. The captured Codex payloads
+(`capture.jsonl`, 18 hook payloads) carry `agent_id` on 3, all from a
+subagent and all with `agent_type: "default"`; the other 15 carry neither key. The adapter now refuses a present `agent_type` that is not a non-empty
+string after strip, and a non-null `agent_id` without `agent_type`.
+
+**Test import.** `python3 -m unittest tests.scripts.test_codex_hook_adapter`
+failed (`No module named 'test_claude_hooks_bash'`); the test now puts its own
+directory on `sys.path`.
+
+Not done in this round (owner's decision): whether a command's `workdir`
+reaches the hook, a fail-closed command wrapper in `.codex/hooks.json`, hook
+files being writable through the hook, and CI not running `tests/scripts`.

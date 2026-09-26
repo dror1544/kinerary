@@ -15,15 +15,22 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_TIMEOUT = 20
+# What Codex 0.153.2's apply_patch trims from a header line before taking its
+# path: exactly Unicode White_Space (Rust str::trim), proven offline per code
+# point in docs/test-reports/codex-hooks-2026-09-26.md ("Review round 1").
+CODEX_TRIM = ("\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(map(chr, range(0x2000, 0x200b)))
+              + "\u2028\u2029\u202f\u205f\u3000")
 
 
 def denied(reason: str) -> dict:
+    # Codex treats a deny with an empty reason as a failed hook and runs the call.
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
+        "permissionDecisionReason": reason.strip() or "Kinerary policy denied this call",
     }}
 
 
@@ -81,7 +88,9 @@ def translate(output: dict) -> dict:
 
 
 def patch_paths(command: str) -> list[str]:
-    lines = command.strip().splitlines()
+    # Split on "\n" only, as Codex does: splitlines() also breaks on U+000B,
+    # U+001C-U+001E, U+0085 and U+2028/9, which Codex keeps inside one line.
+    lines = [line.strip(CODEX_TRIM) for line in command.strip().split("\n")]
     if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
         raise ValueError("Expected a complete apply_patch envelope")
     paths = []
@@ -90,7 +99,11 @@ def patch_paths(command: str) -> list[str]:
                        "*** Delete File: ", "*** Move to: "):
             if line.startswith(prefix):
                 value = line[len(prefix):]
-                if not value or "\x00" in value:
+                # Codex keeps a leading space and every other control/format
+                # character in the path it writes; refuse what we cannot match.
+                if not value or value[0].isspace() or any(
+                        ch != " " and (ch.isspace() or unicodedata.category(ch)[0] == "C")
+                        for ch in value):
                     raise ValueError("Invalid patch path")
                 paths.append(value)
                 break
@@ -118,9 +131,11 @@ def handle(mode: str, payload: dict) -> dict:
     deadline = time.monotonic() + POLICY_TIMEOUT
     if not isinstance(payload, dict):
         raise ValueError("Expected a JSON object")
-    if "agent_type" in payload and not isinstance(payload["agent_type"], str):
+    if "agent_type" in payload and not (isinstance(payload["agent_type"], str)
+                                        and payload["agent_type"].strip()):
+        # The shared hooks read it with $(jq ...), which strips "\n" to empty: the lead.
         raise ValueError("Invalid agent identity")
-    if payload.get("agent_id") and not payload.get("agent_type"):
+    if payload.get("agent_id") is not None and "agent_type" not in payload:
         raise ValueError("Subagent identity is missing its role")
     if mode == "session":
         result = run_policy("sessionstart.sh", payload, deadline)

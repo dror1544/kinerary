@@ -7,9 +7,13 @@ import io
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import patch
 
-from test_claude_hooks_bash import Harness, REPO
+# tests/scripts has no __init__.py; make the sibling import work under both
+# `discover -s tests/scripts` and `python3 -m unittest tests.scripts.<module>`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_claude_hooks_bash import Harness, REPO  # noqa: E402
 
 
 class CodexAdapter(Harness):
@@ -116,6 +120,85 @@ class CodexAdapter(Harness):
         self.assertDenied(self.patch(
             "*** Begin Patch\n*** Update File: CLAUDE.md\n@@\n-old\n+new\n*** End Patch",
             agent_type="developer"))
+
+    # Review round 1. Codex 0.153.2's apply_patch trims Unicode White_Space
+    # from a header line before it takes the path (proven offline with
+    # `codex --codex-run-as-apply-patch`; docs/test-reports/codex-hooks-2026-09-26.md),
+    # so the adapter must check the trimmed path, not the path as typed.
+    def assertAllowed(self, result):
+        self.assertIn(result.get("permissionDecision"), (None, "allow"), result)
+
+    def test_trailing_whitespace_codex_strips_cannot_hide_a_protected_path(self):
+        for ch in (" ", "\t", "\u00a0", "\r", "\u2028", "\u3000"):
+            for body in ("*** Update File: .project/sprint.json" + ch + "\n@@\n-old\n+new",
+                         "*** Update File: safe.txt\n*** Move to: .project/sprint.json" + ch
+                         + "\n@@\n-old\n+new"):
+                with self.subTest(char=repr(ch), body=body[:22]):
+                    self.assertDenied(self.patch("*** Begin Patch\n" + body + "\n*** End Patch"))
+
+    def test_subagent_cannot_patch_policy_behind_a_trailing_space(self):
+        self.assertDenied(self.patch(
+            "*** Begin Patch\n*** Update File: CLAUDE.md \n@@\n-old\n+new\n*** End Patch",
+            agent_type="developer"))
+
+    def test_indented_header_on_a_protected_path_is_denied(self):
+        for indent in ("  ", "\t", "\u00a0"):
+            with self.subTest(indent=repr(indent)):
+                self.assertDenied(self.patch(
+                    "*** Begin Patch\n" + indent + "*** Update File: .project/sprint.json\n"
+                    "@@\n-old\n+new\n*** End Patch"))
+
+    def test_indented_header_on_an_ordinary_path_is_checked_and_allowed(self):
+        self.assertAllowed(self.patch(
+            "*** Begin Patch\n  *** Add File: docs/indented.md\n+hi\n*** End Patch"))
+
+    def test_trailing_whitespace_on_an_ordinary_path_is_allowed(self):
+        self.assertAllowed(self.patch(
+            "*** Begin Patch\n*** Add File: docs/new.md \t\n+hi\n*** End Patch"))
+
+    def test_interior_ascii_space_in_a_path_is_allowed(self):
+        self.assertAllowed(self.patch(
+            "*** Begin Patch\n*** Add File: docs/My Notes (Manual).md\n+hi\n*** End Patch"))
+
+    def test_path_characters_codex_does_not_strip_fail_closed(self):
+        # Codex keeps these in the path it writes (U+001C-U+001F, ZWSP, BOM
+        # trailing; a leading space after the prefix; controls anywhere), so
+        # the adapter cannot prove the path it checks is the path written.
+        for value in ("docs/x.md\x1f", "docs/x.md\x1c", "docs/x.md\u200b", "docs/x.md\ufeff",
+                      " docs/x.md", "docs/a\tb.md", "docs/a\x0bb.md", "docs/a\u2028b.md",
+                      "docs/a\x7fb.md", "docs/\u202ex.md"):
+            with self.subTest(value=repr(value)):
+                self.assertDenied(self.patch(
+                    "*** Begin Patch\n*** Add File: " + value + "\n+hi\n*** End Patch"))
+
+    def test_deny_with_an_empty_reason_still_carries_a_reason(self):
+        # Codex treats a deny without a non-empty reason as a failed hook and
+        # runs the call; the adapter must never emit one.
+        hook = self.root / "scripts/claude-hooks/pretooluse-write.sh"
+        for reason in ("", "   ", "\n"):
+            with self.subTest(reason=repr(reason)):
+                response = json.dumps({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": reason}})
+                hook.write_text("#!/bin/sh\ncat <<'END'\n" + response + "\nEND\n")
+                result = self.call("write", {"tool_input": {"file_path": "docs/ok.md"}})
+                self.assertEqual(result.get("permissionDecision"), "deny", result)
+                self.assertTrue(result.get("permissionDecisionReason", "").strip(), result)
+
+    def test_odd_agent_identities_cannot_inherit_lead_privileges(self):
+        subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
+        for identity in ({"agent_id": 0}, {"agent_id": ""}, {"agent_id": False},
+                         {"agent_id": "child", "agent_type": "\n"},
+                         {"agent_id": "child", "agent_type": " \t"},
+                         {"agent_type": "\n"}, {"agent_type": "  "}):
+            with self.subTest(identity=identity):
+                self.assertDenied(self.bash("git commit -m 'note'", **identity))
+
+    def test_payload_without_agent_keys_is_the_lead(self):
+        # Every lead payload captured from Codex 0.153.2 omits both keys
+        # (capture.jsonl: agent_id present only on subagent payloads).
+        subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
+        self.assertEqual(self.bash("git commit -m 'docs: note'", session_id="s", turn_id="t"), {})
 
     def test_legacy_file_path_is_checked(self):
         self.assertDenied(self.call("write", {
