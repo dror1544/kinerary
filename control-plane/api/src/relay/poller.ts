@@ -98,6 +98,7 @@ import {
   pickForDraft,
   proposeChange,
   rebuildDraft,
+  recordDisplacedPrompt,
   type Draft,
   type ProposeResult,
 } from "../typed-changes-store.js";
@@ -193,7 +194,7 @@ import {
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
 import type { WireMessageEvent } from "./protocol.js";
-import type { TelegramClient } from "./telegram-api.js";
+import { isPermanentRefusal, type TelegramClient } from "./telegram-api.js";
 
 /** Just the part of RelayConnector this needs, so tests need no socket. */
 export interface InboundSink {
@@ -2346,11 +2347,19 @@ function promptDigest(lastPrompt: string | null | undefined, draftId: string): s
  * is up.
  *
  * Says what happened: `shown`, `no_floor` (someone else is speaking; nothing was
- * attempted) or `send_failed` (Telegram refused it; the organizer has seen
- * nothing). With `tellOnFailure: false` a refused send is not announced - the
+ * attempted), `send_failed` (Telegram did not take it THIS time - a rate limit,
+ * a 5xx, the network; the organizer has seen nothing, and the same message may
+ * go through later) or `refused` (Telegram refused this content for good: a
+ * `Bad Request`, which it will repeat). A transient failure is always announced
+ * with `change.sendFailed`, because the change keeps waiting and "yes" or "no"
+ * shows it again. With `tellOnFailure: false` a permanent refusal is not - the
  * caller has something truer to say (`dropUnshowable`).
+ *
+ * A preview that goes out over a prompt the draft does not already name as
+ * displaced records that prompt (#225): it is what the preview covers, and what
+ * has to come back when the change is settled.
  */
-type ShowOutcome = "shown" | "no_floor" | "send_failed";
+type ShowOutcome = "shown" | "no_floor" | "send_failed" | "refused";
 async function showChangeDraft(
   deps: TripBotPollerDeps,
   chatId: string,
@@ -2361,24 +2370,37 @@ async function showChangeDraft(
 ): Promise<ShowOutcome> {
   const rendered = renderDraft(draft, view.language);
   if (!(await takeFloor(chatId, view, deps))) return "no_floor";
+  // Read now, with the floor held, not from `view`: another speaker may have put
+  // something on screen since `view` was built - on the retake in
+  // `showProposedChange` it always has.
+  const covering = await getSessionForChat(deps.db, chatId);
+  const covered = covering.ok ? covering.view.lastPrompt ?? "" : "";
   const previous = shownPreviews.get(draft.id);
   const sent = await deps.telegram.sendMessage({
     chatId,
     text: lead ? `${lead}\n\n${rendered.text}` : rendered.text,
     replyMarkup: rendered.replyMarkup,
-  }).catch(() => undefined) as { ok?: boolean; messageId?: string } | undefined;
+  }).catch(() => undefined) as { ok?: boolean; messageId?: string; permanent?: boolean } | undefined;
   if (!sent?.ok) {
-    // A refused send (a rate limit, the network, a text Telegram will not take)
-    // returns `ok: false` and does not throw. The organizer has seen NOTHING, so
+    // A refused send returns `ok: false` and does not throw (a throw is caught
+    // above and counts as transient). The organizer has seen NOTHING, so
     // nothing may be confirmable by a typed "yes": `lastPrompt` is left as it
     // was, and it names an older version's digest, which matches no current one.
-    (deps.log ?? (() => {}))(structuredLog("warn", "interview.change_show_failed", { session_id: view.sessionId, draft_id: draft.id }));
-    if (options.tellOnFailure !== false) {
+    const permanent = isPermanentRefusal(sent as { ok: boolean; permanent?: boolean } | undefined);
+    (deps.log ?? (() => {}))(structuredLog("warn", "interview.change_show_failed", { session_id: view.sessionId, draft_id: draft.id, permanent }));
+    if (!permanent || options.tellOnFailure !== false) {
       await deps.telegram
         .sendMessage({ chatId, text: uiString("change.sendFailed", view.language) })
         .catch(() => undefined);
     }
-    return "send_failed";
+    return permanent ? "refused" : "send_failed";
+  }
+  if (covered && !covered.startsWith("pc:") && covered !== draft.displacedPrompt) {
+    await recordDisplacedPrompt(deps.db, { draftId: draft.id, sessionId: view.sessionId, prompt: covered });
+    (deps.log ?? (() => {}))(structuredLog("info", "interview.change_displaced_moved", {
+      // The key's first two parts only: a question key can carry an unsettled answer's text after them.
+      session_id: view.sessionId, draft_id: draft.id, displaced: covered.split(":").slice(0, 2).join(":"),
+    }));
   }
   // Recorded only now that it was delivered, and carrying the digest: a typed
   // "yes" confirms exactly the version whose preview went out.
@@ -2399,7 +2421,9 @@ async function showChangeDraft(
 
 /**
  * THE WAY OUT when showing a waiting change was the only thing left to do and
- * Telegram refused it. The draft is cancelled - Cancel applies nothing, so it is
+ * Telegram refused it FOR GOOD (a `Bad Request` - `reshowDraft` calls this only
+ * for `refused`; a rate limit or an outage keeps the change waiting, #225: it may
+ * be one the organizer has already seen). The draft is cancelled - Cancel applies nothing, so it is
  * always safe - the organizer is told so plainly, in the interview's language,
  * and the interview is put back. Without this, a draft whose preview Telegram
  * rejects on every attempt has no button on screen, a typed "no" only tries the
@@ -2420,13 +2444,25 @@ async function dropUnshowable(
   await resumeAfterChange(deps, chatId, strings, draft.displacedPrompt);
 }
 
-/** The interview, put back after a change resolved: what it displaced comes back, or the next step goes out. */
+/**
+ * The interview, put back after a change resolved: what it displaced comes back,
+ * or the next step goes out.
+ *
+ * WHAT IS ON SCREEN NOW wins over what the change once displaced. When the last
+ * prompt recorded is not a change preview, something was said AFTER the preview
+ * - a tap's next step that raced a follow-up (#225), a summary asked for from the
+ * old offer's own button - and that, not the older prompt under the preview, is
+ * what the organizer is looking at and what comes back.
+ */
 async function resumeAfterChange(
   deps: TripBotPollerDeps,
   chatId: string,
   strings: DispatchStrings,
-  displaced: string | null,
+  displacedByChange: string | null,
 ): Promise<void> {
+  const before = await getSessionForChat(deps.db, chatId);
+  const onScreen = before.ok ? before.view.lastPrompt ?? "" : "";
+  const displaced = onScreen && !onScreen.startsWith("pc:") ? onScreen : displacedByChange;
   await recordLastPromptForChat(deps.db, chatId, "");
   const now = await getSessionForChat(deps.db, chatId);
   if (!now.ok) return;
@@ -2450,8 +2486,11 @@ async function resumeAfterChange(
  *
  * `dropIfUnsent`: this re-show is the organizer's only way forward (a typed "no"
  * to a version they never saw, Confirm blocked by the change) - if Telegram
- * refuses it, the draft is dropped out loud (`dropUnshowable`) rather than left
- * waiting behind a preview that may never go out.
+ * refuses it FOR GOOD, the draft is dropped out loud (`dropUnshowable`) rather
+ * than left waiting behind a preview that will never go out. A transient failure
+ * (a rate limit, a 5xx, the network) drops nothing: the change stays waiting and
+ * `change.sendFailed` says so - dropping it would cancel a change the organizer
+ * may already have seen, because Telegram was busy for a second (#225).
  */
 async function reshowDraft(
   deps: TripBotPollerDeps,
@@ -2475,7 +2514,7 @@ async function reshowDraft(
     return;
   }
   const shown = await showChangeDraft(deps, chatId, view, rebuilt, lead, { tellOnFailure: !options.dropIfUnsent });
-  if (shown === "send_failed" && options.dropIfUnsent) await dropUnshowable(deps, chatId, view, rebuilt, strings);
+  if (shown === "refused" && options.dropIfUnsent) await dropUnshowable(deps, chatId, view, rebuilt, strings);
 }
 
 /**
@@ -2620,8 +2659,9 @@ async function announceChange(
     await deps.telegram.sendMessage({ chatId: burst.chatId, text: uiString("change.sessionConfirmed", language) }).catch(() => undefined);
     return true;
   }
+  // Each of these answers THIS message, so it is never lost to the floor (#225).
   const tell = async (text: string) => {
-    if (await takeFloor(burst.chatId, now.view, deps)) await deps.telegram.sendMessage({ chatId: burst.chatId, text }).catch(() => undefined);
+    await answerThisMessage(deps, burst.chatId, now.view, text, log, "change_refused");
     return true;
   };
   switch (made.kind) {
@@ -2666,6 +2706,10 @@ async function announceChange(
  * the floor is taken back, and the preview goes out after that question - two
  * acts, two answers. Unless this exact version is already on screen (a re-show
  * from the tap path got there first), which would only say it twice.
+ *
+ * What the tap put on screen - its next question, or the boundary offer, which
+ * is sent only once - is what this preview now covers; `showChangeDraft` records
+ * it on the draft, so settling the change puts it back (#225).
  */
 async function showProposedChange(
   deps: TripBotPollerDeps,
@@ -2680,10 +2724,58 @@ async function showProposedChange(
   const now = await getSessionForChat(deps.db, chatId);
   if (!current || current.status !== "pending" || !now.ok) return false;
   if (now.view.lastPrompt === changePromptKey(current)) return true;
-  log(structuredLog("info", "interview.change_floor_taken_back", { session_id: view.sessionId, draft_id: draft.id }));
+  const again = await retakeFloor(deps, chatId, view.sessionId, log, "change_preview", { draft_id: draft.id });
+  return again !== null && (await showChangeDraft(deps, chatId, again, current)) === "shown";
+}
+
+/**
+ * THE FLOOR, TAKEN BACK - by a reply to the organizer's own message, and only by
+ * one (#199 round 4, widened in #225).
+ *
+ * The floor makes two speakers racing to answer ONE message produce one reply.
+ * On the interpret path nobody else answers this message, so whoever holds the
+ * floor now was answering something ELSE - in practice a tap whose reply went
+ * out while this message was being read. Losing to it would leave the message
+ * with no reply at all. So the floor is handed back to the machine and the reply
+ * goes out after the tap's: two acts, two answers. The session the caller must
+ * speak from is returned; null when there is none any more.
+ *
+ * Logged as `interview.change_floor_taken_back` whatever the reply is, so one
+ * grep after a deploy finds every time it happened.
+ */
+async function retakeFloor(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  sessionId: string,
+  log: (line: string) => void,
+  reply: "change_preview" | "change_refused" | "change_not_understood",
+  extra: Record<string, string> = {},
+): Promise<SessionView | null> {
+  log(structuredLog("info", "interview.change_floor_taken_back", { session_id: sessionId, reply, ...extra }));
   await markAwaitingMachine(deps.db, chatId);
   const again = await getSessionForChat(deps.db, chatId);
-  return again.ok && (await showChangeDraft(deps, chatId, again.view, current)) === "shown";
+  return again.ok ? again.view : null;
+}
+
+/**
+ * Says `text` in answer to THIS message, taking the floor back once if a
+ * concurrent tap holds it (`retakeFloor`). False when the floor could not be had
+ * even then - someone claimed it again in between - or the session is gone.
+ */
+async function answerThisMessage(
+  deps: TripBotPollerDeps,
+  chatId: string,
+  view: SessionView,
+  text: string,
+  log: (line: string) => void,
+  reply: "change_refused" | "change_not_understood",
+): Promise<boolean> {
+  if (!(await takeFloor(chatId, view, deps))) {
+    const again = await retakeFloor(deps, chatId, view.sessionId, log, reply);
+    if (!again || !(await takeFloor(chatId, again, deps))) return false;
+  }
+  await deps.telegram.sendMessage({ chatId, text }).catch(() => undefined);
+  return true;
 }
 
 async function runInterpretPath(
@@ -3208,15 +3300,13 @@ async function runInterpretPath(
         ops_error: opsError ? true : false,
       }));
       const now = await getSessionForChat(deps.db, burst.chatId);
-      if (now.ok && (await takeFloor(burst.chatId, now.view, deps))) {
+      if (now.ok) {
         const what = [...about].map((id) => questionNoun(id, now.view.language)).join(", ");
-        await deps.telegram.sendMessage({
-          chatId: burst.chatId,
-          text: what
-            ? uiString("change.notUnderstoodAbout", now.view.language).replace("{what}", what)
-            : uiString("change.notUnderstood", now.view.language),
-        });
-        return;
+        const text = what
+          ? uiString("change.notUnderstoodAbout", now.view.language).replace("{what}", what)
+          : uiString("change.notUnderstood", now.view.language);
+        // It answers THIS message, so a concurrent tap holding the floor does not silence it (#225).
+        if (await answerThisMessage(deps, burst.chatId, now.view, text, log, "change_not_understood")) return;
       }
     }
   }

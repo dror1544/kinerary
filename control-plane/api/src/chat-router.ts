@@ -916,6 +916,23 @@ export function renderQuestion(
 const SUGGESTION_LABEL_MAX = 3000;
 
 /**
+ * At most `max` UTF-16 units of `text` - the budget `SUGGESTION_LABEL_MAX` was
+ * written in - made of WHOLE characters. Never `text.slice(0, max)`: a cut
+ * through an emoji leaves half a surrogate pair, which is not valid UTF-8, and
+ * Telegram refuses the whole message; the label can come from a document (#225).
+ * Not `cutText` (typed-changes-render.ts, which imports this module): that counts
+ * code points, so a label of emoji could come out at twice this budget.
+ */
+function cutWhole(text: string, max: number): string {
+  let cut = "";
+  for (const ch of text) {
+    if (cut.length + ch.length > max) break;
+    cut += ch;
+  }
+  return cut;
+}
+
+/**
  * A question asked WITH the answer a document suggested for it.
  *
  * The document said it and the model was unsure it read it right, so the
@@ -929,7 +946,7 @@ export function renderSuggestion(
   language: Language = DEFAULT_LANGUAGE,
   agentText?: string | null,
 ): RenderedQuestion {
-  const shown = label.length > SUGGESTION_LABEL_MAX ? `${label.slice(0, SUGGESTION_LABEL_MAX)}…` : label;
+  const shown = label.length > SUGGESTION_LABEL_MAX ? `${cutWhole(label, SUGGESTION_LABEL_MAX)}…` : label;
   const rows: InlineButton[][] = [[
     { text: uiString("suggestionYes", language), callback_data: suggestionYesCallbackData(question.id) },
     { text: uiString("suggestionNo", language), callback_data: suggestionNoCallbackData(question.id) },
