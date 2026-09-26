@@ -938,6 +938,12 @@ Decisions 21–28 are the owner's answers to the section-B interview of 2026-09-
 
 28. **Two releases; Release A is early and control-plane only.** Release A ships the control-plane and relay fixes merged so far **before 3 Oct, without redeploying any trip site**; Release B carries Track 2 and the exit gate. Dror chose this over the lead's recommendation, which was Release A after both live trips end (about 5–8 Oct). It respects the 2026-09-25 rule that live trips are redeployed only after they end (no trip site changes), but the VM serves a real organizer and the live trips' companions route through its relay, so a control-plane upgrade does reach them. **Conditions the lead proposes for Release A, not yet agreed:** a sprint-mode regression plan for the exact commit; the walks already owed before the VM (the organizer document route, #217; #225 items 1, 3 and 5; #199's real-model run in English and Hebrew; the owner's Hebrew read; the five read-only fleet probes) run in one throwaway-trip session; `kinerary-cp-release upgrade --dry-run` first, with a snapshot and a rehearsed rollback; and a window away from the live trips' active hours. (Dror, 2026-09-26)
 
+Decisions 29–31 were taken in another session's conversation (sprint-6-integration-ba) and are **relayed** here by the lead session, which did not witness them. Dror answered one multiple-choice question, "Accept all three", to three recommendations that session put to him. The reasons in the recommendations were that session's (issue labels; #223 carries `track:4`), not his, so none is recorded as his.
+
+29. **Typed changes to held answers (#206, #205, #114) belong to Track 2**, as their labels say. (Dror, 2026-09-26, relayed)
+30. **Track 4 formally owns CI and test health; the port-collision fix (#223 cause 2) is scheduled after the trip-site connector carry.** This settles decision 15's open ordering. (Dror, 2026-09-26, relayed)
+31. **The trip-site connector gets a GitHub issue on Track 1 (trip UI/UX).** This closes the "unowned gap" named in decision 18. (Dror, 2026-09-26, relayed)
+
 ## Delta against Sprint 6 as written
 
 **Added** (none of this is in `docs/onboarding-mvp-sprint-plan.md:1438-1552`):
