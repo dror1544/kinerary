@@ -30,6 +30,7 @@ import { dispatchUpdate, DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { applyDecision, startTripBotPoller,
   combineBurst,
   foldItineraryFromDocument,
+  suggestionConfirmedText,
 } from "../src/relay/poller.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
@@ -939,6 +940,29 @@ describe("combining a burst of messages into one turn", () => {
     const combined = combineBurst([ev("older"), ev("newest", ["zzz"])]);
     assert.equal(combined?.source.chat_id, "391627336");
     assert.equal(combined?.message_type, "document");
+  });
+});
+
+describe("#225 item 7: a confirmed reading's edit fits Telegram's limit, whatever the label is made of", () => {
+  const destination = INTAKE_QUESTIONS.find((q) => q.id === "destination")!;
+  const wellFormed = (s: string) => !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+
+  test("an emoji-only label (two UTF-16 units each) stays under 4096 units and cuts on whole characters", () => {
+    // 3000 emoji: counted in code points that is exactly the old 3000 budget,
+    // and 6000 units on the wire - which Telegram refuses, for the whole edit.
+    const label = "🎌".repeat(3000);
+    for (const language of ["en", "he"] as const) {
+      const text = suggestionConfirmedText(destination, label, language);
+      assert.ok(text.length <= 4096, `${text.length} UTF-16 units`);
+      assert.ok(wellFormed(text), "no half of a surrogate pair");
+      assert.ok(text.startsWith(askText(destination, language)), "the question still leads");
+      assert.ok(text.includes("✅ 🎌"), "and the reading follows");
+    }
+  });
+
+  test("an ordinary label is shown whole", () => {
+    assert.equal(suggestionConfirmedText(destination, "Japan", "en"), `${askText(destination, "en")}\n\n✅ Japan`);
+    assert.equal(suggestionConfirmedText(destination, null, "en"), `${askText(destination, "en")}\n\n✅ `);
   });
 });
 

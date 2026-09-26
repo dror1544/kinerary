@@ -21,6 +21,7 @@
 import type pg from "pg";
 import {
   conflictCallbackData,
+  cutWhole,
   findQuestion,
   parseCallbackData,
   renderConfirmPrompt,
@@ -102,7 +103,7 @@ import {
   type Draft,
   type ProposeResult,
 } from "../typed-changes-store.js";
-import { bareReply, confirmable, cutText, questionNoun, renderDraft } from "../typed-changes-render.js";
+import { bareReply, confirmable, questionNoun, renderDraft } from "../typed-changes-render.js";
 import {
   applyProposals,
   DEFAULT_MIN_CONFIDENCE,
@@ -194,7 +195,7 @@ import {
 import { toWireEvent, type TelegramUpdate } from "./normalize.js";
 import { agentTextIsInLanguage } from "./internal-leak.js";
 import type { WireMessageEvent } from "./protocol.js";
-import { isPermanentRefusal, type TelegramClient } from "./telegram-api.js";
+import { isPermanentRefusal, type SendResult, type TelegramClient } from "./telegram-api.js";
 
 /** Just the part of RelayConnector this needs, so tests need no socket. */
 export interface InboundSink {
@@ -1273,9 +1274,7 @@ async function applyInterviewCallback(
         await deps.telegram.editMessageText({
           chatId: decision.chatId,
           messageId: decision.messageId,
-          // Cut on code points: the label can come from a document, and half an
-          // emoji makes Telegram refuse the whole edit.
-          text: `${askText(question, language)}\n\n✅ ${cutText(label ?? "", 3000)}`,
+          text: suggestionConfirmedText(question, label, language),
           replyMarkup: undefined,
         });
       }
@@ -2005,10 +2004,27 @@ async function askOpenConflict(view: SessionView, chatId: string, deps: TripBotP
   if (view.lastPrompt === key) return false;
   if (!(await takeFloor(chatId, view, deps))) return false;
   const rendered = await renderConflictQuestion(deps.db, chatId, conflict, view.language);
-  await deps.telegram.sendMessage({ chatId, text: rendered.text, replyMarkup: rendered.replyMarkup });
-  await recordLastPromptForChat(deps.db, chatId, key);
+  // Through `deliverStep`, like the router's other questions (#225 item 9): this
+  // recorded `cfl:` AFTER a send whose result it never read, so a refused ask was
+  // marked as on screen and never asked again. Delivered, or owed to the step
+  // retry - either way this turn is spoken for.
+  await deliverStep(view, chatId, deps, key, { text: rendered.text, replyMarkup: rendered.replyMarkup });
   return true;
 }
+
+/**
+ * What a suggestion's message becomes once its Yes is tapped: the question, and
+ * the reading that was recorded (#225 item 7).
+ *
+ * The label can come from a document, so it is cut - within 3000 UTF-16 units,
+ * the unit Telegram's 4096 limit counts, and on WHOLE characters: half an emoji
+ * is not valid UTF-8 and Telegram refuses the whole edit. `cutText` counted code
+ * points, so 3000 emoji came out at 6000 units and the edit was refused.
+ */
+export function suggestionConfirmedText(question: IntakeQuestion, label: string | null, language: Language): string {
+  return `${askText(question, language)}\n\n✅ ${cutWhole(label ?? "", SUGGESTION_EDIT_LABEL_MAX)}`;
+}
+const SUGGESTION_EDIT_LABEL_MAX = 3000;
 
 /**
  * A question as the router draws it: with the answer a document suggested for
@@ -2404,7 +2420,11 @@ async function showChangeDraft(
   // differs from the one read before the send was said during it; anything else
   // (unchanged, cleared, another preview) leaves `covered` as it was. What
   // remains is the few DB round trips between this read and the `pc:` record.
-  const landed = await getSessionForChat(deps.db, chatId);
+  //
+  // A read that fails degrades to `covered` (#225 F-b): the preview HAS been
+  // delivered, and a throw here left it unrecorded - no `pc:` key, so a typed
+  // "yes" could not confirm what the organizer was looking at.
+  const landed = await getSessionForChat(deps.db, chatId).catch(() => ({ ok: false as const }));
   const during = landed.ok ? landed.view.lastPrompt ?? "" : "";
   const displaced = during && !during.startsWith("pc:") && during !== covered ? during : covered;
   if (displaced && !displaced.startsWith("pc:") && displaced !== draft.displacedPrompt) {
@@ -3580,11 +3600,21 @@ export async function recoverStalledInterviews(
       }));
 
       const rendered = renderStep(question, view);
-      await deps.telegram.sendMessage({
+      const sent = await deps.telegram.sendMessage({
         chatId,
         text: `${uiString("resumed", view.language)}\n\n${rendered.text}`,
         replyMarkup: rendered.replyMarkup ?? undefined,
       });
+      // Only what ARRIVED is on screen (#225 item 9). The real client returns
+      // `ok: false` rather than throwing, and recording the key anyway made the
+      // dedupe above suppress, as already asked, a question nobody received.
+      if (!sent?.ok) {
+        log(structuredLog("warn", "trip_bot.stalled_turn_recovery_failed", {
+          session_id: sessionId,
+          permanent: isPermanentRefusal(sent),
+        }));
+        continue;
+      }
       await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
     } catch {
       log(structuredLog("warn", "trip_bot.stalled_turn_recovery_failed", { session_id: sessionId }));
@@ -4319,9 +4349,193 @@ export function routerPromptKey(
   return `q:${question.id}${subject ? `:about:${subject.optionId}` : ""}${unsettled ? `:unsettled:${unsettled}` : ""}`;
 }
 
+// ── A step Telegram did not take (#225 item 9) ─────────────────────────────────
+//
+// The router names what it is about to put on screen (`lastPrompt`) and claims
+// the floor BEFORE it sends - see `deliverStep`. The real client does not throw
+// when Telegram refuses a message, it returns `ok: false`, and nothing read that:
+// a question or the summary that never arrived stayed named as on screen, so the
+// dedupe suppressed it, and the floor stayed with the organizer, so nothing
+// re-sent it. The organizer saw nothing, and the interview never tried again.
+//
+// WHAT RE-SENDS IT. Not the stall watchdog (`recoverStalledInterviews`): that
+// claims only a session with an OPEN AGENT TURN, and the interpret path - every
+// new session - opens none. What moves an interpret-path interview on a tick is
+// `advanceRouterOwnedQuestions`, which calls `sendNextStep` for every session
+// awaiting the machine with something to ask - every 700 ms, and only while
+// `state = 'interviewing'`, so never for the summary. Handing the floor back is
+// therefore necessary and not sufficient: at 700 ms it would hammer a chat
+// Telegram is rate-limiting, repeat a refusal forever, and still never re-send a
+// refused summary. So a failed step is also written down here, and:
+//  - `sendNextStep` stays quiet for that chat until the backoff has passed
+//    (2 s, doubling, at most 60 s);
+//  - `retryFailedSteps`, on the deliver tick, re-runs `sendNextStep` once it has
+//    - whatever the state, so the summary too;
+//  - after STEP_RETRY_MAX_ATTEMPTS failures in a row (about three minutes) it
+//    stops, and the floor stays with the organizer: their next message - any
+//    message, or a tap - tries afresh;
+//  - a PERMANENT refusal (a 400: this content, which Telegram will refuse again)
+//    is never retried automatically, for the same reason. It is named and
+//    un-named like the rest, so the organizer's next message tries once more
+//    rather than being deduped into silence.
+// Per Telegram client, i.e. per relay process: a restart forgets the backoff,
+// not the floor, so an interviewing session is picked up by the tick scan.
+
+interface StepRetry { attempts: number; notBefore: number }
+const stepRetries = new WeakMap<TelegramClient, Map<string, StepRetry>>();
+function stepRetriesFor(deps: TripBotPollerDeps): Map<string, StepRetry> {
+  let retries = stepRetries.get(deps.telegram);
+  if (!retries) {
+    retries = new Map();
+    stepRetries.set(deps.telegram, retries);
+  }
+  return retries;
+}
+
+/** Transient failures in a row before a step is left to the organizer's next message. */
+export const STEP_RETRY_MAX_ATTEMPTS = 8;
+const STEP_RETRY_BASE_MS = 2_000;
+const STEP_RETRY_MAX_MS = 60_000;
+let stepRetryBaseMs = STEP_RETRY_BASE_MS;
+/** Tests only: a backoff a suite can wait out. Call with no argument to restore. */
+export function setStepRetryBaseMsForTests(ms: number = STEP_RETRY_BASE_MS): void {
+  stepRetryBaseMs = ms;
+}
+function stepRetryDelayMs(attempts: number): number {
+  return Math.min(stepRetryBaseMs * 2 ** (attempts - 1), STEP_RETRY_MAX_MS);
+}
+
+/**
+ * Sends one router step - a question, the summary, a disagreement - named as on
+ * screen BEFORE it goes out, and un-named if Telegram did not take it. Returns
+ * whether it was delivered.
+ *
+ * RECORDED BEFORE IT IS SENT, and the gap is the reason. `sendMessage` is a round
+ * trip to Telegram - hundreds of milliseconds in which the floor is ours but
+ * nothing says what we are saying. A tap handled in that window loses the floor,
+ * sees an unchanged `lastPrompt`, concludes nobody spoke, takes the floor back and
+ * sends the same question again. That is "I had some duplication" on 2026-09-18:
+ * `trip_interests` and `trip_pace` both went out twice, each pair straight after
+ * a `floor_lost`. Recording first makes the pair "floor claimed, prompt named" as
+ * close to one moment as two statements get, so the loser can tell the two cases
+ * apart - see `respond`.
+ *
+ * The caller has already taken the floor. A step that did not arrive is handed to
+ * `stepNotDelivered`, which decides whether and when it is tried again.
+ */
+async function deliverStep(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+  promptKey: string,
+  message: { text: string; replyMarkup?: InlineKeyboard },
+): Promise<boolean> {
+  const previousPrompt = view.lastPrompt ?? "";
+  if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
+  let sent: SendResult | undefined;
+  try {
+    sent = await deps.telegram.sendMessage({ chatId, text: message.text, replyMarkup: message.replyMarkup });
+  } catch (error) {
+    await stepNotDelivered(view, chatId, deps, promptKey, previousPrompt, false);
+    throw error;
+  }
+  if (sent?.ok) {
+    stepRetriesFor(deps).delete(chatId);
+    return true;
+  }
+  await stepNotDelivered(view, chatId, deps, promptKey, previousPrompt, isPermanentRefusal(sent));
+  return false;
+}
+
+/**
+ * A step Telegram did not take: un-name it, and either leave it to the step retry
+ * (transient) or to the organizer's next message (permanent, or retried enough).
+ *
+ * Only while nobody has spoken since: `lastPrompt` still naming this step means
+ * the floor and the screen are as this send left them. Otherwise another speaker
+ * has put something on screen, and it is theirs.
+ */
+async function stepNotDelivered(
+  view: SessionView,
+  chatId: string,
+  deps: TripBotPollerDeps,
+  promptKey: string,
+  previousPrompt: string,
+  permanent: boolean,
+): Promise<void> {
+  const log = deps.log ?? (() => {});
+  const retries = stepRetriesFor(deps);
+  // The key's first two parts only: a question key can carry an unsettled answer's text after them.
+  const prompt = promptKey ? promptKey.split(":").slice(0, 2).join(":") : null;
+  const now = await getSessionForChat(deps.db, chatId);
+  const ours = now.ok && (promptKey ? now.view.lastPrompt === promptKey : now.view.awaiting === "person");
+  if (!ours) {
+    log(structuredLog("warn", "trip_bot.step_send_failed", {
+      session_id: view.sessionId, prompt, permanent, retry: false, reason: "SPOKEN_SINCE",
+    }));
+    return;
+  }
+  if (promptKey) await recordLastPromptForChat(deps.db, chatId, previousPrompt);
+  if (permanent) {
+    retries.delete(chatId);
+    log(structuredLog("warn", "trip_bot.step_send_failed", { session_id: view.sessionId, prompt, permanent, retry: false }));
+    return;
+  }
+  const attempts = (retries.get(chatId)?.attempts ?? 0) + 1;
+  if (attempts >= STEP_RETRY_MAX_ATTEMPTS) {
+    retries.delete(chatId);
+    log(structuredLog("error", "trip_bot.step_send_abandoned", { session_id: view.sessionId, prompt, attempts }));
+    return;
+  }
+  const delay = stepRetryDelayMs(attempts);
+  retries.set(chatId, { attempts, notBefore: Date.now() + delay });
+  // The machine owes this message again - which is what `awaiting = 'machine'`
+  // says, to every speaker and to the tick scan.
+  await markAwaitingMachine(deps.db, chatId);
+  log(structuredLog("warn", "trip_bot.step_send_failed", {
+    session_id: view.sessionId, prompt, permanent, retry: true, attempt: attempts, retry_in_ms: delay,
+  }));
+}
+
+/**
+ * Re-runs `sendNextStep` for every chat whose last step failed and whose backoff
+ * has passed. On the deliver tick, beside the scans; exported for the tests, which
+ * pass a `now` rather than waiting a real backoff out.
+ */
+export async function retryFailedSteps(
+  deps: TripBotPollerDeps,
+  strings: DispatchStrings,
+  log: (line: string) => void,
+  now: number = Date.now(),
+): Promise<void> {
+  const retries = stepRetriesFor(deps);
+  for (const [chatId, entry] of [...retries]) {
+    if (entry.notBefore > now) continue;
+    try {
+      const result = await getSessionForChat(deps.db, chatId);
+      if (!result.ok) {
+        retries.delete(chatId);
+        continue;
+      }
+      // Due: `sendNextStep` lets it through. A failure replaces the entry.
+      entry.notBefore = 0;
+      await sendNextStep(result.view, chatId, deps, strings);
+      // Nothing new recorded against it - sent, or nothing left to say: done.
+      if (retries.get(chatId) === entry) retries.delete(chatId);
+    } catch {
+      log(structuredLog("warn", "trip_bot.step_retry_failed", {}));
+    }
+  }
+}
+
 /**
  * Exported for the transcript tests: the live failure is a STALE view reaching
  * this function, which a test can only reproduce by handing it one.
+ *
+ * Returns true when the next step is taken care of: sent, or owed to the step
+ * retry (a send Telegram did not take, or one waiting out its backoff) - in
+ * which case nobody else may speak for it now. False when nothing was said and
+ * nothing is owed by this call.
  */
 export async function sendNextStep(
   view: SessionView,
@@ -4331,6 +4545,7 @@ export async function sendNextStep(
 ): Promise<boolean> {
   let text: string;
   let replyMarkup: InlineKeyboard | undefined;
+  let askedNomination: string | null = null;
 
   // THE FLOOR. Nothing is sent while it is the organizer's turn — that is a
   // conversation waiting on a human, not a fault. Run 7 got most questions
@@ -4342,6 +4557,14 @@ export async function sendNextStep(
     }));
     return false;
   }
+
+  // A STEP FOR THIS CHAT FAILED AND IS WAITING OUT ITS BACKOFF (#225 item 9).
+  // `retryFailedSteps` sends it when the wait is over; speaking now would be the
+  // hammering the backoff exists to prevent, and a `false` here would invite a
+  // caller to fill the gap with "I didn't follow". Silent: the tick asks every
+  // 700 ms.
+  const owed = stepRetriesFor(deps).get(chatId);
+  if (owed && owed.notBefore > Date.now()) return true;
 
   // A DOCUMENT IS WAITING TO BE READ. Say nothing until it has been.
   //
@@ -4416,11 +4639,10 @@ export async function sendNextStep(
       if (!(await takeFloor(chatId, view, deps))) return false;
       const rendered = renderStep(question, view);
       // Named before it is sent, for the reason given at the end of this
-      // function: what is on screen has to be readable by a racing pass while
-      // this one is still waiting on Telegram.
-      await recordLastPromptForChat(deps.db, chatId, `q:${question.id}`);
-      await deps.telegram.sendMessage({
-        chatId,
+      // function (`deliverStep`): what is on screen has to be readable by a
+      // racing pass while this one is still waiting on Telegram - and un-named
+      // again if Telegram did not take it.
+      await deliverStep(view, chatId, deps, `q:${question.id}`, {
         text: `${uiString("beforeWeFinish", view.language)}\n\n${rendered.text}`,
         replyMarkup: rendered.replyMarkup ?? undefined,
       });
@@ -4699,7 +4921,10 @@ export async function sendNextStep(
     }
     text = rendered.text;
     replyMarkup = rendered.replyMarkup ?? undefined;
-    if (view.pendingAsk?.id === question.id) await clearPendingAskForChat(deps.db, chatId);
+    // The nomination is spent once it has been ASKED - cleared below, after the
+    // send, not here: a send Telegram did not take has asked nothing, and the
+    // retry has to find the same question to ask (#225 item 9).
+    askedNomination = view.pendingAsk?.id === question.id ? question.id : null;
   } else {
     // `interviewing` always has a next question now — required ones first,
     // then optional ones not yet answered or skipped — and every other state
@@ -4710,26 +4935,16 @@ export async function sendNextStep(
   // The question or the recap. Claimed last, immediately before it goes out,
   // so a slow render cannot leave the floor held by a message nobody sent.
   if (!(await takeFloor(chatId, view, deps))) return false;
-  // RECORDED BEFORE IT IS SENT, and the gap is the reason.
-  //
-  // `sendMessage` is a round trip to Telegram — hundreds of milliseconds in
-  // which the floor is ours but nothing says what we are saying. A tap handled
-  // in that window loses the floor, sees an unchanged `lastPrompt`, concludes
-  // nobody spoke, takes the floor back and sends the same question again. That
-  // is "I had some duplication" on 2026-09-18: `trip_interests` and
-  // `trip_pace` both went out twice, each pair straight after a `floor_lost`.
-  //
-  // Recording first makes the pair "floor claimed, prompt named" as close to
-  // one moment as two statements get, so the loser can tell the two cases
-  // apart — see `respond`. Rolled back if the send fails, because the dedupe
-  // must never suppress a question that never reached anybody.
-  const previousPrompt = view.lastPrompt ?? "";
-  if (promptKey) await recordLastPromptForChat(deps.db, chatId, promptKey);
-  try {
-    await deps.telegram.sendMessage({ chatId, text, replyMarkup });
-  } catch (error) {
-    if (promptKey) await recordLastPromptForChat(deps.db, chatId, previousPrompt);
-    throw error;
+  // Named before it is sent and un-named if it did not arrive - `deliverStep`
+  // says why. Not delivered is still `true`: the step is owed to the step retry,
+  // or (refused for good) to the organizer's next message, and a caller that
+  // read `false` as "nothing was said" would say "I didn't follow" over it.
+  if (!(await deliverStep(view, chatId, deps, promptKey, { text, replyMarkup }))) return true;
+  if (askedNomination) {
+    // Only if it is still THIS nomination: one made while the send was in
+    // flight is a new one, and is not ours to clear.
+    const after = await getSessionForChat(deps.db, chatId);
+    if (after.ok && after.view.pendingAsk?.id === askedNomination) await clearPendingAskForChat(deps.db, chatId);
   }
   // WHICH question went out. "Several questions came twice" (2026-09-16) could
   // not be traced to any one of them: the log said a prompt was sent, never
@@ -4919,6 +5134,9 @@ export function startTripBotPoller(
         await flushSettledInboundBursts(deps, log);
         await advanceRouterOwnedQuestions(deps, strings, log);
         await renderDueRouterPrompts(deps, strings, log);
+        // A question or summary Telegram did not take, once its backoff has
+        // passed (#225 item 9) - the scans above never re-send a summary.
+        await retryFailedSteps(deps, strings, log);
         await recoverStalledInterviews(deps, strings, log);
         await closeIdleInterviews(deps, log);
       } catch (error) {

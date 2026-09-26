@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { HttpTelegramClient, isPermanentRefusal, RETRY_AFTER_CAP_SECONDS } from "../src/relay/telegram-api.js";
+import { HttpTelegramClient, isPermanentRefusal, REQUEST_TIMEOUT_MS, RETRY_AFTER_CAP_SECONDS } from "../src/relay/telegram-api.js";
 
 const TOKEN = "123456:SECRET-token-value";
 
@@ -179,5 +179,101 @@ describe("#225: nothing added leaks the bot token", () => {
     }
     const limited = await send([rateLimited(60)]);
     assert.ok(limited.logs.some((l) => l.includes("telegram_api.rate_limited")), "the rate limit is logged, as the method only");
+  });
+
+  test("a timed-out call leaks it neither (#225 item 8): the log names the method, the error is a fixed word", async () => {
+    for (const honoursAbort of [true, false]) {
+      const { result, logs } = await sendHung({ honoursAbort });
+      for (const line of logs) assert.ok(!line.includes(TOKEN) && !line.includes("SECRET"), line);
+      assert.ok(!String(result.error ?? "").includes("SECRET"), String(result.error));
+      assert.ok(!String(result.error ?? "").includes("api.telegram.org"), String(result.error));
+    }
+  });
+});
+
+/**
+ * A connection that never answers: `fetch` that never settles. `honoursAbort`
+ * is what undici does (the signal rejects it); a stub that ignores the signal
+ * is the worst case, and the call must still come back within its bound.
+ */
+function stubHungFetch({ honoursAbort }: { honoursAbort: boolean }) {
+  const calls: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL, init?: RequestInit) => {
+    calls.push(String(input));
+    return new Promise<Response>((_resolve, reject) => {
+      if (!honoursAbort) return;
+      init?.signal?.addEventListener("abort", () => {
+        // What undici rejects with; its message would be the only place a URL could ride.
+        reject(new DOMException(`This operation was aborted: ${String(input)}`, "AbortError"));
+      });
+    });
+  }) as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+const SHORT_TIMEOUT_MS = 30;
+
+async function sendHung(opts: { honoursAbort: boolean }, method: "send" | "edit" = "send") {
+  const t = stubHungFetch(opts);
+  const logs: string[] = [];
+  const waits: number[] = [];
+  const c = new HttpTelegramClient(TOKEN, (line) => logs.push(line), undefined, {
+    sleep: async (ms) => { waits.push(ms); },
+    timeoutMs: SHORT_TIMEOUT_MS,
+  });
+  try {
+    const started = Date.now();
+    const result = method === "send"
+      ? await c.sendMessage({ chatId: "900", text: "hello" })
+      : await c.editMessageText({ chatId: "900", messageId: "7", text: "hello" });
+    return { result, logs, waits, calls: t.calls, took: Date.now() - started };
+  } finally {
+    t.restore();
+  }
+}
+
+describe("#225 item 8: a hung connection is bounded, transient, and not retried", () => {
+  for (const honoursAbort of [true, false]) {
+    test(`a fetch that never settles (${honoursAbort ? "honours" : "ignores"} the abort) returns transient within the bound`, async () => {
+      const { result, calls, waits, took, logs } = await sendHung({ honoursAbort });
+      assert.equal(result.ok, false);
+      assert.notEqual(result.permanent, true, "a timeout is no verdict on the message");
+      assert.equal(isPermanentRefusal(result), false);
+      assert.equal(result.error, "TIMEOUT", "a fixed word, like NETWORK");
+      assert.equal(calls.length, 1, "not retried: only a short 429 is");
+      assert.deepEqual(waits, [], "nothing waited out");
+      assert.ok(took < 2000, `bounded by the timeout, not by undici's default: ${took}ms`);
+      assert.ok(logs.some((l) => l.includes("telegram_api.call_timed_out") && l.includes("sendMessage")), logs.join("\n"));
+    });
+  }
+
+  test("an edit carries the same bound and the same verdict", async () => {
+    const { result, calls } = await sendHung({ honoursAbort: true }, "edit");
+    assert.equal(result.ok, false);
+    assert.equal(isPermanentRefusal(result), false);
+    assert.equal(result.error, "TIMEOUT");
+    assert.equal(calls.length, 1);
+  });
+
+  test("the production bound is well above a normal send and below the gateway's 30 s outbound wait, even with a 429 waited out between two hung tries", () => {
+    assert.ok(REQUEST_TIMEOUT_MS >= 5_000, String(REQUEST_TIMEOUT_MS));
+    assert.ok(2 * REQUEST_TIMEOUT_MS + RETRY_AFTER_CAP_SECONDS * 1000 < 30_000, String(REQUEST_TIMEOUT_MS));
+  });
+
+  test("a call that answers in time is untouched by the timer, and the timer does not outlive it", async () => {
+    const t = stubFetch([ok]);
+    try {
+      const c = new HttpTelegramClient(TOKEN, () => {}, undefined, { timeoutMs: SHORT_TIMEOUT_MS });
+      const result = await c.sendMessage({ chatId: "900", text: "hello" });
+      assert.equal(result.ok, true);
+      // Long past the bound: a timer left armed would have aborted nothing, but
+      // must not have been counted against a later call either.
+      await new Promise((r) => setTimeout(r, SHORT_TIMEOUT_MS * 3));
+      const again = await c.sendMessage({ chatId: "900", text: "hello" });
+      assert.equal(again.ok, true);
+    } finally {
+      t.restore();
+    }
   });
 });
