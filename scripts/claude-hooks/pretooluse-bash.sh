@@ -26,6 +26,10 @@ cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // empty' 2>/dev/null
 
 kind="$(printf '%s' "$cmd" | python3 "$MATCH" 2>/dev/null)" || exit 0
 [ "$kind" != "none" ] || exit 0
+# The same command with its inert shapes (a quoted-heredoc message, -q, a trailing
+# output filter) rewritten to the plain form; the exemptions below are judged on it.
+# Classification above, and every ask, still see the command as typed.
+norm="$(printf '%s' "$cmd" | python3 "$MATCH" --normalize 2>/dev/null)" || norm="$cmd"
 
 # WHO is asking. A tool call from a subagent carries agent_type; the lead
 # session — the one the person is talking to — carries none. CLAUDE.md says
@@ -133,7 +137,7 @@ docs_branch_ok() {
 }
 
 RE_DOCS_COMMIT='^git commit( -q| --quiet)*( -F [A-Za-z0-9_./~-]+| -m "[^"$`\\]*"| -m '\''[^'\''$`\\]*'\'')+$'
-RE_DOCS_PUSH='^git push( -u| --set-upstream)*( origin( [A-Za-z0-9_./-]+)?)?$'
+RE_DOCS_PUSH='^git push( -u| --set-upstream| -q| --quiet)*( origin( [A-Za-z0-9_./-]+)?)?$'
 
 docs_only_commit_ok() {
   local c="$1" f n=0
@@ -187,7 +191,7 @@ docs_only_push_ok() {
 # or `git -C <dir>`. <dir> must be a worktree of THIS repository — an unrelated
 # repository is not vouched for — and the mechanical checks run against that index.
 RE_FEATURE_BRANCH='^(fix|feat|carry|chore)/[A-Za-z0-9._-]+$'
-RE_FEATURE_PUSH='^git push( -u| --set-upstream)* origin ([A-Za-z0-9_./-]+)$'
+RE_FEATURE_PUSH='^git push( -u| --set-upstream| -q| --quiet)* origin ([A-Za-z0-9_./-]+)$'
 
 # Split a leading `cd <dir> && ` or `git -C <dir> ` off a command: sets TARGET (the
 # directory the command acts on) and REST (the command as if run there).
@@ -281,10 +285,10 @@ case "$kind" in
     emit ask "CLAUDE.md hard rule 1 — a merge, cherry-pick, revert, rebase or gh pr merge creates commits, so it needs the same explicit approval as git commit. Approve only if you meant to land this now.$(merge_evidence "$cmd")"
     ;;
   push)
-    if docs_only_push_ok "$cmd"; then
+    if docs_only_push_ok "$norm"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-25): pushing docs-only commits on an integration or docs branch, to the branch's own upstream, needs no per-push approval. Every commit being pushed changes only documentation."
     fi
-    if feature_push_ok "$cmd"; then
+    if feature_push_ok "$norm"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-26): pushing a feature branch (fix/, feat/, carry/, chore/) to its own name on origin needs no per-push approval; nothing lands until it is merged, and that merge is prompted."
     fi
     emit ask "Pushing publishes commits to origin: after this they exist for everyone who fetches, and a force push rewrites what they already had. Approve only if you meant to push right now."
@@ -301,7 +305,7 @@ $(plan_note)"
     # happen: a feature branch usually lives in a sibling worktree of this repository.
     # preflight-checks.sh inspects the checkout that CONTAINS the script, whatever the
     # working directory, so it is that worktree's own copy that has to run.
-    target_of "$cmd"
+    target_of "$norm"
     check_script="$CHECKS"
     if same_repo "$TARGET"; then check_script="$(git -C "$TARGET" rev-parse --show-toplevel)/scripts/preflight-checks.sh"; fi
     if [ -x "$check_script" ]; then
@@ -322,10 +326,10 @@ Fix the BLOCK lines above, or bypass deliberately with: git commit --no-verify"
 THIS COMMIT CHANGES THE SPRINT/BASELINE STATE (.project/sprint.json):
 $changes"
     fi
-    if docs_only_commit_ok "$cmd"; then
+    if docs_only_commit_ok "$norm"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-25): a docs-only commit on an integration or docs branch needs no per-commit approval. Every staged path is documentation and the mechanical checks passed."
     fi
-    if feature_commit_ok "$cmd"; then
+    if feature_commit_ok "$norm"; then
       emit allow "MVP-phase rule (CLAUDE.md, 2026-09-26): a commit on a feature branch (fix/, feat/, carry/, chore/) needs no per-commit approval. No staged path is policy and the mechanical checks passed; the approval comes at the merge into the leading branch."
     fi
     emit ask "CLAUDE.md hard rule 1 — never git commit without explicit user approval. Mechanical checks passed; this prompt is the approval."

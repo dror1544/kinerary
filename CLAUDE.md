@@ -84,7 +84,16 @@ Two branches carry names in this document. The **leading branch** is
    (`cd <dir> &&` or `git -C <dir>` is read; another repository is not vouched
    for) — never for a staged policy path (`CLAUDE.md`, `AGENTS.md`, `.claude/`,
    `.githooks/`, `.github/`, `scripts/`, `.preflight-allow`), `-a`, `--amend`,
-   `--no-verify`, a force, another branch, or `main`. The mechanical checks run
+   `--no-verify`, a force, another branch, or `main`. Three inert shapes are
+   read as the plain form first, for this item and item 1 alike (2026-09-26: the
+   decision log showed 8 of 9 prompts in 90 minutes were for commits meant to
+   pass): a message written as a heredoc with a QUOTED delimiter
+   (`-m "$(cat <<'EOF' … EOF)"`, Claude Code's own style), rewritten only when
+   the delimiter's FIRST terminator line is followed by nothing but the closing
+   `)"` (the shell ends the heredoc there and would run anything after it), `-q`,
+   and a trailing
+   `2>&1`, `| tail -N`, `| head -N` or `| grep -v '<text>'`. Any other pipe,
+   chain or substitution still asks (`match-command.py --normalize`). The mechanical checks run
    first, from that worktree's own copy of `scripts/preflight-checks.sh`,
    against that worktree's index. **The merge into `integration/sprint-*` is the
    one prompt**, and its text carries the PR's base branch and its check

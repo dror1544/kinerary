@@ -97,6 +97,60 @@ MERGE = re.compile(
 # force push rewrites what they already had.
 PUSH = re.compile(CMDPOS + r'(?:sudo\s+)?git\b(?:\s+-\S+(?:\s+\S+)?)*\s+push(?![\w-])')
 
+# --normalize: rewrite the inert shapes sessions actually type into the plain form
+# the hook's exemptions match (2026-09-26, from the decision log: 8 of 9 prompts
+# in 90 minutes were for commits the exemptions meant to allow). Only two things
+# are rewritten, and both are inert:
+#   * a heredoc message with a QUOTED delimiter -- -m "$(cat <<'EOF' ... EOF)" --
+#     whose body the shell passes through literally, becomes -m 'msg';
+#   * a trailing output filter -- 2>&1, | tail -N, | head -N, | grep -v '<text>' --
+#     is dropped: it only shapes what is printed, never what is committed.
+# Anything else is left as it is, so it fails the exemption and is asked.
+#
+# The heredoc ends where the SHELL ends it: at the FIRST line equal to the
+# delimiter. Anything after that line inside the $( ) is executed, so a message is
+# rewritten only when its first terminator line is followed by nothing but the
+# closing )". A terminator is recognised by the classifier's own looser rule
+# (^\s*D\s*$, as strip_heredocs uses), so the two can never disagree about where a
+# heredoc ends. Any anomaly leaves the whole command as typed, which then fails the
+# exemption and is asked. (#242 review, 2026-09-26: a non-greedy regex read to the
+# LAST delimiter and erased a hidden `git push --force origin main` as "body".)
+HEREDOC_OPEN = re.compile(r'"\$\(cat <<[ \t]*([\'"])([A-Za-z_][A-Za-z0-9_]*)\1\n')
+HEREDOC_CLOSE = re.compile(r'\s*\)"')
+FILTER = (r'(?:\s*2>&1'
+          r'|\s*\|\s*(?:tail|head)\s+-n?\s*\d+'
+          r"|\s*\|\s*grep\s+-[vEiF]*v[vEiF]*\s+'[^'\n]*')")
+TRAILING_FILTERS = re.compile(r'(?:' + FILTER + r')+\s*$')
+
+
+def normalize_heredocs(cmd: str) -> str:
+    out, i = [], 0
+    while True:
+        m = HEREDOC_OPEN.search(cmd, i)
+        if not m:
+            out.append(cmd[i:])
+            return "".join(out)
+        terminator = re.compile(r'^[ \t]*' + re.escape(m.group(2)) + r'[ \t]*$', re.M)
+        end = terminator.search(cmd, m.end())
+        if not end:
+            return cmd                                  # never closed: leave it as typed
+        close = HEREDOC_CLOSE.match(cmd, end.end())
+        if not close:
+            return cmd                                  # something runs after the heredoc
+        out.append(cmd[i:m.start()])
+        out.append("'msg'")
+        i = close.end()
+
+
+def normalize(cmd: str) -> str:
+    cmd = cmd.strip()
+    return TRAILING_FILTERS.sub("", normalize_heredocs(cmd)).strip()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--normalize":
+    sys.stdout.write(normalize(sys.stdin.read()))
+    sys.exit(0)
+
 raw = strip_heredocs(sys.stdin.read())
 
 # Asymmetric on purpose. Deploy verbs are matched with quotes intact, because a
