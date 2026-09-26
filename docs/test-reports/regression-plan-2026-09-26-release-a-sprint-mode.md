@@ -366,3 +366,116 @@ G, the Hebrew read (Dror, ~25 min carried + 2):
 - **Ran:** `tests.scripts.test_vm_release` (70 OK, 4.8 s); `classify_migrations` over the 13 files (13 compatible).
 - **Not done:** any DB suite, a `kinerary-cp-release` call, a restart, a deploy, a commit, Proxmox or trip-container reads, reading any message text.
 </details>
+
+---
+
+## Update after the owner's decisions (2026-09-26)
+
+**Verdicts.**
+- **#241 (`76cb601`) is SUFFICIENT to merge into `integration/sprint-6`**, on two conditions: "TypeScript API" finishes green on its merge ref (still `IN_PROGRESS` at 14:52Z; "Kinerary suite" and the other five checks had passed), and the adversarial review returns nothing blocking.
+- **Release A: GO once the open gates below are met.** The target is now the #241 merge commit, not `b04e229`. D1 is answered by decision 41 and closed by #241, so it no longer blocks.
+- What changed since the plan was written: decisions 41–46; #241; the G5 report (`boundary-review-2026-09-26-release-a-g5-sprint-worker-old-site.md`).
+- What I ran for this update:
+  - #241 on a scratch `git archive` of `76cb601` (`node_modules` linked from its worktree, `CONTROL_PLANE_TEST_DATABASE_URL` unset): `tsc --noEmit` clean; `test/document-correction-flow.test.ts` 2/2, the pure half.
+  - 9 mutations (U1).
+  - Nothing else: no DB suite, no new SSH or production read.
+  - A name-only count of the Mac's `provisioning.env`: 0 lines set `ORGANIZER_DOCUMENT_ROUTE_ENABLED`; 1 line sets `ITINERARY_EXTRACT_TIMEOUT_MS`.
+
+### U1. What #241 pins
+
+**Code read in full.**
+- `organizerDocumentRouteSetting`: only the exact string `"1"` turns it on.
+- `organizerDocumentRouteFromEnv`: logs `relay.organizer_document_route {enabled}` once, plus a warning for an unrecognised value; the raw value is never echoed.
+- `organizerDocumentRoute` takes a required `enabled` input. Off, it returns `null` **after** `confirmedOrganizerChat` (a read) and **before** `attachMedia`, logging `trip_bot.organizer_document_route_off {trip_id}`.
+- `dispatch.ts` passes `options.organizerDocumentRoute === true`; `poller.ts` passes it only when `=== true`; `server.ts` reads the environment once.
+
+| Behaviour | Test that fails without it | How I know |
+|---|---|---|
+| exact `"1"`; trim refused; `true`/`yes` refused; absent is off; unrecognised is flagged | parser test | **measured:** trim 1 fail, accept `true` 1, absent-is-on 2, never-unrecognised 2 |
+| start line present, carries the state only, never the raw value; warning present | start-line test | **measured:** line removed 1 fail, raw value echoed 1, warning removed 1, `FromEnv` always true 1 |
+| flag off: the file goes to the companion, **one** Telegram download, the decision deep-equal to the no-model path, runner calls 0, corrections 0, one trip-id-only line | "dispatch (flag unset)" (DB) | **read.** My gate-removed mutation gives 0 fails without a database, as expected; with a database that test's `kind`/`fetches`/`calls` asserts fail |
+| the poller carries the flag both ways | "the poll loop" (DB, `startTripBotPoller`, on and off) | read |
+| **`server.ts` → poller hop** | **none** (the developer's caveat, confirmed) | read |
+
+- **Mutations:** 8 of 8 pure ones caught. The developer's 11 map onto the rows above; I did not see those runs.
+- **The unpinned hop.** A dropped hop fails safe (the route stays off). A hop hard-coded to `true` would not be caught, and the start line would still say `false`, because it reports what was **parsed**, not what was **passed**. That takes a deliberate edit, which review catches. It does not block the merge. The startup test the developer lists as a follow-up would close it (~20 min, after Release A).
+- **Ungated, and why that is acceptable:**
+  - the `dc:` Approve callback needs a proposal row, and none can exist while the route is off (the table arrives empty with the upgrade);
+  - the web `POST /v1/trips/:id/intake/correct` route already exists at `130924b`.
+- **Merge check:** `git merge-tree` of the tip `d6b8f21` with `76cb601` is clean.
+
+### U2. Gates, restated
+
+| Gate | Status | Owner | Minutes (est. unless noted) | Can run in parallel? |
+|---|---|---|---|---|
+| G0: D1 | **DONE** (decision 41; #241) | — | — | — |
+| G1: CI green on the **#241 merge commit** | open | lead (merge approval is a prompt, decision 20) | ~14 CI (measured on #234) | after #241 merges |
+| P2: delta check, `b04e229..<merge>` minus `docs`/`*.md` = exactly #241's 4 `src` files + 1 test | open | lead | 10 | after G1 |
+| G2: the throwaway-trip walk (U4) | open | **Dror** + lead | ~110 with Dror + provisioning | independent of G1 **only if** the Mac stack runs the merge commit, so after the merge |
+| G3: Hebrew read | open | **Dror** | ~27 | anytime; same sitting as G2 |
+| G4: P3 (`test_vm_release`, 70) + P4 (rehearsal test, Docker) | open | lead | 0.1 + ~5 | anytime; parallel to G2 |
+| G5: sprint worker × old site | **DONE** (decisions 44–46, two exits accepted) | — | — | — |
+| G6: `plan` + `upgrade --dry-run` | open | lead, with **Dror** present | 10–15 | window day, 13:30 UTC |
+| G7: fleet re-read at T−10 | open | lead | 5 | window day, 13:20 UTC |
+| G8: nightly e2e off, no Mac provisioning, the day of the walk and the window night | open | lead | 1 | the day before |
+| G9: the owner's word for V3 | open | **Dror** | — | 14:00 UTC |
+
+**The #217 walk is no longer a Release A gate.** It is the condition for switching the flag on anywhere real (decision 41), together with every live trip on that relay having ended.
+
+**Order to the window:**
+1. **Now → 1 Oct:** #241 CI and review → merge (approval) → G1 → P2. G4 in parallel.
+2. **1 Oct, or the morning of 2 Oct IDT:** G2 + G3 together (~2 h 20 of Dror's time). G8 is set beforehand.
+3. **Fri 2 Oct:** 13:20 G7 → 13:30 G6 → ~14:00 G9 → V3 → V4–V9 (~35). Dror's time on the day: ~1 h.
+
+### U3. Post-deploy lines changed by #241
+
+- **V4 adds the direct proof**, read before any other restart:
+  `sudo docker logs -t kinerary-cp-relay-1 2>&1 | grep -E 'relay\.organizer_document_route'`
+  - It must show exactly one line: `{"level":"info","event":"relay.organizer_document_route","enabled":false}`.
+  - It must show **no** `relay.organizer_document_route_setting_unrecognized`.
+  - This replaces W item 13's `grep -c document_correction = 0` as the Release A evidence.
+- Also verified by reading: `compose.vm.yml` (unchanged by #241) does not pass the variable to the relay. It could reach the relay only through one of the relay's two agent-auth `env_file`s. The line above is the proof either way.
+- **What a live organizer's file does after the upgrade:** it takes the companion route, downloaded once, with the same decision as the no-model path. That is where it goes on production today, where the route does not exist.
+  - The only new trace is `trip_bot.organizer_document_route_off {trip_id}`.
+  - **Count those lines in H.** Each one is a live organizer who sent a file that the route would have read.
+  - Nothing is proposed and nothing is rebuilt.
+- **Rollback trigger added:** `enabled:true`, or a `_setting_unrecognized` line, means the environment is not what was deployed. Stop and investigate before the first organizer's file arrives.
+
+### U4. The walk (G2) changes
+
+- **Item 13 becomes the flag-off check.**
+  - Leave `ORGANIZER_DOCUMENT_ROUTE_ENABLED` **unset** on the Mac relay, which matches the VM. `scripts/relay-restart.sh` sources `provisioning.env` and inherits the calling shell; measured: 0 lines in `provisioning.env`, so also do not export it in that shell.
+  - Confirm the Mac relay's start line reads `enabled:false`.
+  - As the throwaway trip's organizer, send a PDF in the private chat. It should reach the companion, with exactly one `trip_bot.organizer_document_route_off`, and 0 rows in `trip_document_corrections`.
+  - ~3 min.
+- **Optional, not a gate:** the #217 walk, which is the condition for turning the flag on later.
+  - Run it as a separate segment on the Mac relay only, with the variable set to exactly `1` for that restart; confirm `enabled:true`.
+  - Walk it: PDF → proposal → Approve and rebuild the throwaway trip; a DM photo; the outage line.
+  - Then unset it, restart, and confirm `enabled:false` before any other item.
+  - +20–40 min and two Mac relay restarts.
+  - **Never add the variable to the VM's deployment values** (they live in `kinerary-deploy`, not here).
+- **W5 stays.** The group-overhearing flow is accepted (decision 43), and decision 43 asks for it to be seen on a throwaway trip first.
+- **Keep `ITINERARY_EXTRACT_TIMEOUT_MS=60000` for the session.** The Mac's `provisioning.env` sets its own value, which the VM does not have.
+
+### U5. Risk table and owner questions, updated
+
+| # | Was | Now |
+|---|---|---|
+| R1 | high, one-way | **low.** Off by construction on the VM (decision 41; #241; not passed by `compose.vm.yml`). Residual: the untested `server.ts` hop (U1), which fails safe |
+| R5 | medium; Q4 open | **accepted** (decision 43); seen in W5 |
+| R6 | unsized; Q6 open | **closed by G5, with two accepted exits.** New trips built between Release A and a promotion serve a voter's user row (incl. Telegram id, age, note) through `GET /api/rsvps/:activityId` (decision 45); hotel and booking document links on them return 404 (decision 46). Exposure: every trip confirmed on the VM in that window, starting with the real organizer's open interview if it confirms |
+| R2–R4, R7–R9 | as §2 | unchanged |
+
+**Answered:** Q1 (41), Q2 (44: no promotion before 3 Oct), Q3 (42: Fri 2 Oct window), Q4 (43), Q6 (44–46). Q5 needs no decision: leave #116 unmerged and do not mount.
+
+**Still open for the owner:**
+1. **Who runs the walk, and when:** 1 Oct, or the morning of 2 Oct IDT, with the nightly off that day (decision 42 names both; pick one).
+2. **Confirm you are free on Friday 2 Oct, 16:30–18:30 IDT.** Whether it is a holiday eve is still not verified by me.
+3. **Q7, production on a non-`main` commit** until sprint 6 merges (not addressed by decisions 41–46). My recommendation is unchanged: accept it and record it.
+
+### U6. The tip since `b04e229`
+
+- `git log b04e229..origin/integration/sprint-6` (tip `d6b8f21`): `60c5a0c` (this plan), `c442f7e`/#239 (`CLAUDE.md`, +14), `df74e21` and `d6b8f21` (`docs/sprint6-tracks.md`, the G5 report).
+- **`git diff b04e229 d6b8f21 -- ':!docs' ':!*.md'` is empty.** No conclusion in §§1–8 changes.
+- After #241 merges, the code delta is `document-correction.ts`, `relay/dispatch.ts`, `relay/poller.ts`, `relay/server.ts` and one test file. There is no migration, and no worker, compose or site change.
+- So §3.2's migration findings, §4's probes and §5's window stand as written. The fleet facts were read at 13:2x–13:5xZ today; G7 re-reads them on the day.
