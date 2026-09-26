@@ -418,6 +418,47 @@ class CodexAdapter(Harness):
                         agent_type="developer"))
                     self.assertAllowed(self.call("write", {"tool_input": {"file_path": value}}))
 
+    def test_root_policy_aliases_without_canonical_disk_spelling(self):
+        # Reserved root name on all filesystems, just like the trip aliases.
+        for existing in (None, "claude.md", "CLAUDE.md"):
+            for p in self.root.iterdir():
+                if p.name.casefold() == "claude.md":
+                    p.unlink()
+            if existing:
+                (self.root / existing).write_text("old\n")
+            for value in ("claude.md", "Claude.MD", "CLAUDE.md"):
+                with self.subTest(existing=existing, value=value):
+                    self.assertEveryRouteDenied(value, agent_type="developer")
+                    for op, body in (("Update", "\n@@\n-old\n+new"), ("Delete", "")):
+                        self.assertDenied(self.patch(
+                            "*** Begin Patch\n*** %s File: %s%s\n*** End Patch" % (op, value, body),
+                            agent_type="developer"))
+                    self.assertEqual(self.call("write", {"tool_input": {"file_path": value}}), {})
+        for value in ("docs/claude.md", "docs/CLAUDE.md", "claude.md.notes"):
+            self.assertEqual(self.call("write", {"agent_type": "developer",
+                             "tool_input": {"file_path": value}}), {})
+
+    def test_direct_hard_links_fail_closed_on_both_routes(self):
+        (self.root / ".project").mkdir()
+        (self.root / "docs").mkdir()
+        target = self.root / ".project/sprint.json"
+        target.write_text("old\n")
+        alias = self.root / "docs/alias.txt"
+        os.link(target, alias)
+        self.assertEqual(alias.stat().st_ino, target.stat().st_ino)
+        self.assertGreater(alias.stat().st_nlink, 1)
+        self.assertEveryRouteDenied("docs/alias.txt")
+        self.assertDenied(self.patch(
+            "*** Begin Patch\n*** Update File: docs/alias.txt\n@@\n-old\n+new\n*** End Patch"))
+        (self.root / "docs/symlink.txt").symlink_to("alias.txt")
+        self.assertDenied(self.call("write", {"tool_input": {"file_path": "docs/symlink.txt"}}))
+        # Ordinary hard links are deliberately refused too: their other names
+        # cannot be established with a bounded repository-local scan.
+        target.unlink()
+        self.assertEqual(self.call("write", {"tool_input": {"file_path": "docs/alias.txt"}}), {})
+        os.link(alias, self.root / "docs/other.txt")
+        self.assertDenied(self.call("write", {"tool_input": {"file_path": "docs/alias.txt"}}))
+
     def test_legacy_file_path_is_checked(self):
         self.assertDenied(self.call("write", {
             "tool_name": "Write", "tool_input": {"file_path": str(self.root / ".project/sprint.json")}}))

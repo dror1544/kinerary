@@ -456,3 +456,58 @@ other direction.
 | This fix | 673 | 366 | **0** | **0** |
 | cdcf335 | 673 | 366 | 72 | 0 |
 | 69f34ab | 673 | 366 | 221 | 75 |
+
+## 11. PR #264 residual file-identity fixes (2026-09-27)
+
+Base: `27c7260`. Scope: adapter, regression tests, this report. No shared
+policy, hook configuration or runtime settings changed.
+
+The review reproduced two inherited bypasses: a developer's Add to
+`Claude.MD` when the root policy file was absent or spelled `claude.md`, and
+an Update to `docs/alias.txt` hard-linked to `.project/sprint.json`. Both
+returned `{}` before the offline engine wrote the protected file.
+
+The adapter now adds the canonical root `CLAUDE.md` spelling when any checked
+root spelling folds to `claude.md`. The shared rule still decides whether
+the caller's role may write it. This deliberately reserves root policy-name
+aliases even on case-sensitive filesystems, consistently with the existing
+conservative treatment of `trip/`; nested `docs/CLAUDE.md` is unaffected.
+
+Existing regular files with `st_nlink > 1` are refused before invoking shared
+hooks, including paths reached through symlinks. A bounded local scan cannot
+establish all other names of an inode, including names outside the checkout.
+This intentionally refuses ordinary hard-linked files too, for all write
+operations and the legacy route. Remove the extra link or use an independent
+copy before editing. Single-link ordinary files remain allowed. Directory
+link counts are not used as evidence of a file alias.
+
+Test-first: the two added tests failed on the base with five failing
+assertions/subtests and passed after the fix. They cover absent/lowercase/
+canonical policy files, Add/Update/Delete/Move and legacy requests, lead
+versus developer, benign nested names, direct and symlinked hard links,
+and restoration of ordinary-file access when the extra link is removed.
+
+This remains a pre-tool pathname check, not atomic filesystem confinement.
+The previously recorded runtime and workdir limitations and #262/#263/#265
+remain separate follow-ups. No merge or deployment was performed.
+
+Independent verifier results (Python 3.9.6):
+
+- Adapter discovery: 54 tests passed (64.616 s).
+- Adapter dotted module: 54 tests passed (65.168 s).
+- Shared bash hooks: 50 tests passed (64.605 s).
+- Shared write hooks: 4 tests passed (0.483 s).
+- `git diff --check` and staged preflight passed. Preflight emitted only
+  existing undeployed skill-profile warnings.
+
+Offline Codex 0.153.2 replay on this APFS volume: 93 cases, 71 protected
+mutations, zero patch-route or legacy-route bypasses, zero denials among
+ten benign cases. Engine writes ran in disposable non-repository directories;
+policy requests used the real shared hooks in isolated fixture repositories.
+The replay covered trip-directory spellings and missing directories, sprint
+aliases including long S, root policy file spellings and absence, symlinks,
+hard links, Hebrew filenames, spaces, and composed/decomposed Unicode.
+Local evidence: `/private/tmp/kinerary-hooks-identity-oracle/`; verifier logs:
+`/private/tmp/codex-final-{adapter,bash,write,dotted}.txt`.
+
+Commit and push are pending explicit policy-file approval under CLAUDE.md.

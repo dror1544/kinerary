@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -183,6 +184,16 @@ def checked_paths(value: str) -> list[str]:
         lexical.relative_to(ROOT)
     except ValueError:
         raise ValueError("Patch path is outside this repository")
+    # Hard links do not resolve to their other names. Refuse multiply-linked
+    # regular files rather than scan an unbounded tree (or miss aliases outside
+    # it). stat follows symlinks, so an indirect hard link is refused as well.
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        pass  # A new file has no inode aliases yet.
+    else:
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise ValueError("Cannot safely authorize a multiply-linked file")
     # The shared rules match one spelling, case-sensitively (trip/*,
     # .project/sprint.json, CLAUDE.md). Check every spelling that can name
     # the file: as written, its symlink destination, each as the disk spells
@@ -191,6 +202,12 @@ def checked_paths(value: str) -> list[str]:
     spellings = [lexical, resolved, on_disk(lexical), on_disk(resolved)]
     spellings += [ROOT.joinpath(*(part.casefold() for part in p.relative_to(ROOT).parts))
                   for p in spellings]
+    # casefold alone cannot reach the shared rule's uppercase CLAUDE.md.
+    # Reserve its root-level aliases on every filesystem, matching the existing
+    # conservative treatment of trip/ and .project/sprint.json. Nested names
+    # remain ordinary files, and the shared hook still decides based on role.
+    if any(p.relative_to(ROOT).parts == ("claude.md",) for p in spellings):
+        spellings.append(ROOT / "CLAUDE.md")
     return list(dict.fromkeys(str(p) for p in spellings))
 
 
