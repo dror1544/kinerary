@@ -13,6 +13,7 @@ import {
   matchEntry,
   mergeParts,
   reconcileStructured,
+  stripVisitMarkers,
 } from "../src/answer-merge.js";
 
 const tokyoFirst = { name: "Tokyo", start: "2026-09-19", end: "2026-09-23" };
@@ -183,5 +184,23 @@ describe("order independence", () => {
     const merged = mergeParts([[kyoto], [tokyoFirst], [{ ...kyoto, planned: ["Fushimi Inari"] }]]) as Record<string, unknown>[];
     assert.deepEqual(merged.map((p) => p.name), ["Tokyo", "Kyoto"]);
     assert.deepEqual(merged[1]!.planned, ["Fushimi Inari"]);
+  });
+});
+
+// The additional-visit marker (#114, round 2) is gone: a return leg is the
+// `add_stop` operation now (typed-changes.ts). What is left is the strip, kept for
+// one release at the gate every write passes, so a stored proposal or a model that
+// has not caught up cannot leave the key in an answer.
+describe("a leftover additional_visit key", () => {
+  test("is stripped from a list of entries, and from a single entry", () => {
+    assert.deepEqual(stripVisitMarkers([{ name: "Tokyo", additional_visit: true }, { name: "Kyoto" }]), [{ name: "Tokyo" }, { name: "Kyoto" }]);
+    assert.deepEqual(stripVisitMarkers({ name: "Tokyo", additional_visit: true }), { name: "Tokyo" });
+  });
+
+  test("does not steer a merge any more: a dated stop is filled onto the undated one, marked or not", () => {
+    const held = [{ name: "Tokyo" }, { name: "Kyoto" }];
+    const out = reconcileStructured(held, [{ name: "Tokyo", start: "2026-09-30", end: "2026-10-03", additional_visit: true }]);
+    assert.equal((out.merged as { name: string }[]).filter((e) => e.name === "Tokyo").length, 1);
+    assert.doesNotMatch(JSON.stringify(out.merged), /additional_visit/, "and it is not filled onto the held entry");
   });
 });

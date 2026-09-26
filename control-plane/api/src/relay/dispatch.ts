@@ -139,6 +139,8 @@ export type DispatchDecision =
       callbackQueryId: string;
       text: string;
     }
+  /** A tap that is answered (the spinner stops) and gets NO message in the chat. */
+  | { kind: "callback_ack"; callbackQueryId: string; text: string }
   /** A tapped inline button that belongs to the interview flow. */
   | {
       kind: "interview_callback";
@@ -1438,6 +1440,16 @@ async function dispatchCallback(
         data: callback.data,
         sessionId: route.sessionId,
         ...(messageId !== undefined && messageId !== null ? { messageId: String(messageId) } : {}),
+      };
+    }
+    // A typed-change button (`pc:`) is ANSWERED, never dropped: an ignored tap
+    // leaves the button spinning for whoever pressed it (#206). Answered ONLY: a
+    // forged tap must not make the bot post into a chat it is merely a member of.
+    if (parsed.kind === "change") {
+      return {
+        kind: "callback_ack",
+        callbackQueryId: callback.id,
+        text: uiString("change.gone", await resolveChatLanguage(db, String(chatId), callback.from?.language_code)),
       };
     }
     // An interview-shaped callback from a chat with no live interview is

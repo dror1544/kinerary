@@ -591,6 +591,49 @@ describe("dispatchUpdate — callback routing", () => {
     });
   });
 
+  // #206: a typed-change button (`pc:<draft>:<digest>:a|c|r:<k>`) is routed by the
+  // chat it arrives in, and ANSWERED wherever it lands - an ignored tap leaves the
+  // button spinning for whoever pressed it.
+  const PC = `pc:pchg_${"0123456789abcdef".repeat(2)}:0a1b2c3d:a`;
+
+  test("a typed-change tap from the owning chat reaches the interview, with the session from the chat", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(issued.ok);
+      const started = await startFromDeepLink(fix.pool, "700001400", issued.token);
+      assert.equal(started.kind, "started");
+      const decision = await dispatchUpdate(fix.pool, tap("700001400", PC));
+      assert.equal(decision.kind, "interview_callback");
+      if (decision.kind !== "interview_callback") return;
+      assert.equal(decision.data, PC, "the tap is handed to the interview whole, digest included");
+      assert.equal(decision.sessionId, started.kind === "started" ? started.sessionId : "");
+    });
+  });
+
+  test("a typed-change tap from another chat, a group, and a confirmed session is answered, not dropped", { skip: SKIP }, async () => {
+    await withFixture(async (fix) => {
+      const issued = await issueEnrollment(fix.pool, fix.userId, fix.tripId, { enrollmentTtlSeconds: 3600 });
+      assert.ok(issued.ok);
+      await startFromDeepLink(fix.pool, "700001500", issued.token);
+
+      const inGroup = (chatId: string): TelegramUpdate => ({
+        update_id: 3,
+        callback_query: { id: "cbq_g", data: PC, from: { id: 777 }, message: { message_id: 7, chat: { id: chatId, type: "supergroup" } } },
+      });
+      // Another organizer's chat (no interview of its own).
+      const stranger = await dispatchUpdate(fix.pool, tap("700001599", PC));
+      assert.deepEqual(stranger, { kind: "callback_ack", callbackQueryId: "cbq_1", text: "That change is no longer waiting." });
+      // A group.
+      const group = await dispatchUpdate(fix.pool, inGroup("-1001234567890"));
+      assert.deepEqual(group, { kind: "callback_ack", callbackQueryId: "cbq_g", text: "That change is no longer waiting." });
+      // The owning chat once its interview is confirmed.
+      await fix.pool.query("UPDATE control_plane.intake_sessions SET state = 'confirmed' WHERE telegram_chat_id = $1", ["700001500"]);
+      const confirmed = await dispatchUpdate(fix.pool, tap("700001500", PC));
+      assert.equal(confirmed.kind, "callback_ack");
+      assert.equal((confirmed as { text?: string }).text, "That change is no longer waiting.");
+    });
+  });
+
   test("an approval-shaped callback reaches the approval path with its sender", { skip: SKIP }, async () => {
     await withFixture(async (fix) => {
       const decision = await dispatchUpdate(fix.pool, tap("700001300", "cbk_deadbeefdeadbeef", 12345));

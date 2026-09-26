@@ -9,7 +9,9 @@ import {
   exampleEchoes,
   extractIntakeFromDocument,
   interpretBurst,
+  INTERPRET_OUTPUT_SCHEMA,
   parseInterpretPayload,
+  submitArgsForAccepted,
   storedOutcomes,
   submitArgsFor,
   buildExtractIntakePrompt,
@@ -20,7 +22,7 @@ import {
   type ProposedAnswer,
 } from "../src/interpret.js";
 import { fakeRunner, firstJsonObject, isRateLimitText, worthRetrying } from "../src/model-runner.js";
-import { INTAKE_QUESTIONS, buildRecap, partitionQuestions, type IntakeQuestion } from "../src/interview.js";
+import { INTAKE_QUESTIONS, buildRecap, partitionQuestions, validateAnswer, type IntakeQuestion } from "../src/interview.js";
 import { documentText, htmlToText, looksLikeIdentityDocument } from "../src/document-text.js";
 
 // A small question set standing in for INTAKE_QUESTIONS, so these tests say
@@ -1445,5 +1447,104 @@ describe("reading the boundary", () => {
     assert.equal(result.ok, true);
     assert.deepEqual(result.ok && result.reading, { intent: "finish", confidence: 0.9 });
     assert.equal(runner.calls[0]?.task, "interpret");
+  });
+});
+
+// #206: a change to held stops or travellers comes back as OPERATIONS, and the
+// gate never writes such a change from a proposal.
+describe("operations from the interpreter (#206)", () => {
+  const STOPS_Q: IntakeQuestion[] = [
+    ...QUESTIONS,
+    { id: "phases", type: "structured", prompt: "Stops?", required: true, dataShape: "array" },
+    { id: "travelers2", type: "structured", prompt: "Who?", required: false, dataShape: "array" },
+  ];
+  const held = {
+    stops: [{ id: "s1", label: "Tokyo, 2026-09-19 to 2026-09-24" }, { id: "s2", label: "Kyoto, no dates" }],
+    travellers: [{ id: "t1", label: "Ruth Cohen, age 70" }],
+  };
+  const prompt = (heldLists?: typeof held) =>
+    buildInterpretPrompt({ language: "en", outstanding: ["phases"], sourceText: "x", questions: STOPS_Q, heldLists });
+
+  test("the prompt shows the held lists WITH ids, in full, and asks for operations, never a list", () => {
+    const p = prompt(held);
+    for (const line of ["- s1: Tokyo, 2026-09-19 to 2026-09-24", "- s2: Kyoto, no dates", "- t1: Ruth Cohen, age 70"]) {
+      assert.ok(p.includes(line), line);
+    }
+    assert.match(p, /do NOT\s+propose the "phases" or "travelers" question and do NOT write out a list/);
+    assert.match(p, /"opsJson"/);
+    assert.match(p, /,"opsJson":null\}/, "the return shape names opsJson");
+  });
+
+  test("every operation is taught, with a worked example in English and in Hebrew", () => {
+    const p = prompt(held);
+    for (const op of ["add_stop", "update_stop", "remove_stop", "rename_stop", "replace_stop", "move_stop", "add_traveller", "update_traveller", "remove_traveller", "choose"]) {
+      assert.ok(p.includes(`"op":"${op}"`), `${op} is shown in an example`);
+    }
+    assert.match(p, /another three days\s+at the end for Tokyo/);
+    assert.match(p, /A RETURN to a place that is\s+already listed is add_stop — never update_stop/);
+    assert.match(p, /"op":"choose"[\s\S]*rename_stop[\s\S]*replace_stop[\s\S]*add_stop/, "the rename / replace / add ambiguity is worked");
+    assert.match(p, /two Ruths|there may be two Ruths/);
+    assert.match(p, /טוקיו זה מה-20 עד ה-25 בספטמבר/);
+    assert.match(p, /עוד שלושה ימים בסוף בטוקיו/);
+    assert.match(p, /never copy their names, dates or ages/);
+    assert.doesNotMatch(p, /additional_visit":\s*true/, "the round-2 marker is no longer asked for");
+  });
+
+  test("with nothing held there is no operations section, and the return shape is as before", () => {
+    for (const p of [prompt(), prompt({ stops: [], travellers: [] })]) {
+      assert.doesNotMatch(p, /CHANGES TO STOPS OR TRAVELLERS/);
+      assert.doesNotMatch(p, /opsJson/);
+    }
+  });
+
+  test("the provider schema carries opsJson, required and nullable", () => {
+    const s = INTERPRET_OUTPUT_SCHEMA as { required: string[]; properties: Record<string, { type?: unknown }> };
+    assert.ok(s.required.includes("opsJson"));
+    assert.deepEqual(s.properties.opsJson?.type, ["string", "null"]);
+  });
+
+  test("parse: operations as an array, or as a string of JSON, arrive typed; bad ones refuse ALL of them", () => {
+    const ops = [{ op: "update_traveller", target: { name: "Ruth" }, fields: { age: 71 } }];
+    assert.deepEqual(parseInterpretPayload({ proposals: [], unclear: [], ops })?.ops, ops);
+    assert.deepEqual(parseInterpretPayload({ proposals: [], unclear: [], opsJson: JSON.stringify(ops) })?.ops, ops);
+    assert.equal(parseInterpretPayload({ proposals: [], unclear: [], opsJson: null })?.ops, undefined);
+    for (const bad of [[{ op: "delete_everything" }], [{ op: "remove_stop", target: { name: "Kyoto" } }, { op: "nope" }], "remove Kyoto"]) {
+      const parsed = parseInterpretPayload({ proposals: [], unclear: [], ops: bad })!;
+      assert.equal(parsed.ops, undefined, JSON.stringify(bad));
+      assert.ok(parsed.opsError, JSON.stringify(bad));
+    }
+  });
+
+  test("a proposal to REPLACE held stops or travellers is refused whatever its confidence; the first answer is not", () => {
+    const answered = { phases: { kind: "structured", schema_version: 3, data: [{ name: "Tokyo" }] } } as never;
+    const proposalFor = () => proposal({
+      questionId: "phases", confidence: 0.99, evidence: "Tokyo",
+      value: { kind: "structured", data: [{ name: "Tokyo", start: "2026-09-20", end: "2026-09-25" }] } as never,
+    });
+    const ctx = { sourceText: "Tokyo", outstanding: [], answered: ["phases"], allowCorrections: true, questions: STOPS_Q, answers: answered, changeQuestions: ["phases", "travelers"] } as never;
+    const refused = applyProposals([proposalFor()], ctx);
+    assert.equal(refused.accepted.length, 0);
+    assert.equal(refused.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION");
+    const first = applyProposals([proposalFor()], { ...(ctx as object), answered: [], outstanding: ["phases"], answers: {} } as never);
+    assert.equal(first.accepted.length, 1, "unanswered, it is the first answer");
+    const document = applyProposals([proposalFor()], { ...(ctx as object), allowCorrections: false, held: answered } as never);
+    assert.notEqual(document.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION", "a document reconciles through `held`, as before");
+  });
+
+  test("another structured list (bookings) still merges into what is held and is written merged", () => {
+    const anchors = [{ type: "hotel", name: "Gion Inn", date: "2026-09-25", confirmation: "GI-77" }];
+    const Q: IntakeQuestion[] = [...QUESTIONS, { id: "travel_anchors", type: "structured", prompt: "Bookings?", required: false, dataShape: "array" }];
+    const d = applyProposals(
+      [proposal({ questionId: "travel_anchors", value: { kind: "structured", data: [{ type: "flight", name: "LY381", date: "2026-09-19" }] } as never, evidence: "LY381" })],
+      { sourceText: "LY381", outstanding: [], answered: ["travel_anchors"], allowCorrections: true, questions: Q, answers: { travel_anchors: { kind: "structured", schema_version: 3, data: anchors } }, changeQuestions: ["phases", "travelers"] } as never,
+    );
+    assert.equal(submitArgsForAccepted(d.accepted[0]!).structuredData instanceof Array, true);
+    assert.equal((submitArgsForAccepted(d.accepted[0]!).structuredData as unknown[]).length, 2, "the held booking is kept");
+  });
+
+  test("validateAnswer still strips a leftover additional_visit key, whatever path proposed the data", () => {
+    const v = validateAnswer("phases", null, null, STOPS_Q, [{ name: "Tokyo", additional_visit: true }]);
+    assert.ok(v.ok);
+    assert.doesNotMatch(JSON.stringify(v), /additional_visit/);
   });
 });
