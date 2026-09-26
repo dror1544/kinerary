@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/scripts/claude-hooks/pretooluse-bash.sh\"",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/claude-hooks/codex-adapter.py\" bash",
             "timeout": 30,
             "statusMessage": "Checking hard rules..."
           }
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/scripts/claude-hooks/pretooluse-write.sh\"",
-            "timeout": 10
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/claude-hooks/codex-adapter.py\" write",
+            "timeout": 30
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/scripts/claude-hooks/sessionstart.sh\"",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/claude-hooks/codex-adapter.py\" session",
             "timeout": 30
           }
         ]
