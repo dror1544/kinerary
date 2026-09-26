@@ -1,12 +1,16 @@
 """Codex transport must preserve shared policy without unsupported ask decisions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib.util
 import io
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -162,10 +166,11 @@ class CodexAdapter(Harness):
 
     def test_path_characters_codex_does_not_strip_fail_closed(self):
         # Codex keeps these in the path it writes (U+001C-U+001F, ZWSP, BOM
-        # trailing; a leading space after the prefix; controls anywhere), so
-        # the adapter cannot prove the path it checks is the path written.
+        # trailing; controls anywhere), so the adapter cannot prove the path
+        # it checks is the path written. (A leading U+0020 is kept literally
+        # and checked as written: round 2, below.)
         for value in ("docs/x.md\x1f", "docs/x.md\x1c", "docs/x.md\u200b", "docs/x.md\ufeff",
-                      " docs/x.md", "docs/a\tb.md", "docs/a\x0bb.md", "docs/a\u2028b.md",
+                      "\u00a0docs/x.md", "docs/a\tb.md", "docs/a\x0bb.md", "docs/a\u2028b.md",
                       "docs/a\x7fb.md", "docs/\u202ex.md"):
             with self.subTest(value=repr(value)):
                 self.assertDenied(self.patch(
@@ -199,6 +204,148 @@ class CodexAdapter(Harness):
         # (capture.jsonl: agent_id present only on subagent payloads).
         subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
         self.assertEqual(self.bash("git commit -m 'docs: note'", session_id="s", turn_id="t"), {})
+
+    # Review round 2 (PR #261).
+    def adapter(self):
+        spec = importlib.util.spec_from_file_location(
+            "codex_adapter_round2", self.root / "scripts/claude-hooks/codex-adapter.py")
+        adapter = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "dont_write_bytecode", True):
+            spec.loader.exec_module(adapter)
+        return adapter
+
+    def test_header_lookalike_in_update_context_is_not_a_file_operation(self):
+        # Codex's repro: offline Codex updates only docs/readme.md here.
+        repro = ("*** Begin Patch\n*** Update File: docs/readme.md\n@@\n"
+                 " *** Update File: .project/sprint.json\n-old\n+new\n*** End Patch")
+        self.assertEqual(self.adapter().patch_paths(repro), ["docs/readme.md"])
+        self.assertAllowed(self.patch(repro))
+        for line in (" *** Add File: CLAUDE.md", " *** Delete File: .project/sprint.json",
+                     " *** Move to: .project/sprint.json", "   *** Update File: trip/x.md",
+                     "+*** Add File: .project/sprint.json", "-*** Delete File: CLAUDE.md",
+                     "", " *** End Patch"):
+            with self.subTest(line=line):
+                self.assertEqual(self.adapter().patch_paths(
+                    "*** Begin Patch\n*** Update File: docs/readme.md\n@@\n-old\n+new\n"
+                    + line + "\n*** End Patch"), ["docs/readme.md"])
+
+    def test_header_after_an_add_or_delete_block_is_a_header(self):
+        # There the next line is at header position, and Codex trims it.
+        for before in ("*** Add File: docs/n.md\n+x\n", "*** Delete File: docs/old.md\n"):
+            for indent in ("", "  ", "\t", "\u00a0", "\u3000"):
+                with self.subTest(before=before[:18], indent=repr(indent)):
+                    self.assertDenied(self.patch(
+                        "*** Begin Patch\n" + before + indent
+                        + "*** Update File: .project/sprint.json\n@@\n-old\n+new\n*** End Patch"))
+
+    def test_header_after_end_of_file_marker_is_a_header(self):
+        for marker in ("*** End of File", "*** End of File ", "*** End of File\t"):
+            with self.subTest(marker=repr(marker)):
+                self.assertEqual(self.adapter().patch_paths(
+                    "*** Begin Patch\n*** Update File: docs/a.md\n@@\n x\n+y\n" + marker
+                    + "\n*** Delete File: CLAUDE.md\n*** End Patch"), ["docs/a.md", "CLAUDE.md"])
+
+    def test_move_to_is_read_only_directly_after_its_update_header(self):
+        adapter = self.adapter()
+        self.assertEqual(adapter.patch_paths(
+            "*** Begin Patch\n*** Update File: a.md\n*** Move to: b.md \n@@\n-x\n+y\n*** End Patch"),
+            ["a.md", "b.md"])
+        # Indented, Codex reads it as a context line, not a move.
+        self.assertEqual(adapter.patch_paths(
+            "*** Begin Patch\n*** Update File: a.md\n  *** Move to: b.md\n-x\n+y\n*** End Patch"),
+            ["a.md"])
+
+    def test_what_codex_rejects_at_header_position_is_refused(self):
+        adapter = self.adapter()
+        for body in ("\n*** Add File: a.md\n+x", "*** Add File: a.md\n+x\n\n*** Add File: b.md\n+y",
+                     "*** Update File: a.md\n@@\n-x\n+y\n***Add File: b.md\n+z",
+                     "*** Update File: a.md\n@@\n-x\n+y\n*** End Patch\n*** Add File: b.md\n+z",
+                     "*** Update File: a.md\n*** Move to: b.md\n*** Move to: c.md\n@@\n-x\n+y",
+                     "*** Add File:a.md\n+x", "*** add file: a.md\n+x"):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    adapter.patch_paths("*** Begin Patch\n" + body + "\n*** End Patch")
+
+    def test_leading_space_in_a_path_is_kept_as_codex_keeps_it(self):
+        # `*** Add File:  lead.md` makes " lead.md" (offline engine, 2026-09-26).
+        self.assertEqual(self.adapter().patch_paths(
+            "*** Begin Patch\n*** Add File:  lead.md\n+x\n*** Update File: a.md\n"
+            "*** Move to:  b.md\n@@\n-x\n+y\n*** End Patch"), [" lead.md", "a.md", " b.md"])
+
+    def test_crlf_patch_is_parsed_like_lf(self):
+        self.assertEqual(self.adapter().patch_paths(
+            "*** Begin Patch\r\n*** Update File: a.md\r\n@@\r\n x\r\n+y\r\n*** End of File\r\n"
+            "*** Add File: .project/sprint.json\r\n+{}\r\n*** End Patch\r\n"),
+            ["a.md", ".project/sprint.json"])
+
+    def test_nul_in_agent_type_cannot_become_the_lead(self):
+        # A shell cannot hold NUL, so $(jq -r .agent_type) reads "\u0000" as empty.
+        subprocess.run(["git", "checkout", "-qb", "fix/example"], cwd=self.root, check=True)
+        for role in ("\u0000", "\u0000\n", "\u0000\u0000", "dev\u0000", "dev\u200b", "dev\tx"):
+            with self.subTest(role=repr(role)):
+                self.assertDenied(self.bash("git commit -m 'note'", agent_type=role))
+                self.assertDenied(self.patch(
+                    "*** Begin Patch\n*** Update File: CLAUDE.md\n@@\n-old\n+new\n*** End Patch",
+                    agent_type=role))
+
+    def test_ordinary_roles_reach_the_shared_hook_as_subagents(self):
+        for role in ("default", "developer", "doc keeper"):
+            with self.subTest(role=role):
+                self.assertAllowed(self.call("write", {
+                    "tool_input": {"file_path": "docs/ok.md"}, "agent_type": role}))
+                result = self.patch(
+                    "*** Begin Patch\n*** Update File: CLAUDE.md\n@@\n-old\n+new\n*** End Patch",
+                    agent_type=role)
+                self.assertDenied(result)
+                self.assertIn("A subagent (%s) never edits it" % role,
+                              result["permissionDecisionReason"])
+
+    def case_insensitive(self):
+        probe = self.root / "CaseProbe"
+        probe.write_text("")
+        try:
+            return (self.root / "caseprobe").exists()
+        finally:
+            probe.unlink()
+
+    def seed_protected(self):
+        (self.root / ".project").mkdir(exist_ok=True)
+        (self.root / ".project/sprint.json").write_text("old\n")
+        (self.root / "CLAUDE.md").write_text("old\n")
+        (self.root / "trip").mkdir(exist_ok=True)
+        (self.root / "trip/proof.txt").write_text("old\n")
+        if not self.case_insensitive():
+            self.skipTest("case-sensitive filesystem: no other spelling opens an existing file")
+
+    def test_an_alias_spelling_cannot_reach_a_protected_file(self):
+        # On a case-insensitive filesystem these open the existing protected
+        # file, and Path.resolve() keeps the spelling it was given.
+        self.seed_protected()
+        cases = [("Update", ".PROJECT/sprint.json", {}), ("Update", ".project/SPRINT.JSON", {}),
+                 ("Delete", ".Project/Sprint.Json", {}), ("Update", "claude.md", {"agent_type": "developer"}),
+                 ("Update", "TRIP/proof.txt", {}), ("Add", "TRIP/new.txt", {})]
+        if (self.root / ".project/\u017fprint.json").exists():  # U+017F LONG S folds to s
+            cases.append(("Update", ".project/\u017fprint.json", {}))
+        for op, value, extra in cases:
+            body = {"Update": "\n@@\n-old\n+new", "Delete": "", "Add": "\n+x"}[op]
+            with self.subTest(op=op, path=value):
+                self.assertDenied(self.patch(
+                    "*** Begin Patch\n*** %s File: %s%s\n*** End Patch" % (op, value, body), **extra))
+                self.assertDenied(self.call("write", {"tool_input": {"file_path": value}, **extra}))
+
+    def test_a_new_leaf_under_an_alias_directory_takes_the_directory_spelling(self):
+        self.seed_protected()
+        root, adapter = self.root.resolve(), self.adapter()
+        self.assertEqual(adapter.checked_paths(str(root / ".PROJECT/newfile")),
+                         [str(root / ".project/newfile")])
+        self.assertEqual(adapter.checked_paths(str(root / "docs/New.md")), [str(root / "docs/New.md")])
+
+    def test_an_alias_matching_two_directory_entries_fails_closed(self):
+        self.seed_protected()
+        root = self.root.resolve()
+        os.link(root / ".project/sprint.json", root / ".project/Other.json")
+        with self.assertRaises(ValueError):
+            self.adapter().checked_paths(str(root / ".project/OTHER.json"))
 
     def test_legacy_file_path_is_checked(self):
         self.assertDenied(self.call("write", {
@@ -301,3 +448,112 @@ class CodexAdapter(Harness):
             with self.assertRaises(ValueError):
                 adapter.run_policy("pretooluse-write.sh", {}, 20)
         self.assertFalse(any(call.args[0][0] == "bash" for call in run.call_args_list))
+
+
+SEED = ("line1\n*** Update File: .project/sprint.json\nold\n*** Add File: ctx-add.txt\n"
+        "*** Delete File: ctx-del.txt\n*** Move to: ctx-mv.txt\n*** End of File\n"
+        "*** End Patch\n@@ ctx\nline9\n")
+SEEDED = ("a.txt", "b.txt", "docs/readme.md", "ctx-del.txt", ".project/sprint.json")
+# Key shapes from the round-2 differential corpus (3,256 patches, 0 disagreements;
+# docs/test-reports/codex-hooks-2026-09-26.md). Each is run through Codex's own
+# offline engine and compared with patch_paths().
+DIFFERENTIAL = (
+    "*** Update File: docs/readme.md\n@@\n *** Update File: .project/sprint.json\n-old\n+new",
+    "*** Update File: docs/readme.md\n@@\n-old\n+new\n *** Add File: ctx-add.txt",
+    "*** Update File: a.txt\n@@\n line9\n+t\n*** End of File\n*** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n line9\n+t\n*** End of File \n*** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n line9\n+t\n*** End of File\n  *** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n-old\n+new\n\t*** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n-old\n+new\n\n\n*** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n-old\n+new\n*** Update File: b.txt\n*** Move to: .project/sprint.json\n@@\n-old\n+new",
+    "*** Update File: a.txt\n  *** Move to: mv.txt\n@@\n-old\n+new",
+    "*** Update File: a.txt\n*** Move to: mv.txt \n@@\n-old\n+new",
+    "*** Update File: a.txt\n*** Move to:  mv.txt\n@@\n-old\n+new",
+    "*** Add File: n.txt\n+x\n  *** Add File: evil.txt\n+y",
+    "*** Add File: n.txt\n+x\n\u2028*** Add File: evil.txt\n+y",
+    "*** Add File: n.txt\n+x\n\n*** Add File: evil.txt\n+y",
+    "*** Delete File: b.txt\n\u3000*** Delete File: a.txt",
+    "  *** Add File: docs/indented.md\n+hi",
+    "*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n*** Add File: evil.txt\n+x",
+    "*** Update File: a.txt\n@@\n-old\n+new\n+*** Add File: body.txt\n-*** Add File: ctx-add.txt",
+)
+
+
+def codex_engine():
+    """The codex binary, if its offline apply_patch engine runs here; else None."""
+    codex = shutil.which("codex")
+    if not codex:
+        return None
+    scratch = tempfile.mkdtemp()
+    try:
+        if subprocess.run(["git", "rev-parse", "--git-dir"], cwd=scratch,
+                          capture_output=True).returncode == 0:
+            return None  # never let the engine write inside a repository
+        result = subprocess.run(
+            [codex, "--codex-run-as-apply-patch",
+             "*** Begin Patch\n*** Add File: probe.txt\n+x\n*** End Patch"],
+            cwd=scratch, capture_output=True, timeout=30)
+        return codex if result.returncode == 0 and os.path.exists(
+            os.path.join(scratch, "probe.txt")) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+class DifferentialAgainstCodex(unittest.TestCase):
+    """Whatever Codex's own engine writes, patch_paths() must name (or refuse).
+
+    Optional: skipped where the codex CLI is absent (CI). No model is involved:
+    `codex --codex-run-as-apply-patch` is the offline patch engine only.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.codex = codex_engine()
+        if not cls.codex:
+            raise unittest.SkipTest("codex offline apply_patch engine not runnable here")
+        spec = importlib.util.spec_from_file_location(
+            "codex_adapter_differential", REPO / "scripts/claude-hooks/codex-adapter.py")
+        cls.adapter = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "dont_write_bytecode", True):
+            spec.loader.exec_module(cls.adapter)
+
+    def touched_by_codex(self, patch_text):
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, True)
+
+        def snapshot():
+            found = {}
+            for folder, _, files in os.walk(scratch):
+                for name in files:
+                    full = os.path.join(folder, name)
+                    with open(full, "rb") as handle:
+                        found[os.path.relpath(full, scratch)] = hashlib.sha1(handle.read()).hexdigest()
+            return found
+
+        for rel in SEEDED:
+            os.makedirs(os.path.join(scratch, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(scratch, rel), "w") as handle:
+                handle.write(SEED)
+        before = snapshot()
+        subprocess.run([self.codex, "--codex-run-as-apply-patch", patch_text], cwd=scratch,
+                       capture_output=True, timeout=60)
+        after = snapshot()
+        return {p for p in set(before) | set(after) if before.get(p) != after.get(p)}
+
+    def test_every_path_codex_writes_is_checked(self):
+        for body in DIFFERENTIAL:
+            text = "*** Begin Patch\n" + body + "\n*** End Patch"
+            with self.subTest(patch=body):
+                touched = self.touched_by_codex(text)
+                try:
+                    listed = {os.path.normpath(p) for p in self.adapter.patch_paths(text)}
+                except ValueError:
+                    continue  # the adapter refuses the call outright
+                self.assertLessEqual(touched, listed)
+
+    def test_the_readme_repro_touches_only_readme(self):
+        text = "*** Begin Patch\n" + DIFFERENTIAL[0] + "\n*** End Patch"
+        self.assertEqual(self.touched_by_codex(text), {"docs/readme.md"})
+        self.assertEqual(self.adapter.patch_paths(text), ["docs/readme.md"])

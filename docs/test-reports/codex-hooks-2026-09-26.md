@@ -301,3 +301,88 @@ directory on `sys.path`.
 Not done in this round (owner's decision): whether a command's `workdir`
 reaches the hook, a fail-closed command wrapper in `.codex/hooks.json`, hook
 files being writable through the hook, and CI not running `tests/scripts`.
+
+## 9. Review round 2 (PR #261)
+
+Three findings, each reproduced on `eb67fd1` before the change (end to end
+through the real shared hooks in a throwaway repository) and fixed on
+`fix/codex-hooks-r1`. The adapter suite runs 48 tests: 22 fail on eb67fd1's
+adapter, and all pass on the fix.
+
+**Header lookalikes in an Update hunk.** Round 1 trimmed every line, so a
+context line ` *** Update File: .project/sprint.json` in an edit of
+`docs/readme.md` was read as a second file operation, and the edit was denied.
+Offline Codex applies that patch and changes only `docs/readme.md`.
+`patch_paths` is now a state machine that follows Codex's parser. Each of
+these rules was measured with the offline engine:
+
+- A file header is read, after trimming, only at header position: after
+  `*** Begin Patch`, after an Add body (the raw `+` lines), or after a Delete.
+- An Update body runs to the first line whose raw text starts with `***`. A
+  line that trims to `*** End of File` stays inside it; Codex accepts one with
+  a trailing space. An indented or tab-prefixed header inside an Update body
+  is context, or a Codex error.
+- `*** Move to:` counts only as the raw line directly after its Update header.
+  Its value is trimmed at the end but keeps a leading space. An indented Move
+  line is context.
+- A blank line at header position is rejected by Codex, and the adapter now
+  refuses it too, along with any other non-header at that position.
+- A leading U+0020 in a path is kept by Codex (`*** Add File:  a.md` writes
+  ` a.md`, for Add, Update, Delete and Move alike). The adapter now checks
+  that literal path instead of refusing it.
+
+*Differential harness.* Every patch runs through
+`codex --codex-run-as-apply-patch` in a fresh scratch directory outside any
+repository, seeded with files that contain header-lookalike lines. The
+harness compares the files Codex created, changed or deleted with what
+`patch_paths` returns.
+
+The corpus has 3,256 patches: 56 targeted, 1,200 random and 2,000 random
+biased towards valid shapes. Codex applied 761 and rejected 2,495. 178 of
+the rejected patches still wrote files before failing, so the invariant is
+checked whenever anything changed, not only on success.
+
+Results for the adapter on this branch:
+- 0 dangerous disagreements: a file touched but neither listed nor refused.
+- 0 false positives: a patch Codex applies that the adapter refuses, or one
+  where it lists an untouched protected path.
+
+For comparison, eb67fd1 had 0 dangerous and 247 false positives on the same
+corpora. `DifferentialAgainstCodex` in the test file replays 18 key shapes
+through the engine when `codex` is runnable, and skips otherwise.
+
+**NUL in `agent_type`.** `"\u0000"`, `"\u0000\n"` and `"\u0000\u0000"`
+passed the round-1 blank check. Bash cannot hold NUL, so the shared hook read
+an empty role and treated the caller as the lead. On eb67fd1 a `fix/` commit
+logged `lead commit allow`, and a CLAUDE.md patch returned `{}`. The adapter
+now refuses any `agent_type` containing a Unicode category-C character, in
+addition to a blank one. `default`, `developer` and `doc keeper` still reach
+the shared hook as subagents.
+
+**Alias spellings on a case-insensitive filesystem.** On this Mac's APFS
+volume, `.PROJECT/sprint.json`, `.project/SPRINT.JSON` and
+`.project/<U+017F>print.json` open the existing `.project/sprint.json`.
+Likewise `claude.md` opens `CLAUDE.md` and `TRIP/proof.txt` opens
+`trip/proof.txt`. `Path.resolve()` keeps the given spelling, so on eb67fd1
+each of these returned `{}`.
+
+`checked_paths` now rewrites every existing component to the directory entry
+that is the same file (`os.path.samestat`). A component that does not exist
+stays as written, so `.PROJECT/newfile` becomes `.project/newfile`. A
+spelling that matches two entries (hard links) is refused. The tests skip on
+a case-sensitive filesystem.
+
+**The same weakness in Claude's own write hook (not changed here).** Fed
+`file_path` values directly, `scripts/claude-hooks/pretooluse-write.sh` gave
+these results in a throwaway repository on this Mac, 2026-09-26:
+
+| `file_path` | Decision |
+|---|---|
+| `.project/sprint.json` | deny |
+| `.PROJECT/sprint.json` | allowed (no output) |
+| `.project/<U+017F>print.json` | allowed (no output) |
+| `trip/x.txt` | deny |
+| `TRIP/x.txt` | allowed (no output) |
+| `claude.md` as `developer` | allowed (no output) |
+
+This is a finding for the owner, not part of this PR.
