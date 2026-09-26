@@ -66,14 +66,21 @@ person's recollection.
    resolution with no `MERGE_HEAD` commits as a single-parent commit, losing
    the ancestry that makes GitHub (and this codebase) recognize the PR as
    merged.
-5. **Verify the merged tree.** Spawn `verifier` on it and paste its report. A
-   migration the PR adds makes `migrations.test.ts` fail until its list is
-   updated — check the PR updated it, and do not wave the failure through as
-   "the expected one".
+5. **Verify the merged tree.** Green CI on the PR's merge ref (`gh pr checks`)
+   IS the verification (2026-09-26, owner's decision) when all three hold:
+   `merge-tree` is clean, no file is touched by both sides, and no security
+   path is involved — the list under step 3. The handover's `ci:` line says
+   which you relied on. On any overlap or security path, or with a required
+   suite red or missing, spawn `verifier` on the merged tree and paste its
+   report. A migration the PR adds makes `migrations.test.ts` fail until its
+   list is updated — check the PR updated it, and do not wave the failure
+   through as "the expected one".
 6. **Re-assess when the risk class changed.** If the merge touches
    `control-plane/db/migrations/`, `shared/` or `server/server.js` — the rule
-   CI uses to decide a push deserves a fresh assessment — spawn
-   `regression-planner` in branch mode on the merged result.
+   CI uses to decide a push deserves a fresh assessment — or an authenticated
+   route, or relay behaviour (`control-plane/api/src/relay/`, `chat-router.ts`),
+   spawn `regression-planner` in branch mode on the merged result. A site-only,
+   test-only, tooling or docs PR needs none: write `not needed (<why>)`.
 7. **Carry forward.** Unresolved review items from the PR go into the
    integration PR's "Carried-forward open items", grouped under the PR number,
    deliberate decisions marked as such so they are not re-raised as findings.
@@ -84,14 +91,17 @@ person's recollection.
    Merge #NNN → <integration branch>: READY | NOT READY | DECISION NEEDED
    merge-tree:     clean | conflicts in <paths>, resolved at <throwaway branch>
    same intent:    none | <file>: <the consult's verdict, and its reasoning>
-   verifier:       <report, verbatim>
+   ci:             green on the merge ref (<checks>) | not relied on (<why>)
+   verifier:       <report, verbatim> | not run (ci: relied on)
    assessment:     not needed (<why>) | docs/test-reports/regression-plan-…
    carry-forward:  <drafted items>
    command:        gh pr merge NNN --merge     (for the person to run)
    ```
 
-9. **After the person merges:** spawn `sprint-scribe` to mark the plan and the
-   ledger, and `pr-steward` to sweep the branch and its worktree.
+9. **After the person merges:** queue it for the daily sweep. `sprint-scribe`
+   marks the plan and the ledger and `pr-steward` sweeps the branches and
+   worktrees once a day for the merges since the last run, and at sprint end —
+   not per merge (2026-09-26).
 
 ## At sprint end
 

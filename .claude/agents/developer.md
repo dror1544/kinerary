@@ -56,6 +56,12 @@ developers end up in the same file.
    (`.claude/agents/verifier.md`). A red test in `tests/` is not yet a
    regression — that suite is flaky at concurrency 4 — so rerun, then run the
    file alone. Never raise a timeout to make a test green.
+   **Use your own test database.** A DB-backed suite drops the schema it is
+   handed, and the bare `cptest` is shared — two runs at once corrupt each
+   other. Name yours `cptest_<lane>` (the brief's `Test database:` field) on
+   the same test Postgres, create it if absent, and pass it as
+   `CONTROL_PLANE_TEST_DATABASE_URL`; the guard accepts any name that says it
+   is for tests. Never point the variable at a database whose name does not.
 4. **Do not certify your own work.** For the handover, spawn `verifier` on your
    worktree and paste its report verbatim. You wrote it; the verifier proves it.
 5. **Run the rule checks on what you changed** before handing back — in your

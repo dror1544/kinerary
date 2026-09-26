@@ -10,7 +10,8 @@ the one place the rules live, not two files kept in sync by hand.
 
 1. **Never `git commit` without explicit user approval.** Finish the change,
    summarize what's ready, then wait for "commit", "go ahead", or equivalent.
-   (One MVP-phase exception: docs-only commits — see "MVP phase" below.)
+   (Two MVP-phase exceptions: docs-only commits, and commits on a feature
+   branch — the approval then comes at the merge. See "MVP phase" below.)
 2. **Never deploy a live trip site without explicit approval** — pushing code
    to a running container, `docker compose up -d --force-recreate`, restarting
    `trip-server`, etc. Ask "ready to deploy?" after committing; a commit
@@ -32,12 +33,16 @@ the one place the rules live, not two files kept in sync by hand.
    reached through an env var or a config file read at runtime. See
    "Two repositories" below for the shape and the escape hatch.
 
-## MVP phase — lighter rules (owner's decision, 2026-09-25)
+## MVP phase — lighter rules (owner's decision, 2026-09-25; item 3 and the last paragraph, 2026-09-26)
 
-For as long as the product is an MVP running family-and-friends trips, two
-kinds of friction are removed. They remove a prompt, not a protection: every
-hard rule above still holds for code, deploys, binaries and this deployment's
-names.
+For as long as the product is an MVP running family-and-friends trips, three
+kinds of friction are removed. They remove a prompt, not a protection: the
+approval for code moves to the merge, and every hard rule above still holds
+for deploys, binaries and this deployment's names.
+
+Two branches carry names in this document. The **leading branch** is
+`integration/sprint-N` — where sprint work lands. The **production branch** is
+`main` — what a release is cut from. Nothing below exempts either of them.
 
 1. **Docs-only work needs no per-commit approval.** A commit whose every staged
    path is documentation (`docs/**/*.md`, `CHANGELOG.md`, `FRAMEWORK.md`,
@@ -49,8 +54,8 @@ names.
    `git add … && git commit`, `-a`, `--amend`, `--no-verify`, another directory,
    a force, or a merge commit. `CLAUDE.md`, `AGENTS.md`, `.claude/`,
    `.githooks/`, `.github/` and `scripts/` are policy, not documentation, and
-   always ask. Code commits, merges, pushes of anything else and deploys still
-   ask (rules 1 and 2). A subagent is still refused for all of them.
+   always ask. Merges, deploys, and commits or pushes outside items 1 and 3
+   still ask (rules 1 and 2). A subagent is still refused for all of them.
 2. **Read-only production probes need no per-probe approval.** Health checks,
    versions, trip dates, dropped-config paths and similar reads against the
    control-plane VM and the live trips. A probe may read a trip's key inside the
@@ -62,10 +67,48 @@ names.
    applies. The harness's own permission classifier is separate from this rule
    and can still ask; a Bash permission rule in the *user's* settings, not in
    this repo, is how to quiet it.
+3. **Feature-branch work needs no per-commit or per-push approval; the merge
+   into the leading branch is the approval (owner's decision, 2026-09-26).**
+   Before this, one change cost three prompts — commit, push, merge — and PRs
+   merged 24–45 minutes after they opened (#192, #196, #197, #211, #215), so
+   the time went on the prompts, not on review. A commit on a `fix/`, `feat/`, `carry/`
+   or `chore/` branch from the lead session, and the push of that branch to its
+   own name on origin, are not prompted: nothing reaches anyone until the branch
+   is merged. `pretooluse-bash.sh` vouches only for one plain `git commit`
+   (message from `-F <file>` or `-m '<text>'`) or one plain
+   `git push [-u] origin <that branch>`, in this repository's own worktrees
+   (`cd <dir> &&` or `git -C <dir>` is read; another repository is not vouched
+   for) — never for a staged policy path (`CLAUDE.md`, `AGENTS.md`, `.claude/`,
+   `.githooks/`, `.github/`, `scripts/`, `.preflight-allow`), `-a`, `--amend`,
+   `--no-verify`, a force, another branch, or `main`. The mechanical checks run
+   first, from that worktree's own copy of `scripts/preflight-checks.sh`,
+   against that worktree's index. **The merge into `integration/sprint-*` is the
+   one prompt**, and its text carries the PR's base branch and its check
+   results (`gh pr view`, best effort — an unreadable GitHub says so and still
+   asks). A merge onto `main`, a deploy, and every commit, push or merge by a
+   subagent are unchanged.
 
-Deliberately **not** lightened: the review gates for a merge (integrator,
-regression plan, boundary review for security paths) and the documentation
-sweep after merges. Rules 2–6 are untouched.
+What stays a gate: the integrator, boundary review for security paths, a
+regression plan (sprint mode) before each release, and every merge to `main`
+and deploy. What is narrower since 2026-09-26, by the owner's decision:
+
+- the per-PR regression plan is for PRs that add a migration, touch auth or a
+  boundary path, or change relay behaviour; a site-only, test-only, tooling or
+  docs PR is recorded as "assessment: not needed (why)". The deploy prompt only
+  reads back a plan for the exact HEAD being deployed, which a per-PR plan is
+  not;
+- green CI on the PR's merge ref stands in for the integrator's local
+  merged-tree verifier when the merge is clean, no file is touched by both
+  sides and no security path is involved (`model-runner.ts`, `server/server.js`,
+  `shared/`, anything spawning a process with an environment). On any overlap
+  or security path the full path applies: a clean merge is not evidence there;
+- the documentation and branch sweeps run once a day and at sprint end, not
+  after every merge;
+- a PR gets at most two review rounds. A finding after the second that is not a
+  correctness or security defect becomes a follow-up issue, named in the PR's
+  carry-forward; a third round is the owner's call.
+
+Rules 2–6 are untouched.
 
 ## What this repo is
 
@@ -537,8 +580,9 @@ Every rule in "Hard Rules" above is now checked by
   resolution.
 - **`.claude/settings.json` hooks** — Claude Code, early enough to steer rather
   than refuse. `git commit` and deploy verbs additionally become a *prompt*
-  every time, because rules 1 and 2 are about intent and no script can check
-  intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
+  every time (bar the MVP-phase exemptions above: docs-only work and
+  feature-branch commits and pushes), because rules 1 and 2 are about intent
+  and no script can check intent. Command classification lives in `scripts/claude-hooks/match-command.py`,
   which strips heredocs and quotes first — matching the bare words "git" and
   "commit" refuses any command that merely *writes documentation about* them.
   Since 2026-09-20 the same prompt covers the routes that create commits

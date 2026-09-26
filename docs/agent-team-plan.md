@@ -28,10 +28,14 @@ re-decide:
   because a verifier that can edit can make itself pass. `sprint-scribe` cannot
   record approval. `regression-planner` cannot deploy. Every role below carries
   the same kind of list.
-- **The human holds two gates, commit and deploy**, and the hooks make each one
-  a prompt rather than a rule to remember (`scripts/claude-hooks/`). No agent
-  gets either. The team's job is to make each prompt a well-prepared decision,
-  not to reduce how often Dror is asked.
+- **The human holds two gates, merge and deploy** (until 2026-09-26 they were
+  commit and deploy — §9 decision 11), and the hooks make each one a prompt
+  rather than a rule to remember (`scripts/claude-hooks/`). No agent gets
+  either. A feature-branch commit or push is no longer a gate: it reaches
+  nobody, and the merge is where the evidence exists. The team's job is to make
+  each remaining prompt a well-prepared decision — and, since that date, to
+  reduce how often Dror is asked, because three prompts a change had become
+  clicks.
 
 ---
 
@@ -45,10 +49,10 @@ re-decide:
 | **Integrator** | half exists (`pr-steward`, `sprint-scribe`) | `integrator` subagent | Sonnet 5 · high; an Opus 5 consult for the same-intent check and conflict resolution | order the merge queue, `merge-tree`, resolve conflicts on a throwaway branch, verify the merged tree, prepare carry-forward | merge, push, close issues, record approval, promote a release |
 | **Regression planner** | exists | as today: CI on PR open; locally before a risk-class merge; sprint mode at sprint end | Opus 5 (CI already pins it) · high | assess, cost, plan | deploy, approve, edit the plan doc |
 | `verifier` | exists | spawned by developer and integrator | Sonnet 5 · medium | run the suites, paste real output | edit |
-| `sprint-scribe`, `run-capture` | exist | after every merge / after every live run | Sonnet 5 · high | mark plan and ledger, route rows | invent an owner, record approval |
-| `pr-steward` | exists | after every merge; sprint end | Sonnet 5 · medium | sweep branches and PRs (doc drift is `doc-keeper`'s since 2026-09-20) | delete an unmerged branch |
+| `sprint-scribe`, `run-capture` | exist | once a day, for the merges since the last run / after every live run | Sonnet 5 · high | mark plan and ledger, route rows | invent an owner, record approval |
+| `pr-steward` | exists | once a day; sprint end | Sonnet 5 · medium | sweep branches and PRs (doc drift is `doc-keeper`'s since 2026-09-20) | delete an unmerged branch |
 | `boundary-reviewer` | exists | whenever a brief flags a security path | Opus 5 · high | audit with live evidence | fix |
-| **Doc keeper** | new (takes over `pr-steward`'s doc-drift sweep) | `doc-keeper` subagent: before gate 1 on the developer's handover; after each merge and at sprint end as a sweep | Sonnet 5 · high; judgment calls reported, not decided | edit any document, write design docs, fix unambiguous drift, propose CLAUDE.md wording | edit code, the plan or the ledger; commit; invent a rationale; apply a CLAUDE.md rule change |
+| **Doc keeper** | new (takes over `pr-steward`'s doc-drift sweep) | `doc-keeper` subagent: before gate 1 on the developer's handover; once a day and at sprint end as a sweep | Sonnet 5 · high; judgment calls reported, not decided | edit any document, write design docs, fix unambiguous drift, propose CLAUDE.md wording | edit code, the plan or the ledger; commit; invent a rationale; apply a CLAUDE.md rule change |
 
 **Before the first run** (§8): the hard-rule-1 hook does not fire on
 `git merge`, `gh pr merge`, `git push` or `git cherry-pick` — all four classify
@@ -74,7 +78,7 @@ Workflows for the two fixed pipelines (integrate, sprint gate).
 | Regression agent | `regression-planner`, unchanged. | It already has the three modes (branch, issue, CI) and a defined seat in the deploy hook. |
 | *(not in the concept)* Reviewer | `/code-review` at high effort, plus `boundary-reviewer` when a brief flags a security path. **No new agent file.** | Nobody in the four-role concept reads the code for correctness before it merges — the planner assesses risk, the verifier runs suites. A fresh-context read of the diff is the cheapest error catcher in the loop, and the tooling exists. |
 | *(not in the concept)* Live acceptance | Dror, from one self-contained script (`docs/setup-test-plan.md`, `live-run` skill). | Standing decision: live runs are driven by a person, from a script, and reviewed afterwards. |
-| Documentation agent — documents aligned, drift found, decisions, architecture and considerations explained | **`doc-keeper` subagent** (§3.6). Two seats: before gate 1 it reads the developer's handover and gives every decision a home, so the document lands in the same commit as the code; after each merge and at sprint end it sweeps for drift. Takes over `pr-steward`'s third sweep. | Dead paths and stale counts are already swept. The *why* is captured nowhere once a PR merges — the same loss the carry-forward discipline exists for. |
+| Documentation agent — documents aligned, drift found, decisions, architecture and considerations explained | **`doc-keeper` subagent** (§3.6). Two seats: before gate 1 it reads the developer's handover and gives every decision a home, so the document lands in the same commit as the code; once a day and at sprint end it sweeps for drift. Takes over `pr-steward`'s third sweep. | Dead paths and stale counts are already swept. The *why* is captured nowhere once a PR merges — the same loss the carry-forward discipline exists for. |
 
 ---
 
@@ -137,7 +141,8 @@ list on the integration PR.
   uses: which surface row it lands on (the two clocks), which suites prove it,
   how many approval rounds it will cost Dror, and whether it needs live minutes
   or an infrastructure window. T-shirt size on top. The number of approval
-  rounds is the estimate that matters most while hard rule 1 is unchanged.
+  rounds — since 2026-09-26 the merge and the deploy, not the commit — is the
+  estimate that matters most.
 - **The claims table**: task → owned paths → worktree → developer. Held in the
   session and mirrored to the issue as the `agent:in-progress` label plus a
   comment naming the paths, so a second session can read it.
@@ -211,6 +216,11 @@ high` for correctness and simplification; `boundary-reviewer` whenever the
 brief's security flag is set or the diff touches `server/server.js`,
 `shared/needs-schema.js`, `shared/agent-schema.js`, or an authenticated route.
 Findings go back to the *same* developer instance, which keeps its context.
+**At most two rounds** (2026-09-26): a finding after the second that is not a
+correctness or security defect becomes a follow-up issue, named in the PR's
+carry-forward; a third round is Dror's call. (#199 ran four audit rounds and
+filed #225 for what was left; the cap makes that the default, not a decision
+taken each time.)
 
 Read-only by construction. No new file.
 
@@ -235,13 +245,19 @@ Runs when the manager says a PR is ready, and at sprint end.
    integrator's own conclusion, and the answer is recorded verbatim.
 4. **Resolve on a throwaway branch in its own worktree**, never on the
    integration branch. Reconcile, do not take a side wholesale.
-5. **Verify the merged tree** by spawning `verifier` on it. A migration added by
-   the PR makes `migrations.test.ts` fail until its list is updated — the planner
-   already says so; the integrator checks that the PR updated it.
+5. **Verify the merged tree.** Green CI on the PR's merge ref *is* that
+   verification (2026-09-26) when the merge is clean, no file is touched by both
+   sides and no security path is involved (`model-runner.ts`, `server/server.js`,
+   `shared/`, anything spawning a process with an environment); the handover
+   says which it relied on. On any overlap or security path, or with a required
+   suite red or missing, spawn `verifier` on the merged tree. A migration added
+   by the PR makes `migrations.test.ts` fail until its list is updated — the
+   planner already says so; the integrator checks that the PR updated it.
 6. **Re-run `regression-planner` (branch mode) on the merged result** when the
-   merge changes the risk class — a migration, `shared/`, the sanitizer — the
-   same rule the CI workflow uses to decide whether a push deserves a fresh
-   assessment.
+   merge changes the risk class — a migration, `shared/`, the sanitizer, an
+   authenticated route, or relay behaviour. A site-only, test-only, tooling or
+   docs PR needs no plan: the handover says `not needed (<why>)`. The
+   sprint-mode plan before each release is unchanged.
 7. **Carry forward.** Unresolved review items from the PR are written into the
    integration PR's "Carried-forward open items" section, grouped under the PR
    number, deliberate-decision rows marked as such (memory
@@ -249,8 +265,10 @@ Runs when the manager says a PR is ready, and at sprint end.
 8. **Hand Dror one decision:** merge #N — clean / resolved at `<throwaway>`,
    verifier report, plan at `docs/test-reports/…`, carry-forward drafted. Dror
    merges, or approves the merge command.
-9. **After the merge:** spawn `sprint-scribe` to mark the plan and the ledger,
-   and `pr-steward` to sweep the branch and its worktree.
+9. **After the merge:** queue it for the daily sweep — `sprint-scribe` marks the
+   plan and the ledger and `pr-steward` sweeps the branches and worktrees once a
+   day for the merges since the last run, and at sprint end, not per merge
+   (2026-09-26).
 
 **At sprint end:** the same procedure for `integration/sprint-6 → main`, plus
 `regression-planner` in sprint mode, plus the deploy hook's plan note (it greps
@@ -305,7 +323,8 @@ in the same commit as the code.
   (the map below), with the alternative it rejected and why? If not, the keeper
   writes the paragraph in the developer's worktree, so it ships with the code.
   Documents the diff touched are checked for drift right then.
-- **After gate 2, and at sprint end — the sweep.** `scripts/preflight-checks.sh
+- **Once a day, and at sprint end — the sweep** (2026-09-26; was after each
+  merge), over the merges since the last sweep. `scripts/preflight-checks.sh
   --all` warn lines for dead paths first, then a read for: commands and paths
   that no longer work, counts that moved on, architecture claims contradicted
   by the tree, a rule describing a mechanism that has since changed, a design
@@ -421,7 +440,7 @@ tracks doc · issues · monitor reports · ledger
    │ the diff touched checked     │
    └────────────┬─────────────────┘
                 ▼
-   ═══ GATE 1: Dror — "commit" (hook prompt) ═══════════════════
+   ═══ GATE 1: commit — NO PROMPT on a feature branch (2026-09-26) ═══
                 │  commit on the feature branch · PR → integration/sprint-6
                 │  CI: regression assessment posts on the PR
                 ▼
@@ -431,7 +450,7 @@ tracks doc · issues · monitor reports · ledger
    │ carry-forward → one report                               │
    └────────────┬─────────────────────────────────────────────┘
                 ▼
-   ═══ GATE 2: Dror — merge ═══════════════════════════════════
+   ═══ GATE 2: Dror — merge; the one prompt, with base branch + CI ═══
                 │
                 ▼
    sprint-scribe marks plan + ledger · pr-steward sweeps branch + worktree
@@ -445,8 +464,10 @@ tracks doc · issues · monitor reports · ledger
    live run by Dror from one script → run-capture → ledger
 ```
 
-Three gates, all Dror's, all already prompted by a hook or a runbook. The team
-changes what arrives at each gate, not how many there are.
+Three gates; since 2026-09-26 gate 1 is not a prompt — the lead commits and
+pushes a feature branch itself — so Dror is asked at gate 2 (merge) and gate 3
+(deploy), each already prompted by a hook or a runbook. The team changes what
+arrives at each prompt.
 
 ---
 
@@ -470,7 +491,8 @@ The tracks document already did the analysis; the mechanism is what is missing.
   - **`model-runner.ts` has one owner** (track 3) and track 2 consumes what it
     records;
   - **`cptest`** — a DB-backed suite names its own database; two runs at once
-    corrupt each other;
+    corrupt each other. Each lane's is `cptest_<lane>` (the brief's `Test
+    database:` field), never the bare shared `cptest`;
   - **the companion install path** — the SSH forced command names one checkout
     for every companion built (#127); a task that changes what a companion is
     built from waits for that to be repointed.
@@ -673,6 +695,26 @@ Principles behind the table:
     documentation track. What it does not fix, it routes with its cost.
     Decision 9 is untouched: CLAUDE.md remains the one document it may never
     edit.
+11. **Feature-branch commits and pushes are not prompts; the merge into the
+    leading branch is** (Dror, 2026-09-26; amends decision 1). Decision 1 said
+    to count the prompts during Sprint 6 and that the count is the argument
+    either way. The count: #192, #196, #197, #211 and #215 merged 24–45 minutes
+    after they opened, so the time went on three prompts a change (commit,
+    push, merge), not on review. The merge prompt is where the integrator's
+    report and CI exist; its text now carries the PR's base branch and check
+    results. Decision 2 stands: Dror merges. *Form:* Dror chose option (b) —
+    commit and push of `fix/`, `feat/`, `carry/`, `chore/` branches unprompted,
+    one prompt at the merge — over (a), one approval covering all three. `main`
+    is the production branch and `integration/sprint-N` the leading branch;
+    neither is exempted, and a merge onto `main`, a deploy, and every subagent
+    action are unchanged. Narrowed with it, all agreed the same day: the
+    per-PR regression plan is for migrations, auth/boundary and relay-behaviour
+    PRs; green CI on the merge ref replaces the integrator's local verifier
+    when the merge is clean, no file overlaps and no security path is touched;
+    the sweeps run daily; a PR gets at most two review rounds; each lane uses
+    its own test database. Implemented in CLAUDE.md ("MVP phase", item 3),
+    `scripts/claude-hooks/pretooluse-bash.sh` and the integrator, developer and
+    doc-keeper roles.
 
 ---
 
@@ -840,6 +882,8 @@ Surface row:         control-plane | relay | worker | migration | release
                      | docs — no runtime, no clock; name who reads it and what
                        they do with it. A wrong claim is acted on at the next
                        read, not the next restart.
+Test database:       cptest_<lane>  (its own database on the test Postgres —
+                     never the bare shared `cptest`; n/a if no DB-backed suite)
 Suites to run:       …  (from verifier's path→suite table — for a docs task
                      look up the path each corrected CLAIM is about, not the
                      path the diff touches; a claim with no assertion is listed
