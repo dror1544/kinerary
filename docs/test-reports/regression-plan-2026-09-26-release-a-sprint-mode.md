@@ -479,3 +479,11 @@ G, the Hebrew read (Dror, ~25 min carried + 2):
 - **`git diff b04e229 d6b8f21 -- ':!docs' ':!*.md'` is empty.** No conclusion in §§1–8 changes.
 - After #241 merges, the code delta is `document-correction.ts`, `relay/dispatch.ts`, `relay/poller.ts`, `relay/server.ts` and one test file. There is no migration, and no worker, compose or site change.
 - So §3.2's migration findings, §4's probes and §5's window stand as written. The fleet facts were read at 13:2x–13:5xZ today; G7 re-reads them on the day.
+
+### U7. #240 (a companion invented a nut-allergy warning) rides with Release A
+
+- **What it is.** A one-sentence example in the companion's SOUL template (`profile-templates/familytrip-companion/templates/SOUL.md.tpl`, "Privacy and learning") was echoed to a family as if it were fact. It is a template and test change with an evaluation tool: no relay, auth, migration or site change. The developer's fix is in flight on `fix/240-companion-invented-needs` and is not yet reviewed; this section says what the fix must be and does not vouch for it.
+- **Who it reaches.** Only companions rendered after the release is deployed, i.e. new trips. Neither live companion changes (a saved system prompt is reused; see the assessment on #240). So it adds no live-trip risk to Release A, and Release A does not need it to be safe.
+- **Why before the window anyway.** Every trip built from the release carries the sentence until it is fixed, and the release is the last one before the promotion decision. It lands on the sprint before Fri 2 Oct, or it waits for the release after; it is not a gate.
+- **What to check on the hand-back.** The rendered prompt for an empty `participant_needs` contains no example person with a need and no personal name outside the roster; the rule "a need is stated only if it is in `participant_needs` or the organizer said it here" is present; the before/after evaluation on both runners is attached and the "before" run reproduces the incident.
+- **After 3 Oct.** Re-rendering the two live companions (`scripts/companion-refresh-prompts.sh` plus a gateway restart) is its own approved step per trip, with the other post-3-Oct items.
