@@ -91,6 +91,10 @@ export const PORTS = {
   heroHttp:                38196,
   tripEventsHttp:          38198,
   controlPlaneSession:     38296,
+  tripMcpEnabled:          38304,
+  tripMcpDisabled:         38305,
+  tripMcpPublicOrigin:     38306,
+  tripMcpNoSdk:            38307,
   // control-plane/api/test/group-document-to-plan.integration.test.ts
   groupDocumentServer:     38294,
 

@@ -385,6 +385,15 @@ it's config-driven (start with the `get_config` tool to discover that
 trip's actual phase/venue/participant ids; nothing is hardcoded). One
 instance talks to one trip via `API_BASE_URL`.
 
+The site also serves its **own** MCP endpoint, for a trip member's own Claude
+or ChatGPT rather than the companion (`server/trip-mcp/`, off unless
+`TRIP_MCP_ENABLED` and `PUBLIC_ORIGIN` are set): read and write for an
+organizer, read only for everyone else. It is its own OAuth 2.1 authorization
+server: the person adds `<site>/mcp` (the More tab has an "Add to Claude"
+install link), signs in with their site login, and approves. Tools call the
+site's routes as that person, not as the agent. Details: `mcp/README.md`,
+"Trip connector".
+
 ### Original plan vs active plan — the vocabulary
 
 A trip carries "what happens on a day" more than once. Use these names for
@@ -502,7 +511,7 @@ hasn't been connected to any username yet — the response is meant to prompt
     the authenticated listing hands one out. Owner decision, 2026-09-25: the link is open to everyone in
     the group. The page's own image URL is a freshly signed one-hour file link, and its metadata is
     HTML-escaped.
-  - **Rotating `JWT_SECRET` revokes every outstanding file and share link and logs every member out.**
+  - **Rotating `JWT_SECRET` revokes every outstanding file and share link and logs every member out.** It does **not** revoke trip-connector (MCP) connections: their tokens are random and stored hashed, not signed with it. An organizer disconnects them from the site's connections list.
 - **Uploads and served files cannot run script.** `/api/photos/upload` accepts only
   `jpg/jpeg/png/gif/webp/heic/heif` with an `image/*` type (SVG and HTML are refused, 400
   `unsupported_file_type`) and stores it under a server-built name (timestamp, random, allow-listed
@@ -526,6 +535,7 @@ hasn't been connected to any username yet — the response is meant to prompt
   `GET /api/agent/brief`. Redeploying an existing trip can hide fields it shows today — run
   `projectConfig` on its config and read the boot log first (#200).
 - Google Sign-In (optional): ID tokens verified against Google's public keys via `google-auth-library`, no server-side secret; binds to `users.google_sub`, unique per username
+- Trip connector (optional, `server/trip-mcp/`): OAuth 2.1 with PKCE, dynamic registration limited to the hosted assistants' callbacks and loopback; opaque, hashed, revocable tokens that are never site sessions (and site sessions are never MCP tokens); anyone on the trip, read-only unless an organizer approved, re-checked on every call
 
 ---
 

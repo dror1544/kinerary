@@ -58,8 +58,11 @@ describe("member logins", () => {
     fireEvent.click(screen.getAllByRole("button", { name: /back to the trip password/i })[1]);
 
     await waitFor(() => expect(screen.getByText(/they can use the trip password again/i)).toBeInTheDocument());
-    expect(calls[0].url).toContain("/api/agent/participants/ben/reset-password");
-    expect(calls[0].body).toEqual({ to: "trip_password" });
+    // Matched by URL: the organizer tools also ask whether the assistant
+    // connector is on, so the reset is not necessarily the first request.
+    const reset = calls.find((c) => c.url.includes("/reset-password"));
+    expect(reset?.url).toContain("/api/agent/participants/ben/reset-password");
+    expect(reset?.body).toEqual({ to: "trip_password" });
   });
 
   it("hands over a one-time link, and says it is not for the group", async () => {
