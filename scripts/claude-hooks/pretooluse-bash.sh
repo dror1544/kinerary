@@ -71,7 +71,22 @@ Ask for one first: "use the regression-planner agent on this branch" — it read
     "$short" "$branch"
 }
 
+# One line per decision, so "how many prompts does a change cost" is measured
+# rather than inferred (docs/test-reports/process-baseline-2026-09-26.md). Local
+# and outside the repository; never the command, which can carry a secret. A log
+# that cannot be written must never change a decision, hence the swallowed errors.
+# Columns: time, session, lead|<agent type>, kind, decision.
+HOOK_LOG="${KINERARY_HOOK_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/kinerary/hook-decisions.tsv}"
+log_decision() {
+  local session
+  session="$(printf '%s' "$payload" | jq -r '.session_id // "-"' 2>/dev/null)"
+  { mkdir -p "$(dirname "$HOOK_LOG")" &&
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${session:--}" \
+      "${agent:-lead}" "$kind" "$1" >>"$HOOK_LOG"; } 2>/dev/null || true
+}
+
 emit() {  # emit <allow|deny|ask> <reason>
+  log_decision "$1"
   jq -cn --arg d "$1" --arg r "$2" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
   exit 0
