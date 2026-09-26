@@ -45,6 +45,47 @@ Only SSH is reachable from the LAN. Everything Kinerary listens on loopback:
 The relay, sidecar and Hermes use **host networking** so they share the VM's
 loopback; postgres/api/worker stay on compose networks.
 
+### This VM does not inherit the trips' NFS mount, and never will
+
+A trip's site is an **LXC container**. Proxmox mounts the TrueNAS export once on
+the **host** (`/mnt/pve/truenas-nfs/…`), and every trip container receives it as
+an `mp0` mountpoint — see `provisioning/adapters.py:97-99`. A trip therefore has
+document storage without doing anything, which is why trip sites can serve
+documents today.
+
+`kinerary-cp` is a **full VM**. A VM has its own kernel and its own mount table,
+so it inherits nothing from the Proxmox host's. It needs its **own NFS client
+mount of the same export**.
+
+That is a difference in the class of guest, not a misconfiguration somebody once
+made. Every future control-plane VM will need this, and a rebuilt one will need
+it again. So it is automated rather than written down as steps:
+
+```bash
+DOCUMENT_STORE_NFS_SOURCE=<host>:/<export> \
+DOCUMENT_STORE_MOUNT=/srv/kinerary-nfs \
+DOCUMENT_STORE_ENV_FILE=/opt/kinerary-deploy/vm.env \
+sudo -E scripts/bootstrap-document-store.sh            # --check first; it changes nothing
+```
+
+The script installs the NFS client, writes one `/etc/fstab` line so the mount
+survives a reboot, mounts it, creates the `.kinerary-document-store` marker on
+the real volume, and then verifies the host against **the same contract the
+product enforces at runtime** — `check_document_store()` in
+`control_plane_worker/document_handoff.py` and `checkDocumentStore` in
+`document-store.ts`: configured → exists → is a directory → carries the marker →
+writable → on a mount of its own. It is idempotent, and it refuses rather than
+guessing any address.
+
+**Why the marker matters.** Its only job is to be *absent* when the export is not
+mounted. Without it a service starting against an empty local directory would
+quietly write a family's documents to a filesystem the next redeploy discards.
+`DOCUMENT_STORE_REQUIRED=1` turns that into a loud startup failure instead.
+
+As of 2026-09-19 this VM has none of it — no `nfs-common`, no fstab entry, no
+mount, and no `KINERARY_NFS_ROOT` in `vm.env`. Document intake cannot deploy here
+until the above has run.
+
 ## Layout
 
 | Path | Owner / mode | What |
