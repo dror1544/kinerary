@@ -6,7 +6,8 @@
 # stack that never changes; a separate nightly stack comes later. So this IS a
 # deploy of staging with nobody asked — never of a live trip site — and it is
 # guarded instead: it skips (exit 0, reason in the report) when
-#   * another nightly run holds the lock,
+#   * another nightly run holds the lock (a lock whose run is dead is taken over),
+#   * staging's database cannot be read — the guards fail closed, never open,
 #   * someone is mid-interview on staging (a session touched in the last hour),
 #   * a provisioning job is running on staging,
 #   * the deployment's own guard says no (KINERARY_NIGHTLY_GUARD — e.g. the
@@ -47,16 +48,33 @@ say "# Nightly e2e — $stamp"
 say ""
 say "Started $(date '+%H:%M %Z'), branch \`$BRANCH\`, scenario \`$SCENARIO\`, automated organizer, torn down after."
 
-mkdir "$LOCK" 2>/dev/null || finish "SKIPPED — another nightly run holds $LOCK"
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+# The lock holds the pid of the run that took it. A run that died without its
+# EXIT trap (kill -9, power cut) leaves a pid that is no longer alive, and the
+# next night takes the lock over instead of skipping forever.
+take_lock() { ( set -o noclobber; echo $$ >"$LOCK" ) 2>/dev/null; }
+if ! take_lock; then
+  holder="$(cat "$LOCK" 2>/dev/null)"
+  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+    finish "SKIPPED — another nightly run (pid $holder) holds $LOCK"
+  fi
+  say "Took over a stale lock left by pid ${holder:-unknown}, which is no longer running."
+  rm -f "$LOCK"
+  take_lock || finish "SKIPPED — another nightly run took the lock first"
+fi
+trap 'rm -f "$LOCK"' EXIT
 
 PG="kinerary-control-plane-local-postgres-1"
 sql() { docker exec "$PG" psql -U kinerary_control_plane -d kinerary_control_plane -At -c "$1" 2>/dev/null; }
 
-live="$(sql "SELECT count(*) FROM control_plane.intake_sessions WHERE state IN ('interviewing','awaiting_confirmation') AND updated_at > now() - interval '60 minutes'")"
-[ "${live:-0}" = 0 ] || finish "SKIPPED — someone was mid-interview on staging in the last hour ($live session(s))"
-busy="$(sql "SELECT count(*) FROM control_plane.jobs WHERE state IN ('leased','running')")"
-[ "${busy:-0}" = 0 ] || finish "SKIPPED — a provisioning job is running on staging"
+# Fail closed: an answer that is not a number means the guard could not look,
+# which is never the same as "nobody is there".
+count() { local n; n="$(sql "$1")" && [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"; }
+live="$(count "SELECT count(*) FROM control_plane.intake_sessions WHERE state IN ('interviewing','awaiting_confirmation') AND updated_at > now() - interval '60 minutes'")" \
+  || finish "SKIPPED — could not read staging's interview sessions (is the stack up?)"
+[ "$live" = 0 ] || finish "SKIPPED — someone was mid-interview on staging in the last hour ($live session(s))"
+busy="$(count "SELECT count(*) FROM control_plane.jobs WHERE state IN ('leased','running')")" \
+  || finish "SKIPPED — could not read staging's provisioning jobs (is the stack up?)"
+[ "$busy" = 0 ] || finish "SKIPPED — a provisioning job is running on staging"
 if [ -n "${KINERARY_NIGHTLY_GUARD:-}" ]; then
   if ! why="$(bash -c "$KINERARY_NIGHTLY_GUARD" 2>&1)"; then finish "SKIPPED — deployment guard: ${why:-no reason given}"; fi
 fi

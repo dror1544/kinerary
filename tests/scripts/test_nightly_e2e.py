@@ -27,10 +27,10 @@ class Nightly(unittest.TestCase):
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                     "NIGHTLY_CHECKOUT": str(self.checkout), "NIGHTLY_REPORTS": str(self.reports)}
 
-    def docker(self, live, busy):
-        """First query answers the live-session count, the second the job count."""
+    def docker(self, live, busy, fail=False):
+        """Answers the live-session count and the job count; fail=True is a database that is down."""
         stub = self.bin / "docker"
-        stub.write_text(f"""#!/bin/sh
+        stub.write_text("#!/bin/sh\nexit 1\n" if fail else f"""#!/bin/sh
 case "$*" in *intake_sessions*) echo {live} ;; *jobs*) echo {busy} ;; esac
 """)
         stub.chmod(0o755)
@@ -78,11 +78,36 @@ case "$*" in *intake_sessions*) echo {live} ;; *jobs*) echo {busy} ;; esac
         self.assertEqual(r.returncode, 0)
         self.assertIn("SKIPPED — deployment guard: the VM is provisioning", self.report())
 
-    def test_skips_when_another_run_holds_the_lock(self):
-        (self.reports / ".lock").mkdir(parents=True)
+    def test_a_guard_that_cannot_answer_skips_rather_than_proceeds(self):
+        """Fail closed: a query that failed is not "nobody is interviewing"."""
+        self.docker("0", "0", fail=True)
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("SKIPPED — could not read staging", self.report())
+
+    def hold_lock(self, pid):
+        self.reports.mkdir(parents=True, exist_ok=True)
+        (self.reports / ".lock").write_text(f"{pid}\n")
+
+    def test_skips_while_a_live_run_holds_the_lock(self):
+        holder = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(holder.kill)
+        self.hold_lock(holder.pid)
         self.assertEqual(self.run_it().returncode, 0)
         self.assertIn("SKIPPED — another nightly run", self.report())
-        self.assertTrue((self.reports / ".lock").is_dir(), "a skipped run must not release someone else's lock")
+        self.assertEqual((self.reports / ".lock").read_text().strip(), str(holder.pid),
+                         "a skipped run must not release someone else's lock")
+
+    def test_a_lock_left_by_a_dead_run_is_taken_over(self):
+        """A kill -9 or a power cut must not skip every night after it."""
+        dead = subprocess.Popen(["true"]); dead.wait()
+        self.hold_lock(dead.pid)
+        self.docker("1", "0")  # so the run stops right after taking the lock
+        self.run_it()
+        report = self.report()
+        self.assertNotIn("another nightly run", report)
+        self.assertIn("stale lock", report)
+        self.assertFalse((self.reports / ".lock").exists(), "the run releases the lock it took")
 
 
 if __name__ == "__main__":
