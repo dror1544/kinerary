@@ -350,6 +350,20 @@ them passing. It is 300000 now, which still fails a hung test, just not a
 passing suite. Raise it rather than trim a suite to fit; if a file genuinely
 approaches five minutes, split the file.
 
+**A green local run is not a green CI run.** The Mac has `codex` and `claude`
+on its PATH; the GitHub runner has neither. On 2026-09-25 #192 made the `/model`
+handler refuse an unverifiable Codex, and a test that had always leaned on the
+Mac's own `codex` began failing on the runner only. The Control plane workflow
+sat red on the leading branch for about 18 hours while #204, #211, #215 and #218
+merged on green local suites (#223, fixed by #224). Before a merge decision read
+`gh pr checks <n>` and the base branch's last few runs (`gh run list --branch
+integration/sprint-6 --workflow "Control plane" --limit 5`), not the local
+result alone: a red base is a finding, not a backdrop, and a green PR on a red
+base is not evidence. A test that needs a tool gets a fake of its own
+(`CODEX_BIN` and `control-plane/api/test/support/child-env-harness.ts`), and a
+`PATH` without the tool — a temp dir holding only a symlink to `node`, plus
+`/usr/bin:/bin` — is the cheap way to reproduce CI locally.
+
 ### The interview has no agent — and silently grows one back
 
 The interview is a **deterministic router calling bounded LLM functions**, not
