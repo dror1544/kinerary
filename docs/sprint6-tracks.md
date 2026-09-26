@@ -266,7 +266,7 @@ picks it up every five minutes** (`familytrip-companion/templates/SOUL.md.tpl:63
 One reply per question, no follow-up turn (`companion-conversation.js:46-48`).
 There is no synchronous path from the trip site to the companion at all.
 
-- **Capture the group invite link at bind time** (decided). `exportChatInviteLink` is implemented at `control-plane/api/src/relay/telegram-api.ts:285-290` and **nothing calls it**. Needs: a column on `telegram_chat_bindings` (none today — `0029`/`0043`/`0053` have no invite field), a call in `bind_chat_to_trip` (`provisioner.py:371-467`), and a path to the site. The site half already exists: `CompanionPanel.tsx:26,62` renders `connection.group_url`, today writable only by hand through MCP `set_companion_connection` (`mcp/mcp.js:276-282`). **Prerequisite:** the bot must be an admin in the group to export a link, which provisioning does not arrange.
+- **Capture the group invite link at bind time** (decided 2026-09-19; **reopened and replaced 2026-09-26, decision 26: the organizer pastes it once through `set_companion_connection`**, so nothing below is being built). `exportChatInviteLink` is implemented at `control-plane/api/src/relay/telegram-api.ts:285-290` and **nothing calls it**. Needs: a column on `telegram_chat_bindings` (none today — `0029`/`0043`/`0053` have no invite field), a call in `bind_chat_to_trip` (`provisioner.py:371-467`), and a path to the site. The site half already exists: `CompanionPanel.tsx:26,62` renders `connection.group_url`, today writable only by hand through MCP `set_companion_connection` (`mcp/mcp.js:276-282`). **Prerequisite:** the bot must be an admin in the group to export a link, which provisioning does not arrange.
 - **Make the handoff affordances clear** — the per-item "Ask" deep link already exists (`trip-web/src/App.tsx:228-232`, used at `:526`).
 
 ### 1e. Group addressing — test what is merged, before building more
@@ -466,7 +466,7 @@ Two cautions:
 
 ### Monitoring
 - **Verification aggregator** (`:1461`) — `ready_private` is written unconditionally at `provisioner.py:1150-1158`, with no gate. The `control_plane.verification_evidence` table exists (`0001_foundation.sql:139`) and **has no writer anywhere** (verified: only the migration and an id-format list reference it). Of the six required signals, only messaging binding and reachability have any check at all.
-- **Super-admin dashboard** (`:1466`) — **decided: build it as specified.** Nothing exists today: no UI, no `/v1/admin/*`, no `/v1/jobs` read endpoint, no suspend/retry. The data mostly exists (`jobs`, `funnel_events`, `audit_events`, `release-registry`, `redaction.ts`) with no reader, so the work is a read API plus a UI shell plus the suspend/retry mutations with server-side authorization.
+- **Super-admin dashboard** (`:1466`) — **decided: build it as specified, in two slices (read-only first, suspend/retry second; 2026-09-26, decision 23).** Nothing exists today: no UI, no `/v1/admin/*`, no `/v1/jobs` read endpoint, no suspend/retry. The data mostly exists (`jobs`, `funnel_events`, `audit_events`, `release-registry`, `redaction.ts`) with no reader, so the work is a read API plus a UI shell plus the suspend/retry mutations with server-side authorization.
   - Considered and **not** taken: wrapping `.agents/skills/trip-fleet-monitor/fleet-mcp.mjs`, whose eight read-only tools already answer six of the dashboard's eight rows against the live DB. Worth keeping in view as the fallback if the console runs long — and worth reading its queries before writing new ones.
   - Per the goal, the daily control-plan report and the derived rates are the dashboard's primary content; the ops rows (jobs, failures, versions, audit) fill in behind them.
 - **Runbook** (`:1476`) — partly satisfied by `kinerary-cp-release upgrade|rollback` (#84, merged `94e572d`), which is not recorded against this bullet.
@@ -476,7 +476,7 @@ Two cautions:
 - Open: the **organizer-scoped projection decision** (`:1469-1475` + §5 `:1895-1935`) — build it here or defer to the post-MVP web track; the richer trip-card model and the action surface (suspend/retry/re-provision) from `docs/web-control-plane-integration-plan.md` §8.
 - Dead weight: six orphaned page files in `web/src/pages/` superseded by `ProductApp.tsx`, and a `web/README.md:14-17` that still says auth is interface-only.
 
-### Account management — **an add to Sprint 6, scoped to organizers** (decided 2026-09-19)
+### Account management — **an add to Sprint 6, scoped to organizers** (decided 2026-09-19; **deferred 2026-09-26, decision 24 — nothing below is being built this sprint**)
 
 **In scope:** organizer email/password signup on the landing page. Control-plane
 organizer accounts are **Google-only** today when the portal is configured —
@@ -826,8 +826,8 @@ Mac, has to happen before track 2 ships at sprint end.
 Verification, not build. It exercises all four of the other tracks, which is why it is not
 folded into any of them — burying it makes the sprint's exit criterion invisible.
 
-- **The two-person demo rehearsal** (`:1512-1520`) — organizer runs signup/interview/confirm/group; super-admin reviews the approval gates and the dashboard; then a deliberate activation rejection, a failed health check and a worker restart before a clean retry.
-- **Re-provision `japan-2026` through the full cycle onto a fresh container** (`:1521`) — the headline manual test, the first trip to go end to end with no hand-seeded state. Three constraints: allocate a **new** vmid (do not add it to `PROVISIONER_VMID_MAP`), the existing container and its family supergroup binding are **live** and the binding move is still unbuilt, and keep the old container until the new one verifies.
+- **The two-person demo rehearsal** (`:1512-1520`) — organizer runs signup/interview/confirm/group; super-admin reviews the approval gates and the dashboard; then a deliberate ~~activation rejection~~ *(dropped 2026-09-26, decision 27: activation is superseded)*, a failed health check and a worker restart before a clean retry.
+- **Re-provision `japan-2026` through the full cycle onto a fresh container** (`:1521`) — **replaced 2026-09-26 (decision 27) by a full-cycle run of the `multi` or `manual` scenario on a fresh container; the constraints below are kept as history** — the headline manual test, the first trip to go end to end with no hand-seeded state. Three constraints: allocate a **new** vmid (do not add it to `PROVISIONER_VMID_MAP`), the existing container and its family supergroup binding are **live** and the binding move is still unbuilt, and keep the old container until the new one verifies.
 - **The automated test list** (`:1498-1510`), including the full sandbox E2E of the demo script.
 - **Exit gate** (`:1551`): the demo script passes, evidence is retained, cleanup is verified, and the run repeats without manual database changes.
 
@@ -836,7 +836,7 @@ folded into any of them — burying it makes the sprint's exit criterion invisib
 ## Decisions taken (2026-09-19)
 
 **Cross-cutting**
-- Track 1 covers site + MCP + transformer work; transformer items reach live trips via **one pilot trip, then the fleet**.
+- Track 1 covers site + MCP + transformer work; transformer items reach live trips via **one pilot trip, then the fleet** *(the pilot phase was dropped 2026-09-26, decision 26)*.
 - The exit gate is **its own fifth track**, not folded into housekeeping.
 - Track 2 ships to the **VM**, through `kinerary-cp-release`, with rollback rehearsed first.
 
@@ -917,6 +917,26 @@ All from Dror, 2026-09-26, recorded as given. Where a reason was not given, none
     Items 1, 2, 4–7 are not implied by items 9–12. Reasons were given only where quoted. (Dror, 2026-09-26 for the carry; 2026-09-25 for the seven)
 
 19. **Model for the lead seat: stay on Sonnet 5**, with judgment calls (consult, regression-planner, boundary-reviewer, the re-audit) on Opus. Consistent with `docs/agent-team-plan.md`'s role table. (Dror, 2026-09-26)
+
+20. **Process: feature-branch commits and pushes are not prompts; the merge into the leading branch is.** Recorded in full as decision 11 of `docs/agent-team-plan.md`, implemented in CLAUDE.md ("MVP phase", item 3), the hook and three roles by PR #226 (open when this was written). The *leading branch* is `integration/sprint-6` and the *production branch* is `main`; neither is exempted. Narrowed with it, all agreed: the per-PR regression plan only for migration, auth/boundary and relay-behaviour PRs; green CI on the merge ref as the merged-tree evidence when the merge is clean, no file overlaps and no security path is touched; daily sweeps; at most two review rounds per PR; a test database per lane. Form (b) was chosen over (a), one approval covering commit, push and merge. (Dror, 2026-09-26)
+
+Decisions 21–28 are the owner's answers to the section-B interview of 2026-09-26. Each was picked from the options put to him; the alternatives are named where they matter.
+
+21. **Track 2 is built in parallel, not in a chain: the rates and the daily report are queries over the existing `assistant_events` table, built against fixtures beside the collector.** The authenticated ingest route waits for the collector. Alternatives not taken: collector first, and relay-only for Sprint 6. **A correction the lead made the same day, after the pick:** it was put to him that three of the five rates would wait for the collector. Counting against the event contract (`control-plane/api/src/analytics/contract.ts`; "the relay never claims `answered`"), it is **four**: only the response rate can be computed from relay events; grounded-answer, missing-data, traveler self-service and post-write trust need the assistant-side signal. The pick stands, and the collector is therefore on the critical path for most of the report and starts in wave 1. Where the collector lives (this repository's Hermes profile templates, or the Hermes runtime) has not been scoped; that is the first task of its lane. Until it lands, those four are shown as "not measured yet", which the sprint plan's own tests already require (an empty report, never a fabricated rate). (Dror, 2026-09-26)
+
+22. **The missing-information control loop is folded into #117's later-check representation and cut for Sprint 6 to: detect a missing fact, record it, and show the top missing items in the daily report.** The focused organizer request and tracking whether it was fulfilled move to the next sprint. Alternatives not taken: all three parts as specified, and the whole loop deferred. (Dror, 2026-09-26)
+
+23. **The super-admin dashboard is built in two slices.** Slice 1 is read-only: `/v1/admin/*` over jobs, funnel, versions, redacted failures, audit and the report, plus one page behind an operator allow-list, reusing the fleet monitor's queries. Slice 2 is suspend/retry, the only part that needs boundary review and server-side authorization. "Built as specified" (2026-09-19) is kept; only the order changes. (Dror, 2026-09-26)
+
+24. **Organizer email/password signup is deferred; Google and operator invitations stay the ways in.** No email sender exists anywhere in the control plane, and register, verify and forgot-password all need one; register without verification would break the account-claiming invariant in CLAUDE.md. This reverses the 2026-09-19 add to Sprint 6. (Dror, 2026-09-26)
+
+25. **The judge pair is sequenced: the offline judge (#198) first, the pre-summary judge of #117 last and time-boxed.** This replaces "a discussion of its own before anything is built" (decision 1 above) with a short decision now. Alternatives not taken: the discussion first, and the offline judge alone this sprint. (Dror, 2026-09-26)
+
+26. **Track 1: the "pilot trip, then the fleet" phase is dropped** (the throwaway end-to-end trip is the pilot; new trips get the change from the promoted release and existing trips keep their pinned release), **and 1d's group link is captured by the organizer pasting it once** through `set_companion_connection`, which already exists. This reopens and replaces the 2026-09-19 decisions "transformer items via one pilot trip, then the fleet" and "capture the invite link at bind time"; no `exportChatInviteLink` call, no new column, and no bot-admin step in provisioning. (Dror, 2026-09-26)
+
+27. **Exit gate: `japan-2026` is replaced by a full-cycle run of the `multi` or `manual` scenario on a fresh container; the activation tests are dropped; the automated end-to-end runs nightly on the Mac.** The `japan-2026` re-provision (2026-09-02) collided with the live trip's slug and dates, and its purpose, a run with no hand-seeded state, is what any full-cycle run proves; replacing it also removes the 3 Oct floor. Activation approval replay/expiry and the activation-rejection rehearsal step go, because the activation design is superseded and is not being built; the failed health check and the worker restart before a clean retry stay. The nightly run provisions on the shared Proxmox, NPM and Cloudflare, so it skips any night with a VM run. (Dror, 2026-09-26)
+
+28. **Two releases; Release A is early and control-plane only.** Release A ships the control-plane and relay fixes merged so far **before 3 Oct, without redeploying any trip site**; Release B carries Track 2 and the exit gate. Dror chose this over the lead's recommendation, which was Release A after both live trips end (about 5–8 Oct). It respects the 2026-09-25 rule that live trips are redeployed only after they end (no trip site changes), but the VM serves a real organizer and the live trips' companions route through its relay, so a control-plane upgrade does reach them. **Conditions the lead proposes for Release A, not yet agreed:** a sprint-mode regression plan for the exact commit; the walks already owed before the VM (the organizer document route, #217; #225 items 1, 3 and 5; #199's real-model run in English and Hebrew; the owner's Hebrew read; the five read-only fleet probes) run in one throwaway-trip session; `kinerary-cp-release upgrade --dry-run` first, with a snapshot and a rehearsed rollback; and a window away from the live trips' active hours. (Dror, 2026-09-26)
 
 ## Delta against Sprint 6 as written
 
