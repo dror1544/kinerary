@@ -262,7 +262,7 @@ G, the Hebrew read (Dror, ~25 min carried + 2):
 - G2: W passed. No D-item applied anything without a Yes, and every D14 count is 0.
 - G3: G (the Hebrew read) accepted.
 - G4: P4 green, and P3 70 OK.
-- G5: P5 clean, or R6 accepted by the owner.
+- G5: P5 clean, or R6 accepted by the owner. **DONE 2026-09-26:** P5 was reviewed (`docs/test-reports/boundary-review-2026-09-26-release-a-g5-sprint-worker-old-site.md`): the config question holds; the one finding (RSVP-activities exit) and the document-link regression were accepted by the owner (`docs/sprint6-tracks.md` decisions 45 and 46).
 - G6: V1 and V2 clean.
 - G7: V0 clean at T−10.
 - G8: nightly e2e and Mac provisioning off for the window.
