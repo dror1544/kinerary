@@ -27,6 +27,24 @@ python3 validate_bundle.py /tmp/familytrip-profile
 python3 -m unittest discover -s tests -v
 ```
 
+## Examples in these templates are placeholders, never people
+
+Whatever a prompt shows as an example, a model can hand back as a fact. Until
+#240, SOUL.md's example of a group-visible need was a sentence naming a person
+and a nut allergy; a companion on a trip with no recorded needs, and nobody by
+that name, told a real family a dinner had "nut-free options" for him. Write an
+example person as `<name>` and an example need as `<need>`.
+`tests/test_template.py` (`NoExamplePeople`) enforces it on the sources and on a
+rendered bundle, and says in its header what it cannot see.
+
+The behavioural half is `eval/needs_eval.py`: it renders a companion for a
+fictional family with no recorded needs (and, as a control, with one real one),
+asks the `claude` and `codex` runners for dinner in English and Hebrew, and
+counts invented needs, names not on the roster and unsourced allergen claims.
+It calls live models, so it is run by hand — `--dry-run` first — and it is a
+proxy: the rendered SOUL.md as the system prompt, no tools, no fallback chain.
+Its header lists what it does and does not measure.
+
 ## Create a real profile
 
 ```bash
