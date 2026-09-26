@@ -1757,8 +1757,8 @@ describe("one burst of messages opens one turn", () => {
   }
 
   test("five rapid messages open exactly one turn, combined", { skip: SKIP }, async () => {
-    // The exact shape of run 9: "אני ניר סולומון 56 / אלה אישתי בת 53 / נעה
-    // ביתי בת 25 סטודנטית / מאיה בת 23 / שי בת 14" — five family members, one
+    // The exact shape of run 9: "אני רון מרגולין 47 / טלי אישתי בת 45 / יעל
+    // ביתי בת 21 סטודנטית / דנה בת 18 / גל בת 11" — five family members, one
     // per Telegram send. Seven distinct turn ids were logged for that one
     // burst live; here, five sends must produce exactly one.
     await withConversation(async (fix) => {
@@ -1766,11 +1766,11 @@ describe("one burst of messages opens one turn", () => {
       await turn(fix, taps(fix, "c:nodoc"));
 
       const lines = [
-        "אני ניר סולומון 56",
-        "אלה אישתי בת 53",
-        "נעה ביתי בת 25 סטודנטית",
-        "מאיה בת 23",
-        "שי בת 14",
+        "אני רון מרגולין 47",
+        "טלי אישתי בת 45",
+        "יעל ביתי בת 21 סטודנטית",
+        "דנה בת 18",
+        "גל בת 11",
       ];
       for (const line of lines) await typesToInterviewer(fix, line);
 

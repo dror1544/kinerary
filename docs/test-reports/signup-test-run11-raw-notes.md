@@ -45,12 +45,12 @@ and the correction, moments later:
 
 > Sorry my bad, ir was an example
 
-*Agent note.* Checked the database before concluding anything: the Solomon
-family (Nir, Ella, Noa, Maya, Shay) is legitimately this round's own data —
+*Agent note.* Checked the database before concluding anything: the Margolin
+family (Ron, Tali, Yael, Dana, Gal) is legitimately this round's own data —
 the same test document reused across rounds, not a cross-session identity
 leak. `dietary: kosher_style + lactose_free` was a real, already-written
 answer (from the document), and the message was the standard
-dietary→dietary_scope follow-up (SOUL rule 9a), using Noa as a natural
+dietary→dietary_scope follow-up (SOUL rule 9a), using Yael as a natural
 example since she is a real, known name — not an assertion about her.
 Resolved by Dror's own correction; no code change needed. Worth recording
 because the INSTINCT to flag it was right — cross-session leaks are exactly

@@ -184,7 +184,7 @@ describe("validateAnswer (unit)", () => {
   });
 
   test("travelers: a name in any script counts, not just Latin", () => {
-    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "ניר", age: 56 }]);
+    const result = validateAnswer("travelers", null, null, INTAKE_QUESTIONS, [{ name: "רון", age: 47 }]);
     assert.equal(result.ok, true);
   });
 

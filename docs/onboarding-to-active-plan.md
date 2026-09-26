@@ -65,7 +65,7 @@ provisioned 2026-09-06 from run 13's confirmed intake.
 | LXC + NPM + Cloudflare | **works** | vmid 104, 192.168.0.61, job succeeded attempt 1 |
 | Site serving | **works** | `192.168.0.61:8080` and `japan-2026-2.ara-united.store` → HTTP 200 |
 | Modern SPA present | **works** | `/modern/` → HTTP 200, `<title>Kinerary Modern Trip</title>` |
-| Family can log in | **works** | `nir` + seed password → 200; wrong password → 401 |
+| Family can log in | **works** | `ron` + seed password → 200; wrong password → 401 |
 | **Modern is the trip's front door** | **no** | `/` served the legacy site (`<title>Family Trip</title>`) on `japan-2026-2`, 2026-09-06. The code has since changed for newly bootstrapped trips — see the note below the table. |
 | **Trip companion reachable** | **no** | `assistant_names` empty, `telegram_chat_bindings` = 0 |
 | `runtime_routes` | **no** | 0 rows; "Open trip", invites, participant lookup all dead |
@@ -151,8 +151,8 @@ of this section is the check that has not been re-run live since 2026-09-06.*
 now holds unrelated content; the function has since moved to `:1046` and been
 rewritten, see the note below) matches `organizer_identity` against `{name,
 name_en, username}` and never `name + family`. Run 13's organizer answered
-"ניר סולומון" against a participant `{name: ניר, name_en: Nir, username: nir,
-family: סולומון}` — no match, so `agent.organizers` went unset,
+"רון מרגולין" against a participant `{name: רון, name_en: Ron, username: ron,
+family: מרגולין}` — no match, so `agent.organizers` went unset,
 `build_companion_handoff` returned `None`, and the companion was skipped.
 Answering with a full name is the normal case. Match `"{name} {family}"` and
 `"{name_en} {family_en}"` too, keeping the existing rule that no match yields

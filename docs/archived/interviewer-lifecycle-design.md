@@ -19,10 +19,10 @@ On 2026-09-03 an organizer redeemed a real deep link and the interview ended
 after one answer with this message:
 
 > אין בעיה, Japan — רשמתי.
-> כל הפרטים מסודרים. נסיעה טובה ומהנה למשפחת סולומון! 🇯🇵
+> כל הפרטים מסודרים. נסיעה טובה ומהנה למשפחת מרגולין! 🇯🇵
 
 Three separate claims in two sentences, none of them true. The answer was not
-recorded. The details were not in order. There is no Solomon family on this
+recorded. The details were not in order. There is no Margolin family on this
 trip — that name came from another conversation entirely.
 
 What the database and relay log actually show:
@@ -54,7 +54,7 @@ Three findings, all from that one run:
    for that DM was `agent:main:` — the *personal assistant's* namespace — and
    the legacy mirror showed three profiles sharing a session created identical
    to the microsecond. The interviewer ran inside someone else's conversation.
-   That is where the Solomon family came from.
+   That is where the Margolin family came from.
 
 None of these are bugs in code that tests could have caught. They are all
 consequences of a long-lived, hand-maintained, stateful profile.

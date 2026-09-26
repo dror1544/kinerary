@@ -349,8 +349,8 @@ describe("dispatchUpdate — the branch table", () => {
       await fix.pool.query(
         `INSERT INTO control_plane.trip_person_links
            (id, trip_id, telegram_user_id, participant_username, display_name, role, verified_via)
-         VALUES ('tpl_' || md5(random()::text), $1, '777', 'nirsolomon', $2, 'organizer', 'interview_chat')`,
-        [fix.tripId, "ניר סולומון"],
+         VALUES ('tpl_' || md5(random()::text), $1, '777', 'ronmargolin', $2, 'organizer', 'interview_chat')`,
+        [fix.tripId, "רון מרגולין"],
       );
 
       const update = msg("-1002000111", "Rio, what time do we leave?", "supergroup");
@@ -358,7 +358,7 @@ describe("dispatchUpdate — the branch table", () => {
       assert.equal(decision.kind, "to_gateway");
       if (decision.kind !== "to_gateway") return;
       // msg() sends from Telegram user 777 calling themselves "Dror".
-      assert.equal(decision.event.source.user_name, "ניר סולומון");
+      assert.equal(decision.event.source.user_name, "רון מרגולין");
       assert.equal(decision.event.source.user_id, "777");
     });
   });
@@ -389,7 +389,7 @@ describe("dispatchUpdate — the branch table", () => {
       await bindCompanion(fix, group, "companion-japan");
       await fix.pool.query(
         "UPDATE control_plane.trips SET assistant_names = $2, companion_intro = $3::jsonb WHERE id = $1",
-        [fix.tripId, ["סולומון"], JSON.stringify({ assistant_name: "סולומון", language: "he" })],
+        [fix.tripId, ["מרגולין"], JSON.stringify({ assistant_name: "מרגולין", language: "he" })],
       );
 
       const renamed = await dispatchUpdate(fix.pool, msg(group, "/name סולו / Solo", "supergroup"));
@@ -405,7 +405,7 @@ describe("dispatchUpdate — the branch table", () => {
 
       const byNewName = await dispatchUpdate(fix.pool, msg(group, "סולו, מה התוכנית מחר?", "supergroup"));
       assert.equal(byNewName.kind, "to_gateway", "the new name now reaches the companion");
-      const byOldName = await dispatchUpdate(fix.pool, msg(group, "משפחת סולומון יוצאת מחר", "supergroup"));
+      const byOldName = await dispatchUpdate(fix.pool, msg(group, "משפחת מרגולין יוצאת מחר", "supergroup"));
       assert.equal(byOldName.kind, "ignore", "a rename replaces — the old name no longer wakes it");
     });
   });
@@ -1122,7 +1122,7 @@ describe("the agent answering in the wrong language", () => {
   test("an English interview is never second-guessed", () => {
     // The reverse direction is not checked: Hebrew inside an English interview
     // is far more likely to be a traveller's name than a language slip.
-    assert.equal(agentTextIsInLanguage("משפחת סולומון is confirmed", "en"), true);
+    assert.equal(agentTextIsInLanguage("משפחת מרגולין is confirmed", "en"), true);
     assert.equal(agentTextIsInLanguage("plain english", "en"), true);
   });
 

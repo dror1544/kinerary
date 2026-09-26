@@ -348,8 +348,8 @@ no deployment commands required from the organizer or family.
 > chance to fire, because a defect one step upstream skipped the companion
 > first: `_resolve_organizers` (`transformer.py:649-656`) matches
 > `organizer_identity` only against `{name, name_en, username}` — **never
-> `name + family`**. The organizer answered "ניר סולומון" against a participant
-> named "ניר"/"Nir"/`nir`, so nothing matched, `agent.organizers` was unset,
+> `name + family`**. The organizer answered "רון מרגולין" against a participant
+> named "רון"/"Ron"/`ron`, so nothing matched, `agent.organizers` was unset,
 > `build_companion_handoff` returned `None`, and the companion was skipped.
 > `assistant_names` is empty and `telegram_chat_bindings` is 0 — the organizer
 > messages the bot and gets "I don't have a trip for this chat."

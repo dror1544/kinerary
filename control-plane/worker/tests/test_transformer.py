@@ -1055,8 +1055,8 @@ class SchemaV2Tests(unittest.TestCase):
 
     def test_a_hebrew_given_name_alone_resolves(self) -> None:
         """Run 14, live: the interview asked who the organizer is and the
-        organizer typed "ניר". The roster held name="ניר סולומון",
-        name_en="Nir", username="nir" — so the ENGLISH given name matched (it
+        organizer typed "רון". The roster held name="רון מרגולין",
+        name_en="Ron", username="ron" — so the ENGLISH given name matched (it
         is already bare in name_en) and the HEBREW one did not, purely because
         `name` carries the full name and `name_en` carries only the first.
 
@@ -1068,12 +1068,12 @@ class SchemaV2Tests(unittest.TestCase):
             # The roster exactly as run 14 produced it: full Hebrew `name`,
             # given-name-only `name_en`.
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "רון מרגולין", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+                {"name": "טלי מרגולין", "name_en": "Tali", "family": "מרגולין", "family_en": "Margolin"},
             ]),
-            organizer_identity=_text("ניר"),
+            organizer_identity=_text("רון"),
         )
-        self.assertEqual(config["agent"]["organizers"], ["nir"])
+        self.assertEqual(config["agent"]["organizers"], ["ron"])
 
     def test_a_given_name_two_travelers_share_stays_unresolved(self) -> None:
         """The reason given names were not matched in the first place, and the
@@ -1081,10 +1081,10 @@ class SchemaV2Tests(unittest.TestCase):
         to whoever the roster happens to list first."""
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
-                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+                {"name": "רון מרגולין", "name_en": "Ron M", "family": "מרגולין"},
+                {"name": "רון כהן", "name_en": "Ron C", "family": "כהן"},
             ]),
-            organizer_identity=_text("ניר"),
+            organizer_identity=_text("רון"),
         )
         self.assertNotIn("agent", config)
 
@@ -1092,10 +1092,10 @@ class SchemaV2Tests(unittest.TestCase):
         # Adding given-name forms must not make a precise answer ambiguous.
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir S", "family": "סולומון"},
-                {"name": "ניר כהן", "name_en": "Nir C", "family": "כהן"},
+                {"name": "רון מרגולין", "name_en": "Ron M", "family": "מרגולין"},
+                {"name": "רון כהן", "name_en": "Ron C", "family": "כהן"},
             ]),
-            organizer_identity=_text("ניר כהן"),
+            organizer_identity=_text("רון כהן"),
         )
         self.assertEqual(len(config["agent"]["organizers"]), 1)
 
@@ -1103,10 +1103,10 @@ class SchemaV2Tests(unittest.TestCase):
         # A family name is not a person. Unchanged by given-name matching.
         config = self._config(
             travelers=_structured([
-                {"name": "ניר סולומון", "name_en": "Nir", "family": "סולומון"},
-                {"name": "אלה סולומון", "name_en": "Ela", "family": "סולומון"},
+                {"name": "רון מרגולין", "name_en": "Ron", "family": "מרגולין"},
+                {"name": "טלי מרגולין", "name_en": "Tali", "family": "מרגולין"},
             ]),
-            organizer_identity=_text("סולומון"),
+            organizer_identity=_text("מרגולין"),
         )
         self.assertNotIn("agent", config)
 
@@ -1135,20 +1135,20 @@ class NonLatinNameTests(unittest.TestCase):
 
     def test_supplied_english_names_become_the_usernames(self) -> None:
         config = self._config([
-            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
-            {"name": "אלה", "name_en": "Ella", "age": 53, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
+            {"name": "טלי", "name_en": "Tali", "age": 45, "family": "מרגולין", "family_en": "Margolin"},
         ])
 
-        self.assertEqual(["nir", "ella"], [p["username"] for p in config["participants"]])
+        self.assertEqual(["ron", "tali"], [p["username"] for p in config["participants"]])
 
     def test_family_keeps_hebrew_display_but_uses_english_where_given(self) -> None:
         config = self._config([
-            {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
+            {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
         ])
 
         family = config["families"][0]
-        self.assertEqual("סולומון", family["name"]["he"])
-        self.assertEqual("Solomon", family["name"]["en"])
+        self.assertEqual("מרגולין", family["name"]["he"])
+        self.assertEqual("Margolin", family["name"]["en"])
 
 
 class PhaseVenuesTests(unittest.TestCase):
@@ -1703,127 +1703,127 @@ class ResolveOrganizersTests(unittest.TestCase):
     """
 
     #: Run 13's actual roster, as transformed on 2026-09-06.
-    SOLOMONS = [
-        {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "ella", "name": "אלה", "name_en": "Ella", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "maya", "name": "מאיה", "name_en": "Maya", "family": "סולומון", "family_en": "Solomon"},
-        {"username": "shai", "name": "שי", "name_en": "Shai", "family": "סולומון", "family_en": "Solomon"},
+    MARGOLINS = [
+        {"username": "ron", "name": "רון", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "tali", "name": "טלי", "name_en": "Tali", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "yael", "name": "יעל", "name_en": "Yael", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "dana", "name": "דנה", "name_en": "Dana", "family": "מרגולין", "family_en": "Margolin"},
+        {"username": "gal", "name": "גל", "name_en": "Gal", "family": "מרגולין", "family_en": "Margolin"},
     ]
 
     def _resolve(self, stated: str, participants=None) -> list[str]:
         return _resolve_organizers(
-            {"organizer_identity": _text(stated)}, participants or list(self.SOLOMONS)
+            {"organizer_identity": _text(stated)}, participants or list(self.MARGOLINS)
         )
 
     def test_the_run_13_answer_that_matched_nobody(self) -> None:
         # Verbatim. This returned [] on 2026-09-06 and cost the trip its
         # companion; it is the whole reason this class exists.
-        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+        self.assertEqual(self._resolve("רון מרגולין"), ["ron"])
 
     def test_full_name_in_either_script(self) -> None:
         # Answering with your full name is the NORMAL case, not an edge one.
-        self.assertEqual(self._resolve("Nir Solomon"), ["nir"])
-        self.assertEqual(self._resolve("ניר סולומון"), ["nir"])
+        self.assertEqual(self._resolve("Ron Margolin"), ["ron"])
+        self.assertEqual(self._resolve("רון מרגולין"), ["ron"])
 
     def test_full_name_across_scripts(self) -> None:
         # Rosters are mixed in practice — a Hebrew given name whose household
         # label was only ever transliterated, or the reverse.
-        self.assertEqual(self._resolve("ניר Solomon"), ["nir"])
-        self.assertEqual(self._resolve("Nir סולומון"), ["nir"])
+        self.assertEqual(self._resolve("רון Margolin"), ["ron"])
+        self.assertEqual(self._resolve("Ron מרגולין"), ["ron"])
 
     def test_the_forms_that_already_worked_still_do(self) -> None:
-        for stated in ("ניר", "Nir", "nir"):
+        for stated in ("רון", "Ron", "ron"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_case_and_spacing_do_not_decide_reachability(self) -> None:
-        for stated in ("  nir  solomon ", "NIR SOLOMON", "Nir  Solomon"):
+        for stated in ("  ron  margolin ", "RON MARGOLIN", "Ron  Margolin"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_a_bare_family_name_names_a_household_not_a_person(self) -> None:
         # Five people share it. Matching would hand one of them — whichever
         # the roster listed first — the organizer's private channel.
-        self.assertEqual(self._resolve("סולומון"), [])
-        self.assertEqual(self._resolve("Solomon"), [])
+        self.assertEqual(self._resolve("מרגולין"), [])
+        self.assertEqual(self._resolve("Margolin"), [])
 
     def test_an_ambiguous_answer_is_refused_rather_than_guessed(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("שי", twins), [])
+        self.assertEqual(self._resolve("גל", twins), [])
         # ...and the family name is exactly what disambiguates them.
-        self.assertEqual(self._resolve("שי כהן", twins), ["shai_a"])
+        self.assertEqual(self._resolve("גל כהן", twins), ["gal_a"])
 
     def test_someone_who_is_not_on_the_trip_matches_nobody(self) -> None:
         self.assertEqual(self._resolve("Dana Levi"), [])
 
     def test_no_answer_is_not_a_match(self) -> None:
-        self.assertEqual(_resolve_organizers({}, list(self.SOLOMONS)), [])
+        self.assertEqual(_resolve_organizers({}, list(self.MARGOLINS)), [])
         self.assertEqual(self._resolve("   "), [])
 
     def test_the_shape_the_transformer_actually_produces(self) -> None:
         # The tests above hand `_resolve_organizers` a roster carrying
-        # `family: "סולומון"`. `_build_participants` does not produce that: it
-        # SLUGIFIES family to "solomon" and drops `family_en` entirely. So a
+        # `family: "מרגולין"`. `_build_participants` does not produce that: it
+        # SLUGIFIES family to "margolin" and drops `family_en` entirely. So a
         # fix verified only against the shape above still leaves the live path
         # broken — which is exactly what happened on the first attempt at this
         # fix, caught by the provisioner integration test rather than here.
         transformed = [
-            {"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"},
-            {"username": "noa", "name": "נעה", "name_en": "Noa", "family": "solomon"},
+            {"username": "ron", "name": "רון", "name_en": "Ron", "family": "margolin"},
+            {"username": "yael", "name": "יעל", "name_en": "Yael", "family": "margolin"},
         ]
         intake = {
-            "organizer_identity": _text("ניר סולומון"),
+            "organizer_identity": _text("רון מרגולין"),
             "travelers": {"kind": "structured", "schema_version": 3, "data": [
-                {"name": "ניר", "name_en": "Nir", "family": "סולומון", "family_en": "Solomon"},
-                {"name": "נעה", "name_en": "Noa", "family": "סולומון", "family_en": "Solomon"},
+                {"name": "רון", "name_en": "Ron", "family": "מרגולין", "family_en": "Margolin"},
+                {"name": "יעל", "name_en": "Yael", "family": "מרגולין", "family_en": "Margolin"},
             ]},
         }
-        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+        self.assertEqual(_resolve_organizers(intake, transformed), ["ron"])
 
         # And the English pair, which the slug happens to resemble but which
         # must resolve through the raw roster rather than by luck.
-        intake["organizer_identity"] = _text("Nir Solomon")
-        self.assertEqual(_resolve_organizers(intake, transformed), ["nir"])
+        intake["organizer_identity"] = _text("Ron Margolin")
+        self.assertEqual(_resolve_organizers(intake, transformed), ["ron"])
 
     # 2026-09-11, the first automated full cycle: a natural answer to "which of
     # the travellers are you?" is a name WITH something around it, and every
     # one of these matched nobody — so the trip provisioned with no companion.
     def test_a_name_followed_by_a_description(self) -> None:
-        for stated in ("ניר, אבא של המשפחה", "Nir - the dad", "Nir — organizing this", "Nir (the dad)"):
+        for stated in ("רון, אבא של המשפחה", "Ron - the dad", "Ron — organizing this", "Ron (the dad)"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_a_self_reference_in_front_of_the_name(self) -> None:
-        for stated in ("אני ניר", "זה אני, ניר", "I'm Nir", "I am Nir Solomon", "me (Nir)", "it's me, Nir"):
+        for stated in ("אני רון", "זה אני, רון", "I'm Ron", "I am Ron Margolin", "me (Ron)", "it's me, Ron"):
             with self.subTest(stated=stated):
-                self.assertEqual(self._resolve(stated), ["nir"])
+                self.assertEqual(self._resolve(stated), ["ron"])
 
     def test_the_tolerant_read_takes_the_leading_name_never_any_word(self) -> None:
-        # "Nir's wife" is NOT Nir. Only the name the sentence starts with — after
+        # "Ron's wife" is NOT Ron. Only the name the sentence starts with — after
         # an optional "I'm"/"אני" — is read; a name buried later is not.
-        self.assertEqual(self._resolve("אשתו של ניר"), [])
-        self.assertEqual(self._resolve("Nir's wife"), [])
+        self.assertEqual(self._resolve("אשתו של רון"), [])
+        self.assertEqual(self._resolve("Ron's wife"), [])
         self.assertEqual(self._resolve("the dad"), [])
-        self.assertEqual(self._resolve("Noa, Nir's wife"), ["noa"])
+        self.assertEqual(self._resolve("Yael, Ron's wife"), ["yael"])
 
     def test_the_tolerant_read_still_refuses_to_guess(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("אני שי", twins), [])
-        self.assertEqual(self._resolve("Shai, the older one", twins), [])
-        self.assertEqual(self._resolve("אני שי כהן", twins), ["shai_a"])
+        self.assertEqual(self._resolve("אני גל", twins), [])
+        self.assertEqual(self._resolve("Gal, the older one", twins), [])
+        self.assertEqual(self._resolve("אני גל כהן", twins), ["gal_a"])
 
     def test_a_roster_with_no_raw_travelers_still_resolves_a_bare_name(self) -> None:
         # Older intakes, and any path that hands over participants without the
         # structured travelers answer beside them, must not regress.
-        transformed = [{"username": "nir", "name": "ניר", "name_en": "Nir", "family": "solomon"}]
-        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Nir")}, transformed), ["nir"])
+        transformed = [{"username": "ron", "name": "רון", "name_en": "Ron", "family": "margolin"}]
+        self.assertEqual(_resolve_organizers({"organizer_identity": _text("Ron")}, transformed), ["ron"])
 
     def test_a_hebrew_answer_finds_a_roster_spelled_only_in_english(self) -> None:
         """2026-09-15, live: every roster name was entered in English letters
@@ -1831,17 +1831,17 @@ class ResolveOrganizersTests(unittest.TestCase):
         in Hebrew, nothing matched, and the trip provisioned with no companion.
         """
         english_only = [
-            {"username": "nir", "name": "Nir", "name_en": "Nir"},
-            {"username": "maya", "name": "Maya", "name_en": "Maya"},
+            {"username": "ron", "name": "Ron", "name_en": "Ron"},
+            {"username": "dana", "name": "Dana", "name_en": "Dana"},
         ]
-        self.assertEqual(self._resolve("ניר", english_only), ["nir"])
+        self.assertEqual(self._resolve("רון", english_only), ["ron"])
 
     def test_sound_alike_never_breaks_a_tie_an_exact_reading_refused(self) -> None:
         twins = [
-            {"username": "shai_a", "name": "שי", "name_en": "Shai", "family": "כהן"},
-            {"username": "shai_b", "name": "שי", "name_en": "Shai", "family": "לוי"},
+            {"username": "gal_a", "name": "גל", "name_en": "Gal", "family": "כהן"},
+            {"username": "gal_b", "name": "גל", "name_en": "Gal", "family": "לוי"},
         ]
-        self.assertEqual(self._resolve("Shai", twins), [])
+        self.assertEqual(self._resolve("Gal", twins), [])
 
 
 class DeriveDaysFromAnchorsTests(unittest.TestCase):

@@ -801,11 +801,11 @@ COMPANION_INTAKE = {
 FULL_NAME_ORGANIZER_INTAKE = {
     **COMPANION_INTAKE,
     "travelers": {"kind": "structured", "schema_version": 1, "data": [
-        {"name": "ניר", "name_en": "Nir", "age": 56, "family": "סולומון", "family_en": "Solomon"},
-        {"name": "נעה", "name_en": "Noa", "age": 25, "family": "סולומון", "family_en": "Solomon"},
+        {"name": "רון", "name_en": "Ron", "age": 47, "family": "מרגולין", "family_en": "Margolin"},
+        {"name": "יעל", "name_en": "Yael", "age": 21, "family": "מרגולין", "family_en": "Margolin"},
     ]},
-    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "ניר סולומון"},
-    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["נעה"]}},
+    "organizer_identity": {"kind": "text", "schema_version": 1, "text": "רון מרגולין"},
+    "dietary_scope": {"kind": "structured", "schema_version": 1, "data": {"vegetarian": ["יעל"]}},
 }
 
 
@@ -2095,7 +2095,7 @@ class OrganizerFullNameReachesCompanionTests(unittest.TestCase):
             len(companion.installed), 1,
             "the companion was never invoked — organizer resolution stopped the chain again",
         )
-        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "ניר")
+        self.assertEqual(companion.installed[0]["organizer"]["display_name"], "רון")
 
         row = self.conn.execute(
             "SELECT chat_id FROM control_plane.telegram_chat_bindings "
