@@ -326,6 +326,7 @@ db.exec(`
     amount      REAL NOT NULL DEFAULT 0,
     is_estimate INTEGER DEFAULT 0,
     seed_key    TEXT UNIQUE,
+    created_by  TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
   );
 
@@ -373,6 +374,19 @@ for (const [col, decl] of [
   ['review_status', "TEXT NOT NULL DEFAULT 'approved'"],
 ]) {
   try { db.exec(`ALTER TABLE bookings ADD COLUMN ${col} ${decl}`); } catch {}
+}
+
+// Issue #173: budget_items had no owner column at all, so PATCH/DELETE could
+// only ever be all-or-nothing (authRequired) rather than row-scoped. NULL —
+// not a sentinel string — is deliberate: every row that predates this column
+// (seeded at boot, or written by an already-deployed server) has no creator
+// to attribute, and NULL is exactly what "nobody recorded" should mean. No
+// backfill is possible or attempted; the row-ownership check below treats a
+// NULL created_by as organizer/agent-only rather than everyone's or nobody's.
+for (const [col, decl] of [
+  ['created_by', 'TEXT'],
+]) {
+  try { db.exec(`ALTER TABLE budget_items ADD COLUMN ${col} ${decl}`); } catch {}
 }
 
 // ── TRIP CONFIG VERSIONING ────────────────────────────────────────────────────
@@ -1965,17 +1979,49 @@ app.get('/photo/:id', (req, res) => {
 });
 
 // ── BUDGET ────────────────────────────────────────────────────────────────────
+// Issue #173: PATCH/DELETE were gated by authRequired alone — every family
+// member, not just the organizer, could silently rewrite or erase ANY OTHER
+// member's line, including the organizer's. budget_items has no owner column
+// at all yet, unlike the comment/photo routes this now matches the shape of.
+//
+// Owner decision 2026-09-25 (issue #173): row ownership, not
+// organizerOrAgentRequired — a member may still add and edit their OWN
+// lines; the organizer and the agent key may touch any line; POST stays
+// authRequired (adding a cost is not the sensitive action, rewriting or
+// erasing someone else's is). A row with no recorded creator — every line
+// seeded at boot, and any line the agent key authors without a requesting
+// member named (mcp/mcp.js's add_budget_item does not pass one along today)
+// — is organizer/agent-only, the same as before this fix for everyone else:
+// nobody's line becomes "anyone's to edit" by virtue of predating the column.
+function isOrganizerOrAgent(req) {
+  return Boolean(req.user?.isAgent) || normalizeOrganizers(TRIP_CONFIG.agent).includes(req.user?.username);
+}
+function canEditBudgetItem(req, row) {
+  return isOrganizerOrAgent(req) || row.created_by === req.user?.username;
+}
+
 app.get('/api/budget', authRequired, (req, res) => {
-  res.json(db.prepare('SELECT * FROM budget_items ORDER BY phase, id').all());
+  // Reading the budget stays trip-wide — every family member could always see
+  // every line, and #173 is about who may WRITE one, not who may see it.
+  // can_edit is server-computed so a client never has to reimplement the
+  // ownership rule above just to decide whether to show its own edit button.
+  const rows = db.prepare('SELECT * FROM budget_items ORDER BY phase, id').all();
+  res.json(rows.map(row => ({ ...row, can_edit: canEditBudgetItem(req, row) })));
 });
 
 app.post('/api/budget', authRequired, (req, res) => {
   const { phase, category, description, amount, is_estimate } = req.body || {};
   if (!phase || !category || !description || amount === undefined)
     return res.status(400).json({ error: 'phase, category, description, amount required' });
+  // The agent key has no "requesting member" of its own to attribute a line
+  // to, so an agent-authored row lands with no creator — organizer/agent-only,
+  // same as a seeded row. A family member's own POST (through this route
+  // directly, or through server/trip-mcp/tools.js, which always calls AS
+  // that person) is attributed to them and stays theirs to edit.
+  const createdBy = req.user?.isAgent ? null : req.user?.username ?? null;
   const result = db.prepare(
-    'INSERT INTO budget_items (phase,category,description,amount,is_estimate) VALUES (?,?,?,?,?)'
-  ).run(phase, category, description, parseFloat(amount) || 0, is_estimate ? 1 : 0);
+    'INSERT INTO budget_items (phase,category,description,amount,is_estimate,created_by) VALUES (?,?,?,?,?,?)'
+  ).run(phase, category, description, parseFloat(amount) || 0, is_estimate ? 1 : 0, createdBy);
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
@@ -1983,6 +2029,9 @@ app.patch('/api/budget/:id', authRequired, (req, res) => {
   const { amount, description } = req.body || {};
   if (amount === undefined && description === undefined)
     return res.status(400).json({ error: 'amount or description required' });
+  const row = db.prepare('SELECT * FROM budget_items WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not_found' });
+  if (!canEditBudgetItem(req, row)) return res.status(403).json({ error: 'forbidden' });
   if (amount !== undefined)
     db.prepare('UPDATE budget_items SET amount=? WHERE id=?').run(parseFloat(amount) || 0, req.params.id);
   if (description !== undefined)
@@ -1991,6 +2040,9 @@ app.patch('/api/budget/:id', authRequired, (req, res) => {
 });
 
 app.delete('/api/budget/:id', authRequired, (req, res) => {
+  const row = db.prepare('SELECT * FROM budget_items WHERE id = ?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not_found' });
+  if (!canEditBudgetItem(req, row)) return res.status(403).json({ error: 'forbidden' });
   db.prepare('DELETE FROM budget_items WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
