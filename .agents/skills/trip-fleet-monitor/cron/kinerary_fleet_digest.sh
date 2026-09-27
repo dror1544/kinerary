@@ -63,18 +63,32 @@ run_section() {
   return 1
 }
 
-echo "📋 Kinerary daily digest — $(date '+%a %d %b, %H:%M')"
+# This is delivered with --no-agent: no model sits between this script and
+# Telegram, so whatever markdown syntax appears here is exactly what the
+# gateway's markdown→MarkdownV2 converter has to work with. Plain indented
+# text has nothing for it to convert, which is why an earlier version of this
+# digest rendered "flat" despite being sent through the same formatter as
+# every other message. Bold section titles + fenced code blocks around the
+# tabular sections (so column alignment survives) fixes that with no agent
+# involved.
+echo "*📋 Kinerary daily digest — $(date '+%a %d %b, %H:%M')*"
 echo
 
 if run_section --tool fleet_overview; then
+  echo "*Fleet overview*"
+  echo '```'
   echo "$OUT"
+  echo '```'
 else
   echo "❌ The fleet overview could not be read: $ERR"
 fi
 echo
 
 if run_section --tool statistics --days 7; then
+  echo "*Statistics — last 7 days*"
+  echo '```'
   echo "$OUT"
+  echo '```'
 else
   echo "❌ Statistics could not be read: $ERR"
 fi
@@ -85,12 +99,15 @@ echo
 # itself succeeded.
 if run_section --tool alerts; then
   if [ -n "$OUT" ]; then
+    echo "*⚠️ Needs attention*"
+    echo '```'
     echo "$OUT"
+    echo '```'
   else
-    echo "✅ Nothing needs attention."
+    echo "✅ *Nothing needs attention.*"
   fi
 else
-  echo "❌ Fleet health could NOT be checked — the alerts query failed, so this digest cannot say whether anything needs attention."
+  echo "❌ *Fleet health could NOT be checked* — the alerts query failed, so this digest cannot say whether anything needs attention."
   echo "   $ERR"
 fi
 
