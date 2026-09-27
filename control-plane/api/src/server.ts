@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -160,6 +160,19 @@ if (operatorKey) {
   };
 }
 
+// The super-admin dashboard's read-only routes (Sprint 6 slice 1, decision 23
+// in docs/sprint6-tracks.md). A key distinct from the operator's, on the same
+// reasoning `AdminDependencies` states: reading across every trip at once is
+// a different kind of power from minting one invitation, and sharing a
+// credential between them would make a leak of either a leak of both.
+// Absent, like every optional block here, means no `/v1/admin/*` route
+// mounts at all.
+let admin: AdminDependencies | undefined;
+const adminKey = process.env.CONTROL_PLANE_ADMIN_KEY;
+if (adminKey) {
+  admin = { db: pool, apiKey: adminKey };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -171,6 +184,7 @@ const app = buildApp(profile, {
   portal,
   interviewAgent,
   operator,
+  admin,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker
