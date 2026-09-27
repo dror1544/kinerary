@@ -35,7 +35,7 @@ model/effort, owned paths, isolated DB, tests, security and infrastructure gates
 
 ## Next managed action
 
-Prove the P1 upload fallback in real ChatGPT and Claude clients where available, then implement direct file transfer only after a verified client file payload and a bounded SSRF-safe fetch contract. P1 passed the full trip-site suite (608/608), preflight, and independent HTTP/boundary checks. The earlier L1 slice passed 606/606. Do not merge initiative code into Sprint 6 before Release A ships on 3 Oct and Claude and Dror approve the integration. #116 remains open and is not a product-path handover. Before editing `server/trip-mcp/oauth.js`, obtain Claude's note about its pre-existing findings.
+The P1 fallback passed a synthetic public-HTTPS OAuth/MCP/upload/readback/revoke probe, plus a signed-in real-browser page check; evidence is on #249. Real ChatGPT and Claude acceptance awaits the intended test accounts and an account-level connector grant. Implement direct file transfer only after a verified client file payload and a bounded SSRF-safe fetch contract. P1 passed the full trip-site suite (608/608), preflight, and independent HTTP/boundary checks. The earlier L1 slice passed 606/606. Do not merge initiative code into Sprint 6 before Release A ships on 3 Oct and Claude and Dror approve the integration. #116 remains open and is not a product-path handover. Before editing `server/trip-mcp/oauth.js`, obtain Claude's note about its pre-existing findings.
 
 ## Resume evidence
 
