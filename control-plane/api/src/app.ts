@@ -17,6 +17,20 @@ import { saveDeferredVenueLinks } from "./venue-links.js";
 import { correctIntake } from "./intake-correction.js";
 import { issueApproval } from "./plan-approval.js";
 import { inviteOrganizer, previewInvitation } from "./organizer-invite.js";
+import {
+  JOB_STATES,
+  JOB_TYPES,
+  getDailyReport,
+  getFunnelSummary,
+  isValidReportDate,
+  listAuditEvents,
+  listJobs,
+  listRedactedFailures,
+  listReleasesForAdmin,
+  recordAdminRead,
+  type JobState,
+  type JobType,
+} from "./admin-dashboard.js";
 import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } from "./password-identity.js";
 import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
@@ -108,6 +122,29 @@ export interface OperatorDependencies {
   botUsername?: string | null;
 }
 
+/**
+ * The super-admin dashboard's read-only routes (Sprint 6 slice 1,
+ * docs/sprint6-tracks.md decision 23): jobs, funnel, versions, redacted
+ * failures, audit and the report — every trip, not one.
+ *
+ * A DISTINCT key from the operator's, on the same reasoning `OperatorDependencies`
+ * already states for why it does not share the interview agent's: these are
+ * different kinds of power. The operator key mints trips and invitations for
+ * addresses that have never contacted this deployment; this key only ever
+ * reads, but it reads every trip's jobs, funnel activity and audit trail at
+ * once — the one thing no other authenticated route in this codebase does.
+ * Sharing either key with this one would make a leak of the smaller power
+ * also a leak of the larger one.
+ *
+ * Absent by default, like every optional block here: a deployment that has
+ * not set CONTROL_PLANE_ADMIN_KEY has none of `/v1/admin/*` at all.
+ */
+export interface AdminDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the operator's dashboard tooling, nowhere else. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -128,6 +165,8 @@ export interface AppDependencies {
   interviewAgent?: InterviewAgentDependencies;
   /** Optional: mount the operator's invitation routes. Off unless a key is set. */
   operator?: OperatorDependencies;
+  /** Optional: mount the super-admin dashboard's read-only routes. Off unless a key is set. */
+  admin?: AdminDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -1557,6 +1596,171 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       language: result.language,
       message: result.message,
     });
+  });
+
+  // ── Super-admin dashboard, slice 1 (read-only) ───────────────────────────
+  //
+  // docs/sprint6-tracks.md decision 23. Every route here reads across ALL
+  // trips — no trip id, no binding, no member scoping — which is why the gate
+  // is a dedicated key (`AdminDependencies`, above) rather than a widened
+  // version of any existing auth. Slice 2 (suspend/retry) is explicitly not
+  // built here: there is no mutation route, and no UI control implying one.
+  //
+  // Every successful read also writes one row to `control_plane.audit_events`
+  // (`recordAdminRead`) — "log who read what" — best-effort: a failure to
+  // write the audit row must never turn a successful read into a 500, so it
+  // is logged and swallowed rather than thrown.
+
+  function adminAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.admin;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return typeof providedKey === "string" && providedKey.length > 0 && providedKey === deps.apiKey;
+  }
+
+  async function auditAdminRead(action: string, targetRef: string): Promise<void> {
+    try {
+      await recordAdminRead(dependencies.admin!.db, action, targetRef);
+    } catch (error) {
+      log(structuredLog("warn", "admin.audit_write_failed", {
+        safe_error_code: "ADMIN_AUDIT_WRITE_FAILED",
+        sqlstate: sqlstateOf(error),
+      }));
+    }
+  }
+
+  function parseLimit(query: Record<string, unknown>): number | undefined {
+    const raw = query.limit;
+    if (typeof raw !== "string") return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  function parseTimestamp(raw: unknown): Date | undefined {
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    const d = new Date(raw);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  }
+
+  // GET /v1/admin/jobs — every trip's provisioning/activation/etc. jobs.
+  // Query: tripId?, state?, jobType?, limit? (max 200), offset?
+  app.get("/v1/admin/jobs", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const tripId = typeof query.tripId === "string" ? query.tripId : undefined;
+    const stateRaw = typeof query.state === "string" ? query.state : undefined;
+    const jobTypeRaw = typeof query.jobType === "string" ? query.jobType : undefined;
+    if (stateRaw !== undefined && !(JOB_STATES as readonly string[]).includes(stateRaw)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    if (jobTypeRaw !== undefined && !(JOB_TYPES as readonly string[]).includes(jobTypeRaw)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+    const offsetRaw = query.offset;
+    const offset = typeof offsetRaw === "string" && Number.isFinite(Number(offsetRaw)) ? Number(offsetRaw) : undefined;
+
+    const result = await listJobs(dependencies.admin.db, {
+      tripId, state: stateRaw as JobState | undefined, jobType: jobTypeRaw as JobType | undefined,
+      limit: parseLimit(query), offset,
+    });
+    await auditAdminRead("admin.read.jobs", tripId ?? "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/funnel — signup/onboarding funnel counts and conversion
+  // rates. Query: since? until? (ISO 8601 timestamps; both optional, no
+  // window means all time).
+  app.get("/v1/admin/funnel", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    const until = parseTimestamp(query.until);
+    if ((query.since !== undefined && since === undefined) || (query.until !== undefined && until === undefined)) {
+      return reply.code(400).send({ error: "INVALID_REQUEST" });
+    }
+
+    const summary = await getFunnelSummary(dependencies.admin.db, { since, until });
+    await auditAdminRead("admin.read.funnel", "all_trips");
+    return reply.code(200).send(summary);
+  });
+
+  // GET /v1/admin/versions — the release registry (candidate/verified/
+  // available/deprecated/retired), newest first. `promotedBy` passes through
+  // `listReleasesForAdmin`'s read-time safety net (admin-dashboard.ts) rather
+  // than the raw column, per the F1 boundary-review fix.
+  app.get("/v1/admin/versions", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const releases = await listReleasesForAdmin(dependencies.admin.db);
+    await auditAdminRead("admin.read.versions", "all_releases");
+    return reply.code(200).send({ releases });
+  });
+
+  // GET /v1/admin/failures — recently failed jobs. Query: since? (ISO 8601),
+  // limit? (max 200). Does NOT serve `result` — see admin-dashboard.ts's
+  // module doc (F1, boundary review on PR #275): a job's `result` is
+  // caller-shaped JSON with nothing in it this route is designed to need, and
+  // `safeErrorCode` already is the safe channel for "what failed".
+  app.get("/v1/admin/failures", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    if (query.since !== undefined && since === undefined) return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const result = await listRedactedFailures(dependencies.admin.db, { since, limit: parseLimit(query) });
+    await auditAdminRead("admin.read.failures", "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/audit — the append-only audit trail. Query: since?,
+  // action?, limit? (max 200). `evidence` passes through a per-action
+  // allow-list (`EVIDENCE_ALLOWLIST` / `projectEvidence`, admin-dashboard.ts)
+  // rather than a deny-list — an action this codebase does not itself
+  // produce gets `{}`, not a best-effort scrub (F1, boundary review on PR
+  // #275). `actorRef`, `targetRef` and `action` itself all pass through
+  // `safePlain` too — none of the three carries a DB-level format CHECK, so
+  // none is served on trust (F1 round 2, findings R1/R3: `action` was still
+  // raw, and the allow-list lookup could crash on an `action` shaped like a
+  // JS built-in property name). Reading this route is itself audited, same
+  // as every other route here — an admin read of the audit trail is still a
+  // read of everyone's data.
+  app.get("/v1/admin/audit", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const since = parseTimestamp(query.since);
+    if (query.since !== undefined && since === undefined) return reply.code(400).send({ error: "INVALID_REQUEST" });
+    const action = typeof query.action === "string" ? query.action : undefined;
+
+    const result = await listAuditEvents(dependencies.admin.db, { since, action, limit: parseLimit(query) });
+    await auditAdminRead("admin.read.audit", "all_trips");
+    return reply.code(200).send(result);
+  });
+
+  // GET /v1/admin/report — the dashboard's primary content per decision 23:
+  // a daily rollup built from what has real data today (funnel_events, jobs,
+  // releases). `notMeasuredYet` names the assistant-quality rates this is NOT
+  // computing — see admin-dashboard.ts's module doc for why. Query: date?
+  // (YYYY-MM-DD, UTC; defaults to today UTC).
+  app.get("/v1/admin/report", async (request, reply) => {
+    if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const query = request.query as Record<string, unknown>;
+    const date = typeof query.date === "string" ? query.date : new Date().toISOString().slice(0, 10);
+    if (!isValidReportDate(date)) return reply.code(400).send({ error: "INVALID_REQUEST" });
+
+    const report = await getDailyReport(dependencies.admin.db, date);
+    await auditAdminRead("admin.read.report", date);
+    return reply.code(200).send(report);
   });
 
   if (dependencies.portal) { app.get("/v1/auth/telegram", async (_request, reply) => reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" })); registerPortalRoutes(app, dependencies.portal); }
