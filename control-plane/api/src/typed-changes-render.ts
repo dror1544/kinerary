@@ -333,11 +333,13 @@ export function confirmable(draft: Pick<Draft, "result" | "unresolved" | "blocke
 const YES = new Set([
   "yes", "y", "yep", "yeah", "yup", "ok", "okay", "sure", "confirm", "confirmed", "apply", "do it", "go ahead",
   "correct", "right", "thats right", "that is right", "sounds good", "looks good", "perfect",
-  "כן", "אישור", "אשר", "אשרו", "מאשר", "מאשרת", "בסדר", "אוקיי", "אוקי", "נכון", "סבבה", "בטח", "עדכן", "עדכנו",
+  "כן", "אישור", "אשר", "אשרו", "מאשר", "מאשרת", "בסדר", "אוקיי", "אוקי", "נכון", "סבבה", "בטח", "עדכן", "עדכנו", "לעדכן",
 ]);
 const NO = new Set([
   "no", "n", "nope", "cancel", "never mind", "nevermind", "stop", "dont", "do not", "leave it", "forget it",
+  "leave it as it was",
   "לא", "בטל", "בטלו", "ביטול", "עזוב", "עזבו", "תעזוב", "לא צריך", "לא תודה",
+  "להשאיר", "השאירו", "להשאיר כמו שהיה",
 ]);
 
 /**
