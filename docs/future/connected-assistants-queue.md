@@ -1,12 +1,12 @@
 # Connected assistants — managed queue
 
-Updated 2026-09-27. Lead: Codex. State: CA-00 reviewed in draft PR #267; CA-01 F0 fixtures reviewed in draft PR #268.
+Updated 2026-09-27. Lead: Codex. State: combined testing lane assembling from reviewed CA-00 and CA-01 F0.
 
 [Parent initiative #247](https://github.com/dror1544/kinerary/issues/247).
 Design and operating contract: [plan](connected-assistants-plan.md).
 
 GitHub issue state is authoritative for execution. This index records initial
-ordering and dependencies; CA-00 documentation is reviewed and CA-01 F0 fixtures are reviewed; neither PR is merged. Product paths remain unclaimed. The contract draft is [here](connected-assistants-contracts.md). PR #257 remains open; this branch carries its plan text from the repaired integration baseline and Claude decides whether the older PR is superseded. GitHub issue comments carry the current brief and owner handover requests; the original issue body is a dated planning snapshot.
+ordering and dependencies; CA-00 documentation is reviewed and CA-01 F0 fixtures are reviewed; neither PR is merged. Product paths remain unclaimed. The contract draft is [here](connected-assistants-contracts.md). PR #257 remains open; this branch carries its plan text from the repaired integration baseline and Claude decides whether the older PR is superseded. The initiative now tests on `feat/connected-assistants-integration`; owner agreement and Claude review precede any merge into Sprint 6. GitHub issue comments carry the current brief and owner handover requests; the original issue body is a dated planning snapshot.
 
 | Work | Issue | Initial status |
 |---|---|---|
@@ -26,6 +26,7 @@ ordering and dependencies; CA-00 documentation is reviewed and CA-01 F0 fixtures
 |---|---|---|
 | Codex lead | `feat/connected-assistants-ca00-current` (based on repaired integration; carries PR #257 docs for Claude to disposition) | `docs/future/connected-assistants-plan.md`, `docs/future/connected-assistants-queue.md`, `docs/future/connected-assistants-contracts.md` |
 | Codex lead | `feat/connected-assistants-ca01-fixtures` | `tests/connected-assistants/**` only |
+| Codex lead | `feat/connected-assistants-integration` | combined reviewed CA-00 docs and CA-01 F0 fixtures; target for future initiative slices |
 
 Claude-led Sprint 6 claims are external dependencies, not transferred here.
 Shared paths require a recorded owner handover on the issue before a developer
@@ -34,7 +35,7 @@ model/effort, owned paths, isolated DB, tests, security and infrastructure gates
 
 ## Next managed action
 
-Review draft PRs #267 and #268, then proceed with CA-01 public transport/linkage after owner handover. #116 remains open and is not a product-path handover. The #227/#163/Sprint 6 owners must hand over the shared server paths before CA-01 code edits. Disjoint fixtures can proceed while that is pending.
+Test CA-00 and CA-01 F0 together on the initiative integration lane, then proceed with CA-01 public transport/linkage after owner handover. Do not merge either draft PR into Sprint 6 until the combined lane is ready and agreed. #116 remains open and is not a product-path handover. The #227/#163/Sprint 6 owners must hand over the shared server paths before CA-01 code edits. Disjoint fixtures can proceed while that is pending.
 
 ## Resume evidence
 

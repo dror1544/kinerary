@@ -350,3 +350,19 @@ handling and service-principal support; no production credential setup is author
 The owner handed the initiative to Codex for CA-00 and the first ready slice after the hook gate. PR #260 merged into `integration/sprint-6` as `8b86e96`; the primary checkout and the active integration checkout have identical `.codex/hooks.json` and adapter hashes. The historical planning base `4122abe` lacks this repair; this implementation worktree starts from the repaired integration head. This Codex session received a live `PreToolUse` block on `git push -h`, demonstrating active loaded policy. The owner-approved hook repair and subsequent fixes are described in `docs/test-reports/codex-hooks-2026-09-26.md` on this repaired integration base. The adapter still blocks approval-required actions because native ask parity is unavailable.
 
 PR #257 is still open at `4122abe`. This CA-00 branch starts at repaired integration `b70d79e` and carries the plan documents from #257 plus the contract; it may supersede #257 only after Claude decides its disposition. Behavior is checked against current integration `b70d79e` and current main `fbf3899`. Claude retains Sprint 6 integration. The shared issues #248 and #249 still carry their original planning-only text; the handoff supplies implementation authority, and issue comments record the narrower briefs and claims. No product path is claimed until its owner hands it over.
+
+## 13. Connected Assistants testing branch (owner direction, 2026-09-27)
+
+The initiative's combined testing branch is `feat/connected-assistants-integration`,
+in isolated worktree `/private/tmp/kinerary-ca-integration`. It starts from
+reviewed CA-00 commit `5ff58eb`, which descends from
+`integration/sprint-6@b70d79e`, and includes the exact two CA-01 F0 fixture
+blobs from `62f1a9d`. The combined staged preflight passed after the unrelated Hermes profile drift was resolved. The `feat/` prefix keeps feature-branch commit/push
+rules usable; this branch functions as the initiative's integration lane.
+
+New Connected Assistants slices target this branch for combined tests. Draft
+PRs #267 and #268 remain review records of the original isolated slices;
+neither is to be merged directly into Sprint 6 while this lane is being
+assembled. The final move into `integration/sprint-6` needs the owner's
+agreement and Claude's integration review. This direction does not transfer
+Sprint 6 release or infrastructure ownership.
