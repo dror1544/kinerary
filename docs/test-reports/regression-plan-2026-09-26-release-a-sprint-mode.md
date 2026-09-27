@@ -487,3 +487,260 @@ G, the Hebrew read (Dror, ~25 min carried + 2):
 - **Why before the window anyway.** Every trip built from the release carries the sentence until it is fixed, and the release is the last one before the promotion decision. It lands on the sprint before Fri 2 Oct, or it waits for the release after; it is not a gate.
 - **What to check on the hand-back.** The rendered prompt for an empty `participant_needs` contains no example person with a need and no personal name outside the roster; the rule "a need is stated only if it is in `participant_needs` or the organizer said it here" is present; the before/after evaluation on both runners is attached and the "before" run reproduces the incident.
 - **After 3 Oct.** Re-rendering the two live companions (`scripts/companion-refresh-prompts.sh` plus a gateway restart) is its own approved step per trip, with the other post-3-Oct items.
+
+### U8. Refresh for `06e79c1` and the Sat 3 Oct window (2026-09-27)
+
+**Verdict: CONDITIONAL, then GO.** Nothing merged since `b04e229` changes Release A's risk. The only code that runs differently on the VM is still #241's four files, which U1 already assessed. Release A is GO on Sat 3 Oct once four things are true: the Hebrew PR has merged, CI is green on the resulting release commit (G1), the new P2 below passes, and G2, G4 and G6–G9 are met. I found no NO-GO condition. One finding should change the Hebrew PR before it merges (U8.2).
+
+**Provenance.**
+- **Git, read today:** `git fetch` gives `origin/integration/sprint-6 = 06e79c1`. `b04e229` is an ancestor. I ran the diffs and AST checks shown below.
+- **CI, read with `gh run list` / `gh run view` at about 06:10Z:**
+  - `1a0111e`: all 6 jobs green. TypeScript API ran 14m14s (22:26:29→22:40:43Z).
+  - `06e79c1`: still in progress. Its delta from `1a0111e` is docs only.
+- **Ran:** `python3 -m unittest discover -s tests` in `profile-templates/familytrip-companion` at `06e79c1`: 32 OK, 1.42 s wall.
+- **VM, read-only probes at 2026-09-27 06:11Z, under the MVP probe rule:** `vm.env`, the checkout, `docker ps`, the release history, `findmnt`, the installed tool's sha256, the forced command's path, and SQL counts and states. I printed no key and read no traveller text.
+- **Not done:** any DB suite, any `kinerary-cp-release` call, a restart, a deploy, or a commit. The G4 runs (P3/P4) are the lead's verifier's, not mine.
+
+#### U8.1 Every file changed since `b04e229`, and where it lands
+
+`git diff --stat b04e229 06e79c1 -- . ':!docs' ':!*.md'` lists 34 files (+2637/−164). **Finding:** that filter, which is the one P2 used, hides four prompt files, because they end in `.md`:
+- `.agents/skills/trip-intake-interviewer/SOUL.md`
+- three `references/*.md` files under its `skills/kinerary/`
+
+Excluding only `docs/` and the root `CLAUDE.md`/`CHANGELOG.md`/`README.md`/`FRAMEWORK.md` gives **39 files**. That is the list to classify, and the new P2 uses that filter.
+
+| PR | Files | Lands | Behaviour change for anyone? |
+|---|---|---|---|
+| #241 | `control-plane/api/src/document-correction.ts`, `relay/dispatch.ts`, `relay/poller.ts`, `relay/server.ts`; `test/document-correction-flow.test.ts` | **VM**: API image and relay (`agent-runtime` = API image + CLIs, `agent-runtime.Dockerfile`) | **Yes, as planned in U1/U3.** The organizer-document route is off. The start line reads `enabled:false` |
+| #245 | `profile-templates/familytrip-companion/templates/SOUL.md.tpl` | **VM host checkout** `/opt/kinerary`, at V3's switch → **companions rendered after that** | Yes, for new trips only: the "a need is a recorded fact" rule and the venue-claim rule. **No live companion changes** (b) |
+| #245 | `…/eval/needs_eval.py`, `…/tests/test_needs_eval.py`, `…/tests/test_template.py`, `…/README.md` | nowhere at runtime. `render_profile.py` copies only `templates/{SOUL,profile,config.overlay}` + `templates/references` + `templates/skills` into a profile (`render_profile.py:56-57`, read) | No. **These tests run in no CI job and not in `preflight-deploy.sh`** (read both). I measured them green today; see U8.9 |
+| #258 | `control-plane/db/migrations/0051_trip_person_links.sql` | API image `/app/migrations` (`control-plane/api/Dockerfile:15`) | **No** (a) |
+| #258 | `control-plane/worker/control_plane_worker/transformer.py`, `provisioner.py` | **VM**: worker image, rebuilt at V3 | **No** (c): the ASTs are identical once docstrings are blanked. `provisioner.py`'s raw AST is identical too |
+| #258 | `control-plane/contracts/v1/name-matching-cases.json` | **not in any production image**: only `Dockerfile.test` copies `contracts/`. It is read only by `test/organizer-identity.test.ts` and `worker/tests/test_transformer.py` (`git grep`) | No (c) |
+| #258 | `trip-web/src/api.ts` (a `/** */` comment), `trip-web/src/login-roster.test.tsx` | the release payload, through `site/modern`, which is **not** changed in the range. No release is promoted (decision 44) | No |
+| #258 | 12 files under `control-plane/api/test/` (incl. `fixtures/itinerary-sample.txt`), 2 under `control-plane/worker/tests/` | tests only | No |
+| #258 | `.agents/skills/trip-intake-interviewer/SOUL.md` + 3 `references/*.md` | **the Hermes `trip-intake` profile**. On the VM it is staged by hand from the Mac (`compose.vm.yml:362`); `upgrade` never touches Hermes data or the image (HERMES_REV unchanged). Every production session is `interpret_path = true` (§4 probe 2) | No. Text-only redaction; it reaches no VM process through Release A |
+| #242/#260/#261/#264 | `.codex/hooks.json`, `scripts/claude-hooks/{codex-adapter.py,match-command.py,pretooluse-bash.sh}`, `tests/scripts/test_claude_hooks_bash.py`, `test_codex_hook_adapter.py` | **dev-only** (d). They sit in `/opt/kinerary` after the switch, but nothing on the VM executes them | No |
+| #239/#242 | `CLAUDE.md` | policy text | No |
+
+**(a) The comment edit in the already-applied `0051`.** Nothing reads an applied migration's content.
+- `applyMigrations` (`migrations.ts`, read in full) lists files by name. It skips any `version` (= the filename) already in `public.control_plane_schema_migrations`, so an applied file is never re-read.
+- `vm-release.py` (read):
+  - `migration_files` is a `git ls-tree` of names.
+  - `plan`/`upgrade` classify `files - applied` only, so `0051`'s header is not even looked at.
+  - `verify` compares name sets.
+  - Nothing hashes or diffs a migration file. The only sha256 in the tool is the trip-monitor gate's code digest (`vm-release.py:651`).
+- **Production has `0051` applied** (51 rows, last `0051_trip_person_links.sql`; re-read today).
+- **The edit is comment-only.** `git diff -U0` over `0051`, excluding `--` lines, is 0 lines from `b04e229` and 0 lines from `130924b`. A fresh install therefore runs identical SQL.
+- **Preflight B7** checks only migrations a change *adds*. A file already in `HEAD` is grandfathered (`preflight-checks.sh:361`), so a modification is never examined, whether it is a comment or SQL.
+- **`docs/migrations.md`** forbids *renaming* an applied migration. It says nothing about editing one. So this edit breaks no written rule, and nothing would catch an SQL edit either (U8.9 item 5).
+- **Effect on `kinerary-cp-release`: none. V6's expected count is still 64** (51 + 13). `git diff --name-status b04e229 06e79c1 -- control-plane/db/migrations` is `M 0051` only.
+
+**(b) Who renders a companion on the VM.** The chain:
+1. The worker has `PROVISIONER_COMPANION_SSH_HOST` set (probed: set).
+2. So `__main__.py` selects `SshCompanionProfileAdapter` (`companion_profile.py`).
+3. That adapter calls the VM `hermes` user's forced command, which is **`/opt/kinerary/scripts/companion-install-host.sh`** (read today from `authorized_keys`, the `command=` field only).
+4. That script runs `$REPO_ROOT/profile-templates/familytrip-companion/render_profile.py`.
+
+So the template comes from the **host checkout**, not from the worker image, and it changes at the moment V3 checks out the release commit.
+
+`install()` is called only from the provisioner's completion path, and `render_profile.py` refuses to overwrite an existing profile (`render_profile.py:64`). Nothing in `vm-release.py` re-renders a profile. Its only per-profile actions are gateway stop/start in `restart-bridges` (`:1854-1865`), which is not part of `upgrade`. **So no live companion is re-rendered.** The two live companions keep their saved prompt until someone runs `companion-refresh-prompts.sh` after their trips (U7).
+
+The first companion to get the new template is whichever trip is confirmed next on the VM. Today that would be the one unexpired open interview, if it confirms.
+
+**(c) The redaction.** No runtime change:
+- worker: docstrings and one `#` comment;
+- migration: SQL comments;
+- trip-web: a JSDoc comment;
+- the name-matching contract: test data that no production image contains;
+- the interviewer prompt files: not deployed by Release A.
+
+CI on `4726274` (the #258 merge) and on every later commit ran the contract through both matchers and passed.
+
+**(d) The Codex hooks** are dev-only. Nothing that runs on the VM invokes them:
+- The relay's model children run the `claude` CLI with `--tools ""` in `cwd: tmpdir()` (`model-runner.ts:332,572`), so no project hook fires.
+- `.claude/settings.json` is unchanged in the range.
+- No agent-runtime or API image copies `scripts/` or `.codex/` (the three Dockerfiles, read).
+
+#### U8.2 The pending Hebrew PR (G3's nine findings)
+
+The PR is not open yet (`gh pr list`, 06:10Z).
+
+**What it touches:**
+- `control-plane/api/src/intake-copy.ts`: the `change.*` keys and `changePendingBlocksConfirm`, Hebrew plus the English pairs F2–F4 name.
+- `control-plane/api/src/relay/command-menu.ts`: the `he.trips` / `he.switch` descriptions.
+- the tests that pin them.
+
+**Where it lands:** the API image and relay, at V3. **Who sees it:**
+- The `change.*` strings reach only interpret-path interviews that are not yet confirmed. Confirmed sessions are refused everywhere (#230 §3), so **neither live family ever sees them**. Today's only audience is the one unexpired open interview (`en`, idle 93 h at 06:11Z).
+- The menu descriptions reach every Hebrew-locale Telegram client of `@Kinerary_bot`. They are published at relay boot (`relay.command_menu_published`).
+
+**What it needs:**
+- CI's **TypeScript API** job, on the PR's merge ref and again on the pushed merge: about 14 min each, measured on `1a0111e`. That job's `npm test` (with DB) covers:
+  - `intake-copy.test.ts`: every key in both languages, none blank, none untranslated;
+  - `typed-changes-render.test.ts`:
+    - the same `{placeholders}` in both languages for every `change*` key (`:33-37`, which covers `changePendingBlocksConfirm`);
+    - no unfilled placeholder in any rendered line (`:131`);
+    - `bareReply`;
+  - `command-menu.test.ts`: Hebrew descriptions are Hebrew and fit within 256 characters;
+  - the flow tests that call `uiString` by key.
+- No worker, site, template or `tests/` suite is needed.
+- **The real-model evidence (113/114) still holds** if the PR touches none of `interpret.ts`, `typed-changes.ts` or `model-runner.ts`, and its `intake-copy.ts` hunks are confined to `change*` keys. Those strings are output-only: they are consumed by `typed-changes-render.ts`, `relay/poller.ts` and `relay/dispatch.ts`, and `interpret.ts` does not import `intake-copy` (read).
+
+**Finding, to fix in the PR itself.** F3 and F4 teach the organizer new words that the deterministic yes/no reader does not know.
+- F3 changes the "no" wording to "לא, להשאיר כמו שהיה" / "leave everything as it was". F4 asks "לעדכן?" / "Apply this?".
+- `bareReply`'s sets (`typed-changes-render.ts:333-341`, read) contain `עדכן`/`עדכנו` and `leave it`. They do **not** contain:
+  - `לעדכן`
+  - `להשאיר`
+  - `השאירו`
+  - `להשאיר כמו שהיה`
+  - `leave it as it was`
+- An organizer who answers the new question in the new words is therefore not read as a yes or a no. The message goes to the model, and the result is "interpreted and MERGED into the waiting change, never applied or dropped" (`poller.ts:3041-3050`).
+- That is safe: nothing is applied without a yes. But it is the owner's standing rule broken in the other direction: a button's words must also work typed ("buttons are shortcuts, not syntax").
+- **Recommended:** the same PR adds those forms to `YES`/`NO`, with cases in the existing `bareReply` test (`typed-changes-render.test.ts:82-88`).
+  - It adds one file, `typed-changes-render.ts`, to the PR.
+  - It only removes model calls; it never adds one.
+  - `NO` means "leave it as it was", so the new words ask for exactly what they say.
+- If the PR ships without this, record a follow-up issue. It is not a gate.
+
+#### U8.3 The new P2: the exact expected delta for the release commit
+
+Run on the day, with `R` = the release commit (the tip after the Hebrew PR merges, plus any docs commits):
+
+```bash
+R=<release sha>
+git merge-base --is-ancestor 06e79c1 "$R" && echo ok                 # must print ok
+X=(-- . ':!docs' ':!CLAUDE.md' ':!CHANGELOG.md' ':!README.md' ':!FRAMEWORK.md')   # NOT ':!*.md' (U8.1)
+git diff --name-only 06e79c1 "$R" "${X[@]}"
+#   allowed, and nothing else:
+#     control-plane/api/src/intake-copy.ts
+#     control-plane/api/src/relay/command-menu.ts
+#     control-plane/api/src/typed-changes-render.ts     (only if U8.2's YES/NO forms are added)
+#     control-plane/api/test/*.test.ts
+#   anything else -> re-plan
+git diff --name-status 06e79c1 "$R" -- control-plane/db/migrations control-plane/deployment   # must be empty
+git diff 06e79c1 "$R" -- control-plane/api/src/interpret.ts control-plane/api/src/typed-changes.ts \
+  control-plane/api/src/model-runner.ts | wc -l                                                # must be 0 (real-model evidence)
+```
+
+The part from `b04e229` to `06e79c1` is fixed history, assessed above. It is 39 files (list in U8.1), fingerprint `git diff --name-only b04e229 06e79c1 "${X[@]}" | shasum | cut -c1-12` = `3e0a27c632f8`.
+
+`control-plane/deployment/` is unchanged across the whole range, so the tool the upgrade runs is still the installed one: `/usr/local/sbin/kinerary-cp-release` sha256 `52520d77…` equals the repo's `vm-release.py` (re-measured today). G4's P3/P4 results therefore carry to `R` as long as P2 passes.
+
+#### U8.4 The fleet, re-read (06:11Z today), and what is live on Sat 3 Oct
+
+- **VM:**
+  - `KINERARY_REV=130924b`, `HERMES_REV=ab0d98414-pbf43d580`; the checkout is at `130924b` and clean.
+  - Images match §4 probe 1, and `inbound` is still on `agent-runtime:810795a`.
+  - 51 migrations applied.
+  - No network filesystem mounted; `/` has 27 G free.
+  - Release history: last row `130924b` `ok` (09-23), no rollback row.
+- **Releases:** newest `available` is `release_ad97b4bd…` (`130924b`); `release_58b8e3b2…` is `verified`. Unchanged.
+- **Trips that are not retired:**
+  - `ready_private`: 2 (`orlando-florida-2026`, `japan-tokyo-hakone-kyoto-osaka-2026`; 1 and 2 open bindings respectively);
+  - `intake_in_progress`: 3;
+  - `intake_confirmed`: 2;
+  - `draft`: 6.
+- **Jobs:** 34 succeeded, 1 failed, 1 cancelled; **0 queued or running**.
+- **Unexpired open interviews: 1** (`interviewing`, awaiting the person, `en`, idle 93 h). This is the same session as §4 probe 5.
+- `trips.start_date`/`end_date` are NULL for both live trips, so I could not read their dates from the control plane. **Carried, not verified by me:** Orlando ended 1 Oct, and 3 Oct is Japan's last day, "afternoon there" (decision 51; memory: Japan runs Sep 19 – Oct 3).
+
+**On Sat 3 Oct:**
+- **Orlando** has ended. Its companion and site are still up (`ready_private`), and the family may still write.
+- **Japan** is on its last day, probably travelling. The relay restart and every relay behaviour in §4's table reach it for its last hours.
+- **No other trip** will be past `ready_private` unless one is confirmed and built before then. G7 re-checks that.
+
+#### U8.5 The schedule, Sat 3 Oct 2026
+
+IDT = UTC+3 (Israel stays on summer time until 25 Oct). JST = UTC+9. EDT = UTC−4. Durations are carried estimates unless marked.
+
+**Friday 2 Oct, before 20:00 IDT (17:00Z): the prerequisites.**
+- The Hebrew PR is merged into `integration/sprint-6` (the merge prompt is the approval), and CI on the pushed merge is all green (G1): about 14 min after the push.
+- P2 passes on that commit.
+- The lead's G4 is recorded.
+- G8: the Mac's nightly launchd job (02:00 local) is disabled for the night of 2→3 Oct. Otherwise it redeploys staging from `~/kinerary-nightly` and provisions onto the shared Proxmox/NPM/Cloudflare hours before the walk.
+
+**Saturday:**
+
+| IDT | UTC | JST | Step | Min | Who |
+|---|---|---|---|---|---|
+| 07:30 | 04:30 | 13:30 | Setup: `origin/integration/sprint-6` still equals `R`; Mac stack up from the release worktree (`WORKER_REPO_ROOT_HOST=$PWD`), VM-matched runners, `ITINERARY_EXTRACT_TIMEOUT_MS=60000`, `ORGANIZER_DOCUMENT_ROUTE_ENABLED` unset (U4). **W0 (new):** the VM has 0 jobs in flight, and its open interview has not moved. The Mac walk and a real VM provision would share Proxmox/NPM/Cloudflare | 20 | lead |
+| 08:00 | 05:00 | 14:00 | **G2, the walk** (§6 W as changed by U4), plus U8.6's Hebrew items | ~110 + provisioning | **Dror** + lead |
+| ~10:00 | 07:00 | 16:00 | Teardown of the throwaway trip (`teardown-trip.py --execute`, Mac, pre-approved); Mac provisioning off (G8) | 10 | lead |
+| 10:20 | 07:20 | 16:20 | **G7 / V0**, the fleet re-read at T−10 | 5 | lead |
+| 10:30 | 07:30 | 16:30 | **G6**: V1 `plan R`, V2 `upgrade R --dry-run` | 10–15 | lead, **Dror present** |
+| ~10:45 | 07:45 | 16:45 | **G9**: the owner's word for V3 | — | **Dror** |
+| 10:45–11:10 | 07:45–08:10 | 16:45–17:10 | **V3** upgrade. The relay restart is its last step (§6), so expect it at about 17:05 JST | 15–25 | lead |
+| 11:10–11:45 | 08:10–08:45 | 17:10–17:45 | V4–V9 (with U3's and U8.7's additions) | ~35 | lead; Dror for V9 |
+
+- **Owner time on the day:** about 2 h 45 m in total (walk ~110, dry-run ~15, V9 ~15, plus the word). All of it falls between 08:00 and ~12:00 IDT.
+- **If the walk fails, there is no window.** Release A then moves past 3 Oct, which is the lower-risk window B (§5): no live trip at all. A failed walk costs the fleet nothing.
+- **A time of day.** Every hour of "morning IDT" is the afternoon of Japan's last day (07:00–12:00 IDT = 13:00–18:00 JST), so no hour in the window avoids the family being awake. The only thing that could make one hour better than another is the family's flight time, which only the owner can supply (U8.10 Q2). Without it, the schedule above stands. The measured load is about 11 companion-routed messages in 56 h (§4), and during the ~1 min pause messages wait at Telegram.
+- **Calendar, derived, not verified by a tool:** decision 51 calls Friday a holiday eve, so Saturday 3 Oct is the holiday itself in Israel (Shemini Atzeret / Simchat Torah) and also Shabbat. The owner chose it. Only his availability depends on this.
+
+#### U8.6 What changes because it is Japan's last day, not the night before
+
+| | Fri 2 Oct plan (§5 A) | Sat 3 Oct |
+|---|---|---|
+| Relay restart lands at | 23:00 JST, family asleep | ~17:05 JST, family awake and probably travelling |
+| Live-trip exposure to the new relay behaviour (group context, #179 quietness, 10 s bound / 429 wait, the `/trips` `/switch` menu) | ~1.5 days | **hours**: the rest of the last day |
+| A departure-day document (boarding pass) in the organizer's DM | goes to the companion (flag off) | same. Expect `trip_bot.organizer_document_route_off` lines on the day: **that is expected, not an alarm** (U3 counts them) |
+| A rollback, if needed | at night | during the family's last afternoon. Same ~1 min pause. The keep-DB path has still never run on production (P4 caveat, §6) |
+| Post-3-Oct items (redeploy trip sites, re-render companions, #217 walk) | two days away | available the same evening. **Not part of Release A**; each is its own approved step |
+
+**Additions to the walk (G2) for the Hebrew PR** (about 10 min, in the Hebrew half, on the Mac, Hebrew-locale client):
+1. A preview shows F4's question and F3's button.
+2. Type `להשאיר כמו שהיה`, then `לעדכן`, to a waiting preview. With U8.2's fix, expect `interview.change_answered_in_words`; without it, the model path.
+3. Replace a traveller to see F5.
+4. Type a name close to an existing traveller to see F6.
+5. Remove the organizer's own traveller entry to see F7.
+6. Open the ⌘ menu in a Hebrew-locale client and read `/trips` `/switch` (F9).
+7. F1, F2 and F8 need a non-refundable booking or a failed send; their pinned tests stand in for them.
+
+#### U8.7 Gates, restated (status at 06:15Z 2026-09-27)
+
+| Gate | Status | Evidence / remaining |
+|---|---|---|
+| G0 | DONE | decision 41, #241 |
+| G1: CI on the release commit `R` | **open** | `R` does not exist yet (Hebrew PR). Base is healthy: `1a0111e` 6/6 green; `06e79c1` in progress (docs-only delta) |
+| P2 | **open** | U8.3, on `R` |
+| G2: walk | **open** | Sat 08:00 IDT, on `R`, with U8.6's additions |
+| G3: Hebrew | review DONE (nine findings, decision 53); **fix PR pending** | merged + CI green by Fri 20:00 IDT. Fold in U8.2's YES/NO words |
+| G4: P3 (70) + P4 (rehearsal) | **running** (the lead's verifier) | carries to `R` because `control-plane/deployment/` and `tests/scripts/test_vm_release*.py` are unchanged (P2 enforces it) |
+| G5 | DONE | decisions 44–46 |
+| G6 | on the day | 10:30 IDT |
+| G7 | on the day | 10:20 IDT. Pass as §6 V0, plus: 0 jobs in flight; no new non-retired `ready_private` beyond the two |
+| G8 | Fri evening + Sat after the walk | nightly off for 2→3 Oct; Mac provisioning off after teardown |
+| G9 | on the day | ~10:45 IDT, Dror |
+
+**Post-deploy additions:**
+- **V4 also greps `relay.command_menu_published`.** It must show `"failed":0`; the menu is how the Hebrew PR's F9 reaches users.
+- **V6 is unchanged: 64 migrations.**
+- **V8 adds a check:** `/opt/kinerary` is at `R`, which `verify` checks. That is also the moment the #245 template is live for the next companion. Nothing is re-rendered, so there is nothing else to check.
+
+#### U8.8 NO-GO conditions (in addition to §7)
+
+Stop before V3 if any of these hold:
+- **P2 lists a file outside U8.3's allowed set**, or a migration or `control-plane/deployment/` change appears. Re-plan.
+- **The Hebrew PR is not merged with green CI by Fri 20:00 IDT.** Do not walk a commit that is not `R`. Choose per U8.10 Q1.
+- **G1 shows any red job on `R`.** A single red "Kinerary suite" test is first re-run and then run alone (§7 of the agent rules). The Hebrew PR does not touch that suite.
+- **W0 or G7 finds a VM job in flight**, or a third trip at `ready_private`.
+
+#### U8.9 What would reduce the risk (ranked by risk removed per minute)
+
+1. **Put U8.2's YES/NO forms into the Hebrew PR (~15 min developer, same CI run).** It closes the one behaviour gap the new strings create, and costs nothing extra on the day.
+2. **Use U8.3's filter, not `':!*.md'` (0 min).** The old filter would have passed a prompt-file change unseen.
+3. **Run the companion template tests on `R` as part of P3 (2 s):** `cd profile-templates/familytrip-companion && python3 -m unittest discover -s tests` (32 OK today). #245's guarantees live only in those tests, and no CI job or `preflight-deploy.sh` step runs them. Follow-up issue: wire them into CI (one job step).
+4. **W0 at the start of the walk (2 min).** It stops a Mac provision from overlapping a real VM provision on the shared Proxmox/NPM/Cloudflare.
+5. **Follow-up, not for Release A:** a B7 extension that blocks non-comment changes to a migration already in `HEAD`, and one line in `docs/migrations.md` saying so (for `doc-keeper`). Today a SQL edit to an applied migration would be caught by nothing and would split fresh installs from production.
+
+Nothing else is worth adding. The redaction and the hook work are runtime-neutral, and the template change reaches only new companions.
+
+#### U8.10 Decisions needed
+
+1. **If the Hebrew PR slips past Fri 20:00 IDT: slip the PR, or slip the release?**
+   - The `change.*` strings reach only interviews not yet confirmed. Today that is one interview, idle for four days. Live families never see them.
+   - A strings-only upgrade after 3 Oct touches no live trip.
+   - **I recommend slipping the PR, not Release A,** and recording that decision 53's "before release" was deferred. The owner's word is needed, because decision 53 says "before release".
+2. **The hour.** If you know when the Japan family leaves for the airport or boards, say so, and the lead moves V3 within the morning so the ~1 min pause does not fall in the hour before boarding. The alternative is the same day after the holiday ends: V3 at about 19:30 IDT, which is 16:30Z and 01:30 JST on 4 Oct, with no live trip. That keeps the morning walk but contradicts decision 51's "morning". **I recommend the morning schedule as written unless you know the flight.**
+3. No other open question. Q7 was answered by decision 52, and the allergy note by decision 54.
