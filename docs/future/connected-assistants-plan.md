@@ -1,6 +1,6 @@
 # Connected assistants and account-wide intake — Codex-managed plan
 
-Status: implementation authorized after hook gate; CA-00 reviewed in draft PR #267, CA-01 fixture slice in draft PR #268. Updated 2026-09-27.
+Status: implementation authorized after hook gate; CA-00 and CA-01 fixtures reviewed, CA-01 L1 booking linkage verified on the separate integration branch. Updated 2026-09-27.
 Lead: Codex dev manager. Product owner and merge/deploy authority: Dror.
 Claude remains lead of Sprint 6. This is a separate initiative, not Sprint 7
 (which already names post-trip learning), and adds nothing to Sprint 6's exit gate.
@@ -205,7 +205,7 @@ retired `/v1/auth/telegram` route. Validate feasibility and mobile UX first.
 
 ## 7. Managed delivery queue
 
-GitHub is the execution queue. CA-00 is reviewed in draft PR #267; CA-01 F0 fixtures are reviewed in draft PR #268. Shared product paths remain unclaimed pending handover.
+GitHub is the execution queue. CA-00 is reviewed in draft PR #267; CA-01 F0 fixtures are reviewed in draft PR #268; CA-01 L1 booking linkage is reviewed in draft PR #271 and integrated on the initiative branch at `39b1bf2`. Claude handed over the narrow CA-01 server paths on #249; other shared paths still require handover.
 Issue links are maintained in [connected-assistants-queue.md](connected-assistants-queue.md).
 Before dispatch the manager writes the full Appendix B brief with an exact base,
 owned paths, exclusions, model/effort, suites, isolated test DB and acceptance.
