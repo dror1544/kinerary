@@ -30,7 +30,7 @@ const withPeople = rows => {
   return Array.isArray(rows) ? rows.map(one) : one(rows);
 };
 
-function registerTools(mcp, site, { write = true } = {}) {
+function registerTools(mcp, site, { write = true, origin } = {}) {
   const ok = data => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
   // A read-only connection never even lists a write tool: what an assistant
   // cannot see, it cannot be talked into calling.
@@ -92,6 +92,18 @@ function registerTools(mcp, site, { write = true } = {}) {
       passengers: z.string().optional(), confirmation: z.string().optional(), pin: z.string().optional(),
       cost: z.number().optional(), notes: z.string().optional(), location_url: z.string().url().optional(),
     }, ({ id, ...fields }) => site.patch(`/api/bookings/${id}`, fields));
+
+  tool('get_booking_confirmation_upload_link', 'Upload a booking confirmation PDF',
+    'When this assistant cannot transfer the original PDF bytes, give the organizer this booking-specific link on the trip site. '
+    + 'The link is pending, not proof that a file was uploaded. Ask the organizer to open it while signed into the trip site and '
+    + 'report success only after the page says the saved PDF was verified.',
+    WRITE, { booking_id: z.number().int().positive().describe('Existing booking id from get_bookings') },
+    async ({ booking_id }) => {
+      if (!origin) throw new Error('Trip origin unavailable');
+      const bookings = await site.get('/api/bookings');
+      if (!bookings.some(booking => booking.id === booking_id)) throw new Error('Booking not found on this trip');
+      return { status: 'pending_upload', booking_id, url: origin + '/mcp/upload-confirmation/' + booking_id };
+    });
 
   tool('delete_booking', 'Delete a booking',
     'Delete a booking by id. Confirm with the organizer first.',
