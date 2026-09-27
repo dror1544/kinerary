@@ -2054,7 +2054,7 @@ app.post('/api/bookings/extract', authRequired, extractUpload.single('file'), as
 const confUpload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, CONF_DIR),
-    filename: (req, _file, cb) => cb(null, `booking-${req.params.id}-${Date.now()}.pdf`),
+    filename: (req, _file, cb) => cb(null, `booking-${req.params.id}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.pdf`),
   }),
   fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
   limits: { fileSize: 50 * 1024 * 1024 },
@@ -2135,9 +2135,26 @@ app.delete('/api/bookings/:id', organizerOrAgentRequired, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, confUpload.single('file'), (req, res) => {
+app.post('/api/bookings/:id/confirmation', organizerOrAgentRequired, (req, res, next) => {
+  // Multer writes to disk before the handler. Reject an absent booking before
+  // accepting its bytes, then still check the UPDATE in case it was deleted.
+  if (!db.prepare('SELECT id FROM bookings WHERE id = ?').get(req.params.id)) {
+    return res.status(404).json({ error: 'booking not found' });
+  }
+  next();
+}, confUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'pdf file required' });
-  db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
+  let result;
+  try {
+    result = db.prepare('UPDATE bookings SET conf_file = ? WHERE id = ?').run(req.file.filename, req.params.id);
+  } catch (error) {
+    fs.unlinkSync(req.file.path);
+    throw error;
+  }
+  if (!result.changes) {
+    fs.unlinkSync(req.file.path);
+    return res.status(404).json({ error: 'booking not found' });
+  }
   res.json({ ok: true, conf_file: req.file.filename });
 });
 
