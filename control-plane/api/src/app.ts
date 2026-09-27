@@ -1724,9 +1724,13 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // allow-list (`EVIDENCE_ALLOWLIST` / `projectEvidence`, admin-dashboard.ts)
   // rather than a deny-list — an action this codebase does not itself
   // produce gets `{}`, not a best-effort scrub (F1, boundary review on PR
-  // #275). Reading this route is itself audited, same as every other route
-  // here — an admin read of the audit trail is still a read of everyone's
-  // data.
+  // #275). `actorRef`, `targetRef` and `action` itself all pass through
+  // `safePlain` too — none of the three carries a DB-level format CHECK, so
+  // none is served on trust (F1 round 2, findings R1/R3: `action` was still
+  // raw, and the allow-list lookup could crash on an `action` shaped like a
+  // JS built-in property name). Reading this route is itself audited, same
+  // as every other route here — an admin read of the audit trail is still a
+  // read of everyone's data.
   app.get("/v1/admin/audit", async (request, reply) => {
     if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
     if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });

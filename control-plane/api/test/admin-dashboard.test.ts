@@ -418,6 +418,70 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
     }
   });
 
+  // ── Audit: F1 round 2 (PR #275 boundary review, R1 + R3) ────────────────
+
+  test("GET /v1/admin/audit withholds `action` itself when it carries PII, not just actorRef/targetRef/evidence", async () => {
+    // R1: `action` had no CHECK constraint and was served as a raw column —
+    // the reviewer put a PII sentence directly into it and read it back
+    // verbatim. There is no `?action=` filter here on purpose: the seeded
+    // value is free text with spaces and punctuation, not something a query
+    // string should have to URL-encode to prove a point — find the row by
+    // its own correlation id instead, over the unfiltered route.
+    const piiAction = "note: severe peanut allergy — carries an EpiPen for Emma Cohen, age 7";
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'user:test', $2, 'trip_unknown', 'corr_manualaudittest006', '{}'::jsonb, now())`,
+      [`audit_${suffix()}`, piiAction],
+    );
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200);
+      const { events } = JSON.parse(response.body);
+      const found = events.find((e: { correlationId: string }) => e.correlationId === "corr_manualaudittest006");
+      assert.ok(found, "the seeded row must be present");
+      assert.equal(found.action, "[REDACTED]");
+      assert.ok(!response.body.includes(piiAction));
+      assert.ok(!response.body.includes("Emma Cohen"));
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("GET /v1/admin/audit does not 500 on an action shaped like a JS built-in property name", async () => {
+    // R3: `EVIDENCE_ALLOWLIST[action]` as a plain-object lookup resolves
+    // 'constructor' to Object.prototype's own constructor (truthy, not an
+    // array), so the old code crashed trying to iterate it — and because
+    // audit_events is append-only, one such row breaks the route for every
+    // future request, not just this one.
+    for (const dangerousAction of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      await pool.query(
+        `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+         VALUES ($1, 'user:test', $2, 'trip_unknown', $3, '{}'::jsonb, now())`,
+        [`audit_${suffix()}`, dangerousAction, `corr_dangerous${suffix()}`],
+      );
+    }
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=constructor", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200, "must not 500");
+      const { events } = JSON.parse(response.body);
+      assert.ok(events.length >= 1);
+      for (const event of events) assert.deepEqual(event.evidence, {});
+
+      // And the unfiltered route — the one shape an attacker cannot avoid
+      // exercising, since a real operator will read it without ?action= —
+      // must also survive every dangerous action name landing in the same
+      // page of results.
+      const unfiltered = await app.inject({ method: "GET", url: "/v1/admin/audit", headers: { "x-api-key": KEY } });
+      assert.equal(unfiltered.statusCode, 200, "must not 500");
+    } finally {
+      await app.close();
+    }
+  });
+
   // ── Versions ──────────────────────────────────────────────────────────────
 
   test("GET /v1/admin/versions lists the seeded releases", async () => {

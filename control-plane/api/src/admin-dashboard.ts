@@ -40,24 +40,30 @@
 //     confirmed by reading the constraint rather than assumed. `safePlain`
 //     is still applied to it below, but as defense-in-depth against that
 //     CHECK ever being loosened, not because it was found exposed.
-//   - `actorRef` / `targetRef` on `audit_events` are the real version of that
-//     risk: that table carries NO DB-level format CHECK on either column
-//     (confirmed by reading migrations 0001 and 0005 — 0005's opaque-id
-//     format sweep covers `audit_events.id`, not `actor_ref`/`target_ref`).
-//     Today's only writers happen to constrain them at the application layer
-//     before insert (`recordAdminRead`'s literal `'admin:api-key'`;
+//   - `actorRef` / `targetRef` / `action` on `audit_events` are the real
+//     version of that risk: that table carries NO DB-level format CHECK on
+//     any of the three (confirmed by reading migrations 0001 and 0005 —
+//     0005's opaque-id format sweep covers `audit_events.id`, not these).
+//     Today's only writers happen to constrain `actorRef`/`action` at the
+//     application layer before insert (`recordAdminRead`'s literals;
 //     `promoteRelease`'s `PROMOTED_BY_RE` check on `actorRef`,
 //     release-registry.ts) — but trusting that forever is the same
 //     "individual fields judged harmless" reasoning CLAUDE.md's rule was
 //     written against: nothing stops a future writer, migration, or direct
-//     SQL from putting free text there. So this file re-checks at the READ
-//     boundary too (`safePlain`, below): a value that does not look like the
-//     opaque machine identifiers this codebase actually produces
-//     (`user:<id>`, `admin:api-key`, `operator:cli`, a release id, a trip id,
-//     `all_trips`, a `YYYY-MM-DD` date, …) is withheld rather than served on
-//     trust. Fails safe, per the same rule `shared/needs-schema.js` follows:
-//     unrecognized resolves to the most restrictive option, not to "probably
-//     fine."
+//     SQL from putting free text there (fixed 2026-09-27, boundary review on
+//     PR #275 round 2, finding R1 — `action` was still a raw column when
+//     round 1 shipped). So this file re-checks at the READ boundary too
+//     (`safePlain`, below): a value that does not look like the opaque
+//     machine identifiers this codebase actually produces (`user:<id>`,
+//     `admin:api-key`, `operator:cli`, a release id, a trip id, `all_trips`,
+//     a `YYYY-MM-DD` date, an action like `release.promote` or
+//     `admin.read.jobs`) is withheld rather than served on trust. Fails safe,
+//     per the same rule `shared/needs-schema.js` follows: unrecognized
+//     resolves to the most restrictive option, not to "probably fine."
+//     `action` is passed to `projectEvidence` in its RAW form regardless —
+//     the allow-list lookup needs to see what is actually in the row to pick
+//     the right bucket (or correctly find none); only the value served back
+//     to the caller goes through `safePlain`.
 //
 // WHAT IS SPEC-BACKED VS DESIGN CHOICE, stated once so each function does not
 // have to repeat it:
@@ -124,34 +130,48 @@ function safePlain(value: string): string {
  * this codebase has not named. Keys not in an action's own list are dropped
  * even when the action IS listed; this is a projection, not a delete-the-rest.
  *
+ * A `Map`, not a plain object (fixed 2026-09-27, boundary review on PR #275
+ * round 2, finding R3): `action` is an unconstrained DB column (see the
+ * module doc's `actorRef`/`targetRef` note — the same gap applies to it,
+ * fixed separately below via `safePlain`), so a row whose `action` happens to
+ * be a JS built-in property name (`constructor`, `__proto__`, `toString`, …)
+ * would resolve against `{}[action]` as a plain-object lookup and return
+ * `Object.prototype`'s own method instead of `undefined` — not a leak (it
+ * fails closed: `for (const key of allowedKeys)` then throws on a
+ * non-iterable, and the caught... except nothing catches it, so the whole
+ * route 500s), but `audit_events` is append-only (0002's triggers block
+ * UPDATE/DELETE/TRUNCATE), so one such row breaks `/v1/admin/audit`
+ * permanently, not for one request. A `Map.get` never touches the prototype
+ * chain regardless of what string it is asked for.
+ *
  * Values are not further redacted: every key named below is populated only
  * by code in this repository from data that is itself format-constrained
  * (a release id, a status enum, a sha256 digest) — never from traveler or
  * organizer text. If that stops being true for an action, its entry here
  * has to be reconsidered, not just widened.
  */
-const EVIDENCE_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
+const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   // release-registry.ts's promoteRelease() — from/to are ReleaseStatus enum
   // values, artifactDigest is the release's own sha256 digest.
-  "release.promote": ["from", "to", "artifactDigest"],
+  ["release.promote", ["from", "to", "artifactDigest"]],
   // recordAdminRead() below always writes '{}'::jsonb for these — listed
   // explicitly so a reader of this file does not have to guess whether the
   // omission is an oversight.
-  "admin.read.jobs": [],
-  "admin.read.funnel": [],
-  "admin.read.versions": [],
-  "admin.read.failures": [],
-  "admin.read.audit": [],
-  "admin.read.report": [],
-};
+  ["admin.read.jobs", []],
+  ["admin.read.funnel", []],
+  ["admin.read.versions", []],
+  ["admin.read.failures", []],
+  ["admin.read.audit", []],
+  ["admin.read.report", []],
+]);
 
 function projectEvidence(action: string, evidence: unknown): unknown {
-  const allowedKeys = EVIDENCE_ALLOWLIST[action];
+  const allowedKeys = EVIDENCE_ALLOWLIST.get(action);
   if (!allowedKeys || evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) return {};
   const source = evidence as Record<string, unknown>;
   const projected: Record<string, unknown> = {};
   for (const key of allowedKeys) {
-    if (key in source) projected[key] = source[key];
+    if (Object.hasOwn(source, key)) projected[key] = source[key];
   }
   return projected;
 }
@@ -328,7 +348,14 @@ export async function listAuditEvents(
   );
   return {
     events: rows.rows.map((r) => ({
-      id: r.id, actorRef: safePlain(r.actor_ref), action: r.action, targetRef: safePlain(r.target_ref),
+      id: r.id, actorRef: safePlain(r.actor_ref), action: safePlain(r.action), targetRef: safePlain(r.target_ref),
+      // The RAW action, not the display value above: the allow-list lookup
+      // has to see exactly what is in the row to pick the right bucket (or
+      // correctly find none) — redacting it first would make an
+      // already-illegible action ALSO fail to match a legitimate entry it
+      // might otherwise have matched, which is not a real case (a legitimate
+      // action name is always `safePlain`-shaped already) but would be a
+      // confusing accident to introduce.
       correlationId: r.correlation_id, evidence: projectEvidence(r.action, r.evidence),
       occurredAt: r.occurred_at.toISOString(),
     })),
