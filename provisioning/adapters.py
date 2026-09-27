@@ -13,7 +13,7 @@ from .models import CloudflareSpec, LxcSpec, ProxySpec
 
 
 class SshTransport(Protocol):
-    def run(self, command: str) -> str: ...
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str: ...
 
 
 class SubprocessSshTransport:
@@ -35,31 +35,67 @@ class SubprocessSshTransport:
         # container bootstrap partway through apt on 2026-08-28.
         self.command_timeout = command_timeout
 
-    def run(self, command: str) -> str:
-        result = subprocess.run(
-            ["ssh", "-i", self.identity_file, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
-             # These are static, LAN-only, operator-controlled hosts — not
-             # exposed to the internet. A fresh caller (e.g. a freshly built
-             # Docker container, unlike this developer machine's own already
-             # populated known_hosts) has no prior host-key history for them,
-             # and BatchMode=yes refuses rather than prompts on an unknown
-             # host key. accept-new still does the key exchange and pins the
-             # key for the session; it just doesn't require a pre-seeded,
-             # writable known_hosts file (the worker container runs as
-             # `nobody`, which has none).
-             "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=/dev/null",
-             "-o", f"ConnectTimeout={self.timeout}", f"{self.user}@{self.host}", command],
-            capture_output=True, text=True, timeout=self.command_timeout,
-        )
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str:
+        # `command` is sent on stdin to a remote `bash -s`, never as an argv
+        # element of the local `ssh` invocation. Before #185, the whole
+        # command string — including the bootstrap script's embedded
+        # SEED_PASSWORD and CONTROL_PLANE_EXCHANGE_KEY — was the final argv
+        # entry of the locally-run `ssh` process, visible to anything that
+        # can list this process's arguments (`ps`, a crash dump, a
+        # subprocess-logging wrapper) for as long as it runs. `ssh host
+        # command` and `ssh host bash -s` (stdin piped in) execute the same
+        # script remotely; only where the bytes travel locally changes.
+        argv = ["ssh", "-i", self.identity_file, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+                # These are static, LAN-only, operator-controlled hosts — not
+                # exposed to the internet. A fresh caller (e.g. a freshly built
+                # Docker container, unlike this developer machine's own already
+                # populated known_hosts) has no prior host-key history for them,
+                # and BatchMode=yes refuses rather than prompts on an unknown
+                # host key. accept-new still does the key exchange and pins the
+                # key for the session; it just doesn't require a pre-seeded,
+                # writable known_hosts file (the worker container runs as
+                # `nobody`, which has none).
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=/dev/null",
+                "-o", f"ConnectTimeout={self.timeout}", f"{self.user}@{self.host}", "bash", "-s"]
+        try:
+            result = subprocess.run(
+                argv, input=command, capture_output=True, text=True, timeout=self.command_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A hung remote command (the bootstrap script stalling mid-apt is
+            # the real case this transport's own command_timeout exists for)
+            # raises this instead of returning a CompletedProcess — but
+            # exc.stdout/exc.stderr carry whatever the command had already
+            # written, same as the returncode!=0 branch below, and are just
+            # as capable of holding a secret the script echoed before it
+            # hung. Route through the same redaction rather than letting a
+            # different exception type skip it — the leak class #185 closed
+            # for a failed run, not specifically for a non-zero exit.
+            detail = _redact((exc.stderr or "").strip() or (exc.stdout or "").strip(), secrets)
+            raise RuntimeError(
+                f"ssh command timed out after {self.command_timeout}s: {_truncate_middle(detail)}"
+            ) from exc
         if result.returncode != 0:
             # Prefer stderr (ssh's own errors, and most remote tools'), but fall
             # back to stdout — apt, git and deploy.sh all report failures there,
             # and an empty-stderr failure otherwise reports just "exit N:".
-            detail = result.stderr.strip() or result.stdout.strip()
+            detail = _redact(result.stderr.strip() or result.stdout.strip(), secrets)
             raise RuntimeError(
                 f"ssh command failed (exit {result.returncode}): {_truncate_middle(detail)}"
             )
         return result.stdout
+
+
+def _redact(text: str, secrets: tuple[str, ...]) -> str:
+    """Replace every occurrence of each known secret value with a fixed
+    marker. Shared by both of run()'s failure paths (a non-zero exit and a
+    subprocess.TimeoutExpired) so a secret a script echoed on its way to
+    failing — by either route — never reaches the RuntimeError text, and
+    from there, worker logs."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 def _truncate_middle(text: str, head: int = 400, tail: int = 600) -> str:
@@ -282,7 +318,15 @@ class ProxmoxLxcAdapter:
         script = f"""#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-for i in $(seq 1 30); do pct exec {vmid} -- true 2>/dev/null && break; sleep 2; done
+# </dev/null matters now that this whole script arrives over the same ssh
+# stdin stream `bash -s` reads from (#185): without it, a `pct exec ...--
+# true` that relays/drains its inherited fd 0 (lxc-attach-style stdio
+# relaying can do this even though `true` itself never reads) could consume
+# bytes meant for the BOOTSTRAP_INNER heredoc below, on any of up to 30
+# retries — truncating or shifting it silently. Under the old argv-based
+# transport this couldn't happen: the whole script arrived as one argv
+# string, never as a stdin stream a nested command could share.
+for i in $(seq 1 30); do pct exec {vmid} -- true </dev/null 2>/dev/null && break; sleep 2; done
 
 pct exec {vmid} -- bash -s <<'BOOTSTRAP_INNER'
 set -euo pipefail
@@ -458,7 +502,14 @@ systemctl enable nginx kinerary-server >/dev/null 2>&1 || true
 systemctl restart nginx
 BOOTSTRAP_INNER
 """
-        self.ssh.run(script)
+        # Named explicitly so a failure that echoes either value (e.g. the
+        # remote shell tracing a command it shouldn't) is redacted from the
+        # RuntimeError run() raises, rather than reaching worker logs raw.
+        # run()'s redaction is opt-in per call, not enforced by anything —
+        # any future self.ssh.run() call whose script embeds a secret must
+        # list it in secrets= too, the same way this one does.
+        secrets = tuple(s for s in (self._seed_password, self._control_plane_exchange_key) if s)
+        self.ssh.run(script, secrets=secrets)
 
     def _reset_trip_data(self, nfs_host_dir: str) -> None:
         """Wipe the trip's persisted app state (SQLite DB under server-data/)

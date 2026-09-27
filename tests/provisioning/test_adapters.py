@@ -45,7 +45,7 @@ class FakeSshTransport:
         self.restart_count = 0
         self._active = True
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str:
         self.commands.append(command)
         if command == f"sudo -n cat {self.config_path}":
             return self.files[self.config_path]
@@ -102,7 +102,7 @@ class FakeProxmoxSsh:
         self.bootstrapped = bootstrapped
         self.commands: list[str] = []
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, *, secrets: tuple[str, ...] = ()) -> str:
         self.commands.append(command)
         if command == "pct list":
             return self.pct_list_output
@@ -318,6 +318,123 @@ class AdapterTests(unittest.TestCase):
                 transport.run("git pull")
         self.assertIn("repository not found", str(caught.exception))
         self.assertIn("exit 2", str(caught.exception))
+
+    # ── #185: the command never reaches ssh's argv ────────────────────────
+    def test_run_sends_the_command_on_stdin_never_in_ssh_argv(self) -> None:
+        # Anything passed to run() previously became the final element of
+        # ssh's own argv (subprocess.run(["ssh", ..., host, command])), which
+        # a local `ps`/process listing, or any logging of the invoked argv,
+        # would show in full — including any secret embedded in the command
+        # text. `ssh ... bash -s` with the command fed on stdin never puts it
+        # on the command line at all.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        secret_bearing_command = "printf 'SEED_PASSWORD=%s\\n' 'tr0ub4dor&3' >> /opt/kinerary/.env"
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
+            transport.run(secret_bearing_command)
+
+        argv = run.call_args[0][0]
+        kwargs = run.call_args[1]
+        self.assertNotIn(secret_bearing_command, argv)
+        self.assertFalse(any("tr0ub4dor&3" in part for part in argv))
+        self.assertEqual(secret_bearing_command, kwargs.get("input"))
+        # The remote side still runs it as a shell script, read from stdin.
+        self.assertIn("bash", argv)
+        self.assertIn("-s", argv)
+
+    def test_bootstrap_secrets_never_reach_ssh_argv_end_to_end(self) -> None:
+        # The concrete exposure #185 was filed against: the whole bootstrap
+        # script — which embeds SEED_PASSWORD and CONTROL_PLANE_EXCHANGE_KEY
+        # via _bootstrap_app_environment — must never appear in any argv
+        # subprocess.run is called with, across a full create().
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(returncode=0, stdout="203\n", stderr="")
+        adapter = ProxmoxLxcAdapter(
+            transport, seed_password="s3cret pw$x", control_plane_exchange_key="exchange $key",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed) as run:
+            adapter.create(LXC_SPEC)
+
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertFalse(any("s3cret pw$x" in part for part in argv))
+            self.assertFalse(any("exchange $key" in part for part in argv))
+        # The bootstrap script (carrying both secrets) reached the transport
+        # on stdin, not argv — confirms the assertion above isn't vacuous.
+        bootstrap_call = next(
+            call for call in run.call_args_list
+            if isinstance(call.kwargs.get("input"), str) and "BOOTSTRAP_INNER" in call.kwargs["input"]
+        )
+        self.assertIn("s3cret pw$x", bootstrap_call.kwargs["input"])
+        self.assertIn("exchange $key", bootstrap_call.kwargs["input"])
+
+    def test_failed_run_redacts_secrets_from_the_raised_error(self) -> None:
+        # A RuntimeError's text reaches worker logs. If the failing script's
+        # own stdout happened to echo a secret (a debug trace, an accidental
+        # echo), the raised error must not repeat it.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        completed = mock.Mock(
+            returncode=1, stdout="+ printf SEED_PASSWORD=tr0ub4dor&3\nmkdir: Permission denied", stderr="",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("some script", secrets=("tr0ub4dor&3",))
+
+        self.assertNotIn("tr0ub4dor&3", str(caught.exception))
+        self.assertIn("Permission denied", str(caught.exception))
+
+    def test_bootstrap_failure_redacts_seed_password_and_exchange_key_from_the_error(self) -> None:
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+
+        def fake_run(argv, **kwargs):
+            script = kwargs.get("input", "")
+            if "BOOTSTRAP_INNER" in script:
+                return mock.Mock(
+                    returncode=1,
+                    stdout="SEED_PASSWORD=s3cret pw$x CONTROL_PLANE_EXCHANGE_KEY=exchange $key failed",
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="203\n", stderr="")
+
+        adapter = ProxmoxLxcAdapter(
+            transport, seed_password="s3cret pw$x", control_plane_exchange_key="exchange $key",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as caught:
+                adapter.create(LXC_SPEC)
+
+        self.assertNotIn("s3cret pw$x", str(caught.exception))
+        self.assertNotIn("exchange $key", str(caught.exception))
+
+    def test_timeout_redacts_secrets_from_the_raised_error(self) -> None:
+        # subprocess.TimeoutExpired (the hung-command path command_timeout
+        # exists for — the bootstrap script stalling mid-apt, say) carries
+        # its own .stdout/.stderr with whatever the command had already
+        # written, same as a non-zero returncode does — and was not being
+        # redacted at all: a different exception type skipping the same
+        # secrets= handling the returncode!=0 branch has.
+        from unittest import mock
+
+        transport = SubprocessSshTransport("h", "u", "/k")
+        timed_out = subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output="+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
+        )
+        with mock.patch("provisioning.adapters.subprocess.run", side_effect=timed_out):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.run("some script", secrets=("tr0ub4dor&3",))
+
+        self.assertNotIn("tr0ub4dor&3", str(caught.exception))
+        self.assertIn("timed out", str(caught.exception))
+        self.assertIn("apt-get installing", str(caught.exception))
 
     def test_reset_data_wipes_server_data_and_media_before_anything_else(self) -> None:
         # The NFS dir outlives a container, so a failed earlier provision can
