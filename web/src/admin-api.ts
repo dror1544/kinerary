@@ -90,6 +90,9 @@ export type AdminRelease = {
   promotedBy: string | null;
 };
 
+// NOT `result` — the route deliberately does not serve it (F1, boundary
+// review on PR #275: jobs.result is unfiltered caller-shaped JSON, no
+// allow-list worth building for it). safeErrorCode is the whole answer.
 export type AdminFailure = {
   id: string;
   tripId: string;
@@ -97,7 +100,6 @@ export type AdminFailure = {
   jobType: string;
   attempt: number;
   safeErrorCode: string | null;
-  result: unknown;
   createdAt: string;
   updatedAt: string;
 };

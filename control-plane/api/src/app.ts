@@ -26,7 +26,7 @@ import {
   listAuditEvents,
   listJobs,
   listRedactedFailures,
-  listReleases as listReleasesForAdmin,
+  listReleasesForAdmin,
   recordAdminRead,
   type JobState,
   type JobType,
@@ -1689,7 +1689,9 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   });
 
   // GET /v1/admin/versions — the release registry (candidate/verified/
-  // available/deprecated/retired), newest first.
+  // available/deprecated/retired), newest first. `promotedBy` passes through
+  // `listReleasesForAdmin`'s read-time safety net (admin-dashboard.ts) rather
+  // than the raw column, per the F1 boundary-review fix.
   app.get("/v1/admin/versions", async (request, reply) => {
     if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
     if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
@@ -1699,8 +1701,11 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send({ releases });
   });
 
-  // GET /v1/admin/failures — recently failed jobs, redacted. Query: since?
-  // (ISO 8601), limit? (max 200).
+  // GET /v1/admin/failures — recently failed jobs. Query: since? (ISO 8601),
+  // limit? (max 200). Does NOT serve `result` — see admin-dashboard.ts's
+  // module doc (F1, boundary review on PR #275): a job's `result` is
+  // caller-shaped JSON with nothing in it this route is designed to need, and
+  // `safeErrorCode` already is the safe channel for "what failed".
   app.get("/v1/admin/failures", async (request, reply) => {
     if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
     if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
@@ -1714,10 +1719,14 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
     return reply.code(200).send(result);
   });
 
-  // GET /v1/admin/audit — the append-only audit trail, redacted. Query:
-  // since?, action?, limit? (max 200). Reading this route is itself audited,
-  // same as every other route here — an admin read of the audit trail is
-  // still a read of everyone's data.
+  // GET /v1/admin/audit — the append-only audit trail. Query: since?,
+  // action?, limit? (max 200). `evidence` passes through a per-action
+  // allow-list (`EVIDENCE_ALLOWLIST` / `projectEvidence`, admin-dashboard.ts)
+  // rather than a deny-list — an action this codebase does not itself
+  // produce gets `{}`, not a best-effort scrub (F1, boundary review on PR
+  // #275). Reading this route is itself audited, same as every other route
+  // here — an admin read of the audit trail is still a read of everyone's
+  // data.
   app.get("/v1/admin/audit", async (request, reply) => {
     if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
     if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });

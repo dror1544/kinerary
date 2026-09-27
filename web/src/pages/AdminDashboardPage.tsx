@@ -232,17 +232,21 @@ function JobsSection({ jobs }: { jobs: UseQueryResult<{ jobs: AdminJob[] }, Erro
 function FailuresSection({ failures }: { failures: UseQueryResult<{ failures: AdminFailure[] }, Error> }) {
   return (
     <section className="workflow-card">
-      <h2>Redacted failures</h2>
+      <h2>Failures</h2>
+      <p className="subtle">
+        Only the safe error code — a job&apos;s raw result is never served here (it is
+        caller-shaped JSON with no allow-list worth building for it).
+      </p>
       <SectionState query={failures} label="failures" />
       {failures.data && (failures.data.failures.length === 0
         ? <p>No failures recorded.</p>
         : <table>
-            <thead><tr><th>Trip</th><th>Type</th><th>Error</th><th>Result</th><th>Updated</th></tr></thead>
+            <thead><tr><th>Trip</th><th>Type</th><th>Error</th><th>Updated</th></tr></thead>
             <tbody>
               {failures.data.failures.map((failure) => (
                 <tr key={failure.id}>
                   <td>{failure.tripSlug}</td><td>{failure.jobType}</td><td>{failure.safeErrorCode ?? "—"}</td>
-                  <td><code>{JSON.stringify(failure.result)}</code></td><td>{failure.updatedAt}</td>
+                  <td>{failure.updatedAt}</td>
                 </tr>
               ))}
             </tbody>

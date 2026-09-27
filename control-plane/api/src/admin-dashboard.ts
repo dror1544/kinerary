@@ -9,14 +9,65 @@
 // lives in app.ts (`adminAuth`, X-API-Key against CONTROL_PLANE_ADMIN_KEY);
 // this module assumes the caller already passed it.
 //
+// REDACTION IS ALLOW-LIST, NOT DENY-LIST (fixed 2026-09-27 after boundary
+// review on PR #275, finding F1). `jobs.result` and `audit_events.evidence`
+// are caller-shaped JSON blobs with no schema — nothing in this codebase
+// today writes traveler text into either column, but the moment something
+// does, a deny-list (`redact()`'s known-bad key names and three string
+// patterns) lets it straight through, because that is what a deny-list is
+// for: things it was told to remove. The boundary reviewer proved this live
+// by seeding an email, a phone number, a child's name and age, an allergy
+// note and a hotel address into both columns and reading every one of them
+// back verbatim. That is the exact bug class `sanitizeConfig()`'s 2026-09-25
+// rewrite (#172, CLAUDE.md "Security-sensitive paths") exists to forbid: "a
+// field it does not name is withheld, silently and on purpose." So:
+//
+//   - `/v1/admin/failures` no longer serves `result` AT ALL. `safeErrorCode`
+//     is the channel every job-failure path already designs to be safe
+//     (`^[A-Z][A-Z0-9_]{2,63}$`, migrations 0001/0005) — there is nothing to
+//     allow-list inside `result` worth keeping, so it is dropped whole.
+//   - `/v1/admin/audit` serves `evidence` only through `EVIDENCE_ALLOWLIST`,
+//     keyed by `action`: an action with a known key set gets exactly those
+//     keys (via `projectEvidence`); an action with none — which includes
+//     every action this codebase does not itself produce — gets `{}`. A
+//     future writer that starts putting traveler text into `evidence` for a
+//     NEW action name is withheld by default, not exposed by default.
+//   - `promoted_by` (versions) is NOT the same shape of risk as the two
+//     above: `control_plane.releases` carries an actual DB-level CHECK
+//     (`promoted_by IS NULL OR promoted_by ~ '^[A-Za-z0-9:_.-]{1,128}$'`,
+//     migration 0027) that every writer, present or future, has to satisfy —
+//     free text (an email, a name with a space) cannot land there at all,
+//     confirmed by reading the constraint rather than assumed. `safePlain`
+//     is still applied to it below, but as defense-in-depth against that
+//     CHECK ever being loosened, not because it was found exposed.
+//   - `actorRef` / `targetRef` on `audit_events` are the real version of that
+//     risk: that table carries NO DB-level format CHECK on either column
+//     (confirmed by reading migrations 0001 and 0005 — 0005's opaque-id
+//     format sweep covers `audit_events.id`, not `actor_ref`/`target_ref`).
+//     Today's only writers happen to constrain them at the application layer
+//     before insert (`recordAdminRead`'s literal `'admin:api-key'`;
+//     `promoteRelease`'s `PROMOTED_BY_RE` check on `actorRef`,
+//     release-registry.ts) — but trusting that forever is the same
+//     "individual fields judged harmless" reasoning CLAUDE.md's rule was
+//     written against: nothing stops a future writer, migration, or direct
+//     SQL from putting free text there. So this file re-checks at the READ
+//     boundary too (`safePlain`, below): a value that does not look like the
+//     opaque machine identifiers this codebase actually produces
+//     (`user:<id>`, `admin:api-key`, `operator:cli`, a release id, a trip id,
+//     `all_trips`, a `YYYY-MM-DD` date, …) is withheld rather than served on
+//     trust. Fails safe, per the same rule `shared/needs-schema.js` follows:
+//     unrecognized resolves to the most restrictive option, not to "probably
+//     fine."
+//
 // WHAT IS SPEC-BACKED VS DESIGN CHOICE, stated once so each function does not
 // have to repeat it:
 //
-//   - `listJobs`, `listRedactedFailures` and `listAuditEvents` read tables
-//     (`jobs`, `audit_events`) whose shape is not this file's to invent —
-//     the response is a direct, redacted projection of existing rows.
-//   - `listReleases` for the "versions" row is release-registry.ts's own
-//     existing function, re-exported here for one import path; not new logic.
+//   - `listJobs` and `listAuditEvents` read tables (`jobs`, `audit_events`)
+//     whose shape is not this file's to invent — the response is a direct,
+//     allow-list-projected view of existing rows, per the redaction note
+//     above (not this file's invention either — it is CLAUDE.md's own rule).
+//   - `listReleasesForAdmin` wraps release-registry.ts's own `listReleases`
+//     (not new logic) and additionally applies `safePlain` to `promotedBy`.
 //   - `getFunnelSummary` computes conversion rates over the CHECK-enforced
 //     ten-name `funnel_events` vocabulary (db/migrations/0034). The choice of
 //     which adjacent pairs count as a "conversion" (FUNNEL_SEQUENCE below) is
@@ -43,14 +94,87 @@
 
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
-import { redact } from "./redaction.js";
 import { listReleases, type ReleaseSummary } from "./release-registry.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
 }
 
-export { listReleases, type ReleaseSummary };
+export type { ReleaseSummary };
+
+// The opaque-machine-identifier shape every legitimate actor_ref/target_ref/
+// promoted_by value in this codebase takes — the SAME charset
+// release-registry.ts's `PROMOTED_BY_RE` already enforces at write time for
+// `promoted_by`, reused here as the read-time safety net for every column
+// that shares its shape. No space, no `@`, no punctuation wide enough to
+// carry a name, an email or a free-text note — a phone number formatted as
+// digits-and-hyphens is the one PII shape narrow enough to slip through this
+// charset, which is why this is a floor, not the whole fix: real free text
+// (an email, a name, an address, an allergy note) cannot pass it.
+const SAFE_PLAIN_TOKEN = /^[A-Za-z0-9:_.-]{1,200}$/;
+
+function safePlain(value: string): string {
+  return SAFE_PLAIN_TOKEN.test(value) ? value : "[REDACTED]";
+}
+
+/**
+ * Per-action allow-list for `audit_events.evidence`. An action not listed
+ * here — including every action a future writer might invent — gets `{}`:
+ * withheld by default, exactly `sanitizeConfig()`'s rule for a config field
+ * this codebase has not named. Keys not in an action's own list are dropped
+ * even when the action IS listed; this is a projection, not a delete-the-rest.
+ *
+ * Values are not further redacted: every key named below is populated only
+ * by code in this repository from data that is itself format-constrained
+ * (a release id, a status enum, a sha256 digest) — never from traveler or
+ * organizer text. If that stops being true for an action, its entry here
+ * has to be reconsidered, not just widened.
+ */
+const EVIDENCE_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
+  // release-registry.ts's promoteRelease() — from/to are ReleaseStatus enum
+  // values, artifactDigest is the release's own sha256 digest.
+  "release.promote": ["from", "to", "artifactDigest"],
+  // recordAdminRead() below always writes '{}'::jsonb for these — listed
+  // explicitly so a reader of this file does not have to guess whether the
+  // omission is an oversight.
+  "admin.read.jobs": [],
+  "admin.read.funnel": [],
+  "admin.read.versions": [],
+  "admin.read.failures": [],
+  "admin.read.audit": [],
+  "admin.read.report": [],
+};
+
+function projectEvidence(action: string, evidence: unknown): unknown {
+  const allowedKeys = EVIDENCE_ALLOWLIST[action];
+  if (!allowedKeys || evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) return {};
+  const source = evidence as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const key of allowedKeys) {
+    if (key in source) projected[key] = source[key];
+  }
+  return projected;
+}
+
+// ── Versions ─────────────────────────────────────────────────────────────
+
+export interface AdminReleaseSummary extends Omit<ReleaseSummary, "promotedBy"> {
+  promotedBy: string | null;
+}
+
+/**
+ * `listReleases` itself (release-registry.ts) is untouched — other callers
+ * (the CLI, the CLI's own tests) still get the raw value. This wrapper is
+ * the admin route's own read-time safety net on `promotedBy`, same reasoning
+ * as `actorRef`/`targetRef` in the module doc above.
+ */
+export async function listReleasesForAdmin(db: pg.Pool): Promise<AdminReleaseSummary[]> {
+  const releases = await listReleases(db);
+  return releases.map((release) => ({
+    ...release,
+    promotedBy: release.promotedBy === null ? null : safePlain(release.promotedBy),
+  }));
+}
 
 // ── Jobs ──────────────────────────────────────────────────────────────────
 
@@ -127,6 +251,11 @@ export async function listJobs(db: pg.Pool, filters: JobListFilters = {}): Promi
 
 // ── Redacted failures ────────────────────────────────────────────────────
 
+// NOT a redacted projection of `result` — `result` is not served at all.
+// See the module doc's redaction note (F1): `result` is caller-shaped JSON
+// with no allow-list worth building, because there is nothing inside it this
+// route is designed to need. `safeErrorCode` is the whole answer to "what
+// failed" that this route was ever meant to carry.
 export interface FailureRow {
   id: string;
   tripId: string;
@@ -134,7 +263,6 @@ export interface FailureRow {
   jobType: string;
   attempt: number;
   safeErrorCode: string | null;
-  result: unknown;
   createdAt: string;
   updatedAt: string;
 }
@@ -146,9 +274,11 @@ export async function listRedactedFailures(
   const limit = boundedLimit(options.limit);
   const rows = await db.query<{
     id: string; trip_id: string; slug: string; job_type: string; attempt: number;
-    safe_error_code: string | null; result: unknown; created_at: Date; updated_at: Date;
+    safe_error_code: string | null; created_at: Date; updated_at: Date;
   }>(
-    `SELECT j.id, j.trip_id, t.slug, j.job_type, j.attempt, j.safe_error_code, j.result, j.created_at, j.updated_at
+    // No j.result — never selected, so there is nothing for a future edit to
+    // start passing through by accident.
+    `SELECT j.id, j.trip_id, t.slug, j.job_type, j.attempt, j.safe_error_code, j.created_at, j.updated_at
        FROM control_plane.jobs j
        JOIN control_plane.trips t ON t.id = j.trip_id
       WHERE j.state = 'failed'
@@ -161,11 +291,6 @@ export async function listRedactedFailures(
     failures: rows.rows.map((r) => ({
       id: r.id, tripId: r.trip_id, tripSlug: r.slug, jobType: r.job_type, attempt: r.attempt,
       safeErrorCode: r.safe_error_code,
-      // Blanket redaction, same rule sanitizeConfig() follows: whatever a job
-      // recorded as its result is not assumed safe just because it reached
-      // this table. redact() strips known-sensitive keys and patterns; it is
-      // not a per-field judgment call.
-      result: redact(r.result),
       createdAt: r.created_at.toISOString(), updatedAt: r.updated_at.toISOString(),
     })),
     limit,
@@ -203,8 +328,8 @@ export async function listAuditEvents(
   );
   return {
     events: rows.rows.map((r) => ({
-      id: r.id, actorRef: r.actor_ref, action: r.action, targetRef: r.target_ref,
-      correlationId: r.correlation_id, evidence: redact(r.evidence),
+      id: r.id, actorRef: safePlain(r.actor_ref), action: r.action, targetRef: safePlain(r.target_ref),
+      correlationId: r.correlation_id, evidence: projectEvidence(r.action, r.evidence),
       occurredAt: r.occurred_at.toISOString(),
     })),
     limit,

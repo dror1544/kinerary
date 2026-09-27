@@ -271,21 +271,30 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
     }
   });
 
-  // ── Failures: redaction ──────────────────────────────────────────────────
+  // ── Failures: F1 (PR #275 boundary review) ───────────────────────────────
+  //
+  // The reviewer seeded exactly these PII shapes into `result` and `evidence`
+  // and read every one of them back verbatim through the old deny-list
+  // (`redact()`). These constants are reused across the failures and audit
+  // tests below so both prove the same real-world shapes are gone, not a
+  // synthetic stand-in for them.
+  const PII = {
+    email: "family.traveler@example.com",
+    phone: "+1-555-123-4567",
+    childNameAge: "Emma Cohen, age 7",
+    allergyNote: "severe peanut allergy — carries an EpiPen",
+    hotelAddress: "123 Main St, Orlando, FL 32819",
+  };
 
-  test("GET /v1/admin/failures redacts sensitive keys in the job result but keeps the rest", async () => {
-    // A key literally named "token" or "password" can never reach this table
-    // in the first place — control_plane.jobs' own
-    // jobs_result_is_canonical CHECK (migration 0002/0004) already refuses
-    // it at the database, before redact() ever runs. What that CHECK does
-    // NOT catch is a value carrying embedded userinfo (a connection string),
-    // which is exactly the case redact()'s third pattern exists for — see
-    // redaction.ts. That is the case worth pinning here: it is where the
-    // application-layer redaction adds something the database guard does not.
+  test("GET /v1/admin/failures serves no PII at all — result is not in the response", async () => {
     const tripA = await seedTrip("a");
     await seedJob({
       tripId: tripA, label: "f1", jobType: "provision", state: "failed", safeErrorCode: "BUILD_FAILED",
-      result: { note: "container did not start", upstreamRef: "postgres://dbuser:dbpass@dbhost.example.com:5432/appdb" },
+      result: {
+        note: "container did not start",
+        email: PII.email, phone: PII.phone, childNameAge: PII.childNameAge,
+        allergyNote: PII.allergyNote, hotelAddress: PII.hotelAddress,
+      },
     });
 
     const app = appWithAdmin();
@@ -294,23 +303,53 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
       assert.equal(response.statusCode, 200);
       const { failures } = JSON.parse(response.body);
       assert.equal(failures.length, 1);
-      assert.equal(failures[0].result.upstreamRef, "postgres://[REDACTED]@dbhost.example.com:5432/appdb");
-      assert.equal(failures[0].result.note, "container did not start");
+      assert.equal("result" in failures[0], false, "result must not be in the response at all");
+      assert.equal(failures[0].safeErrorCode, "BUILD_FAILED");
+      // Belt and suspenders: none of the seeded PII appears ANYWHERE in the
+      // raw response body, not just absent from a `result` key by name.
+      for (const value of Object.values(PII)) {
+        assert.ok(!response.body.includes(value), `leaked into the response: ${value}`);
+      }
     } finally {
       await app.close();
     }
   });
 
-  // ── Audit: redaction and filtering ───────────────────────────────────────
+  // ── Audit: F1 (PR #275 boundary review) — allow-list, not deny-list ─────
 
-  test("GET /v1/admin/audit redacts evidence and can filter by action", async () => {
-    // Same reasoning as the failures test above: a key named "apiKey" would
-    // never make it into this column (audit_evidence_is_canonical), so the
-    // case worth seeding is a value with embedded userinfo.
+  test("GET /v1/admin/audit withholds evidence entirely for an action with no allow-list entry", async () => {
+    // A future writer inventing a new action name (here: one this codebase
+    // does not itself produce) gets `{}`, not a best-effort scrub of a
+    // deny-list that has never seen this shape of data before.
     await pool.query(
       `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
-       VALUES ($1, 'user:test', 'release.promote', 'release_1', 'corr_manualaudittest001', $2::jsonb, now())`,
-      [`audit_${suffix()}`, JSON.stringify({ from: "candidate", to: "verified", sourceRef: "postgres://opuser:opsecret@db.internal.example:5432/control_plane" })],
+       VALUES ($1, 'user:test', 'companion.report', 'trip_unknown', 'corr_manualaudittest002', $2::jsonb, now())`,
+      [`audit_${suffix()}`, JSON.stringify({ ...PII, note: "traveler reported this via the companion" })],
+    );
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=companion.report", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200);
+      const { events } = JSON.parse(response.body);
+      assert.equal(events.length, 1);
+      assert.deepEqual(events[0].evidence, {});
+      for (const value of Object.values(PII)) {
+        assert.ok(!response.body.includes(value), `leaked into the response: ${value}`);
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("GET /v1/admin/audit projects only the allow-listed keys for a known action, dropping everything else", async () => {
+    // release.promote IS on the allow-list, but only for {from, to,
+    // artifactDigest}. An extra key on the SAME row — however it got there —
+    // must still be dropped, not passed through because the action is known.
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'user:test', 'release.promote', 'release_1', 'corr_manualaudittest003', $2::jsonb, now())`,
+      [`audit_${suffix()}`, JSON.stringify({ from: "candidate", to: "verified", artifactDigest: `sha256:${"a".repeat(64)}`, operatorNote: PII.childNameAge })],
     );
 
     const app = appWithAdmin();
@@ -318,11 +357,62 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
       const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=release.promote", headers: { "x-api-key": KEY } });
       assert.equal(response.statusCode, 200);
       const { events } = JSON.parse(response.body);
-      // Exactly the seeded row — the admin route's own audit-of-itself uses a
-      // different action name, so it never contaminates this filter.
       assert.equal(events.length, 1);
-      assert.equal(events[0].evidence.sourceRef, "postgres://[REDACTED]@db.internal.example:5432/control_plane");
       assert.equal(events[0].evidence.to, "verified");
+      assert.equal(events[0].evidence.from, "candidate");
+      assert.equal("operatorNote" in events[0].evidence, false);
+      assert.ok(!response.body.includes(PII.childNameAge));
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("GET /v1/admin/audit withholds actorRef and targetRef that do not look like opaque identifiers", async () => {
+    // audit_events.actor_ref / target_ref carry no DB-level format CHECK
+    // (unlike releases.promoted_by) — this is the read-time safety net for
+    // that gap, not a claim that today's writers would ever produce this.
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, $2, 'companion.report', $3, 'corr_manualaudittest004', '{}'::jsonb, now())`,
+      [`audit_${suffix()}`, PII.childNameAge, PII.hotelAddress],
+    );
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=companion.report", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200);
+      const { events } = JSON.parse(response.body);
+      // A prior test in this file also seeded a 'companion.report' row
+      // (audit_events is append-only, so this file cannot wipe it between
+      // tests) — find this one by its own correlation id, never by array
+      // position or length.
+      const found = events.find((e: { correlationId: string }) => e.correlationId === "corr_manualaudittest004");
+      assert.ok(found, "the seeded row must be present");
+      assert.equal(found.actorRef, "[REDACTED]");
+      assert.equal(found.targetRef, "[REDACTED]");
+      assert.ok(!response.body.includes(PII.childNameAge));
+      assert.ok(!response.body.includes(PII.hotelAddress));
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("GET /v1/admin/audit still shows a normal machine-generated actorRef and targetRef", async () => {
+    // The safety net must not swallow the ordinary case.
+    await pool.query(
+      `INSERT INTO control_plane.audit_events(id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
+       VALUES ($1, 'operator:cli', 'release.promote', 'release_abc123XY', 'corr_manualaudittest005', '{}'::jsonb, now())`,
+      [`audit_${suffix()}`],
+    );
+
+    const app = appWithAdmin();
+    try {
+      const response = await app.inject({ method: "GET", url: "/v1/admin/audit?action=release.promote", headers: { "x-api-key": KEY } });
+      assert.equal(response.statusCode, 200);
+      const { events } = JSON.parse(response.body);
+      const found = events.find((e: { targetRef: string }) => e.targetRef === "release_abc123XY");
+      assert.ok(found, "the normal row must still be readable");
+      assert.equal(found.actorRef, "operator:cli");
     } finally {
       await app.close();
     }
