@@ -86,6 +86,7 @@ export const PORTS = {
   configVersionsBoot:      28098,
   serverDefault:           28099,  // helpers/server.js fallback — server.test.js
   agentParticipants:       28101,
+  agentParticipantsGhostOrganizer: 28131,
   bookingExtractServer:    28104,
   errorHandling:           28105,
   currencyRates:           28107,

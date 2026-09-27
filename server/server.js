@@ -73,6 +73,25 @@ const HERMES_KEY    = process.env.HERMES_API_KEY || '';
 const SEED_PASSWORD = process.env.SEED_PASSWORD || '';
 const AGENT_USER    = { username: 'hermes', name: 'Hermes', family: 'system', isAgent: true };
 
+// Constant-time comparison for a caller-supplied secret against a configured
+// one (#184). Plain `===` on the raw strings leaks a timing signal proportional
+// to how many leading bytes match, and crypto.timingSafeEqual() throws outright
+// on a length mismatch — which itself would leak the real key's length unless
+// every caller handled that branch identically. Hashing both sides to a fixed
+// 32-byte SHA-256 digest first sidesteps both: the digests being compared are
+// always the same length regardless of what the caller sent, so
+// timingSafeEqual() never throws and the comparison's cost is the same
+// whether the supplied value is empty, too short, too long, or byte-for-byte
+// wrong. `expected` empty means the feature is unconfigured — refuse without
+// ever touching the (irrelevant) supplied value's content.
+function timingSafeKeyMatch(supplied, expected) {
+  if (!expected) return false;
+  const suppliedStr = typeof supplied === 'string' ? supplied : '';
+  const suppliedDigest = crypto.createHash('sha256').update(suppliedStr).digest();
+  const expectedDigest = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(suppliedDigest, expectedDigest);
+}
+
 // Optional: "Sign in with Google" as an alternate login method bound to an
 // already-predefined user (see /api/auth/google-link). Unset → feature is
 // simply absent; the site still works password-only.
@@ -714,7 +733,7 @@ function getUser(username) {
 function authRequired(req, res, next) {
   // API key path — for the hermes agent (non-user service account)
   const apiKey = req.headers['x-api-key'];
-  if (HERMES_KEY && apiKey === HERMES_KEY) {
+  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) {
     req.user = AGENT_USER;
     return next();
   }
@@ -888,7 +907,7 @@ app.get('/api/config/warnings', authRequired, (_req, res) => {
 //     organizer-only needs at all — they were stored and visible to nobody.
 function organizerOrAgentRequired(req, res, next) {
   const apiKey = req.headers['x-api-key'];
-  if (HERMES_KEY && apiKey === HERMES_KEY) { req.user = AGENT_USER; return next(); }
+  if (timingSafeKeyMatch(apiKey, HERMES_KEY)) { req.user = AGENT_USER; return next(); }
 
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query._t || null);
@@ -905,6 +924,23 @@ function organizerOrAgentRequired(req, res, next) {
   if (!organizers.length || !organizers.includes(payload.username)) return res.status(403).json({ error: 'organizer_only' });
   req.user = { username: payload.username };
   next();
+}
+
+// #184 — the agent key authenticates a service account, not a person: unlike
+// an organizer's own JWT (which proves a specific browser session that person
+// logged into), the key alone proves nothing about who is actually asking.
+// Three agent routes below let the caller act ON a username that names a
+// configured organizer — reset-password, telegram rebind, and (boundary
+// review on PR #274, finding A) participant creation, where the target
+// "already exists" only after this call returns — and in every one, acting
+// through the agent key alone is how #184 took the account over outright:
+// mint a reset token with only the key, redeem it via /api/auth/enroll
+// (which needs no session at all), then log in as the organizer. Route
+// through this before doing anything organizer-specific. req.user.isAgent is
+// only ever true on the X-API-Key path (see AGENT_USER above) — an
+// organizer's own session reaching the same route is unaffected.
+function agentActingOnOrganizer(req, uname) {
+  return Boolean(req.user?.isAgent) && normalizeOrganizers(TRIP_CONFIG.agent).includes(uname);
 }
 
 const journey = livingJourney.create({
@@ -1066,6 +1102,22 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
   if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+  // #184 (boundary review on PR #274, finding A): if trip.config.json's
+  // agent.organizers names a username with no seeded participant row yet,
+  // the normal `username_taken` check below does nothing to stop the agent
+  // key from CREATING that account — and the row it creates is a full
+  // organizer (organizerOrAgentRequired admits it exactly like the real one),
+  // which can then use agentActingOnOrganizer's own guard as a floor, not a
+  // ceiling: reset-password and telegram-rebind still refuse the agent key
+  // against the REAL organizer, but this freshly-created one is not the
+  // agent key acting on an organizer from this route's point of view — it's
+  // creating one. Not reachable through normal provisioning (`_resolve_organizers`
+  // and driver.mjs both refuse to produce an organizer name with no seeded
+  // participant), but a hand-built or legacy trip.config.json can still have
+  // one, so this is defense-in-depth, not a live path today.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
+  }
 
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(409).json({ error: 'username_taken' });
@@ -1111,6 +1163,13 @@ app.post('/api/agent/participants/:username/reset-password', organizerOrAgentReq
   const uname = String(req.params.username).toLowerCase().trim();
   if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(404).json({ error: 'user_not_found' });
+  }
+  // #184: the agent has no legitimate need to reset an organizer's own
+  // credential, and letting it do so is a full account takeover — see
+  // agentActingOnOrganizer() above. The organizer resetting THEMSELVES
+  // through their own JWT session is unaffected.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
   }
 
   // `to: 'trip_password'` — back to the password the trip was seeded with.
@@ -1158,6 +1217,16 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
   const participant = (TRIP_CONFIG.participants || []).find(p => p.username === uname);
   if (!participant || !db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(404).json({ error: 'user_not_found' });
+  }
+  // #184: rebinding an organizer's Telegram identity through the agent key
+  // alone is the same takeover shape as agent-key reset-password — it hands
+  // whoever holds the key (or, per verifyTelegramLogin's live membership
+  // check, whoever controls that Telegram account and is in the trip's group)
+  // a working login as the organizer, and silently breaks the organizer's own
+  // existing Telegram login in the process. The organizer rebinding their OWN
+  // Telegram identity through their own JWT session is unaffected.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
   }
   const conflict = db.prepare('SELECT username FROM users WHERE telegram_id = ? AND username != ?').get(tgId, uname);
   if (conflict) return res.status(409).json({ error: 'telegram_id_taken' });

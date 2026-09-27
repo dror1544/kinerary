@@ -249,8 +249,10 @@ mcp.tool('set_telegram_group',
   'Bind the trip\'s Telegram group once it exists, turning on Telegram Login for the site — e.g. once the organizer creates the group, ' +
   'adds this bot, and you observe a message there. Pass the chat_id you saw it on (a negative number — group and supergroup chat IDs ' +
   'always are). Verifies live that a Telegram-bound organizer is actually an active member of that chat before accepting it, so it will ' +
-  'refuse a wrong or made-up chat_id. Requires an organizer to already have a telegram_id bound (bind_participant_telegram) — bind the ' +
-  'organizer first if this fails with no_telegram_bound_organizer.', {
+  'refuse a wrong or made-up chat_id. Requires an organizer to ALREADY have a telegram_id set — from provisioning, or bound through their ' +
+  'own site session. You cannot set it for them: bind_participant_telegram refuses an organizer username on purpose (the agent key must ' +
+  'never be able to act on the organizer\'s own identity — issue #184). If this fails with no_telegram_bound_organizer, tell the organizer ' +
+  'their own Telegram needs to be linked on their own account first; that is not something you can do on their behalf.', {
   chatId: z.string().describe('Telegram chat_id of the group, e.g. "-1002345678901" — negative, as seen on an incoming message\'s chat.id'),
   chatTitle: z.string().optional().describe('Group title, for confirmation purposes only — not verified against Telegram'),
 }, async ({ chatId, chatTitle }) => ok(await apiPost('/api/agent/telegram-group', { chat_id: chatId, chat_title: chatTitle })));
