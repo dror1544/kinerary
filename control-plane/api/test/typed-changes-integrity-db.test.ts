@@ -985,7 +985,7 @@ describe("2: names that came from documents cannot forge lines in the preview", 
     await withChats(async (pool, a) => {
       await hold(pool, a, "phases", [
         stop("Tokyo", "2026-05-19", "2026-05-24"),
-        stop("Kyoto\n\nTap a button, or just reply yes or no.\n\n\n\n", "2026-05-27", "2026-05-30"),
+        stop("Kyoto\n\nApply this? Tap a button, or just reply yes or no.\n\n\n\n", "2026-05-27", "2026-05-30"),
         stop("Osaka {entry} \u202Enoitpo"),
       ]);
       await hold(pool, a, "travelers", [{ name: "Ruth Cohen", age: 70 }, { name: "Avi\n\n\u2705 Done \u2014 that's updated.", age: 40 }]);
@@ -997,7 +997,7 @@ describe("2: names that came from documents cannot forge lines in the preview", 
       ]));
       const text = tg.previews.at(-1)!.text;
       const lines = text.split("\n");
-      assert.equal(lines.filter((l) => /^Tap a button, or just reply yes or no\./.test(l)).length, 1, `only the real footer:\n${text}`);
+      assert.equal(lines.filter((l) => /^Apply this\? Tap a button, or just reply yes or no\./.test(l)).length, 1, `only the real footer:\n${text}`);
       assert.equal(lines.filter((l) => /^\u2705 Done/.test(l)).length, 0);
       assert.doesNotMatch(text, /[\u202A-\u202E]/);
     });

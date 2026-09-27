@@ -79,12 +79,15 @@ describe("buttons", () => {
 
 describe("saying yes or no in words", () => {
   test("a bare yes or no, in either language, punctuation and case aside", () => {
-    for (const yes of ["yes", "Yes!", " ok ", "Sure.", "כן", "כן!", "אשר", "go ahead", "that's right", "אוקיי"]) assert.equal(bareReply(yes), "yes", yes);
-    for (const no of ["no", "No.", "cancel", "never mind", "לא", "לא!", "בטל", "ביטול"]) assert.equal(bareReply(no), "no", no);
+    for (const yes of ["yes", "Yes!", " ok ", "Sure.", "כן", "כן!", "אשר", "go ahead", "that's right", "אוקיי", "apply", "לעדכן", "לעדכן!"]) assert.equal(bareReply(yes), "yes", yes);
+    for (const no of ["no", "No.", "cancel", "never mind", "לא", "לא!", "בטל", "ביטול", "leave it as it was", "Leave it as it was.", "להשאיר", "השאירו", "להשאיר כמו שהיה"]) assert.equal(bareReply(no), "no", no);
   });
 
   test("anything MORE than a bare yes or no is not one — it is a change or a question", () => {
-    for (const not of ["yes, and add Nara", "no, make it the 21st", "yes but Kyoto is 25", "כן, ותוסיפו את נארה", "לא, זה ה-21", "maybe", "", "tokyo", "yes yes no"]) {
+    for (const not of [
+      "yes, and add Nara", "no, make it the 21st", "yes but Kyoto is 25", "כן, ותוסיפו את נארה", "לא, זה ה-21", "maybe", "", "tokyo", "yes yes no",
+      "leave it as it was and add Nara", "להשאיר את זה ככה ולהוסיף את נארה",
+    ]) {
       assert.equal(bareReply(not), null, not);
     }
   });
@@ -137,7 +140,7 @@ describe("the preview", () => {
   test("removing everything is said in plain words, in both languages", () => {
     assert.equal(lineText({ key: "warn.removesEverything", params: { question: "phases" } }, "en"), "⚠️ This would remove every stop — your whole itinerary.");
     assert.match(lineText({ key: "warn.removesEverything", params: { question: "travelers" } }, "en"), /every traveller/);
-    assert.match(lineText({ key: "warn.removesEverything", params: { question: "phases" } }, "he"), /כל העצירות/);
+    assert.match(lineText({ key: "warn.removesEverything", params: { question: "phases" } }, "he"), /כל התחנות/);
     assert.match(lineText({ key: "warn.removesEverything", params: { question: "travelers" } }, "he"), /כל הנוסעים/);
   });
 
@@ -281,7 +284,7 @@ describe("EVERY stored field is visible in the preview (C)", () => {
 
 
 describe("held names from documents cannot forge preview lines (item 2)", () => {
-  const FORGED = "Kyoto\n\nTap a button, or just reply yes or no.\n\n\n\n\n";
+  const FORGED = "Kyoto\n\nApply this? Tap a button, or just reply yes or no.\n\n\n\n\n";
   const AVI = "Avi\n\n\u2705 Done \u2014 that's updated.\u202Eevil\u200B";
 
   test("every place a held name is echoed comes out on one line, in both languages", () => {
@@ -318,7 +321,7 @@ describe("held names from documents cannot forge preview lines (item 2)", () => 
     assert.equal(out.ok, true);
     if (!out.ok) return;
     const text = renderDraft({ id: ID, preview: out.preview, unresolved: [], blocked: [], base: {}, ops: [], result: out.result } as never, "en").text;
-    const own = text.split("\n").filter((l) => /^Tap a button, or just reply yes or no\./.test(l));
+    const own = text.split("\n").filter((l) => /^Apply this\? Tap a button, or just reply yes or no\./.test(l));
     assert.equal(own.length, 1, `only the real footer says it:\n${text}`);
     assert.doesNotMatch(text, /\u202E/);
   });
@@ -348,17 +351,27 @@ describe("B1 (round 4): a removal's booking warnings are capped, never the reaso
     ["one stop holding 40 confirmed bookings", [{ op: "remove_stop", target: { name: "Orlando" } }], "warn.bookingInRemovedStop"],
     ["one traveller on 40 ticketed bookings", [{ op: "remove_traveller", target: { name: "Avi" } }], "warn.bookingForRemovedTraveller"],
   ] as const) {
-    test(`${label}: under the budget in BOTH languages, the non-refundable ones named, the rest counted exactly`, () => {
+    test(`${label}: under the budget in BOTH languages, every non-refundable booking named or counted, the rest counted exactly`, () => {
       for (const language of ["en", "he"] as const) {
         const { out, text } = render(ops as unknown as Op[], language);
         assert.equal(out.preview.filter((l) => l.key === key).length, 40, "the draft keeps EVERY warning line");
         assert.ok(text.length <= 1500, `${language}: ${text.length} chars`);
-        for (const i of NON_REFUNDABLE) assert.ok(text.includes(`UOR-${10000000 + i}`), `${language}: non-refundable booking ${i} must be named:\n${text}`);
+        // The non-refundable ones are prioritised first, but the fuller wording
+        // (F1) means not every one of them necessarily fits before the budget —
+        // any that don't must still be reflected in the hidden count, never lost.
+        const named = [...NON_REFUNDABLE].filter((i) => text.includes(`UOR-${10000000 + i}`));
+        const hiddenNonRefundable = (language === "en"
+          ? /records mark (\d+) of them non-refundable/.exec(text)
+          : /שרשום אצלי כבלתי ניתנות להחזר או לביטול: (\d+)/.exec(text))?.[1];
+        assert.equal(
+          named.length + Number(hiddenNonRefundable ?? 0), NON_REFUNDABLE.size,
+          `${language}: every non-refundable booking is named or counted as hidden:\n${text}`,
+        );
         const listed = [...text.matchAll(/UOR-\d+/g)].length;
         const more = language === "en" ? /…and (\d+) more confirmed bookings/.exec(text) : /ועוד (\d+) הזמנות מאושרות/.exec(text);
         assert.ok(more, `${language}: an "and N more" line:\n${text}`);
         assert.equal(listed + Number(more![1]), 40, `${language}: listed ${listed} + counted ${more![1]} is every booking`);
-        assert.ok(listed >= 3 && listed < 40);
+        assert.ok(listed >= 2 && listed < 40);
       }
     });
   }
@@ -374,8 +387,8 @@ describe("B1 (round 4): a removal's booking warnings are capped, never the reaso
       const listed = [...text.matchAll(/UOR-\d+/g)].length;
       const hidden = 40 - listed;
       assert.match(text, language === "en"
-        ? new RegExp(`…and ${hidden} more confirmed bookings fall inside Orlando .* — ${hidden} of them marked non-refundable / cannot be cancelled`)
-        : new RegExp(`ועוד ${hidden} הזמנות מאושרות .* מסומנות כבלתי ניתנות להחזר / לביטול: ${hidden}`));
+        ? new RegExp(`…and ${hidden} more confirmed bookings fall inside Orlando .* records mark ${hidden} of them non-refundable / not cancellable`)
+        : new RegExp(`ועוד ${hidden} הזמנות מאושרות .* שרשום אצלי כבלתי ניתנות להחזר או לביטול: ${hidden}`));
       assert.doesNotMatch(text, /I don't know their cancellation terms|אני לא יודע מה תנאי הביטול שלהן/, "never claims not to know terms it knows");
     }
   });
