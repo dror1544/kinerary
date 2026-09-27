@@ -25,6 +25,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenticateClient, SCOPE, READ_SCOPE } = require('./oauth');
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
+const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
 const { registerTools, buildInstructions } = require('./tools');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
@@ -346,7 +347,7 @@ function registerTripMcp({
       { name: 'kinerary-trip', title: tripTitle(), version: '1.0.0' },
       { instructions: (cfg => buildInstructions(cfg, normalizeOrganizers(cfg.agent), { write }))(getPublicConfig()) },
     );
-    registerTools(server, siteClient(req.mcpGrant.username), { write });
+    registerTools(server, siteClient(req.mcpGrant.username), { write, origin });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     try {
@@ -356,6 +357,23 @@ function registerTripMcp({
       console.error('[trip-mcp] request failed:', err.message);
       if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'internal error' }, id: null });
     }
+  });
+  // The page itself contains no trip data or credential. A browser sends its
+  // own site session to the established booking routes after loading it.
+  app.get('/mcp/upload-confirmation/:id', noStore, (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1 || String(id) !== req.params.id) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.set('Content-Security-Policy', [
+      "default-src 'none'", "script-src 'nonce-" + nonce + "'", "style-src 'nonce-" + nonce + "'",
+      "connect-src 'self'", "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'",
+    ].join('; '));
+    res.set('X-Frame-Options', 'DENY');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Referrer-Policy', 'no-referrer');
+    res.type('html').send(renderConfirmationUploadPage({ bookingId: id, nonce }));
   });
   app.options('/mcp', cors);
   // A person who opens the address in a browser (or lands on /modern/mcp,
