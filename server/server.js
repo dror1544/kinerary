@@ -915,14 +915,16 @@ function organizerOrAgentRequired(req, res, next) {
 // #184 — the agent key authenticates a service account, not a person: unlike
 // an organizer's own JWT (which proves a specific browser session that person
 // logged into), the key alone proves nothing about who is actually asking.
-// Two agent routes below let the caller act ON a participant by username —
-// reset-password and telegram rebind — and if that participant is an
-// organizer, acting through the agent key alone is how #184 took the account
-// over outright: mint a reset token with only the key, redeem it via
-// /api/auth/enroll (which needs no session at all), then log in as the
-// organizer. Route through this before doing anything organizer-specific.
-// req.user.isAgent is only ever true on the X-API-Key path (see AGENT_USER
-// above) — an organizer's own session reaching the same route is unaffected.
+// Three agent routes below let the caller act ON a username that names a
+// configured organizer — reset-password, telegram rebind, and (boundary
+// review on PR #274, finding A) participant creation, where the target
+// "already exists" only after this call returns — and in every one, acting
+// through the agent key alone is how #184 took the account over outright:
+// mint a reset token with only the key, redeem it via /api/auth/enroll
+// (which needs no session at all), then log in as the organizer. Route
+// through this before doing anything organizer-specific. req.user.isAgent is
+// only ever true on the X-API-Key path (see AGENT_USER above) — an
+// organizer's own session reaching the same route is unaffected.
 function agentActingOnOrganizer(req, uname) {
   return Boolean(req.user?.isAgent) && normalizeOrganizers(TRIP_CONFIG.agent).includes(uname);
 }
@@ -1086,6 +1088,22 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
   if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+  // #184 (boundary review on PR #274, finding A): if trip.config.json's
+  // agent.organizers names a username with no seeded participant row yet,
+  // the normal `username_taken` check below does nothing to stop the agent
+  // key from CREATING that account — and the row it creates is a full
+  // organizer (organizerOrAgentRequired admits it exactly like the real one),
+  // which can then use agentActingOnOrganizer's own guard as a floor, not a
+  // ceiling: reset-password and telegram-rebind still refuse the agent key
+  // against the REAL organizer, but this freshly-created one is not the
+  // agent key acting on an organizer from this route's point of view — it's
+  // creating one. Not reachable through normal provisioning (`_resolve_organizers`
+  // and driver.mjs both refuse to produce an organizer name with no seeded
+  // participant), but a hand-built or legacy trip.config.json can still have
+  // one, so this is defense-in-depth, not a live path today.
+  if (agentActingOnOrganizer(req, uname)) {
+    return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
+  }
 
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(409).json({ error: 'username_taken' });
