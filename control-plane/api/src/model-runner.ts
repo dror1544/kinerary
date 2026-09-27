@@ -74,9 +74,16 @@ export function addUsage(a: ModelUsage | undefined, b: ModelUsage | undefined): 
   return out;
 }
 
+/**
+ * `usedFallback` is set by `quotaFallbackRunner` alone (§ decision 48): true
+ * when THIS result — success or failure — came from the fallback runner
+ * rather than the primary. Optional and absent everywhere else, so every
+ * runner already built before decision 48 constructs `RunnerResult` exactly
+ * as it always has; nothing here needed to change for this field to exist.
+ */
 export type RunnerResult<T> =
-  | { ok: true; value: T; attempts: number; ms: number; usage?: ModelUsage }
-  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number; usage?: ModelUsage };
+  | { ok: true; value: T; attempts: number; ms: number; usage?: ModelUsage; usedFallback?: true }
+  | { ok: false; reason: RunnerFailure; detail?: string; attempts: number; ms: number; usage?: ModelUsage; usedFallback?: true };
 
 /**
  * A file the model has to LOOK at rather than read as text: a photographed
@@ -1189,6 +1196,84 @@ export function composeRunners(byTask: Record<string, StructuredModelRunner>): S
 }
 
 /**
+ * The tasks decision 48 (docs/sprint6-tracks.md #48) may escalate on a quota
+ * limit: reading a document, on either of its two passes ("what does this
+ * document answer" and "what happens on each day"). `interpret` and
+ * `plan_review` keep the no-fallback rule absolutely, and `read_image` is
+ * untouched by this decision — it is a photo/scan attachment task, not what
+ * #48 measured.
+ *
+ * This is a fixed module-level set, not read from the environment — see
+ * `quotaFallbackRunner` and `modelRunnerFromEnv`. A `*_FALLBACK_*` variable
+ * named for any other task is never read at all, so misconfiguring one for
+ * `interpret` is structurally inert, not merely unused by convention.
+ */
+export const DOCUMENT_READ_TASKS: ReadonlySet<string> = new Set(["extract", "extract_intake", "extract_itinerary"]);
+
+/**
+ * Decision 48 (docs/sprint6-tracks.md #48): production document reading may
+ * escalate to a SECOND, DIFFERENT, EXPLICITLY CONFIGURED runner — but only
+ * when the primary's own same-model retry (`worthRetrying`, inside its own
+ * `run`) has already ended in RATE_LIMITED. This is deliberately not the
+ * 2026-09-07 failure this module's header warns about: that was an
+ * unannounced swap to a different model MID-CALL, under the same identity,
+ * that finished an interview in the wrong language. This is a visible,
+ * logged, single hop — after the primary has fully given up — to a runner an
+ * operator named on purpose, in configuration, ahead of time. In the owner's
+ * own words on the scope of the fallback: "fallback only due to quota limit,
+ * not on failure."
+ *
+ * Every other `RunnerFailure` — `TIMED_OUT`, `FAILED`, `UPSTREAM_ERROR`,
+ * `BAD_OUTPUT`, `UNAUTHORIZED`, `NOT_CONFIGURED` — surfaces from the primary
+ * exactly as it would with no fallback wired at all. A broken primary must
+ * never be able to hide behind a working fallback.
+ *
+ * `describe` reports the PRIMARY's pin, unconditionally — it answers "what is
+ * this task configured to run on", a configuration-level question, never a
+ * per-call outcome (see `StructuredModelRunner.describe`'s own doc comment:
+ * "for RECORDING, never for deciding"). A caller that wants to know whether a
+ * PARTICULAR answer came from the fallback reads `RunnerResult.usedFallback`.
+ *
+ * Exactly one hop: the fallback's own result, success or failure, is what the
+ * caller gets. Its own RATE_LIMITED is never retried onto a third runner —
+ * chaining fallbacks is the same failure shape one level further out, and
+ * decision 48 asks for one escalation, not a chain.
+ *
+ * Never used generically. `modelRunnerFromEnv` is the only caller, and only
+ * for tasks in `DOCUMENT_READ_TASKS` — `composeRunners`'s own contract is
+ * untouched, so nothing outside that one call site can wrap a runner this
+ * way.
+ */
+export function quotaFallbackRunner(
+  primary: StructuredModelRunner,
+  fallback: StructuredModelRunner,
+  task: string,
+): StructuredModelRunner {
+  return {
+    describe(t) {
+      return primary.describe ? primary.describe(t) : null;
+    },
+    async run<T>(req: StructuredModelRequest<T>): Promise<RunnerResult<T>> {
+      const primaryResult = await primary.run(req);
+      if (primaryResult.ok || primaryResult.reason !== "RATE_LIMITED") return primaryResult;
+      // Task and reason only — never content, never the prompt, never the
+      // answer. The fallback's own provider/model is configuration, not
+      // content, and is what makes "a primary that is always out of quota"
+      // visible in logs rather than silently invisible.
+      const fallbackPin = fallback.describe ? fallback.describe(task) : null;
+      console.warn(structuredLog("warn", "model_runner.quota_fallback", {
+        task,
+        reason: primaryResult.reason,
+        fallbackProvider: fallbackPin?.provider,
+        fallbackModel: fallbackPin?.model,
+      }));
+      const fallbackResult = await fallback.run(req);
+      return { ...fallbackResult, usedFallback: true };
+    },
+  };
+}
+
+/**
  * The OpenRouter key: `OPENROUTER_API_KEY`, or a file holding it.
  *
  * The file may hold the bare key, or be an env file with an
@@ -1419,6 +1504,31 @@ export function runnerForBinding(
  *
  * `plan_review` unset is a visible downgrade: the post-deploy review still
  * runs its deterministic half and records why the model did not contribute.
+ *
+ * **The quota-only fallback (decision 48, docs/sprint6-tracks.md #48).**
+ * `extract`, `extract_intake` and `extract_itinerary` — `DOCUMENT_READ_TASKS`,
+ * the reading-a-document tasks — may additionally be given a SECOND,
+ * explicitly configured binding that `quotaFallbackRunner` calls only when
+ * the primary's own RATE_LIMITED survives its own retries. Unset means no
+ * fallback at all — today's behaviour, byte for byte:
+ *
+ *   EXTRACT_FALLBACK_RUNNER=openrouter|codex|claude|hermes  EXTRACT_FALLBACK_MODEL=<id|profile>
+ *   EXTRACT_FALLBACK_TIMEOUT_MS
+ *   EXTRACT_INTAKE_FALLBACK_RUNNER / _MODEL / _TIMEOUT_MS       (optional; else EXTRACT_FALLBACK_*)
+ *   EXTRACT_ITINERARY_FALLBACK_RUNNER / _MODEL / _TIMEOUT_MS    (optional; else EXTRACT_FALLBACK_*)
+ *
+ * This is the SAME inheritance shape as the primary axis above (own wins,
+ * else inherit the named prefix's whole binding, else none) but resolved
+ * SEPARATELY from it: `EXTRACT_INTAKE_RUNNER=codex` (a primary detached from
+ * `EXTRACT_*`) still inherits `EXTRACT_FALLBACK_*` unless it also sets its own
+ * `EXTRACT_INTAKE_FALLBACK_*`. `interpret`, `plan_review` and `read_image`
+ * have no `_FALLBACK_*` branch at all — not merely unset by convention, but
+ * never read, so misconfiguring one of those names is inert. The fallback
+ * binding is built through the identical `runnerForBinding` the primary uses,
+ * so `FORBIDDEN_MODELS` and the attachment-runner guard apply to it exactly
+ * as they do to any binding, and a fallback that resolves to no runner (a
+ * forbidden model, an unresolvable binding) simply leaves the task unwrapped
+ * — the primary's own result surfaces, same as if no fallback were named.
  */
 export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): StructuredModelRunner | undefined {
   const byTask: Record<string, StructuredModelRunner> = {};
@@ -1439,7 +1549,30 @@ export function modelRunnerFromEnv(env: NodeJS.ProcessEnv = process.env): Struct
       (kind === "openrouter" ? openRouterModel ?? "" : kind === "codex" ? CODEX_LUNA_MODEL : "");
     if (!model) continue;
     const runner = build(kind, model, Number(env[`${source}_TIMEOUT_MS`] || timeoutMs), task);
-    if (runner) byTask[task] = runner;
+    if (!runner) continue;
+
+    // The quota-only fallback (decision 48). A separate axis from the primary
+    // binding above, resolved the same way (own prefix wins, else inherit the
+    // named prefix's whole binding, else none) — and read at all only for the
+    // three document-reading tasks, so `interpret` and `plan_review` cannot be
+    // wired this way by any spelling of the environment.
+    let wired = runner;
+    if (DOCUMENT_READ_TASKS.has(task)) {
+      const fbOwn = (env[`${prefix}_FALLBACK_RUNNER`] || "").trim().toLowerCase();
+      const fbSource = fbOwn ? prefix : inherits && (env[`${inherits}_FALLBACK_RUNNER`] || "").trim() ? inherits : null;
+      if (fbSource) {
+        const fbKind = (env[`${fbSource}_FALLBACK_RUNNER`] || "").trim().toLowerCase();
+        const fbModel =
+          (env[`${fbSource}_FALLBACK_MODEL`] || "").trim() ||
+          (fbKind === "openrouter" ? openRouterModel ?? "" : fbKind === "codex" ? CODEX_LUNA_MODEL : "");
+        if (fbModel) {
+          const fbTimeoutMs = Number(env[`${fbSource}_FALLBACK_TIMEOUT_MS`] || timeoutMs);
+          const fbRunner = build(fbKind, fbModel, fbTimeoutMs, task);
+          if (fbRunner) wired = quotaFallbackRunner(runner, fbRunner, task);
+        }
+      }
+    }
+    byTask[task] = wired;
   }
 
   return Object.keys(byTask).length > 0 ? composeRunners(byTask) : undefined;

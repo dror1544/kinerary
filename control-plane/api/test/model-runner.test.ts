@@ -25,8 +25,12 @@ import {
   openRouterKey,
   openRouterRunner,
   openRouterSpec,
+  quotaFallbackRunner,
   reasonForStatus,
+  runnerForBinding,
   worthRetrying,
+  type RunnerFailure,
+  type RunnerResult,
   type StructuredModelRunner,
 } from "../src/model-runner.js";
 
@@ -252,6 +256,107 @@ describe("composeRunners", () => {
     assert.equal(e.ok && e.value, "e");
     const missing = await runner.run({ task: "phrase", prompt: "", parse: identity });
     assert.equal(missing.ok === false && missing.reason, "NOT_CONFIGURED");
+  });
+});
+
+/**
+ * decision 48 (docs/sprint6-tracks.md #48): production document reading may
+ * escalate — ONCE, only on a quota limit, only after the primary's own
+ * same-model retry has given up — to a second, explicitly configured runner.
+ * Not the 2026-09-07 failure the module header warns about: that was an
+ * unannounced mid-call swap under the same identity; this is a visible,
+ * logged, single hop to a runner an operator named on purpose.
+ *
+ * A stub that always answers the same fixed `RunnerResult`, so these tests
+ * exercise the wrapper's own decision logic and nothing about a real
+ * provider.
+ */
+function fixedRunner<T>(result: RunnerResult<T>): StructuredModelRunner & { calls: unknown[] } {
+  const calls: unknown[] = [];
+  return {
+    calls,
+    describe: () => ({ provider: "fixed", model: "fixed" }),
+    async run() {
+      calls.push(1);
+      return result as RunnerResult<never>;
+    },
+  } as StructuredModelRunner & { calls: unknown[] };
+}
+
+describe("quotaFallbackRunner", () => {
+  const req = { task: "extract_intake", prompt: "p", parse: identity };
+
+  test("primary succeeds: fallback never called, result is primary's, no fallback marker", async () => {
+    const primary = fixedRunner<{ a: number }>({ ok: true, value: { a: 1 }, attempts: 1, ms: 0 });
+    const fallback = fixedRunner<{ a: number }>({ ok: true, value: { a: 2 }, attempts: 1, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.value, { a: 1 });
+    assert.equal(fallback.calls.length, 0);
+    assert.equal(result.ok && "usedFallback" in result ? result.usedFallback : undefined, undefined);
+  });
+
+  const nonQuotaReasons: RunnerFailure[] = ["FAILED", "TIMED_OUT", "UPSTREAM_ERROR", "BAD_OUTPUT", "UNAUTHORIZED", "NOT_CONFIGURED"];
+  for (const reason of nonQuotaReasons) {
+    test(`primary ${reason}: fallback never called, primary's failure surfaces unchanged`, async () => {
+      const primary = fixedRunner({ ok: false, reason, detail: "d", attempts: 1, ms: 0 });
+      const fallback = fixedRunner({ ok: true, value: "should never be reached", attempts: 1, ms: 0 });
+      const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+      const result = await runner.run(req);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok === false && result.reason, reason);
+      assert.equal(fallback.calls.length, 0, `a ${reason} must never reach the fallback — only RATE_LIMITED may`);
+    });
+  }
+
+  test("primary RATE_LIMITED, fallback configured and succeeds: fallback's result returned and marked", async () => {
+    const primary = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429", attempts: 3, ms: 10 });
+    const fallback = fixedRunner<{ a: string }>({ ok: true, value: { a: "fb" }, attempts: 1, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.ok && result.value, { a: "fb" });
+    assert.equal(fallback.calls.length, 1);
+    assert.equal(result.ok && result.usedFallback, true);
+  });
+
+  test("primary RATE_LIMITED, fallback also RATE_LIMITED: the fallback's failure surfaces, exactly one hop", async () => {
+    const primary = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429 primary", attempts: 3, ms: 0 });
+    const fallback = fixedRunner({ ok: false, reason: "RATE_LIMITED" as RunnerFailure, detail: "429 fallback", attempts: 2, ms: 0 });
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    const result = await runner.run(req);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "RATE_LIMITED");
+    assert.equal(result.ok === false && result.detail, "429 fallback", "the fallback's own failure, not the primary's");
+    assert.equal(fallback.calls.length, 1, "exactly one fallback hop — never a fallback of the fallback");
+    assert.equal((result as { usedFallback?: boolean }).usedFallback, true);
+  });
+
+  test("describe names the primary's pin — the fallback is an escalation path, not a re-pin", () => {
+    const primary = fixedRunner({ ok: true, value: 1, attempts: 1, ms: 0 });
+    const fallback: StructuredModelRunner = {
+      describe: () => ({ provider: "should-not-be-read", model: "should-not-be-read" }),
+      run: async () => ({ ok: true, value: 2 as never, attempts: 1, ms: 0 }),
+    };
+    const runner = quotaFallbackRunner(primary, fallback, "extract_intake");
+    assert.deepEqual(runner.describe?.("extract_intake"), { provider: "fixed", model: "fixed" });
+  });
+
+  // The fallback binding is built by the identical `runnerForBinding` the
+  // primary uses, so FORBIDDEN_MODELS and the attachment-runner guard apply
+  // automatically — there is no second gate to forget.
+  test("the fallback binding is refused by the same guards as the primary — forbidden model, and codex cannot attach files", () => {
+    assert.equal(
+      runnerForBinding("openrouter", "openrouter/auto", 1000, "extract_intake", { OPENROUTER_API_KEY: "sk-x" }),
+      undefined,
+      "a model that picks a model is refused whichever side of the fallback wiring names it",
+    );
+    assert.equal(
+      runnerForBinding("codex", "gpt-5.6-luna", 1000, "read_image", {}),
+      undefined,
+      "codex cannot attach files — the same guard the fallback binding would be built through",
+    );
   });
 });
 
