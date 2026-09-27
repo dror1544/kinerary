@@ -362,7 +362,7 @@ describe("B1 (round 4): a removal's booking warnings are capped, never the reaso
         const named = [...NON_REFUNDABLE].filter((i) => text.includes(`UOR-${10000000 + i}`));
         const hiddenNonRefundable = (language === "en"
           ? /records mark (\d+) of them non-refundable/.exec(text)
-          : /שרשום אצלי כבלתי ניתנות להחזר או לביטול: (\d+)/.exec(text))?.[1];
+          : /שרשומות אצלי כבלתי ניתנות להחזר או לביטול: (\d+)/.exec(text))?.[1];
         assert.equal(
           named.length + Number(hiddenNonRefundable ?? 0), NON_REFUNDABLE.size,
           `${language}: every non-refundable booking is named or counted as hidden:\n${text}`,
@@ -388,7 +388,7 @@ describe("B1 (round 4): a removal's booking warnings are capped, never the reaso
       const hidden = 40 - listed;
       assert.match(text, language === "en"
         ? new RegExp(`…and ${hidden} more confirmed bookings fall inside Orlando .* records mark ${hidden} of them non-refundable / not cancellable`)
-        : new RegExp(`ועוד ${hidden} הזמנות מאושרות .* שרשום אצלי כבלתי ניתנות להחזר או לביטול: ${hidden}`));
+        : new RegExp(`ועוד ${hidden} הזמנות מאושרות .* שרשומות אצלי כבלתי ניתנות להחזר או לביטול: ${hidden}`));
       assert.doesNotMatch(text, /I don't know their cancellation terms|אני לא יודע מה תנאי הביטול שלהן/, "never claims not to know terms it knows");
     }
   });
