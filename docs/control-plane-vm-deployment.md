@@ -447,6 +447,87 @@ chat, it just cannot open a GitHub issue. The token is a fine-grained PAT scoped
 to Issues on one repository — never the `gh` CLI's login. See the skill's
 Install section.
 
+### The fleet monitor's database role
+
+**Why.** Every Hermes profile, the traveller-facing companions included, runs in
+the one `hermes` container as uid 10000 over the one data mount
+`/opt/hermes-data:/opt/data` (`compose.vm.yml:385-406`), and the fork's image
+sets `HERMES_WRITE_SAFE_ROOT=/opt/data` (`Dockerfile:379`, as carried in
+`tests/scripts/fixtures/hermes-src/`), so the monitor's `fleet-stacks.json` sits
+where a companion's file tools reach. The URL in it must therefore not be the
+relay's read-write login, and the MCP's read-only `PGOPTIONS` is only a session
+default an inherited value replaces (`fleet-mcp.mjs:338`; issue #302, regression
+plan 2026-09-28 finding 3).
+
+**What it is.** `control-plane/deployment/monitor-db-role.sql` creates
+`kinerary_fleet_ro`: `LOGIN NOINHERIT`, no other attribute, no memberships,
+connection limit 20, `default_transaction_read_only = on`,
+`statement_timeout = 20s`, and `SELECT` on exactly the 79 columns of the 12
+relations the fleet MCP reads — column-level, so `trips.companion_intro` (each
+site's password), `intake_sessions.answers` and people's names stay unreadable
+(the file's header). It also takes `TEMPORARY` on the database from `PUBLIC`,
+which affects every role that is neither a superuser nor the database's owner:
+read `\du` first. It is not a migration: a role is cluster-wide and carries a
+password, and a stack without a monitor needs none (same header).
+`tests/scripts/test_monitor_db_role.py` holds the list to what `fleet-mcp.mjs`
+queries, and fails when a query needs a column the role lacks or the role holds
+one no query needs. Such a change is not live until the role is re-applied here:
+until then that tool fails with "permission denied" (`fleet-mcp.mjs:347`), never
+an empty answer.
+
+**Applying it.** The mechanism is `scripts/create-monitor-db-role.sh`, which
+names no host, container or path and refuses when a value is unset. The values
+are this VM's, so they belong in the private `kinerary-deploy`, in a wrapper
+that is not in this repository and, as of 2026-09-28, not yet written. What it
+sets:
+
+| Variable | This VM | Source |
+|---|---|---|
+| `PSQL_CMD` | `docker exec -i kinerary-cp-postgres-1 psql -X -U kinerary_control_plane -d kinerary_control_plane` | the name `vm-relay-restart.sh:28` uses; the image's `POSTGRES_USER` (`compose.vm.yml:33`) is a superuser, which the script needs to read `pg_authid` |
+| `MONITOR_DB_HOST`, `MONITOR_DB_PORT` | `127.0.0.1`, `5433` | the published loopback port (`compose.vm.yml:42`), which Hermes reaches on the host network (`compose.vm.yml:386`) |
+| `MONITOR_DB_NAME` | `kinerary_control_plane` | `compose.vm.yml:32` |
+| `MONITOR_DB_URL_FILE` | `/opt/kinerary/control-plane/deployment/.local-secrets/fleet_monitor_database_url` | beside the other compose secrets ([Layout](#layout)), outside `/opt/hermes-data` |
+| `MONITOR_DB_URL_OWNER` | `debian` | that directory's owner ([Layout](#layout)); written mode 0600 |
+
+Run it with `sudo`, `--check` first, and only with the owner's yes: creating the
+role is a production database write. The script creates or corrects the role,
+sets a password only when the role is new or the file does not hold its
+password, writes the URL with `umask 077` through a temporary file moved into
+place after the transaction commits, and prints the role and the path, never the
+URL. The password is 32 bytes from `openssl rand`; PostgreSQL is sent only a
+SCRAM verifier computed by the script, so no server log can hold it.
+
+Then point the bootstrap at the file: `FLEET_DB_URL_FILE` is what
+`bootstrap-fleet-monitor.sh` reads (`bootstrap-fleet-monitor.sh:72`). It leaves
+an existing `fleet-stacks.json` alone (`bootstrap-fleet-monitor.sh:121-122`), so
+to move a monitor already bootstrapped with the read-write URL, remove the
+profile's `fleet-stacks.json` and run the bootstrap again. Its step 7 reads the
+control plane through the MCP with the new URL (`bootstrap-fleet-monitor.sh:193-199`).
+
+**Rotating.** `create-monitor-db-role.sh --rotate` sets a new password and
+replaces the file. The profile's `fleet-stacks.json` still holds the old URL, so
+remove it and rerun the bootstrap straight after; until then every monitor query
+fails authentication. The MCP opens a fresh `psql` for each query
+(`fleet-mcp.mjs:328`), so no open session keeps the old password working.
+
+**Verifying.** `create-monitor-db-role.sh --check` changes nothing. It checks the
+file (mode 600, owner, and that its user, address and password are the role's,
+by recomputing the stored SCRAM verifier) and the role (attributes, settings, no
+memberships or owned objects, no `CREATE` or `TEMPORARY`, every column readable
+exactly when the list names it, nothing writable, no `SECURITY DEFINER` function
+it can call). Then, as the role, inside a transaction that is rolled back and is
+not read-only, it tries an `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+`CREATE TABLE`, `CREATE TEMPORARY TABLE` and two reads outside the list, and
+requires every one to be refused with "permission denied". It exits 1 naming
+each difference; a run without `--check` corrects them.
+
+What it does not cover: the URL is still readable by every profile, so a
+companion can read what the monitor reads, including the uploaded document text
+inside `intake_sessions.source_document` (the MCP reads only its filename and
+length, but a column grant cannot narrow a JSON value), companion bug-report
+text, and Telegram chat ids. A client can also override `statement_timeout`, so
+the connection limit is what bounds load.
+
 ## Companion host
 
 The worker installs a trip's companion over SSH to a forced command, as on the
