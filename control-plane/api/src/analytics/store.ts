@@ -119,8 +119,9 @@ export const DEFAULT_RETENTION_DAYS = 90;
  * Deletes events older than the cutoff (design §10: rows without text or
  * direct identifiers live 90–180 days). Returns how many went.
  *
- * NOT SCHEDULED by this slice. Scheduling it is a precondition for enabling
- * assistant events anywhere real, recorded as carry-forward on #177.
+ * Scheduled by `analytics/purge-schedule.ts`, which the relay starts only when
+ * `ASSISTANT_EVENTS_ENABLED=1` (#186): once shortly after start, then daily,
+ * with this default. It deletes from `assistant_events` alone, by `occurred_at`.
  *
  * Refuses a cutoff under one day: `0` would delete everything, and a purge is
  * not the tool for that.

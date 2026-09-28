@@ -47,6 +47,7 @@ import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model
 import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
 import { assistantEventsFromEnv } from "../analytics/emitter.js";
+import { startAssistantEventsPurge } from "../analytics/purge-schedule.js";
 import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
@@ -368,6 +369,7 @@ async function main(): Promise<void> {
   let stopPolling: (() => void) | undefined;
   let stopSweeping: (() => void) | undefined;
   let stopOverrides: (() => void) | undefined;
+  let stopEventsPurge: (() => void) | undefined;
   if (runtime.db) {
     // …and poll only once the companions are back. Every restart (upgrade,
     // rollback, reboot, runner switch) otherwise answers the messages Telegram
@@ -418,6 +420,10 @@ async function main(): Promise<void> {
     });
     // Clears interrupted document writes and claims — see document-sweeper.ts.
     stopSweeping = startDocumentSweeper(runtime.db, documentStore, log);
+    // Retention for assistant events (#186): a daily purge, scheduled only
+    // when recording is on (`ASSISTANT_EVENTS_ENABLED=1`) — otherwise no timer
+    // exists. Undefined when off.
+    stopEventsPurge = startAssistantEventsPurge(process.env, runtime.db, log);
     // Keeps a super admin's `/model` override actually in force. Without this,
     // `/model` writes the override to the database and the switchable runner
     // never reads it back — the command reports success and changes nothing.
@@ -439,6 +445,7 @@ async function main(): Promise<void> {
       stopPolling?.();
       stopSweeping?.();
       stopOverrides?.();
+      stopEventsPurge?.();
       // One last bounded write of what is queued; a failure only drops events.
       void (assistantEvents?.stop() ?? Promise.resolve())
         .catch(() => {})

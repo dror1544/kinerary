@@ -897,7 +897,12 @@ governs, and nothing here is switched on in any deployment.
   turns with no delivered reply, by channel and role, and each document's fate
   as far as the relay can see it.
 - **The purge** — `purgeExpiredEvents(db, olderThanDays = 90)`; refuses under
-  one day, since `0` would delete everything.
+  one day, since `0` would delete everything. Scheduled (#186) by
+  `analytics/purge-schedule.ts`, which the relay starts only when
+  `ASSISTANT_EVENTS_ENABLED=1`: one run 60 seconds after start, then one every
+  24 hours, at the default 90 days. It logs `relay.assistant_events_purged` (`deleted`,
+  `retention_days`) or `relay.assistant_events_purge_failed` (`error_class`,
+  `message`), and a failure is retried at the next tick.
 
 `test/assistant-events-replay.test.ts` replays an anonymized week of the Nir
 trip through the real `dispatchUpdate` and `applyDecision` and checks the
@@ -925,7 +930,7 @@ the setting unset the same week writes nothing.
   trips, which is exactly the cross-trip tracking §5.3 forbids.
 - **No category, no LLM, no Prometheus, no dashboard.** No `question_category`
   is stored, because the relay never reads a message for its topic.
-- **Purge is not scheduled.** The function exists and is tested.
+- **Purge scheduling was not part of this slice**; it followed in #186 (§16.7, item 1).
 - **Not enabled anywhere** (§16.6).
 
 ### 16.3 Where this slice settles or changes the rest of the document
@@ -1169,8 +1174,9 @@ still stand before recording is switched on anywhere (from the
 `regression-planner` and the reviews, as listed in #177's 2026-09-25 comment;
 enabling goes to the Mac first, then production, as decided there):
 
-1. **Schedule `purgeExpiredEvents`.** A precondition for enabling
-   (§10 requires deletion jobs). Not scheduled by this slice.
+1. **Schedule `purgeExpiredEvents` — done (#186).** It was a precondition for
+   enabling (§10 requires deletion jobs). The relay now runs it daily, and
+   only when `ASSISTANT_EVENTS_ENABLED=1` (`analytics/purge-schedule.ts`).
 2. **Tests the planner named:** a boot test for `relay/server.ts`;
    `handedOff(delivered=false)` through `applyDecision`; the connector's
    `suppressed` and `{ok:false}` branches; the `runDocumentCorrection`
