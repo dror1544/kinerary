@@ -378,9 +378,261 @@ const asTable = (rows, headers) =>
 
 const header = (stack) => `Stack: ${stackLabel(stack)}${isProduction(stack) ? "  [PRODUCTION]" : ""}`;
 
+/* ------------------------------------------------- the digest rendering --- */
+
+/**
+ * `format: "digest"` — the same rows, laid out for a person reading Telegram.
+ *
+ * WHY A SECOND RENDERING RATHER THAN PARSING THE FIRST. The daily digest is
+ * delivered by a cron job with no model in it, so whatever this prints is what
+ * the gateway's markdown converter is handed. The text form is written for an
+ * agent: pipe tables, capital-letter titles, sentences explaining how to read
+ * them. Wrapped in code fences to keep the columns, it rendered as boxed
+ * blocks, and its `*Title*` titles came out italic, because a single asterisk
+ * is italic in the markdown Hermes converts. The digest form is built from the
+ * data the same queries already return, and the default output of every tool
+ * is untouched: the agent's text is pinned byte for byte by a test.
+ *
+ * WHAT THIS FORM MAY NOT CONTAIN, because each was measured to go wrong:
+ *   - no ``` fence (Telegram draws it as a box) and no pipe table;
+ *   - no line starting with `>` (that IS a block quote);
+ *   - bold is `**text**`, never `*text*`;
+ *   - nothing a person typed, unstripped — see `md`.
+ *
+ * NOT A NEW CATALOG ENTRY. It is an option on three existing tools, it adds no
+ * query, and it is not offered in their input schemas: the agent has no use
+ * for it and should not learn that it exists.
+ */
+function chooseFormat(format) {
+  if (format === undefined || format === null || format === "" || format === "text") return false;
+  if (format === "digest") return true;
+  throw new Error("format must be 'text' (the default) or 'digest'");
+}
+
+/**
+ * A value from the database, made safe to sit inside a digest line.
+ *
+ * Most values here are slugs and enum-like words, but some are free text a
+ * traveller or an error message wrote (a companion's bug summary, an
+ * unreachable reason). Stripped: newlines and the fold character (a value must
+ * stay on its own line), `*` and backticks (they would turn into bold, italics
+ * or a code fence), and square brackets (`[x](y)` is a link a stranger could
+ * plant in the owner's morning message).
+ */
+const md = (value) =>
+  String(value ?? "")
+    .replace(/[\x1e\r\n\t]+/g, " ")
+    .replace(/[*`]/g, "")
+    .replace(/\[/g, "(")
+    .replace(/\]/g, ")")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/**
+ * Stage names for a person. A stage this table does not know is printed as it
+ * is: a new lifecycle state must appear under its own name rather than
+ * disappear, or be shown under somebody else's.
+ */
+const STAGE_WORDS = {
+  draft: "draft",
+  intake_in_progress: "interviewing",
+  intake_confirmed: "confirmed",
+  provisioning_approved: "approved",
+  ready_private: "ready",
+  ready_public: "ready (public)",
+};
+const stageLabel = (stage) => STAGE_WORDS[stage] ?? md(stage);
+
+/** The classes whose rows are test debris, and what a reader should do about them. */
+const NOISE_CLASSES = new Set(["retired", "scaffolding"]);
+const NOISE_NOTE = "(test runs, ignore)";
+
+const DOT = " · ";
+
+/** Group [key, …rest] rows by their first column, keeping first-seen order. */
+function groupBy(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    if (!groups.has(row[0])) groups.set(row[0], []);
+    groups.get(row[0]).push(row);
+  }
+  return groups;
+}
+
+/** Job states, most reassuring first; a state not listed follows, under its own name. */
+const JOB_STATE_ORDER = ["succeeded", "running", "leased", "queued", "waiting", "failed", "cancelled"];
+function stateCounts(rows) {
+  const rank = (state) => {
+    const i = JOB_STATE_ORDER.indexOf(state);
+    return i === -1 ? JOB_STATE_ORDER.length : i;
+  };
+  return [...rows]
+    .sort((a, b) => rank(a[0]) - rank(b[0]))
+    .map((r) => `${md(r[1])} ${md(r[0])}`)
+    .join(DOT);
+}
+
+// The label says what the stack is; a production stack needs nothing added. The
+// case that needs a flag is the other one, so only that is marked, loudly.
+const digestFirstLine = (stack) =>
+  `${md(stackLabel(stack))}${isProduction(stack) ? "" : `${DOT}NOT PRODUCTION`}`;
+
+function renderOverviewDigest(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links }) {
+  const lines = [digestFirstLine(stack), ""];
+
+  // Trips by class and stage. live, prospect and retired always get a line so
+  // "none" is stated rather than implied; any other class the deployment's own
+  // classification produces follows, and can never be dropped for not being
+  // known here.
+  lines.push("**Trips**");
+  const byClass = groupBy(stages);
+  const classes = ["live", "prospect", "retired", ...(byClass.has("scaffolding") ? ["scaffolding"] : [])];
+  for (const cls of byClass.keys()) if (!classes.includes(cls)) classes.push(cls);
+  for (const cls of classes) {
+    const rows = byClass.get(cls) ?? [];
+    if (rows.length === 0) {
+      lines.push(`• ${md(cls)}: none`);
+      continue;
+    }
+    const total = rows.reduce((n, r) => n + Number(r[2]), 0);
+    const breakdown = rows.map((r) => `${md(r[2])} ${stageLabel(r[1])}`).join(DOT);
+    if (NOISE_CLASSES.has(cls)) {
+      lines.push(`• ${md(cls)}: ${total} ${NOISE_NOTE} — ${breakdown}`);
+    } else if (cls === "live") {
+      const inFlight = rows.filter((r) => !r[1].startsWith("ready_")).reduce((n, r) => n + Number(r[2]), 0);
+      lines.push(`• live: ${breakdown}${inFlight > 0 ? ` — ${inFlight} in flight` : ""}`);
+    } else {
+      lines.push(`• ${md(cls)}: ${breakdown}`);
+    }
+  }
+
+  lines.push("", "**Provisioning**");
+  if (jobs.length === 0) {
+    lines.push("no jobs yet");
+  } else {
+    const byType = groupBy(jobs);
+    for (const [type, rows] of byType) {
+      const counts = stateCounts(rows.map((r) => [r[1], r[2]]));
+      lines.push(byType.size === 1 ? counts : `• ${md(type)}: ${counts}`);
+    }
+  }
+
+  lines.push("");
+  if (notifications.length === 0) {
+    lines.push("**Failed notifications**: none");
+  } else {
+    lines.push("**Failed notifications**");
+    for (const [cls, rows] of groupBy(notifications)) {
+      const detail = rows.map((r) => `${md(r[1])} ×${md(r[3])}`).join(DOT);
+      lines.push(NOISE_CLASSES.has(cls) ? `• ${md(cls)}: ${detail} ${NOISE_NOTE}` : `• ⚠️ ${md(cls)}: ${detail}`);
+    }
+  }
+
+  lines.push("");
+  if (stalled.length === 0) {
+    lines.push("**Open interviews**: none");
+  } else {
+    lines.push("**Open interviews**");
+    for (const r of stalled) lines.push(`• ${md(r[0])}: ${md(r[1])} (longest idle ${md(r[2])}h)`);
+  }
+
+  lines.push("");
+  if (links.length === 0) {
+    lines.push("**Interview links**: none");
+  } else {
+    lines.push("**Interview links**");
+    for (const [cls, rows] of groupBy(links)) {
+      lines.push(`• ${md(cls)}: ${rows.map((r) => `${md(r[2])} ${md(r[1])}`).join(DOT)}`);
+    }
+  }
+
+  lines.push("");
+  if (unreachable.length === 0) {
+    lines.push("**Unreachable**: none");
+  } else {
+    lines.push("**Unreachable**");
+    for (const r of unreachable) lines.push(`• ${md(r[0])} — ${md(r[1])}`);
+  }
+
+  lines.push("");
+  if (stuck.length === 0) {
+    lines.push("**Confirmed, never built**: none");
+  } else {
+    lines.push("**Confirmed, never built**");
+    for (const r of stuck) lines.push(`• ${md(r[0])} — ${md(r[1])}, ${stageLabel(r[2])}, waiting ${md(r[3])}`);
+  }
+  return lines.join("\n");
+}
+
+const DURATION_WORDS = {
+  "build minutes (median, to last heartbeat)": "build",
+  "interview minutes (median)": "interview",
+};
+
+function renderStatisticsDigest(stack, d, { funnel, builds, durations, classes, models }) {
+  const used = new Set();
+  const value = (key) => {
+    used.add(key);
+    return md(funnel.find((r) => r[0] === key)?.[1] ?? "0");
+  };
+  const started = Number(value("interviews started"));
+  const confirmed = Number(value("interviews confirmed"));
+  const issued = Number(value("interview links issued"));
+  const opened = Number(value("links opened"));
+  const pct = (a, b) => (b > 0 ? `${Math.round((a / b) * 100)}%` : "n/a");
+
+  const created = classes.map((r) => `${md(r[0])} ${md(r[1])}`).join(DOT);
+  const anyNoise = classes.some((r) => NOISE_CLASSES.has(r[0]));
+  const ok = Number(builds.find((r) => r[0] === "succeeded")?.[1] ?? 0);
+  const bad = builds.filter((r) => r[0] !== "succeeded").reduce((n, r) => n + Number(r[1]), 0);
+  const modelOk = Number(models.find((r) => r[0] === "succeeded")?.[1] ?? 0);
+  const modelBad = models.filter((r) => r[0] !== "succeeded").reduce((n, r) => n + Number(r[1]), 0);
+
+  const lines = [`**Last ${d} day${d === 1 ? "" : "s"}**`];
+  lines.push(
+    `• trips created: ${value("trips created")}` +
+      (created ? ` (${created}${anyNoise ? "; retired and scaffolding are test runs" : ""})` : ""),
+  );
+  lines.push(
+    `• interview links: ${value("interview links issued")} issued${DOT}${value("links opened")} opened (${pct(opened, issued)})` +
+      `${DOT}${value("links that expired unopened")} expired unopened`,
+  );
+  lines.push(
+    `• interviews: ${value("interviews started")} started${DOT}${value("interviews confirmed")} confirmed (${pct(confirmed, started)})` +
+      `${DOT}${value("a document was sent in")} with a document${DOT}${value("open right now")} open now` +
+      `${DOT}${value("closed for idleness")} closed for idleness`,
+  );
+  lines.push(`• trips reaching ready: ${value("trips reaching ready")}`);
+  // A funnel row this rendering has never heard of is still shown.
+  const others = funnel.filter((r) => !used.has(r[0]));
+  if (others.length > 0) lines.push(`• also: ${others.map((r) => `${md(r[0])} ${md(r[1])}`).join(DOT)}`);
+
+  lines.push(
+    `• provisioning: ${builds.length === 0 ? "no jobs in this window" : stateCounts(builds)}` +
+      `${DOT}build success ${pct(ok, ok + bad)}`,
+  );
+  lines.push(
+    `• interview model calls: ${models.length === 0 ? "none in this window" : stateCounts(models)}` +
+      `${DOT}success ${pct(modelOk, modelOk + modelBad)}`,
+  );
+  const shown = durations.map((r) => {
+    const word = DURATION_WORDS[r[0]];
+    if (!word) return `${md(r[0])} ${md(r[1])}`;
+    return `${word} ${r[1] === "n/a" ? "n/a" : `${md(r[1])} min`}`;
+  });
+  lines.push(`• median duration: ${shown.join(DOT) || "n/a"}`);
+  return lines.join("\n");
+}
+
 /* ---------------------------------------------------------------- tools --- */
 
-async function fleetOverview({ stack = CONFIG.defaultStack }) {
+async function fleetOverview({ stack = CONFIG.defaultStack, format }) {
+  const wantDigest = chooseFormat(format);
+  const data = await loadOverview(stack);
+  return wantDigest ? renderOverviewDigest(stack, data) : renderOverviewText(stack, data);
+}
+
+async function loadOverview(stack) {
   const [stages, jobs, notifications, stalled, unreachable, stuck, links] = await Promise.all([
     runSql(stack, `SELECT ${tripClassSql(stack)}, t.lifecycle_state, count(*)
                      FROM control_plane.trips t GROUP BY 1,2 ORDER BY 1,2;`),
@@ -422,7 +674,10 @@ async function fleetOverview({ stack = CONFIG.defaultStack }) {
                      JOIN control_plane.trips t ON t.id = e.trip_id
                     GROUP BY 1,2 ORDER BY 1,2;`),
   ]);
+  return { stages, jobs, notifications, stalled, unreachable, stuck, links };
+}
 
+function renderOverviewText(stack, { stages, jobs, notifications, stalled, unreachable, stuck, links }) {
   const liveStages = stages.filter((r) => r[0] === "live");
   const byStage = (cls) => stages.filter((r) => r[0] === cls).map((r) => `${r[1]}=${r[2]}`).join(", ") || "none";
 
@@ -687,8 +942,14 @@ async function stalledInterviews({ stack = CONFIG.defaultStack, hours = 6 }) {
   ].join("\n");
 }
 
-async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
+async function statistics({ stack = CONFIG.defaultStack, days = 30, format }) {
+  const wantDigest = chooseFormat(format);
   const d = clamp(days, 1, 365, 30);
+  const data = await loadStatistics(stack, d);
+  return wantDigest ? renderStatisticsDigest(stack, d, data) : renderStatisticsText(stack, d, data);
+}
+
+async function loadStatistics(stack, d) {
   const since = `now() - interval '${d} days'`;
 
   const [funnel, builds, durations, classes, models] = await Promise.all([
@@ -737,7 +998,10 @@ async function statistics({ stack = CONFIG.defaultStack, days = 30 }) {
                      FROM control_plane.interview_interpretations
                     WHERE created_at > ${since} GROUP BY 1 ORDER BY 2 DESC;`),
   ]);
+  return { funnel, builds, durations, classes, models };
+}
 
+function renderStatisticsText(stack, d, { funnel, builds, durations, classes, models }) {
   const value = (rows, key) => rows.find((r) => r[0] === key)?.[1] ?? "0";
   const started = Number(value(funnel, "interviews started"));
   const confirmed = Number(value(funnel, "interviews confirmed"));
@@ -866,8 +1130,14 @@ async function bugReports({ stack = CONFIG.defaultStack, days = 7 }) {
   ].join("\n");
 }
 
-async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
+async function alerts({ stack = CONFIG.defaultStack, hours = 1, format }) {
+  const wantDigest = chooseFormat(format);
   const h = clamp(hours, 1, 240, 1);
+  const data = await loadAlerts(stack, h);
+  return wantDigest ? renderAlertsDigest(stack, data) : renderAlertsText(stack, data);
+}
+
+async function loadAlerts(stack, h) {
   const real = `${tripClassSql(stack)} IN ('live','prospect')`;
 
   // Companion reports ride on the alert, which is what makes a family's
@@ -944,22 +1214,80 @@ async function alerts({ stack = CONFIG.defaultStack, hours = 1 }) {
                         ORDER BY r.reported_at DESC, r.id;`)
       : Promise.resolve([]),
   ]);
+  return { unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported };
+}
 
-  const sections = [];
-  const add = (title, rows, render) => {
-    if (rows.length > 0) sections.push(`${title}\n${rows.map((r) => `  • ${render(r)}`).join("\n")}`);
-  };
-  add("UNREACHABLE", unreachable, (r) => `${r[0]} — ${r[1]}`);
-  add("BUILT WITHOUT AN ORGANIZER CHAT", companionless, (r) => `${r[0]} — site is up, no private chat bound`);
-  add("FAILED JOBS", jobs, (r) => `${r[0]} — ${r[1]} ${r[2]} (attempt ${r[3]})`);
-  add("CONFIRMED BUT NEVER BUILT", stuck, (r) => `${r[0]} — ${r[1]}, confirmed ${r[2]}`);
-  add("INTERVIEW WAITING ON US", awaiting, (r) => `${r[0]} — phase ${r[1]}, waiting on us since ${r[2]}`);
-  add("MODEL FAILING MID-INTERVIEW", modelFailing, (r) => `${r[0]} — ${r[1]}`);
-  add("UNDELIVERED NOTIFICATIONS", notifications, (r) => `${r[0]} — ${r[1]} (attempt ${r[2]})`);
-  add("REPORTED BY A COMPANION", reported, (r) => `${r[0]} [${r[1]}] ${r[2]} (${r[3]}, ${r[4]})`);
+/**
+ * The alert categories, ONCE. The text the agent reads and the compact digest
+ * are two renderings of these same rows, so a category added here cannot reach
+ * one and not the other — which is how a digest ends up announcing a healthy
+ * fleet while the watchdog is describing a fault.
+ *
+ * `text` is the line the agent has always read (its bytes are pinned by a test,
+ * because Hermes hashes them); `digest` is the same incident for a person, with
+ * the trip first. Anything a person could have typed goes through `md`.
+ */
+function alertSections({ unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported }) {
+  return [
+    { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
+      text: (r) => `${r[0]} — ${r[1]}`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])}` },
+    { title: "BUILT WITHOUT AN ORGANIZER CHAT", label: "no organizer chat", rows: companionless,
+      text: (r) => `${r[0]} — site is up, no private chat bound`,
+      digest: (r) => `${md(r[0])} — site is up, no private chat bound` },
+    { title: "FAILED JOBS", label: "failed job", rows: jobs,
+      text: (r) => `${r[0]} — ${r[1]} ${r[2]} (attempt ${r[3]})`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])} ${md(r[2])} (attempt ${md(r[3])})` },
+    { title: "CONFIRMED BUT NEVER BUILT", label: "confirmed, never built", rows: stuck,
+      text: (r) => `${r[0]} — ${r[1]}, confirmed ${r[2]}`,
+      digest: (r) => `${md(r[0])} — ${r[1] === "intake_confirmed" ? "" : `${stageLabel(r[1])}, `}confirmed ${md(r[2])}` },
+    { title: "INTERVIEW WAITING ON US", label: "interview waiting on us", rows: awaiting,
+      text: (r) => `${r[0]} — phase ${r[1]}, waiting on us since ${r[2]}`,
+      digest: (r) => `${md(r[0])} — phase ${md(r[1])}, waiting on us since ${md(r[2])}` },
+    { title: "MODEL FAILING MID-INTERVIEW", label: "model failing mid-interview", rows: modelFailing,
+      text: (r) => `${r[0]} — ${r[1]}`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])}` },
+    { title: "UNDELIVERED NOTIFICATIONS", label: "undelivered notification", rows: notifications,
+      text: (r) => `${r[0]} — ${r[1]} (attempt ${r[2]})`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])} (attempt ${md(r[2])})` },
+    { title: "REPORTED BY A COMPANION", label: "reported by a companion", rows: reported,
+      text: (r) => `${r[0]} [${r[1]}] ${r[2]} (${r[3]}, ${r[4]})`,
+      // A traveller's own summary: cut short, and stripped of anything that
+      // would render as formatting or a link in the message.
+      digest: (r) => `${md(r[0])} — ${md(r[1])}, ${md(r[2]).slice(0, 140)} (${md(r[3])}, ${md(r[4])})` },
+  ];
+}
+
+function renderAlertsText(stack, data) {
+  const sections = alertSections(data)
+    .filter((section) => section.rows.length > 0)
+    .map((section) => `${section.title}\n${section.rows.map((r) => `  • ${section.text(r)}`).join("\n")}`);
 
   if (sections.length === 0) return "";
   return [`⚠️ Kinerary fleet — ${stackLabel(stack)}`, ...sections].join("\n\n");
+}
+
+/** How many incidents of one kind the digest lists before saying "and N more". */
+const DIGEST_ALERT_CAP = 10;
+
+/**
+ * The same incidents, laid out for a person: one bullet each, trip first, no
+ * boxes. Empty string when nothing is wrong, exactly like the text form — the
+ * caller decides what "nothing" looks like, so a failed read can never be
+ * mistaken for it.
+ */
+function renderAlertsDigest(stack, data) {
+  const lines = [];
+  for (const section of alertSections(data)) {
+    for (const r of section.rows.slice(0, DIGEST_ALERT_CAP)) {
+      lines.push(`• ${section.label}: ${section.digest(r)}`);
+    }
+    if (section.rows.length > DIGEST_ALERT_CAP) {
+      lines.push(`• ${section.label}: …and ${section.rows.length - DIGEST_ALERT_CAP} more — ask the monitor for the full list`);
+    }
+  }
+  if (lines.length === 0) return "";
+  return ["**⚠️ Needs attention**", ...lines].join("\n");
 }
 
 async function stacksTool() {
@@ -1151,7 +1479,7 @@ async function runCli(argv) {
   if (!tool) {
     process.stderr.write(
       `usage: fleet-mcp.mjs --tool <${TOOLS.map((t) => t.name).join("|")}>` +
-        ` [--stack <name>] [--days N] [--hours N] [--filter live] [--trip REF]\n`,
+        ` [--stack <name>] [--days N] [--hours N] [--filter live] [--trip REF] [--format digest]\n`,
     );
     process.exit(2);
   }
