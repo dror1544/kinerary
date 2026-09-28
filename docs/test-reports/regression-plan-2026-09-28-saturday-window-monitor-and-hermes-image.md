@@ -180,3 +180,41 @@ Corrections to the existing plan: what ships is D, not `a744c28`; U8.3's P2 is n
 untouched" no longer holds; an evening rollback restarts every companion; "messages wait at Telegram" holds for
 relay restarts only; `inbound` is recreated; V8 moves to the VM monitor after E7; #182 is in the line, #290 and
 #297 are not; live-trip dates are read, not carried.
+
+## 8. Addendum 2026-09-28 (afternoon): the monitor's tool surface and its database credential
+
+A `boundary-reviewer` pass on the monitor-on-VM configuration (with the wrapper's harness and Hermes's own tool
+resolver, on a scratch profile with the real fleet MCP registered) found that section 2's finding 3 is understated.
+Changes to the plan:
+
+1. **`disabled_toolsets: [terminal, code_execution]` is not a lockdown.** On that config alone the resolver gives
+   the monitor 27 tools on both telegram and cron, including `read_file`, `write_file`, `patch`, `search_files`,
+   `web_search`, `web_extract`, `browser_*`, `delegate_task`, `skill_manage` and `memory`. File write into its own
+   profile is process execution (`mcp_servers.<name>.command/args/env` in `config.yaml` are started as processes),
+   which is the shell the runbook forbids. **The enforced configuration is an allow-list:**
+   `platform_toolsets.telegram` and `.cron` = `[fleet]`, `agent.disabled_toolsets` = the full deny list
+   (`terminal, code_execution, file, browser, web, delegation, cronjob, skills, memory, session_search, vision,
+   image_gen, video, video_gen, tts, todo, messaging, computer_use, bfl, kanban, x_search, homeassistant,
+   clarify`), and `known_builtin_toolsets.telegram/.cron` = the Hermes catalog (so a toolset shipped later fails
+   closed). Resolver result: enabled toolsets == `["fleet"]`, model-visible tools == Hermes's three meta-tools
+   (`tool_search`, `tool_describe`, `tool_call`) with the nine `mcp__fleet__*` tools deferred behind them.
+   **Verified end to end** on the Mac monitor profile (applied 2026-09-28 12:08, gateway restarted): a real CLI chat
+   called `mcp__fleet__fleet_overview` and `mcp__fleet__alerts` and answered correctly.
+2. **The wrapper's `--start-gateway` gate asserts the resolved tool surface, not config keys**, fails closed when the
+   resolver cannot run, refuses if `mcp_servers.fleet` has an `env` key or a command/args other than the node binary
+   and the profile's `fleet-mcp.mjs`, or any other MCP server, and refuses on a symlinked `$HERMES_DATA` or
+   `fleet-stacks.json` (root operates in a tree the Hermes uid writes).
+3. **The monitor must not hold the relay's read-write database URL in the shared container.** Every Hermes profile
+   shares one container, one uid and one data mount (`/opt/data`, and `HERMES_WRITE_SAFE_ROOT=/opt/data`), and
+   `fleet-stacks.json` is not on the file tools' credential deny list. Today the control-plane credential lives only
+   in root-owned `.local-secrets` outside the container. **New prerequisite P-RO (Friday, a production database
+   write, needs the owner's yes):** create the read-only role `kinerary_fleet_ro` (SELECT on exactly the 12
+   relations `fleet-mcp.mjs` queries; the generic script `scripts/create-monitor-db-role.sh` and its drift-guard
+   test are being built), write its URL to `.local-secrets/control_plane_database_url_monitor`, and point the
+   wrapper's `FLEET_DB_URL_FILE` at it. The wrapper refuses to use `control_plane_database_url_host` and its gate
+   checks the URL's user (never printing it).
+4. **`trip-intake` has no disabled toolsets and made 0 tool calls** in its log (the interview runs through the
+   router). It can be locked down with the same allow-list at the Hermes recreate at no functional cost; optional.
+5. **No monitor move without P-RO and the gate.** If either is not ready by Friday 20:00 IDT, the Hermes recreate
+   (psql patch) still goes ahead and the monitor stays on the Mac (already locked down there).
+6. A review of the *companion* profiles' tool surface (the same class applies to them) is tracked separately.
