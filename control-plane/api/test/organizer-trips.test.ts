@@ -252,6 +252,29 @@ describe("/trips (DB)", { skip: SKIP }, () => {
     });
   });
 
+  test("carries why a trip is unreachable through to the /trips reply (#296)", async () => {
+    await withFixture(async ({ pool, italyId }) => {
+      const setReason = (reason: string) => pool.query(
+        "UPDATE control_plane.trips SET reachability = 'unreachable', unreachable_reason = $2 WHERE id = $1",
+        [italyId, reason],
+      );
+      const italyLine = async (): Promise<string> => {
+        const decision = await dispatchUpdate(pool, msg(ORGANIZER_CHAT, "/trips"), DEFAULT_STRINGS);
+        assert.equal(decision.kind, "reply");
+        return decision.kind === "reply" ? decision.reply.text.split("\n").find((l) => l.includes("italy-2026")) ?? "" : "";
+      };
+
+      await setReason("TRIP_MCP_BRIDGE_FAILED");
+      const listed = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);
+      assert.equal(listed.find((t) => t.tripId === italyId)?.unreachableReason, "TRIP_MCP_BRIDGE_FAILED");
+      assert.ok((await italyLine()).includes(uiString("tripBridgeUnreachable", "en")));
+
+      await setReason("COMPANION_INSTALL_FAILED");
+      assert.ok((await italyLine()).includes(uiString("tripUnreachable", "en")));
+      assert.ok(!(await italyLine()).includes(uiString("tripBridgeUnreachable", "en")));
+    });
+  });
+
   test("never lists a trip belonging to somebody else", async () => {
     await withFixture(async ({ pool, strangerTripId }) => {
       const trips = await listOrganizerTrips(pool, ORGANIZER_CHAT, ORGANIZER_CHAT);

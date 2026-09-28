@@ -667,6 +667,8 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     // that produced "I don't have a trip for this chat" about a site that was
     // provisioned perfectly.
     tripUnreachable: "(site not responding)",
+    // TRIP_MCP_BRIDGE_FAILED (#296): the site works, the companion cannot read it.
+    tripBridgeUnreachable: "(assistant can't read the trip right now)",
 
     // A document after the trip is confirmed. Nothing it says changes the trip
     // until the organizer approves — so every message says what WOULD change,
@@ -885,6 +887,7 @@ export const UI_STRINGS: Record<Language, Record<string, string>> = {
     switchInGroup: "אני יכול להחליף טיול רק בצ׳אט הפרטי בינינו — הקבוצה הזו נשארת על הטיול שלה.",
     switchInInterview: "אנחנו באמצע הקמת טיול. בואו נסיים את זה קודם, ואז אוכל להחליף.",
     tripUnreachable: "(האתר לא מגיב)",
+    tripBridgeUnreachable: "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)",
 
     correctionReading: "קיבלתי — אני קורא את זה מול הטיול שלכם. כל מה שזה ישנה אראה לכם לפני שמשהו משתנה.",
     correctionProposal: "{document} יעדכן את הטיול שלכם:\n{changes}\n\nשום דבר לא משתנה עד שתאשרו.",
