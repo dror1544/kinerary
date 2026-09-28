@@ -50,17 +50,20 @@ CREATE TABLE control_plane.trips (
   id text PRIMARY KEY CHECK (id ~ '^trip_[a-z0-9]{8,}$'),
   slug text NOT NULL UNIQUE,
   lifecycle_state text NOT NULL CHECK (lifecycle_state IN ('draft','ready_private')),
+  reachability text NOT NULL DEFAULT 'unknown',
+  unreachable_reason text,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE control_plane.telegram_chat_bindings (
-  id text PRIMARY KEY, trip_id text NOT NULL REFERENCES control_plane.trips(id), chat_id text NOT NULL
+  id text PRIMARY KEY, trip_id text NOT NULL REFERENCES control_plane.trips(id), chat_id text NOT NULL,
+  hermes_profile text, closed_at timestamptz
 );
 CREATE UNIQUE INDEX bindings_chat_idx ON control_plane.telegram_chat_bindings (chat_id);
 CREATE FUNCTION control_plane.touch() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN NEW.updated_at := now(); RETURN NEW; END $$;
 CREATE TRIGGER trips_touch BEFORE UPDATE ON control_plane.trips FOR EACH ROW EXECUTE FUNCTION control_plane.touch();
 INSERT INTO control_plane.trips(id, slug, lifecycle_state) VALUES ('trip_aaaaaaaa', 'japan', 'ready_private'), ('trip_bbbbbbbb', 'usa', 'draft');
-INSERT INTO control_plane.telegram_chat_bindings VALUES ('tcb_1', 'trip_aaaaaaaa', '1001');
+INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id) VALUES ('tcb_1', 'trip_aaaaaaaa', '1001');
 """
 
 
@@ -246,7 +249,31 @@ class RestoreAgainstPostgres(unittest.TestCase):
         self.assertEqual(self.sql("kinerary_control_plane",
                                   "SELECT count(*) FROM pg_trigger WHERE tgname = 'trips_touch'"), "1")
         with self.assertRaises(AssertionError):
-            self.sql("kinerary_control_plane", "INSERT INTO control_plane.telegram_chat_bindings VALUES ('tcb_2', 'trip_bbbbbbbb', '1001')")
+            self.sql("kinerary_control_plane",
+                     "INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id) VALUES ('tcb_2', 'trip_bbbbbbbb', '1001')")
+
+    def test_live_companions_includes_a_bridge_failed_trip(self):
+        # Issue #193: TRIP_MCP_BRIDGE_FAILED means the companion itself
+        # answers fine and only its trip-mcp bridge is down — the exact case
+        # `restart-bridges` and `verify` exist to repair. Skipping it here
+        # means the operator's own repair path silently excludes the trip it
+        # exists to fix. A trip that is unreachable for any OTHER reason must
+        # still be excluded.
+        self.sql("kinerary_control_plane", """
+            UPDATE control_plane.telegram_chat_bindings SET hermes_profile = 'japan2026' WHERE id = 'tcb_1';
+            INSERT INTO control_plane.trips(id, slug, lifecycle_state, reachability, unreachable_reason) VALUES
+              ('trip_ccccccc1', 'bridge-broken', 'ready_private', 'unreachable', 'TRIP_MCP_BRIDGE_FAILED'),
+              ('trip_ccccccc2', 'gone-for-good', 'ready_private', 'unreachable', 'ORGANIZER_UNRESOLVED');
+            INSERT INTO control_plane.telegram_chat_bindings(id, trip_id, chat_id, hermes_profile) VALUES
+              ('tcb_bridge', 'trip_ccccccc1', '2001', 'bridge2026'),
+              ('tcb_gone', 'trip_ccccccc2', '2002', 'gone2026');
+        """)
+        result = self.cp.live_companions()
+        self.assertIn(("japan", "japan2026"), result, "an already-reachable trip is unaffected")
+        self.assertIn(("bridge-broken", "bridge2026"), result,
+                      "TRIP_MCP_BRIDGE_FAILED is the one unreachable reason restart-bridges/verify must still see")
+        self.assertNotIn(("gone-for-good", "gone2026"), result,
+                         "genuinely unreachable for another reason is still excluded")
 
 
 if __name__ == "__main__":

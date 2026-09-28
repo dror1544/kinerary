@@ -472,6 +472,27 @@ sudo kinerary-cp-release prune --dry-run
    trip-intake's `*_for_chat` tools, Hermes credentials, and every live trip's
    companion connection and trip-mcp bridge. Dror gets the result on Telegram.
 
+**A trip marked `TRIP_MCP_BRIDGE_FAILED` is not skipped by any of this**
+(issue #193): `restart-bridges`, `verify`'s bridge check and the relay's
+post-restart wait all still include it, because that mark is exactly what
+the operator's own repair path — `setup-mcp.sh --restart-only` (see "A
+Mac-provisioned companion that cannot read its own trip", staging only) or
+its VM equivalent — exists to fix. Fixing the bridge does not clear the
+mark by itself, though: the repair step to reach for is
+`python -m control_plane_worker provision --reconcile-companion <trip_id>`
+(the flag belongs to the `provision` subcommand; run it in the worker
+container, whose environment carries the database URL, deploy root and VM map)
+— it writes `reachability` back to `reachable` (`provisioner.py`'s
+`reconcile_companion` via `_attach_companion`), and it is the one place that
+does so *only after confirming the bridge it just wired is actually healthy*,
+never unconditionally. Run it after the bridge repair, or the trip stays flagged
+unreachable — and reported as such by the fleet monitor — even though
+nothing is wrong with it any more. (`switch-trip-chat.py` also writes
+`reachability = 'reachable'` when it rebinds a chat to an installed
+companion, but with no bridge-health check at all — it is not a substitute
+for this step, and clearing a genuinely-broken bridge's mark that way is a
+known gap, tracked separately as #287.)
+
 **What trips notice.** Websites: nothing. The bot pauses for the relay
 restart. Since the relay waits for the live trips' companions to reconnect
 before polling (`RELAY_GATEWAY_WAIT_SECONDS`, default 40), messages sent in the
