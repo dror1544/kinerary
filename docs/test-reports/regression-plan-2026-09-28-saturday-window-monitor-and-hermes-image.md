@@ -1,3 +1,12 @@
+> **SUPERSEDED FOR SATURDAY (owner decision 2026-09-28, evening).** Saturday 3 Oct is **Release A only** on
+> `release/a` = `a744c28`, exactly as in `regression-plan-2026-09-26-release-a-sprint-mode.md`: no Hermes image
+> rebuild or recreate, no monitor move, no release-line change (`release/a` is not repointed). This document is kept
+> as the analysis for the later window in which the monitor moves into **its own container**. What still applies to
+> Release A from it: section 2 finding 4 (nothing runs CI on `release/**`; G1 rests on `a744c28`'s own push CI, which
+> is green), and section 1's note that #182 is in the release while #290 and #297 are not (a trip built after Release
+> A can be marked `TRIP_MCP_BRIDGE_FAILED` and the release-line relay and installed tool skip its companion in
+> `restart-bridges`/`verify`; neither live trip is exposed).
+
 # Regression plan addendum: Saturday 3 Oct 2026 — the Hermes image rebuild and the fleet monitor's move to the VM
 
 Assessed 2026-09-28 by `regression-planner` (local branch mode), with read-only production probes 07:50-08:40Z
