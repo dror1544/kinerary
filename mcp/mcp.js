@@ -786,6 +786,46 @@ function requireSiteOrAgentKey(req, res, next) {
 const HERMES_EXTRACT_PROFILE = process.env.HERMES_EXTRACT_PROFILE || '';
 const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
 
+// The environment the Hermes child (runHermesExtract, below) may see — an
+// ALLOW-list, matching the pattern control-plane/api/src/model-runner.ts
+// established for the same class of child reading untrusted organizer/
+// document text (structuringChildEnv / claudeChildEnv / codexChildEnv,
+// #153/#58): the base set every such child needs (how to find its own
+// executable, a place to write, a locale, certificates) plus HERMES_HOME — a
+// config-directory location, the same kind of variable as CODEX_HOME, not a
+// credential; Hermes reads its own provider keys from ~/.hermes/.env, never
+// from this process's environment (mirrors hermesChildEnv there). A
+// deny-list cannot be audited here either — issue #183: this bridge's own
+// secrets, HERMES_API_KEY (its MCP auth key) and API_BASE_URL (the trip site
+// it talks to), must never reach a process fed a stranger's uploaded PDF, and
+// neither should anything else this process happens to hold. Before this fix,
+// execFile below passed no `env` option at all — Node treats that as
+// "inherit everything" — so a prompt injection in an uploaded document ran
+// inside a process that could see both.
+//
+// DUPLICATE, NOT SHARED — keep in sync by hand until unified: this list and
+// function are a byte-for-byte copy of control-plane/api/src/model-runner.ts's
+// STRUCTURING_BASE_ENV + hermesChildEnv (#153/#58), not an import of them.
+// mcp.js is plain CommonJS with no existing import path into
+// control-plane/api's TS/ESM build, and model-runner.ts is this task's
+// (#183) "must not touch" — owned by #153/#58 — so a real shared module is a
+// separate, cross-package task with its own brief, not folded into this fix.
+// If either copy's allow-list changes, check the other.
+const HERMES_CHILD_ENV_ALLOW = [
+  'PATH', 'HOME', 'XDG_CONFIG_HOME',
+  'TMPDIR', 'TMP', 'TEMP',
+  'LANG', 'LC_ALL', 'LC_CTYPE',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'HERMES_HOME',
+];
+
+function hermesChildEnv(source = process.env) {
+  const allowed = new Set(HERMES_CHILD_ENV_ALLOW);
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined)
+  );
+}
+
 async function extractPdfText(buf) {
   const { text } = await pdfParse(buf);
   return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 20000);
@@ -805,7 +845,7 @@ function runHermesExtract(prompt, { timeoutMs = 45000 } = {}) {
     execFile(
       HERMES_BIN,
       ['-p', HERMES_EXTRACT_PROFILE, 'chat', '-q', prompt, '-Q', '--ignore-rules', '--reasoning', 'none'],
-      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, env: hermesChildEnv() },
       (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
         if (err.code === 'ENOENT') return reject(new Error(`hermes CLI not found on this host (HERMES_BIN=${HERMES_BIN})`));

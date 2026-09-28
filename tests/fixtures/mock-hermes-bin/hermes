@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stands in for the real `hermes` CLI on PATH, for mcp-extract-env.test.js
+# (issue #183): dumps its own environment and argv to $HERMES_HOME so the
+# test can assert what runHermesExtract actually handed the child, instead
+# of trusting the source. Requires HERMES_HOME so a stray invocation outside
+# the test (HERMES_HOME unset) writes nothing rather than clobbering some
+# other directory.
+if [ -n "$HERMES_HOME" ]; then
+  env > "$HERMES_HOME/env-dump.txt"
+  # NUL-separated, not newline-separated: the prompt argument is a whole
+  # document's worth of text and legitimately contains newlines, which would
+  # otherwise split one argv entry into several dump lines.
+  printf '%s\0' "$@" > "$HERMES_HOME/argv-dump.txt"
+fi
+echo '{}'

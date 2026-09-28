@@ -125,6 +125,7 @@ export const PORTS = {
   groupDocumentMcp:        28293,
   mcpExtract:              28106,
   mcpExtractEmpty:         28300,
+  mcpExtractEnv:           28301,  // tests/mcp-extract-env.test.js — issue #183
   itineraryPlanLayerMcp:   28108,
   mcpDefault:              28117,
   mcpBookingConfirmation:  28116,
