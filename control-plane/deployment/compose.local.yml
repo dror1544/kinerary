@@ -161,6 +161,7 @@ services:
       PROVISIONER_COMPANION_SSH_KNOWN_HOSTS: ${PROVISIONER_COMPANION_SSH_KNOWN_HOSTS:-}
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-}
+      PROVISIONER_BRIDGE_PROBE_MINUTES: ${PROVISIONER_BRIDGE_PROBE_MINUTES:-}
       # ShellDeployAdapter's REPO_ROOT (site/server/shared come from here) —
       # deploy.sh's own default is a host macOS path that doesn't exist
       # inside this container, so this must be set (to /repo) whenever

@@ -122,6 +122,7 @@ services:
       # the Hermes container instead of a launchd plist.
       PROVISIONER_COMPANION_PROFILE_ENABLED: ${PROVISIONER_COMPANION_PROFILE_ENABLED:-0}
       PROVISIONER_MCP_BRIDGE_ENABLED: ${PROVISIONER_MCP_BRIDGE_ENABLED:-0}
+      PROVISIONER_BRIDGE_PROBE_MINUTES: ${PROVISIONER_BRIDGE_PROBE_MINUTES:-}
       # Companion host = this VM, reached from the container as
       # host.docker.internal (extra_hosts below). The key is VM-only — it never
       # authorizes into the Mac — and ~hermes/.ssh/authorized_keys pins it to one

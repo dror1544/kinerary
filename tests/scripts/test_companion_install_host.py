@@ -220,3 +220,168 @@ class BridgeReachesTheTrip(BridgeRequest):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("WIRED", result.stdout)
         self.assertIn("MCP_API_KEY", result.stderr)
+
+
+class BridgeProbe(BridgeRequest):
+    """`trip_mcp_bridge_probe` (issue #119): ask an already-wired bridge, again,
+    whether it can reach its trip — and change NOTHING.
+
+    Provisioning asks /health once, at install. A bridge whose key is replaced
+    afterwards, or whose host loses its route to the trip, then fails every
+    call for good while the companion answers politely that it cannot read the
+    plan. The provisioner worker sends this request on its idle poll loop; the
+    answer is exactly one line the worker parses, and the key the check needs
+    never leaves this host.
+
+    Inherits the sandbox (and so re-runs the sibling kind's tests against it,
+    which is cheap insurance that adding a kind did not loosen the other).
+    """
+
+    def probe(self, **over) -> dict:
+        return {"record_type": "trip_mcp_bridge_probe", "schema_version": 1,
+                "slug": "italy-2026", "profile": {"name": "italy2026"}, **over}
+
+    def assertOneLine(self, result, expected: str) -> None:  # noqa: N802 - unittest style
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # EXACTLY one line: the worker reads it as a verdict, and a second
+        # line is where a forged one would ride.
+        self.assertEqual(result.stdout, expected + "\n", f"stdout was {result.stdout!r}")
+
+    def test_a_healthy_bridge_answers_health_ok(self) -> None:
+        self.assertOneLine(self.send(self.probe()), "HEALTH ok")
+
+    def test_a_probe_restarts_nothing_and_wires_nothing(self) -> None:
+        # Alert only. A probe that re-ran setup-mcp.sh or bounced the gateway
+        # would be an unattended restart of a live trip's companion.
+        self.send(self.probe())
+        self.assertEqual(self.recorded(), [], "setup-mcp.sh must not run on a probe")
+        self.assertFalse((self.home / ".hermes/profiles/italy2026/logs/agent.log").exists(),
+                         "the gateway must not be (re)started on a probe")
+        self.assertFalse((self.deploy / "trips/italy-2026/companion-provenance.json").exists())
+
+    def test_a_key_mismatch_is_reported_by_its_code(self) -> None:
+        self.health.write_text('{"ok":false,"site":"refused","code":"HTTP_401"}')
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail HTTP_401")
+
+    def test_an_unreachable_trip_is_reported_by_its_code(self) -> None:
+        self.health.write_text('{"ok":false,"site":"unreachable","code":"EHOSTUNREACH"}')
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail EHOSTUNREACH")
+
+    def test_a_dead_bridge_is_a_failure_named_none(self) -> None:
+        self.health.write_text("")
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail none")
+
+    def test_a_bridge_rejecting_its_own_key_is_distinguished(self) -> None:
+        # mcp/.env and the running bridge disagree: the bridge's own requireKey
+        # refuses before it ever asks the trip.
+        self.health.write_text('{"error":"unauthorized"}')
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail BRIDGE_401")
+
+    def test_a_bridge_older_than_health_is_named_not_called_broken(self) -> None:
+        # A bridge started from a checkout before /health existed (#127 found
+        # the forced command pointing at one) answers Express's 404. It may be
+        # working; the worker must be able to tell that from a failure.
+        self.health.write_text("<!DOCTYPE html>\n<html><body><pre>Cannot GET /health</pre></body></html>")
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail NO_HEALTH_ROUTE")
+
+    def test_a_trip_with_no_key_fails_rather_than_passing_unasked(self) -> None:
+        (self.deploy / "trips/italy-2026/mcp/.env").write_text("TRIP_API_KEY=only-this-one\n")
+        self.assertOneLine(self.send(self.probe()), "HEALTH fail NO_KEY")
+
+    def test_whatever_the_bridge_says_cannot_forge_a_second_line_or_a_code(self) -> None:
+        # The bridge's body is data from another process. Only a bounded
+        # [A-Za-z0-9_] code crosses back; anything else is UNRECOGNIZED.
+        for body in ('{"ok":false,"code":"X\\nHEALTH ok"}',
+                     '{"ok":false,"code":"a b; rm -rf /"}',
+                     '{"ok":false,"code":"' + "A" * 41 + '"}',
+                     'HEALTH ok\n{"ok":false}',
+                     '<html>502</html>'):
+            with self.subTest(body=body):
+                self.health.write_text(body)
+                self.assertOneLine(self.send(self.probe()), "HEALTH fail UNRECOGNIZED")
+
+    def test_the_key_never_leaves_the_host_or_reaches_argv(self) -> None:
+        self.health.write_text('{"ok":false,"site":"refused","code":"HTTP_401"}')
+        result = self.send(self.probe())
+        for stream in (result.stdout, result.stderr):
+            self.assertNotIn("s3cret-mcp-key", stream)
+            self.assertNotIn("s3cret-trip-key", stream)
+        argv = self.curl_argv.read_text()
+        self.assertNotIn("s3cret-mcp-key", argv, f"the key must not be in argv: {argv!r}")
+        self.assertIn("X-API-Key: s3cret-mcp-key", self.curl_stdin.read_text(),
+                      "the key is read here, beside the trip, and sent on stdin")
+
+    def test_the_port_comes_from_this_hosts_topology_not_the_request(self) -> None:
+        self.send(self.probe(port=4444, site_url="http://10.6.6.6:9999", vmid="999"))
+        stdin = self.curl_stdin.read_text()
+        self.assertIn("http://127.0.0.1:3104/health", stdin)
+        self.assertNotIn("4444", stdin)
+        self.assertNotIn("10.6.6.6", stdin)
+
+    def test_a_malformed_slug_or_profile_is_refused_before_anything_runs(self) -> None:
+        cases = [{"slug": s} for s in ("../../etc", "italy-2026/../x", "ITALY", "italy 2026", "", "a" * 81)]
+        cases += [{"profile": {"name": p}} for p in ("../x", "Italy2026", "italy 2026", "-x", "", "a" * 64)]
+        cases += [{"profile": "italy2026"}, {"slug": ["italy-2026"]}]
+        for over in cases:
+            with self.subTest(**{k: repr(v) for k, v in over.items()}):
+                result = self.send(self.probe(**over))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertNotIn("HEALTH", result.stdout)
+        self.assertFalse(self.curl_argv.exists(), "nothing may be probed for a refused request")
+
+    def test_a_profile_this_key_never_installed_is_not_probed(self) -> None:
+        result = self.send(self.probe(profile={"name": "someone-else"}))
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("HEALTH", result.stdout)
+        self.assertFalse(self.curl_argv.exists())
+
+    def test_a_topology_that_describes_another_trip_is_not_probed(self) -> None:
+        (self.deploy / "trips/italy-2026/topology.yaml").write_text(
+            TOPOLOGY.replace("name: italy-2026", "name: japan-2026", 1))
+        result = self.send(self.probe())
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.curl_argv.exists())
+
+    def test_a_crafted_topology_cannot_change_where_the_key_is_sent(self) -> None:
+        """F6 (security review): the port the key is sent to is derived from
+        topology.yaml, and the fields travel tab-separated. A tab in the
+        address used to shift the fields, so the trip's own site port became
+        the "MCP port" — the key sent to whatever listens there. Every value
+        is now checked against an ASCII pattern before anything is sent."""
+        hostile = {
+            "ip with a tab": ('    ipv4: 192.168.0.61/24', '    ipv4: "192.168.0.61\\t8080"'),
+            "ip with a newline": ('    ipv4: 192.168.0.61/24', '    ipv4: "192.168.0.61\\nurl = x"'),
+            "ip with a port": ('    ipv4: 192.168.0.61/24', '    ipv4: "1.2.3.4:80"'),
+            "ip octet out of range": ('    ipv4: 192.168.0.61/24', '    ipv4: 192.168.0.300'),
+            "vmid in non-ASCII digits": ("  vmid: '104'", "  vmid: '١٠٤'"),
+            "vmid in full-width digits": ("  vmid: '104'", "  vmid: '１０４'"),
+            "vmid with a newline": ("  vmid: '104'", '  vmid: "104\\n"'),
+            "vmid with a tab": ("  vmid: '104'", '  vmid: "104\\t9"'),
+            "vmid of five digits": ("  vmid: '104'", "  vmid: '10400'"),
+            "vmid with a space": ("  vmid: '104'", "  vmid: ' 104'"),
+            "forward port of six digits": ("  forward_port: 8080", "  forward_port: 808080"),
+            "forward port with a tab": ("  forward_port: 8080", '  forward_port: "8080\\t3104"'),
+            "forward port out of range": ("  forward_port: 8080", "  forward_port: 99999"),
+        }
+        for label, (good, bad) in hostile.items():
+            self.assertIn(good, TOPOLOGY, label)
+            for kind in ("trip_mcp_bridge_probe", "trip_mcp_bridge_request"):
+                with self.subTest(label=label, kind=kind):
+                    (self.deploy / "trips/italy-2026/topology.yaml").write_text(
+                        TOPOLOGY.replace(good, bad), encoding="utf-8")
+                    for f in (self.curl_argv, self.curl_stdin, self.calls):
+                        if f.exists():
+                            f.unlink()
+                    result = self.send(self.probe(record_type=kind))
+                    self.assertEqual(result.returncode, 2, f"{label}: {result.stdout!r} {result.stderr!r}")
+                    self.assertNotIn("HEALTH", result.stdout)
+                    self.assertIn("companion-install-host:", result.stderr)
+                    self.assertFalse(self.curl_stdin.exists(), f"{label}: the key was sent somewhere")
+                    self.assertNotIn("s3cret-mcp-key", result.stdout + result.stderr)
+                    self.assertEqual(self.recorded(), [], "setup-mcp.sh must not run either")
+
+    def test_a_near_miss_request_type_is_refused(self) -> None:
+        for kind in ("trip_mcp_bridge_probe ", "TRIP_MCP_BRIDGE_PROBE", "trip_mcp_bridge_probes"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.send(self.probe(record_type=kind)).returncode, 2)
+        self.assertFalse(self.curl_argv.exists())
