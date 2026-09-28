@@ -31,7 +31,7 @@ from .companion_profile import (
     build_companion_handoff,
 )
 from .compute import ComputeAdapter, NullComputeAdapter
-from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter
+from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
 from .release_source import ReleaseSourceError, materialize_release_source
 from .transformer import (
     derive_bookings,
@@ -167,6 +167,177 @@ def _record_reachability(
             "reason": reason,
             "consequence": consequence or "the organizer cannot reach this trip from Telegram",
         })
+
+
+#: /health codes that mean the trip SITE did not answer the bridge — the hop
+#: after the bridge. mcp.js's /health fetches the site's /api/config (5s
+#: timeout) and reports the fetch's own error code; these are the network
+#: errnos Node and undici raise, plus ETIMEDOUT for its timeout.
+_SITE_ERRNO = {"ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN",
+               "ENETUNREACH", "ENETDOWN", "EHOSTDOWN", "ECONNABORTED", "EPIPE"}
+
+
+def _bridge_failure_class(code: str) -> str:
+    """Which hop failed: "key", "site", "mac_route", "bridge", or "other"."""
+    if code in ("HTTP_401", "HTTP_403"):
+        return "key"
+    if code == "EHOSTUNREACH":
+        return "mac_route"
+    if (code in _SITE_ERRNO or code.startswith("UND_ERR_")
+            or (code.startswith("HTTP_5") and len(code) == 8 and code[5:].isdigit())):
+        return "site"
+    if code in ("none", "NO_KEY", "BRIDGE_401"):
+        return "bridge"
+    return "other"
+
+
+def bridge_probe_consequence(code: str, trip_id: str, slug: str) -> str:
+    """The alert text for a trip marked TRIP_MCP_BRIDGE_FAILED by the probe.
+
+    CODE-AWARE, because /health is two hops (bridge -> site) and the right
+    repair depends on which one failed. A site outage (container, NFS,
+    Proxmox) fails /health exactly as a broken bridge does, and sending the
+    operator to `restart-bridges` for it restarts a live companion and fixes
+    nothing. Repair stays an operator's act; nothing here restarts anything.
+    """
+    trip_env = (
+        f"Check first for a trips/{slug}/trip.env in the deploy directory: setup-mcp.sh prefers it over the "
+        f"container's own key, so a stale one re-applies the wrong key on every repair"
+    )
+    rewire = (
+        f"kinerary-cp-release restart-bridges on the control-plane VM; if it persists, re-wire from scratch "
+        f"with python -m control_plane_worker provision --reconcile-companion {trip_id}"
+    )
+    kind = _bridge_failure_class(code)
+    if kind == "key":
+        what = (f"the trip refused the bridge's key ({code}): the key the bridge holds is not the one the "
+                f"trip's container accepts. Repair by re-wiring the bridge: {rewire}. {trip_env}")
+    elif kind == "site":
+        what = (f"the trip's site did not answer through the bridge ({code}) — check the site first (its "
+                f"container, its NFS mount, its Proxmox host); restarting the bridge will not fix a dead site. "
+                f"If the site answers and this persists, the bridge is the next suspect")
+    elif kind == "mac_route":
+        what = (f"the bridge cannot route to the trip's address ({code}). On a Mac companion host this is the "
+                f"Local Network permission a bridge started over SSH lacks, not the key: restart the bridge "
+                f"from a Terminal (setup-mcp.sh --restart-only --trip-dir ./trips/{slug}). On a Linux host it "
+                f"usually means the trip's container is down — check the site first")
+    elif code == "none":
+        what = (f"the bridge did not answer at all (none): it is not running. Restart it: {rewire}. {trip_env}")
+    elif code == "NO_KEY":
+        what = (f"the companion host has no MCP_API_KEY for this trip's bridge (NO_KEY): it was never wired "
+                f"or its mcp/.env is gone. Re-wire it: {rewire}. {trip_env}")
+    elif code == "BRIDGE_401":
+        what = (f"the bridge refused the key in its own mcp/.env (BRIDGE_401): the file changed after the "
+                f"bridge started. Restart it: {rewire}. {trip_env}")
+    else:
+        what = (f"the bridge's /health reported {code}. Check the site first, then the bridge "
+                f"(kinerary-cp-release restart-bridges)")
+    return f"the companion answers normally but cannot read this trip — {what}"
+
+
+def record_bridge_probe(
+    conn: Any,
+    trip_id: str,
+    *,
+    ok: bool,
+    code: str = "",
+    confirmed: bool = False,
+    slug: str = "",
+) -> str:
+    """Records one bridge-probe verdict (issue #119) — CONDITIONALLY, never the
+    unconditional overwrite `_record_reachability` performs.
+
+    - Every verdict stamps `reachability_checked_at`, so "when was this last
+      looked at" is answerable from the row the fleet monitor already prints.
+    - A failure marks the trip `unreachable`/`TRIP_MCP_BRIDGE_FAILED` only when
+      `confirmed` (the caller counted two failed verdicts with no successful
+      verdict between them — see BridgeProbeSweep) AND only when the row says
+      `reachable` right now. Any other
+      reason — NO_ORGANIZER_CHAT, BINDING_REFUSED, … — is the provisioning
+      path's finding and is never replaced; `unknown` is the fail-safe default
+      and a probe has no standing to decide it.
+    - A success clears `unreachable` back to `reachable` only when the reason
+      is TRIP_MCP_BRIDGE_FAILED. The provisioning path records that reason only
+      when the chat binding beside it succeeded (a later binding failure
+      replaces it), so clearing it cannot uncover a masked second fault.
+
+    One reason for every failure code, not a TRIP_MCP_KEY_MISMATCH for
+    HTTP_401: `restart-bridges`, `verify` and the relay's wait select
+    TRIP_MCP_BRIDGE_FAILED trips (#193) and would silently skip a new reason.
+    The code travels in the log line and the consequence text instead.
+
+    The check-and-set is one UPDATE with the condition in its WHERE, so a
+    concurrent writer (switch-trip-chat.py, a reconcile) is never overwritten
+    by a stale read. Returns "marked", "cleared", "unchanged" or
+    "write_failed"; never raises.
+    """
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if ok:
+                    cur.execute(
+                        """UPDATE control_plane.trips
+                              SET reachability = 'reachable',
+                                  unreachable_reason = NULL,
+                                  reachability_checked_at = now()
+                            WHERE id = %s
+                              AND reachability = 'unreachable'
+                              AND unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED'
+                        RETURNING id""",
+                        (trip_id,),
+                    )
+                    changed = cur.fetchone() is not None
+                elif confirmed:
+                    cur.execute(
+                        """UPDATE control_plane.trips
+                              SET reachability = 'unreachable',
+                                  unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED',
+                                  reachability_checked_at = now()
+                            WHERE id = %s
+                              AND reachability = 'reachable'
+                        RETURNING id""",
+                        (trip_id,),
+                    )
+                    changed = cur.fetchone() is not None
+                else:
+                    changed = False
+                if not changed:
+                    cur.execute(
+                        "UPDATE control_plane.trips SET reachability_checked_at = now() WHERE id = %s",
+                        (trip_id,),
+                    )
+    except Exception as exc:
+        # Class and SQLSTATE only, no traceback: a driver's text is not
+        # something this line vouches for (__main__.safe_failure_message).
+        sqlstate = getattr(exc, "sqlstate", None)
+        logger.warning(log_fields(
+            "provisioner.reachability_write_failed", slug=slug, trip_id=trip_id, source="bridge_probe",
+            error=type(exc).__name__, sqlstate=sqlstate if isinstance(sqlstate, str) else None,
+            effect="this verdict was not recorded; the next sweep asks again",
+        ), extra={"trip_id": trip_id, "slug": slug, "source": "bridge_probe"})
+        return "write_failed"
+
+    if not changed:
+        return "unchanged"
+    if ok:
+        logger.info(log_fields(
+            "provisioner.trip_reachable", slug=slug, trip_id=trip_id, source="bridge_probe",
+            cleared="TRIP_MCP_BRIDGE_FAILED",
+        ), extra={"trip_id": trip_id, "slug": slug, "source": "bridge_probe"})
+        return "cleared"
+    consequence = bridge_probe_consequence(code, trip_id, slug)
+    logger.warning(log_fields(
+        "provisioner.trip_unreachable", slug=slug, trip_id=trip_id, source="bridge_probe",
+        reason="TRIP_MCP_BRIDGE_FAILED", code=code, repair=consequence,
+    ), extra={
+        "trip_id": trip_id,
+        "slug": slug,
+        "source": "bridge_probe",
+        "reason": "TRIP_MCP_BRIDGE_FAILED",
+        "code": code,
+        "consequence": consequence,
+    })
+    return "marked"
 
 
 class ShellDeployAdapter:

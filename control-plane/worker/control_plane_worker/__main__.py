@@ -7,6 +7,8 @@ import logging
 import os
 from pathlib import Path
 import re
+import time
+from typing import Any, Callable
 
 from .cleanup import UnsafeCleanupError, load_test_resource_name_prefix, select_test_resources
 from .inventory import ProxmoxHttpTransport, ProxmoxInventory
@@ -30,6 +32,52 @@ def safe_failure_message(exc: BaseException) -> str:
     if isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
         return f"{type(exc).__name__} (sqlstate {sqlstate})"
     return f"{type(exc).__name__}: operation failed, details suppressed"
+
+
+def poll_loop(
+    worker_obj: Any,
+    bridge_sweep: Any,
+    poll_seconds: float,
+    is_stopping: Callable[[], bool],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """The provisioner's loop: one job at a time; when there is none, the
+    bridge probe (if due), then a sleep.
+
+    The probe runs ONLY on an idle poll, in this same thread, so it can never
+    race a provision re-wiring the same trip's bridge (issue #119). A failed
+    sweep has its own handler so the loop still sleeps after it rather than
+    spinning straight back to run_once.
+    """
+    while not is_stopping():
+        try:
+            found = worker_obj.run_once()
+            if not found:
+                try:
+                    bridge_sweep.maybe_run(should_stop=is_stopping)
+                except Exception as exc:
+                    print(json.dumps({"event": "provisioner.bridge_probe_sweep_failed",
+                                      "error": safe_failure_message(exc)}), flush=True)
+                end = monotonic() + poll_seconds
+                while not is_stopping() and monotonic() < end:
+                    sleep(min(0.25, max(0, end - monotonic())))
+        except Exception as exc:
+            print(json.dumps({"event": "provisioner.error", "error": safe_failure_message(exc)}), flush=True)
+
+
+def _non_negative_minutes(raw: str) -> float:
+    """An interval in minutes: a number, 0 or more. Anything else refuses at
+    startup rather than silently becoming a default — an unreadable value
+    quietly turning a check off is the failure this flag exists to end."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"not a number of minutes: {raw!r}") from None
+    if value < 0 or value != value or value == float("inf"):
+        raise argparse.ArgumentTypeError(f"must be 0 (off) or a positive number of minutes: {raw!r}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +167,21 @@ def build_parser() -> argparse.ArgumentParser:
                                 "PROVISIONER_LXC_IP_POOL/PROVISIONER_LXC_HOSTNAME_DOMAIN/PROVISIONER_LXC_TUNNEL_ID "
                                 "(PROVISIONER_COMPUTE_ENABLED=1)")
     provision.add_argument("--poll-seconds", type=float, default=10.0)
+    # Issue #119. ON by default, like the bridge itself: a bridge that stops
+    # reaching its trip after provisioning is otherwise found by an organizer,
+    # not by anyone who can fix it. Two consecutive failed probes mark the trip,
+    # so at 30 minutes one is found within about an hour. It only ever runs
+    # where the SSH bridge adapter is configured (see BridgeProbeSweep).
+    # `or "30"`: compose passes `${PROVISIONER_BRIDGE_PROBE_MINUTES:-}`, so an
+    # unset variable arrives as "" — which must mean the default, not a refusal
+    # that crash-loops the worker and stops provisioning. A value that IS set
+    # but is not a number of minutes still refuses at startup.
+    provision.add_argument("--bridge-probe-minutes", type=_non_negative_minutes,
+                           default=os.environ.get("PROVISIONER_BRIDGE_PROBE_MINUTES") or "30",
+                           help="when idle, re-ask every live trip's trip-mcp bridge whether it still reaches its "
+                                "trip at most this often, and record the answer as the trip's reachability — "
+                                "alert only, nothing is restarted. 0 turns it off "
+                                "(PROVISIONER_BRIDGE_PROBE_MINUTES, default 30)")
     check = subparsers.add_parser("check-database", help="verify the private worker database connection")
     check.add_argument("--database-url-file", default=os.environ.get("CONTROL_PLANE_DATABASE_URL_FILE"))
     return parser
@@ -147,7 +210,13 @@ def _configure_logging() -> None:
     level = getattr(logging, requested, None)
     if not isinstance(level, int):
         level = logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=level, format=LOG_FORMAT)
+
+
+#: The worker's log line. It prints the message and NOTHING from `extra`, so a
+#: fact passed only as an extra field is invisible in the log (#292 tracks the
+#: worker-wide fix). Named so tests can render lines exactly as the worker does.
+LOG_FORMAT = "%(levelname)s %(name)s %(message)s"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -461,22 +530,22 @@ def main(argv: list[str] | None = None) -> int:
             if args.reconcile_companion:
                 print(json.dumps(worker_obj.reconcile_companion(args.reconcile_companion), sort_keys=True), flush=True)
                 return 0
-            import signal, time as _time
+            # The bridge probe (issue #119) rides the same loop, in the same
+            # thread, only when no job was found — so it can never race a
+            # provision that is re-wiring the same trip's bridge. Off, and said
+            # so at startup, wherever the adapter cannot probe (the bridge flag
+            # off, or no companion SSH host).
+            from .mcp_bridge import BridgeProbeSweep
+            bridge_sweep = BridgeProbeSweep(db_url, mcp_bridge_adapter, interval_minutes=args.bridge_probe_minutes)
+            print(bridge_sweep.describe(), flush=True)
+            import signal
             stopping = False
             def _stop(_sig: int, _frame: object) -> None:
                 nonlocal stopping
                 stopping = True
             signal.signal(signal.SIGTERM, _stop)
             signal.signal(signal.SIGINT, _stop)
-            while not stopping:
-                try:
-                    found = worker_obj.run_once()
-                    if not found:
-                        end = _time.monotonic() + args.poll_seconds
-                        while not stopping and _time.monotonic() < end:
-                            _time.sleep(min(0.25, max(0, end - _time.monotonic())))
-                except Exception as exc:
-                    print(json.dumps({"event": "provisioner.error", "error": safe_failure_message(exc)}), flush=True)
+            poll_loop(worker_obj, bridge_sweep, args.poll_seconds, lambda: stopping)
             return 0
         if args.command == "run":
             from .runtime import run
