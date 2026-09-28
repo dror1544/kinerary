@@ -36,6 +36,20 @@ const MAX_GATEWAY_WAIT_SECONDS = 300;
  * column may still read whatever it was before teardown. A stale open binding
  * against such a trip (however it came to exist) must not cost every other
  * trip the full gateway-wait timeout on every relay restart.
+ *
+ * One `unreachable` reason is the exception, not the rule:
+ * `TRIP_MCP_BRIDGE_FAILED` means the companion itself answers fine and only
+ * its trip-mcp bridge is down (`restart-bridges` exists to repair exactly
+ * this). The gateway the relay is waiting on here is the companion's Hermes
+ * gateway, not the bridge, so after a restart it can and does reconnect —
+ * skipping it would mean the relay never waits for a trip whose operator
+ * repair path is `restart-bridges`, the same gap issue #193 fixes on the
+ * `vm-release.py` side.
+ *
+ * The same special case, for the same reason, lives in
+ * `control-plane/deployment/vm-release.py`'s `live_companions()` — if
+ * another `UNREACHABLE_REASONS` value ever needs the same treatment, update
+ * both queries together.
  */
 export async function expectedGatewayProfiles(db: Pick<Pool | PoolClient, "query">): Promise<string[]> {
   const result = await db.query<{ hermes_profile: string }>(
@@ -44,7 +58,7 @@ export async function expectedGatewayProfiles(db: Pick<Pool | PoolClient, "query
        JOIN control_plane.trips t ON t.id = b.trip_id
       WHERE b.closed_at IS NULL
         AND b.hermes_profile IS NOT NULL
-        AND t.reachability <> 'unreachable'
+        AND (t.reachability <> 'unreachable' OR t.unreachable_reason = 'TRIP_MCP_BRIDGE_FAILED')
         AND ${NOT_RETIRED_SQL}
       ORDER BY b.hermes_profile`,
   );

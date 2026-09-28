@@ -40,7 +40,11 @@ actually be reached: `reachable`, `unreachable` with an `unreachable_reason`, or
 is the worst state in the system** — it looks finished and is not. The reasons
 are specific and worth quoting exactly: `ORGANIZER_UNRESOLVED`,
 `ASSISTANT_UNCONFIGURED`, `COMPANION_TEMPLATES_ABSENT`, `COMPANION_INSTALL_FAILED`,
-`NO_ORGANIZER_CHAT`, `BINDING_REFUSED`, `BINDING_FAILED`.
+`NO_ORGANIZER_CHAT`, `BINDING_REFUSED`, `BINDING_FAILED`, `TRIP_RETIRED`,
+`TRIP_MCP_BRIDGE_FAILED`. The last one is milder than the rest: the companion
+itself answers, only its trip-mcp bridge is down, and the operator's own
+repair (`restart-bridges`) exists for exactly that reason — quote it, but
+don't raise it the same as a trip nobody can reach at all.
 
 ## Most rows are test runs. Classify before you alarm.
 
