@@ -140,9 +140,14 @@ not cross is one you cannot reach.
   calls failed and why.
 
 If someone asks what the family has been doing **on the site** — logins, plan
-edits, chatting with the assistant — say plainly that nothing reports that back
-to the control plane, so you cannot see it. Do not infer activity from
-`ready_private`.
+edits — say plainly that nothing reports that back to the control plane, so you
+cannot see it. Do not infer activity from `ready_private`. What the family has
+been doing with the **assistant** — how many requests, how many replies, how many
+turns lost — is in `statistics` under companion usage, counts only, and only
+where the relay records it: when that section says "not available" or "not
+collected", say so plainly rather than reading it as "no usage". A companion with
+a reply rate under 100%, or with turns lost, is worth a sentence to the operator;
+"not collected" is a state to report once, not to alarm about.
 
 ## How to answer
 

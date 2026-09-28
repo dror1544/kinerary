@@ -130,6 +130,26 @@ class GrantListMatchesTheCatalogue(unittest.TestCase):
             for column in columns:
                 self.assertRegex(column, r"^[a-z_][a-z0-9_]*$")
 
+    def test_companion_usage_is_granted_by_column_and_never_the_ids_or_metadata(self):
+        """assistant_events is metadata-only by construction; the role reads only what the usage query counts."""
+        columns = grant_list().get("control_plane.assistant_events")
+        self.assertIsNotNone(columns, "fleet-mcp.mjs reads assistant_events but the role is not granted it")
+        self.assertEqual(
+            columns,
+            {"trip_id", "occurred_at", "event_type", "channel_type", "requester_role", "outcome",
+             "response_latency_ms", "media_kind"})
+        for withheld in ("event_id", "turn_id", "metadata", "trigger_type", "message_length_bucket", "source_service"):
+            self.assertNotIn(withheld, columns, f"assistant_events.{withheld} is not read by any monitor query")
+
+    def test_the_runbook_states_the_number_of_relations_and_columns_the_role_grants(self):
+        """The runbook once said 79 columns of 12 relations; a count in prose goes stale with the list."""
+        grants = grant_list()
+        relations, columns = len(grants), sum(len(c) for c in grants.values())
+        runbook = re.sub(r"\s+", " ", (ROOT / "docs" / "control-plane-vm-deployment.md").read_text())
+        self.assertIn(f"exactly the {columns} columns of the {relations} relations the fleet MCP reads", runbook,
+                      f"the runbook's count of granted columns/relations is stale: the list grants {columns} "
+                      f"columns of {relations} relations")
+
     def test_the_repository_holds_no_password_for_the_role(self):
         for path in (SQL_FILE, SCRIPT):
             text = path.read_text() if path.exists() else ""
@@ -260,6 +280,30 @@ VALUES ('iv_seed000001', 'trip_seed0002', 1, 'artifact-1', 'sha256:' || repeat('
 INSERT INTO control_plane.companion_bug_reports (id, trip_id, hermes_profile, kind, summary, detail, quote, surface)
 VALUES ('bug_seed00001', 'trip_seed0001', 'seedprofile', 'user-reported', 'The map link opens the wrong city',
         E'line one\\nline two', 'a quote', 'site');
+-- Companion usage: a known mix for trip_seed0001 (4 requests: 2 group / 2 DM, 3 organizer / 1 participant,
+-- 2 with media; 2 delivered, 1 failed, 1 suppressed; 1 turn lost of each kind; 3 chatter ignored; reply
+-- latencies 10s, 10s, 3s, 5s -> median 7.5s), one delivered request for a retired trip, one request whose
+-- trip was deleted (trip_id NULL), and one request older than any window the tests ask for.
+INSERT INTO control_plane.assistant_events (event_id, trip_id, occurred_at, source_service, event_type, turn_id,
+    channel_type, trigger_type, requester_role, outcome, response_latency_ms, message_length_bucket, media_kind)
+VALUES
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '5 hours', 'relay', 'request_forwarded', gen_random_uuid(), 'group', 'mention', 'participant', 'dispatched', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '5 hours', 'relay', 'request_forwarded', gen_random_uuid(), 'group', 'name', 'organizer', 'dispatched', NULL, '41_160', 'photo'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '4 hours', 'relay', 'request_forwarded', gen_random_uuid(), 'organizer_dm', 'dm', 'organizer', 'dispatched', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '4 hours', 'relay', 'request_to_relay', gen_random_uuid(), 'organizer_dm', 'dm', 'organizer', 'dispatched', NULL, 'none', 'document'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '5 hours', 'relay', 'reply_sent', NULL, NULL, NULL, NULL, 'reply_delivered', 10000, '41_160', NULL),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '5 hours', 'relay', 'reply_sent', NULL, NULL, NULL, NULL, 'reply_delivered', 10000, '41_160', NULL),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '4 hours', 'relay', 'reply_sent', NULL, NULL, NULL, NULL, 'failed_delivery', 3000, '1_40', NULL),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '4 hours', 'relay', 'reply_sent', NULL, NULL, NULL, NULL, 'reply_suppressed', 5000, 'none', NULL),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '3 hours', 'relay', 'turn_lost', NULL, 'group', 'mention', 'participant', 'lost_gateway_unavailable', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '3 hours', 'relay', 'turn_lost', NULL, 'organizer_dm', 'dm', 'organizer', 'lost_companion_unreachable', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '2 hours', 'relay', 'ignored_not_addressed', NULL, 'group', 'not_addressed', 'participant', 'ignored_not_addressed', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '2 hours', 'relay', 'ignored_not_addressed', NULL, 'group', 'not_addressed', 'organizer', 'ignored_not_addressed', NULL, '41_160', 'none'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '2 hours', 'relay', 'ignored_not_addressed', NULL, 'group', 'not_addressed', 'participant', 'ignored_not_addressed', NULL, '1_40', 'photo'),
+ (gen_random_uuid(), 'trip_seed0001', now() - interval '100 days', 'relay', 'request_forwarded', gen_random_uuid(), 'group', 'mention', 'participant', 'dispatched', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0003', now() - interval '1 day', 'relay', 'request_forwarded', gen_random_uuid(), 'group', 'mention', 'organizer', 'dispatched', NULL, '1_40', 'none'),
+ (gen_random_uuid(), 'trip_seed0003', now() - interval '1 day', 'relay', 'reply_sent', NULL, NULL, NULL, NULL, 'reply_delivered', 1000, '1_40', NULL),
+ (gen_random_uuid(), NULL, now() - interval '1 day', 'relay', 'request_forwarded', gen_random_uuid(), 'group', 'mention', 'participant', 'dispatched', NULL, '1_40', 'none');
 """
 
 #: Every call the monitor can make, each filter included: one query per branch.
@@ -535,6 +579,60 @@ class AgainstPostgres(unittest.TestCase):
         for section in ("UNREACHABLE", "FAILED JOBS", "CONFIRMED BUT NEVER BUILT", "INTERVIEW WAITING ON US",
                         "MODEL FAILING MID-INTERVIEW", "UNDELIVERED NOTIFICATIONS", "REPORTED BY A COMPANION"):
             self.assertIn(section, alerts, "the seed no longer exercises every alert query")
+
+    @unittest.skipUnless(NODE, "node is not installed")
+    def test_companion_usage_is_counted_correctly_by_the_real_query_as_the_role(self):
+        """The stand-in psql cannot tell whether the SQL is right; this can. A wrong query would not fail the
+        tool (a usage failure is reported in words, the digest carries on), so the text is asserted, not the exit."""
+        code, digest, err = self.fleet(self.url(), ["--tool", "statistics", "--days", "30", "--format", "digest"])
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("could not be read", digest)
+        self.assertNotIn("not available", digest)
+        self.assertNotIn("not collected", digest)
+        usage = digest.split("**Companion usage**", 1)[1].strip().splitlines()
+        self.assertEqual(usage, [
+            "• ⚠️ seed-live-2026: 4 requests · 2 replies (50%, under 100%) · 1 failed · 1 suppressed"
+            " · 2 lost (1 gateway unavailable · 1 companion unreachable) · 3 chatter ignored · median 7.5s"
+            " · group 2 / DM 2 · organizer 3 / participants 1 · 2 with media",
+            "• ⚠️ (removed trip): 1 request · 0 replies (0%, under 100%) · 0 failed · 0 lost · 0 chatter ignored"
+            " · median n/a · group 1 / DM 0 · organizer 0 / participants 1",
+            "• retired: 1 request · 1 reply · 0 chatter ignored (test runs, ignore)",
+        ])
+        # A wider window brings the old request in; the text form carries the same counts as a table.
+        _, wide, _ = self.fleet(self.url(), ["--tool", "statistics", "--days", "365"])
+        self.assertIn("seed-live-2026 | live | 5 | 2 | 40% | 1 | 1 | 1 | 1 | 3 | 7.5s | 2 | 3 | 2 | 3 | 2", wide)
+        self.assertIn("tool usage: not collected yet", wide)
+
+    @unittest.skipUnless(NODE, "node is not installed")
+    def test_companion_usage_says_no_table_and_not_collected_against_the_real_catalog(self):
+        """The two no-data states on a real database: no zeros, and no error. The table is put aside for the
+        duration (as the owner, so the role's grants stay with it) and restored whatever happens."""
+        digest_call = ["--tool", "statistics", "--days", "30", "--format", "digest"]
+        self.admin_sql("ALTER TABLE control_plane.assistant_events RENAME TO assistant_events_held;")
+        try:
+            _, gone, _ = self.fleet(self.url(), digest_call)
+            self.assertIn("companion usage: not available — this database has no assistant_events table yet", gone)
+            self.assertNotIn("could not be read", gone)
+            self.assertIn("**Last 30 days**", gone)
+            # The runbook's ordering rule: the grant list names the table, so applying the role to a
+            # database that lacks it fails (inside its own transaction, changing nothing).
+            probe = f"fleetro_probe_{uuid.uuid4().hex[:8]}"
+            refused = subprocess.run([self.env["PSQL_CMD"]], input=f"\\set role {probe}\n".encode() + SQL_FILE.read_bytes(),
+                                     capture_output=True)
+            self.assertNotEqual(refused.returncode, 0, "the role applied to a database with no assistant_events")
+            self.assertIn("assistant_events", refused.stderr.decode())
+            self.assertEqual(self.admin_sql(f"SELECT count(*) FROM pg_roles WHERE rolname = '{probe}'"), "0")
+            self.admin_sql("CREATE TABLE control_plane.assistant_events "
+                           "(LIKE control_plane.assistant_events_held);")
+            try:
+                _, empty, _ = self.fleet(self.admin_url(), digest_call)
+                self.assertIn("companion usage: not collected — assistant events are switched off on this stack", empty)
+                self.assertNotIn(" requests", empty)
+                self.assertNotIn("could not be read", empty)
+            finally:
+                self.admin_sql("DROP TABLE control_plane.assistant_events;")
+        finally:
+            self.admin_sql("ALTER TABLE control_plane.assistant_events_held RENAME TO assistant_events;")
 
     def test_writes_fail_under_the_role_s_session_default(self):
         before = self.admin_sql("SELECT count(*) FROM control_plane.trips")

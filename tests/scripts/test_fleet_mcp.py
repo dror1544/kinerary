@@ -49,6 +49,10 @@ if fixtures:
     import json
     for marker, marker_rows in json.load(open(fixtures)):
         if marker in sql:
+            if isinstance(marker_rows, str):
+                # A string is not rows: it is what psql writes on stderr when it fails.
+                sys.stderr.write(marker_rows + "\\n")
+                sys.exit(1)
             for row in marker_rows:
                 sys.stdout.write("\\x1f".join(row) + "\\n")
             break
@@ -93,6 +97,8 @@ FIXTURES = [
     ('telegram_chat_bindings', [['trip-c']]),
     ('DISTINCT t.slug', [['trip-b', 'TIMED_OUT']]),
     ('companion_bug_reports r\n', [['trip-d', 'bug', 'The itinerary page shows the wrong day', 'rep_1', '2026-09-27 08:00 UTC']]),
+    ('max(e.occurred_at)', [['77', '2026-09-28']]),
+    ('x.response_latency_ms', [['trip-a', 'live', '12', '11', '1', '0', '0', '0', '9', '15000', '2', '8', '4', '5', '7'], ['retired-t-20260901', 'retired', '3', '3', '0', '0', '0', '0', '0', '1000', '0', '3', '0', '1', '2']]),
 ]
 
 #: The agent-facing text of those rows, captured from the commit BEFORE the
@@ -174,7 +180,16 @@ PROVISIONING
 DURATIONS
   measure | value
   build minutes (median, to last heartbeat) | 2
-  interview minutes (median) | 22"""
+  interview minutes (median) | 22
+
+COMPANION USAGE  (counts only, last 7 days; retired/scaffolding are test runs, not customers)
+  trip | class | requests | replies | reply rate | failed | suppressed | lost (gateway) | lost (companion) | chatter ignored | median reply | with media | group | dm | organizer | participant
+  trip-a | live | 12 | 11 | 92% | 1 | 0 | 0 | 0 | 9 | 15s | 2 | 8 | 4 | 5 | 7
+  retired-t-20260901 | retired | 3 | 3 | 100% | 0 | 0 | 0 | 0 | 0 | 1.0s | 0 | 3 | 0 | 1 | 2
+  reply rate = replies delivered / requests. Under 100% means some requests got no delivered reply:
+  a failed or suppressed delivery, or a turn lost (gateway unavailable, companion unreachable).
+  chatter ignored = group messages not addressed to the assistant. Requests split by channel and role.
+  tool usage: not collected yet"""
 
 TEXT_ALERTS = """\
 ⚠️ Kinerary fleet — a control plane
@@ -234,7 +249,11 @@ DIGEST_STATISTICS = """\
 • trips reaching ready: 1
 • provisioning: 1 succeeded · build success 100%
 • interview model calls: 20 succeeded · 2 RATE_LIMITED · success 91%
-• median duration: build 2 min · interview 22 min"""
+• median duration: build 2 min · interview 22 min
+
+**Companion usage**
+• ⚠️ trip-a: 12 requests · 11 replies (92%, under 100%) · 1 failed · 0 lost · 9 chatter ignored · median 15s · group 8 / DM 4 · organizer 5 / participants 7 · 2 with media
+• retired: 3 requests · 3 replies · 0 chatter ignored (test runs, ignore)"""
 
 DIGEST_ALERTS = """\
 **⚠️ Needs attention**
@@ -545,6 +564,216 @@ class FleetMcp(unittest.TestCase):
         self.assertIn("• failed job: …and 3 more", text)
         # ... while the agent's own text lists all of them.
         self.assertEqual(self.rendered("alerts", fixtures=[["j.state = 'failed' AND", rows]]).count("trip-"), 13)
+
+    # ------------------------------------------------------ companion usage --
+    #
+    # `statistics` reads control_plane.assistant_events (metadata-only relay
+    # facts). That table does not exist before Release A and is empty wherever
+    # the relay does not write it, so "nothing to report" has several causes that
+    # must never look alike, and never look like a row of zeros.
+
+    def usage(self, fixtures: list, arguments: dict | None = None) -> str:
+        """The statistics digest with every funnel fixture, plus these usage ones."""
+        return self.rendered("statistics", {"days": 7, "format": "digest", **(arguments or {})},
+                             [*fixtures, *FIXTURES])
+
+    def usage_text(self, fixtures: list) -> str:
+        return self.rendered("statistics", {"days": 7}, [*fixtures, *FIXTURES])
+
+    NO_TABLE = "companion usage: not available — this database has no assistant_events table yet"
+
+    def test_no_table_yet_is_said_in_words_and_the_rest_of_the_digest_survives(self):
+        for render in (self.usage, self.usage_text):
+            self.log.unlink(missing_ok=True)
+            text = render([["to_regclass", [["f"]]]])
+            self.assertIn(self.NO_TABLE, text)
+            self.assertNotIn("0 requests", text)
+            # The relation is named in a query only after the guard said it exists.
+            self.assertFalse([s for s in self.statements() if "FROM control_plane.assistant_events" in s],
+                             "queried a table the guard said is not there")
+        digest = self.usage([["to_regclass", [["f"]]]])
+        self.assertIn("• trips created: 3", digest)
+        self.assertIn("• median duration: build 2 min", digest)
+
+    def test_a_missing_table_reported_by_postgres_itself_is_the_same_state(self):
+        """The guard can pass and the table be gone a moment later: 42P01 is state (a), not an error."""
+        err = 'psql:<stdin>:3: ERROR:  relation "control_plane.assistant_events" does not exist'
+        text = self.usage([["max(e.occurred_at)", err]])
+        self.assertIn(self.NO_TABLE, text)
+        self.assertNotIn("could not be read", text)
+
+    def test_a_table_that_never_held_a_row_is_not_collected_not_zero(self):
+        for render in (self.usage, self.usage_text):
+            text = render([["max(e.occurred_at)", [["0", ""]]]])
+            self.assertIn(
+                "companion usage: not collected — assistant events are switched off on this stack "
+                "(relay ASSISTANT_EVENTS_ENABLED); these would be zeros, not measurements", text)
+            self.assertNotIn(" requests", text)
+            self.assertNotIn("(0%)", text)
+            self.assertNotIn("(n/a)", text)
+
+    def test_no_answer_at_all_from_the_count_is_not_a_zero_either(self):
+        """A count query that returns no row is a failed read, not an empty table."""
+        text = self.usage([["max(e.occurred_at)", []]])
+        self.assertIn("companion usage: could not be read", text)
+        self.assertNotIn("not collected", text)
+
+    def test_rows_that_exist_but_none_in_the_window_say_when_the_last_one_was(self):
+        for render in (self.usage, self.usage_text):
+            text = render([["max(e.occurred_at)", [["41", "2026-09-20"]]], ["x.response_latency_ms", []]])
+            self.assertIn("no companion activity in the last 7 days (last event 2026-09-20)", text)
+            self.assertNotIn("companion usage: not collected", text)
+            self.assertNotIn(" requests", text)
+
+    def test_any_other_database_error_is_named_and_the_rest_of_the_digest_still_renders(self):
+        for error in ("ERROR:  permission denied for table assistant_events",
+                      "ERROR:  canceling statement due to statement timeout"):
+            reason = error.split("ERROR:  ")[1]
+            digest = self.usage([["max(e.occurred_at)", error]])
+            self.assertIn(f"companion usage: could not be read ({reason})", digest)
+            self.assertNotIn("not available", digest)
+            self.assertNotIn("not collected", digest)
+            # the funnel, provisioning and durations sections are all still there
+            self.assertIn("**Last 7 days**", digest)
+            self.assertIn("• trips created: 3 (live 1 · prospect 2)", digest)
+            self.assertIn("• provisioning: 1 succeeded", digest)
+            self.assertIn("• median duration: build 2 min · interview 22 min", digest)
+            text = self.usage_text([["max(e.occurred_at)", error]])
+            self.assertIn(f"companion usage: could not be read ({reason})", text)
+            self.assertIn("FUNNEL", text)
+            self.assertIn("DURATIONS", text)
+
+    def test_the_window_query_failing_is_also_could_not_be_read(self):
+        digest = self.usage([["max(e.occurred_at)", [["50", "2026-09-27"]]],
+                             ["x.response_latency_ms", "ERROR:  column reference is ambiguous"]])
+        self.assertIn("companion usage: could not be read (column reference is ambiguous)", digest)
+        self.assertIn("• trips created: 3", digest)
+
+    def test_an_error_reason_never_carries_connection_details(self):
+        """A failure that is not a database ERROR line (ssh, docker, psql itself) prints nothing of its text."""
+        digest = self.usage([["max(e.occurred_at)", "ssh: connect to host 10.9.8.7 port 22: Connection refused"]])
+        self.assertIn("companion usage: could not be read (the query failed)", digest)
+        self.assertNotIn("10.9.8.7", digest)
+
+    def test_an_answer_that_is_not_numbers_is_an_error_not_zeros(self):
+        digest = self.usage([["max(e.occurred_at)", [["3", "2026-09-27"]]],
+                             ["x.response_latency_ms", [["japan-2026", "live", "lots"] + ["0"] * 12]]])
+        self.assertIn("companion usage: could not be read", digest)
+        self.assertNotIn("lots", digest)
+
+    #: slug, class, requests, delivered, failed, suppressed, lost (gateway), lost (companion),
+    #: chatter, median ms, with media, group, dm, organizer, participant
+    USAGE_ROWS = [
+        ["japan-2026", "live", "12", "12", "0", "0", "0", "0", "9", "15000", "2", "8", "4", "5", "7"],
+        ["orlando-2026", "live", "10", "7", "1", "1", "1", "1", "0", "2300", "0", "0", "10", "10", "0"],
+        ["quiet-2026", "live", "0", "0", "0", "0", "0", "0", "4", "", "0", "0", "0", "0", "0"],
+        ["retired-a-20260901", "retired", "3", "3", "0", "0", "0", "0", "1", "1000", "0", "3", "0", "1", "2"],
+        ["retired-b-20260902", "retired", "2", "1", "0", "0", "1", "0", "0", "800", "1", "0", "2", "2", "0"],
+    ]
+
+    def usage_fixtures(self, rows: list | None = None) -> list:
+        return [["max(e.occurred_at)", [["77", "2026-09-28"]]],
+                ["x.response_latency_ms", self.USAGE_ROWS if rows is None else rows]]
+
+    def test_the_digest_has_one_bullet_per_trip_with_counts_rate_and_median(self):
+        text = self.usage(self.usage_fixtures())
+        self.assertIn("**Companion usage**", text)
+        self.assertIn(
+            "• japan-2026: 12 requests · 12 replies (100%) · 0 failed · 0 lost · 9 chatter ignored · median 15s"
+            " · group 8 / DM 4 · organizer 5 / participants 7 · 2 with media", text)
+        # An under-100% reply rate says so, and every loss is itemised where it happened.
+        self.assertIn(
+            "• ⚠️ orlando-2026: 10 requests · 7 replies (70%, under 100%) · 1 failed · 1 suppressed"
+            " · 2 lost (1 gateway unavailable · 1 companion unreachable) · 0 chatter ignored · median 2.3s"
+            " · group 0 / DM 10 · organizer 10 / participants 0", text)
+        # Chatter with no request is not a reply rate of 0%.
+        self.assertIn("• quiet-2026: 0 requests · 0 replies (n/a) · 0 failed · 0 lost · 4 chatter ignored · median n/a", text)
+        self.assert_telegram_safe(text)
+        self.assertNotIn("╔", text)
+
+    def test_test_run_trips_are_one_line_per_class_marked_as_such(self):
+        """Exactly as `trips created` treats retired and scaffolding: counted, labelled, never per-trip."""
+        text = self.usage(self.usage_fixtures())
+        self.assertIn("• retired: 5 requests · 4 replies · 1 lost · 1 chatter ignored (test runs, ignore)", text)
+        self.assertNotIn("retired-a-20260901", text)
+        self.assertNotIn("retired-b-20260902", text)
+        # and never flagged with a warning, whatever their rate
+        self.assertNotIn("⚠️ retired", text)
+
+    def test_usage_comes_after_the_funnel_and_nothing_before_it_moved(self):
+        text = self.usage(self.usage_fixtures())
+        self.assertEqual(text.splitlines()[0], "**Last 7 days**")
+        self.assertLess(text.index("• median duration"), text.index("**Companion usage**"))
+
+    def test_the_text_rendering_carries_the_same_counts_as_a_table_and_the_tool_usage_line(self):
+        text = self.usage_text(self.usage_fixtures())
+        self.assertIn("COMPANION USAGE", text)
+        section = text.split("COMPANION USAGE", 1)[1]
+        self.assertIn("trip | class | requests | replies | reply rate | failed | suppressed | lost (gateway)"
+                      " | lost (companion) | chatter ignored | median reply | with media | group | dm"
+                      " | organizer | participant", section)
+        self.assertIn("japan-2026 | live | 12 | 12 | 100% | 0 | 0 | 0 | 0 | 9 | 15s | 2 | 8 | 4 | 5 | 7", section)
+        self.assertIn("orlando-2026 | live | 10 | 7 | 70% | 1 | 1 | 1 | 1 | 0 | 2.3s | 0 | 0 | 10 | 10 | 0", section)
+        self.assertIn("quiet-2026 | live | 0 | 0 | n/a", section)
+        self.assertIn("retired-a-20260901 | retired | 3 | 3 | 100%", section)
+        self.assertIn("tool usage: not collected yet", section)
+
+    def test_tool_usage_is_in_the_text_only_and_in_every_state(self):
+        self.assertNotIn("tool usage", self.usage(self.usage_fixtures()))
+        self.assertNotIn("tool usage", self.usage([["to_regclass", [["f"]]]]))
+        for fixtures in ([["to_regclass", [["f"]]]], [["max(e.occurred_at)", [["0", ""]]]],
+                         [["max(e.occurred_at)", [["4", "2026-09-01"]]]],
+                         [["max(e.occurred_at)", "ERROR:  boom"]], self.usage_fixtures()):
+            self.assertIn("tool usage: not collected yet", self.usage_text(fixtures))
+
+    def test_the_usage_query_reads_only_counts_and_named_columns(self):
+        """Metadata only: never event_id, turn_id or metadata — and the role is not granted them."""
+        self.usage(self.usage_fixtures())
+        sent = [s for s in self.statements() if "control_plane.assistant_events" in s and "to_regclass" not in s]
+        self.assertGreaterEqual(len(sent), 2)
+        for statement in sent:
+            for column in ("event_id", "turn_id", "metadata", "trigger_type", "message_length_bucket", "SELECT *", "e.*"):
+                self.assertNotIn(column, statement)
+        window = [s for s in sent if "response_latency_ms" in s]
+        self.assertEqual(len(window), 1)
+        self.assertIn("interval '7 days'", window[0])
+        for word in ("reply_delivered", "failed_delivery", "reply_suppressed", "lost_gateway_unavailable",
+                     "lost_companion_unreachable", "ignored_not_addressed", "request_forwarded",
+                     "request_to_relay"):
+            self.assertIn(word, window[0])
+        # test-run classification is the stack's own, not a copy of it
+        self.assertIn("WHEN t.slug LIKE 'retired-%' THEN 'retired'", window[0])
+
+    def test_a_stack_s_own_trip_class_override_is_used_for_usage_too(self):
+        stacks = json.loads(self.config.read_text())
+        stacks["stacks"]["prod"]["trip_class_sql"] = "'weird'"
+        self.config.write_text(json.dumps(stacks))
+        self.usage(self.usage_fixtures())
+        window = [s for s in self.statements() if "response_latency_ms" in s][0]
+        self.assertIn("'weird'", window)
+        self.assertNotIn("LIKE 'retired-%'", window)
+
+    def test_a_slug_with_markup_cannot_make_markup_in_the_usage_bullets(self):
+        rows = [["**bold** [x](http://e.example) `c`", "live", "1", "1", "0", "0", "0", "0", "0", "1000", "0", "1", "0", "1", "0"]]
+        text = self.usage(self.usage_fixtures(rows))
+        self.assertIn("• bold (x)(http://e.example) c: 1 request · 1 reply (100%)", text)
+        self.assertNotIn("[", text)
+        self.assertNotIn("](", text)
+        self.assert_telegram_safe(text)
+
+    def test_a_class_the_deployment_invented_is_shown_by_name(self):
+        rows = [["sandbox-1", "weird", "2", "2", "0", "0", "0", "0", "0", "1000", "0", "0", "2", "2", "0"]]
+        self.assertIn("• sandbox-1: 2 requests · 2 replies (100%)", self.usage(self.usage_fixtures(rows)))
+
+    def test_many_active_trips_stay_within_one_message(self):
+        rows = [[f"trip-{i:03d}", "live", "5", "5", "0", "0", "0", "0", "1", "1000", "0", "2", "3", "2", "3"]
+                for i in range(60)]
+        text = self.usage(self.usage_fixtures(rows))
+        self.assertEqual(text.count("• trip-"), 15)
+        self.assertIn("• …and 45 more trips with companion activity (the statistics tool lists them all)", text)
+        self.assert_telegram_safe(text)
+        self.assertEqual(self.usage_text(self.usage_fixtures(rows)).count("trip-0"), 60)
+
 
 
 if __name__ == "__main__":
