@@ -262,11 +262,40 @@ is kept **pristine**: everything we add to the fork lives as a patch in
 `control-plane/deployment/hermes-patches/`, and the build applies them.
 
 ```bash
-control-plane/deployment/build-hermes-image.sh            # build + verify, print the tag
-control-plane/deployment/build-hermes-image.sh --set-rev  # + write HERMES_REV into vm.env
-$C up -d --wait hermes                                    # the deploy — restarts every gateway
-control-plane/deployment/hermes-image-check.sh            # what is RUNNING carries these patches
+# 1. Build, from a tree of the revision that carries the patch set. Changes nothing that runs.
+git -C /opt/kinerary fetch
+git -C /opt/kinerary worktree add --detach /var/tmp/hermes-build-<rev> <rev>
+sudo /var/tmp/hermes-build-<rev>/control-plane/deployment/build-hermes-image.sh   # prints the tag; NO --set-rev
+# 2. Deploy through the release tool, which recreates Hermes last.
+sudo kinerary-cp-release upgrade <rev> --hermes-rev <tag> --dry-run   # <tag> is what follows "kinerary-cp/hermes:"
+sudo kinerary-cp-release upgrade <rev> --hermes-rev <tag>             # restarts every gateway
+# 3. What is RUNNING carries these patches
+control-plane/deployment/hermes-image-check.sh
 ```
+
+**The release tool never builds the image.** `upgrade --hermes-rev <tag>` refuses
+in Prepare when `kinerary-cp/hermes:<tag>` is absent (`vm-release.py:1488-1491`),
+recreates Hermes last, after the relay restart (`start_switched`,
+`vm-release.py:1239-1254`), and records `hermes_from` and `hermes_to` in its
+history (`vm-release.py:1523,1530`), which is how `rollback` flips the tag back
+(`vm-release.py:1590-1597`; it fails if the old image is gone, and Hermes images
+are never pruned). A person types this: the `trip-monitor` gate accepts only a
+hex `--hermes-rev` (`vm-release.py:554`), which a patch-set tag is not.
+
+**Do not use `build-hermes-image.sh --set-rev` on this VM.** It edits
+`HERMES_REV` in `vm.env` (`build-hermes-image.sh:141-143`) outside the tool's
+history. Run before an upgrade, the upgrade sees no Hermes change
+(`vm-release.py:1488`), leaves the container alone, and `verify` fails on the
+image tag (`vm-release.py:1317`). Run after a release, a later `rollback` of
+that release silently reverts Hermes, because it takes the target from the
+history row's `hermes_from` (`vm-release.py:1590`).
+
+**Build from a tree that has the newest patch, never from `/opt/kinerary`
+unless it does.** The script reads the patch set from the checkout it lives in
+(`build-hermes-image.sh:26-28`) and tags `<base>-p<hash of the set>` (line 111).
+Built from a tree lacking the newest patch, it re-tags the previous image and
+overwrites the rollback target. Remove the build tree afterwards
+(`git -C /opt/kinerary worktree remove /var/tmp/hermes-build-<rev>`).
 
 The script copies the snapshot, applies every patch in order onto the copy
 (refusing anything that does not apply cleanly — an already-patched tree means
@@ -332,11 +361,17 @@ takes a PDF from the family group to a booking a family member downloads.
 So a change we make to the fork survives only if it is written down here:
 every one lives as a patch in `control-plane/deployment/hermes-patches/`, with
 that directory's README carrying the build, test and rollout steps. Re-apply
-them after any refresh of the snapshot — `HERMES_REV` is then `<sha>-<name>`,
-and a bare sha means the patches are gone. Currently carried:
-`0001-tool-call-payload-key-aliases` (`ab0d98414-toolcall-alias2`), without
-which a deferred tool call whose payload the model spelled `parameters` is
-silently never invoked.
+them after any refresh of the snapshot — `HERMES_REV` is then
+`<sha>-p<hash of the patch set>`, and a bare sha means the patches are gone.
+Currently carried: `0001-tool-call-payload-key-aliases`, without which a
+deferred tool call whose payload the model spelled `parameters` is silently
+never invoked; `0002-relay-media-dir` (above); and `0003-postgresql-client`,
+the `psql` the fleet monitor's MCP shells out to. The image running on
+2026-09-28 was `ab0d98414-pbf43d580` (the 0001+0002 set, per the regression
+plan `docs/test-reports/regression-plan-2026-09-28-saturday-window-monitor-and-hermes-image.md`
+section 5); an image built with 0003 has another hash, so until it is deployed
+`hermes-image-check.sh` reports the running set as different from the
+checkout's (`hermes-image-check.sh:52-55`).
 
 ### The fleet monitor — bootstrapped, not assembled
 
@@ -367,14 +402,44 @@ Three things it decides, each of which has an obvious wrong answer:
   `127.0.0.1:5433`. The fleet MCP can also `docker exec` into postgres, and that
   is the answer to refuse: Hermes gets no Docker socket (safety rule 6). The MCP
   still opens every connection read-only through `PGOPTIONS`.
-- **It verifies psql exists inside the Hermes container**, because the image is
-  not ours. Without it the MCP reads nothing and reports nothing — which looks
-  exactly like a healthy fleet. If it is missing, add a `postgresql-client`
-  layer to the Hermes image and rebuild; do not install it into the running
-  container, which loses it on the next recreate.
+- **It needs `psql` inside the Hermes container**, because the MCP shells out
+  to it and the image is not ours. Without it the MCP reads nothing and reports
+  nothing — which looks exactly like a healthy fleet. The image carries it since
+  patch `0003-postgresql-client` (PR #293), so it is no longer added by hand:
+  an image built without 0003 has none, and `hermes-image-check.sh` fails naming
+  that patch (`hermes-image-check.sh:36-66`). Never install it into the running
+  container, which loses it on the next recreate. The bootstrap's own proof is
+  step 7, the MCP reading the control plane (`bootstrap-fleet-monitor.sh:192-199`).
 - **It does not start the gateway.** The monitor has its own bot, and Telegram
   gives each update to one `getUpdates` loop. Stop the Mac's
   (`hermes -p trip-monitor gateway stop`) before `--start-gateway` here.
+
+Three things it does not do or does not know, found in the 2026-09-28
+regression plan (`docs/test-reports/regression-plan-2026-09-28-saturday-window-monitor-and-hermes-image.md`,
+section 2):
+
+- **The profile blocks the way back.** `rollback --restore-db` refuses when a
+  Hermes profile exists that was not in the dump's `profiles.txt`
+  (`vm-release.py:1615-1621`), and `vm-restore-snapshot.sh` refuses when a
+  profile directory was born after the snapshot (`vm-restore-snapshot.sh:171-177`).
+  A bootstrapped `trip-monitor` is such a profile. Bootstrap the monitor only
+  after an upgrade has soaked; to go back past it, `hermes profile delete
+  trip-monitor` first, then rescan the supervisor
+  (`/command/s6-svscanctl -an /run/service`, as in "Tearing a trip down"). Plain
+  keep-DB `rollback` is unaffected.
+- **The container runs in UTC** (the plan's reading, 2026-09-28; `compose.vm.yml`
+  sets no `TZ`). Set the profile's `timezone` (or `HERMES_TIMEZONE`), or the
+  digest's `0 9 * * *` (`bootstrap-fleet-monitor.sh:177`) fires at 09:00 UTC. The
+  bootstrap sets no timezone.
+- **Toolsets and persona.** The profile must have
+  `agent.disabled_toolsets: [terminal, code_execution]` (see "trip-monitor
+  manages releases too" for why) and the checkout's
+  `.agents/skills/trip-fleet-monitor/SOUL.md` installed as the profile SOUL.
+  `bootstrap-fleet-monitor.sh` does neither (`hermes profile create` seeds a
+  default SOUL, and `install-hermes-skill.sh` manages only the skill; issue #302).
+  Until #302 lands the private deployment wrapper does it. Read both back with
+  `hermes -p trip-monitor config get agent.disabled_toolsets` and a `diff` of
+  the profile's SOUL against the checkout's before `--start-gateway`.
 
 Issue filing is optional and off unless `/opt/kinerary-deploy/issue-target.json`
 exists: without it the monitor still watches and still reports to the operator
@@ -497,7 +562,21 @@ known gap, tracked separately as #287.)
 restart. Since the relay waits for the live trips' companions to reconnect
 before polling (`RELAY_GATEWAY_WAIT_SECONDS`, default 40), messages sent in the
 window wait at Telegram rather than getting "try again". Companions and site AI
-features restart only when `HERMES_REV` changes.
+features restart only when `HERMES_REV` changes, and **that is not queued**: the
+wait above belongs to a relay restart, and nothing holds updates back while
+Hermes is recreated. On the 2026-09-18 recreate the Japan companion's gateway log runs from SIGTERM at
+20:26:00.575 to "relay connected" at 20:26:17.009, about 16 s (measured for the
+2026-09-28 regression plan). A message addressed to a companion in that window
+gets the generic companion-unavailable reply and the turn is lost, and a turn
+in flight is killed: Docker's default 10 s stop grace applies, since
+`compose.vm.yml` sets no `stop_grace_period`, and companion turns have taken
+20-42 s. The release tool's guard checks interview turns (`cmd_upgrade` calls
+`guard_interview`, `vm-release.py:850-859,1499`), not companion turns, and the relay has
+none either, so before a Hermes recreate check for a live companion
+conversation yourself: each live companion's `gateway.log`, last 15 minutes,
+for `inbound message` or `response ready`. Wait it out. If a turn is lost
+anyway the relay logs `trip_bot.update_shape`; the organizer resends, nothing
+is replayed.
 
 **Three ways back:**
 
