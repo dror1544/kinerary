@@ -41,10 +41,14 @@ is the worst state in the system** — it looks finished and is not. The reasons
 are specific and worth quoting exactly: `ORGANIZER_UNRESOLVED`,
 `ASSISTANT_UNCONFIGURED`, `COMPANION_TEMPLATES_ABSENT`, `COMPANION_INSTALL_FAILED`,
 `NO_ORGANIZER_CHAT`, `BINDING_REFUSED`, `BINDING_FAILED`, `TRIP_RETIRED`,
-`TRIP_MCP_BRIDGE_FAILED`. The last one is milder than the rest: the companion
-itself answers, only its trip-mcp bridge is down, and the operator's own
-repair (`restart-bridges`) exists for exactly that reason — quote it, but
-don't raise it the same as a trip nobody can reach at all.
+`TRIP_MCP_BRIDGE_FAILED`. Do not treat the last one as milder because the
+companion still answers: it stays fluent and in character while every trip tool
+fails, so a family is told "I can't retrieve the plan right now" indefinitely
+while every other health check looks green. That is a silent failure, and on a
+`ready_private` trip it gets full severity. Name the repair in the alert: the
+operator runs `restart-bridges`, and once the bridge is confirmed healthy again
+clears the mark with `python -m control_plane_worker --reconcile-companion
+<trip_id>`.
 
 ## Most rows are test runs. Classify before you alarm.
 
