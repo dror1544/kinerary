@@ -7,6 +7,9 @@
 # before trusting a setting that only a patch makes the runtime read, such as
 # HERMES_RELAY_MEDIA_DIR.
 #
+# It also asks the image for `psql`: the fleet monitor's MCP shells out to it,
+# and the image is ours to change only by a patch (hermes-patches/0003).
+#
 #   control-plane/deployment/hermes-image-check.sh                    # the running `hermes` container
 #   control-plane/deployment/hermes-image-check.sh kinerary-cp/hermes:abc-p1234
 #   control-plane/deployment/hermes-image-check.sh --manifest FILE    # compare a file (tests use this)
@@ -30,6 +33,16 @@ case "$target" in
   *)          found="$(docker run --rm --entrypoint sh "$target" -lc "cat $MANIFEST_PATH" 2>/dev/null || true)"; what="image $target" ;;
 esac
 
+# Is `psql` inside what runs? A file has no image to ask, so --manifest says it
+# did not look rather than passing quietly.
+has_psql() {
+  case "$target" in
+    --manifest) return 2 ;;
+    "")         docker exec "$CONTAINER" sh -c 'command -v psql' >/dev/null 2>&1 ;;
+    *)          docker run --rm --entrypoint sh "$target" -lc 'command -v psql' >/dev/null 2>&1 ;;
+  esac
+}
+
 if [ -z "$found" ]; then
   echo "✗ $what carries no patch manifest — it was not built by build-hermes-image.sh," >&2
   echo "  so nothing in it reads a setting a patch adds. Rebuild before deploying." >&2
@@ -43,3 +56,15 @@ if ! diff <(printf '%s\n' "$found") <(expected) >/dev/null; then
 fi
 
 echo "✓ $what carries this checkout's patch set ($(expected | wc -l | tr -d ' ') patch(es))"
+
+rc=0
+has_psql || rc=$?
+case "$rc" in
+  0) echo "✓ $what has psql" ;;
+  2) echo "- psql not probed: --manifest compares a file, not an image" ;;
+  *) echo "✗ $what has no psql — the fleet monitor's MCP shells out to it, and a monitor" >&2
+     echo "  that cannot reach the database reports nothing, which reads like a healthy fleet." >&2
+     echo "  Rebuild the image with patch 0003-postgresql-client (build-hermes-image.sh) and" >&2
+     echo "  redeploy; never install it into the running container — the next recreate loses it." >&2
+     exit 1 ;;
+esac
