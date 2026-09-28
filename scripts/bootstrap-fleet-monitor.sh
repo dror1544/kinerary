@@ -103,6 +103,28 @@ elif say_missing "Hermes profile '$PROFILE'"; then
   ok "created profile '$PROFILE'"
 fi
 
+# ── 1b. Deliver the digest without Hermes's cron wrapper ────────────────────
+# By default Hermes wraps every cron delivery in "Cronjob Response: <name>
+# (job_id: …) ---- … To stop or manage this job, send me a new message". The
+# daily digest runs with --no-agent, so there is nobody to "stop a reminder" —
+# the wrapper is noise around every morning report. `cron.wrap_response` is
+# per profile, and unset means true (`config get` prints the effective value:
+# `true` on a fresh profile, `false` once set). Reading it first makes this
+# idempotent and lets --check report the drift without changing anything.
+wrap_response() {
+  hermes_cli --profile "$PROFILE" config get cron.wrap_response 2>/dev/null \
+    | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
+}
+if [ "$(wrap_response || true)" = "false" ]; then
+  ok "cron.wrap_response is false (deliveries arrive unwrapped)"
+elif say_missing "cron.wrap_response = false (Hermes would wrap every digest in a 'Cronjob Response' header and footer)"; then
+  hermes_cli --profile "$PROFILE" config set cron.wrap_response false >/dev/null
+  # A `set` that did not take would leave the wrapper on with nothing to show it.
+  [ "$(wrap_response || true)" = "false" ] \
+    || die "cron.wrap_response is still not false after 'config set' — the digest would keep its wrapper."
+  ok "set cron.wrap_response = false"
+fi
+
 # ── 2. Skill, from the repo — the profile copy is never the source ──────────
 if HERMES_HOME="$HERMES_HOME" "$REPO_ROOT/scripts/install-hermes-skill.sh" "$SKILL" "$PROFILE" --check >/dev/null 2>&1; then
   ok "skill '$SKILL' is in sync with the repo"

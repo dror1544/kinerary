@@ -227,6 +227,7 @@ hermes --profile <profile> cron create '0 9 * * *' --name fleet-digest \
   --script kinerary_fleet_digest.sh --no-agent --deliver telegram:<chat_id>
 hermes --profile <profile> cron create 'every 30m' "<what to say when it changes>" \
   --name fleet-alerts --monitor-script kinerary_fleet_alerts.sh --deliver telegram:<chat_id>
+hermes --profile <profile> config set cron.wrap_response false   # deliver clean, see below
 
 # 4. issue filing (optional — the monitor works without it)
 cp .agents/skills/trip-fleet-monitor/issue-target.example.json \
@@ -237,6 +238,15 @@ hermes --profile <profile> mcp add issues --command "$(command -v node)" \
   --args ~/.hermes/profiles/<profile>/skills/travel/trip-fleet-monitor/issue-mcp.mjs
 hermes --profile <profile> mcp test issues    # lists one tool
 ```
+
+`cron.wrap_response` is per profile and true by default: Hermes then wraps every
+cron delivery in a "Cronjob Response: <name> (job_id: …)" header and a "To stop
+or manage this job, send me a new message" footer. The digest has no agent
+behind it to answer that, so the bootstrap script sets it to `false` (and
+`--check` reports it as MISSING while it is not). The digest's own layout is
+written for Hermes's Telegram converter: `**bold**` titles, one bullet per fact,
+no code fences. `fleet-mcp.mjs --format digest` renders it; the cron script only
+sequences the three renderings.
 
 The profile's `SOUL.md` is paired to this directory in `.agents/hermes-sync.tsv`,
 so preflight blocks a commit while the two differ.
