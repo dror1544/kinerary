@@ -47,7 +47,7 @@ agent="$(printf '%s' "$payload" | jq -r '.agent_type // empty' 2>/dev/null)"
 # That half is owed here, at the deploy, which is the only moment it can be
 # answered — and the only moment anyone is forced to look. So this does not
 # block: it puts the answer in front of the person while they decide.
-plan_note() {
+plan_note_repo() {
   local head short branch dir exact stale
   dir="$REPO_ROOT/docs/test-reports"
   [ -d "$dir" ] || { printf 'No docs/test-reports/ — nothing has been assessed.'; return; }
@@ -73,6 +73,74 @@ Commits since then are unassessed.' \
   printf 'NO regression plan for %s or %s.
 Ask for one first: "use the regression-planner agent on this branch" — it reads the live fleet, which CI cannot.' \
     "$short" "$branch"
+}
+
+# The same question when KINERARY_NOTES_DIR is set: plans are filed outside the
+# repo now (CLAUDE.md, "Notes, handovers and insights live outside the repo"), and
+# older ones are still under docs/test-reports, so BOTH are searched and the prompt
+# says which. A notes directory that cannot be read is said, never reported as
+# "nothing has been assessed". Only file NAMES reach the prompt, never contents (a
+# vault file is data), and control characters are stripped from them so a name
+# cannot add a line of its own.
+first_matches() {  # first_matches <needle> <file>... -> up to 3 names, control characters shown as ?
+  local needle="$1" f n=0
+  shift
+  while IFS= read -r -d '' f; do
+    printf '%s\n' "${f//[[:cntrl:]]/?}"
+    n=$((n + 1)); [ "$n" -lt 3 ] || break
+  done < <(grep -l --null -- "$needle" "$@" 2>/dev/null)
+}
+
+plan_note_with_notes() {
+  local notes="$1" head short branch legacy vault searched="" note="" exact stale
+  local -a globs=()
+  legacy="$REPO_ROOT/docs/test-reports"
+  vault="$notes/regression-plans"
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)" || return
+  short="${head:0:7}"
+  branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+
+  if [ ! -d "$notes" ]; then
+    note="KINERARY_NOTES_DIR is set but that directory does not exist, so no plan filed there could be checked."
+  elif ! { [ -r "$notes" ] && [ -x "$notes" ] && ls "$notes" >/dev/null 2>&1; }; then
+    note="KINERARY_NOTES_DIR is set but that directory could not be read, so no plan filed there could be checked — this is not the same as nothing having been assessed."
+  elif [ ! -d "$vault" ]; then
+    note="KINERARY_NOTES_DIR has no regression-plans/ folder yet."
+  elif ! { [ -r "$vault" ] && [ -x "$vault" ] && ls "$vault" >/dev/null 2>&1; }; then
+    note="KINERARY_NOTES_DIR/regression-plans could not be read, so no plan filed there could be checked — this is not the same as nothing having been assessed."
+  else
+    globs+=("$vault"/*.md)
+    searched='$KINERARY_NOTES_DIR/regression-plans'
+  fi
+  if [ -d "$legacy" ]; then
+    globs+=("$legacy"/regression-plan-*.md)
+    searched="${searched:+$searched and }docs/test-reports"
+  fi
+  # Both places are named whatever was found, so an absent one reads as absent.
+  [ -d "$legacy" ] || note="${note:+$note }docs/test-reports/ is absent."
+  searched="Searched: ${searched:-nothing} (plans are filed in \$KINERARY_NOTES_DIR/regression-plans; earlier ones in docs/test-reports).${note:+ $note}"
+
+  exact="$(first_matches "$short" "${globs[@]}")"
+  if [ -n "$exact" ]; then
+    printf 'Assessed at this commit (%s):\n%s\n%s' "$short" "$exact" "$searched"
+    return
+  fi
+  stale="$(first_matches "$branch" "${globs[@]}")"
+  if [ -n "$stale" ]; then
+    printf 'NO plan for this commit (%s). There is one for an EARLIER commit on %s:\n%s\n\nCommits since then are unassessed.\n%s' \
+      "$short" "$branch" "$stale" "$searched"
+    return
+  fi
+  printf 'NO regression plan for %s or %s.\nAsk for one first: "use the regression-planner agent on this branch" — it reads the live fleet, which CI cannot.\n%s' \
+    "$short" "$branch" "$searched"
+}
+
+plan_note() {
+  if [ -n "${KINERARY_NOTES_DIR:-}" ]; then
+    plan_note_with_notes "$KINERARY_NOTES_DIR"
+  else
+    plan_note_repo
+  fi
 }
 
 # One line per decision, so "how many prompts does a change cost" is measured

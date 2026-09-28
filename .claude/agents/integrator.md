@@ -98,7 +98,7 @@ person's recollection.
    same intent:    none | <file>: <the consult's verdict, and its reasoning>
    ci:             green on the merge ref (<checks>) | not relied on (<why>)
    verifier:       <report, verbatim> | not run (ci: relied on)
-   assessment:     not needed (<why>) | docs/test-reports/regression-plan-…
+   assessment:     not needed (<why>) | regression-plans/<file> under the notes dir | docs/test-reports/regression-plan-… (legacy)
    carry-forward:  <drafted items>
    command:        gh pr merge NNN --merge     (for the person to run)
    ```
@@ -111,9 +111,12 @@ person's recollection.
 ## At sprint end
 
 The same procedure for `integration/sprint-N → main`, plus `regression-planner`
-in sprint mode, plus one thing about ordering: the deploy hook greps
-`docs/test-reports/` for the exact HEAD, so the plan is written after the
-final commit on the branch, or it names an earlier commit and says so.
+in sprint mode, plus one thing about ordering: the deploy hook searches both
+`$KINERARY_NOTES_DIR/regression-plans/` and the legacy `docs/test-reports/` for
+the exact HEAD, so the plan is written after the final commit on the branch, or
+it names an earlier commit and says so. Check both places for that HEAD; if the
+variable is unset or the folder cannot be read, say so rather than reporting
+"no plan".
 
 ## You do not
 
