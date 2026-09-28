@@ -64,3 +64,35 @@ The build script and the image check arrive with the branch that adds
 `0002-relay-media-dir`; until that merges, this patch is carried in
 `kinerary-cp/hermes:ab0d98414-toolcall-alias2`, built by hand from a patched
 snapshot — which is the practice the script exists to end.
+
+## 0003-postgresql-client
+
+The fleet monitor reads the control-plane database through an MCP that shells
+out to `psql`, and it runs inside the Hermes container. Stock Hermes ships no
+`psql`, so `bootstrap-monitor.sh` refuses on the VM — deliberately, because a
+monitor that cannot reach the database reports nothing, which reads exactly
+like a healthy fleet. The image is not ours to install into: a package put into
+the running container is lost on the next recreate, so the only place it can
+live is the image, and the only way to change the image is a patch here.
+
+The patch adds `postgresql-client` to the **runtime** stage's existing
+`apt-get install -y --no-install-recommends …` line — not the `sqlite_build`
+stage's, which is discarded — and keeps `--no-install-recommends`. It is one
+edited line, not a new `RUN` layer, so the image gains the package without
+another apt cache-and-cleanup cycle. Debian 13 (trixie) ships client 17, which
+talks to older servers fine.
+
+Like any patch, it changes the patch-set hash and therefore the image tag
+(`<base>-p<hash>`), so the running image cannot pass for the new set until it
+is rebuilt. Deploying it recreates the `hermes` container, which restarts every
+companion gateway: do it when no conversation is live.
+`hermes-image-check.sh` now asks the running container (or the named image) for
+`psql` after the manifest check and fails, naming this patch, when it is absent.
+
+Tests: `tests/scripts/test_hermes_patches.py` applies the Dockerfile patches at
+fuzz 0 to a verbatim copy of the pristine Dockerfile
+(`tests/scripts/fixtures/hermes-src/Dockerfile`, read from the VM's
+`/opt/hermes-src` on 2026-09-28), asserts `postgresql-client` lands in the
+runtime stage and not the `sqlite_build` stage, and drives the image check with
+a stand-in `docker` that has and lacks `psql`. The image itself was not built by
+this change; the VM builds it.
