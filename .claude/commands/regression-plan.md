@@ -45,8 +45,12 @@ ledger, and this never edits either.
 
 ## Afterwards
 
-The plan lands in `docs/test-reports/regression-plan-<date>-<topic>.md`. The
-deploy hook greps that directory for the current commit, so a plan filed here
-is what a later `--deploy` prompt reports back — write the commit SHA into it.
+The plan lands in `$KINERARY_NOTES_DIR/regression-plans/<yyyy-mm-dd>-<topic>.md`,
+outside this public repo. The deploy hook searches that folder (and the legacy
+`docs/test-reports/`) for the current commit, so a plan filed there is what a
+later `--deploy` prompt reports back — write the commit SHA into it. If
+`KINERARY_NOTES_DIR` is unset, missing, locked or not writable, say so plainly and
+print the plan in the reply, naming where it could not be written; never fall
+back to `docs/test-reports/`.
 
 Do not run the deploy, and do not approve it. Hard rules 1 and 2 stand.
