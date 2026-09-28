@@ -47,8 +47,8 @@ fails, so a family is told "I can't retrieve the plan right now" indefinitely
 while every other health check looks green. That is a silent failure, and on a
 `ready_private` trip it gets full severity. Name the repair in the alert: the
 operator runs `restart-bridges`, and once the bridge is confirmed healthy again
-clears the mark with `python -m control_plane_worker --reconcile-companion
-<trip_id>`.
+clears the mark with `python -m control_plane_worker provision
+--reconcile-companion <trip_id>`, run in the worker container.
 
 ## Most rows are test runs. Classify before you alarm.
 

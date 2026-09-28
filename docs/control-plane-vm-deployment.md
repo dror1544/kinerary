@@ -479,11 +479,13 @@ the operator's own repair path — `setup-mcp.sh --restart-only` (see "A
 Mac-provisioned companion that cannot read its own trip", staging only) or
 its VM equivalent — exists to fix. Fixing the bridge does not clear the
 mark by itself, though: the repair step to reach for is
-`python -m control_plane_worker --reconcile-companion <trip_id>` — it writes
-`reachability` back to `reachable` (`provisioner.py`'s `reconcile_companion`
-via `_attach_companion`), and it is the one place that does so *only after
-confirming the bridge it just wired is actually healthy*, never
-unconditionally. Run it after the bridge repair, or the trip stays flagged
+`python -m control_plane_worker provision --reconcile-companion <trip_id>`
+(the flag belongs to the `provision` subcommand; run it in the worker
+container, whose environment carries the database URL, deploy root and VM map)
+— it writes `reachability` back to `reachable` (`provisioner.py`'s
+`reconcile_companion` via `_attach_companion`), and it is the one place that
+does so *only after confirming the bridge it just wired is actually healthy*,
+never unconditionally. Run it after the bridge repair, or the trip stays flagged
 unreachable — and reported as such by the fleet monitor — even though
 nothing is wrong with it any more. (`switch-trip-chat.py` also writes
 `reachability = 'reachable'` when it rebinds a chat to an installed
