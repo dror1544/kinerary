@@ -71,7 +71,14 @@ class SubprocessSshTransport:
             # hung. Route through the same redaction rather than letting a
             # different exception type skip it — the leak class #185 closed
             # for a failed run, not specifically for a non-zero exit.
-            detail = _redact((exc.stderr or "").strip() or (exc.stdout or "").strip(), secrets)
+            #
+            # exc.stdout/exc.stderr are BYTES on a real timeout even though
+            # run() was called with text=True (they are the raw pipe buffers,
+            # not decoded); a str secret cannot be replaced in bytes, so
+            # decode first (PR #285 review).
+            detail = _redact(
+                _as_text(exc.stderr).strip() or _as_text(exc.stdout).strip(), secrets,
+            )
             raise RuntimeError(
                 f"ssh command timed out after {self.command_timeout}s: {_truncate_middle(detail)}"
             ) from exc
@@ -84,6 +91,19 @@ class SubprocessSshTransport:
                 f"ssh command failed (exit {result.returncode}): {_truncate_middle(detail)}"
             )
         return result.stdout
+
+
+def _as_text(value: str | bytes | None) -> str:
+    """Normalise TimeoutExpired's stdout/stderr to str. They are None when
+    nothing was captured, bytes on a real timeout (whatever text= was), and
+    str on some Python versions/callers. Undecodable bytes become U+FFFD
+    rather than raising: this runs inside an error path, where a
+    UnicodeDecodeError would replace the diagnosis with a decoding failure."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _redact(text: str, secrets: tuple[str, ...]) -> str:

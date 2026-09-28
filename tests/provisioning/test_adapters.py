@@ -414,27 +414,76 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("s3cret pw$x", str(caught.exception))
         self.assertNotIn("exchange $key", str(caught.exception))
 
-    def test_timeout_redacts_secrets_from_the_raised_error(self) -> None:
-        # subprocess.TimeoutExpired (the hung-command path command_timeout
-        # exists for — the bootstrap script stalling mid-apt, say) carries
-        # its own .stdout/.stderr with whatever the command had already
-        # written, same as a non-zero returncode does — and was not being
-        # redacted at all: a different exception type skipping the same
-        # secrets= handling the returncode!=0 branch has.
+    def _assert_timeout_error_is_redacted(self, timed_out, canary: str = "tr0ub4dor&3") -> str:
         from unittest import mock
 
         transport = SubprocessSshTransport("h", "u", "/k")
-        timed_out = subprocess.TimeoutExpired(
-            cmd=["ssh"], timeout=900,
-            output="+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
-        )
         with mock.patch("provisioning.adapters.subprocess.run", side_effect=timed_out):
             with self.assertRaises(RuntimeError) as caught:
-                transport.run("some script", secrets=("tr0ub4dor&3",))
+                transport.run("some script", secrets=(canary,))
+        text = str(caught.exception)
+        self.assertIn("timed out", text)
+        self.assertNotIn(canary, text)
+        return text
 
-        self.assertNotIn("tr0ub4dor&3", str(caught.exception))
+    # subprocess.TimeoutExpired keeps .stdout/.stderr as BYTES even when
+    # subprocess.run(..., text=True) was used (Python 3.9-3.12, POSIX), so a
+    # test that builds it with str output never exercises the real type. These
+    # cases do. Added after PR #285 review found that str.replace(secret, ...)
+    # on bytes raised TypeError instead of redacting.
+    def test_timeout_with_bytes_stdout_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output=b"+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
+        ))
+        self.assertIn("apt-get installing", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_timeout_with_bytes_stderr_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900, output=None,
+            stderr=b"debug: key=tr0ub4dor&3\nW: still waiting on dpkg lock",
+        ))
+        self.assertIn("dpkg lock", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_timeout_with_non_utf8_bytes_does_not_crash_and_is_redacted(self) -> None:
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output=b"\xff\xfe before tr0ub4dor&3 after \xff\xfe",
+        ))
+        self.assertIn("before", text)
+        self.assertIn("after", text)
+
+    def test_timeout_with_str_output_is_still_redacted(self) -> None:
+        # Some Python versions / callers hand back str; both must work.
+        text = self._assert_timeout_error_is_redacted(subprocess.TimeoutExpired(
+            cmd=["ssh"], timeout=900,
+            output="+ printf SEED_PASSWORD=tr0ub4dor&3\nstill apt-get installing",
+        ))
+        self.assertIn("apt-get installing", text)
+
+    def test_real_ssh_child_that_prints_and_hangs_is_redacted(self) -> None:
+        # No mock of subprocess: a fake `ssh` earlier on PATH prints the canary
+        # and hangs, so the TimeoutExpired is the one Python really raises.
+        # `exec sleep` matters: without it the killed shell's `sleep` child
+        # keeps the pipe open and subprocess.run blocks until it exits.
+        from unittest import mock
+
+        canary = "canary-secret-7f3a"
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "ssh")
+            with open(fake, "w") as handle:
+                handle.write(f"#!/bin/sh\necho {canary}\nexec sleep 30\n")
+            os.chmod(fake, 0o755)
+            transport = SubprocessSshTransport("h", "u", "/k", command_timeout=1)
+            with mock.patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ["PATH"]}):
+                with self.assertRaises(RuntimeError) as caught:
+                    transport.run("some script", secrets=(canary,))
+
         self.assertIn("timed out", str(caught.exception))
-        self.assertIn("apt-get installing", str(caught.exception))
+        self.assertNotIn(canary, str(caught.exception))
+        self.assertIn("[REDACTED]", str(caught.exception))
 
     def test_reset_data_wipes_server_data_and_media_before_anything_else(self) -> None:
         # The NFS dir outlives a container, so a failed earlier provision can
