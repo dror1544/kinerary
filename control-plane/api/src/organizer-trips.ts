@@ -136,6 +136,11 @@ export interface OrganizerTrip {
   title: string | null;
   lifecycleState: string;
   reachability: string;
+  /**
+   * Why the trip is unreachable (migration 0042), or NULL. The database only
+   * lets it be non-NULL while `reachability` is `unreachable`.
+   */
+  unreachableReason: string | null;
   /** The trip THIS chat routes to right now. At most one is true. */
   current: boolean;
   /**
@@ -187,10 +192,11 @@ export async function listOrganizerTrips(
     title: string | null;
     lifecycle_state: string;
     reachability: string;
+    unreachable_reason: string | null;
     current: boolean;
     has_companion: boolean;
   }>(
-    `SELECT DISTINCT t.id, t.slug, t.title, t.lifecycle_state, t.reachability, t.created_at,
+    `SELECT DISTINCT t.id, t.slug, t.title, t.lifecycle_state, t.reachability, t.unreachable_reason, t.created_at,
             EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings b
                      WHERE b.trip_id = t.id AND b.chat_id = $2 AND b.closed_at IS NULL) AS current,
             EXISTS (SELECT 1 FROM control_plane.telegram_chat_bindings hb
@@ -214,6 +220,7 @@ export async function listOrganizerTrips(
     title: row.title,
     lifecycleState: row.lifecycle_state,
     reachability: row.reachability,
+    unreachableReason: row.unreachable_reason,
     current: row.current,
     hasCompanion: row.has_companion,
   }));

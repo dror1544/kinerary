@@ -1133,6 +1133,15 @@ export function tripDisplayName(trip: Pick<OrganizerTrip, "title" | "slug">): st
 }
 
 /**
+ * `trips.unreachable_reason` (migration 0042) written by the provisioner when
+ * the companion's trip-mcp bridge cannot read the trip's site
+ * (`UNREACHABLE_REASONS` in `control_plane_worker/provisioner.py`). The literal
+ * is duplicated because the two sides are different languages; the test
+ * `renderTripList — why a trip is unreachable` pins it.
+ */
+const BRIDGE_FAILED_REASON = "TRIP_MCP_BRIDGE_FAILED";
+
+/**
  * Draws the `/trips` answer: which trips are this organizer's, what state each
  * is in, and which one THIS chat is wired to.
  *
@@ -1161,7 +1170,15 @@ export function renderTripList(
     const parts = [`• ${name} — ${lifecycleLabel(trip.lifecycleState, language)}`];
     // Only ever shown when it is NOT reachable: a line saying "reachable" on
     // every row would be noise, and this one is the exception worth reading.
-    if (trip.reachability === "unreachable") parts.push(uiString("tripUnreachable", language));
+    //
+    // The wording depends on WHY. A bridge failure is the one reason where the
+    // trip's site works and only the companion cannot read it (#296), so "site
+    // not responding" would be false. Every other reason — including a NULL one —
+    // keeps the original label: an unknown reason is not evidence the site is up.
+    if (trip.reachability === "unreachable") {
+      const label = trip.unreachableReason === BRIDGE_FAILED_REASON ? "tripBridgeUnreachable" : "tripUnreachable";
+      parts.push(uiString(label, language));
+    }
     if (trip.current) parts.push(uiString("tripsCurrent", language));
     lines.push(parts.join(" "));
 

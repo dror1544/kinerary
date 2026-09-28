@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -21,12 +22,14 @@ import {
   renderDocumentOffer,
   renderQuestion,
   renderSuggestion,
+  renderTripList,
   resolveChatRoute,
   suggestionNoCallbackData,
   suggestionYesCallbackData,
   setCompanionExpectsReply,
   startFromDeepLink,
 } from "../src/chat-router.js";
+import type { OrganizerTrip } from "../src/organizer-trips.js";
 import { testDatabaseUrl } from "./support/test-database.js";
 
 // ── Pure decision logic — no database required ───────────────────────────────
@@ -114,6 +117,68 @@ describe("callback data", () => {
       for (const option of question.options ?? []) {
         const data = answerCallbackData(question.id, option.id);
         assert.ok(callbackDataFits(data), `${data} exceeds 64 bytes`);
+      }
+    }
+  });
+});
+
+describe("renderTripList — why a trip is unreachable", () => {
+  const trip = (over: Partial<OrganizerTrip>): OrganizerTrip => ({
+    tripId: "trip_1e35d697ca5dfd1b2a95d32181b8fc18",
+    slug: "italy-2026",
+    title: "Italy",
+    lifecycleState: "ready_private",
+    reachability: "unknown",
+    unreachableReason: null,
+    current: false,
+    hasCompanion: true,
+    ...over,
+  });
+  const line = (t: OrganizerTrip, language: "en" | "he"): string =>
+    renderTripList([t], language).text.split("\n").find((l) => l.startsWith("•")) ?? "";
+
+  // The owner-approved wording, pinned as literals so a reword is a deliberate
+  // edit of this test and not a silent change of what families read.
+  const BRIDGE_EN = "(assistant can't read the trip right now)";
+  const BRIDGE_HE = "(לצערי אני לא יכול לקרוא את נתוני הטיול כרגע)";
+  const SITE_EN = "(site not responding)";
+  const SITE_HE = "(האתר לא מגיב)";
+
+  test("a bridge failure says the assistant cannot read the trip, in English and Hebrew", () => {
+    const t = trip({ reachability: "unreachable", unreachableReason: "TRIP_MCP_BRIDGE_FAILED" });
+    assert.ok(line(t, "en").includes(BRIDGE_EN), line(t, "en"));
+    assert.ok(!line(t, "en").includes(SITE_EN), "the site works; it must not be called down");
+    assert.ok(line(t, "he").includes(BRIDGE_HE), line(t, "he"));
+    assert.ok(!line(t, "he").includes(SITE_HE));
+  });
+
+  test("the reason literal is one the provisioner actually writes", () => {
+    // The label keys off a string duplicated across Python and TypeScript. If
+    // the worker renames it, this fails instead of the label silently going
+    // back to "site not responding".
+    const provisioner = readFileSync(
+      fileURLToPath(new URL("../../worker/control_plane_worker/provisioner.py", import.meta.url)),
+      "utf8",
+    );
+    assert.match(provisioner, /UNREACHABLE_REASONS[\s\S]*?"TRIP_MCP_BRIDGE_FAILED",\s*\}/);
+  });
+
+  test("every other unreachable reason keeps the old label", () => {
+    for (const reason of ["COMPANION_INSTALL_FAILED", "NO_ORGANIZER_CHAT", "BINDING_REFUSED", "TRIP_RETIRED", "BINDING_FAILED", null]) {
+      const t = trip({ reachability: "unreachable", unreachableReason: reason });
+      assert.ok(line(t, "en").includes(SITE_EN), `${reason}: ${line(t, "en")}`);
+      assert.ok(!line(t, "en").includes(BRIDGE_EN), `${reason}`);
+      assert.ok(line(t, "he").includes(SITE_HE), `${reason}: ${line(t, "he")}`);
+      assert.ok(!line(t, "he").includes(BRIDGE_HE), `${reason}`);
+    }
+  });
+
+  test("a trip that is not unreachable shows no label, whatever a stale reason says", () => {
+    for (const reachability of ["reachable", "unknown"]) {
+      const t = trip({ reachability, unreachableReason: "TRIP_MCP_BRIDGE_FAILED" });
+      for (const language of ["en", "he"] as const) {
+        assert.ok(!line(t, language).includes(BRIDGE_EN) && !line(t, language).includes(BRIDGE_HE), `${reachability}/${language}`);
+        assert.ok(!line(t, language).includes(SITE_EN) && !line(t, language).includes(SITE_HE), `${reachability}/${language}`);
       }
     }
   });
