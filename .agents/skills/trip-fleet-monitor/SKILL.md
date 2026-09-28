@@ -74,7 +74,7 @@ scaffolding would have hidden production's alerts.
 | `trip_detail` | one trip end to end: its site URL, sessions with document provenance, every interview link and whether it was opened, how the interview's model calls went, jobs with error codes, notifications, Telegram bindings, linked people |
 | `failures` | failed jobs, jobs in flight over an hour, failed notifications, unreachable trips in a window — each tagged with trip class |
 | `stalled_interviews` | interviews **still open** and idle beyond a threshold, and what they wait on |
-| `statistics` | funnel including how many links were opened, completion rate, model success rate inside the interview, build success rate, median interview and build durations |
+| `statistics` | funnel including how many links were opened, completion rate, model success rate inside the interview, build success rate, median interview and build durations — and **companion usage** per trip (see below), which is one of four stated no-data states rather than a row of zeros wherever the relay does not record it |
 | `alerts` | **only** what is actionable — and empty output when healthy, which is what makes a silent watchdog possible. Byte-stable while nothing changes: each incident says when it started (UTC), never how long ago, and rows are sorted |
 | `bug_reports` | what trip companions have reported as broken, with the reporting person's exact words — your triage queue |
 | `stacks` | which stacks exist, which is production, where config came from, the schema version each has applied, live connectivity |
@@ -84,6 +84,37 @@ psql and asserts the properties that are easy to lose in an edit: no tool takes
 SQL, no query reads a document's text or the column holding the site password,
 alerts select nothing derived from `now()`, and every live-interview query
 excludes the sessions that have already closed.
+
+### Companion usage in `statistics`
+
+Counts of what the relay saw, from `control_plane.assistant_events` over the same
+`days` window, one row per trip that had any event: requests handed to the
+assistant, replies delivered, failed deliveries, suppressed replies, turns lost
+(split: gateway unavailable, companion unreachable), group chatter ignored (a
+message not addressed to the assistant), median reply latency, requests carrying
+media, and requests split by channel (group / organizer DM) and by requester
+(organizer / participant). **Reply rate** is replies delivered / requests. The
+table is metadata only by construction: no text, no chat or user id, and the
+monitor's database role is granted eight of its columns and not `event_id`,
+`turn_id` or `metadata`. Retired and scaffolding trips are test runs, exactly as
+under "trips created": the digest sums them into one labelled line, the text form
+lists them. Tool usage is not collected anywhere yet; the text form says so in
+one line and the digest omits it.
+
+**Never a row of zeros.** When there is nothing to count, the section says which
+of these it is, in words:
+
+| what it says | what it means |
+|---|---|
+| `companion usage: not available — this database has no assistant_events table yet` | the stack is behind the release that added the table (Postgres 42P01, or the table is absent) |
+| `companion usage: not collected — assistant events are switched off on this stack …` | the table exists and has never held a row: the relay writes it only when assistant events are switched on, so zeros would not be measurements |
+| `no companion activity in the last N days (last event <date>)` | rows exist, none in the window |
+| `companion usage: could not be read (<reason>)` | anything else — for example `permission denied` after the release added the table but the monitor's role was not re-applied. The rest of the digest still renders |
+
+Reading it: a companion whose reply rate is under 100%, or with turns lost or
+failed deliveries, is worth a sentence to the operator (the digest marks it with
+a warning sign). "Not available" and "not collected" are states to report once,
+not to alarm about; "could not be read" is a fault to name.
 
 Every tool also runs from a shell, which is how the schedules avoid paying for a
 model: `fleet-mcp.mjs --tool alerts [--stack <name>]`. Same handler the agent

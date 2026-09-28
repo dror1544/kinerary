@@ -462,7 +462,7 @@ plan 2026-09-28 finding 3).
 **What it is.** `control-plane/deployment/monitor-db-role.sql` creates
 `kinerary_fleet_ro`: `LOGIN NOINHERIT`, no other attribute, no memberships,
 connection limit 20, `default_transaction_read_only = on`,
-`statement_timeout = 20s`, and `SELECT` on exactly the 79 columns of the 12
+`statement_timeout = 20s`, and `SELECT` on exactly the 87 columns of the 13
 relations the fleet MCP reads — column-level, so `trips.companion_intro` (each
 site's password), `intake_sessions.answers` and people's names stay unreadable
 (the file's header). It also takes `TEMPORARY` on the database from `PUBLIC`,
@@ -473,7 +473,14 @@ password, and a stack without a monitor needs none (same header).
 queries, and fails when a query needs a column the role lacks or the role holds
 one no query needs. Such a change is not live until the role is re-applied here:
 until then that tool fails with "permission denied" (`fleet-mcp.mjs:347`), never
-an empty answer.
+an empty answer. One ordering follows from the grant list naming
+`control_plane.assistant_events` (migration `20260925143012`, which ships with
+Release A): apply the role **after** that migration has run, because the apply
+fails on a database that has no such table. Until then the statistics tool's
+companion-usage section says "not available — this database has no
+assistant_events table yet"; after the migration and before the re-apply it says
+"could not be read (permission denied for table assistant_events)", and the rest
+of the digest is unaffected either way.
 
 **Applying it.** The mechanism is `scripts/create-monitor-db-role.sh`, which
 names no host, container or path and refuses when a value is unset. The values

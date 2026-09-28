@@ -70,6 +70,8 @@
 SELECT set_config('kinerary_fleet_ro.role', :'role', false) AS fleet_ro_role,
        set_config('kinerary_fleet_ro.connection_limit', :'connection_limit', false) AS fleet_ro_limit,
        set_config('kinerary_fleet_ro.grants', $grants$
+control_plane.assistant_events: trip_id occurred_at event_type channel_type requester_role outcome
+control_plane.assistant_events: response_latency_ms media_kind
 control_plane.companion_bug_reports: id trip_id reported_at kind summary detail quote surface
 control_plane.intake_sessions: id trip_id state created_at updated_at source_document language phase
 control_plane.intake_sessions: awaiting awaiting_since interpret_path expires_at expired_at

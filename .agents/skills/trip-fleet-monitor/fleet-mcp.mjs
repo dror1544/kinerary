@@ -569,7 +569,7 @@ const DURATION_WORDS = {
   "interview minutes (median)": "interview",
 };
 
-function renderStatisticsDigest(stack, d, { funnel, builds, durations, classes, models }) {
+function renderStatisticsDigest(stack, d, { funnel, builds, durations, classes, models, usage }) {
   const used = new Set();
   const value = (key) => {
     used.add(key);
@@ -621,6 +621,7 @@ function renderStatisticsDigest(stack, d, { funnel, builds, durations, classes, 
     return `${word} ${r[1] === "n/a" ? "n/a" : `${md(r[1])} min`}`;
   });
   lines.push(`• median duration: ${shown.join(DOT) || "n/a"}`);
+  lines.push("", ...renderUsageDigest(usage, d));
   return lines.join("\n");
 }
 
@@ -998,10 +999,237 @@ async function loadStatistics(stack, d) {
                      FROM control_plane.interview_interpretations
                     WHERE created_at > ${since} GROUP BY 1 ORDER BY 2 DESC;`),
   ]);
-  return { funnel, builds, durations, classes, models };
+  // A section of its own, after the rest: it can fail on its own (the table does
+  // not exist before Release A), and that must never take the funnel with it.
+  const usage = await loadCompanionUsage(stack, d);
+  return { funnel, builds, durations, classes, models, usage };
 }
 
-function renderStatisticsText(stack, d, { funnel, builds, durations, classes, models }) {
+/**
+ * Companion usage, from the relay's metadata-only facts in
+ * `control_plane.assistant_events`.
+ *
+ * NEVER A ROW OF ZEROS. "Nothing to report" has five causes and the reader must
+ * be able to tell them apart, because four of them are not "the companions were
+ * quiet":
+ *
+ *   no_table         the relation is not in this database (a release behind)
+ *   never_collected  it exists and has never held a row: the relay does not
+ *                    write it unless assistant events are switched on, so these
+ *                    would be zeros that are not measurements
+ *   quiet            rows exist, none inside the window
+ *   unreadable       anything else went wrong; the reason is named
+ *   activity         there is something to count
+ *
+ * The table is asked about BEFORE it is queried (`tableExists`), because
+ * PostgreSQL resolves a missing relation at plan time, and a 42P01 from the
+ * query itself, in the moment between the two, is the same state and not a
+ * fault. Every other failure is reported as itself and is caught HERE: this
+ * section failing must not stop the funnel and provisioning sections, which is
+ * the opposite of how the other tools treat a failed read, on purpose (the
+ * digest is one message and a fifth of it missing is better than all of it).
+ *
+ * Counts only. No column read here can hold text, a chat id or a user id: the
+ * role in monitor-db-role.sql grants these eight columns and not event_id,
+ * turn_id or metadata.
+ */
+const ASSISTANT_EVENTS = "control_plane.assistant_events";
+
+/** What went wrong, short enough for a digest line and free of hosts and addresses. */
+function shortReason(error) {
+  const match = /ERROR:\s*([^\n]+)/.exec(String(error?.message ?? ""));
+  if (!match) return "the query failed";
+  return md(match[1]).slice(0, 100) || "the query failed";
+}
+
+async function loadCompanionUsage(stack, d) {
+  try {
+    if (!(await tableExists(stack, ASSISTANT_EVENTS))) return { state: "no_table" };
+    const since = `now() - interval '${d} days'`;
+    const [overall, perTrip] = await Promise.all([
+      runSql(stack, `SELECT count(*)::text, coalesce(to_char(max(e.occurred_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD'), '')
+                       FROM ${ASSISTANT_EVENTS} e;`),
+      // One row per trip that had any event in the window. A trip whose row was
+      // deleted keeps its events (trip_id is set to NULL), so it is counted under
+      // a name of its own rather than dropped or filed under a live trip.
+      runSql(stack, `
+        SELECT x.slug, x.cls,
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay'))::text,
+               count(*) FILTER (WHERE x.event_type = 'reply_sent' AND x.outcome = 'reply_delivered')::text,
+               count(*) FILTER (WHERE x.event_type = 'reply_sent' AND x.outcome = 'failed_delivery')::text,
+               count(*) FILTER (WHERE x.event_type = 'reply_sent' AND x.outcome = 'reply_suppressed')::text,
+               count(*) FILTER (WHERE x.event_type = 'turn_lost' AND x.outcome = 'lost_gateway_unavailable')::text,
+               count(*) FILTER (WHERE x.event_type = 'turn_lost' AND x.outcome = 'lost_companion_unreachable')::text,
+               count(*) FILTER (WHERE x.event_type = 'ignored_not_addressed')::text,
+               coalesce(round(percentile_cont(0.5) WITHIN GROUP (ORDER BY x.response_latency_ms)
+                              FILTER (WHERE x.event_type = 'reply_sent'))::text, ''),
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay')
+                                  AND x.media_kind <> 'none')::text,
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay')
+                                  AND x.channel_type = 'group')::text,
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay')
+                                  AND x.channel_type = 'organizer_dm')::text,
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay')
+                                  AND x.requester_role = 'organizer')::text,
+               count(*) FILTER (WHERE x.event_type IN ('request_forwarded', 'request_to_relay')
+                                  AND x.requester_role = 'participant')::text
+          FROM (
+            SELECT coalesce(t.slug, '(removed trip)') AS slug,
+                   CASE WHEN t.id IS NULL THEN 'removed' ELSE ${tripClassSql(stack)} END AS cls,
+                   e.event_type, e.outcome, e.channel_type, e.requester_role, e.media_kind, e.response_latency_ms
+              FROM ${ASSISTANT_EVENTS} e
+              LEFT JOIN control_plane.trips t ON t.id = e.trip_id
+             WHERE e.occurred_at > ${since}
+          ) x
+         GROUP BY 1, 2 ORDER BY 2, 1;`),
+    ]);
+
+    const total = Number(overall[0]?.[0]);
+    if (!Number.isFinite(total)) throw new Error("ERROR: the count came back unreadable");
+    if (total === 0) return { state: "never_collected" };
+    if (perTrip.length === 0) return { state: "quiet", lastEvent: overall[0][1] || "unknown" };
+
+    // A row that is not the shape asked for is a failed read: coerced, it would
+    // print as a zero, which is the one thing this section must never do.
+    const count = (v) => {
+      const n = Number(v);
+      if (v === undefined || v === "" || !Number.isFinite(n)) throw new Error("ERROR: a usage row came back unreadable");
+      return n;
+    };
+    const trips = perTrip.map((r) => {
+      if (r.length !== 15) throw new Error("ERROR: a usage row came back unreadable");
+      return {
+        slug: r[0], cls: r[1],
+        requests: count(r[2]), delivered: count(r[3]), failed: count(r[4]), suppressed: count(r[5]),
+        lostGateway: count(r[6]), lostCompanion: count(r[7]), chatter: count(r[8]),
+        // No reply carried a latency: unknown, which is not zero milliseconds.
+        medianMs: r[9] === "" ? null : count(r[9]),
+        media: count(r[10]), group: count(r[11]), dm: count(r[12]),
+        organizer: count(r[13]), participant: count(r[14]),
+      };
+    });
+    return { state: "activity", trips };
+  } catch (error) {
+    if (/relation "[^"]*assistant_events" does not exist/.test(String(error?.message ?? ""))) {
+      return { state: "no_table" };
+    }
+    return { state: "unreadable", reason: shortReason(error) };
+  }
+}
+
+/** The state lines. Words, never numbers: each says why there are none. */
+function usageStateLine(usage, d) {
+  switch (usage.state) {
+    case "no_table":
+      return "companion usage: not available — this database has no assistant_events table yet";
+    case "never_collected":
+      return "companion usage: not collected — assistant events are switched off on this stack " +
+        "(relay ASSISTANT_EVENTS_ENABLED); these would be zeros, not measurements";
+    case "quiet":
+      return `no companion activity in the last ${d} day${d === 1 ? "" : "s"} (last event ${md(usage.lastEvent)})`;
+    case "unreadable":
+      return `companion usage: could not be read (${usage.reason})`;
+    default:
+      return null;
+  }
+}
+
+const usageLost = (u) => u.lostGateway + u.lostCompanion;
+const usagePct = (a, b) => (b > 0 ? `${Math.round((a / b) * 100)}%` : "n/a");
+
+/** A median in the unit a person reads: 800ms, 2.3s, 15s. */
+function usageLatency(ms) {
+  if (ms === null) return "n/a";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
+}
+
+const DIGEST_USAGE_TRIP_CAP = 15;
+
+function renderUsageDigest(usage, d) {
+  const lines = ["**Companion usage**"];
+  const stateLine = usageStateLine(usage, d);
+  if (stateLine) return [...lines, `• ${stateLine}`];
+
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  const real = usage.trips.filter((u) => !NOISE_CLASSES.has(u.cls));
+  const noise = groupBy(usage.trips.filter((u) => NOISE_CLASSES.has(u.cls)).map((u) => [u.cls, u]));
+
+  const shown = real.slice(0, DIGEST_USAGE_TRIP_CAP);
+  for (const u of shown) {
+    // Worth the reader's eye: some request got no delivered reply, a delivery
+    // failed, or a turn was lost. Silence about a quiet trip, a flag on a bad one.
+    const flagged = (u.requests > 0 && u.delivered < u.requests) || u.failed > 0 || usageLost(u) > 0;
+    const rate = usagePct(u.delivered, u.requests);
+    const parts = [
+      plural(u.requests, "request", "requests"),
+      `${plural(u.delivered, "reply", "replies")} (${rate}${u.requests > 0 && u.delivered < u.requests ? ", under 100%" : ""})`,
+      `${u.failed} failed`,
+    ];
+    if (u.suppressed > 0) parts.push(`${u.suppressed} suppressed`);
+    const lost = usageLost(u);
+    parts.push(lost > 0
+      ? `${lost} lost (${[u.lostGateway > 0 ? `${u.lostGateway} gateway unavailable` : null,
+        u.lostCompanion > 0 ? `${u.lostCompanion} companion unreachable` : null].filter(Boolean).join(DOT)})`
+      : "0 lost");
+    parts.push(`${u.chatter} chatter ignored`, `median ${usageLatency(u.medianMs)}`);
+    if (u.requests > 0) {
+      parts.push(`group ${u.group} / DM ${u.dm}`, `organizer ${u.organizer} / participants ${u.participant}`);
+      if (u.media > 0) parts.push(`${u.media} with media`);
+    }
+    lines.push(`• ${flagged ? "⚠️ " : ""}${md(u.slug)}: ${parts.join(DOT)}`);
+  }
+  if (real.length > shown.length) {
+    lines.push(`• …and ${real.length - shown.length} more trips with companion activity (the statistics tool lists them all)`);
+  }
+  // Test runs, as `trips created` treats them: counted, labelled, never one line each.
+  for (const [cls, rows] of noise) {
+    const sum = (key) => rows.reduce((n, [, u]) => n + u[key], 0);
+    const parts = [
+      plural(sum("requests"), "request", "requests"),
+      plural(sum("delivered"), "reply", "replies"),
+    ];
+    if (sum("failed") > 0) parts.push(`${sum("failed")} failed`);
+    const lost = rows.reduce((n, [, u]) => n + usageLost(u), 0);
+    if (lost > 0) parts.push(`${lost} lost`);
+    parts.push(`${sum("chatter")} chatter ignored`);
+    lines.push(`• ${md(cls)}: ${parts.join(DOT)} ${NOISE_NOTE}`);
+  }
+  return lines;
+}
+
+const USAGE_TEXT_HEADERS = ["trip", "class", "requests", "replies", "reply rate", "failed", "suppressed",
+  "lost (gateway)", "lost (companion)", "chatter ignored", "median reply", "with media", "group", "dm",
+  "organizer", "participant"];
+
+function renderUsageText(usage, d) {
+  const lines = [
+    `COMPANION USAGE  (counts only, last ${d} days; retired/scaffolding are test runs, not customers)`,
+  ];
+  const stateLine = usageStateLine(usage, d);
+  if (stateLine) {
+    lines.push(`  ${stateLine}`);
+  } else {
+    lines.push(asTable(
+      usage.trips.map((u) => [
+        u.slug, u.cls, u.requests, u.delivered, usagePct(u.delivered, u.requests), u.failed, u.suppressed,
+        u.lostGateway, u.lostCompanion, u.chatter, usageLatency(u.medianMs), u.media, u.group, u.dm,
+        u.organizer, u.participant,
+      ].map(String)),
+      USAGE_TEXT_HEADERS,
+    ));
+    lines.push(
+      "  reply rate = replies delivered / requests. Under 100% means some requests got no delivered reply:",
+      "  a failed or suppressed delivery, or a turn lost (gateway unavailable, companion unreachable).",
+      "  chatter ignored = group messages not addressed to the assistant. Requests split by channel and role.",
+    );
+  }
+  lines.push("  tool usage: not collected yet");
+  return lines;
+}
+
+function renderStatisticsText(stack, d, { funnel, builds, durations, classes, models, usage }) {
   const value = (rows, key) => rows.find((r) => r[0] === key)?.[1] ?? "0";
   const started = Number(value(funnel, "interviews started"));
   const confirmed = Number(value(funnel, "interviews confirmed"));
@@ -1033,6 +1261,8 @@ function renderStatisticsText(stack, d, { funnel, builds, durations, classes, mo
     "",
     "DURATIONS",
     asTable(durations, ["measure", "value"]),
+    "",
+    ...renderUsageText(usage, d),
   ].join("\n");
 }
 
