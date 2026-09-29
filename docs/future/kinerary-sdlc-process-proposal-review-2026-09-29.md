@@ -317,15 +317,21 @@ uses instrumentation that already exists, plus one label — no new tracker.
 *allows* mean the Sept 26 exemption is not reaching most commits. Broken down
 by session (the log's `who` column reads `lead` throughout, so these are not
 subagents): one session 31 ask / 9 allow, another 24 ask / 0 allow, a session
-type that stamps no session id 19 ask, two more 6 and 1. The log holds no
-command text by design, so whether these are matcher misses (a heredoc shape
-the vouching does not read) or legitimately prompted shapes (a policy path
-staged, a code commit made on the integration branch instead of a feature
-branch) is **unknown**. Next step, one week: log the command's shape *class* —
-plain / chained / policy path / branch kind — never the command. Until then
-the cheapest M2 win is still the matcher, not the process; the
-`chore/hook-heredoc-message` branch at the tip of two locked bridge worktrees
-is not the lead session's, and that session type may be the unstamped one. And M3's 1.3 assessments per merged PR is the
+type that stamps no session id 19 ask, two more 6 and 1. The 24/0 is
+**known and fixed at the source**: the lead session fed its own command
+through `match-command.py --normalize` and found a double-quoted trailing
+`| grep -v "…"` that `TRAILING_FILTERS` strips only when single-quoted, so
+the command never collapsed to the plain shape; it switched to single quotes.
+Whether to widen the matcher to an inert double-quoted pattern (no `$`,
+backtick or backslash) is Dror's decision — the hook is a protection, and the
+single-quote rule is what keeps a "trailing filter" from carrying an
+expansion. The 31/9 is being attributed by asking the other interactive
+session; the unstamped 19 are most likely bridge/Cowork sessions (the
+`chore/hook-heredoc-message` branch sits at the tip of two locked bridge
+worktrees and is not the lead session's) and cannot be asked. Only if the
+31/9 turns out to be a different shape is a week of logging the command's
+shape *class* — plain / chained / policy path / branch kind, never the
+command — worth adding. And M3's 1.3 assessments per merged PR is the
 number lever 7 acts on directly; it is the one metric with no interpretation
 in it.
 
