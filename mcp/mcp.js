@@ -518,6 +518,17 @@ mcp.tool('add_trivia_question',
 
 // ── Phase plan items ──────────────────────────────────────────────────────────
 
+// Hermes hands any mcp_-prefixed tool's result to the model inline only up to
+// DEFAULT_MCP_RESULT_SIZE_CHARS = 50,000 characters (external fact — read from
+// ~/.hermes/hermes-agent/tools/budget_config.py, not part of this repo — and
+// exposed here as mcp__trip_mcp__get_phase_plan); past that it spills the
+// result to a file and hands the model a path instead. On a large trip the
+// no-argument, no-date get_phase_plan call crossed that threshold, and the
+// companion worked around it by reading the spillover file itself and writing
+// a private skill to parse it (issue #310). 40,000 leaves a safety margin
+// under the real 50,000-char cutoff.
+const PHASE_PLAN_SAFE_LIMIT = 40_000;
+
 mcp.tool('get_phase_plan',
   'THE ACTIVE PLAN for a phase — the live day-by-day schedule the family actually sees, including AI enrichment and every organizer ' +
   'edit. Read this before answering or changing anything about what happens on a given day. ' +
@@ -530,11 +541,17 @@ mcp.tool('get_phase_plan',
   'It holds the note (why) and previous (what it said before, shown struck through on the site). ' +
   'These are what you relay to the organizer after a schedule change; do not silently pass over them. ' +
   'item.status is "confirmed" or "needs_review" (auto-migrated or agent-derived content awaiting organizer review). ' +
-  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended.',
+  'Also the read-back tool: after any plan edit, call this and check the dates and headlines actually say what you intended. ' +
+  'On a large trip, calling this with neither argument can be too big to return in one go — pass phase_id, date, or both to keep ' +
+  'the answer to the day(s) you actually need; date alone (no phase_id) is how you find which phase covers a date you don\'t know yet.',
   {
     phase_id: z.string().describe('Phase id from get_config (e.g. "la", "honolulu"). Omit to get all phases.').optional(),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD').optional()
+      .describe('Limit the result to one date (YYYY-MM-DD). With phase_id, filters that phase\'s items and day down to just this date. ' +
+        'Without phase_id, returns only the phase(s) that actually cover this date — every other phase is left out entirely, ' +
+        'rather than coming back with empty items/days.'),
   },
-  async ({ phase_id }) => {
+  async ({ phase_id, date }) => {
     // Items and headlines are two tables and two endpoints, but one answer to
     // "what does this day look like" — an agent given only the items cannot see
     // that the headline still names the old plan.
@@ -545,14 +562,43 @@ mcp.tool('get_phase_plan',
       ]);
       return { phase_id: id, days, items };
     };
-    if (phase_id) return ok(await load(phase_id));
+    const filterToDate = (plan, d) => ({
+      ...plan,
+      items: plan.items.filter(item => item.date === d),
+      days: plan.days.filter(day => day.date === d),
+    });
+    if (phase_id) {
+      const plan = await load(phase_id);
+      return ok(date ? filterToDate(plan, date) : plan);
+    }
     const cfg = await apiGet('/api/config');
     const phases = cfg.phases || [];
     // Fetched together rather than awaited one at a time — an 8-phase trip was
     // paying 8 sequential round trips for reads that don't depend on each other.
     const plans = await Promise.all(phases.map(p => load(p.id)));
     const results = {};
-    phases.forEach((p, i) => { results[p.id] = plans[i]; });
+    phases.forEach((p, i) => {
+      let plan = plans[i];
+      if (date) {
+        plan = filterToDate(plan, date);
+        // The point of allowing date alone: a caller who knows the date but not
+        // the phase gets back only the phase(s) that cover it, not an empty
+        // items/days entry for every phase that doesn't.
+        if (plan.items.length === 0 && plan.days.length === 0) return;
+      }
+      results[p.id] = plan;
+    });
+    // Only the no-phase_id, no-date shape (today's only calling shape before
+    // this fix) can still be arbitrarily large on a big trip — passing either
+    // argument already bounds the result. See PHASE_PLAN_SAFE_LIMIT above.
+    if (!date) {
+      const size = JSON.stringify(results).length;
+      if (size >= PHASE_PLAN_SAFE_LIMIT) {
+        throw new Error(
+          "This trip's full plan is too large to return at once. Ask for one phase_id, or one phase_id plus a date, instead."
+        );
+      }
+    }
     return ok(results);
   });
 

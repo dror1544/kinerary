@@ -133,6 +133,8 @@ export const PORTS = {
   mcpHealthUnreachable:    28122,
   mcpHealthReachable:      28123,
   mcpHealthAuth:           28125,
+  mcpPhasePlan:            28308,  // tests/mcp-phase-plan.test.js — issue #310
+  mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
