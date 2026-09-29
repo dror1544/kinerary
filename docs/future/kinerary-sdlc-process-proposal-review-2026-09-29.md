@@ -294,3 +294,38 @@ tree and the machine, not against the first pass's notes.
 **Unchanged and still recommended:** the two adopt-now levers, the
 sequencing in §3, the verdict on `agency-agents`. Nothing found in the second
 pass moves those.
+
+## 10. Measurement protocol — what "it worked" will mean
+
+Dror asked, after the second pass, for the switch to be coordinated with the
+lead session and for the effect to be measured, not felt. This section is the
+protocol; the numbers under "Baseline" were measured on 2026-09-29 with the
+tools named, so the comparison has a fixed starting point. Everything here
+uses instrumentation that already exists, plus one label — no new tracker.
+
+| # | Metric | Source | Baseline (2026-09-26T07:46Z → 2026-09-29) | Direction wanted |
+|---|---|---|---|---|
+| M1 | PR open → merge, median / 75th pct / over a day | `scripts/process-metrics.py --since <switch>` | **32 min / 133 min / 1** (41 merged PRs) | tail stays at zero-or-one; median not worse |
+| M2 | Hook prompts per merged PR | same script, hook-decisions log | **3.7** — commit ask 82 vs allow 22, merge ask 39, push ask 24 vs allow 25, deploy ask 7 | ≤ 2 (merge, occasionally deploy) |
+| M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` | **54 completed / 41 merged ≈ 1.3** (79 runs: 54 success, 18 skipped, 7 cancelled) | halves — Small tier skipped, Normal/High still assessed |
+| M4 | Small-tier PRs taken directly vs via a developer | PR body line `Path: direct \| developer`, `size:S` label | not recorded before the switch | recorded on every Small PR; the count is the sample size |
+| M5 | Escaped defects on lightened-path PRs | `fix/` PRs or reverts citing a Small-tier PR within 7 days; boundary findings on anything mis-tiered | 0 by construction (no lightened path yet) | 0; one is a stop condition (§7 of the proposal) |
+| M6 | Tokens / model usage per PR | none exists | **unknown** — recorded as such, never reconstructed from PR size | unknown until a source exists |
+| M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md` | **0 / 3** (2026-09-27, -28, -29 — same failure, §2) | ≥ 6 of 7 once the fix lands |
+
+**Two things the baseline already says.** M2's 82 commit *asks* against 22
+*allows* mean the Sept 26 exemption is not reaching most commits — the hook's
+"plain commit" shape is not matching what sessions actually type (a
+`chore/hook-heredoc-message` branch is already on it). The cheapest M2 win is
+that matcher, not the process. And M3's 1.3 assessments per merged PR is the
+number lever 7 acts on directly; it is the one metric with no interpretation
+in it.
+
+**Windows and decision rule.** "Before" is the Sept 26 window above, extended
+to the switch date. "After" starts at the switch and closes at whichever is
+later: ten Small-tier PRs (M4) or two weeks. At close: M2 ≤ 2, M3 at most
+half its baseline, M1 median and tail not worse, M5 zero, M7 holding —
+adopt. Any M5 event, or follow-up work erasing the M2/M3 gain — pause the
+exception and record what failed, per the proposal's own stop condition.
+Run `process-metrics.py` twice (`--until <switch>` and `--since <switch>`),
+never one window straddling it.
