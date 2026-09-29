@@ -261,11 +261,23 @@ describe('config allow-list — golden round trip (nothing the site needs is los
     assert.deepEqual(Object.keys(configs).sort(), ['planned-path', 'venues-path']);
     for (const [name, cfg] of Object.entries(configs)) {
       const { value, dropped, withheld } = projectConfig(cfg);
-      assert.deepEqual(dropped, [], `${name}: provisioner fields missing from the allow-list: ${dropped.join(', ')}`);
+      // meta.timezone is a producer field the allow-list deliberately does NOT
+      // serve — not an oversight. GET /api/config would otherwise echo the
+      // raw config spelling verbatim, which contradicts the rule
+      // living-journey.js's localClock already follows ("The config's
+      // timezone keys are not on the /api/config allow-list... so serve
+      // Intl's canonical name... never the config's own spelling"), and once
+      // a live override is set via set_trip_timezone this raw value would go
+      // stale next to it. GET /api/today's time_zone is the one canonical,
+      // override-aware answer to "what timezone is this trip" — nothing
+      // reads meta.timezone client-side.
+      assert.deepEqual(dropped, ['meta.timezone'], `${name}: provisioner fields missing from the allow-list: ${dropped.join(', ')}`);
       for (const p of withheld) {
         assert.match(p, /^participants\[\d+\]\.needs\[\d+\]$|^agent\.standing_instructions\[\d+\]$/, `${name}: ${p}`);
       }
-      assert.deepEqual(value, withoutWithheld(cfg, withheld), name);
+      const expected = withoutWithheld(cfg, withheld);
+      delete expected.meta.timezone;
+      assert.deepEqual(value, expected, name);
     }
     // The fixture really exercised what it claims to: both shapes the two
     // interview paths write, enrichment's additions, and a withheld need.

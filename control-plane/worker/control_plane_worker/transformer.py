@@ -19,7 +19,14 @@ Intake question IDs (INTAKE_SCHEMA_VERSION = 2):
   departure_date text: optional "YYYY-MM-DD" — precise departure, preferred
                  over the trip_duration placeholder logic when present
   return_date    text: optional "YYYY-MM-DD" — precise return
-  timezone       text: optional, not yet projected into trip.config.json
+  timezone       text: optional. Resolved by _resolve_timezone and projected
+                 into BOTH agent.timezone (the companion's own cron scheduling)
+                 and meta.timezone (what the site's tripTimeZone() reads for
+                 day/time logic) — the same resolved value in both places,
+                 never independently. meta.timezone is itself only a
+                 provisioning-time default: server/living-journey.js's
+                 trip_settings table can override it later without a
+                 redeploy, and that DB override always wins when set.
   travelers      structured (array): [{name, name_en?, age?, family}, ...] —
                  populates participants[]/families[]
   phases         structured (array): [{name, name_en?, start, end,
@@ -1935,6 +1942,11 @@ def transform_intake(
     # applies to the whole group for the agent block to carry instead.
     dietary_instructions = _apply_dietary(data, participants)
     agent = _derive_agent(data, participants, dietary_instructions, language)
+    # The SAME resolved value _derive_agent already decided (see its own
+    # "must not create a block that wouldn't otherwise exist" contract) —
+    # read back off the dict it wrote, not re-resolved here, so meta.timezone
+    # and agent.timezone can never disagree about what was typed or derived.
+    resolved_timezone = (agent or {}).get("timezone", "")
 
     phases = _derive_phases(_structured_list(data, "phases"), destination_raw)
 
@@ -2042,6 +2054,19 @@ def transform_intake(
     # as different statements about the trip.
     if agent:
         config["agent"] = agent
+
+    # Closes the gap this file used to document at its own top: a resolved
+    # zone reached agent.timezone (the companion's cron scheduling) but never
+    # the site-facing field living-journey.js's tripTimeZone() actually reads,
+    # so a newly provisioned trip's website silently ran on UTC regardless of
+    # what was typed or derivable. `config["meta"]` always exists (unlike
+    # `agent`), so the same rule from _derive_agent applies here to the KEY,
+    # not the block: a derived-only zone must not appear unless the same
+    # conditions that let it appear on agent.timezone were already met — which
+    # `resolved_timezone` being non-empty already proves, since it is read
+    # from that same dict.
+    if resolved_timezone:
+        config["meta"]["timezone"] = resolved_timezone
 
     currency = _lookup_known_currency(destination)
     if currency:

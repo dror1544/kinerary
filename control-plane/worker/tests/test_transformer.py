@@ -780,12 +780,17 @@ class SchemaV2Tests(unittest.TestCase):
         # byte-identical output to the intake that could not have answered them.
         baseline = transform_intake({**JAPAN_INTAKE, "travelers": TRAVELERS}, today=date(2026, 8, 20))
         self.assertNotIn("agent", baseline)
+        # JAPAN_INTAKE's destination ("Japan") resolves to a real zone, so this
+        # also proves a derived-only timezone cannot leak into meta on its own
+        # — same rule as agent.timezone, now checked for the meta key too.
+        self.assertNotIn("timezone", baseline["meta"])
         for participant in baseline["participants"]:
             self.assertNotIn("needs", participant)
 
     def test_all_none_answers_produce_no_agent_block(self) -> None:
         config = self._config(dietary=_multi("none"), bot_proactive=_multi("none"))
         self.assertNotIn("agent", config)
+        self.assertNotIn("timezone", config["meta"])
 
     # ── dietary ───────────────────────────────────────────────────────────────
 
@@ -949,6 +954,9 @@ class SchemaV2Tests(unittest.TestCase):
         self.assertEqual(agent["tone"], "playful")
         self.assertEqual(agent["timezone"], "Asia/Tokyo")
         self.assertEqual(agent["proactive"], {"morning_briefing": "07:30", "flight_changes": True})
+        # The site-facing field living-journey.js's tripTimeZone() actually
+        # reads — the same resolved value, projected into BOTH places.
+        self.assertEqual(config["meta"]["timezone"], "Asia/Tokyo")
 
     def test_named_assistant_without_gender_falls_back_to_neutral(self) -> None:
         # Hebrew conjugates by gender; 'neutral' is gender-avoidant phrasing,
@@ -2434,6 +2442,21 @@ class TripClockAndLanguage(unittest.TestCase):
         # Absent is a gap something can notice. "Narnia" sitting in a field
         # read as a zone looks answered and is not.
         self.assertEqual("", transformer._resolve_timezone("Narnia", "Narnia"))
+
+    def test_an_unresolved_destination_leaves_both_agent_and_meta_without_a_timezone(self):
+        # Full-pipeline version of the test above: bot_name makes the agent
+        # block exist for another reason, and a typed zone that cannot
+        # resolve (transformer.timezone_unresolved fires instead of raising)
+        # must still leave BOTH agent.timezone and meta.timezone absent.
+        config = transform_intake({
+            "trip_type": _choice("family"),
+            "destination": _text("Narnia"),
+            "bot_name": _text("Sol"),
+            "timezone": _text("Narnia"),
+        }, today=date(2026, 8, 20))
+        self.assertIn("agent", config)
+        self.assertNotIn("timezone", config["agent"])
+        self.assertNotIn("timezone", config["meta"])
 
     def test_a_derived_zone_alone_does_not_invent_an_agent_block(self):
         # An intake that answered none of the assistant questions must produce
