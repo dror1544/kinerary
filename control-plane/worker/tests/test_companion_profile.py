@@ -316,3 +316,26 @@ class CompanionOverlayTemplateTests(unittest.TestCase):
         # And the one-shot flag is spent before the profile ever speaks.
         self.assertIs(onboarding["seen"]["profile_build_offered"], True)
 
+    def test_skill_manage_writes_are_staged_and_toolsets_are_unchanged(self) -> None:
+        """companion-write-confinement (2026-09-29): production usage showed
+        write_file/patch (zero calls, ever) and skill_manage (one call, ever —
+        the companion writing itself an undesired workaround skill) have no
+        legitimate use on a trip companion. `skills.write_approval: true`
+        makes Hermes's own gate (tools/write_approval.py) STAGE every
+        skill_manage create/edit/patch/delete/write_file/remove_file instead
+        of applying it — nothing auto-approves a staged write.
+
+        This must NOT touch disabled_toolsets: `file`, `memory`, `cronjob`
+        and `skills` stay enabled so read_file/search_files/skill_view/memory
+        keep working — only the WRITE actions are gated, and write_file/patch
+        are a separate code path this config key does not reach (confined
+        instead by HERMES_WRITE_SAFE_ROOT, set at enrollment — see
+        scripts/companion-install-host.sh, not this template).
+        """
+        overlay = yaml.safe_load(self.OVERLAY.read_text(encoding="utf-8"))
+        self.assertEqual(overlay["skills"], {"write_approval": True})
+        self.assertEqual(
+            overlay["agent"]["disabled_toolsets"], ["terminal", "code_execution"],
+            "this change must not disable file/memory/cronjob/skills too",
+        )
+

@@ -385,3 +385,104 @@ class BridgeProbe(BridgeRequest):
             with self.subTest(kind=kind):
                 self.assertEqual(self.send(self.probe(record_type=kind)).returncode, 2)
         self.assertFalse(self.curl_argv.exists())
+
+
+class EnrollRelay(unittest.TestCase):
+    """companion-write-confinement (2026-09-29): enroll_relay() now writes
+    HERMES_WRITE_SAFE_ROOT beside the relay identity it already writes
+    (GATEWAY_RELAY_URL/ID/SECRET, COMPANION_CONTROL_TOKEN). This exercises the
+    plain "profile already exists" path (ALREADY_PRESENT) — merge_overlay and
+    start_gateway both no-op harmlessly there (no overlay file, no Hermes venv
+    python), so this is the narrowest real run that reaches enroll_relay
+    through the actual script rather than through a hand-extracted copy of it.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        (self.home / ".local/bin").mkdir(parents=True)
+        self._exe(self.home / ".local/bin/hermes", "#!/bin/sh\nexit 0\n")
+        self.profile_dir = self.home / ".hermes/profiles/testprofile"
+        self.profile_dir.mkdir(parents=True)
+
+        # The architecture profile enroll_relay reads relay url + secret ref
+        # from — real values, on this host's own kinerary-deploy files never
+        # apply here, so this test supplies its own.
+        self.secret_file = self.home / "relay.secret"
+        self.secret_file.write_text("s3cret-relay-key")
+        self.arch_profile = self.home / "architecture.relay-host.json"
+        self.arch_profile.write_text(json.dumps({
+            "relay": {
+                "bind_host": "127.0.0.1",
+                "port": 4321,
+                "gateway_secret_refs": [f"file://{self.secret_file}"],
+            }
+        }))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _exe(path: Path, body: str) -> None:
+        path.write_text(body)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def send(self) -> subprocess.CompletedProcess:
+        env = {
+            "HOME": str(self.home),
+            "PATH": f"{self.home}/.local/bin:/usr/bin:/bin",
+            "KINERARY_ARCHITECTURE_PROFILE": str(self.arch_profile),
+        }
+        request = {"profile": {"name": "testprofile"}}
+        return subprocess.run(["bash", str(SCRIPT)], input=json.dumps(request), capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    def env_lines(self) -> dict[str, str]:
+        text = (self.profile_dir / ".env").read_text()
+        out = {}
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            k, _, v = line.partition("=")
+            out[k] = v
+        return out
+
+    def test_the_sandbox_root_is_written_and_created(self) -> None:
+        result = self.send()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ALREADY_PRESENT testprofile")
+
+        expected_sandbox = str(self.profile_dir / "write-sandbox")
+        env = self.env_lines()
+        self.assertEqual(env.get("HERMES_WRITE_SAFE_ROOT"), expected_sandbox)
+        self.assertTrue((self.profile_dir / "write-sandbox").is_dir(),
+                        "the directory named in .env must actually exist")
+
+        # Unrelated existing behaviour must still work: the relay identity
+        # this function already wrote before this change.
+        self.assertEqual(env.get("GATEWAY_RELAY_URL"), "http://127.0.0.1:4321")
+        self.assertEqual(env.get("GATEWAY_RELAY_ID"), "testprofile")
+        self.assertEqual(env.get("GATEWAY_RELAY_SECRET"), "s3cret-relay-key")
+        self.assertIn("COMPANION_CONTROL_TOKEN", env)
+
+    def test_a_retry_does_not_duplicate_the_line(self) -> None:
+        self.assertEqual(self.send().returncode, 0)
+        result = self.send()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = (self.profile_dir / ".env").read_text()
+        self.assertEqual(text.count("HERMES_WRITE_SAFE_ROOT="), 1)
+
+    def test_no_architecture_profile_leaves_no_sandbox_line(self) -> None:
+        # enroll_relay's existing early-return path (no ARCH_PROFILE — the
+        # profile is left UNENROLLED). HERMES_WRITE_SAFE_ROOT rides on the
+        # same write as the relay identity, so it is absent too rather than
+        # half-written.
+        env = {"HOME": str(self.home), "PATH": f"{self.home}/.local/bin:/usr/bin:/bin",
+               "KINERARY_ARCHITECTURE_PROFILE": str(self.home / "does-not-exist.json")}
+        request = {"profile": {"name": "testprofile"}}
+        result = subprocess.run(["bash", str(SCRIPT)], input=json.dumps(request), capture_output=True,
+                                text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("left UNENROLLED", result.stderr)
+        self.assertFalse((self.profile_dir / ".env").exists())
+        self.assertFalse((self.profile_dir / "write-sandbox").exists())
