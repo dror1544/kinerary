@@ -1,5 +1,6 @@
 import json,re,subprocess,tempfile,unittest
 from pathlib import Path
+import yaml
 ROOT=Path(__file__).resolve().parents[1]
 class Tests(unittest.TestCase):
  def go(self,d=None):
@@ -38,6 +39,15 @@ class Tests(unittest.TestCase):
    self.assertIn('tone is set too, not defaulted',soul,tone)
  def test_profile_description_is_yaml_safe(self):
   d=json.loads((ROOT/'example.handoff.json').read_text()); d['profile']['description']='A trip: "quoted"'; td,o,c=self.go(d); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr); self.assertIn('description: "A trip: \\"quoted\\""',(o/'profile.yaml').read_text())
+ def test_rendered_overlay_gates_skill_manage_writes(self):
+  # companion-write-confinement (2026-09-29): the RENDERED config.overlay.yaml
+  # (string.Template substitution, not the raw .tpl) must still carry
+  # `skills.write_approval: true` and must not have disabled a toolset the
+  # companion still needs (file/memory/cronjob/skills).
+  td,o,c=self.go(); self.addCleanup(td.cleanup); self.assertEqual(c.returncode,0,c.stderr)
+  overlay=yaml.safe_load((o/'config.overlay.yaml').read_text())
+  self.assertEqual(overlay['skills'],{'write_approval':True})
+  self.assertEqual(overlay['agent']['disabled_toolsets'],['terminal','code_execution'])
  def test_shipped_skills_find_their_own_files(self):
   # trip-kml-export ran its script from $PROFILE_SKILLS_DIR, which nothing
   # defines, so on every companion the path pointed at /travel/... (#71). A

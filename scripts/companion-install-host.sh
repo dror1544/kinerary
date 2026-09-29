@@ -213,7 +213,8 @@ ARCH_PROFILE="${KINERARY_ARCHITECTURE_PROFILE:-$REPO_ROOT/control-plane/deployme
 # rule docs/per-trip-gateway-architecture.md already states.
 enroll_relay() {
   local name="$1"
-  local env_file="$HOME/.hermes/profiles/$name/.env"
+  local profile_dir="$HOME/.hermes/profiles/$name"
+  local env_file="$profile_dir/.env"
 
   if [ ! -f "$ARCH_PROFILE" ]; then
     printf 'companion-install-host: no architecture profile at %s; %s left UNENROLLED (it would answer as the interviewer)\n' \
@@ -251,13 +252,27 @@ PY
     return 0
   }
 
+  # Companions write nothing on purpose (see the `skills:` block
+  # config.overlay.yaml.tpl adds), but write_file/patch stay technically
+  # reachable through the toolset — they are not what skill_manage's
+  # write_approval gate covers (tools/skill_manager_tool.py writes via
+  # atomic_write_text, a different code path). HERMES_WRITE_SAFE_ROOT scopes
+  # them to a directory of this profile's own that nothing legitimate ever
+  # writes into, so a prompt-injected document or a wrong inference that
+  # tries to write another profile's config.yaml, or this profile's own
+  # skill files, is hard-denied by Hermes itself (agent/file_safety.py)
+  # rather than merely discouraged. Created here so the value in .env always
+  # names a directory that exists.
+  local sandbox_dir="$profile_dir/write-sandbox"
+  mkdir -p "$sandbox_dir"
+
   # Rewritten in place, not appended: this runs again on every retry, and three
   # copies of GATEWAY_RELAY_ID with different values is a worse state than none.
   umask 077
   touch "$env_file"
-  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" <<'PY'
+  /usr/bin/python3 - "$env_file" "$relay_url" "$name" "$secret" "$sandbox_dir" <<'PY'
 import base64, hashlib, hmac, sys
-env_path, url, gid, secret = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+env_path, url, gid, secret, sandbox_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 
 def control_token(gateway_id, key):
@@ -276,6 +291,12 @@ managed = {
     # The companion's `trip-control` MCP connection (companion-mcp.ts): the one
     # way it can rename itself so the router hears the new name.
     "COMPANION_CONTROL_TOKEN": control_token(gid, secret),
+    # Confines write_file/patch to this profile's own sandbox subdirectory —
+    # see the comment above this block. Only newly enrolled companions get
+    # this; a profile enrolled before this line existed is not retrofitted
+    # (this whole function only runs at install/repair time, never on a
+    # schedule against a live profile).
+    "HERMES_WRITE_SAFE_ROOT": sandbox_dir,
 }
 with open(env_path) as fh:
     lines = fh.read().splitlines()
