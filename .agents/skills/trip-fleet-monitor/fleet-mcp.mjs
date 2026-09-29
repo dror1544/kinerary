@@ -360,15 +360,22 @@ function runSql(stackName, sql) {
 
 /**
  * The exact literal shape of a Hermes tool-completion log line, confirmed live
- * on the VM (2026-09-28):
+ * on the VM (2026-09-29, against real production `agent.log`, superseding the
+ * 2026-09-28 idealized shape below the marker):
  *
- *   2026-09-16 14:23:01,000 INFO agent.tool_executor: tool <tool_name> completed
+ *   2026-09-23 18:03:17,352 INFO [20260923_180308_9b7827a0] agent.tool_executor: tool mcp__trip_mcp__get_today completed (0.07s, 594 chars)
  *
- * This is Hermes's own logging, not user-influenceable text — but the parser
- * below still anchors on it strictly and treats anything else as noise, never
- * as a tool name. NOT a database read: `loadToolUsage`'s interim source
- * (approved 2026-09-28, to be dropped once a proper Hermes-hook pipeline
- * exists) is this literal string in `agent.log` files on the reached host.
+ * A bracketed session id sits between the log level and the marker — harmless,
+ * since the awk program below finds `TOOL_LOG_MARKER` by substring search
+ * anywhere in the line, not by a fixed column. More importantly, every real
+ * line carries trailing text after the literal word "completed" — timing and
+ * response size, e.g. `(0.07s, 594 chars)` — whose shape is not guaranteed
+ * stable and is never parsed or validated here. This is Hermes's own logging,
+ * not user-influenceable text — but the parser below still anchors on it
+ * strictly and treats anything else as noise, never as a tool name. NOT a
+ * database read: `loadToolUsage`'s interim source (approved 2026-09-28, to be
+ * dropped once a proper Hermes-hook pipeline exists) is this literal string in
+ * `agent.log` files on the reached host.
  */
 const TOOL_LOG_MARKER = "agent.tool_executor: tool ";
 
@@ -392,10 +399,12 @@ function toolUsageCutoff(days) {
  *
  * The awk program prints ONLY `profile<TAB>tool<TAB>count` — never a raw log
  * line, a chat id, a user id or any other column. A line is counted only when
- * it contains the exact `TOOL_LOG_MARKER` followed by exactly one
- * space-free token and the literal word "completed" and nothing else; any
- * other shape (including the marker followed by extra trailing text) is
- * skipped, never guessed at.
+ * it contains `TOOL_LOG_MARKER` followed by one space-free tool-name token and
+ * then the literal word "completed" as its own whole token (not a prefix or a
+ * glued-together word, e.g. "completedish" is rejected); anything after that —
+ * the real `(0.07s, 594 chars)` timing/size suffix, or nothing at all — is
+ * ignored and never parsed or validated. Any other shape (no marker, no
+ * "completed" token, or an empty tool name) is skipped, never guessed at.
  */
 function toolUsageScript(dir, sinceIso) {
   const findExpr = `-mindepth 3 -maxdepth 3 -type f -name 'agent.log*' -path '*/logs/agent.log*'`;
@@ -407,7 +416,7 @@ function toolUsageScript(dir, sinceIso) {
     "  if (i == 0) next;",
     "  rest = substr($0, i + length(marker));",
     '  n = split(rest, parts, " ");',
-    '  if (n != 2 || parts[2] != "completed" || parts[1] == "") next;',
+    '  if (n < 2 || parts[2] != "completed" || parts[1] == "") next;',
     '  nf = split(FILENAME, segs, "/");',
     "  profile = segs[nf - 2];",
     '  counts[profile "\\t" parts[1]]++;',

@@ -118,11 +118,15 @@ the digest omits it, unchanged from before:
 
 A "profile" there is the Hermes profile **directory name**, exactly as found
 on disk — not a trip slug, and this tool does not attempt to map one to the
-other (that mapping is not established). The read is a strict, anchored
-parse of one literal log shape only (`agent.tool_executor: tool <name>
-completed`); anything else on a line, including a trailing extra token, is
-ignored rather than guessed at, and the remote command itself never prints a
-raw log line or any column besides the counted tool name.
+other (that mapping is not established). The read is a strict, anchored parse
+of one literal log shape: `agent.tool_executor: tool <name> completed`, where
+`completed` must appear as its own whole token right after the tool name (not
+a prefix or a glued word) but anything after it — a real line's trailing
+`(0.07s, 594 chars)` timing/size suffix, confirmed live 2026-09-29, or nothing
+at all — is ignored and never parsed. Any other shape, including a missing
+"completed" token or an empty tool name, is skipped rather than guessed at,
+and the remote command itself never prints a raw log line or any column
+besides the counted tool name.
 
 **Never a row of zeros.** When there is nothing to count, the section says which
 of these it is, in words:

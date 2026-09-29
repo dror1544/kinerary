@@ -794,6 +794,21 @@ class FleetMcp(unittest.TestCase):
 
     NOT_CONFIGURED = "tool usage: not collected on this stack (no hermes_logs_dir configured)"
 
+    @staticmethod
+    def tool_log_line(day: str, time: str, tool: str, session: str = "20260923_180308_9b7827a0",
+                       duration: str = "0.07s", size: str = "594 chars") -> str:
+        """One real-shape Hermes tool-completion log line.
+
+        Matches the verbatim lines pulled off the VM's `agent.log` on
+        2026-09-29 — a bracketed run id between the level and the marker, and
+        trailing `(<duration>, <size>)` after the word "completed". The old
+        fixture shape (`... agent.tool_executor: tool <name> completed`, with
+        nothing after "completed") is not what production ever wrote; the
+        parser must accept this shape, not that one.
+        """
+        return (f"{day} {time} INFO [{session}] agent.tool_executor: "
+                f"tool {tool} completed ({duration}, {size})")
+
     def configure_hermes_logs_dir(self, path: Path) -> None:
         stacks = json.loads(self.config.read_text())
         stacks["stacks"]["prod"]["hermes_logs_dir"] = str(path)
@@ -827,7 +842,7 @@ class FleetMcp(unittest.TestCase):
     def test_tool_usage_no_activity_when_files_exist_but_nothing_matches_the_window(self):
         old = (date.today() - timedelta(days=30)).isoformat()
         self.write_hermes_log("japan-2026", "agent.log", [
-            f"{old} 09:00:00,000 INFO agent.tool_executor: tool old_tool completed",
+            self.tool_log_line(old, "09:00:00,000", "old_tool"),
             "this line does not match the log shape at all",
         ])
         self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
@@ -845,21 +860,21 @@ class FleetMcp(unittest.TestCase):
         secret = "sk-FAKESECRET1234567890"
 
         self.write_hermes_log("japan-2026", "agent.log", [
-            f"{recent} 10:00:00,000 INFO agent.tool_executor: tool get_config completed",
-            f"{recent} 10:00:05,000 INFO agent.tool_executor: tool get_config completed",
-            f"{outside} 09:00:00,000 INFO agent.tool_executor: tool old_tool completed",
+            self.tool_log_line(recent, "10:00:00,000", "get_config"),
+            self.tool_log_line(recent, "10:00:05,000", "get_config"),
+            self.tool_log_line(outside, "09:00:00,000", "old_tool"),
             # A fake-secret-looking value in an unrelated column, on a line that
             # does not match the fixed log shape: must never reach the output.
             f"{recent} 10:01:00,000 DEBUG chat_id=-1009999999999 secret={secret}",
         ])
         # A rotated log file: its lines count exactly like the live one.
         self.write_hermes_log("japan-2026", "agent.log.1", [
-            f"{just_inside} 08:00:00,000 INFO agent.tool_executor: tool send_message completed",
+            self.tool_log_line(just_inside, "08:00:00,000", "send_message"),
         ])
         self.write_hermes_log("orlando-2026", "agent.log", [
-            f"{recent2} 12:00:00,000 INFO agent.tool_executor: tool get_config completed",
-            f"{recent2} 12:00:01,000 INFO agent.tool_executor: tool web_search completed",
-            f"{outside} 00:00:00,000 INFO agent.tool_executor: tool ancient_tool completed",
+            self.tool_log_line(recent2, "12:00:00,000", "get_config"),
+            self.tool_log_line(recent2, "12:00:01,000", "web_search"),
+            self.tool_log_line(outside, "00:00:00,000", "ancient_tool"),
             "not a log line at all just noise",
         ])
         self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
@@ -880,14 +895,58 @@ class FleetMcp(unittest.TestCase):
 
     def test_tool_usage_caps_the_list_and_says_so(self):
         today = date.today().isoformat()
-        lines = [f"{today} 09:{i:02d}:00,000 INFO agent.tool_executor: tool tool_{i:02d} completed"
-                 for i in range(20)]
+        lines = [self.tool_log_line(today, f"09:{i:02d}:00,000", f"tool_{i:02d}") for i in range(20)]
         self.write_hermes_log("japan-2026", "agent.log", lines)
         self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
         text = self.tool_usage_text()
         shown = re.findall(r"tool_\d\d: 1", text)
         self.assertEqual(len(shown), 15, text)
         self.assertIn("…and 5 more", text)
+
+    def test_tool_usage_counts_verbatim_production_lines(self):
+        """The exact lines pulled off the VM's agent.log on 2026-09-29 that the
+        merged #312 parser silently failed to count (reported `no_activity`
+        against 374 and 41 real matching lines). If this regresses, the fix
+        this brief exists for has regressed with it."""
+        today = date.today().isoformat()
+        self.write_hermes_log("japan-2026", "agent.log", [
+            f"{today} 18:03:17,352 INFO [20260923_180308_9b7827a0] agent.tool_executor: "
+            "tool mcp__trip_mcp__get_today completed (0.07s, 594 chars)",
+            f"{today} 18:30:35,472 INFO [20260923_180308_9b7827a0] agent.tool_executor: "
+            "tool tool_search completed (0.01s, 480 chars)",
+            f"{today} 20:30:09,882 INFO [20260915_203000_54e258] agent.tool_executor: "
+            "tool skill_view completed (0.03s, 3979 chars)",
+            f"{today} 20:30:09,898 INFO [20260915_203000_54e258] agent.tool_executor: "
+            "tool tool_describe completed (0.01s, 605 chars)",
+            f"{today} 20:30:12,647 INFO [20260915_203000_54e258] agent.tool_executor: "
+            "tool mcp__trip_mcp__get_agent_brief completed (0.03s, 2297 chars)",
+        ])
+        self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
+        text = self.tool_usage_text()
+
+        self.assertNotIn(self.NOT_CONFIGURED, text)
+        self.assertNotIn("could not be read", text)
+        self.assertNotIn("no tool calls", text, "the real production shape must not be reported as no activity")
+        self.assertIn("TOOL USAGE", text)
+        self.assertIn("mcp__trip_mcp__get_today: 1", text)
+        self.assertIn("tool_search: 1", text)
+        self.assertIn("skill_view: 1", text)
+        self.assertIn("tool_describe: 1", text)
+        self.assertIn("mcp__trip_mcp__get_agent_brief: 1", text)
+
+    def test_tool_usage_still_excludes_completed_lookalikes(self):
+        """A word that merely starts with "completed" (or has it glued to more
+        text with no space) must stay excluded, real trailing text or not."""
+        today = date.today().isoformat()
+        self.write_hermes_log("japan-2026", "agent.log", [
+            self.tool_log_line(today, "09:00:00,000", "get_config").replace(
+                "completed (0.07s", "completedish (0.07s"),
+            f"{today} 09:01:00,000 INFO agent.tool_executor: tool get_config completedwithnospace",
+            f"{today} 09:02:00,000 INFO agent.tool_executor: tool get_config failed (0.02s, 10 chars)",
+        ])
+        self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
+        text = self.tool_usage_text()
+        self.assertIn("tool usage: no tool calls in the last 7 days", text)
 
 
 if __name__ == "__main__":
