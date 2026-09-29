@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -189,7 +190,7 @@ COMPANION USAGE  (counts only, last 7 days; retired/scaffolding are test runs, n
   reply rate = replies delivered / requests. Under 100% means some requests got no delivered reply:
   a failed or suppressed delivery, or a turn lost (gateway unavailable, companion unreachable).
   chatter ignored = group messages not addressed to the assistant. Requests split by channel and role.
-  tool usage: not collected yet"""
+  tool usage: not collected on this stack (no hermes_logs_dir configured)"""
 
 TEXT_ALERTS = """\
 ⚠️ Kinerary fleet — a control plane
@@ -716,15 +717,21 @@ class FleetMcp(unittest.TestCase):
         self.assertIn("orlando-2026 | live | 10 | 7 | 70% | 1 | 1 | 1 | 1 | 0 | 2.3s | 0 | 0 | 10 | 10 | 0", section)
         self.assertIn("quiet-2026 | live | 0 | 0 | n/a", section)
         self.assertIn("retired-a-20260901 | retired | 3 | 3 | 100%", section)
-        self.assertIn("tool usage: not collected yet", section)
+        self.assertIn("tool usage: not collected on this stack (no hermes_logs_dir configured)", section)
 
     def test_tool_usage_is_in_the_text_only_and_in_every_state(self):
         self.assertNotIn("tool usage", self.usage(self.usage_fixtures()))
         self.assertNotIn("tool usage", self.usage([["to_regclass", [["f"]]]]))
+        # None of these fixture combinations configure hermes_logs_dir, so every
+        # one of them is the not_configured state regardless of what companion
+        # usage is doing — the two sections are independent.
         for fixtures in ([["to_regclass", [["f"]]]], [["max(e.occurred_at)", [["0", ""]]]],
                          [["max(e.occurred_at)", [["4", "2026-09-01"]]]],
                          [["max(e.occurred_at)", "ERROR:  boom"]], self.usage_fixtures()):
-            self.assertIn("tool usage: not collected yet", self.usage_text(fixtures))
+            self.assertIn(
+                "tool usage: not collected on this stack (no hermes_logs_dir configured)",
+                self.usage_text(fixtures),
+            )
 
     def test_the_usage_query_reads_only_counts_and_named_columns(self):
         """Metadata only: never event_id, turn_id or metadata — and the role is not granted them."""
@@ -774,6 +781,113 @@ class FleetMcp(unittest.TestCase):
         self.assert_telegram_safe(text)
         self.assertEqual(self.usage_text(self.usage_fixtures(rows)).count("trip-0"), 60)
 
+    # ------------------------------------------------------------ tool usage --
+    #
+    # Interim source approved 2026-09-28: real counts read straight from the
+    # Hermes relay's own `agent.log` files, not the database — dropped once a
+    # proper Hermes-hook pipeline exists. Unlike every other tool in this file
+    # this is not psql at all, so these tests point `hermes_logs_dir` at a real
+    # local temp directory with real fixture log files, and the server's own
+    # find/awk pipeline runs for real against them — no fake binary needed
+    # (there is no `argv`-style escape hatch to stub here; the local, ssh-less
+    # branch this function builds is the thing under test).
+
+    NOT_CONFIGURED = "tool usage: not collected on this stack (no hermes_logs_dir configured)"
+
+    def configure_hermes_logs_dir(self, path: Path) -> None:
+        stacks = json.loads(self.config.read_text())
+        stacks["stacks"]["prod"]["hermes_logs_dir"] = str(path)
+        self.config.write_text(json.dumps(stacks))
+
+    def write_hermes_log(self, profile: str, filename: str, lines: list[str]) -> None:
+        path = self.tmp / "hermes-logs" / profile / "logs" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+
+    def tool_usage_text(self, days: int = 7) -> str:
+        return self.rendered("statistics", {"days": days}, FIXTURES)
+
+    def test_tool_usage_not_configured_when_hermes_logs_dir_is_absent(self):
+        """The default stack in setUp never sets hermes_logs_dir."""
+        text = self.tool_usage_text()
+        self.assertIn(self.NOT_CONFIGURED, text)
+
+    def test_tool_usage_unreadable_and_the_rest_of_statistics_still_renders(self):
+        """A command that exits nonzero with a stderr line — here, a directory that isn't there."""
+        self.configure_hermes_logs_dir(self.tmp / "does-not-exist")
+        text = self.tool_usage_text()
+        self.assertIn("tool usage: could not be read (", text)
+        self.assertNotIn(self.NOT_CONFIGURED, text)
+        self.assertNotIn("no tool calls", text)
+        # This section failing must never take the rest of `statistics` with it.
+        self.assertIn("FUNNEL", text)
+        self.assertIn("DURATIONS", text)
+        self.assertIn("COMPANION USAGE", text)
+
+    def test_tool_usage_no_activity_when_files_exist_but_nothing_matches_the_window(self):
+        old = (date.today() - timedelta(days=30)).isoformat()
+        self.write_hermes_log("japan-2026", "agent.log", [
+            f"{old} 09:00:00,000 INFO agent.tool_executor: tool old_tool completed",
+            "this line does not match the log shape at all",
+        ])
+        self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
+        text = self.tool_usage_text()
+        self.assertIn("tool usage: no tool calls in the last 7 days", text)
+        self.assertNotIn(self.NOT_CONFIGURED, text)
+        self.assertNotIn("could not be read", text)
+
+    def test_tool_usage_activity_counts_across_profiles_and_rotated_logs(self):
+        today = date.today()
+        recent = today.isoformat()
+        recent2 = (today - timedelta(days=1)).isoformat()
+        just_inside = (today - timedelta(days=5)).isoformat()
+        outside = (today - timedelta(days=20)).isoformat()
+        secret = "sk-FAKESECRET1234567890"
+
+        self.write_hermes_log("japan-2026", "agent.log", [
+            f"{recent} 10:00:00,000 INFO agent.tool_executor: tool get_config completed",
+            f"{recent} 10:00:05,000 INFO agent.tool_executor: tool get_config completed",
+            f"{outside} 09:00:00,000 INFO agent.tool_executor: tool old_tool completed",
+            # A fake-secret-looking value in an unrelated column, on a line that
+            # does not match the fixed log shape: must never reach the output.
+            f"{recent} 10:01:00,000 DEBUG chat_id=-1009999999999 secret={secret}",
+        ])
+        # A rotated log file: its lines count exactly like the live one.
+        self.write_hermes_log("japan-2026", "agent.log.1", [
+            f"{just_inside} 08:00:00,000 INFO agent.tool_executor: tool send_message completed",
+        ])
+        self.write_hermes_log("orlando-2026", "agent.log", [
+            f"{recent2} 12:00:00,000 INFO agent.tool_executor: tool get_config completed",
+            f"{recent2} 12:00:01,000 INFO agent.tool_executor: tool web_search completed",
+            f"{outside} 00:00:00,000 INFO agent.tool_executor: tool ancient_tool completed",
+            "not a log line at all just noise",
+        ])
+        self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
+        text = self.tool_usage_text()
+
+        self.assertNotIn(secret, text, "a raw log line (or any of its columns) leaked into the output")
+        self.assertNotIn("chat_id", text)
+        self.assertNotIn(self.NOT_CONFIGURED, text)
+        self.assertNotIn("could not be read", text)
+        self.assertNotIn("no tool calls", text)
+        self.assertIn("TOOL USAGE", text)
+        self.assertIn("get_config: 3", text)
+        self.assertIn("send_message: 1", text)
+        self.assertIn("web_search: 1", text)
+        self.assertNotIn("old_tool", text, "a line outside the window was counted")
+        self.assertNotIn("ancient_tool", text, "a line outside the window was counted")
+        self.assertIn("active profiles: japan-2026, orlando-2026", text)
+
+    def test_tool_usage_caps_the_list_and_says_so(self):
+        today = date.today().isoformat()
+        lines = [f"{today} 09:{i:02d}:00,000 INFO agent.tool_executor: tool tool_{i:02d} completed"
+                 for i in range(20)]
+        self.write_hermes_log("japan-2026", "agent.log", lines)
+        self.configure_hermes_logs_dir(self.tmp / "hermes-logs")
+        text = self.tool_usage_text()
+        shown = re.findall(r"tool_\d\d: 1", text)
+        self.assertEqual(len(shown), 15, text)
+        self.assertIn("…and 5 more", text)
 
 
 if __name__ == "__main__":

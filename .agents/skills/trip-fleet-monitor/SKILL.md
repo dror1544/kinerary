@@ -98,8 +98,31 @@ table is metadata only by construction: no text, no chat or user id, and the
 monitor's database role is granted eight of its columns and not `event_id`,
 `turn_id` or `metadata`. Retired and scaffolding trips are test runs, exactly as
 under "trips created": the digest sums them into one labelled line, the text form
-lists them. Tool usage is not collected anywhere yet; the text form says so in
-one line and the digest omits it.
+lists them.
+
+**Tool usage**, in the same section, is a different animal: not a database
+read at all, and not on every stack. It is an interim source Dror approved
+2026-09-28 — real counts read straight from the Hermes relay's own
+`agent.log` files on the reached host, to be dropped once a proper Hermes-hook
+pipeline exists. It turns on only when a stack's config names
+`hermes_logs_dir` (`fleet-stacks.example.json`); a stack that does not is
+simply unconfigured, stated in words, never a silent zero. Text form only —
+the digest omits it, unchanged from before:
+
+| what it says | what it means |
+|---|---|
+| `tool usage: not collected on this stack (no hermes_logs_dir configured)` | the stack's config does not name a Hermes logs directory |
+| `tool usage: could not be read (<reason>)` | the read itself failed — a bad path, ssh, permissions. The rest of `statistics` still renders |
+| `tool usage: no tool calls in the last N days` | it read cleanly and found nothing in the window |
+| a `TOOL USAGE` block, top tools by total calls with an `…and N more` cap, plus `active profiles: <names>` | there is something to count |
+
+A "profile" there is the Hermes profile **directory name**, exactly as found
+on disk — not a trip slug, and this tool does not attempt to map one to the
+other (that mapping is not established). The read is a strict, anchored
+parse of one literal log shape only (`agent.tool_executor: tool <name>
+completed`); anything else on a line, including a trailing extra token, is
+ignored rather than guessed at, and the remote command itself never prints a
+raw log line or any column besides the counted tool name.
 
 **Never a row of zeros.** When there is nothing to count, the section says which
 of these it is, in words:

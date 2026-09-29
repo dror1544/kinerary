@@ -601,7 +601,7 @@ class AgainstPostgres(unittest.TestCase):
         # A wider window brings the old request in; the text form carries the same counts as a table.
         _, wide, _ = self.fleet(self.url(), ["--tool", "statistics", "--days", "365"])
         self.assertIn("seed-live-2026 | live | 5 | 2 | 40% | 1 | 1 | 1 | 1 | 3 | 7.5s | 2 | 3 | 2 | 3 | 2", wide)
-        self.assertIn("tool usage: not collected yet", wide)
+        self.assertIn("tool usage: not collected on this stack (no hermes_logs_dir configured)", wide)
 
     @unittest.skipUnless(NODE, "node is not installed")
     def test_companion_usage_says_no_table_and_not_collected_against_the_real_catalog(self):

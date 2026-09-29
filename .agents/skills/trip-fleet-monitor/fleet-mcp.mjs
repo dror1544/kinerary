@@ -358,6 +358,149 @@ function runSql(stackName, sql) {
   });
 }
 
+/**
+ * The exact literal shape of a Hermes tool-completion log line, confirmed live
+ * on the VM (2026-09-28):
+ *
+ *   2026-09-16 14:23:01,000 INFO agent.tool_executor: tool <tool_name> completed
+ *
+ * This is Hermes's own logging, not user-influenceable text — but the parser
+ * below still anchors on it strictly and treats anything else as noise, never
+ * as a tool name. NOT a database read: `loadToolUsage`'s interim source
+ * (approved 2026-09-28, to be dropped once a proper Hermes-hook pipeline
+ * exists) is this literal string in `agent.log` files on the reached host.
+ */
+const TOOL_LOG_MARKER = "agent.tool_executor: tool ";
+
+/** `days` turned into the literal cutoff date the remote command compares against — no remote date arithmetic. */
+function toolUsageCutoff(days) {
+  return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+}
+
+/**
+ * The read-only shell script that does the counting, run by `sh -c` (locally)
+ * or through the remote shell ssh already invokes for a command string.
+ *
+ * AWK/GREP-ONLY (find, test and xargs-free): `find ... -exec awk ... {} +`
+ * batches every matched file into ONE awk invocation. `find` runs TWICE
+ * on purpose — once to let a real error (missing directory, permission
+ * denied) surface as a captured, non-zero exit before anything is counted,
+ * and once, only after that check passes, to do the actual counting. A
+ * single `find | xargs awk` pipe cannot do this: with no matches, `xargs`
+ * (even sudo'd) exits 0 regardless of what `find` itself hit, which would
+ * turn "the directory doesn't exist" into a silent "no activity".
+ *
+ * The awk program prints ONLY `profile<TAB>tool<TAB>count` — never a raw log
+ * line, a chat id, a user id or any other column. A line is counted only when
+ * it contains the exact `TOOL_LOG_MARKER` followed by exactly one
+ * space-free token and the literal word "completed" and nothing else; any
+ * other shape (including the marker followed by extra trailing text) is
+ * skipped, never guessed at.
+ */
+function toolUsageScript(dir, sinceIso) {
+  const findExpr = `-mindepth 3 -maxdepth 3 -type f -name 'agent.log*' -path '*/logs/agent.log*'`;
+  const awkProgram = [
+    "{",
+    "  d = substr($0, 1, 10);",
+    "  if (d < cutoff) next;",
+    "  i = index($0, marker);",
+    "  if (i == 0) next;",
+    "  rest = substr($0, i + length(marker));",
+    '  n = split(rest, parts, " ");',
+    '  if (n != 2 || parts[2] != "completed" || parts[1] == "") next;',
+    '  nf = split(FILENAME, segs, "/");',
+    "  profile = segs[nf - 2];",
+    '  counts[profile "\\t" parts[1]]++;',
+    "}",
+    "END {",
+    '  for (key in counts) print key "\\t" counts[key];',
+    "}",
+  ].join("\n");
+
+  return [
+    `D=${shq(dir)}`,
+    `ERR=$(find "$D" ${findExpr} 2>&1 >/dev/null)`,
+    "STATUS=$?",
+    'if [ "$STATUS" -ne 0 ]; then echo "$ERR" >&2; exit "$STATUS"; fi',
+    `find "$D" ${findExpr} -exec awk -v cutoff=${shq(sinceIso)} -v marker=${shq(TOOL_LOG_MARKER)} ${shq(awkProgram)} {} +`,
+  ].join("\n");
+}
+
+/**
+ * Turn a stack's `hermes_logs_dir` into the argv that runs `toolUsageScript`.
+ *
+ * Not psql, so this does not extend `buildArgv` — it reuses only the SSH/sudo
+ * plumbing that function already established (`ssh.sudo`, `ssh.target`,
+ * `ssh.key`, `ssh.options`, `ssh.connect_timeout`), rather than inventing a
+ * second convention for reaching a host. `container` does not apply here:
+ * `agent.log` is read straight off the host filesystem (confirmed live), even
+ * when Hermes itself runs in a container.
+ */
+function buildToolUsageArgv(name, sinceIso) {
+  const stack = CONFIG.stacks[name];
+  if (!stack) {
+    const known = Object.keys(CONFIG.stacks).join(", ") || "none configured";
+    throw new Error(`unknown stack '${name}' (configured: ${known})`);
+  }
+  const script = toolUsageScript(stack.hermes_logs_dir, sinceIso);
+
+  // No ssh: this machine's own shell runs it directly.
+  if (!stack.ssh) {
+    return [findBinary("sh", "FLEET_SH_BIN", ["/bin/sh"]), "-c", script];
+  }
+
+  // Over SSH the remote shell ssh already invokes interprets the script as-is
+  // (no extra `sh -c` needed) unless sudo is required, in which case the
+  // script becomes the single quoted argument to a `sudo sh -c` — the
+  // standard way to run a multi-statement script as another user.
+  const ssh = stack.ssh;
+  const remote = ssh.sudo === false ? script : `sudo sh -c ${shq(script)}`;
+
+  const sshArgs = ["-o", "BatchMode=yes", "-o", `ConnectTimeout=${ssh.connect_timeout ?? 10}`];
+  if (ssh.key) sshArgs.push("-i", expandHome(ssh.key));
+  if (ssh.port) sshArgs.push("-p", String(ssh.port));
+  for (const option of ssh.options ?? []) sshArgs.push("-o", option);
+
+  return [
+    findBinary("ssh", "FLEET_SSH_BIN", ["/usr/bin/ssh"]),
+    ...sshArgs,
+    ssh.target,
+    remote,
+  ];
+}
+
+/** Run the tool-usage argv and return its TAB-separated rows as string arrays. */
+function runToolUsageCommand(argv) {
+  return new Promise((resolve_, reject) => {
+    const child = spawn(argv[0], argv.slice(1), {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        HOME: process.env.HOME || homedir(),
+        PATH: process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+      },
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.on("error", (e) => {
+      const wrapped = new Error(e.message);
+      wrapped.stderr = e.message;
+      reject(wrapped);
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const e = new Error(`tool usage command exited ${code}`);
+        e.stderr = err.trim() || out.trim();
+        return reject(e);
+      }
+      const rows = out.split("\n").filter((l) => l.length > 0).map((l) => l.split("\t"));
+      resolve_(rows);
+    });
+  });
+}
+
 /** A trip id or slug, and nothing else — the only free text that reaches SQL. */
 function safeRef(value) {
   const ref = String(value ?? "").trim();
@@ -999,10 +1142,12 @@ async function loadStatistics(stack, d) {
                      FROM control_plane.interview_interpretations
                     WHERE created_at > ${since} GROUP BY 1 ORDER BY 2 DESC;`),
   ]);
-  // A section of its own, after the rest: it can fail on its own (the table does
-  // not exist before Release A), and that must never take the funnel with it.
+  // Sections of their own, after the rest: each can fail on its own (the table
+  // does not exist before Release A; hermes_logs_dir may not be configured or
+  // reachable), and neither must ever take the funnel with it.
   const usage = await loadCompanionUsage(stack, d);
-  return { funnel, builds, durations, classes, models, usage };
+  const toolUsage = await loadToolUsage(stack, d);
+  return { funnel, builds, durations, classes, models, usage, toolUsage };
 }
 
 /**
@@ -1117,6 +1262,53 @@ async function loadCompanionUsage(stack, d) {
   }
 }
 
+/** What went wrong reading the log files, short and stripped — never a host, path or connection detail. */
+function toolUsageShortReason(text) {
+  const line = String(text ?? "").trim().split("\n")[0] || "";
+  return md(line).slice(0, 100) || "the command failed";
+}
+
+/**
+ * Tool usage, from the Hermes relay's own `agent.log` files rather than the
+ * database (see `toolUsageScript`). Same never-a-zero-row discipline as
+ * `loadCompanionUsage`, with a state this section owns because it has no
+ * database table to be missing or empty:
+ *
+ *   not_configured   `hermes_logs_dir` is absent on this stack — not measured,
+ *                    not an error
+ *   unreadable       the read itself failed (bad path, ssh, permissions)
+ *   no_activity      it ran cleanly and found no matching lines in the window
+ *   activity         there is something to count
+ *
+ * Catches its own errors, exactly like `loadCompanionUsage`: this section
+ * failing must never take the funnel or provisioning sections of `statistics`
+ * down with it.
+ */
+async function loadToolUsage(stack, d) {
+  const dir = CONFIG.stacks[stack]?.hermes_logs_dir;
+  if (!dir) return { state: "not_configured" };
+  try {
+    const argv = buildToolUsageArgv(stack, toolUsageCutoff(d));
+    const rows = await runToolUsageCommand(argv);
+    const counts = new Map();
+    const profiles = new Set();
+    for (const row of rows) {
+      if (row.length !== 3) continue;
+      const [profile, tool, countText] = row;
+      if (!profile || !tool) continue;
+      const n = Number(countText);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      counts.set(tool, (counts.get(tool) ?? 0) + n);
+      profiles.add(profile);
+    }
+    if (counts.size === 0) return { state: "no_activity" };
+    const tools = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    return { state: "activity", tools, profiles: [...profiles].sort() };
+  } catch (error) {
+    return { state: "unreadable", reason: toolUsageShortReason(error?.stderr ?? error?.message) };
+  }
+}
+
 /** The state lines. Words, never numbers: each says why there are none. */
 function usageStateLine(usage, d) {
   switch (usage.state) {
@@ -1203,7 +1395,42 @@ const USAGE_TEXT_HEADERS = ["trip", "class", "requests", "replies", "reply rate"
   "lost (gateway)", "lost (companion)", "chatter ignored", "median reply", "with media", "group", "dm",
   "organizer", "participant"];
 
-function renderUsageText(usage, d) {
+/** How many tools the text listing shows before saying "…and N more" — mirrors the companion-usage digest's own cap. */
+const TEXT_TOOL_CAP = 15;
+
+/**
+ * TEXT-only (the digest form never calls this — tool usage in the digest was a
+ * deliberate earlier decision to keep out, unchanged here). Four states, same
+ * never-a-zero discipline as `usageStateLine`.
+ */
+function toolUsageLines(toolUsage, d) {
+  switch (toolUsage.state) {
+    case "unreadable":
+      return [`  tool usage: could not be read (${toolUsage.reason})`];
+    case "no_activity":
+      return [`  tool usage: no tool calls in the last ${d} day${d === 1 ? "" : "s"}`];
+    case "activity": {
+      const lines = [
+        "",
+        `TOOL USAGE  (top tools by total calls, last ${d} day${d === 1 ? "" : "s"}; profile is the Hermes` +
+          " profile directory name as-is — mapping it to a trip slug or class is not established, so this" +
+          " does not attempt it)",
+      ];
+      const shown = toolUsage.tools.slice(0, TEXT_TOOL_CAP);
+      for (const [tool, count] of shown) lines.push(`  ${md(tool)}: ${count}`);
+      if (toolUsage.tools.length > shown.length) {
+        lines.push(`  …and ${toolUsage.tools.length - shown.length} more`);
+      }
+      lines.push(`  active profiles: ${toolUsage.profiles.map(md).join(", ")}`);
+      return lines;
+    }
+    case "not_configured":
+    default:
+      return ["  tool usage: not collected on this stack (no hermes_logs_dir configured)"];
+  }
+}
+
+function renderUsageText(usage, toolUsage, d) {
   const lines = [
     `COMPANION USAGE  (counts only, last ${d} days; retired/scaffolding are test runs, not customers)`,
   ];
@@ -1225,11 +1452,11 @@ function renderUsageText(usage, d) {
       "  chatter ignored = group messages not addressed to the assistant. Requests split by channel and role.",
     );
   }
-  lines.push("  tool usage: not collected yet");
+  lines.push(...toolUsageLines(toolUsage, d));
   return lines;
 }
 
-function renderStatisticsText(stack, d, { funnel, builds, durations, classes, models, usage }) {
+function renderStatisticsText(stack, d, { funnel, builds, durations, classes, models, usage, toolUsage }) {
   const value = (rows, key) => rows.find((r) => r[0] === key)?.[1] ?? "0";
   const started = Number(value(funnel, "interviews started"));
   const confirmed = Number(value(funnel, "interviews confirmed"));
@@ -1262,7 +1489,7 @@ function renderStatisticsText(stack, d, { funnel, builds, durations, classes, mo
     "DURATIONS",
     asTable(durations, ["measure", "value"]),
     "",
-    ...renderUsageText(usage, d),
+    ...renderUsageText(usage, toolUsage, d),
   ].join("\n");
 }
 
