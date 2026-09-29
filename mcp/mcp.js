@@ -258,7 +258,7 @@ mcp.tool('set_telegram_group',
 }, async ({ chatId, chatTitle }) => ok(await apiPost('/api/agent/telegram-group', { chat_id: chatId, chat_title: chatTitle })));
 
 mcp.tool('get_today',
-  'Read the trip clock date, active plan for today, next activity, and today\'s companion_message. Use this date when publishing a daily message.', {},
+  'Read the trip clock date, current time, active plan for today, next activity, and today\'s companion_message, all in the trip\'s own timezone. This directly answers "what time is it" / "what time is it there" for this trip — read this instead of a general web search. Use this date when publishing a daily message. If the timezone looks wrong (e.g. it should be where the family actually is), use set_trip_timezone to correct it rather than working around it.', {},
   async () => ok(await apiGet('/api/today')));
 
 mcp.tool('get_companion_inbox',
@@ -280,6 +280,11 @@ mcp.tool('set_companion_connection',
     group_url: z.string().nullable().optional(), bot_username: z.string().nullable().optional(),
     binding_command: z.string().nullable().optional(), binding_expires_at: z.string().nullable().optional(),
   }, async args => ok(await apiPost('/api/agent/companion/connection', args)));
+
+mcp.tool('set_trip_timezone',
+  'Change the trip\'s own canonical timezone — the one get_today, day/night state and every trip-local time on the site are computed from. Use this when a traveler or organizer says the trip\'s time or timezone looks wrong, or names where they actually are (e.g. "we\'re in Miami now, not wherever this thinks we are"). Takes effect immediately, no redeploy needed. This is a structural, trip-wide setting, not a personal display preference for one member — do not use it to answer "what\'s MY local time". Pass a real IANA timezone identifier (e.g. "America/New_York", "Asia/Jerusalem"); an invalid one is rejected and nothing changes. Returns the confirmed value — read it back to confirm to whoever asked.', {
+    timezone: z.string().min(1).describe('IANA timezone identifier, e.g. "America/New_York", "Asia/Jerusalem", "Asia/Ho_Chi_Minh"'),
+  }, async ({ timezone }) => ok(await apiPatch('/api/settings', { timezone })));
 
 mcp.tool('publish_daily_message',
   'Publish one short, warm encouragement on the trip Today page. Read get_today first; use its exact today date. ' +

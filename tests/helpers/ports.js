@@ -102,6 +102,7 @@ export const PORTS = {
   galleryHardening:        28129,  // tests/gallery-hardening.test.js — boundary audit round 2 of #191/#194
   // tests/trip-documents.test.js
   tripDocuments:           28299,
+  tripTimezone:            28310,  // tests/trip-timezone.test.js
 
   modernParity:            28298,
   modernEnrichment:        28194,
@@ -135,6 +136,7 @@ export const PORTS = {
   mcpHealthAuth:           28125,
   mcpPhasePlan:            28308,  // tests/mcp-phase-plan.test.js — issue #310
   mcpPhasePlanLarge:       28309,  // tests/mcp-phase-plan.test.js — issue #310, safety-net fixture
+  mcpTripTimezone:         28311,  // tests/mcp-trip-timezone.test.js
 
   // ── Stand-ins for services the server calls out to ─────────────────────
   bookingExtractMockHermes: 28103,
