@@ -59,8 +59,15 @@ for pkg in server tests mcp control-plane/api; do
 
   main_nm="$main_pkg/node_modules"
   main_nm_usable=false
+  main_nm_stale=false
   if [ -d "$main_nm" ] && [ ! -L "$main_nm" ]; then
-    main_nm_usable=true      # never chain a symlink to a symlink
+    # A missing .package-lock.json also counts as stale — `-nt` against a
+    # missing file is true, which is the fail-safe direction.
+    if [ "$main_pkg/package-lock.json" -nt "$main_nm/.package-lock.json" ]; then
+      main_nm_stale=true
+    else
+      main_nm_usable=true    # never chain a symlink to a symlink
+    fi
   fi
 
   if [ "$wt_hash" = "$main_hash" ] && [ "$main_nm_usable" = true ]; then
@@ -69,16 +76,29 @@ for pkg in server tests mcp control-plane/api; do
     ln -s "$main_nm" "$wt_pkg/node_modules"
     ok "$pkg: linked -> $main_nm"
   else
-    if [ "$main_nm_usable" != true ]; then
+    if [ "$main_nm_stale" = true ]; then
+      reason="main's node_modules is older than its lockfile — this worktree gets its own install (duplicated until someone runs: cd $main_pkg && npm ci)"
+    elif [ "$main_nm_usable" != true ]; then
       reason="main has no real node_modules for $pkg yet (run npm install in $main_pkg)"
     else
       reason="package-lock.json differs from main (lockfile drift) — symlinking would give wrong deps"
     fi
     warn "$pkg: $reason"
-    if [ -L "$wt_pkg/node_modules" ]; then
-      rm "$wt_pkg/node_modules"        # drop stale link before a real install
+
+    wt_nm="$wt_pkg/node_modules"
+    if [ -f "$wt_pkg/package-lock.json" ] && [ -d "$wt_nm" ] && [ ! -L "$wt_nm" ] \
+       && [ ! "$wt_pkg/package-lock.json" -nt "$wt_nm/.package-lock.json" ]; then
+      ok "$pkg: already has a real, current node_modules — left as is"
+    else
+      if [ -L "$wt_nm" ]; then
+        rm "$wt_nm"        # drop stale link before a real install
+      fi
+      if [ -f "$wt_pkg/package-lock.json" ]; then
+        ( cd "$wt_pkg" && npm ci --no-audit --no-fund )
+      else
+        ( cd "$wt_pkg" && npm install )
+      fi
+      ok "$pkg: installed real node_modules in worktree"
     fi
-    ( cd "$wt_pkg" && npm install )
-    ok "$pkg: installed real node_modules in worktree"
   fi
 done
