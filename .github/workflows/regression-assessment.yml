@@ -36,6 +36,14 @@
 # CI CANNOT SEE PRODUCTION, on purpose. No SSH key, no database, no deploy host.
 # The agent's "live-fleet exposure" step is therefore not performed here and the
 # comment says so. That half is still owed locally before a deploy.
+#
+# An `opened`/`ready_for_review` PR is ALSO skipped, before the Opus step runs
+# at all, when scripts/regression-assessment-scope.sh says every changed path
+# is documentation, tests or stylesheets. That list is positive and short —
+# it grows only by a recorded decision, not by habit — and fails toward
+# assessing on anything it cannot read or does not recognise. A `labeled`
+# event with the `regression-assessment` label always assesses regardless;
+# that label is the manual override this filter cannot see past.
 
 name: Regression assessment
 
@@ -160,6 +168,30 @@ jobs:
               echo "could not diff $BEFORE..$AFTER — assessing anyway"
             fi
           fi
+
+          # ── Is this PR entirely docs, tests or stylesheets? ───────────────
+          #
+          # Only on `opened`/`ready_for_review` — never `labeled` (that is the
+          # `regression-assessment` label, the manual override, and it must
+          # always assess) and never `synchronize` (handled above already).
+          # scripts/regression-assessment-scope.sh holds the positive safe
+          # list; this step only calls it. Fails OPEN: if the file list
+          # cannot be fetched, or is empty, or the scope script itself is
+          # unhappy, assess rather than skip.
+          if [ "$EVENT" = "pull_request" ] \
+               && { [ "$ACTION" = "opened" ] || [ "$ACTION" = "ready_for_review" ]; }; then
+            if SCOPE_FILES=$(gh pr diff "$NUMBER" --name-only 2>/dev/null) && [ -n "$SCOPE_FILES" ]; then
+              if printf '%s\n' "$SCOPE_FILES" | scripts/regression-assessment-scope.sh; then
+                RELEVANT=false
+                echo "::notice title=Assessment skipped::Every changed path is documentation, tests or stylesheets (scripts/regression-assessment-scope.sh). Apply the regression-assessment label to assess anyway."
+              else
+                echo "not every changed path is safe to skip — assessing"
+              fi
+            else
+              echo "could not list changed files for #$NUMBER — assessing anyway"
+            fi
+          fi
+
           echo "relevant=$RELEVANT" >> "$GITHUB_OUTPUT"
           [ "$RELEVANT" = "true" ] || exit 0
 
