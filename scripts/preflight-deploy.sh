@@ -150,8 +150,20 @@ NEED_LINK=0
 for pkg in server tests mcp control-plane/api web trip-web control-plane/runtime-gateway; do
   [ -f "$pkg/package.json" ] || continue
   if [ -e "$pkg/node_modules" ]; then
+    if [ -L "$pkg/node_modules" ]; then
+      case "$pkg" in
+        server|tests|mcp|control-plane/api)
+          # A symlink whose target predates the worktree's lockfile is stale —
+          # let the linker decide (relink to a fresh main, or install locally).
+          if is_worktree && [ "$pkg/package-lock.json" -nt "$pkg/node_modules/.package-lock.json" ]; then
+            NEED_LINK=1
+          fi
+          ;;
+      esac
+      continue
+    fi
     # A real install older than its lockfile is a stale one.
-    if [ ! -L "$pkg/node_modules" ] && [ "$pkg/package-lock.json" -nt "$pkg/node_modules/.package-lock.json" ]; then
+    if [ "$pkg/package-lock.json" -nt "$pkg/node_modules/.package-lock.json" ]; then
       ( cd "$pkg" && npm ci --no-audit --no-fund ) >"$LOGS/npm-$(echo "$pkg" | tr / _).log" 2>&1 \
         && pass "$pkg: reinstalled (lockfile was newer)" || die "$pkg: npm ci failed"
     fi
