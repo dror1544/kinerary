@@ -22,11 +22,11 @@ one in front of us; I would not import any part of it here.
 | Lever | Verdict | Why |
 |---|---|---|
 | Risk-sized process (three tiers) | **Adopt**, as the classifier under everything else | Must be mechanical, not judged per task — a path allow-list, default-High on anything unrecognized, the same fail-safe shape `shared/needs-schema.js` already uses for visibility. A soft heuristic here just becomes the "another costly review" the proposal itself worries about. |
-| Direct implementation for small tasks | **Modify, then adopt** | §3.1's "it does not write product code... even for a one-liner" is real, verbatim, not a summary error. But its stated reason is "so the verifier and reviewer see it" — an independent check, not proof that a *subagent* has to hold the pen. Let the lead session implement Small/Normal-tier changes directly, but require it to run the verifier itself, in the same turn, before proposing the commit. Cut the coordination hop, keep the verification hop. |
+| Direct implementation for small tasks | **Modify, then adopt — Small tier only** | §3.1's "it does not write product code... even for a one-liner" is real, verbatim, not a summary error. But its stated reason is "so the verifier and reviewer see it" — an independent check, not proof that a *subagent* has to hold the pen. Let the lead session implement Small-tier changes directly, on a feature branch in a worktree that is not live-served, and still spawn `verifier` exactly as today — it cannot edit, so it cannot pass itself. Cut the developer hop; keep the verifier hop and the isolation. Normal tier keeps the developer (§4, §9). |
 | One compact brief | **Adopt** | Already close to true — the manager already posts a brief as the issue's first comment (§3.1). This mostly asks to stop writing a second and third planning document for the same fact, which doc-keeper's "one authoritative home per fact" rule already implies. |
 | Smaller always-loaded context | **Defer** | Roles load once per session, not fresh per task (agent-team-plan: "Roles load once per session, from the checkout it starts in"), and CLAUDE.md is prompt-cached across a session's own turns. Line count is reading surface, not token cost — the proposal says so itself. Nothing in this repo currently measures token spend by role (see §5); cutting a well-organized reference document apart on a 5–20% guess, with the real cost of a rule an agent can no longer find, is the wrong order of operations. |
 | Reuse valid verification | **Adopt, as already scoped** | This is the Sept 26 rule ("CI as merged-tree evidence... when the merge is clean, no file is touched by both sides and no security path is involved") applied more consistently, not a new rule. Widening it further is a separate, later decision — correctly deferred by the proposal itself. |
-| Conditional per-task doc-keeper | **Reject the framing — mostly already true** | Re-reading §3.6: the keeper's actual job is "is it recorded... if not, the keeper writes..." A diff with no decision in it — the case this lever targets — already costs the keeper close to nothing, because there's nothing to record. Formalizing "conditional" adds a classification step to save time the design mostly doesn't spend today. Revisit with data if that turns out false. |
+| Conditional per-task doc-keeper | **Modify — fold into lever 2** | The first pass said "reject, mostly already true"; that overstated it. Re-reading §3.6, a keeper on a decision-less diff still costs a spawn — a full turn reading the handover, the diff, the PR body and every touched document — not nothing. But the question only arises for Small tier, where lever 2 already removes the developer handover the keeper reads from. So: on Small tier the lead session records any decision itself (usually there is none) and the daily sweep catches drift; Normal and High keep the per-task seat exactly as §3.6 has it. No separate classification step — the tier decides. |
 | Filter regression-assessment before model invocation | **Adopt, and move it first** | I read `.github/workflows/regression-assessment.yml` directly. Every `opened`/`ready_for_review` PR event on this repo runs the full pipeline — checkout, context collection, an Opus regression-planner call — **unconditionally**. Only `synchronize` (a later push) has any skip logic, and only for *re*-assessment, not the first one. No size or risk pre-filter exists today. This is the cleanest lever on the list: a diff-path check against the same risk allow-list from lever 1, before the workflow's own "is this configured" step, defaulting to "assess" on anything unrecognized. It touches nothing about delegation or documentation — pure CI cost avoidance, and the savings are visible directly in Actions minutes. |
 | Bound concurrency by review capacity | **Adopt — already measured, not hypothesized** | `docs/test-reports/process-baseline-2026-09-26.md`: median PR open→merge is 2.4h, 75th percentile 30h, while first-commit→PR-open is 0.0h. The bottleneck is confirmed to sit after the PR opens — review and merge — not generation speed. More parallel developer sessions against one approver grows the queue in front of that constraint; it doesn't relieve it. |
 | Shared Claude/Codex handoff + selective second opinions | **Defer** | Cross-tool consistency already has a demonstrated failure mode here: 2026-09-25's #192, where a test leaning on the Mac's locally installed `codex` binary passed locally and stayed red on the GitHub runner for ~18 hours before #224 fixed it (CLAUDE.md's own "green local ≠ green CI" section). Adding a second model into the loop before that class of problem is solved adds a surface for divergence, not removes one. Sequence after, not alongside, the rest. |
@@ -48,24 +48,34 @@ one in front of us; I would not import any part of it here.
   moves Actions minutes and model invocations, a metric the baseline doesn't
   track at all. Layering these two doesn't dirty the Sept 26 re-measurement's
   signal.
-- **A stale citation, not a proposal error.** §2 cites the tracks document's
-  claim that nightly e2e is "not scheduled... waits on Dror." I checked the
-  actual launchd job on this Mac
-  (`~/Library/LaunchAgents/com.kinerary.nightly-e2e.plist`): it now carries a
-  `StartCalendarInterval` of 02:00 daily — it *is* scheduled. The proposal
-  read the tracks doc correctly; the tracks doc itself is five days stale.
-  That's evidence for the proposal's own point cutting both ways: a script or
-  a line going unread and drifting from the tree is exactly the failure this
-  whole effort is trying to reduce, and it already happened once, quietly,
-  in under a week. Worth a doc-keeper sweep line, not a process redesign.
+- **A half-stale citation — and the first pass got the other half wrong.**
+  §2 cites the tracks document's claim that nightly e2e is "not scheduled...
+  not marked BUILT... waits on Dror." The launchd job on this Mac
+  (`~/Library/LaunchAgents/com.kinerary.nightly-e2e.plist`) carries a
+  `StartCalendarInterval` of 02:00 daily, and
+  `~/Library/Logs/kinerary-nightly/` holds a log for each of 2026-09-27, -28
+  and -29 — so "not scheduled" is stale. But every one of those three runs
+  ended `[fail] preflight failed — nothing deployed`, each time on the
+  trip-site `tests` suite (the 28th also on `scripts tests`), exit 1. So "not
+  marked BUILT" still stands: the automation exists and fires, and has never
+  once done the thing it is for. The first pass of this review read the plist
+  and called the tracks doc "five days stale"; it should have read the logs
+  too. Both lessons are the proposal's own point — script existence is not an
+  operating automation, and a schedule is not a green run. The failing suite
+  is an operational item for Dror (§7), not this review's to diagnose.
 
 ## 3. Timing
 
 Start now, not on the proposal's suggested October 5 window — but only for
-the two adopt-now levers (risk classifier + direct small-task implementation
-with in-session verification; regression-assessment pre-filter). Both are
+the two adopt-now levers (risk classifier + direct Small-tier implementation
+with the verifier still spawned; regression-assessment pre-filter). Both are
 mechanical, reversible, and closer in size to the Sept 26 change itself than
-to a new pilot program. Everything else should wait for Release A (Oct 3) and
+to a new pilot program. Sequence them: the workflow pre-filter first — it
+changes one YAML file and no role, so no session restart. The delegation
+exception edits `.claude/agents/` and agent-team-plan §3.1, which means a
+Codex-mirror regeneration and a restart of every session that loaded the old
+role; do that at the first quiet task boundary, which with Release A on
+Oct 3 probably means the following week, not this one. Everything else should wait for Release A (Oct 3) and
 for the Sept 26 baseline's own re-measurement window (next 10 PRs) to close,
 exactly as the proposal recommends — those levers touch review-round counts
 and context structure, the things Sept 26 is actively being measured on.
@@ -78,20 +88,41 @@ alongside the Sept 26 re-measurement already due.
 
 ## 4. Minimum pilot
 
-- **Eligible:** a change whose entire diff stays outside the risk allow-list
-  (no migration, no `server/server.js`, no `shared/`, no auth route, no
-  `mcp/provision.js`, no `control-plane/**` process-spawning code, no
-  deployment/guardrail policy file), describable in one sentence of intended
-  behavior.
-- **Excluded:** anything touching a listed path, and anything whose risk is
-  itself unclear — defaults to the current mandatory-delegation path, same as
-  the schema-visibility fail-safe rule CLAUDE.md already teaches.
-- **Evidence still required:** a verifier run in the lead session's own turn
-  (not skipped — just not delegated), the one-sentence brief on the issue,
+- **Eligible (Small tier) — a positive list, not "everything else."** The
+  first pass phrased this as "outside the risk list", which is a deny-list —
+  the shape CLAUDE.md's sanitizer history says leaks. Invert it: a diff is
+  Small only when every changed path matches an enumerated safe pattern —
+  `docs/**` (not policy files), `tests/**` and other test-only files, `site/`
+  copy and styling, presentational SPA components — and the change is
+  describable in one sentence of intended behavior. Anything else is Normal
+  or High by default. The safe list is short on purpose and grows only by a
+  recorded decision, the way `.preflight-allow` does.
+- **Never Small, whatever the diff size:** migrations, `server/server.js`,
+  `shared/`, `model-runner.ts`, any auth route, `mcp/**`, `control-plane/**`,
+  anything that spawns a process, and — the two the first pass missed —
+  deployed prompts (`.agents/skills/**` SOUL and skill files reach live
+  companions; #240 was a template edit) and policy (`CLAUDE.md`, `.claude/`,
+  `.github/`, `scripts/`, `.githooks/`). A prompt edit is a production
+  behavior change, as the proposal itself says.
+- **Evidence still required:** `verifier` spawned as today — it cannot edit,
+  so it cannot pass itself; that invariant is the whole reason it is a
+  separate agent, and a lead session that edits and then runs the suites
+  itself would quietly lose it. Plus the one-sentence brief on the issue and
   the existing merge gate.
+- **Isolation still required:** the work happens on a `fix/`/`feat/`/`chore/`
+  branch in a worktree that is not live-served. `docker inspect` on this Mac
+  today shows the staging API mounting
+  `.../worktrees/sprint-6-integration/control-plane/api/dist` and the worker
+  mounting that whole worktree at `/repo` — the lead session's own checkout
+  *is* the served tree. The developer's "own worktree" was doing two jobs,
+  coordination and isolation; dropping the developer must not drop the
+  second. `developer.md` already says it ("you were given a worktree for a
+  reason"); the exception has to say it too.
 - **Rule that changes:** agent-team-plan §3.1's "it does not write product
-  code... even for a one-liner" gets a named exception for this tier. Nothing
-  else moves.
+  code... even for a one-liner" gets a named exception for Small tier only.
+  Normal tier keeps the developer — the proposal's own table keeps "fresh
+  review" there, and a second pair of eyes on a bounded feature is the plan's
+  reason to exist.
 - **Controls that stay exactly as strict:** the two-round review cap,
   boundary review on every security path, the regression-plan requirement for
   risky PRs, the integrator's merge-tree check, hard rules 1–6, sprint/
@@ -158,6 +189,11 @@ than the rest of the list combined for a repo opening this many PRs a week.
 - Whether to fold this into the existing Sept 26 re-measurement window (next
   10 PRs) or track it separately — I'd default to folding it in (§2), but
   it's his call what a clean signal is worth.
+- The nightly e2e has fired three nights running and failed all three at the
+  trip-site `tests` suite (§2). Whether that is the known concurrency flake or
+  a real regression is not determined here; either way staging has not been
+  refreshed by it once, and a Release A dry run that leans on "the nightly is
+  green" would be leaning on nothing.
 
 ---
 
@@ -224,3 +260,37 @@ breadth of persona coverage — out of it; it solves a problem this repo
 doesn't have. The result is the same team of roles Kinerary already built,
 doing less coordination on the share of changes that are small and safe, and
 exactly as much scrutiny as today on everything else.
+
+## 9. Second pass — same day, a different model
+
+Dror asked for a second, independent read before treating this review as
+ratified. This pass re-checked every claim the verdicts lean on against the
+tree and the machine, not against the first pass's notes.
+
+**Held, re-verified at source:**
+
+- The regression-assessment workflow, all 270 lines this time: on `opened`
+  and `ready_for_review` nothing sets `relevant=false` — only `synchronize`
+  has a skip — and the Assess step runs `claude-opus-5` with `--max-turns 40`.
+  "Unconditional on open" is exact.
+- §3.1's one-liner delegation rule; the baseline's 2.4h / 30h / 0.0h; the
+  #274 and #275 boundary-review catches; `process-metrics.py` measuring PR
+  timing and hook decisions and nothing about tokens.
+
+**Changed:**
+
+- Lever 2 narrowed from Small/Normal to Small only, and "run the verifier
+  itself" replaced with "spawn `verifier` as today". The first wording would
+  have let one session edit and grade its own work — the exact failure the
+  verifier's no-edit rule exists to prevent.
+- §4's eligibility inverted from a deny-list to a positive safe list, with
+  deployed prompts and policy files added to never-Small.
+- Worktree isolation added as a retained control, on the evidence that the
+  lead session's checkout is the Mac's live-served tree.
+- Lever 6 (doc-keeper) softened from "reject" to "fold into lever 2".
+- The nightly-e2e correction corrected: scheduled and firing, yes; ever
+  green, no.
+
+**Unchanged and still recommended:** the two adopt-now levers, the
+sequencing in §3, the verdict on `agency-agents`. Nothing found in the second
+pass moves those.
