@@ -310,14 +310,22 @@ uses instrumentation that already exists, plus one label — no new tracker.
 | M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` | **54 completed / 41 merged ≈ 1.3** (79 runs: 54 success, 18 skipped, 7 cancelled) | halves — Small tier skipped, Normal/High still assessed |
 | M4 | Small-tier PRs taken directly vs via a developer | PR body line `Path: direct \| developer`, `size:S` label | not recorded before the switch | recorded on every Small PR; the count is the sample size |
 | M5 | Escaped defects on lightened-path PRs | `fix/` PRs or reverts citing a Small-tier PR within 7 days; boundary findings on anything mis-tiered | 0 by construction (no lightened path yet) | 0; one is a stop condition (§7 of the proposal) |
-| M6 | Tokens / model usage per PR | none exists | **unknown** — recorded as such, never reconstructed from PR size | unknown until a source exists |
+| M6 | Model usage per PR | none today; from the switch, `tool_uses` and `duration_ms` in every developer/verifier handover (the task-notification metadata already carries both — lead session's amendment, 2026-09-29) | **unknown** for the before window — recorded as such, never reconstructed from PR size | measured from the switch; tokens proper stay unknown until a source exists |
 | M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md` | **0 / 3** (2026-09-27, -28, -29 — same failure, §2) | ≥ 6 of 7 once the fix lands |
 
 **Two things the baseline already says.** M2's 82 commit *asks* against 22
-*allows* mean the Sept 26 exemption is not reaching most commits — the hook's
-"plain commit" shape is not matching what sessions actually type (a
-`chore/hook-heredoc-message` branch is already on it). The cheapest M2 win is
-that matcher, not the process. And M3's 1.3 assessments per merged PR is the
+*allows* mean the Sept 26 exemption is not reaching most commits. Broken down
+by session (the log's `who` column reads `lead` throughout, so these are not
+subagents): one session 31 ask / 9 allow, another 24 ask / 0 allow, a session
+type that stamps no session id 19 ask, two more 6 and 1. The log holds no
+command text by design, so whether these are matcher misses (a heredoc shape
+the vouching does not read) or legitimately prompted shapes (a policy path
+staged, a code commit made on the integration branch instead of a feature
+branch) is **unknown**. Next step, one week: log the command's shape *class* —
+plain / chained / policy path / branch kind — never the command. Until then
+the cheapest M2 win is still the matcher, not the process; the
+`chore/hook-heredoc-message` branch at the tip of two locked bridge worktrees
+is not the lead session's, and that session type may be the unstamped one. And M3's 1.3 assessments per merged PR is the
 number lever 7 acts on directly; it is the one metric with no interpretation
 in it.
 
