@@ -311,7 +311,7 @@ uses instrumentation that already exists, plus one label — no new tracker.
 | M4 | Small-tier PRs taken directly vs via a developer | PR body line `Path: direct \| developer`, `size:S` label | not recorded before the switch | recorded on every Small PR; the count is the sample size |
 | M5 | Escaped defects on lightened-path PRs | `fix/` PRs or reverts citing a Small-tier PR within 7 days; boundary findings on anything mis-tiered | 0 by construction (no lightened path yet) | 0; one is a stop condition (§7 of the proposal) |
 | M6 | Model usage per PR | none today; from the switch, `tool_uses` and `duration_ms` in every developer/verifier handover (the task-notification metadata already carries both — lead session's amendment, 2026-09-29) | **unknown** for the before window — recorded as such, never reconstructed from PR size | measured from the switch; tokens proper stay unknown until a source exists |
-| M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md` | **0 / 3** (2026-09-27, -28, -29 — same failure, §2) | ≥ 6 of 7 once the fix lands |
+| M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md` | **0 / 4** — 2026-09-27, -28, -29 02:00 the same linker failure (§2, fixed by #316); the 29th's on-demand run at 19:36 passed the trip-site suite for the first time and failed one Web SPA test on a lazy-route import that took 2.58 s against a 1 s wait, with CI green on the same commit `cd39cb7` (fix in flight) | ≥ 6 of 7 once both fixes land |
 
 **Two things the baseline already says.** M2's 82 commit *asks* against 22
 *allows* mean the Sept 26 exemption is not reaching most commits. Broken down
