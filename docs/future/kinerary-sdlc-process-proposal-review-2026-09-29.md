@@ -352,8 +352,10 @@ number lever 7 acts on directly; it is the one metric with no interpretation
 in it.
 
 **Windows and decision rule.** "Before" is the Sept 26 window above, extended
-to the switch date. "After" starts at the switch and closes at whichever is
-later: ten Small-tier PRs (M4) or two weeks. At close: M2 ≤ 2, M3 at most
+to the switch date. **The switch is #322, merged 2026-09-30T09:30Z as
+`2b34997`** — "after" starts there for M1, M2, M4, M5, M6 (for M3, when the
+secret in #323 is set) and closes at whichever is later: ten Small-tier PRs
+(M4) or two weeks, i.e. not before 2026-10-14. At close: M2 ≤ 2, M3 at most
 half its baseline, M1 median and tail not worse, M5 zero, M7 holding —
 adopt. Any M5 event, or follow-up work erasing the M2/M3 gain — pause the
 exception and record what failed, per the proposal's own stop condition.
