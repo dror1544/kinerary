@@ -27,7 +27,7 @@ one in front of us; I would not import any part of it here.
 | Smaller always-loaded context | **Defer** | Roles load once per session, not fresh per task (agent-team-plan: "Roles load once per session, from the checkout it starts in"), and CLAUDE.md is prompt-cached across a session's own turns. Line count is reading surface, not token cost — the proposal says so itself. Nothing in this repo currently measures token spend by role (see §5); cutting a well-organized reference document apart on a 5–20% guess, with the real cost of a rule an agent can no longer find, is the wrong order of operations. |
 | Reuse valid verification | **Adopt, as already scoped** | This is the Sept 26 rule ("CI as merged-tree evidence... when the merge is clean, no file is touched by both sides and no security path is involved") applied more consistently, not a new rule. Widening it further is a separate, later decision — correctly deferred by the proposal itself. |
 | Conditional per-task doc-keeper | **Modify — fold into lever 2** | The first pass said "reject, mostly already true"; that overstated it. Re-reading §3.6, a keeper on a decision-less diff still costs a spawn — a full turn reading the handover, the diff, the PR body and every touched document — not nothing. But the question only arises for Small tier, where lever 2 already removes the developer handover the keeper reads from. So: on Small tier the lead session records any decision itself (usually there is none) and the daily sweep catches drift; Normal and High keep the per-task seat exactly as §3.6 has it. No separate classification step — the tier decides. |
-| Filter regression-assessment before model invocation | **Adopt, and move it first** | I read `.github/workflows/regression-assessment.yml` directly. Every `opened`/`ready_for_review` PR event on this repo runs the full pipeline — checkout, context collection, an Opus regression-planner call — **unconditionally**. Only `synchronize` (a later push) has any skip logic, and only for *re*-assessment, not the first one. No size or risk pre-filter exists today. This is the cleanest lever on the list: a diff-path check against the same risk allow-list from lever 1, before the workflow's own "is this configured" step, defaulting to "assess" on anything unrecognized. It touches nothing about delegation or documentation — pure CI cost avoidance, and the savings are visible directly in Actions minutes. |
+| Filter regression-assessment before model invocation | **Adopt, and move it first** | I read `.github/workflows/regression-assessment.yml` directly. Every `opened`/`ready_for_review` PR event on this repo runs the full pipeline — checkout, context collection, an Opus regression-planner call — **unconditionally**. Only `synchronize` (a later push) has any skip logic, and only for *re*-assessment, not the first one. No size or risk pre-filter exists today. This is the cleanest lever on the list: a diff-path check against the same risk allow-list from lever 1, before the workflow's own "is this configured" step, defaulting to "assess" on anything unrecognized. It touches nothing about delegation or documentation — pure CI cost avoidance, and the savings are visible directly in Actions minutes. **Correction, 2026-09-30 (#323):** the workflow *intends* all that, but in practice no assessment has run since at least 2026-09-25 — its credentials step finds no repository secret and every later step is skipped while the check reports success. Shipped as #320 and correct; it saves nothing until the secret is set. |
 | Bound concurrency by review capacity | **Adopt — already measured, not hypothesized** | `docs/test-reports/process-baseline-2026-09-26.md`: median PR open→merge is 2.4h, 75th percentile 30h, while first-commit→PR-open is 0.0h. The bottleneck is confirmed to sit after the PR opens — review and merge — not generation speed. More parallel developer sessions against one approver grows the queue in front of that constraint; it doesn't relieve it. |
 | Shared Claude/Codex handoff + selective second opinions | **Defer** | Cross-tool consistency already has a demonstrated failure mode here: 2026-09-25's #192, where a test leaning on the Mac's locally installed `codex` binary passed locally and stayed red on the GitHub runner for ~18 hours before #224 fixed it (CLAUDE.md's own "green local ≠ green CI" section). Adding a second model into the loop before that class of problem is solved adds a surface for divergence, not removes one. Sequence after, not alongside, the rest. |
 | Measure outcomes and costs | **Adopt, and it's cheaper than estimated — with one real gap** | `scripts/process-metrics.py` and the hook-decision log already exist and already run (both dated 2026-09-26, confirmed on disk). But read what they actually measure: PR open→merge time and hook prompt/allow/deny counts — **not tokens**. There is no existing instrumentation for token or model-usage totals by role anywhere in this repo. That's the real missing piece the proposal's §5 target needs, not a new weekly ritual — the habit of reading existing output belongs in doc-keeper's existing sweep cadence, not a new one. |
@@ -196,7 +196,12 @@ than the rest of the list combined for a repo opening this many PRs a week.
   trip-site `tests` suite (§2). Whether that is the known concurrency flake or
   a real regression is not determined here; either way staging has not been
   refreshed by it once, and a Release A dry run that leans on "the nightly is
-  green" would be leaning on nothing.
+  green" would be leaning on nothing. *(Resolved 2026-09-30: four causes fixed
+  in turn, first green night — §10 M7.)*
+- Set the `CLAUDE_CODE_OAUTH_TOKEN` repository secret (`claude setup-token`)
+  so the CI regression assessment runs at all, and decide whether an
+  unconfigured run should fail the check instead of passing it (#323). Nobody
+  but the owner can mint that secret.
 
 ---
 
@@ -298,6 +303,14 @@ tree and the machine, not against the first pass's notes.
 sequencing in §3, the verdict on `agency-agents`. Nothing found in the second
 pass moves those.
 
+**Postscript, 2026-09-30.** Both passes verified the workflow's *text* and
+neither verified its *runs*. Every `gh pr checks` table I read that day showed
+"Assess deployment risk — pass" in 3–6 seconds, which is not how long an Opus
+assessment takes; the lead session opened one run and found the model steps
+skipped for lack of a secret (#323). The strongest claim in this review was
+right about the file and wrong about the world for at least five days. Verify
+the run, not the file.
+
 ## 10. Measurement protocol — what "it worked" will mean
 
 Dror asked, after the second pass, for the switch to be coordinated with the
@@ -310,7 +323,7 @@ uses instrumentation that already exists, plus one label — no new tracker.
 |---|---|---|---|---|
 | M1 | PR open → merge, median / 75th pct / over a day | `scripts/process-metrics.py --since <switch>` | **32 min / 133 min / 1** (41 merged PRs) | tail stays at zero-or-one; median not worse |
 | M2 | Hook prompts per merged PR | same script, hook-decisions log | **3.7** — commit ask 82 vs allow 22, merge ask 39, push ask 24 vs allow 25, deploy ask 7 | ≤ 2 (merge, occasionally deploy) |
-| M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` | **54 completed / 41 merged ≈ 1.3** (79 runs: 54 success, 18 skipped, 7 cancelled). **Lever 7 live since #320 (`b229225`, 2026-09-30)** — counting for the "after" window starts there | halves — Small tier skipped, Normal/High still assessed |
+| M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` **and each run's step conclusions** — a job succeeds with `Assess` skipped | **0 actual / 41 merged.** The first pass counted 54 "success" runs as assessments; every one had `Assess` skipped because no `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` secret exists (#323, found by the lead session on 2026-09-30). Lever 7 shipped in #320 (`b229225`) and is correct; its "after" window starts when the secret is set, not at the merge | once assessments run at all: at most half of merged PRs assessed, Normal/High always |
 | M4 | Small-tier PRs taken directly vs via a developer | PR body line `Path: direct \| developer`, `size:S` label | not recorded before the switch | recorded on every Small PR; the count is the sample size |
 | M5 | Escaped defects on lightened-path PRs | `fix/` PRs or reverts citing a Small-tier PR within 7 days; boundary findings on anything mis-tiered | 0 by construction (no lightened path yet) | 0; one is a stop condition (§7 of the proposal) |
 | M6 | Model usage per PR | none today; from the switch, `tool_uses` and `duration_ms` in every developer/verifier handover (the task-notification metadata already carries both — lead session's amendment, 2026-09-29) | **unknown** for the before window — recorded as such, never reconstructed from PR size | measured from the switch; tokens proper stay unknown until a source exists |
