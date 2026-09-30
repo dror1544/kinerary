@@ -117,7 +117,10 @@ alongside the Sept 26 re-measurement already due.
   *is* the served tree. The developer's "own worktree" was doing two jobs,
   coordination and isolation; dropping the developer must not drop the
   second. `developer.md` already says it ("you were given a worktree for a
-  reason"); the exception has to say it too.
+  reason"); the exception has to say it too. (Since 2026-09-30 02:23 the
+  nightly redeploys staging from `~/kinerary-nightly`, so the served tree is
+  that checkout, reset every night — the rule stands, and `docker inspect`
+  remains the way to know which tree it is on a given day.)
 - **Rule that changes:** agent-team-plan §3.1's "it does not write product
   code... even for a one-liner" gets a named exception for Small tier only.
   Normal tier keeps the developer — the proposal's own table keeps "fresh
@@ -307,11 +310,11 @@ uses instrumentation that already exists, plus one label — no new tracker.
 |---|---|---|---|---|
 | M1 | PR open → merge, median / 75th pct / over a day | `scripts/process-metrics.py --since <switch>` | **32 min / 133 min / 1** (41 merged PRs) | tail stays at zero-or-one; median not worse |
 | M2 | Hook prompts per merged PR | same script, hook-decisions log | **3.7** — commit ask 82 vs allow 22, merge ask 39, push ask 24 vs allow 25, deploy ask 7 | ≤ 2 (merge, occasionally deploy) |
-| M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` | **54 completed / 41 merged ≈ 1.3** (79 runs: 54 success, 18 skipped, 7 cancelled) | halves — Small tier skipped, Normal/High still assessed |
+| M3 | Opus regression assessments per merged PR | `gh run list --workflow "Regression assessment"` | **54 completed / 41 merged ≈ 1.3** (79 runs: 54 success, 18 skipped, 7 cancelled). **Lever 7 live since #320 (`b229225`, 2026-09-30)** — counting for the "after" window starts there | halves — Small tier skipped, Normal/High still assessed |
 | M4 | Small-tier PRs taken directly vs via a developer | PR body line `Path: direct \| developer`, `size:S` label | not recorded before the switch | recorded on every Small PR; the count is the sample size |
 | M5 | Escaped defects on lightened-path PRs | `fix/` PRs or reverts citing a Small-tier PR within 7 days; boundary findings on anything mis-tiered | 0 by construction (no lightened path yet) | 0; one is a stop condition (§7 of the proposal) |
 | M6 | Model usage per PR | none today; from the switch, `tool_uses` and `duration_ms` in every developer/verifier handover (the task-notification metadata already carries both — lead session's amendment, 2026-09-29) | **unknown** for the before window — recorded as such, never reconstructed from PR size | measured from the switch; tokens proper stay unknown until a source exists |
-| M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md` | **0 / 4** — 2026-09-27, -28, -29 02:00 the same linker failure (§2, fixed by #316); the 29th's on-demand run at 19:36 passed the trip-site suite for the first time and failed one Web SPA test on a lazy-route import that took 2.58 s against a 1 s wait, with CI green on the same commit `cd39cb7` (fix in flight) | ≥ 6 of 7 once both fixes land |
+| M7 | Nightly e2e green nights | `~/Library/Logs/kinerary-nightly/*.md`; on a failure the kept preflight logs; on success `launchctl print` (exit 0), the containers' creation time and the `retired-<slug>-<date>` row | **1 / 5.** 2026-09-27, -28, -29 02:00: the linker failure (§2, fixed by #316). 29th 19:36 on demand: trip-site suite green, one Web SPA test red on a lazy-route import (2.58 s against a 1 s wait; fixed by #319). 29th 20:26 on demand: every suite green, first deploy attempt, failed on a missing bind-mount source — the nightly checkout had no gitignored `.local-secrets/`; fixed in the kinerary-deploy wrapper (copies the main checkout's set each run, fails closed). **2026-09-30 02:00, launchd, `c3fe549`: green** — exit 0, staging recreated 02:23 from `~/kinerary-nightly`, `italy-2026` walked and retired 02:33. 30th 05:36 on demand, same commit: preflight and deploy green, **interview stalled on `organizer_identity`** — extraction produced a duplicated roster ("Dana Levi" and "Dana"), the typed first name never settled, the retry prompt was deduped into "didn't follow" (#321). Four infrastructure causes, each the next layer down, then the first product defect — which is what the nightly is for. | ≥ 6 of 7 from here; a red night with an issue filed is the nightly working, a red night with no cause named is not |
 
 **Two things the baseline already says.** M2's 82 commit *asks* against 22
 *allows* mean the Sept 26 exemption is not reaching most commits. Broken down
