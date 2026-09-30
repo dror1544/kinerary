@@ -127,6 +127,23 @@ Two branches carry names in this document. The **leading branch** is
    asks). A merge onto `main`, a deploy, and every commit, push or merge by a
    subagent are unchanged.
 
+4. **Small-tier work may be implemented by the lead session directly, instead
+   of briefed to a developer (owner's decision, 2026-09-30).** "Small" is
+   mechanical, not judged: `git diff --name-only <base>...HEAD | scripts/
+   regression-assessment-scope.sh` exits 0 — the SAME script and the SAME
+   never-safe-first path list #320 already uses to skip the CI regression
+   assessment, one list for both callers, never copied into prose here or
+   anywhere else. `verifier` is still spawned exactly as for a developer's
+   work — it cannot edit, so it cannot pass itself, and a lead session that
+   edits and then grades its own change quietly loses that invariant. The work
+   still happens on a `fix/`/`feat/`/`chore/` branch, in a worktree that is
+   **not** the tree currently served to staging or production (`docker
+   inspect` says which; the nightly redeploys staging from
+   `~/kinerary-nightly` every night at 02:00, so "not live-served" moves —
+   check, never assume). The PR body carries `Path: direct` (vs `developer`)
+   and `size:S`; Normal and High tiers are unaffected and keep the developer
+   hop unchanged. Full shape: `docs/agent-team-plan.md` §3.1 and §3.6.
+
 What stays a gate: the integrator, boundary review for security paths, a
 regression plan (sprint mode) before each release, and every merge to `main`
 and deploy. What is narrower since 2026-09-26, by the owner's decision:
@@ -764,7 +781,12 @@ of `docs/signup-test-execution-capture (Manual).md`.
 `regression-planner` also runs itself, in CI:
 `.github/workflows/regression-assessment.yml` posts an assessment when a PR or
 an issue is opened. The agent file is the single source of truth for what the
-assessment says — change the analysis there, not in the workflow.
+assessment says — change the analysis there, not in the workflow. Since #320
+(2026-09-30) a PR whose every changed path is docs-only, test-only or a
+stylesheet skips the Opus run entirely: the Collect-context step pipes the
+PR's file list into `scripts/regression-assessment-scope.sh` before any model
+runs, and only its exit 0 sets `relevant=false`; an unreadable or empty list
+assesses, and the `regression-assessment` label always overrides it back on.
 
 Three things about that workflow are load-bearing, all because **this repo is
 public** and anyone can open an issue:

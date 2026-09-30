@@ -150,9 +150,48 @@ list on the integration PR.
   that both want a path, an item whose only proof is an 80-minute run.
 
 **Rules:** it does not write product code (it briefs a developer, even for a
-one-liner, so the verifier and reviewer see it); it does not assign an owner
-to a gap the plan does not own (standing instruction — flag it); it never
-records approval; it does not touch the infrastructure window itself.
+one-liner, so the verifier and reviewer see it) — **except Small tier, below**;
+it does not assign an owner to a gap the plan does not own (standing
+instruction — flag it); it never records approval; it does not touch the
+infrastructure window itself.
+
+**Small-tier exception (owner's decision, 2026-09-30, reviewed in
+`docs/future/kinerary-sdlc-process-proposal-review-2026-09-29.md` §4; CLAUDE.md
+MVP item 4):** the lead session may write the change itself, instead of
+briefing a developer, exactly when it is mechanically Small — `git diff
+--name-only <base>...HEAD | scripts/regression-assessment-scope.sh` exits 0
+(at least one changed path, every one on the safe side, never-safe checked
+first). That script is the ONE place the path list lives — the same list #320
+already uses to skip the CI regression assessment. Never copy it into prose
+here, in CLAUDE.md, or anywhere else; the list grows only by a recorded
+decision, in the script, and both callers see the change together. Everything
+else about the process stays exactly as strict:
+
+- `verifier` is still spawned, exactly as for a developer's work — it cannot
+  edit, so it cannot pass itself. A lead session that edits and then grades its
+  own change quietly loses the one invariant the verifier exists for.
+- The work still happens on a `fix/`/`feat/`/`chore/` branch, in a worktree
+  that is **not** the tree currently served to staging or production —
+  `docker inspect` says which checkout is live on a given day (the nightly
+  redeploys staging from `~/kinerary-nightly` every night at 02:00, so "not
+  live-served" moves; check, don't assume). The lead's own checkout has been
+  the served tree before; never write a Small-tier change there.
+- The one-sentence brief still goes on the issue first.
+- The PR body carries `Path: direct` (vs `developer`) and the `size:S` label —
+  the record of which tier a change actually took, per the Sept-26-style
+  before/after measurement (M4). When the lead spawns `verifier` or any other
+  agent for a Small-tier change, it writes that agent's `tool_uses` and
+  `duration_ms` from the task-completion notification into the PR body too
+  (M6) — the agent cannot see its own count, so this is the manager's record,
+  not a template change to `verifier.md`/`developer.md`, and needs no
+  Codex-mirror regen.
+- Normal tier keeps the developer unchanged — a second pair of eyes on a
+  bounded feature is that tier's reason to exist, and this exception does not
+  widen it.
+- The two-round review cap, boundary review on every security path, the
+  regression-plan requirement for risky PRs, the integrator's merge-tree
+  check, hard rules 1–6 and sprint/baseline lock discipline are untouched by
+  this exception, full stop.
 
 **Model:** Sonnet 5 at high effort for the everyday loop — labelling, briefs
 from a settled tracks document, claims, spawning. A hard call — two briefs
@@ -317,12 +356,17 @@ in the same commit as the code.
 
 **Two seats in the flow:**
 
-- **Before gate 1, per task.** It reads the developer's handover (the
-  `Decisions made:` block, Appendix C), the diff and the PR body draft. For
-  each decision: is it recorded, in the document that owns that kind of content
-  (the map below), with the alternative it rejected and why? If not, the keeper
-  writes the paragraph in the developer's worktree, so it ships with the code.
-  Documents the diff touched are checked for drift right then.
+- **Before gate 1, per task — Normal and High tiers.** It reads the
+  developer's handover (the `Decisions made:` block, Appendix C), the diff and
+  the PR body draft. For each decision: is it recorded, in the document that
+  owns that kind of content (the map below), with the alternative it rejected
+  and why? If not, the keeper writes the paragraph in the developer's
+  worktree, so it ships with the code. Documents the diff touched are checked
+  for drift right then. A Small-tier change (§3.1, 2026-09-30) has no
+  developer handover to read: the lead records any decision itself, in the
+  document the map names (there is usually none — a Small diff is docs, tests
+  or styling), and the daily sweep below catches whatever it missed. The
+  per-task seat is not spawned for it.
 - **Once a day, and at sprint end — the sweep** (2026-09-26; was after each
   merge), over the merges since the last sweep. `scripts/preflight-checks.sh
   --all` warn lines for dead paths first, then a read for: commands and paths
