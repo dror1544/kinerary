@@ -95,8 +95,14 @@ jobs:
       #
       # The `claude` CLI on the Mac is authenticated by subscription, not by an
       # API key, so the token this wants is the one `claude setup-token` mints.
-      # Without it, say so once, in the log, and stop — a silent skip would mean
-      # nobody notices the assessments stopped.
+      # Without it, FAIL the job — a `::warning` behind an `if:` guard on every
+      # later step used to leave the job green while nothing ran (#323: silent
+      # since ~2026-09-25, because a skipped step is a passing step and nobody
+      # opens a green check). A red job gets noticed and fixed; the warning
+      # sat unread for five days. Nothing below this step is reachable once it
+      # exits non-zero, so there is no `configured` output to gate on anymore
+      # — every later step runs unconditionally (modulo the #320 `relevant`
+      # pre-filter, which is a separate, still-live concern).
       - name: Check credentials
         id: auth
         env:
@@ -104,16 +110,14 @@ jobs:
           APIKEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           if [ -n "$OAUTH" ] || [ -n "$APIKEY" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Regression assessment not configured::\
+            exit 0
+          fi
+          echo "::error title=Regression assessment not configured::\
           Set the CLAUDE_CODE_OAUTH_TOKEN repository secret (run 'claude setup-token' \
           locally) or ANTHROPIC_API_KEY. No assessment was produced."
-          fi
+          exit 1
 
       - uses: actions/checkout@v4
-        if: steps.auth.outputs.configured == 'true'
         with:
           # `git diff main...HEAD` needs both sides. A shallow clone has neither.
           fetch-depth: 0
@@ -124,7 +128,6 @@ jobs:
       # .assessment-context/ as plain files. After this step the token is gone.
       - name: Collect context
         id: ctx
-        if: steps.auth.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
@@ -212,7 +215,7 @@ jobs:
           ls -la .assessment-context
 
       - name: Assess
-        if: steps.auth.outputs.configured == 'true' && steps.ctx.outputs.relevant == 'true'
+        if: steps.ctx.outputs.relevant == 'true'
         uses: anthropics/claude-code-action@v1
         with:
           # Whichever is set. The action refuses both at once, and only one of
@@ -267,7 +270,7 @@ jobs:
 
       # ── Post it. No model runs in this step. ──────────────────────────────
       - name: Post the assessment
-        if: steps.auth.outputs.configured == 'true' && steps.ctx.outputs.relevant == 'true'
+        if: steps.ctx.outputs.relevant == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
