@@ -1,8 +1,8 @@
 # Connected Assistants contracts (CA-00)
 
-Status: design review draft for #248, 2026-09-27. This is a contract for later slices, not a claim that the implementation exists or a Sprint 6 release gate.
+Status: CA-00 contract draft with dated CA-01 R1 implementation evidence added 2026-10-02. The original 2026-09-27 design and evidence-tree snapshot below are historical; R1 is not a Sprint 6 release gate.
 
-Evidence trees: `integration/sprint-6` at `b70d79e315ccfc00790650205198a2c2126765bc` and current `main` at `fbf38997ec643035e49f690c4e3f2c148d4894f1`, both confirmed against remote branch heads on 2026-09-27. Plan PR #257 is open at `4122abe`. Rows below name their actual branch. The booking/MCP observations apply to both named trees; the control-plane document and converged identity observations apply to Sprint 6 only. Main has not received those Sprint 6 foundations.
+Historical evidence trees (2026-09-27, before CA-01 L1/P1): `integration/sprint-6` at `b70d79e315ccfc00790650205198a2c2126765bc` and current `main` at `fbf38997ec643035e49f690c4e3f2c148d4894f1`, both confirmed against remote branch heads on 2026-09-27. Plan PR #257 is open at `4122abe`. Rows below name their actual branch. The booking/MCP observations apply to both named trees; the control-plane document and converged identity observations apply to Sprint 6 only. Main has not received those Sprint 6 foundations.
 
 ## Existing owners and coexistence
 
@@ -58,4 +58,52 @@ The current lifecycle path includes `pending_signup_approval -> draft -> intake_
 - Retain exact original bytes in the current registry instead of extracted text or temporary assistant URLs: only the original can prove the site will open the voucher later.
 - Require account handoff for Mini App private views instead of Telegram launch authentication: the old SSO route was retired.
 
-Before code edits, CA-01 needs the #227/#163/Sprint 6 owners' handover for `server/trip-mcp/**` and `server/server.js`. Later slices need handovers for account, interview, document, relay, model-runner and migration paths. PR #116 remains with its author and Claude's release decision. Exact OAuth mechanics and imported-file retention/deletion periods need product/security review; code briefs cannot fill them by guess.
+The narrow CA-01 handover was recorded on #249 on 2026-09-27 for `server/trip-mcp/**` and the booking-confirmation route region of `server/server.js`; other shared server paths remain excluded. Later slices need handovers for account, interview, document, relay, model-runner and migration paths. PR #116 remains with its author and Claude's release decision. Exact OAuth mechanics and imported-file retention/deletion periods need product/security review; code briefs cannot fill them by guess.
+
+## CA-01 R1 implemented retrieval contract (2026-10-02)
+
+R1 is prepared on feat/ca01-confirmation-readback, based on initiative commit
+cc048c6c52a4d3421c0025c55abff0117bde8b88. It has not been integrated into the
+initiative branch, Sprint 6, main or production.
+
+get_booking_confirmation accepts only a positive safe-integer booking_id.
+Its strict schema rejects additional selectors. It is offered only to current
+organizer write grants despite its read-only annotation, preserving the brief's
+organizer file-management scope.
+
+The tool resolves conf_file through caller-scoped /api/bookings. It accepts
+no caller URL or path. The client validates and encodes the stored basename,
+then reads only the confirmation route on the fixed trip listener with a
+short-lived JWT for the connected person. Arbitrary attachment URL fetching
+requires its own reviewed transport contract.
+
+The binary phase is bounded to 5 MiB and 10 seconds, covering headers and
+streamed body. The preceding booking lookup is outside that deadline.
+Redirects are refused; both declared and streamed size are checked.
+application/pdf and a PDF signature are required; this is a retrieval/type
+check, not full PDF validation.
+
+Success returns exact bytes as an embedded application/pdf MCP resource under
+a content-addressed urn:sha256 URI, plus booking_id, byte_count and sha256
+metadata. No credentials, local paths, public download URL or retained cache
+are returned. R1 performs no upload mutation. Lookup and transport exceptions
+are sanitized; failed retrieval returns no resource.
+
+Actual-server Unicode filename retrieval exposed an existing shared
+Content-Disposition defect outside R1's ownership. The tool reports failure
+truthfully. Synthetic safe-Unicode filename guard coverage does not establish
+successful retrieval through the real server. The server owner must fix or
+explicitly carry that defect before Unicode-original support is claimed.
+
+The independent verifier's 2026-10-02 final suite passed 616/616 tests in
+65.3 seconds, with zero skips. The final boundary addendum independently
+verified sanitized lookup errors (one selected test passed, six unrelated
+cases skipped), with no new finding. These are local synthetic observations;
+real ChatGPT/Claude client acceptance and direct attachment transfer remain
+unfinished.
+
+The earlier 3 October merge freeze is superseded by
+[#249 decision 55](https://github.com/dror1544/kinerary/issues/249#issuecomment-5856293225).
+Release A deploys a pinned release/a revision. Ready CA-01 PRs may enter Sprint
+6 through normal security/integrator review and owner merge authority;
+outstanding OAuth findings and main-via-sprint conditions remain.
