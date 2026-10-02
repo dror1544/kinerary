@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { normalizeIdentity, resolveOrganizer, rosterChoices, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
+import { normalizeIdentity, resolveOrganizer, rosterChoices, rosterChoicesFor, type OrganizerMatch, type RosterChoice } from "./organizer-identity.js";
 import { LIVE_INTAKE_SESSION_PREDICATE } from "./organizer-trips.js";
 import type pg from "pg";
 import { assertCanonicalRecordSafe, UnsafeCanonicalRecordError } from "./canonical.js";
@@ -300,6 +300,14 @@ export interface IntakeQuestion {
   canonicalize?: (answers: AnswerStore) => IntakeAnswer | null;
   /** Buttons for a TEXT or STRUCTURED question, drawn from what is already recorded. */
   choicesFrom?: (answers: AnswerStore) => RosterChoice[];
+  /**
+   * Which WAY an unsettled answer on record fails to settle this question, for
+   * `unsettledText` to pick the right copy — `organizer_identity` reads
+   * differently when nobody on the roster matched ("doesn't match any of the
+   * names") than when two did ("which one are you?"). Absent for every
+   * question with only one way to be unsettled.
+   */
+  unsettledMatchKind?: (answers: AnswerStore) => string | undefined;
   /**
    * What this question is about RIGHT NOW, when one question is put once per
    * thing: "gluten-free — who does that apply to?". Names an option of another
@@ -812,7 +820,22 @@ export const INTAKE_QUESTIONS: readonly IntakeQuestion[] = [
       if (match.kind !== "matched" || (current?.kind === "text" && current.text === match.name)) return null;
       return { kind: "text", schema_version: INTAKE_SCHEMA_VERSION, text: match.name };
     },
-    choicesFrom: (answers) => rosterChoices(answers.travelers?.kind === "structured" ? answers.travelers.data : undefined),
+    // The whole roster, normally — the organizer's real answer may be the
+    // first thing typed. Narrowed to just the two-or-more it could be once a
+    // typed answer is ambiguous: offering the whole roster there just repeats
+    // the mistake, since the roster's OWN "Dana" button records "Dana" and
+    // resolves ambiguous again (#321).
+    choicesFrom: (answers) => {
+      const roster = answers.travelers?.kind === "structured" ? answers.travelers.data : undefined;
+      const match = organizerMatch(answers);
+      return match.kind === "ambiguous" ? rosterChoicesFor(roster, match.candidates) : rosterChoices(roster);
+    },
+    // Nobody matched, or more than one did — `unsettledText` reads different
+    // copy for each, and `renderQuestion`'s buttons already differ above.
+    unsettledMatchKind: (answers) => {
+      const match = organizerMatch(answers);
+      return match.kind === "matched" ? undefined : match.kind;
+    },
   },
   {
     // The assistant's name, voice and tone are REQUIRED as of 2026-09-07, at the
@@ -1604,8 +1627,12 @@ export interface SessionView {
    * An answer on record that does not settle its question, by question id, as
    * written — so asking again can say what did not match rather than repeat
    * itself. See `IntakeQuestion.satisfiedBy`.
+   *
+   * `matchKind` is `IntakeQuestion.unsettledMatchKind`'s reading of WHY it is
+   * unsettled, when a question has more than one way to be — organizer_identity
+   * reads differently for "matched nobody" than for "matched two".
    */
-  unsettled?: Record<string, string>;
+  unsettled?: Record<string, { text: string; matchKind?: string }>;
   /** The choice whose Other button is awaiting literal organizer text. */
   otherPending: IntakeQuestion | null;
 }
@@ -1628,12 +1655,12 @@ function recordSubjects(answers: AnswerStore): Record<string, { fromQuestion: st
   return out;
 }
 
-function unsettledAnswers(answers: AnswerStore): Record<string, string> {
-  const out: Record<string, string> = {};
+function unsettledAnswers(answers: AnswerStore): Record<string, { text: string; matchKind?: string }> {
+  const out: Record<string, { text: string; matchKind?: string }> = {};
   for (const q of INTAKE_QUESTIONS) {
     const answer = answers[q.id];
     if (!q.satisfiedBy || answer === undefined || q.satisfiedBy(answers)) continue;
-    if (answer.kind === "text") out[q.id] = answer.text;
+    if (answer.kind === "text") out[q.id] = { text: answer.text, matchKind: q.unsettledMatchKind?.(answers) };
   }
   return out;
 }
