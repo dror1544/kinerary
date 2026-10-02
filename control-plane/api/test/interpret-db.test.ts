@@ -500,12 +500,13 @@ async function say(
   text: string,
   telegram: Recorder,
   modelRunner: unknown = emptyRunner,
+  log: (line: string) => void = () => {},
 ) {
   seq += 1;
   await queueInboundMessage(pool, chatId, { text, message_id: `m${seq}` } as never);
   await flushSettledInboundBursts(
     { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner } as never,
-    () => {},
+    log,
     0,
   );
 }
