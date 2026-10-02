@@ -7,7 +7,7 @@ import { digestTelegramId } from "../src/identity.js";
 import { signApprovalAction } from "../src/approval-action.js";
 import { startSignup, type NotificationAdapter, type SignupConfig } from "../src/signup.js";
 import { deleteWebhookIfPresent, handleTelegramUpdate, startTelegramApprovalPoller } from "../src/telegram-poller.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -37,7 +37,7 @@ async function resetDb(client: pg.PoolClient) {
 }
 
 async function freshPool(): Promise<pg.Pool> {
-  const pool = new pg.Pool({ connectionString: DB_URL });
+  const pool = testPool();
   const client = await pool.connect();
   await resetDb(client);
   await applyMigrations(client, migrationsDir);

@@ -39,7 +39,7 @@ import type { TelegramMessage } from "../src/relay/normalize.js";
 import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import { makeUpgradeToken } from "../src/relay/protocol.js";
 import { minimalPdf } from "./support/minimal-pdf.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 // The trip-site suite's own harness: a real server.js on a throwaway copy of
 // tests/fixtures, and a real mcp.js pointed at it.
 // @ts-expect-error — plain JS helpers, no type declarations
@@ -99,7 +99,7 @@ describe("an itinerary PDF sent to the family group reaches the trip's plan", { 
   const mediaStore = new MediaStore();
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: databaseUrl });
+    pool = testPool();
     const client = await pool.connect();
     try {
       await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

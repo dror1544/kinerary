@@ -28,7 +28,7 @@ import { uiString } from "../src/intake-copy.js";
 import { CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
 import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
 import { burstKey, claimInterpretation, setInterpretPath } from "../src/interpret.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -55,7 +55,7 @@ async function seedChat(pool: pg.Pool, chatId: string): Promise<Chat> {
 }
 
 async function withChats(fn: (pool: pg.Pool, a: Chat, b: Chat) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

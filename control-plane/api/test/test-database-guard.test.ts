@@ -4,6 +4,7 @@ import {
   databaseNameOf,
   isTestDatabaseUrl,
   testDatabaseUrl,
+  testPool,
   UnsafeTestDatabaseError,
 } from "./support/test-database.js";
 
@@ -88,5 +89,65 @@ describe("test database guard", () => {
     assert.equal(databaseNameOf("postgres://host:5432"), null);
     assert.throws(() => testDatabaseUrl("not a url"), UnsafeTestDatabaseError);
     assert.throws(() => testDatabaseUrl("postgres://host:5432"), UnsafeTestDatabaseError);
+  });
+});
+
+describe("testPool() (#203)", () => {
+  // testPool() reads CONTROL_PLANE_TEST_DATABASE_URL through testDatabaseUrl()
+  // itself, the same as every other call in this file — these tests only
+  // control that one env var, never a connection.
+  test("throws, rather than building a pool from the driver's defaults, when no safe URL is configured", () => {
+    // This is the hazard #203 audited: the old call sites built their own
+    // pool directly, from a connection string that could be undefined, and
+    // relied on every test/describe remembering its own `{ skip: SKIP }`
+    // gate. One forgot (organizer-trips.test.ts, fixed 2026-09-25).
+    // testPool() closes that path at the source — calling it unguarded now
+    // throws instead of silently reaching for localhost:5432 or whatever
+    // PG* the shell holds.
+    const saved = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+    try {
+      delete process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+      assert.throws(() => testPool(), UnsafeTestDatabaseError);
+      try {
+        testPool();
+        assert.fail("expected a throw");
+      } catch (error) {
+        assert.ok(error instanceof UnsafeTestDatabaseError);
+        assert.match((error as Error).message, /no CONTROL_PLANE_TEST_DATABASE_URL set/);
+        assert.match((error as Error).message, /skip/i);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+      else process.env.CONTROL_PLANE_TEST_DATABASE_URL = saved;
+    }
+  });
+
+  test("throws the same way testDatabaseUrl() does when the URL is set but unsafe", () => {
+    const saved = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+    try {
+      process.env.CONTROL_PLANE_TEST_DATABASE_URL = "postgresql://u:p@127.0.0.1:5433/kinerary_control_plane";
+      assert.throws(() => testPool(), UnsafeTestDatabaseError);
+    } finally {
+      if (saved === undefined) delete process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+      else process.env.CONTROL_PLANE_TEST_DATABASE_URL = saved;
+    }
+  });
+
+  test("builds a real pg.Pool, carrying extra options through, when the URL is safe", () => {
+    const saved = process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+    try {
+      process.env.CONTROL_PLANE_TEST_DATABASE_URL = "postgres://postgres:test@127.0.0.1:5434/cptest";
+      const pool = testPool({ max: 3 });
+      try {
+        assert.equal(pool.options.max, 3);
+        assert.equal(pool.options.connectionString, "postgres://postgres:test@127.0.0.1:5434/cptest");
+      } finally {
+        // No connection was ever made — .end() on an unused pool is a no-op.
+        void pool.end();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.CONTROL_PLANE_TEST_DATABASE_URL;
+      else process.env.CONTROL_PLANE_TEST_DATABASE_URL = saved;
+    }
   });
 });

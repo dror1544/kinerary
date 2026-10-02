@@ -17,7 +17,7 @@ import { applyDecision } from "../src/relay/poller.js";
 import { setInterpretPath } from "../src/interpret.js";
 import { cancelDraft, getDraft, getOpenDraft, proposeChange, rebuildDraft } from "../src/typed-changes-store.js";
 import type { Op } from "../src/typed-changes.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -44,7 +44,7 @@ async function seedChat(pool: pg.Pool, chatId: string): Promise<Chat> {
 }
 
 async function withChats(fn: (pool: pg.Pool, a: Chat, b: Chat) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

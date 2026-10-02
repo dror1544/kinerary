@@ -19,7 +19,7 @@ import { listOrganizerTrips, switchChatToTrip } from "../src/organizer-trips.js"
 import { digestTelegramId } from "../src/identity.js";
 import { uiString } from "../src/intake-copy.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -56,7 +56,7 @@ let schemaReady: Promise<pg.Pool> | null = null;
 
 function migratedPool(): Promise<pg.Pool> {
   schemaReady ??= (async () => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
+    const pool = testPool();
     const client = await pool.connect();
     try {
       await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

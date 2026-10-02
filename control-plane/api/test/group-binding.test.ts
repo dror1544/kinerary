@@ -11,7 +11,7 @@ import {
   redeemGroupBindingToken,
 } from "../src/group-binding.js";
 import { resolveChatRoute } from "../src/chat-router.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -22,7 +22,7 @@ const testId = (p: string) => `${p}_${randomBytes(16).toString("hex")}`;
 interface Fixture { pool: pg.Pool; tripId: string; otherTripId: string }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

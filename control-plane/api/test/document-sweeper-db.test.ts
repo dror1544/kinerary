@@ -15,7 +15,7 @@ import { applyMigrations } from "../src/migrations.js";
 import { contentDigest, filesystemDocumentStore, storageKeyFor } from "../src/document-store.js";
 import { getTripDocument, markDocumentStored, reserveDocument } from "../src/document-registry.js";
 import { sweepDocumentStore } from "../src/document-sweeper.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -23,7 +23,7 @@ const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.
 
 describe("the document sweep", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
   test("clears old interrupted writes and claims, and leaves complete and recent work alone", async () => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
+    const pool = testPool();
     const root = await mkdtemp(path.join(tmpdir(), "doc-sweep-"));
     const client = await pool.connect();
     try {

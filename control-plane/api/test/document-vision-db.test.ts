@@ -23,7 +23,7 @@ import { DOCUMENT_READER_VERSION } from "../src/document-text.js";
 import { VISION_READER_VERSION, visionProcessingConfig } from "../src/document-vision.js";
 import { composeRunners, fakeRunner } from "../src/model-runner.js";
 import { makePdf } from "./support/zip.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -51,7 +51,7 @@ interface Fixture {
 }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

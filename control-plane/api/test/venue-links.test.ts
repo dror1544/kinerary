@@ -5,7 +5,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { resolvePendingVenueLinks } from "../src/venue-links.js";
 import type { VenueUrlSearch } from "../src/itinerary-extract.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -17,7 +17,7 @@ async function resetDb(client: pg.PoolClient) {
 }
 
 async function withDb(fn: (pool: pg.Pool) => Promise<void>) {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);

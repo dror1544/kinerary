@@ -18,7 +18,7 @@ import {
   verifyUpgradeToken,
 } from "../src/relay/protocol.js";
 import { displayName, mapChatType, normalizeUpdate, toWireEvent, type TelegramUpdate } from "../src/relay/normalize.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 // ── Upgrade-token auth: cross-language conformance ───────────────────────────
 
@@ -364,7 +364,7 @@ interface Fixture {
 }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

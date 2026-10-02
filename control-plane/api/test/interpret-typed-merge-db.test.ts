@@ -17,7 +17,7 @@ import { startFromDeepLink } from "../src/chat-router.js";
 import { queueInboundMessage } from "../src/interview.js";
 import { flushSettledInboundBursts } from "../src/relay/poller.js";
 import { setInterpretPath } from "../src/interpret.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -26,7 +26,7 @@ const id = (prefix: string) => `${prefix}_${randomBytes(16).toString("hex")}`;
 const CHAT = "840000001";
 
 async function withInterview(fn: (pool: pg.Pool, sessionId: string) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
