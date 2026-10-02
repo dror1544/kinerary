@@ -26,7 +26,7 @@ import {
   savePlanReview,
   tripsNeedingPlanReview,
 } from "../src/plan-review-store.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -62,7 +62,7 @@ const ANSWERS = {
 };
 
 async function withDatabase(fn: (pool: pg.Pool) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

@@ -18,7 +18,7 @@ import { GroupContext } from "../src/relay/group-context.js";
 import { confirmIntakeForChat, getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { issueGroupBindingToken } from "../src/group-binding.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 import { agentTextIsInLanguage } from "../src/relay/internal-leak.js";
 import { digestTelegramId } from "../src/identity.js";
 import { CODEX_ISOLATION_FEATURES, runnerForBinding, type StructuredModelRunner } from "../src/model-runner.js";
@@ -64,7 +64,7 @@ interface Fixture {
 }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

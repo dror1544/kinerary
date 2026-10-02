@@ -6,7 +6,7 @@ import pg from "pg";
 import { isCanonicalRecordSafe } from "../src/canonical.js";
 import { applyMigrations } from "../src/migrations.js";
 import { loadCanonicalFixtures } from "./canonical-fixtures.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
@@ -17,7 +17,7 @@ async function reset(client: pg.PoolClient) {
 }
 
 test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -169,7 +169,7 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
 });
 
 test("failed jobs are durable without a resource side effect", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -190,7 +190,7 @@ test("failed jobs are durable without a resource side effect", { skip: !database
 });
 
 test("database guardrails reject secrets, private addressing and unlabelled test resources", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -208,7 +208,7 @@ test("database guardrails reject secrets, private addressing and unlabelled test
 });
 
 test("audit events reject update, delete and truncate", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -227,7 +227,7 @@ test("audit events reject update, delete and truncate", { skip: !databaseUrl }, 
 });
 
 test("failed job steps require a formatted safe error code", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -276,7 +276,7 @@ const safeDocuments: Record<string, unknown> = {
 };
 
 test("canonical guardrail matches sensitive keys regardless of case style", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -297,7 +297,7 @@ test("canonical guardrail matches sensitive keys regardless of case style", { sk
 });
 
 test("every canonical record carries an opaque identifier", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -331,7 +331,7 @@ test("every canonical record carries an opaque identifier", { skip: !databaseUrl
 });
 
 test("canonical guardrail is enforced by the table constraints it backs", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -367,7 +367,7 @@ test("the SQL guardrail and the application guard agree on every shared fixture"
   // from the SQL, carrying the same three defects. Both are now driven from one
   // fixture file, and disagreement on any single case fails here.
   const { unsafe, safe } = await loadCanonicalFixtures();
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -389,7 +389,7 @@ test("the SQL guardrail and the application guard agree on every shared fixture"
 });
 
 test("20260922060001 merges the two accounts an invited organizer used to end up with", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);
@@ -470,7 +470,7 @@ test("20260922060001 merges the two accounts an invited organizer used to end up
 });
 
 test("20260922060001 gives an invited account with no rival an identity of its own", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await reset(client);

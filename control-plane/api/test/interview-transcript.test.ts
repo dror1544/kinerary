@@ -68,7 +68,7 @@ import { detectInternalLeak } from "../src/relay/internal-leak.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -320,7 +320,7 @@ async function withConversation(fn: (fix: Fixture) => Promise<void>): Promise<vo
 }
 
 async function runConversation(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

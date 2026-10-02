@@ -37,7 +37,7 @@ import { applyDecision, startTripBotPoller,
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import type { BotSelf, ChatInfo, SendResult, TelegramClient } from "../src/relay/telegram-api.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -130,7 +130,7 @@ interface Fixture {
 }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>, deliver = true): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

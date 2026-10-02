@@ -36,7 +36,7 @@ import {
 } from "../src/interview.js";
 import { readableDate } from "../src/intake-copy.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -600,7 +600,7 @@ describe("startSession (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -730,7 +730,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1885,7 +1885,7 @@ describe("the organizer is someone on the roster (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1997,7 +1997,7 @@ describe("the trip's dates are in order (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 

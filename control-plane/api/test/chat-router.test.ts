@@ -30,7 +30,7 @@ import {
   startFromDeepLink,
 } from "../src/chat-router.js";
 import type { OrganizerTrip } from "../src/organizer-trips.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 // ── Pure decision logic — no database required ───────────────────────────────
 
@@ -435,7 +435,7 @@ interface Fixture {
 }
 
 async function withFixture(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

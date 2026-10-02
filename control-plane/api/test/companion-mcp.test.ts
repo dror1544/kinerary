@@ -20,7 +20,7 @@ import {
 } from "../src/companion-mcp.js";
 import { applyMigrations } from "../src/migrations.js";
 import { makeUpgradeToken } from "../src/relay/protocol.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const SECRET = "relay-gateway-secret-for-tests";
 
@@ -50,7 +50,7 @@ const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.
 const hex = (n = 12) => randomBytes(n).toString("hex");
 
 async function withDb(run: (pool: pg.Pool) => Promise<void>) {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

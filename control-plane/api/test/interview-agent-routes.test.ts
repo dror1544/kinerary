@@ -33,7 +33,7 @@ import { startFromDeepLink } from "../src/chat-router.js";
 import { openAgentTurn, resolveChatFromOpenTurn, claimDueRouterPrompts, submitAnswerForAgent } from "../src/interview.js";
 import { buildApp, type InterviewAgentDependencies } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -94,7 +94,7 @@ interface Fixture {
 }
 
 async function withTwoInterviews(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

@@ -6,7 +6,7 @@ import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { dispatchPendingTripNotifications } from "../src/outbox-dispatcher.js";
 import { FakeNotificationAdapter } from "../src/adapters/notification.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -48,7 +48,7 @@ async function insertOutboxRow(
 }
 
 test("dispatches a pending provisioning_complete row to the real chat id", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -80,7 +80,7 @@ test("dispatches a pending provisioning_complete row to the real chat id", { ski
 });
 
 test("a row with no recipient chat id is skipped, not sent or retried forever", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -108,7 +108,7 @@ test("a row with no recipient chat id is skipped, not sent or retried forever", 
 });
 
 test("a provisioning_failed row gets a generic, error-code-free message", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -135,7 +135,7 @@ test("a provisioning_failed row gets a generic, error-code-free message", { skip
 });
 
 test("send failure re-queues the row until max_attempts, then marks it failed", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -169,7 +169,7 @@ test("send failure re-queues the row until max_attempts, then marks it failed", 
 });
 
 test("the legacy admin_signup_approval row (no trip_id) is never touched by this dispatcher", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -203,7 +203,7 @@ test("the legacy admin_signup_approval row (no trip_id) is never touched by this
 });
 
 test("operator rows carry identifiers and a safe error code the organizer copy withholds", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -258,7 +258,7 @@ test("operator rows carry identifiers and a safe error code the organizer copy w
 });
 
 test("an unrecognized operator_ type is skipped, not retried forever", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -289,7 +289,7 @@ test("site-ready says only that, and mints no binding token", { skip }, async ()
   // provisioning_complete now carries the URL and nothing else. It cannot
   // introduce an assistant that does not exist yet, and it cannot hand out a
   // token for one.
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);
@@ -322,7 +322,7 @@ test("site-ready says only that, and mints no binding token", { skip }, async ()
 });
 
 test("companion-ready introduces the assistant and hands over the token", { skip }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await resetDb(client);

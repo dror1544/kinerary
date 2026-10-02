@@ -29,7 +29,7 @@ import {
   inviteOrganizer,
   previewInvitation,
 } from "../src/organizer-invite.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -79,7 +79,7 @@ describe("organizer invitations", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE
   let pool: pg.Pool;
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   });
@@ -542,7 +542,7 @@ describe("the operator's invitation routes", { skip: SKIP ? "no CONTROL_PLANE_TE
   let pool: pg.Pool;
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   });
