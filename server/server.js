@@ -446,6 +446,16 @@ try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
+// #279: DELETE /api/agent/participants/:username revokes access (scrambles
+// the password, clears telegram_id) but never deletes the users row —
+// photos/bookings/ratings reference the username by text, so a hard delete
+// would orphan that history. Without a marker, that left nothing to stop a
+// later reset-password from handing the same row a fresh working password,
+// exactly as if the delete had never happened. NULL means "never removed";
+// set once, at delete time, and never cleared — removal is permanent short
+// of re-provisioning under a fresh username, not something this column is
+// meant to undo.
+try { db.exec('ALTER TABLE users ADD COLUMN removed_at TEXT'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_items (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   phase_id     TEXT NOT NULL,
@@ -1119,6 +1129,11 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
     return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
   }
 
+  // #279: this also already refuses to resurrect a removed username — DELETE
+  // never removes the row (see the removed_at column), so it still "exists"
+  // here and username_taken fires first. Confirmed by investigation, not
+  // changed: the actual live gap was reset-password, which checked only
+  // row-existence and is now gated on removed_at too.
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(409).json({ error: 'username_taken' });
   }
@@ -1161,8 +1176,21 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // user — the row already exists, only its password needs to change.
 app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
-  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+  const existing = db.prepare('SELECT removed_at FROM users WHERE username = ?').get(uname);
+  if (!existing) {
     return res.status(404).json({ error: 'user_not_found' });
+  }
+  // #279: DELETE /api/agent/participants/:username never removes the users
+  // row (see the removed_at ALTER TABLE comment) — it only scrambles the
+  // password and clears telegram_id. Without this check, this was the one
+  // live path back in: the row still "exists" for the check above, so
+  // reset-password would mint a fresh, fully working enrollment token for a
+  // participant the organizer explicitly removed. Checked before the
+  // organizer-takeover guard below on purpose — a removed username has no
+  // credential to protect from the agent key either way, and the more
+  // specific refusal is the more honest one.
+  if (existing.removed_at) {
+    return res.status(409).json({ error: 'participant_removed' });
   }
   // #184: the agent has no legitimate need to reset an organizer's own
   // credential, and letting it do so is a full account takeover — see
@@ -1240,11 +1268,15 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
 
 // Removes a participant from the trip: drops them from trip.config.json and
 // revokes DB-level access (clears telegram_id, replaces the password with a
-// fresh unusable random hash) rather than deleting the users row outright —
-// photos/bookings/ratings reference the username by text, and a hard delete
-// would orphan that history. Blocks removing a currently-configured
-// organizer; that's a deliberate, separate decision, not something that
-// should fall out of a generic remove call.
+// fresh unusable random hash, stamps removed_at) rather than deleting the
+// users row outright — photos/bookings/ratings reference the username by
+// text, and a hard delete would orphan that history. #279: removed_at is
+// what keeps that revocation real — reset-password (and nothing else reached
+// through the agent key, see its own comment) refuses once it is set, so the
+// row's continued existence can no longer be used to hand this username a
+// fresh working login. Blocks removing a currently-configured organizer;
+// that's a deliberate, separate decision, not something that should fall out
+// of a generic remove call.
 app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
@@ -1258,7 +1290,10 @@ app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async 
   persistConfigChange();
 
   const randomPasswordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
-  db.prepare('UPDATE users SET telegram_id = NULL, password = ? WHERE username = ?').run(randomPasswordHash, uname);
+  // #279: removed_at is what makes this revocation survive a later
+  // reset-password — see the ALTER TABLE comment above. Set unconditionally;
+  // there is no un-remove route, so this never needs to be cleared back.
+  db.prepare("UPDATE users SET telegram_id = NULL, password = ?, removed_at = datetime('now') WHERE username = ?").run(randomPasswordHash, uname);
 
   res.json({
     ok: true, username: uname,
