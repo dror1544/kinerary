@@ -9,12 +9,27 @@ const APP_JS = join(HERE, '..', '..', 'site', 'app.js');
 
 let _renderCode = null;
 
+// escapeHtml()/safeParticipantColor() (#213) live outside RENDER_FUNS_BEGIN/END
+// — real top-level functions in app.js, in scope there for any render
+// function same as in the browser, but invisible to this sandbox unless
+// pulled in separately. Extracted by name, not reimplemented, so a future
+// edit to either function is exercised here too rather than silently
+// diverging from what's actually extracted and run.
+function extractFunction(src, name) {
+  const start = src.indexOf(`function ${name}(`);
+  if (start === -1) throw new Error(`Could not locate function ${name}() in app.js`);
+  const end = src.indexOf('\n}\n', start) + 3;
+  return src.slice(start, end);
+}
+
 function getRenderCode() {
   if (_renderCode) return _renderCode;
   const src = readFileSync(APP_JS, 'utf8');
   const m = src.match(/\/\* RENDER_FUNS_BEGIN \*\/([\s\S]*?)\/\* RENDER_FUNS_END \*\//);
   if (!m) throw new Error('RENDER_FUNS_BEGIN / RENDER_FUNS_END markers not found in app.js');
-  _renderCode = m[1];
+  const escapeHtmlSrc = extractFunction(src, 'escapeHtml');
+  const safeParticipantColorSrc = extractFunction(src, 'safeParticipantColor');
+  _renderCode = escapeHtmlSrc + '\n' + safeParticipantColorSrc + '\n' + m[1];
   return _renderCode;
 }
 
