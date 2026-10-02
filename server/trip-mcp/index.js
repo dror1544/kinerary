@@ -27,6 +27,7 @@ const { createOAuthStore, redirectAllowed, isLoopbackHost, pkceMatches, authenti
 const { renderAuthorizePage, renderErrorPage, renderConnectorInfoPage } = require('./authorize-page');
 const { renderConfirmationUploadPage } = require('./confirmation-upload-page');
 const { registerTools, buildInstructions } = require('./tools');
+const { readConfirmationPdf } = require('./confirmation-readback');
 const { normalizeOrganizers } = require('../../shared/agent-schema');
 
 
@@ -332,6 +333,16 @@ function registerTripMcp({
       return data;
     };
     return {
+      // Accept a filename only; URL, host, credentials and route are fixed here.
+      getConfirmation: filename => {
+        if (typeof filename !== 'string' || !/^[\p{L}\p{N}][\p{L}\p{N} ._-]{0,254}$/u.test(filename) || filename.includes('..') || filename.endsWith(' ')) {
+          throw new Error('Unsafe confirmation filename. Open the authenticated trip site to view the original.');
+        }
+        const token = jwt.sign({ username }, jwtSecret, { expiresIn: 120 });
+        return readConfirmationPdf(signal => fetch(`${siteBase}/api/bookings/confirmation/${encodeURIComponent(filename)}`, {
+          headers: { authorization: `Bearer ${token}` }, redirect: 'manual', signal,
+        }));
+      },
       get: path => call('GET', path),
       post: (path, body) => call('POST', path, body ?? {}),
       patch: (path, body) => call('PATCH', path, body ?? {}),

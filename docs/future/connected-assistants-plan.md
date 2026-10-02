@@ -1,6 +1,6 @@
 # Connected assistants and account-wide intake — Codex-managed plan
 
-Status: implementation authorized after hook gate; CA-00 and CA-01 fixtures reviewed, CA-01 L1 booking linkage and P1 authenticated upload fallback verified on the separate integration branch. Updated 2026-09-27.
+Status: CA-00 and initial CA-01 slices implemented on the separate initiative lane; R1 original retrieval independently verified on its feature branch. Updated 2026-10-02.
 Lead: Codex dev manager. Product owner and merge/deploy authority: Dror.
 Claude remains lead of Sprint 6. This is a separate initiative, not Sprint 7
 (which already names post-trip learning), and adds nothing to Sprint 6's exit gate.
@@ -253,7 +253,13 @@ If blocked, advance only disjoint docs/contracts/fixtures. Never revert another
 session's work. Do not close or reassign existing issues merely because this plan
 references them. No infrastructure window is claimed by this planning task.
 
-Current initiative claim: Codex lead owns only `docs/future/connected-assistants-plan.md`, `docs/future/connected-assistants-queue.md`, and `docs/future/connected-assistants-contracts.md` on `feat/connected-assistants-ca00-current`, based on the hook-repaired integration head. The plan content is copied from open PR #257; Claude still decides whether to merge #257 separately or supersede it with this branch. All product paths remain unclaimed by this initiative. CA-00 contracts are in the linked contract document; owner handovers are listed there.
+Current claims are recorded in the managed queue. The narrow CA-01 server
+handover on #249 covers trip MCP and the booking-confirmation route region;
+shared OAuth findings and other server paths retain their existing owners.
+The CA-02 account-owner handover is pending on #250. R1 is prepared on
+feat/ca01-confirmation-readback; it has not been integrated into the initiative
+branch, Sprint 6 or main. Claude retains the disposition of earlier draft
+planning PR #257.
 
 Use `cptest_ca_<task>` for DB-backed work; never shared `cptest` or production.
 No shared-stack rebuilds while Claude holds the infrastructure window. Follow
@@ -332,7 +338,8 @@ product metric targets are set after the initial measured baseline.
 Repository links above are authoritative for current ownership; proposals are
 labelled as such. Orlando observations are from the preceding read-only task,
 not a new live probe or proof that recovery was performed. No runtime tests or
-provider integrations were run for this planning-only change.
+provider integrations were run for the original 2026-09-26 planning-only change.
+Later CA-01 verification is recorded as dated evidence in the queue and contracts.
 
 - [OpenAI plugin packaging](https://developers.openai.com/plugins/build/plugins)
 - [OpenAI file input metadata](https://developers.openai.com/plugins/reference)
