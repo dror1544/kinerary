@@ -46,7 +46,7 @@ import { startDocumentSweeper } from "../document-sweeper.js";
 import { codexIsolationProblem, runnerForBinding, taskTimeoutMs } from "../model-runner.js";
 import { startTaskOverrideRefresh, switchableRunner } from "../model-task-settings.js";
 import { HttpTelegramClient, TELEGRAM_API_ROOT, telegramApiRoot, type TelegramClient } from "./telegram-api.js";
-import { assistantEventsFromEnv } from "../analytics/emitter.js";
+import { assistantEventsFromEnv, assistantEventsSetting } from "../analytics/emitter.js";
 import { startAssistantEventsPurge } from "../analytics/purge-schedule.js";
 import { organizerDocumentRouteFromEnv } from "../document-correction.js";
 
@@ -289,6 +289,20 @@ async function main(): Promise<void> {
   // of INTERPRET_*: shipping this code must never be what switches recording
   // on. Undefined here means every hook below records nothing.
   const assistantEvents = assistantEventsFromEnv(process.env, runtime.db, log);
+
+  // #327 precondition 1: the ONE line a restart script — or a person reading
+  // logs — can grep for to know whether THIS process records anything, so a
+  // deployment can never turn recording on silently. Deliberately its own
+  // fixed event name, separate from assistantEventsFromEnv's own log line
+  // (which the emitter owns and which also reports "no database" as
+  // effectively off): this one names only the boolean and the word "env" —
+  // never the raw setting value, which is not a secret but is also not
+  // anything a boot line needs to repeat.
+  const eventsSetting = assistantEventsSetting(process.env);
+  log(structuredLog("info", eventsSetting.enabled ? "assistant_events.enabled" : "assistant_events.disabled", {
+    enabled: eventsSetting.enabled,
+    source: "env",
+  }));
 
   // The organizer's private-chat document route (#178): a file they send
   // after confirmation is read here and proposed back, and an Approve
