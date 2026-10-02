@@ -1531,6 +1531,60 @@ describe("operations from the interpreter (#206)", () => {
     assert.notEqual(document.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION", "a document reconciles through `held`, as before");
   });
 
+  // #205's own reproduction, pinned: Tokyo, Hakone, Kyoto, Osaka held; a typed
+  // reading that names only Tokyo must never become an `accepted` write for
+  // `phases` — if it did, `submitArgsFor(accepted.proposal.value)` would store
+  // only what the model re-emitted (per the interpreter prompt, "propose only
+  // what is being ADDED or CHANGED, not the whole list") and Hakone, Kyoto and
+  // Osaka would be gone the moment the shared writer replaced the stored answer
+  // wholesale. The gate below is what stands between a typed correction and
+  // that loss: `changeQuestions` refuses the raw proposal outright, so it never
+  // reaches `accepted` for the relay's typed path to write in the first place —
+  // the correction is instead carried as a structured diff (#206) and applied
+  // only on confirmation.
+  test("#205: a typed reading naming only Tokyo never reaches `accepted` for phases — Hakone, Kyoto, Osaka are never at risk", () => {
+    const held = {
+      phases: {
+        kind: "structured", schema_version: 3,
+        data: [{ name: "Tokyo" }, { name: "Hakone" }, { name: "Kyoto" }, { name: "Osaka" }],
+      },
+    } as never;
+    const tokyoOnly = proposal({
+      questionId: "phases", confidence: 0.95,
+      evidence: "another three days at the end for Tokyo, 30 September to 3 October",
+      value: { kind: "structured", data: [{ name: "Tokyo", start: "2026-09-30", end: "2026-10-03" }] } as never,
+    });
+    const ctx = {
+      sourceText: "another three days at the end for Tokyo, 30 September to 3 October",
+      outstanding: [], answered: ["phases"], allowCorrections: true,
+      questions: STOPS_Q, answers: held, changeQuestions: ["phases", "travelers"],
+    } as never;
+    const decided = applyProposals([tokyoOnly], ctx);
+    assert.equal(decided.accepted.length, 0, "never silently written as an accepted proposal");
+    assert.equal(decided.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION");
+  });
+
+  test("#205: the same shape for travelers — 'my mother is joining too' never reaches `accepted` either", () => {
+    const held = {
+      travelers: {
+        kind: "structured", schema_version: 3,
+        data: [{ name: "Dror Cohen" }, { name: "Ruth Cohen" }, { name: "Avi Cohen" }],
+      },
+    } as never;
+    const motherOnly = proposal({
+      questionId: "travelers", confidence: 0.95, evidence: "my mother is joining too",
+      value: { kind: "structured", data: [{ name: "Mom Cohen" }] } as never,
+    });
+    const ctx = {
+      sourceText: "my mother is joining too",
+      outstanding: [], answered: ["travelers"], allowCorrections: true,
+      questions: STOPS_Q, answers: held, changeQuestions: ["phases", "travelers"],
+    } as never;
+    const decided = applyProposals([motherOnly], ctx);
+    assert.equal(decided.accepted.length, 0);
+    assert.equal(decided.rejected[0]?.reason, "CHANGE_NEEDS_CONFIRMATION");
+  });
+
   test("another structured list (bookings) still merges into what is held and is written merged", () => {
     const anchors = [{ type: "hotel", name: "Gion Inn", date: "2026-09-25", confirmation: "GI-77" }];
     const Q: IntakeQuestion[] = [...QUESTIONS, { id: "travel_anchors", type: "structured", prompt: "Bookings?", required: false, dataShape: "array" }];
