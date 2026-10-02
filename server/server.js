@@ -1994,12 +1994,99 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 });
 
 // ── LOST & FOUND ──────────────────────────────────────────────────────────────
+// POST stays open with no login by owner decision (issue #207, 2026-09-27): a
+// finder is a stranger who reports what they found on the trip's website. A
+// stranger can reach the form, so a script can too — this section bounds and
+// rate-limits what an anonymous caller can write, without adding auth.
+
+// Field caps (trimmed lengths) — generous for a name/phone/short description,
+// tight enough that a script cannot use this form to stash arbitrary text.
+const LOST_FOUND_MAX_NAME = 80;
+const LOST_FOUND_MAX_PHONE = 32;
+const LOST_FOUND_MAX_ITEM = 200;
+const LOST_FOUND_MAX_LOCATION = 200;
+// Small cap on the whole request body — four short strings never need more
+// than a few hundred bytes; this catches an oversized payload before it is
+// even validated. Not a replacement for the global 30mb express.json()
+// limit (shared by every route), just a much tighter bound for this one.
+const LOST_FOUND_MAX_BODY_BYTES = 4096;
+
+// In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
+// Deliberately no dependency and no persistence — an abuse bound on a small
+// social feature, not a security control, so resetting on every restart is
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first.
+const LOST_FOUND_RATE_LIMIT = 5;
+const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
+// Bounds the map itself: a flood of distinct addresses (not just repeats
+// from one) must not grow this without limit for the life of the process.
+const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
+const lostFoundWrites = new Map();
+
+function pruneLostFoundBucket(timestamps, now) {
+  while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
+  return timestamps;
+}
+
+// Drops any bucket whose writes have all aged out, then — only if the map is
+// still oversized (many distinct addresses, not just repeat offenders) —
+// evicts the oldest-inserted entries outright. Map preserves insertion
+// order, so this is a real "oldest first" eviction, not an arbitrary one.
+function evictLostFoundBuckets(now) {
+  for (const [address, timestamps] of lostFoundWrites) {
+    pruneLostFoundBucket(timestamps, now);
+    if (!timestamps.length) lostFoundWrites.delete(address);
+  }
+  while (lostFoundWrites.size > LOST_FOUND_MAX_TRACKED_ADDRESSES) {
+    lostFoundWrites.delete(lostFoundWrites.keys().next().value);
+  }
+}
+
 app.post('/api/lost-found', (req, res) => {
+  const now = Date.now();
+  evictLostFoundBuckets(now);
+
+  // No `trust proxy` is set anywhere in this server, and trip sites sit
+  // behind nginx/NPM in production — see the #207 handover for what that
+  // means for this address (every visitor to one trip's proxy shares a
+  // single req.ip today; fixing that is a separate, deployment-wide change).
+  const address = req.ip;
+  const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
+  if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
+    const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
+    res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'rate_limited' });
+  }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
+    return res.status(413).json({ error: 'body_too_large' });
+  }
+
   const { name, phone, item, location } = req.body || {};
-  if (!name?.trim() || !item?.trim()) return res.status(400).json({ error: 'name and item are required' });
+  if (typeof name !== 'string' || typeof item !== 'string') {
+    return res.status(400).json({ error: 'name and item are required' });
+  }
+  if (phone != null && typeof phone !== 'string') return res.status(400).json({ error: 'phone must be a string' });
+  if (location != null && typeof location !== 'string') return res.status(400).json({ error: 'location must be a string' });
+
+  const trimmedName = name.trim();
+  const trimmedItem = item.trim();
+  const trimmedPhone = (typeof phone === 'string' ? phone : '').trim();
+  const trimmedLocation = (typeof location === 'string' ? location : '').trim();
+
+  if (!trimmedName || !trimmedItem) return res.status(400).json({ error: 'name and item are required' });
+  if (trimmedName.length > LOST_FOUND_MAX_NAME) return res.status(400).json({ error: 'name too long' });
+  if (trimmedItem.length > LOST_FOUND_MAX_ITEM) return res.status(400).json({ error: 'item too long' });
+  if (trimmedPhone.length > LOST_FOUND_MAX_PHONE) return res.status(400).json({ error: 'phone too long' });
+  if (trimmedLocation.length > LOST_FOUND_MAX_LOCATION) return res.status(400).json({ error: 'location too long' });
+
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(name.trim(), (phone || '').trim(), item.trim(), (location || '').trim());
+  ).run(trimmedName, trimmedPhone, trimmedItem, trimmedLocation);
+
+  bucket.push(now);
+  lostFoundWrites.set(address, bucket);
+
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 
