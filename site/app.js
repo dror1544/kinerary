@@ -1538,11 +1538,11 @@ async function loadRatings() {
 function buildRatingChips(venueId) {
   const ratings = allRatings[venueId] || {};
   return Object.entries(ratings).map(([u, r]) => {
-    const color = window.USERS_CACHE?.[u]?.color || '#888';
+    const color = safeParticipantColor(window.USERS_CACHE?.[u]?.color || '#888');
     const name = uname(u);
     const isMe = currentUser?.username === u;
     const meLabel = (T[currentLang]||T['he']).rating_me;
-    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${name}: ${r}★">${isMe ? meLabel : name[0]} <span class="stars-val">${r}★</span></span>`;
+    return `<span class="rating-chip${isMe ? ' rating-chip-me' : ''}" style="background:${color}" title="${escapeHtml(name)}: ${r}★">${isMe ? meLabel : escapeHtml(name[0])} <span class="stars-val">${r}★</span></span>`;
   }).join('');
 }
 
@@ -1600,8 +1600,30 @@ window.saveRating = saveRating;
    ========================================================= */
 const venueCommentsCache = {};
 
+// #213: quotes used to pass through unescaped, on the theory that every
+// caller only ever fed this into element TEXT. That stopped being true once
+// participant name/name_en started reaching attribute contexts too (RSVP
+// chip title, reaction tooltip) — an unescaped `"` there closes the
+// attribute early and lets the rest of the string become a live handler
+// (`onmouseover=`, etc). Escaping quotes in a text-only context is harmless
+// (they render as literal " / ' characters); every existing call site here
+// only ever fed element text, never markup, so none of them double-escape.
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(s ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// #213: color is organizer/agent-supplied (POST /api/agent/participants, or
+// a hand-edited trip.config.json) and reaches an unescaped inline
+// `style="background:${color}"` on every participant-carrying surface. The
+// API now refuses a non-hex color, but this is the render-side half of the
+// same fix — a config written before that check existed, or edited by hand,
+// must not be able to break out of the attribute either. Anything that
+// isn't `#`-prefixed hex falls back to the same neutral gray every avatar
+// already uses when color is simply missing.
+function safeParticipantColor(c) {
+  return typeof c === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#888';
 }
 
 
@@ -1636,11 +1658,11 @@ function renderVenueCommentThread(venueId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -1717,9 +1739,9 @@ function renderRsvpCard(activity) {
   const statusLabel = { yes: tr.rsvp_status_yes, no: tr.rsvp_status_no, maybe: tr.rsvp_status_maybe };
   const chips = rsvps.map(r => {
     const emoji = r.status === 'yes' ? '✅' : r.status === 'no' ? '❌' : '🤔';
-    const color = r.user?.color || '#888';
+    const color = safeParticipantColor(r.user?.color || '#888');
     const name  = uname(r.username, r.user);
-    return `<span class="rsvp-chip" style="background:${color}" title="${name}: ${statusLabel[r.status] || r.status}">${emoji} ${name}</span>`;
+    return `<span class="rsvp-chip" style="background:${color}" title="${escapeHtml(name)}: ${statusLabel[r.status] || r.status}">${emoji} ${escapeHtml(name)}</span>`;
   }).join('');
 
   const btnClass = (s) => `rsvp-btn${myRsvp?.status === s ? ` active-${s}` : ''}`;
@@ -2026,7 +2048,7 @@ window.confirmDeletePhoto = confirmDeletePhoto;
 function buildPhotoCard(p, reactions) {
   photoIndex[p.id] = p;
   const tr     = T[currentLang] || T['he'];
-  const color  = p.user?.color  || '#888';
+  const color  = safeParticipantColor(p.user?.color  || '#888');
   const name   = uname(p.username, p.user);
   const date   = new Date(p.uploadedAt).toLocaleDateString('he-IL');
 
@@ -2038,7 +2060,7 @@ function buildPhotoCard(p, reactions) {
     const users = reactions?.[e] || [];
     const count = users.length;
     const active = myReactions.has(e) ? 'active' : '';
-    const tooltip = users.map(u => uname(u)).join(', ');
+    const tooltip = users.map(u => escapeHtml(uname(u))).join(', ');
     return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${p.id}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
   }).join('');
 
@@ -2052,7 +2074,7 @@ function buildPhotoCard(p, reactions) {
       <button class="pg-delete-btn" onclick="askDeletePhoto('${p.id}')" title="${tr.ph_delete}">🗑️</button>
     </div>` : ''}
     <div class="pg-meta">
-      <div class="pg-avatar" style="background:${color}">${name[0]}</div>
+      <div class="pg-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div class="pg-info"><div class="pg-name">${escapeHtml(name)}</div><div>${date}</div></div>
       <div class="pg-share-btns">
         <button class="pg-share-btn pg-share-fb" onclick="sharePhotoFacebook('${p.id}')" title="${tr.ph_share_fb}"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg></button>
@@ -2151,7 +2173,7 @@ async function togglePhotoReaction(photoId, emoji) {
         const users2 = allPhotoReactions[photoId]?.[e] || [];
         const count = users2.length;
         const active = myReactions.has(e) ? 'active' : '';
-        const tooltip = users2.map(u => window.USERS_CACHE?.[u]?.name || u).join(', ');
+        const tooltip = users2.map(u => escapeHtml(window.USERS_CACHE?.[u]?.name || u)).join(', ');
         return `<button class="pg-react-btn ${active}" title="${tooltip}" onclick="togglePhotoReaction('${photoId}','${e}')">${e}${count > 0 ? `<span>${count}</span>` : ''}</button>`;
       }).join('');
     }
@@ -2188,11 +2210,11 @@ function renderPhotoCommentThread(photoId) {
   if (btn) btn.textContent = `💬 ${comments.length} ${(T[currentLang]||T['he']).ph_comments} ▲`;
 
   const list = comments.map(c => {
-    const color = c.user?.color || '#888';
+    const color = safeParticipantColor(c.user?.color || '#888');
     const name  = uname(c.username, c.user);
     const time  = new Date(c.created_at).toLocaleDateString('he-IL');
     return `<div class="vc-comment">
-      <div class="vc-avatar" style="background:${color}">${name[0]}</div>
+      <div class="vc-avatar" style="background:${color}">${escapeHtml(name[0])}</div>
       <div>
         <span class="vc-name">${escapeHtml(name)}</span><span class="vc-meta">${time}</span>
         <div class="vc-body">${escapeHtml(c.body)}</div>
@@ -3591,8 +3613,8 @@ function renderFamilies(cfg) {
       (p.age >= 25 ? heads : kids).push(p);
     });
     const headLines = heads.map(p =>
-      `<li><strong><span class="lang-he">${p.name}</span><span class="lang-en">${p.name_en}</span></strong>${p.age ? ` (${p.age})` : ''}</li>`).join('');
-    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${p.name}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${p.name_en}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span></li>` : '';
+      `<li><strong><span class="lang-he">${escapeHtml(p.name)}</span><span class="lang-en">${escapeHtml(p.name_en)}</span></strong>${p.age ? ` (${p.age})` : ''}</li>`).join('');
+    const kidLine = kids.length ? `<li><span class="lang-he">${kids.map(p => `${escapeHtml(p.name)}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span><span class="lang-en">${kids.map(p => `${escapeHtml(p.name_en)}${p.age ? ' ('+p.age+')' : ''}`).join(', ')}</span></li>` : '';
     const noteHtml = fam.note ? `<div class="fam-note">${_biSpan(fam.note)}</div>` : '';
     return `<div class="fam">
       <div class="fam-letter ltr">${fam.letter}</div>

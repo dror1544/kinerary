@@ -1112,6 +1112,14 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
   if (!username || !name) return res.status(400).json({ error: 'missing_fields' });
   const uname = String(username).toLowerCase().trim();
   if (!/^[a-z0-9_-]+$/.test(uname)) return res.status(400).json({ error: 'invalid_username' });
+  // #213: color reaches the classic client's inline `style="background:${color}"`
+  // on every participant-carrying surface (RSVP chip, reaction tooltip,
+  // pg-avatar/vc-avatar). The renderer now escapes and falls back to a
+  // neutral default too, but refusing an unrecognized value here means a bad
+  // color never reaches trip.config.json in the first place.
+  if (color != null && color !== '' && !/^#[0-9a-fA-F]{3,8}$/.test(color)) {
+    return res.status(400).json({ error: 'invalid_color' });
+  }
   // #184 (boundary review on PR #274, finding A): if trip.config.json's
   // agent.organizers names a username with no seeded participant row yet,
   // the normal `username_taken` check below does nothing to stop the agent

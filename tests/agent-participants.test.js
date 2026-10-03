@@ -97,6 +97,40 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.equal((await res.json()).error, 'missing_fields');
   });
 
+  // #213: color reaches an unescaped inline style attribute on the classic
+  // client (RSVP chip, reaction tooltip, pg-avatar/vc-avatar) — refusing a
+  // non-hex value here means the API never writes a row that a renderer
+  // would later have to defend against.
+  test('rejects a color that is not a hex value — no row written', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'xss-color', name: 'X', color: 'red;" onmouseover="alert(3)' },
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_color');
+
+    const cfg = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'));
+    assert.ok(!cfg.participants.some(p => p.username === 'xss-color'), 'the refused create must not have written a row');
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'xss-color', password: '1234' } });
+    assert.equal(login.status, 401, 'no user row should have been inserted either');
+  });
+
+  test('accepts a well-formed short hex color', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'hex-short', name: 'Hex', color: '#abc' },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  test('a missing color is still allowed (optional field)', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'no-color', name: 'No Color' },
+    });
+    assert.equal(res.status, 200);
+  });
+
   test('organizer JWT adds a password-only participant and returns an enrollment token', async () => {
     const res = await api('/api/agent/participants', {
       method: 'POST', token: aliceToken,
