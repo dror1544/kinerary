@@ -83,6 +83,13 @@ interface QuestionCopy {
    * (`IntakeQuestion.satisfiedBy`). `{answer}` is what was written (a date as a person would say it).
    */
   unsettled?: Localised;
+  /**
+   * The other way to be unsettled — matched MORE than one, not none. Used only
+   * when `IntakeQuestion.unsettledMatchKind` reports it (`organizer_identity`'s
+   * `"ambiguous"` today); falls back to `unsettled` when absent, since every
+   * other question has only the one way to be unsettled.
+   */
+  ambiguous?: Localised;
 }
 
 export const INTAKE_COPY: Record<string, QuestionCopy> = {
@@ -216,6 +223,10 @@ export const INTAKE_COPY: Record<string, QuestionCopy> = {
     unsettled: {
       en: "“{answer}” doesn't match any of the names in the travellers list. Which of them are you? Tap your name.",
       he: "״{answer}״ לא תואם לאף אחד מהשמות ברשימת הנוסעים. מי מהם זה אתה? אפשר ללחוץ על השם שלך.",
+    },
+    ambiguous: {
+      en: "More than one traveller is called “{answer}” — which one are you? Tap your name.",
+      he: "יותר מנוסע אחד נקרא ״{answer}״ — מי מהם זה אתה? אפשר ללחוץ על השם שלך.",
     },
   },
   bot_name: {
@@ -983,9 +994,22 @@ export function askText(question: IntakeQuestion, language: Language = DEFAULT_L
 /**
  * Asking again for a question whose recorded answer does not settle it, quoting
  * what was written. Falls back to the plain question.
+ *
+ * `matchKind` is `IntakeQuestion.unsettledMatchKind`'s reading of WHY the
+ * answer did not settle the question — `"ambiguous"` reads the `ambiguous`
+ * template (falling back to `unsettled` if a question has none); anything
+ * else, or absent, reads `unsettled` as before.
  */
-export function unsettledText(question: IntakeQuestion, written: string, language: Language = DEFAULT_LANGUAGE): string {
-  const template = pick(INTAKE_COPY[question.id]?.unsettled, language);
+export function unsettledText(
+  question: IntakeQuestion,
+  written: string,
+  language: Language = DEFAULT_LANGUAGE,
+  matchKind?: string,
+): string {
+  const copy = INTAKE_COPY[question.id];
+  const template = matchKind === "ambiguous"
+    ? pick(copy?.ambiguous, language) ?? pick(copy?.unsettled, language)
+    : pick(copy?.unsettled, language);
   // A stored date is YYYY-MM-DD; an organizer is never shown that form.
   const answer = readableDate(written, language) ?? written.trim();
   return template ? template.replace("{answer}", answer) : askText(question, language);

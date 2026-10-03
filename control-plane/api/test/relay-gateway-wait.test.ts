@@ -7,7 +7,7 @@ import {
   gatewayWaitMsFromEnv,
 } from "../src/relay/gateway-wait.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -89,7 +89,7 @@ const databaseUrl = testDatabaseUrl();
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 
 test("expected companions are the open bindings of trips not known to be unreachable", { skip: !databaseUrl }, async () => {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

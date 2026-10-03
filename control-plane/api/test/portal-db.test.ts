@@ -6,7 +6,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { sha256, type PortalDependencies } from "../src/portal.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const skip = !databaseUrl;
@@ -54,7 +54,7 @@ async function session(userId: string, label: string) {
 
 before(async () => {
   if (skip) return;
-  pool = new pg.Pool({ connectionString: databaseUrl, max: 3 });
+  pool = testPool({ max: 3 });
   const client = await pool.connect();
   try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   await pool.query(`INSERT INTO control_plane.users(id,status,display_name) VALUES ($1,'active','Owner'),($2,'active','Member'),($3,'active','Outsider')`, [ids.owner, ids.member, ids.outsider]);

@@ -97,6 +97,40 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     assert.equal((await res.json()).error, 'missing_fields');
   });
 
+  // #213: color reaches an unescaped inline style attribute on the classic
+  // client (RSVP chip, reaction tooltip, pg-avatar/vc-avatar) — refusing a
+  // non-hex value here means the API never writes a row that a renderer
+  // would later have to defend against.
+  test('rejects a color that is not a hex value — no row written', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'xss-color', name: 'X', color: 'red;" onmouseover="alert(3)' },
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_color');
+
+    const cfg = JSON.parse(readFileSync(join(tripDir, 'trip.config.json'), 'utf8'));
+    assert.ok(!cfg.participants.some(p => p.username === 'xss-color'), 'the refused create must not have written a row');
+    const login = await api('/api/auth/login', { method: 'POST', body: { username: 'xss-color', password: '1234' } });
+    assert.equal(login.status, 401, 'no user row should have been inserted either');
+  });
+
+  test('accepts a well-formed short hex color', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'hex-short', name: 'Hex', color: '#abc' },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  test('a missing color is still allowed (optional field)', async () => {
+    const res = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY,
+      body: { username: 'no-color', name: 'No Color' },
+    });
+    assert.equal(res.status, 200);
+  });
+
   test('organizer JWT adds a password-only participant and returns an enrollment token', async () => {
     const res = await api('/api/agent/participants', {
       method: 'POST', token: aliceToken,
@@ -439,6 +473,69 @@ describe('POST /api/agent/participants + POST /api/auth/enroll', () => {
     // not reassigned, so it's now free for someone else to bind instead.
     const rebind = await api('/api/agent/participants/dana/telegram', { method: 'PATCH', apiKey: AGENT_KEY, body: { telegram_id: '888000111' } });
     assert.equal(rebind.status, 200, 'the removed participant\'s telegram_id should be free to rebind elsewhere');
+  });
+
+  // #279 — DELETE scrambles the password and clears telegram_id but, until
+  // this fix, left the users row itself in place. reset-password only ever
+  // checked "does a row exist", which a removed user's row still does, so the
+  // agent key alone could fully revive a removed family member: delete them,
+  // reset-password, redeem the token via /api/auth/enroll (no session
+  // needed), then log in as them — exactly as if the delete had never
+  // happened. This replays that live sequence end to end and asserts the
+  // revival is refused at reset-password, the one route that was actually
+  // reachable (POST /api/agent/participants is already blocked earlier, by
+  // username_taken, since DELETE never removes the row).
+  test('#279: the agent key cannot revive a removed participant via reset-password', async () => {
+    const created = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY, body: { username: 'erin', name: 'Erin' },
+    });
+    assert.equal(created.status, 200);
+    const { enrollment_token: firstToken } = await created.json();
+    await api('/api/auth/enroll', { method: 'POST', body: { token: firstToken, password: 'erins-first-password' } });
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: 'erins-first-password' } })).status, 200,
+      'sanity: erin can log in before removal');
+
+    const removed = await api('/api/agent/participants/erin', { method: 'DELETE', apiKey: AGENT_KEY });
+    assert.equal(removed.status, 200);
+
+    // The actual live attack: agent key alone, no organizer session, no
+    // re-creation — straight to reset-password on the now-removed username.
+    const revive = await api('/api/agent/participants/erin/reset-password', { method: 'POST', apiKey: AGENT_KEY });
+    assert.equal(revive.status, 409);
+    const reviveBody = await revive.json();
+    assert.equal(reviveBody.error, 'participant_removed');
+    // No side door: the refused call must not have minted a redeemable token.
+    assert.equal(reviveBody.enrollment_token, undefined, 'a refused reset must not leak a redeemable token');
+
+    // And the `to: trip_password` branch is refused the same way.
+    const reviveTripPassword = await api('/api/agent/participants/erin/reset-password', {
+      method: 'POST', apiKey: AGENT_KEY, body: { to: 'trip_password' },
+    });
+    assert.equal(reviveTripPassword.status, 409);
+    assert.equal((await reviveTripPassword.json()).error, 'participant_removed');
+
+    // erin genuinely cannot log in any more — not with the old password, not
+    // with the trip password, and (since no token was ever minted) not via
+    // any enrollment redemption either.
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: 'erins-first-password' } })).status, 401);
+    assert.equal((await api('/api/auth/login', { method: 'POST', body: { username: 'erin', password: '1234' } })).status, 401);
+  });
+
+  // #279, companion case: an organizer's own JWT session must not revive a
+  // removed participant either — removal is meant to be permanent short of
+  // re-provisioning under a fresh username, not something either caller can
+  // undo through this route.
+  test('#279: an organizer\'s own session cannot revive a removed participant either', async () => {
+    const created = await api('/api/agent/participants', {
+      method: 'POST', apiKey: AGENT_KEY, body: { username: 'frank', name: 'Frank' },
+    });
+    assert.equal(created.status, 200);
+    const removed = await api('/api/agent/participants/frank', { method: 'DELETE', token: aliceToken });
+    assert.equal(removed.status, 200);
+
+    const revive = await api('/api/agent/participants/frank/reset-password', { method: 'POST', token: aliceToken });
+    assert.equal(revive.status, 409);
+    assert.equal((await revive.json()).error, 'participant_removed');
   });
 });
 

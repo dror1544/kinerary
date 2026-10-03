@@ -828,9 +828,11 @@ export function renderQuestion(
   /**
    * What the record adds to this question: buttons drawn from it (the roster,
    * for the organizer), and an answer on record that did not settle it, which
-   * the question then quotes back instead of repeating itself.
+   * the question then quotes back instead of repeating itself. `unsettledKind`
+   * is `IntakeQuestion.unsettledMatchKind`'s reading of WHY, when a question
+   * has more than one way to be unsettled — see `unsettledText`.
    */
-  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; subject?: string } = {},
+  fromRecord: { choices?: readonly RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } = {},
 ): RenderedQuestion {
   const rows: InlineButton[][] = [];
 
@@ -905,7 +907,7 @@ export function renderQuestion(
   // organizer needs to know, and a sentence written before the answer landed
   // cannot know it.
   const body = fromRecord.unsettled
-    ? unsettledText(question, fromRecord.unsettled, language)
+    ? unsettledText(question, fromRecord.unsettled, language, fromRecord.unsettledKind)
     : agentText?.trim() || askText(question, language);
   // One question put once per thing it is about: "gluten-free — who is that for?"
   const text = fromRecord.subject ? `${fromRecord.subject} — ${body}` : body;

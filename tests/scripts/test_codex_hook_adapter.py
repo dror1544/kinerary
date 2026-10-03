@@ -26,7 +26,7 @@ class CodexAdapter(Harness):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.hermes.cleanup)
         self.addCleanup(self.log.unlink, missing_ok=True)
-        for name in ("codex-adapter.py", "pretooluse-write.sh", "sessionstart.sh"):
+        for name in ("codex-adapter.py", "path_canon.py", "pretooluse-write.sh", "sessionstart.sh"):
             shutil.copy2(REPO / "scripts/claude-hooks" / name,
                          self.root / "scripts/claude-hooks" / name)
 

@@ -26,7 +26,7 @@ import {
   staleReservedDocuments,
   type ProcessingConfig,
 } from "../src/document-registry.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -46,7 +46,7 @@ async function seedTrip(pool: pg.Pool): Promise<string> {
 }
 
 async function withTwoTrips(fn: (fix: { pool: pg.Pool; a: string; b: string }) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

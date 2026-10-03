@@ -17,7 +17,7 @@ import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
 import { applyMigrations } from "../src/migrations.js";
 import { NOT_MEASURED_YET } from "../src/admin-dashboard.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -46,7 +46,7 @@ describe("super-admin dashboard: slice 1 (read-only)", { skip: SKIP ? "no CONTRO
   let pool: pg.Pool;
 
   before(async () => {
-    pool = new pg.Pool({ connectionString: DB_URL });
+    pool = testPool();
     const client = await pool.connect();
     try {
       // Fresh schema every run of this file, not only every process: the

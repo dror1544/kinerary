@@ -39,7 +39,7 @@ import { answerCallbackData, resolveChatRoute, startFromDeepLink } from "../src/
 import { getSessionForChat, submitAnswerForChat } from "../src/interview.js";
 import { dispatchUpdate } from "../src/relay/dispatch.js";
 import { normalizeUpdate, type TelegramUpdate } from "../src/relay/normalize.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -102,7 +102,7 @@ async function bind(pool: pg.Pool, trip: Trip): Promise<void> {
 
 /** Two trips, always. The second one is the one that must never be reached. */
 async function withTwoTrips(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

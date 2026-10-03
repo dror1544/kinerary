@@ -2062,12 +2062,14 @@ function renderStep(question: IntakeQuestion, view: SessionView, phrasing?: stri
  */
 function fromRecord(
   view: SessionView, questionId: string,
-): { choices?: RosterChoice[]; unsettled?: string; subject?: string } {
+): { choices?: RosterChoice[]; unsettled?: string; unsettledKind?: string; subject?: string } {
   const subject = view.subjects?.[questionId];
   const from = subject ? findQuestion(subject.fromQuestion) : null;
+  const unsettled = view.unsettled?.[questionId];
   return {
     choices: view.choices?.[questionId],
-    unsettled: view.unsettled?.[questionId],
+    unsettled: unsettled?.text,
+    unsettledKind: unsettled?.matchKind,
     subject: from && subject ? optionLabel(from, subject.optionId, view.language) : undefined,
   };
 }
@@ -4028,8 +4030,6 @@ async function restateExpectation(
   deps: TripBotPollerDeps,
   reason: "NOT_UNDERSTOOD" | "EXPIRING",
 ): Promise<boolean> {
-  const lead = uiString(reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : "didNotFollow", view.language);
-
   // What is outstanding, most specific first. The BOUNDARY is the case that
   // needed this: `state` is still `interviewing` there — everything required
   // answered, every optional one skipped, `nextQuestion` null — so keying off
@@ -4046,6 +4046,21 @@ async function restateExpectation(
   const question = offerOnScreen
     ? null
     : view.nextQuestion ?? view.pendingAsk ?? view.optionalRemaining[0] ?? null;
+
+  // #321: an answer already ON RECORD for this question that did not settle it
+  // — "Dana" against a roster with two Danas — was READ and MATCHED, just not
+  // to exactly one traveller. `rendered.text` below already says so, quoting
+  // what was written (`unsettledText`/the ambiguous copy); leading with "I
+  // didn't quite follow" on top of that is false, and repeats the one thing
+  // most likely to make someone stop trusting the interview's clarifying
+  // questions. Only for NOT_UNDERSTOOD: EXPIRING is a timer firing, not a
+  // judgement on the last reply, so its "still waiting" lead is unaffected —
+  // and only while it is THIS question's own unsettled answer, not some other
+  // outstanding question's turn to be restated for an unrelated reason.
+  const unsettledHere = question ? view.unsettled?.[question.id] : undefined;
+  const skipLead = reason === "NOT_UNDERSTOOD" && Boolean(unsettledHere);
+  const lead = skipLead ? null : uiString(reason === "EXPIRING" ? "stillWaitingBeforeExpiry" : "didNotFollow", view.language);
+
   let rendered: RenderedQuestion;
   if (question) {
     rendered = renderStep(question, view);
@@ -4066,10 +4081,11 @@ async function restateExpectation(
   (deps.log ?? (() => {}))(structuredLog("info", "trip_bot.expectation_restated", {
     session_id: view.sessionId,
     reason,
+    lead_skipped_for_unsettled_answer: skipLead,
   }));
   await deps.telegram.sendMessage({
     chatId,
-    text: `${lead}\n\n${rendered.text}`,
+    text: lead ? `${lead}\n\n${rendered.text}` : rendered.text,
     replyMarkup: rendered.replyMarkup ?? undefined,
   });
   return true;
@@ -4362,7 +4378,12 @@ export function routerPromptKey(
   if (!question) return "";
   const subject = view.subjects?.[question.id];
   const unsettled = view.unsettled?.[question.id];
-  return `q:${question.id}${subject ? `:about:${subject.optionId}` : ""}${unsettled ? `:unsettled:${unsettled}` : ""}`;
+  // The kind rides along with the text: the same typed "Dana" reads as a
+  // different message once the roster makes it settle a different way (e.g.
+  // matched nobody, then ambiguous after a roster update), and two messages
+  // that read differently must never share a dedupe key.
+  const unsettledPart = unsettled ? `:unsettled:${unsettled.text}${unsettled.matchKind ? `:${unsettled.matchKind}` : ""}` : "";
+  return `q:${question.id}${subject ? `:about:${subject.optionId}` : ""}${unsettledPart}`;
 }
 
 // ── A step Telegram did not take (#225 item 9) ─────────────────────────────────

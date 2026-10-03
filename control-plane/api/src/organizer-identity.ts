@@ -21,7 +21,8 @@ import { createHash } from "node:crypto";
 
 export type OrganizerMatch =
   | { kind: "matched"; index: number; name: string }
-  | { kind: "ambiguous" }
+  /** The roster positions the answer could name — never guessed between. */
+  | { kind: "ambiguous"; candidates: number[] }
   | { kind: "unmatched" }
   | { kind: "no_roster" };
 
@@ -196,7 +197,7 @@ export function resolveOrganizer(answer: string, roster: unknown): OrganizerMatc
 
   const decide = (hits: number[]): OrganizerMatch | null => {
     if (hits.length === 1) return { kind: "matched", index: hits[0]!, name: rosterName(entries[hits[0]!]!) };
-    if (hits.length > 1) return { kind: "ambiguous" };
+    if (hits.length > 1) return { kind: "ambiguous", candidates: hits };
     return null;
   };
 
@@ -222,4 +223,16 @@ export function rosterChoices(roster: unknown): RosterChoice[] {
     const fingerprint = createHash("sha256").update(name).digest("hex").slice(0, 6);
     return { id: `p${i}_${fingerprint}`, label, value: name };
   });
+}
+
+/**
+ * The roster as buttons, restricted to the given roster positions — what an
+ * `ambiguous` `OrganizerMatch` offers: only the travellers the typed answer
+ * could actually mean, in roster order, never the whole roster (which is what
+ * produced the ambiguity in the first place: the roster's OWN "Dana" button
+ * records "Dana" and would just resolve ambiguous again).
+ */
+export function rosterChoicesFor(roster: unknown, indices: readonly number[]): RosterChoice[] {
+  const wanted = new Set(indices);
+  return rosterChoices(roster).filter((_, i) => wanted.has(i));
 }

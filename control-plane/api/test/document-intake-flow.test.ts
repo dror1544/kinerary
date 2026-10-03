@@ -41,7 +41,7 @@ import { DEFAULT_STRINGS } from "../src/relay/dispatch.js";
 import { filesystemDocumentStore, type DocumentBlobStore } from "../src/document-store.js";
 import { uiString, type Language } from "../src/intake-copy.js";
 import type { RunnerResult, StructuredModelRequest, StructuredModelRunner } from "../src/model-runner.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -260,7 +260,7 @@ interface Flow {
 }
 
 async function withFlow(options: { store: boolean }, fn: (flow: Flow) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

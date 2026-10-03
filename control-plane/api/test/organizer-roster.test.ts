@@ -8,7 +8,7 @@ import {
   type AnswerStore,
   type IntakeAnswer,
 } from "../src/interview.js";
-import { rosterChoices } from "../src/organizer-identity.js";
+import { rosterChoices, rosterChoicesFor } from "../src/organizer-identity.js";
 
 const organizer = INTAKE_QUESTIONS.find((q) => q.id === "organizer_identity")!;
 const text = (t: string): IntakeAnswer => ({ kind: "text", schema_version: 3, text: t });
@@ -39,6 +39,24 @@ describe("the organizer question, answered from the roster", () => {
     assert.match(he.text, /״רות״ לא תואם לאף אחד מהשמות ברשימת הנוסעים/);
   });
 
+  // #321: a name that matches two travellers reads its OWN copy — "which one"
+  // rather than "doesn't match any" — and offers only the two it could be.
+  test("a name that matched two travellers asks which one, and offers only those two buttons", () => {
+    const twoDanas = [{ name: "Dana Levi" }, { name: "Dana Cohen" }, { name: "Omri Levi" }];
+    const choices = rosterChoicesFor(twoDanas, [0, 1]);
+    const en = renderQuestion(organizer, [], "en", null, { choices, unsettled: "Dana", unsettledKind: "ambiguous" });
+    assert.match(en.text, /More than one traveller is called “Dana” — which one are you\?/);
+    assert.deepEqual(en.replyMarkup!.inline_keyboard.flat().map((b) => b.text), ["Dana Levi", "Dana Cohen"]);
+
+    const he = renderQuestion(organizer, [], "he", null, { unsettled: "דנה", unsettledKind: "ambiguous" });
+    assert.match(he.text, /יותר מנוסע אחד נקרא ״דנה״ — מי מהם זה אתה/);
+  });
+
+  test("the same unsettled text falls back to the plain 'matched nobody' copy without a matchKind", () => {
+    const rendered = renderQuestion(organizer, [], "en", null, { unsettled: "Dana" });
+    assert.match(rendered.text, /“Dana” doesn't match any of the names in the travellers list/);
+  });
+
   test("an organizer answer counts only when it names exactly one traveller", () => {
     const base: AnswerStore = { travelers: roster([{ name: "Dana" }, { name: "Dina" }]) };
     assert.equal(isAnswered(organizer, { ...base, organizer_identity: text("Dana") }), true);
@@ -52,5 +70,30 @@ describe("the organizer question, answered from the roster", () => {
     const { outstanding, answered } = partitionQuestions(answers);
     assert.ok(outstanding.includes("organizer_identity"));
     assert.ok(!answered.includes("organizer_identity"));
+  });
+
+  // #321: the question definition's OWN `choicesFrom`/`unsettledMatchKind` —
+  // not the helpers directly — end to end, the way `buildSessionView` actually
+  // calls them.
+  test("the question's own choicesFrom narrows to the ambiguous pair, and unsettledMatchKind reports it", () => {
+    const answers: AnswerStore = {
+      travelers: roster([{ name: "Dana Levi" }, { name: "Dana Cohen" }, { name: "Omri Levi" }]),
+      organizer_identity: text("Dana"),
+    };
+    assert.equal(organizer.unsettledMatchKind?.(answers), "ambiguous");
+    assert.deepEqual(
+      organizer.choicesFrom?.(answers).map((c) => c.value),
+      ["Dana Levi", "Dana Cohen"],
+    );
+  });
+
+  test("choicesFrom offers the whole roster when nothing is on record yet, or nobody matched", () => {
+    const roster3 = roster([{ name: "Dana Levi" }, { name: "Omri Levi" }]);
+    assert.deepEqual(organizer.choicesFrom?.({ travelers: roster3 }).map((c) => c.value), ["Dana Levi", "Omri Levi"]);
+    assert.deepEqual(
+      organizer.choicesFrom?.({ travelers: roster3, organizer_identity: text("Grandma Ruth") }).map((c) => c.value),
+      ["Dana Levi", "Omri Levi"],
+      "unmatched has nobody to narrow to, so the whole roster stays offered — only ambiguous narrows",
+    );
   });
 });
