@@ -1,4 +1,4 @@
-import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies } from "./app.js";
+import { buildApp, type SignupDependencies, type InterviewDependencies, type PlannerDependencies, type ProvisionerDependencies, type ChatRoutingDependencies, type InterviewAgentDependencies, type OperatorDependencies, type AdminDependencies, type AssistantEventsIngestDependencies } from "./app.js";
 import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
@@ -175,6 +175,17 @@ if (adminKey) {
   admin = { db: pool, apiKey: adminKey };
 }
 
+// The Hermes tool-outcome ingest route (AssistantEventsIngestDependencies,
+// app.ts). A key distinct from the admin/operator ones above and from any
+// trip's own HERMES_API_KEY — see that interface's own comment for why.
+// Absent, like every optional block here, means the route 503s rather than
+// accepting or even confirming its own existence.
+let assistantEventsIngest: AssistantEventsIngestDependencies | undefined;
+const assistantEventsIngestKey = process.env.ASSISTANT_EVENTS_INGEST_KEY;
+if (assistantEventsIngestKey) {
+  assistantEventsIngest = { db: pool, apiKey: assistantEventsIngestKey };
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
@@ -187,6 +198,7 @@ const app = buildApp(profile, {
   interviewAgent,
   operator,
   admin,
+  assistantEventsIngest,
 });
 
 // Dispatches trip notifications (e.g. "your site is ready") that the worker

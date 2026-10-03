@@ -36,6 +36,8 @@ import { createOrVerifyPasswordIdentity, verifyPasswordLogin, resolveWebAuth } f
 import { generatePlan, getPlan, listAvailableReleases, retryProvision } from "./planner.js";
 import { structuredLog } from "./redaction.js";
 import { registerPortalRoutes, type PortalDependencies } from "./portal.js";
+import { ingestHermesToolOutcomes } from "./hermes-ingest.js";
+import { timingSafeKeyMatch } from "./secure-compare.js";
 import {
   startSignup,
   processApprovalCallback,
@@ -153,6 +155,31 @@ export interface AdminDependencies {
   apiKey: string;
 }
 
+/**
+ * The Hermes tool-outcome ingest route (the slice #177/#326 named as still
+ * missing: an assistant-side fact the relay can never observe itself).
+ *
+ * A DISTINCT key from every other one here, for the same reason
+ * `AdminDependencies` and `OperatorDependencies` each give for not sharing
+ * theirs: a trip's own `HERMES_API_KEY` (server/server.js) is scoped to
+ * that one trip's SITE — reading/writing its photos, bookings, plan — and
+ * reusing it here would let anyone holding one trip's site key write
+ * analytics rows claiming to be a DIFFERENT trip's companion. This key
+ * authorizes exactly one thing: "I am some trip's Hermes plugin, reporting
+ * one of its own tool calls" — the request still names no trip id (see
+ * `hermes-ingest.ts`); the key only gets a caller past the door, never past
+ * the profile → trip resolution.
+ *
+ * Absent by default, like every optional block here: a deployment that has
+ * not set ASSISTANT_EVENTS_INGEST_KEY gets a 503 from this route, never a
+ * 401 that would at least confirm the route exists to brute-force against.
+ */
+export interface AssistantEventsIngestDependencies {
+  db: pg.Pool;
+  /** Presented as X-API-Key. Held by the Hermes plugin's own env, nowhere else. */
+  apiKey: string;
+}
+
 export interface AppDependencies {
   readiness?: () => Promise<Record<string, unknown>>;
   close?: () => Promise<void>;
@@ -175,6 +202,8 @@ export interface AppDependencies {
   operator?: OperatorDependencies;
   /** Optional: mount the super-admin dashboard's routes (read, and slice 2's retry/suspend/resume mutations). Off unless a key is set. */
   admin?: AdminDependencies;
+  /** Optional: mount the Hermes tool-outcome ingest route. Off unless a key is set. */
+  assistantEventsIngest?: AssistantEventsIngestDependencies;
 }
 
 // A driver's message and stack routinely carry the connection string, so the
@@ -1866,6 +1895,48 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       return reply.code(status).send({ error: result.reason });
     }
     return reply.code(200).send({ tripId: result.tripId });
+  });
+
+  // ── Hermes tool-outcome ingest ───────────────────────────────────────────
+  //
+  // The assistant-side half of the outcome-event pipeline (#177/#326): a
+  // companion's Hermes plugin posts a batch of `{event_id, outcome,
+  // occurred_at?}` facts about its OWN trip-mcp tool calls — `grounded_answer`
+  // or `failed_tool`, never `answered` (analytics/contract.ts). The request
+  // names the Hermes PROFILE reporting, never a trip id; `hermes-ingest.ts`
+  // resolves the one trip that profile belongs to (`trips.hermes_profile`)
+  // before anything is written, so a key leaked from one trip's companion
+  // still cannot name another trip in the body.
+  //
+  // Body: { profile: string, events: [{ event_id, outcome, occurred_at? }] }
+  // (at most hermes-ingest.ts's MAX_BATCH_SIZE entries). A profile with no trip,
+  // or more than one, is a 404/409 and nothing is written; a malformed
+  // profile or batch shape is 400 before the database is touched. A
+  // per-event contract violation inside an otherwise-resolvable batch is
+  // reported in `rejected`, exactly as the relay's own emitter batches are —
+  // this never 500s for one bad row in a batch of otherwise-good ones.
+  function assistantEventsIngestAuth(request: { headers: unknown }): boolean {
+    const deps = dependencies.assistantEventsIngest;
+    if (!deps) return false;
+    const providedKey = (request.headers as Record<string, unknown>)["x-api-key"];
+    return timingSafeKeyMatch(providedKey, deps.apiKey);
+  }
+
+  app.post("/internal/assistant-events/tool-outcomes", async (request, reply) => {
+    if (!dependencies.assistantEventsIngest) return reply.code(503).send({ error: "ASSISTANT_EVENTS_INGEST_NOT_CONFIGURED" });
+    if (!assistantEventsIngestAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const result = await ingestHermesToolOutcomes(dependencies.assistantEventsIngest.db, body.profile, body.events);
+    if (!result.ok) {
+      const status = result.reason === "NO_TRIP" ? 404 : result.reason === "AMBIGUOUS_TRIP" ? 409 : 400;
+      return reply.code(status).send({ error: result.reason, ...(result.detail ? { detail: result.detail } : {}) });
+    }
+    return reply.code(200).send({
+      inserted: result.write.inserted,
+      duplicates: result.write.duplicates,
+      rejected: result.write.rejected,
+    });
   });
 
   if (dependencies.portal) { app.get("/v1/auth/telegram", async (_request, reply) => reply.code(410).send({ error: "TELEGRAM_WEB_AUTH_RETIRED" })); registerPortalRoutes(app, dependencies.portal); }

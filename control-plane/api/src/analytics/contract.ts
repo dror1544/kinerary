@@ -1,6 +1,7 @@
 /**
  * The assistant-event contract, in TypeScript — issue #177, Track 2's first
- * slice of the outcome-event pipeline.
+ * slice of the outcome-event pipeline, extended by a later slice (the Hermes
+ * plugin + ingest route) to carry the assistant's OWN tool-outcome facts.
  *
  * The language-neutral source is `analytics/schemas/tripbot-event.v1.json`;
  * this file mirrors it so the relay can validate without reading a file that
@@ -15,12 +16,24 @@
  * digest of any of those, or a tool argument/result — there is no field for
  * them, and `metadata` accepts only bounded numbers and one boolean.
  *
- * **The relay never claims `answered`.** It sees whether a reply reached
- * Telegram; it cannot see whether the tool behind that reply worked. Design doc
- * §6.3 (commit 9554da8): `failed_tool` beats `answered`, so an emitter blind to
- * tools must not write `answered` at all. The outcome vocabulary below simply
- * has no such value — a forwarded turn with a delivered reply is "reply
- * delivered, substantive outcome unknown", and the rollup says exactly that.
+ * **The relay never claims `answered`, and neither does this contract — on
+ * purpose, for anyone.** It sees whether a reply reached Telegram; it cannot
+ * see whether the tool behind that reply worked. Design doc §6.3 (commit
+ * 9554da8): `failed_tool` beats `answered`, so an emitter blind to tools must
+ * not write `answered` at all. `test/assistant-events-contract.test.ts` pins
+ * this with a literal string check ("there is no `answered` anywhere in the
+ * relay's vocabulary") that is NOT scoped to `source_service: "relay"` — it
+ * checks the shared `OUTCOMES` list itself, so the word stays banned even now
+ * that a second source (`hermes`, below) can see the tool it ran. The Hermes
+ * plugin's success outcome is named `grounded_answer` instead: narrower and
+ * more honest than "answered" would be (it names what was verified — real
+ * data came back — not a claim that the organizer's actual question was
+ * satisfied), and it lines up with `grounded_answer_rate`, one of the four
+ * rates `analytics/rates.ts` has carried as `not_measurable` since #326
+ * pending exactly this slice. A forwarded turn with a delivered reply is
+ * still "reply delivered, substantive outcome unknown" on the relay's own
+ * event; `tool_call_completed` is a DIFFERENT event, from a DIFFERENT
+ * source_service, about a fact only the assistant that ran the tool can see.
  */
 
 export const EVENT_TYPES = [
@@ -30,10 +43,11 @@ export const EVENT_TYPES = [
   "turn_lost",
   "reply_sent",
   "relay_tool_completed",
+  "tool_call_completed",
 ] as const;
 export type EventType = (typeof EVENT_TYPES)[number];
 
-export const SOURCE_SERVICES = ["relay"] as const;
+export const SOURCE_SERVICES = ["relay", "hermes"] as const;
 export type SourceService = (typeof SOURCE_SERVICES)[number];
 
 export const CHANNEL_TYPES = ["group", "organizer_dm", "other", "unclassified"] as const;
@@ -65,6 +79,7 @@ export const OUTCOMES = [
   "blocked_by_policy",
   "correction_proposed",
   "no_new_information",
+  "grounded_answer",
 ] as const;
 export type Outcome = (typeof OUTCOMES)[number];
 
@@ -144,6 +159,21 @@ export const EVENT_RULES: Record<EventType, { outcomes: readonly Outcome[]; requ
   relay_tool_completed: {
     outcomes: ["failed_tool", "blocked_by_policy", "correction_proposed", "no_new_information"],
     required: ["trip_id", "turn_id"],
+  },
+  // The assistant's own fact about one trip-mcp tool call (Hermes plugin,
+  // the `post_tool_call` hook — see .agents/hermes-plugins/assistant-events
+  // for why `api_request_error` is NOT a source here: it carries no
+  // `tool_name`/`result`, so it cannot be attributed to a specific tool
+  // call). No `turn_id`: that id is the relay's in-memory hand-off key,
+  // created and spent inside emitter.ts and never handed to the assistant,
+  // so Hermes has no turn to name — and none of the relay's inbound
+  // dimensions apply to a fact the relay never saw. `trip_id` alone,
+  // resolved server-side at the ingest route from the caller's Hermes
+  // profile (never a trip id in the request body — see hermes-ingest.ts),
+  // is what ties the row to a trip.
+  tool_call_completed: {
+    outcomes: ["grounded_answer", "failed_tool"],
+    required: ["trip_id"],
   },
 };
 
