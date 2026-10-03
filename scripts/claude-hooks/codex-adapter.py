@@ -12,13 +12,20 @@ import json
 import os
 from pathlib import Path
 import shutil
-import stat
 import subprocess
 import sys
 import time
 import unicodedata
 
 ROOT = Path(__file__).resolve().parents[2]
+# The directory-entry/inode canonicalization this and pretooluse-write.sh
+# share (#262, following this file's own #261) — import by path, not package,
+# since both routes copy these two files together as a pair (see the test
+# harness and .claude/settings.json: codex-adapter.py and pretooluse-write.sh
+# always sit side by side in scripts/claude-hooks/).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import path_canon  # noqa: E402
+
 POLICY_TIMEOUT = 20
 # What Codex 0.153.2's apply_patch trims from a header line before taking its
 # path: exactly Unicode White_Space (Rust str::trim), proven offline per code
@@ -144,71 +151,18 @@ def patch_paths(command: str) -> list[str]:
 def on_disk(path: Path) -> Path:
     """`path` (absolute, under ROOT) spelled the way the filesystem stores it.
 
-    On a case- or normalisation-insensitive filesystem `.PROJECT/sprint.json`
-    and `.project/<U+017F>print.json` open the existing `.project/sprint.json`, and
-    Path.resolve() keeps the spelling it was given. Each existing component is
-    replaced by the directory entry that is the same file; a component that
-    does not exist stays as written, because nothing can alias it.
+    See path_canon.on_disk — the routine #262 factored out of this file so
+    pretooluse-write.sh's own Write/Edit route (Claude's, not Codex's) shares
+    it instead of reimplementing it.
     """
-    current = ROOT
-    for part in path.relative_to(ROOT).parts:
-        try:
-            names = os.listdir(current)
-            wanted = os.lstat(current / part)
-        except OSError:
-            current = current / part
-            continue
-        if part not in names:
-            same = []
-            for name in names:
-                try:
-                    if os.path.samestat(os.lstat(current / name), wanted):
-                        same.append(name)
-                except OSError:
-                    pass
-            if len(same) != 1:
-                raise ValueError("Patch path spelling does not match one directory entry")
-            part = same[0]
-        current = current / part
-    return current
+    return path_canon.on_disk(ROOT, path)
 
 
 def checked_paths(value: str) -> list[str]:
-    path = Path(value)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    resolved = path.resolve()
-    lexical = Path(os.path.abspath(path))
-    try:
-        resolved.relative_to(ROOT)
-        lexical.relative_to(ROOT)
-    except ValueError:
-        raise ValueError("Patch path is outside this repository")
-    # Hard links do not resolve to their other names. Refuse multiply-linked
-    # regular files rather than scan an unbounded tree (or miss aliases outside
-    # it). stat follows symlinks, so an indirect hard link is refused as well.
-    try:
-        info = resolved.stat()
-    except FileNotFoundError:
-        pass  # A new file has no inode aliases yet.
-    else:
-        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
-            raise ValueError("Cannot safely authorize a multiply-linked file")
-    # The shared rules match one spelling, case-sensitively (trip/*,
-    # .project/sprint.json, CLAUDE.md). Check every spelling that can name
-    # the file: as written, its symlink destination, each as the disk spells
-    # it, and each case-folded (a protected directory that does not exist
-    # yet, or exists spelled differently). A spelling may only add a denial.
-    spellings = [lexical, resolved, on_disk(lexical), on_disk(resolved)]
-    spellings += [ROOT.joinpath(*(part.casefold() for part in p.relative_to(ROOT).parts))
-                  for p in spellings]
-    # casefold alone cannot reach the shared rule's uppercase CLAUDE.md.
-    # Reserve its root-level aliases on every filesystem, matching the existing
-    # conservative treatment of trip/ and .project/sprint.json. Nested names
-    # remain ordinary files, and the shared hook still decides based on role.
-    if any(p.relative_to(ROOT).parts == ("claude.md",) for p in spellings):
-        spellings.append(ROOT / "CLAUDE.md")
-    return list(dict.fromkeys(str(p) for p in spellings))
+    """Every spelling that can alias `value`, plus Codex's own refusals
+    (outside the repository, multiply hard-linked). See
+    path_canon.checked_paths — shared with pretooluse-write.sh (#262)."""
+    return path_canon.checked_paths(ROOT, value)
 
 
 def handle(mode: str, payload: dict) -> dict:

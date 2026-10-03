@@ -52,7 +52,7 @@ import { PendingAttachments } from "../src/relay/pending-attachments.js";
 import { applyDecision, settleDocumentCorrections, type TripBotPollerDeps } from "../src/relay/poller.js";
 import { makeUpgradeToken, type WireMessageEvent } from "../src/relay/protocol.js";
 import type { SendResult, TelegramClient } from "../src/relay/telegram-api.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -201,7 +201,7 @@ interface World {
 }
 
 async function withTrip(fn: (pool: pg.Pool, tripId: string) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

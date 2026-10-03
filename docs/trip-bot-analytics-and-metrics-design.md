@@ -1226,3 +1226,94 @@ Open items for later slices:
     to remove the restart limit in §16.5.
 14. **Splitting `other`** in `channel_type` (§16.3), once participants are
     linkable or a channel path exists.
+
+### 16.8 slice 2: rates and report (built 2026-09-30, issue #326)
+
+- **What is built** — `analytics/rates.ts`: `deriveRates(rollup: DayRollup)`
+  returns every rate the relay's facts alone can support — response rate,
+  unanswered rate, lost-turn rate, reply-latency p50/p95, group-addressed
+  share, document forwarded-and-replied rate, and relay-read outcomes (the
+  `relay_tool_completed` outcome distribution) — from a `DayRollup` and
+  nothing else: no re-query of `assistant_events`. `analytics/report.ts`:
+  `renderDailyReport(rollup)` renders the five sections
+  `control-plan-metrics.md`'s "Suggested Daily Control Plan Report" names
+  (Usage, Value Delivered, Information Quality, Learning and Enrichment,
+  Organizer Enablement) as one `DailyReport` object, plus a Markdown string
+  built from that same object so the two renderings cannot disagree.
+  `tools/assistant-report.ts` is a read-only CLI:
+  `--trip <id> --day YYYY-MM-DD [--tz]`, prints the Markdown.
+- **The four rates `control-plan-metrics.md` names that the relay cannot
+  support** — grounded-answer rate, missing-data rate, traveller self-service
+  rate, post-write trust rate — are `not_measurable`, with one shared reason
+  string, never `0` and never a fabricated number. They need an assistant-side
+  outcome event (verified-data answer, missing-data answer, a resolution with
+  no organizer escalation, a post-write verification) that no emitter in this
+  slice writes; §16.2 already says no such emitter exists yet.
+- **Granularity is the rollup's, not the report's wish.**
+  `DayRollup.by_channel_role` differentiates `not_addressed` / `forwarded` /
+  `to_relay` / `lost` per (channel, role) cell, so a lost-turn rate and an
+  addressed share are honestly computable at that grain, and `deriveRates`
+  reports them there (`by_channel_role`). Reply outcome (`turns`), reply
+  latency (`reply_latency_ms`) and a document's fate (`documents`) are folded
+  once per day with no channel/role tag on the row that produced them, so
+  response rate, unanswered rate, both latency percentiles, the document rate
+  and the relay-read outcome distribution are day-level only in this slice —
+  re-deriving a per-cell split the source rows do not carry would itself be a
+  fabricated number, the thing this whole slice exists to refuse. Rejected
+  alternative: changing `store.ts` to tag `turns`/`reply_latency_ms`/
+  `documents` by channel and role, so every rate could be cut the same way —
+  out of this slice's paths (`store.ts` is explicitly not owned here) and a
+  contract/rollup-shape decision, not a rates one.
+- **The percentile is nearest-rank**, over the day's `reply_latency_ms`
+  sorted ascending: `index = clamp(ceil(p/100 × n) − 1, 0, n−1)`. With `n=4`
+  and the replay fixture's `[8000, 12000, 30000, 45000]`, p50 is `12000` and
+  p95 is `45000` — the highest sample, which a 4-point day should read as
+  exactly what it is, an outlier standing in for a percentile it cannot really
+  resolve. No interpolation, because an interpolated millisecond between two
+  real replies is not a value anyone actually observed.
+- **`emptyDayRollup(tripId, localDay)`** (rates.ts) is the zero-count
+  `DayRollup` a trip/day with no rows gets, so `renderDailyReport` never
+  branches on "do I have a rollup" — every `Rate.value` comes out `null` by
+  the same arithmetic path (`denominator === 0`) an ordinary quiet day would
+  produce, rather than a separate "empty" code path that could drift from the
+  real one.
+- **`value: null`, never `0`, never `NaN`, for a zero denominator.** A `Rate`
+  is `{ value, numerator, denominator }`; a day with nothing to divide reports
+  `null` — the acceptance test's own words, "no divide-by-zero, no fabricated
+  rate." `renderDailyReport` reads `value === null` as "no data recorded" for
+  every rate-based line; count-based lines (e.g. "Inbound messages to the
+  bot") report a real `0` instead, because the relay DID observe that nothing
+  happened that day — an honest zero, not an absent measurement. "Unique
+  travelers who used it" is `no data recorded` regardless of traffic: §16.2
+  built no pseudonym, so there is no source for it at any volume.
+- **The KNOWN LIMIT is carried into the report text, not hidden.**
+  `rates.ts` exports `RELAY_RESTART_CAVEAT`, the same restart-forgets-
+  attribution caveat `rollupAssistantEvents`'s own doc comment carries
+  (§16.5); `deriveRates` attaches it to every day's `known_limits`
+  unconditionally, because the rollup itself never records whether a restart
+  happened that day — there is no signal to condition the caveat on, so it is
+  always shown rather than sometimes silently true. `renderDailyReport` puts
+  it in `notes`, and the CLI's Markdown always opens with it.
+- **No identifier reaches the report.** Every value is a count, a rate, or a
+  string from a closed vocabulary (`channel_type`, `requester_role`, a
+  `relay_tool_completed` outcome) — never free text, a chat id, a user id, or
+  a `turn_id` uuid. The one identifier that IS in the report on purpose is the
+  requested `trip_id`, once, in the header;
+  `test/assistant-events-report.test.ts` greps the rendered Markdown and the
+  serialized JSON for exactly that — no other `trip_*` value, no uuid shape,
+  no 9-plus-digit run (the shape of a Telegram chat/user id in this repo's own
+  fixtures).
+- **Fixtures reused, relay not re-run.** Both new test files use the exact
+  `DayRollup` values `test/assistant-events-replay.test.ts`'s
+  "the table alone reproduces the hand evaluation's counts" test already
+  asserts field-by-field — captured by running that test against
+  `cptest_t2rates` and reading its own `console.log('# rollup …')` line, not
+  hand-guessed. Re-running the full relay/gateway simulation a second time,
+  in a second file, to get the same rollup was rejected as duplication with no
+  benefit: `deriveRates` and `renderDailyReport` take a `DayRollup`, and the
+  replay test already proves that shape is what the relay really produces.
+- **Not built in this slice:** anything that reads `assistant_events` beyond
+  `rollupAssistantEvents` (out of paths); a runtime clock that calls any of
+  this in production — nothing does yet, the CLI is the only caller; the
+  dashboard that would render `DailyReport` for a person (§14's next slice,
+  explicitly out of these paths — nothing under `web/` changed).

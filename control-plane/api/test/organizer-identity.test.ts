@@ -2,7 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { namesSoundAlike, resolveOrganizer, rosterChoices, statedNameCandidates } from "../src/organizer-identity.js";
+import { namesSoundAlike, resolveOrganizer, rosterChoices, rosterChoicesFor, statedNameCandidates } from "../src/organizer-identity.js";
 
 // Shared with the worker's NameMatchingContractTests, so the interview and the
 // build cannot come to disagree about who the organizer is.
@@ -38,8 +38,19 @@ describe("organizer identity", () => {
     assert.deepEqual(result, { kind: "matched", index: 0, name: "Nir" });
   });
 
-  test("an ambiguous sound-alike is reported as ambiguous, never assigned", () => {
-    assert.deepEqual(resolveOrganizer("דנה", [{ name: "Dana" }, { name: "Dina" }]), { kind: "ambiguous" });
+  test("an ambiguous sound-alike is reported as ambiguous, never assigned — and carries which two it could be", () => {
+    assert.deepEqual(
+      resolveOrganizer("דנה", [{ name: "Dana" }, { name: "Dina" }]),
+      { kind: "ambiguous", candidates: [0, 1] },
+    );
+  });
+
+  test("the ambiguous roster positions turn into only those two buttons", () => {
+    const roster = [{ name: "Dana Levi" }, { name: "Dana Cohen" }, { name: "Omri Levi" }];
+    const match = resolveOrganizer("Dana", roster);
+    assert.equal(match.kind, "ambiguous");
+    const choices = match.kind === "ambiguous" ? rosterChoicesFor(roster, match.candidates) : [];
+    assert.deepEqual(choices.map((c) => c.value), ["Dana Levi", "Dana Cohen"]);
   });
 
   test("someone who is not on the roster is unmatched", () => {

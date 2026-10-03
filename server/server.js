@@ -446,6 +446,16 @@ try { db.exec('ALTER TABLE users ADD COLUMN google_email TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_picture TEXT'); } catch {}
 try { db.exec('ALTER TABLE users ADD COLUMN telegram_id TEXT'); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL'); } catch {}
+// #279: DELETE /api/agent/participants/:username revokes access (scrambles
+// the password, clears telegram_id) but never deletes the users row —
+// photos/bookings/ratings reference the username by text, so a hard delete
+// would orphan that history. Without a marker, that left nothing to stop a
+// later reset-password from handing the same row a fresh working password,
+// exactly as if the delete had never happened. NULL means "never removed";
+// set once, at delete time, and never cleared — removal is permanent short
+// of re-provisioning under a fresh username, not something this column is
+// meant to undo.
+try { db.exec('ALTER TABLE users ADD COLUMN removed_at TEXT'); } catch {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS phase_plan_items (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   phase_id     TEXT NOT NULL,
@@ -1127,6 +1137,11 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
     return res.status(403).json({ error: 'organizer_credential_not_agent_resettable' });
   }
 
+  // #279: this also already refuses to resurrect a removed username — DELETE
+  // never removes the row (see the removed_at column), so it still "exists"
+  // here and username_taken fires first. Confirmed by investigation, not
+  // changed: the actual live gap was reset-password, which checked only
+  // row-existence and is now gated on removed_at too.
   if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
     return res.status(409).json({ error: 'username_taken' });
   }
@@ -1169,8 +1184,21 @@ app.post('/api/agent/participants', organizerOrAgentRequired, async (req, res) =
 // user — the row already exists, only its password needs to change.
 app.post('/api/agent/participants/:username/reset-password', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
-  if (!db.prepare('SELECT 1 FROM users WHERE username = ?').get(uname)) {
+  const existing = db.prepare('SELECT removed_at FROM users WHERE username = ?').get(uname);
+  if (!existing) {
     return res.status(404).json({ error: 'user_not_found' });
+  }
+  // #279: DELETE /api/agent/participants/:username never removes the users
+  // row (see the removed_at ALTER TABLE comment) — it only scrambles the
+  // password and clears telegram_id. Without this check, this was the one
+  // live path back in: the row still "exists" for the check above, so
+  // reset-password would mint a fresh, fully working enrollment token for a
+  // participant the organizer explicitly removed. Checked before the
+  // organizer-takeover guard below on purpose — a removed username has no
+  // credential to protect from the agent key either way, and the more
+  // specific refusal is the more honest one.
+  if (existing.removed_at) {
+    return res.status(409).json({ error: 'participant_removed' });
   }
   // #184: the agent has no legitimate need to reset an organizer's own
   // credential, and letting it do so is a full account takeover — see
@@ -1248,11 +1276,15 @@ app.patch('/api/agent/participants/:username/telegram', organizerOrAgentRequired
 
 // Removes a participant from the trip: drops them from trip.config.json and
 // revokes DB-level access (clears telegram_id, replaces the password with a
-// fresh unusable random hash) rather than deleting the users row outright —
-// photos/bookings/ratings reference the username by text, and a hard delete
-// would orphan that history. Blocks removing a currently-configured
-// organizer; that's a deliberate, separate decision, not something that
-// should fall out of a generic remove call.
+// fresh unusable random hash, stamps removed_at) rather than deleting the
+// users row outright — photos/bookings/ratings reference the username by
+// text, and a hard delete would orphan that history. #279: removed_at is
+// what keeps that revocation real — reset-password (and nothing else reached
+// through the agent key, see its own comment) refuses once it is set, so the
+// row's continued existence can no longer be used to hand this username a
+// fresh working login. Blocks removing a currently-configured organizer;
+// that's a deliberate, separate decision, not something that should fall out
+// of a generic remove call.
 app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async (req, res) => {
   const uname = String(req.params.username).toLowerCase().trim();
   const idx = (TRIP_CONFIG.participants || []).findIndex(p => p.username === uname);
@@ -1266,7 +1298,10 @@ app.delete('/api/agent/participants/:username', organizerOrAgentRequired, async 
   persistConfigChange();
 
   const randomPasswordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
-  db.prepare('UPDATE users SET telegram_id = NULL, password = ? WHERE username = ?').run(randomPasswordHash, uname);
+  // #279: removed_at is what makes this revocation survive a later
+  // reset-password — see the ALTER TABLE comment above. Set unconditionally;
+  // there is no un-remove route, so this never needs to be cleared back.
+  db.prepare("UPDATE users SET telegram_id = NULL, password = ?, removed_at = datetime('now') WHERE username = ?").run(randomPasswordHash, uname);
 
   res.json({
     ok: true, username: uname,
@@ -2002,12 +2037,99 @@ app.post('/api/upload', authRequired, upload.array('files'), async (req, res) =>
 });
 
 // ── LOST & FOUND ──────────────────────────────────────────────────────────────
+// POST stays open with no login by owner decision (issue #207, 2026-09-27): a
+// finder is a stranger who reports what they found on the trip's website. A
+// stranger can reach the form, so a script can too — this section bounds and
+// rate-limits what an anonymous caller can write, without adding auth.
+
+// Field caps (trimmed lengths) — generous for a name/phone/short description,
+// tight enough that a script cannot use this form to stash arbitrary text.
+const LOST_FOUND_MAX_NAME = 80;
+const LOST_FOUND_MAX_PHONE = 32;
+const LOST_FOUND_MAX_ITEM = 200;
+const LOST_FOUND_MAX_LOCATION = 200;
+// Small cap on the whole request body — four short strings never need more
+// than a few hundred bytes; this catches an oversized payload before it is
+// even validated. Not a replacement for the global 30mb express.json()
+// limit (shared by every route), just a much tighter bound for this one.
+const LOST_FOUND_MAX_BODY_BYTES = 4096;
+
+// In-memory, per-address rate limit: 5 ACCEPTED writes per rolling hour.
+// Deliberately no dependency and no persistence — an abuse bound on a small
+// social feature, not a security control, so resetting on every restart is
+// fine. `address -> [timestamp, ...]` of accepted writes, oldest first.
+const LOST_FOUND_RATE_LIMIT = 5;
+const LOST_FOUND_RATE_WINDOW_MS = 60 * 60 * 1000;
+// Bounds the map itself: a flood of distinct addresses (not just repeats
+// from one) must not grow this without limit for the life of the process.
+const LOST_FOUND_MAX_TRACKED_ADDRESSES = 1000;
+const lostFoundWrites = new Map();
+
+function pruneLostFoundBucket(timestamps, now) {
+  while (timestamps.length && now - timestamps[0] >= LOST_FOUND_RATE_WINDOW_MS) timestamps.shift();
+  return timestamps;
+}
+
+// Drops any bucket whose writes have all aged out, then — only if the map is
+// still oversized (many distinct addresses, not just repeat offenders) —
+// evicts the oldest-inserted entries outright. Map preserves insertion
+// order, so this is a real "oldest first" eviction, not an arbitrary one.
+function evictLostFoundBuckets(now) {
+  for (const [address, timestamps] of lostFoundWrites) {
+    pruneLostFoundBucket(timestamps, now);
+    if (!timestamps.length) lostFoundWrites.delete(address);
+  }
+  while (lostFoundWrites.size > LOST_FOUND_MAX_TRACKED_ADDRESSES) {
+    lostFoundWrites.delete(lostFoundWrites.keys().next().value);
+  }
+}
+
 app.post('/api/lost-found', (req, res) => {
+  const now = Date.now();
+  evictLostFoundBuckets(now);
+
+  // No `trust proxy` is set anywhere in this server, and trip sites sit
+  // behind nginx/NPM in production — see the #207 handover for what that
+  // means for this address (every visitor to one trip's proxy shares a
+  // single req.ip today; fixing that is a separate, deployment-wide change).
+  const address = req.ip;
+  const bucket = pruneLostFoundBucket(lostFoundWrites.get(address) || [], now);
+  if (bucket.length >= LOST_FOUND_RATE_LIMIT) {
+    const retryAfterMs = LOST_FOUND_RATE_WINDOW_MS - (now - bucket[0]);
+    res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'rate_limited' });
+  }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (contentLength > LOST_FOUND_MAX_BODY_BYTES) {
+    return res.status(413).json({ error: 'body_too_large' });
+  }
+
   const { name, phone, item, location } = req.body || {};
-  if (!name?.trim() || !item?.trim()) return res.status(400).json({ error: 'name and item are required' });
+  if (typeof name !== 'string' || typeof item !== 'string') {
+    return res.status(400).json({ error: 'name and item are required' });
+  }
+  if (phone != null && typeof phone !== 'string') return res.status(400).json({ error: 'phone must be a string' });
+  if (location != null && typeof location !== 'string') return res.status(400).json({ error: 'location must be a string' });
+
+  const trimmedName = name.trim();
+  const trimmedItem = item.trim();
+  const trimmedPhone = (typeof phone === 'string' ? phone : '').trim();
+  const trimmedLocation = (typeof location === 'string' ? location : '').trim();
+
+  if (!trimmedName || !trimmedItem) return res.status(400).json({ error: 'name and item are required' });
+  if (trimmedName.length > LOST_FOUND_MAX_NAME) return res.status(400).json({ error: 'name too long' });
+  if (trimmedItem.length > LOST_FOUND_MAX_ITEM) return res.status(400).json({ error: 'item too long' });
+  if (trimmedPhone.length > LOST_FOUND_MAX_PHONE) return res.status(400).json({ error: 'phone too long' });
+  if (trimmedLocation.length > LOST_FOUND_MAX_LOCATION) return res.status(400).json({ error: 'location too long' });
+
   const result = db.prepare(
     "INSERT INTO lost_found (name, phone, item, location) VALUES (?,?,?,?)"
-  ).run(name.trim(), (phone || '').trim(), item.trim(), (location || '').trim());
+  ).run(trimmedName, trimmedPhone, trimmedItem, trimmedLocation);
+
+  bucket.push(now);
+  lostFoundWrites.set(address, bucket);
+
   res.json({ ok: true, id: result.lastInsertRowid });
 });
 

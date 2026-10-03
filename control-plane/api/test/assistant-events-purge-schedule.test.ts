@@ -21,7 +21,7 @@ import {
 } from "../src/analytics/purge-schedule.js";
 import { DEFAULT_RETENTION_DAYS, writeAssistantEvents } from "../src/analytics/store.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 interface FakeTimer {
   kind: "timeout" | "interval";
@@ -255,7 +255,7 @@ function event(tripId: string, occurredAt: string): AssistantEvent {
 
 describe("assistant-events purge schedule against Postgres", () => {
   test("the scheduled run deletes only events older than 90 days and touches no trip", { skip: SKIP }, async () => {
-    const pool = new pg.Pool({ connectionString: databaseUrl });
+    const pool = testPool();
     try {
       const client = await pool.connect();
       try {

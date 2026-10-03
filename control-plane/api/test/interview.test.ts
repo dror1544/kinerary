@@ -36,7 +36,7 @@ import {
 } from "../src/interview.js";
 import { readableDate } from "../src/intake-copy.js";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
@@ -600,7 +600,7 @@ describe("startSession (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -730,7 +730,7 @@ describe("getSession / submitAnswer / confirmIntake (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1885,7 +1885,7 @@ describe("the organizer is someone on the roster (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -1941,7 +1941,7 @@ describe("the organizer is someone on the roster (DB)", () => {
       assert.equal(answered.ok, true);
       if (!answered.ok) throw new Error("unreachable");
       assert.equal(await storedOrganizer(fix.pool, sessionId), "דנה", "kept as written, so asking again can quote it");
-      assert.equal(answered.view.unsettled?.organizer_identity, "דנה");
+      assert.equal(answered.view.unsettled?.organizer_identity?.text, "דנה");
       assert.equal(answered.view.nextQuestion?.id, "organizer_identity", "the question comes back");
       assert.deepEqual(answered.view.choices?.organizer_identity?.map((c) => c.value), ["Dana", "Dina"]);
 
@@ -1979,7 +1979,7 @@ describe("the organizer is someone on the roster (DB)", () => {
       const early = await submitAnswer(fix.pool, sessionToken, "organizer_identity", "ניר");
       assert.equal(early.ok, true);
       if (!early.ok) throw new Error("unreachable");
-      assert.equal(early.view.unsettled?.organizer_identity, "ניר", "no roster yet to name anyone from");
+      assert.equal(early.view.unsettled?.organizer_identity?.text, "ניר", "no roster yet to name anyone from");
 
       await submitAnswer(fix.pool, sessionToken, "travelers", null, undefined, undefined, [
         { name: "Nir", name_en: "Nir", age: 40 },
@@ -1997,7 +1997,7 @@ describe("the trip's dates are in order (DB)", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     await runMigrations(pool);
   });
 
@@ -2017,7 +2017,7 @@ describe("the trip's dates are in order (DB)", () => {
       const reversed = await submitAnswer(fix.pool, sessionToken, "departure_date", "2027-07-12");
       assert.equal(reversed.ok, true);
       if (!reversed.ok) throw new Error("unreachable");
-      assert.equal(reversed.view.unsettled?.return_date, "2027-07-01", "the departure arriving second re-opens the return");
+      assert.equal(reversed.view.unsettled?.return_date?.text, "2027-07-01", "the departure arriving second re-opens the return");
       assert.equal(reversed.view.nextQuestion?.id, "return_date");
 
       const refused = await confirmIntake(fix.pool, sessionToken);

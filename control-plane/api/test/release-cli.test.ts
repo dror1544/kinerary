@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const run = promisify(execFile);
 const DB_URL = testDatabaseUrl();
@@ -37,7 +37,7 @@ describe("release CLI", () => {
 
   before(async () => {
     if (SKIP) return;
-    pool = new pg.Pool({ connectionString: DB_URL, max: 3 });
+    pool = testPool({ max: 3 });
     const client = await pool.connect();
     try { await applyMigrations(client, migrationsDir); } finally { client.release(); }
   });

@@ -216,6 +216,12 @@ services:
       # (2026-09-11: at default effort the VM mapped answers to the wrong question).
       # Explicit here so this VM matches the Mac on purpose, not by inheritance.
       CLAUDE_CONFIG_DIR: /home/node/.claude-config
+      # #327: analytics/emitter.ts's own off-by-default switch. Empty default
+      # (never `:?`) on purpose — unset must stay OFF so shipping this image is
+      # never what starts recording a family's conversation (see emitter.ts's
+      # own doc comment, property 1). Turning it on anywhere real is a separate,
+      # deliberate step that still waits on retention and the family-notice work.
+      ASSISTANT_EVENTS_ENABLED: ${ASSISTANT_EVENTS_ENABLED:-}
     # CLAUDE_CODE_OAUTH_TOKEN, minted with `claude setup-token`; and
     # OPENROUTER_API_KEY — the same key Hermes holds, since an API key has no
     # rotating state (codex and anthropic OAuth are each logged into separately:

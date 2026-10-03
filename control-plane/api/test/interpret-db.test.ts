@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { applyMigrations } from "../src/migrations.js";
 import { issueEnrollment } from "../src/enrollment.js";
-import { startFromDeepLink } from "../src/chat-router.js";
+import { answerCallbackData, startFromDeepLink } from "../src/chat-router.js";
 import {
   INTAKE_QUESTIONS,
   answersForChat,
@@ -35,7 +35,9 @@ import {
   submitAnswerForChat,
   touchSessionDeadline,
 } from "../src/interview.js";
-import { flushSettledInboundBursts, OPTIONAL_OFFER_PROMPT } from "../src/relay/poller.js";
+import { applyDecision, flushSettledInboundBursts, OPTIONAL_OFFER_PROMPT } from "../src/relay/poller.js";
+import { dispatchUpdate } from "../src/relay/dispatch.js";
+import type { TelegramUpdate } from "../src/relay/normalize.js";
 import { uiString } from "../src/intake-copy.js";
 import {
   claimInterpretation,
@@ -49,7 +51,7 @@ import {
 } from "../src/interpret.js";
 import { buildApp } from "../src/app.js";
 import { validateArchitectureProfile } from "../src/config.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -96,7 +98,7 @@ async function seedInterview(pool: pg.Pool, chatId: string): Promise<Chat> {
 }
 
 async function withTwoInterviews(fn: (fix: { pool: pg.Pool; a: Chat; b: Chat }) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
@@ -500,12 +502,19 @@ async function say(
   text: string,
   telegram: Recorder,
   modelRunner: unknown = emptyRunner,
+  log: (line: string) => void = () => {},
 ) {
   seq += 1;
   await queueInboundMessage(pool, chatId, { text, message_id: `m${seq}` } as never);
+  // `log` ALSO goes on `deps`, exactly as `startTripBotPoller` wires it in
+  // production (relay/server.ts): `runInterpretPath` logs through the
+  // threaded parameter, but `sendNextStep`/`ask`/`restateExpectation` read
+  // `deps.log` — omitted here, those events logged nowhere and a test
+  // watching for them (dedupe, the restated fallback) saw a call that never
+  // happened rather than one that happened silently (#321).
   await flushSettledInboundBursts(
-    { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner } as never,
-    () => {},
+    { db: pool, telegram, connector: { pushInbound: () => true }, modelRunner, log } as never,
+    log,
     0,
   );
 }
@@ -889,6 +898,123 @@ describe("a reply that answers nothing", { skip: SKIP ? "no CONTROL_PLANE_TEST_D
         false,
         "the optional question is behind us, not offered again",
       );
+    });
+  });
+});
+
+/**
+ * #321: A REPEATED UNSETTLED ANSWER IS NEVER "DIDN'T FOLLOW".
+ *
+ * "Dana" against a roster holding two Danas is ambiguous — read and matched,
+ * just not to exactly one traveller. The first ask shows the ambiguous copy
+ * with only the two candidate buttons; the SAME typed "Dana" a second time
+ * hits `sendNextStep`'s ordinary dedupe (the prompt key has not changed), and
+ * before this fix `ask()`'s fallback restated it under "I didn't quite
+ * follow" — telling someone who had been read correctly that they had not
+ * been. `restateExpectation` now skips that lead when the question it is
+ * restating already carries an unsettled answer on record for it.
+ */
+function tap(chatId: string, data: string): TelegramUpdate {
+  return {
+    update_id: 2,
+    callback_query: {
+      id: "cbq_1",
+      data,
+      from: { id: 777 },
+      message: { message_id: 7, chat: { id: chatId, type: "private" } },
+    },
+  } as never;
+}
+
+describe("a repeated unsettled organizer answer is restated, never 'didn't follow' (#321)", { skip: SKIP ? "no CONTROL_PLANE_TEST_DATABASE_URL" : false }, () => {
+  /** Every required question except travelers and organizer_identity, answered with a placeholder. */
+  async function fillOtherRequired(pool: pg.Pool, chatId: string): Promise<void> {
+    for (const q of INTAKE_QUESTIONS.filter((x) => x.required && x.id !== "travelers" && x.id !== "organizer_identity")) {
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object($2::text, $3::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [chatId, q.id, JSON.stringify({ kind: "text", schema_version: 3, text: "x" })],
+      );
+    }
+  }
+
+  /** Echoes `text` back as the organizer_identity proposal — the ambiguous case still needs a model call, since `typedChoiceAnswer` refuses to guess between two travellers. */
+  function echoOrganizer(text: string) {
+    return {
+      async run<T>(req: { parse: (raw: unknown) => T | null }) {
+        const value = req.parse({
+          proposals: [{ questionId: "organizer_identity", value: { kind: "text", text }, confidence: 0.95, evidence: text }],
+          unclear: [],
+        });
+        return value
+          ? { ok: true as const, value, attempts: 1, ms: 0 }
+          : { ok: false as const, reason: "BAD_OUTPUT" as const, attempts: 1, ms: 0 };
+      },
+    };
+  }
+
+  test("typing the ambiguous name twice restates the ambiguous copy — then tapping settles it", async () => {
+    await withTwoInterviews(async ({ pool, a }) => {
+      await setInterpretPath(pool, a.chatId, true);
+      await fillOtherRequired(pool, a.chatId);
+      await pool.query(
+        `UPDATE control_plane.intake_sessions
+            SET answers = answers || jsonb_build_object('travelers', $2::jsonb)
+          WHERE telegram_chat_id = $1`,
+        [a.chatId, JSON.stringify({
+          kind: "structured", schema_version: 3,
+          data: [{ name: "Dana Levi" }, { name: "Dana Cohen" }],
+        })],
+      );
+
+      const telegram = new Recorder();
+      const runner = echoOrganizer("Dana");
+      let lines: string[] = [];
+      const log = (line: string) => lines.push(line);
+
+      // FIRST "Dana": new prompt key (nothing unsettled was on screen before),
+      // so the dedupe does not fire — the ambiguous copy goes out plainly.
+      await say(pool, a.chatId, "Dana", telegram, runner, log);
+      const first = telegram.sent.at(-1)!;
+      assert.match(first.text, /More than one traveller is called “Dana” — which one are you\?/);
+      assert.equal(first.buttons, 2, "only the two Danas, not the whole roster");
+      assert.ok(!first.text.includes(uiString("didNotFollow", "en")), "first ask never carried the lead to begin with");
+
+      // SECOND "Dana": identical text, identical unsettled state — the exact
+      // shape `sendNextStep`'s dedupe exists to catch — followed by ask()'s
+      // fallback, which is what this test is actually about.
+      lines = [];
+      await say(pool, a.chatId, "Dana", telegram, runner, log);
+
+      const dedupedIndex = lines.findIndex((l) => l.includes("trip_bot.prompt_deduped"));
+      const restatedIndex = lines.findIndex((l) => l.includes("trip_bot.expectation_restated"));
+      assert.ok(dedupedIndex >= 0, `expected trip_bot.prompt_deduped in: ${JSON.stringify(lines)}`);
+      assert.ok(restatedIndex >= 0, `expected trip_bot.expectation_restated in: ${JSON.stringify(lines)}`);
+      assert.ok(dedupedIndex < restatedIndex, "deduped first, then restated — the fallback this is testing");
+      assert.match(lines[restatedIndex]!, /"lead_skipped_for_unsettled_answer":true/);
+
+      const second = telegram.sent.at(-1)!;
+      assert.ok(
+        !second.text.includes(uiString("didNotFollow", "en")),
+        `a repeated answer was still followed — got: ${second.text}`,
+      );
+      assert.match(second.text, /More than one traveller is called “Dana” — which one are you\?/);
+      assert.equal(second.buttons, 2);
+
+      // TAPPING "Dana Levi" settles it — the roster's own spelling, from the
+      // buttons this exact ambiguous state offers.
+      const view = await getSessionForChat(pool, a.chatId);
+      assert.ok(view.ok);
+      const choice = view.ok ? view.view.choices?.organizer_identity?.find((c) => c.value === "Dana Levi") : undefined;
+      assert.ok(choice, "Dana Levi is one of the two offered buttons");
+
+      const decision = await dispatchUpdate(pool, tap(a.chatId, answerCallbackData("organizer_identity", choice!.id)));
+      await applyDecision(decision, { db: pool, telegram, connector: { pushInbound: () => true } } as never);
+
+      const store = await answersForChat(pool, a.chatId);
+      const settled = store?.answers.organizer_identity;
+      assert.equal(settled?.kind === "text" ? settled.text : undefined, "Dana Levi");
     });
   });
 });

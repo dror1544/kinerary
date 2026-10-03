@@ -33,7 +33,7 @@ import { dispatchUpdate } from "../src/relay/dispatch.js";
 import type { TelegramUpdate } from "../src/relay/normalize.js";
 import type { WireMessageEvent } from "../src/relay/protocol.js";
 import { applyDecision, settleDocumentCorrections, startTripBotPoller } from "../src/relay/poller.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -133,7 +133,7 @@ interface Trip {
 }
 
 async function withConfirmedTrip(fn: (trip: Trip) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");

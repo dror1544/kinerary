@@ -28,7 +28,7 @@ import { uiString } from "../src/intake-copy.js";
 import { CONFIRM_CALLBACK_DATA } from "../src/chat-router.js";
 import { applyDecision, flushSettledInboundBursts } from "../src/relay/poller.js";
 import { burstKey, claimInterpretation, setInterpretPath } from "../src/interpret.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -55,7 +55,7 @@ async function seedChat(pool: pg.Pool, chatId: string): Promise<Chat> {
 }
 
 async function withChats(fn: (pool: pg.Pool, a: Chat, b: Chat) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
@@ -629,6 +629,57 @@ describe("typed changes: saying it in words, and everything the router must not 
       assert.equal(model.calls.n, 1, "asked again, not resumed as 'the model said nothing'");
       assert.ok(tg.button("a"), "and the change is shown");
       assert.deepEqual(await draftStatuses(pool, a), ["pending"]);
+    });
+  });
+
+  // #205's own scenario, end to end through the real typed path: held phases =
+  // Tokyo, Hakone, Kyoto, Osaka; the organizer types a reading that names only
+  // Tokyo. Before PR #199/#206, the relay wrote `accepted.proposal.value` —
+  // whatever the model re-emitted, which by the interpreter prompt's own rule
+  // is only what changed — and the shared writer replaced the stored answer
+  // wholesale, so Hakone, Kyoto and Osaka were silently dropped. This drives
+  // `flushSettledInboundBursts` and `applyDecision` for real and reads
+  // `intake_sessions.answers` back, the same way `interpret-typed-merge-db.test.ts`
+  // does for the other structured lists.
+  test("#205: 'another three days at the end for Tokyo' keeps Hakone, Kyoto and Osaka", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "phases", [stop("Tokyo"), stop("Hakone"), stop("Kyoto"), stop("Osaka")]);
+      const tg = new Telegram();
+      const model = fakeModel(() => [
+        { op: "update_stop", target: { name: "Tokyo" }, fields: { start: "2026-09-30", end: "2026-10-03" } },
+      ]);
+      await say(pool, a, "another three days at the end for Tokyo, 30 September to 3 October", tg, model);
+      assert.deepEqual(
+        names(await stored(pool, a, "phases")),
+        ["Tokyo", "Hakone", "Kyoto", "Osaka"],
+        "nothing stored before confirmation",
+      );
+      const yes = tg.button("a");
+      assert.ok(yes, `a preview with a confirm button — sent: ${JSON.stringify(tg.last)}`);
+      await tap(pool, a, yes!.callback_data, tg, model);
+      const after = await stored(pool, a, "phases");
+      assert.deepEqual(names(after), ["Tokyo", "Hakone", "Kyoto", "Osaka"], "#205: Hakone, Kyoto and Osaka survive");
+      assert.deepEqual([after[0].start, after[0].end], ["2026-09-30", "2026-10-03"]);
+    });
+  });
+
+  test("#205: 'my mother is joining too' adds a traveller without dropping the rest of the roster", async () => {
+    await withChats(async (pool, a) => {
+      await hold(pool, a, "travelers", [{ name: "Dror Cohen" }, { name: "Ruth Cohen" }, { name: "Avi Cohen" }]);
+      const tg = new Telegram();
+      const model = fakeModel(() => [{ op: "add_traveller", fields: { name: "Mom Cohen" } }]);
+      await say(pool, a, "my mother is joining too", tg, model);
+      assert.deepEqual(
+        names(await stored(pool, a, "travelers")),
+        ["Dror Cohen", "Ruth Cohen", "Avi Cohen"],
+        "nothing stored before confirmation",
+      );
+      await tap(pool, a, tg.button("a")!.callback_data, tg, model);
+      assert.deepEqual(
+        names(await stored(pool, a, "travelers")).sort(),
+        ["Avi Cohen", "Dror Cohen", "Mom Cohen", "Ruth Cohen"],
+        "#205: the rest of the roster survives",
+      );
     });
   });
 });

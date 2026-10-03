@@ -31,7 +31,7 @@ import {
   PENDING_ATTACHMENTS_PER_SENDER,
   PendingAttachments,
 } from "../src/relay/pending-attachments.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -155,7 +155,7 @@ interface Fixture {
 }
 
 async function withGroupTrip(fn: (fix: Fixture) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
