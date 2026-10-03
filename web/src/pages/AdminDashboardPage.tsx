@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Brand } from "../components/Brand";
 import {
   AdminApiError,
@@ -12,6 +12,9 @@ import {
   getAdminJobs,
   getAdminReport,
   getAdminVersions,
+  resumeTrip,
+  retryTrip,
+  suspendTrip,
   type AdminAuditEvent,
   type AdminFailure,
   type AdminFunnelSummary,
@@ -21,14 +24,12 @@ import {
 } from "../admin-api";
 
 /**
- * Sprint 6 slice 1 (docs/sprint6-tracks.md decision 23): read-only. There is
- * no suspend/retry control on this page and none should be added here —
- * that is slice 2, and it needs its own server-side authorization, not a
- * button wired to nothing.
- *
- * Behind an operator key (X-API-Key), never the organizer's cookie session —
- * see admin-api.ts's module doc for why this is a separate client rather than
- * a reuse of api.ts.
+ * Sprint 6, docs/sprint6-tracks.md decision 23: slice 1's reads plus slice
+ * 2's suspend/retry mutations, both behind an operator key (X-API-Key),
+ * never the organizer's cookie session — see admin-api.ts's module doc for
+ * why this is a separate client rather than a reuse of api.ts, and for why
+ * that same header makes slice 2's mutations safe to add here without a
+ * separate CSRF story.
  */
 export default function AdminDashboardPage() {
   const [key, setKeyState] = useState(() => getStoredAdminKey());
@@ -108,13 +109,13 @@ export default function AdminDashboardPage() {
       <main className="dashboard-main">
         <div className="page-title">
           <div>
-            <p className="eyebrow">Read-only · every trip</p>
+            <p className="eyebrow">Every trip</p>
             <h1>Control-plane dashboard</h1>
           </div>
         </div>
         <ReportSection report={report} />
         <FunnelSection funnel={funnel} title="Funnel (all time)" />
-        <JobsSection jobs={jobs} />
+        <JobsSection jobs={jobs} adminKey={key} />
         <FailuresSection failures={failures} />
         <VersionsSection versions={versions} />
         <AuditSection audit={audit} />
@@ -207,7 +208,70 @@ function FunnelSection({ funnel, title }: { funnel: UseQueryResult<AdminFunnelSu
   );
 }
 
-function JobsSection({ jobs }: { jobs: UseQueryResult<{ jobs: AdminJob[] }, Error> }) {
+/**
+ * Slice 2 (docs/sprint6-tracks.md decision 23): retry/suspend/resume, one
+ * row's worth of controls per trip. Plain `useState`, not a `useMutation` —
+ * this page has no other mutation to share a pattern with yet, and three
+ * buttons each doing one POST do not need one.
+ *
+ * Suspend's reason — the mandatory, audited justification that is this
+ * mutation's authorization story beyond the shared key (admin-mutations.ts's
+ * module doc) — is collected with `window.prompt` rather than a new form:
+ * this is an internal operator tool, not a traveler-facing surface, and a
+ * modal for one required string would be a new UI pattern on this page for
+ * no benefit a prompt doesn't already give. A cancelled prompt sends nothing.
+ */
+function TripActions({ tripId, adminKey, onDone }: { tripId: string; adminKey: string; onDone: () => void }) {
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  async function run(label: string, action: () => Promise<unknown>) {
+    setPending(true);
+    setMessage(null);
+    try {
+      await action();
+      setMessage(`${label}: done.`);
+      onDone();
+    } catch (error) {
+      setMessage(`${label} failed: ${error instanceof AdminApiError ? error.message : "unexpected error"}`);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function onSuspend() {
+    const reason = window.prompt("Reason for suspending this trip (required, logged to the audit trail):");
+    if (reason === null) return; // cancelled — nothing sent
+    void run("Suspend", () => suspendTrip(adminKey, tripId, reason));
+  }
+
+  return (
+    <div className="trip-actions">
+      <button className="text-button" disabled={pending} onClick={() => void run("Retry", () => retryTrip(adminKey, tripId))}>
+        Retry
+      </button>
+      <button className="text-button" disabled={pending} onClick={onSuspend}>
+        Suspend
+      </button>
+      <button className="text-button" disabled={pending} onClick={() => void run("Resume", () => resumeTrip(adminKey, tripId))}>
+        Resume
+      </button>
+      {message && <p className="subtle">{message}</p>}
+    </div>
+  );
+}
+
+function JobsSection({ jobs, adminKey }: { jobs: UseQueryResult<{ jobs: AdminJob[] }, Error>; adminKey: string }) {
+  const queryClient = useQueryClient();
+  function refetchAfterMutation() {
+    // Slice 2's mutations change job/trip state that slice 1's reads surface
+    // elsewhere too (failures, the daily report's job counts) — invalidate
+    // all of them rather than only this section's own query.
+    void queryClient.invalidateQueries({ queryKey: ["admin-jobs"] });
+    void queryClient.invalidateQueries({ queryKey: ["admin-failures"] });
+    void queryClient.invalidateQueries({ queryKey: ["admin-report"] });
+    void queryClient.invalidateQueries({ queryKey: ["admin-audit"] });
+  }
   return (
     <section className="workflow-card">
       <h2>Jobs</h2>
@@ -215,12 +279,13 @@ function JobsSection({ jobs }: { jobs: UseQueryResult<{ jobs: AdminJob[] }, Erro
       {jobs.data && (jobs.data.jobs.length === 0
         ? <p>No jobs recorded yet.</p>
         : <table>
-            <thead><tr><th>Trip</th><th>Type</th><th>State</th><th>Attempt</th><th>Error</th><th>Updated</th></tr></thead>
+            <thead><tr><th>Trip</th><th>Type</th><th>State</th><th>Attempt</th><th>Error</th><th>Updated</th><th>Actions</th></tr></thead>
             <tbody>
               {jobs.data.jobs.map((job) => (
                 <tr key={job.id}>
                   <td>{job.tripSlug}</td><td>{job.jobType}</td><td>{job.state}</td><td>{job.attempt}</td>
                   <td>{job.safeErrorCode ?? "—"}</td><td>{job.updatedAt}</td>
+                  <td><TripActions tripId={job.tripId} adminKey={adminKey} onDone={refetchAfterMutation} /></td>
                 </tr>
               ))}
             </tbody>

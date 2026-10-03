@@ -1,16 +1,22 @@
-// The super-admin dashboard's client (Sprint 6 slice 1, docs/sprint6-tracks.md
-// decision 23). A separate file from api.ts, deliberately: api.ts's `api()`
+// The super-admin dashboard's client (Sprint 6, docs/sprint6-tracks.md
+// decision 23: slice 1's reads below, slice 2's suspend/retry mutations
+// after them). A separate file from api.ts, deliberately: api.ts's `api()`
 // sends the organizer's cookie session and a CSRF token, because it talks to
-// routes scoped to the caller's own trips. Every route here is read-only and
-// gated by a shared operator key (X-API-Key) instead — reusing `api()` would
-// either send a cookie these routes ignore, or tempt a future edit to add a
-// mutation through a helper that was never CSRF-protected for one.
+// routes scoped to the caller's own trips. Every route here — reads AND
+// slice 2's mutations alike — is gated by a shared operator key (X-API-Key)
+// instead, sent as an explicit header this file sets on every call. Reusing
+// `api()` would either send a cookie these routes ignore, or carry a CSRF
+// token these routes don't need: CSRF is an attack on AMBIENT credentials a
+// browser attaches on its own (a cookie); an explicit header only this
+// client code ever sets is not ambient, so a cross-site request cannot forge
+// it the way it could a cookie-authenticated POST. That is also why slice 2's
+// mutations could live here safely at all, rather than needing their own
+// CSRF story bolted on afterward.
 //
 // DESIGN CHOICE, not a spec: the key is kept in `sessionStorage`, not
 // `localStorage` — it does not outlive the tab — and never sent anywhere but
-// these six routes. There is no server-side admin session; entering the key
-// again after closing the tab is the deliberate cost of that simplicity for a
-// slice 1 read surface.
+// these routes. There is no server-side admin session; entering the key
+// again after closing the tab is the deliberate cost of that simplicity.
 
 const ADMIN_KEY_STORAGE = "kinerary-admin-key";
 
@@ -50,6 +56,27 @@ export class AdminApiError extends Error {
 
 async function adminApi<T>(key: string, path: string): Promise<T> {
   const response = await fetch(path, { headers: { "X-API-Key": key }, credentials: "same-origin" });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}) as Record<string, unknown>);
+    throw new AdminApiError(
+      typeof payload.error === "string" ? payload.error : "The request could not be completed.",
+      response.status,
+    );
+  }
+  return response.json() as Promise<T>;
+}
+
+// Slice 2 (suspend/retry, docs/sprint6-tracks.md decision 23): mutations,
+// not reads, but still gated by the same operator key over the same header —
+// there is no second credential here, see admin-mutations.ts's module doc
+// for why. POST with a JSON body, never a GET-with-side-effects.
+async function adminApiPost<T>(key: string, path: string, body?: Record<string, unknown>): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "X-API-Key": key, "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(body ?? {}),
+  });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}) as Record<string, unknown>);
     throw new AdminApiError(
@@ -130,3 +157,26 @@ export const getAdminJobs = (key: string) => adminApi<{ jobs: AdminJob[] }>(key,
 export const getAdminFailures = (key: string) => adminApi<{ failures: AdminFailure[] }>(key, "/v1/admin/failures");
 export const getAdminVersions = (key: string) => adminApi<{ releases: AdminRelease[] }>(key, "/v1/admin/versions");
 export const getAdminAudit = (key: string) => adminApi<{ events: AdminAuditEvent[] }>(key, "/v1/admin/audit");
+
+// ── Slice 2: suspend/retry mutations ────────────────────────────────────────
+//
+// Each call takes the trip id straight off a jobs-table row — this page has
+// no separate trip picker — and reports the server's own refusal reason
+// rather than guessing one client-side; app.ts's routes are the actual
+// authorization, this is just the transport.
+
+export type AdminRetryResult = { planId: string; planDigest: string; releaseId: string; jobId: string; supersededPlanId: string | null };
+export type AdminSuspendResult = { tripId: string; suspendedAt: string };
+export type AdminResumeResult = { tripId: string };
+
+export const retryTrip = (key: string, tripId: string) =>
+  adminApiPost<AdminRetryResult>(key, `/v1/admin/trips/${encodeURIComponent(tripId)}/retry`);
+
+// `reason` is required server-side (app.ts: REASON_REQUIRED/REASON_TOO_LONG/
+// REASON_INVALID on a 400) — the mandatory, audited justification that is
+// this mutation's authorization story beyond the shared key.
+export const suspendTrip = (key: string, tripId: string, reason: string) =>
+  adminApiPost<AdminSuspendResult>(key, `/v1/admin/trips/${encodeURIComponent(tripId)}/suspend`, { reason });
+
+export const resumeTrip = (key: string, tripId: string) =>
+  adminApiPost<AdminResumeResult>(key, `/v1/admin/trips/${encodeURIComponent(tripId)}/resume`);

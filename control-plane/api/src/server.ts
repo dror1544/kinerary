@@ -160,10 +160,12 @@ if (operatorKey) {
   };
 }
 
-// The super-admin dashboard's read-only routes (Sprint 6 slice 1, decision 23
-// in docs/sprint6-tracks.md). A key distinct from the operator's, on the same
-// reasoning `AdminDependencies` states: reading across every trip at once is
-// a different kind of power from minting one invitation, and sharing a
+// The super-admin dashboard's routes (Sprint 6 slice 1 + slice 2, decision 23
+// in docs/sprint6-tracks.md): read across every trip at once, and mutate
+// (retry/suspend/resume) any one of them. One key gates both — see
+// `AdminDependencies`'s own comment for why. A key distinct from the
+// operator's, on the same reasoning `AdminDependencies` states: this is a
+// different kind of power from minting one invitation, and sharing a
 // credential between them would make a leak of either a leak of both.
 // Absent, like every optional block here, means no `/v1/admin/*` route
 // mounts at all.

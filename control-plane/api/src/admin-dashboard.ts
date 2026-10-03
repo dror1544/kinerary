@@ -1,7 +1,17 @@
 // Read-only queries behind the super-admin dashboard's slice 1 (Sprint 6,
-// decision 23 in docs/sprint6-tracks.md). This module never mutates state —
-// suspend/retry is slice 2, explicitly out of scope here — and every function
-// takes a pool and returns plain data for app.ts's routes to serve.
+// decision 23 in docs/sprint6-tracks.md). This module itself never mutates
+// state — slice 2's suspend/retry mutations live in admin-mutations.ts, kept
+// separate precisely so this sentence stays true without a reader having to
+// re-check every function — and every function here takes a pool and returns
+// plain data for app.ts's routes to serve.
+//
+// `EVIDENCE_ALLOWLIST` below is shared with admin-mutations.ts: that file
+// writes `audit_events` rows for the three mutation actions listed in it
+// (`admin.retry_trip`, `admin.suspend_trip`, `admin.resume_trip`), and
+// `listAuditEvents`'s `/v1/admin/audit` route is what reads any of them back
+// — so a mutation action needs an entry here for its evidence to be visible
+// at all, on the same "a field not named is withheld, not exposed" rule as
+// every other action in the map.
 //
 // This file reads across every trip, on purpose: that is the one thing no
 // other authenticated route in this codebase does (everything else is scoped
@@ -163,6 +173,20 @@ const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   ["admin.read.failures", []],
   ["admin.read.audit", []],
   ["admin.read.report", []],
+  // Slice 2 mutations (admin-mutations.ts). `ok` is always a boolean; the
+  // rest are opaque ids this codebase generates itself (retryProvision's own
+  // plan/job/release ids) or a closed reason enum (RetryProvisionResult's own
+  // `reason` union / SuspendTripResult's) — never traveler, organizer, or
+  // even operator free text. The operator's suspend `reason` is deliberately
+  // NOT in this list — see admin-mutations.ts's module doc for why it is
+  // withheld from evidence on purpose, not an omission to fix later.
+  ["admin.retry_trip", ["ok", "jobId", "planId", "releaseId", "supersededPlanId", "reason"]],
+  // #review 2026-10-03, finding 5: a refusal is audited now too (admin-
+  // mutations.ts), carrying SuspendTripResult's/ResumeTripResult's own
+  // closed `reason` enum (TRIP_NOT_FOUND / ALREADY_SUSPENDED / NOT_SUSPENDED)
+  // — same posture as admin.retry_trip's `reason` above, never free text.
+  ["admin.suspend_trip", ["ok", "reason"]],
+  ["admin.resume_trip", ["ok", "reason"]],
 ]);
 
 function projectEvidence(action: string, evidence: unknown): unknown {

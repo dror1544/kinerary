@@ -19,7 +19,7 @@ function renderPage() {
   );
 }
 
-function stubFetch(handler: (url: string) => Response) {
+function stubFetch(handler: (url: string, init?: RequestInit) => Response) {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     // Every call to an admin route must carry the key; a call missing it is a bug in the page itself.
@@ -27,7 +27,7 @@ function stubFetch(handler: (url: string) => Response) {
       const headers = new Headers(init?.headers);
       if (!headers.get("x-api-key")) return new Response(JSON.stringify({ error: "AUTHENTICATION_REQUIRED" }), { status: 401 });
     }
-    return handler(url);
+    return handler(url, init);
   }));
 }
 
@@ -71,9 +71,9 @@ describe("the super-admin dashboard page", () => {
     expect(await screen.findByText(/no audit events recorded/i)).toBeInTheDocument();
     // The five rates this slice deliberately does not compute are named, not silently absent.
     expect(screen.getByText(/response rate/i)).toBeInTheDocument();
-    // Never a mutation control: this is read-only, slice 1.
-    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /suspend/i })).not.toBeInTheDocument();
+    // No jobs recorded means no per-trip action row either — nothing to retry/suspend yet.
+    expect(screen.queryByRole("button", { name: /^retry$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^suspend$/i })).not.toBeInTheDocument();
   });
 
   it("renders the seeded rows from each route", async () => {
@@ -94,6 +94,80 @@ describe("the super-admin dashboard page", () => {
     expect(screen.getByText("BUILD_FAILED")).toBeInTheDocument();
     expect(screen.getByText("release_1")).toBeInTheDocument();
     expect(screen.getByText("operator:dror")).toBeInTheDocument();
+  });
+
+  function jobsWithOneRow() {
+    return (url: string, init?: RequestInit) => {
+      if (url === "/v1/admin/report") return json(EMPTY_REPORT);
+      if (url === "/v1/admin/funnel") return json(EMPTY_FUNNEL);
+      if (url === "/v1/admin/jobs") return json({ jobs: [{ id: "job_1", tripId: "trip_1", tripSlug: "rome-2026", jobType: "provision", state: "failed", attempt: 1, safeErrorCode: "BUILD_FAILED", createdAt: "2026-09-27T00:00:00.000Z", updatedAt: "2026-09-27T00:05:00.000Z" }] });
+      if (url === "/v1/admin/failures") return json({ failures: [] });
+      if (url === "/v1/admin/versions") return json({ releases: [] });
+      if (url === "/v1/admin/audit") return json({ events: [] });
+      if (url === "/v1/admin/trips/trip_1/retry" && init?.method === "POST") {
+        return json({ planId: "plan_1", planDigest: "sha256:aa", releaseId: "rls_1", jobId: "job_2", supersededPlanId: null }, 201);
+      }
+      if (url === "/v1/admin/trips/trip_1/suspend" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        if (typeof body.reason !== "string" || body.reason.length === 0) return json({ error: "REASON_REQUIRED" }, 400);
+        return json({ tripId: "trip_1", suspendedAt: "2026-09-27T00:10:00.000Z" });
+      }
+      if (url === "/v1/admin/trips/trip_1/resume" && init?.method === "POST") {
+        return json({ tripId: "trip_1" });
+      }
+      return json({ error: "NOT_FOUND" }, 404);
+    };
+  }
+
+  async function unlockWithOneJobRow() {
+    stubFetch(jobsWithOneRow());
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "a-real-admin-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    expect(await screen.findByText("rome-2026")).toBeInTheDocument();
+  }
+
+  it("retries a trip from its job row and reports success", async () => {
+    await unlockWithOneJobRow();
+    fireEvent.click(screen.getByRole("button", { name: /^retry$/i }));
+    expect(await screen.findByText(/retry: done/i)).toBeInTheDocument();
+  });
+
+  it("suspends a trip with a prompted reason, and sends exactly that reason", async () => {
+    await unlockWithOneJobRow();
+    vi.stubGlobal("prompt", vi.fn(() => "pausing to fix a transformer bug"));
+    fireEvent.click(screen.getByRole("button", { name: /^suspend$/i }));
+    expect(await screen.findByText(/suspend: done/i)).toBeInTheDocument();
+  });
+
+  it("sends nothing when the suspend prompt is cancelled", async () => {
+    const calls: string[] = [];
+    stubFetch((url, init) => {
+      if (url.includes("/suspend")) calls.push(url);
+      return jobsWithOneRow()(url, init);
+    });
+    renderPage();
+    fireEvent.change(screen.getByLabelText(/admin key/i), { target: { value: "a-real-admin-key" } });
+    fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    await screen.findByText("rome-2026");
+
+    vi.stubGlobal("prompt", vi.fn(() => null));
+    fireEvent.click(screen.getByRole("button", { name: /^suspend$/i }));
+    await Promise.resolve();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("surfaces the server's refusal reason rather than a generic error", async () => {
+    await unlockWithOneJobRow();
+    vi.stubGlobal("prompt", vi.fn(() => ""));
+    fireEvent.click(screen.getByRole("button", { name: /^suspend$/i }));
+    expect(await screen.findByText(/suspend failed: REASON_REQUIRED/i)).toBeInTheDocument();
+  });
+
+  it("resumes a trip from its job row and reports success", async () => {
+    await unlockWithOneJobRow();
+    fireEvent.click(screen.getByRole("button", { name: /^resume$/i }));
+    expect(await screen.findByText(/resume: done/i)).toBeInTheDocument();
   });
 
   it("drops a rejected key and returns to the unlock form", async () => {
