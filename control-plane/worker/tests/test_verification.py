@@ -78,6 +78,62 @@ class EvidenceDigestTests(unittest.TestCase):
         self.assertNotEqual(verification.evidence_digest("x"), verification.evidence_digest("y"))
 
 
+class RetryingTests(unittest.TestCase):
+    """#review 2026-10-03: found live — a hard gate probing a freshly
+    deployed site the instant deploy() returns, with no grace period, can
+    mistake ordinary DNS/NPM/Cloudflare propagation lag for a broken
+    deployment. These test `_retrying` in isolation, with a fake sleep that
+    never actually sleeps — the real `time.sleep` default is for production,
+    not tests."""
+
+    def test_a_passing_result_on_the_first_try_never_retries_or_sleeps(self) -> None:
+        calls = []
+        sleeps = []
+        def check() -> verification.CheckResult:
+            calls.append(1)
+            return verification.CheckResult("x", "passed", "ok")
+        result = verification._retrying(check, attempts=5, delay_s=10.0, sleep=sleeps.append)
+        self.assertEqual(result.outcome, "passed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_a_skipped_result_never_retries_either(self) -> None:
+        calls = []
+        def check() -> verification.CheckResult:
+            calls.append(1)
+            return verification.CheckResult("x", "skipped", "no reason to ask")
+        result = verification._retrying(check, attempts=5, delay_s=10.0, sleep=lambda s: None)
+        self.assertEqual(result.outcome, "skipped")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failure_that_recovers_on_a_later_attempt_passes(self) -> None:
+        outcomes = iter(["failed", "failed", "passed"])
+        sleeps = []
+        def check() -> verification.CheckResult:
+            return verification.CheckResult("x", next(outcomes), "evidence")
+        result = verification._retrying(check, attempts=5, delay_s=7.5, sleep=sleeps.append)
+        self.assertEqual(result.outcome, "passed")
+        self.assertEqual(sleeps, [7.5, 7.5], "slept once before each retry, not before the first or last call")
+
+    def test_a_failure_that_never_recovers_is_reported_as_failed_after_the_full_budget(self) -> None:
+        calls = []
+        def check() -> verification.CheckResult:
+            calls.append(1)
+            return verification.CheckResult("x", "failed", f"attempt {len(calls)}")
+        result = verification._retrying(check, attempts=4, delay_s=1.0, sleep=lambda s: None)
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(len(calls), 4, "exactly the requested number of attempts, no more")
+
+    def test_attempts_1_is_the_old_unretried_behavior(self) -> None:
+        calls = []
+        def check() -> verification.CheckResult:
+            calls.append(1)
+            return verification.CheckResult("x", "failed", "nope")
+        result = verification._retrying(check)  # every default
+        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(len(calls), 1)
+
+
 class RuntimeHealthCheckTests(unittest.TestCase):
     def test_passes_on_ok_true(self) -> None:
         get = FakeGet()
@@ -480,6 +536,53 @@ class GateReadyPrivateTests(unittest.TestCase):
         self.assertEqual(outcomes[verification.MESSAGING_BINDING], "skipped")
         self.assertEqual(outcomes[verification.BACKUP_CHECKPOINT], "skipped")
 
+    def test_retries_a_site_that_becomes_healthy_partway_through_the_budget(self) -> None:
+        """#review 2026-10-03: found live — a freshly deployed, genuinely
+        healthy trip can fail runtime_health/rendered_data on nothing but
+        ordinary external DNS/NPM/Cloudflare propagation lag if probed the
+        instant deploy() returns. This simulates exactly that: unhealthy for
+        the first two attempts, healthy on the third — the gate must pass,
+        not fail, and must record the FINAL (passing) evidence."""
+        # health_calls counts ONLY /api/health calls — the roster call
+        # check_rendered_data also makes through the same `get` shares no
+        # state with this, and always succeeds immediately, so it must not
+        # perturb the count this test's math depends on.
+        health_calls = {"n": 0}
+        def get(url: str) -> tuple[int, str]:
+            if url.endswith("/api/health"):
+                health_calls["n"] += 1
+                # Unhealthy for the first two attempts, healthy on the third.
+                return (200, '{"ok": true}') if health_calls["n"] >= 3 else (503, '{"ok": false}')
+            return 200, json.dumps({"participants": [{"username": "a"}]})
+        sleeps: list[float] = []
+        verification.gate_ready_private(
+            self.conn, trip_id=self.fix["trip_id"], deployment_ref="rev1",
+            plan_desired={"release_id": self.fix["release_id"]},
+            private_url="https://trip.example", http_get=get,
+            retry_attempts=4, retry_delay_s=2.0, sleep=sleeps.append,
+        )
+        self.assertEqual(health_calls["n"], 3, "stopped retrying the instant it passed, not exhausting all 4 attempts")
+        self.assertEqual(sleeps, [2.0, 2.0], "slept once before each retry, never after the attempt that finally passed")
+        rows = self.conn.execute(
+            "SELECT outcome FROM control_plane.verification_evidence "
+            "WHERE trip_id = %s AND check_name = %s",
+            (self.fix["trip_id"], verification.RUNTIME_HEALTH),
+        ).fetchall()
+        self.assertEqual([r["outcome"] for r in rows], ["passed"], "the recorded evidence is the final, passing attempt")
+
+    def test_still_fails_when_the_site_never_recovers_within_the_retry_budget(self) -> None:
+        get = self._get(health_ok=False)
+        sleeps: list[float] = []
+        with self.assertRaises(verification.VerificationFailed):
+            verification.gate_ready_private(
+                self.conn, trip_id=self.fix["trip_id"], deployment_ref="rev1",
+                plan_desired={"release_id": self.fix["release_id"]},
+                private_url="https://trip.example", http_get=get,
+                retry_attempts=3, retry_delay_s=1.0, sleep=sleeps.append,
+            )
+        self.assertEqual(sleeps, [1.0, 1.0], "a hard gate that never recovers still fails, after the full budget")
+        self.assertEqual(len([c for c in get.calls if c.endswith("/api/health")]), 3)
+
     def test_raises_and_still_records_evidence_when_release_is_deprecated(self) -> None:
         with self.conn.transaction():
             self.conn.execute(
@@ -625,8 +728,15 @@ class ProvisionerVerificationIntegrationTests(unittest.TestCase):
         )
         self.conn.commit()
 
+        # verification_retry_attempts=1: this test is about the gate
+        # blocking ready_private on a genuinely unhealthy site, not about
+        # the retry budget itself (RetryingTests and
+        # GateReadyPrivateTests.test_still_fails_when_the_site_never_recovers
+        # cover that directly) — without this override it would wait
+        # through the real ~60s production retry budget for real.
         worker = ProvisionerWorker(
             db_url=DB_URL, deploy=FakeDeployAdapter(health_ok=False), worker_id="test-verify-unhealthy",
+            verification_retry_attempts=1,
         )
         worker.run_once()
 
@@ -647,8 +757,10 @@ class ProvisionerVerificationIntegrationTests(unittest.TestCase):
         )
         self.conn.commit()
 
+        # Same reasoning as test_an_unhealthy_site_blocks_ready_private above.
         worker = ProvisionerWorker(
             db_url=DB_URL, deploy=FakeDeployAdapter(roster_participants=[]), worker_id="test-verify-empty",
+            verification_retry_attempts=1,
         )
         worker.run_once()
 

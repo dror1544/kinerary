@@ -64,6 +64,15 @@ DRAFT_SLUG_PREFIX = "draft-"
 # Bounded so a pathological base cannot spin the worker.
 SLUG_COLLISION_LIMIT = 100
 
+# #review 2026-10-03: found live — gate_ready_private's runtime_health/
+# rendered_data probes used to run the instant deploy() returned, with no
+# grace period for ordinary DNS/NPM/Cloudflare propagation lag behind a
+# freshly deployed, genuinely-healthy trip. Up to a minute of retrying
+# before a hard-gate failure is accepted as real; see verification.py's
+# `_retrying` for why only these two checks get this at all.
+VERIFICATION_RETRY_ATTEMPTS = 6
+VERIFICATION_RETRY_DELAY_S = 10.0
+
 
 class DeployAdapter(Protocol):
     """Deploys a trip config and returns the private URL."""
@@ -1054,6 +1063,9 @@ class ProvisionerWorker:
         seed_password: str | None = None,
         document_store_dir: str | None = None,
         verification_http_get: "verification.HttpGetFn | None" = None,
+        verification_retry_attempts: int | None = None,
+        verification_retry_delay_s: float | None = None,
+        verification_sleep: "verification.SleepFn | None" = None,
     ) -> None:
         self._db_url = db_url
         # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
@@ -1096,6 +1108,20 @@ class ProvisionerWorker:
         self._verification_http_get = (
             verification_http_get or getattr(deploy, "http_get", None) or verification.default_http_get
         )
+        # #review 2026-10-03: injectable for the same reason verification_http_get
+        # is — a FakeDeployAdapter's http_get answers instantly, in-memory, so a
+        # test deliberately simulating an unhealthy site must not ALSO wait
+        # through the real production retry budget (up to a minute of real
+        # time.sleep) to prove the gate still fails. Defaults are the real
+        # values; every existing test that does not override these keeps its
+        # old, fast, unretried behavior.
+        self._verification_retry_attempts = (
+            verification_retry_attempts if verification_retry_attempts is not None else VERIFICATION_RETRY_ATTEMPTS
+        )
+        self._verification_retry_delay_s = (
+            verification_retry_delay_s if verification_retry_delay_s is not None else VERIFICATION_RETRY_DELAY_S
+        )
+        self._verification_sleep = verification_sleep or time.sleep
 
     # ── public API ──────────────────────────────────────────────────────────────
 
@@ -1275,6 +1301,9 @@ class ProvisionerWorker:
                 expected_usernames=expected_usernames,
                 expected_departure=meta.get("departure"),
                 expected_return_date=meta.get("returnDate"),
+                retry_attempts=self._verification_retry_attempts,
+                retry_delay_s=self._verification_retry_delay_s,
+                sleep=self._verification_sleep,
             )
 
             # Commit success.

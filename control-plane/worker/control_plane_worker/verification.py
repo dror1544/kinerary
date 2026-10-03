@@ -58,6 +58,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 from typing import AbstractSet, Any, Callable, Mapping, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -127,6 +128,39 @@ def default_http_get(url: str, timeout: float = 10.0) -> "tuple[int, str]":
             return response.status, response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
         return exc.code, (exc.read() or b"").decode("utf-8", errors="replace")
+
+
+#: (seconds) -> None. Injectable for the same reason `HttpGetFn` is: a test
+#: retrying a deliberately-failing check must never actually sleep.
+SleepFn = Callable[[float], None]
+
+
+def _retrying(
+    check: Callable[[], CheckResult], *, attempts: int = 1, delay_s: float = 0.0, sleep: SleepFn = time.sleep,
+) -> CheckResult:
+    """Found live 2026-10-03: `gate_ready_private` used to probe
+    `runtime_health`/`rendered_data` the INSTANT `_deploy.deploy()` returned,
+    with no grace period at all. `deploy.sh` has its own internal health
+    check and only returns once THAT passes, but it reaches the site by a
+    more direct path than this module's external `https://<hostname>/...`
+    probe does (through the real Cloudflare/NPM/DNS chain) — so a freshly
+    deployed, genuinely-healthy trip can still fail this gate on nothing but
+    ordinary external propagation lag, which a hard gate must not mistake
+    for a broken deployment. `attempts=1` (the default, all the way up
+    through `run_pre_ready_private_checks` and `gate_ready_private`) is
+    exactly the old, unretried behavior — every existing caller and test is
+    unaffected unless it explicitly asks for more; only `provisioner.py`'s
+    own production call site passes real values, opting into retrying for
+    real. Retries ONLY a `failed` outcome; `passed` and `skipped` return on
+    the first call, always.
+    """
+    result = check()
+    for _ in range(max(0, attempts - 1)):
+        if result.outcome != "failed":
+            return result
+        sleep(delay_s)
+        result = check()
+    return result
 
 
 # ── Individual checks — each pure enough to unit-test with a fake conn/get ──
@@ -340,14 +374,27 @@ def run_pre_ready_private_checks(
     expected_usernames: AbstractSet[str] = frozenset(),
     expected_departure: str | None = None,
     expected_return_date: str | None = None,
+    retry_attempts: int = 1,
+    retry_delay_s: float = 0.0,
+    sleep: SleepFn = time.sleep,
 ) -> list[CheckResult]:
     """All six, in the shape they can honestly be evaluated in BEFORE
     `_attach_companion` has run. See the module docstring for why the last
-    three are not real checks at this point."""
+    three are not real checks at this point.
+
+    `retry_attempts`/`retry_delay_s` apply only to the two HTTP-backed hard
+    gates (`runtime_health`, `rendered_data`) — see `_retrying`'s own
+    docstring for why. The default (1 attempt) is the old, unretried
+    behavior; `gate_ready_private`'s own production default is what
+    actually opts into retrying.
+    """
     return [
         check_release_compatibility(conn, plan_desired),
-        check_runtime_health(http_get, private_url),
-        check_rendered_data(http_get, private_url, expected_usernames, expected_departure, expected_return_date),
+        _retrying(lambda: check_runtime_health(http_get, private_url), attempts=retry_attempts, delay_s=retry_delay_s, sleep=sleep),
+        _retrying(
+            lambda: check_rendered_data(http_get, private_url, expected_usernames, expected_departure, expected_return_date),
+            attempts=retry_attempts, delay_s=retry_delay_s, sleep=sleep,
+        ),
         CheckResult(
             MCP_ISOLATION, "skipped",
             "not attempted yet: the companion/bridge wiring step (_attach_companion) "
@@ -410,17 +457,28 @@ def gate_ready_private(
     expected_usernames: AbstractSet[str] = frozenset(),
     expected_departure: str | None = None,
     expected_return_date: str | None = None,
+    retry_attempts: int = 1,
+    retry_delay_s: float = 0.0,
+    sleep: SleepFn = time.sleep,
 ) -> list[CheckResult]:
     """Runs all six checks, records evidence for all six (always — a hard-gate
     failure is recorded before it is ever raised, so the evidence survives
     the job failing), then raises `VerificationFailed` if any HARD_GATE_CHECKS
     entry did not come back `passed` — including one that is missing from the
-    results entirely, which is a bug in this module, not a pass."""
+    results entirely, which is a bug in this module, not a pass.
+
+    `retry_attempts`/`retry_delay_s` default to no retry, same as
+    `run_pre_ready_private_checks` — every existing caller and test is
+    unaffected unless it asks for more. `provisioner.py`'s own production
+    call site is the one place that passes real values; see `_retrying`'s
+    docstring for why a hard gate needs this at all.
+    """
     get = http_get or default_http_get
     results = run_pre_ready_private_checks(
         conn, plan_desired=plan_desired, private_url=private_url, http_get=get,
         expected_usernames=expected_usernames,
         expected_departure=expected_departure, expected_return_date=expected_return_date,
+        retry_attempts=retry_attempts, retry_delay_s=retry_delay_s, sleep=sleep,
     )
     record_evidence(conn, trip_id=trip_id, deployment_ref=deployment_ref, results=results)
 
