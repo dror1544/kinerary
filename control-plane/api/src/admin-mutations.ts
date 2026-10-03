@@ -60,6 +60,7 @@
 // opaque-only; the reason lives in its own bounded, DB-CHECKed column.
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
+import { issueApproval } from "./plan-approval.js";
 import { retryProvision, type RetryProvisionResult } from "./planner.js";
 
 function generateId(prefix: string): string {
@@ -163,14 +164,32 @@ async function recordAdminMutation(
  * Re-runs provisioning for an arbitrary trip on the admin's behalf. A thin
  * wrapper over `retryProvision` (planner.ts) — see this module's header for
  * why that is the whole mechanism rather than a reimplementation — that adds
- * exactly one thing: an audit row, best-effort, after the call returns.
- * Best-effort (not inside `retryProvision`'s own transactions) because
- * `retryProvision` already spans two connections by design (its own comment:
- * a fresh connection for the `generatePlan` half) and wrapping a
- * cross-connection operation in a third transaction here would not make it
- * more atomic, only harder to read. A failure to write the audit row must
- * never be reported back as if the retry itself failed — the retry already
- * happened by the time this file can act on it.
+ * two things: issuing the approval `retryProvision` alone leaves pending, and
+ * an audit row, best-effort, after both calls return.
+ *
+ * #review 2026-10-03 [P1]: `generatePlan` (inside `retryProvision`) always
+ * leaves a fresh plan `pending_approval` and its job `waiting_for_user_action`
+ * — correct for the organizer's OWN two-step route (POST .../plan/retry, then
+ * a separate POST .../plans/:id/approve, so they can look at what changed
+ * before committing to it), but this function used to return `ok: true` at
+ * exactly that point and stop, with no approval control anywhere on the admin
+ * dashboard to ever finish the job. Clicking Retry reported success and left
+ * the trip stuck waiting on an approval nobody could give. An admin acting on
+ * someone else's trip is not reviewing a diff the way an organizer is — it
+ * approves immediately, so Retry is the one-shot action the dashboard already
+ * presents it as. `issueApproval`'s only refusals (PLAN_NOT_FOUND,
+ * ALREADY_APPROVED, PLAN_NOT_PENDING) cannot fire against a plan this
+ * function just created fresh, so a refusal here throws rather than returning
+ * a misleading success — a real bug surfacing loudly beats the trip sitting
+ * stuck again with the dashboard none the wiser.
+ *
+ * Both calls are best-effort for the audit row (not inside `retryProvision`'s
+ * own transactions) because `retryProvision` already spans two connections by
+ * design (its own comment: a fresh connection for the `generatePlan` half)
+ * and wrapping a cross-connection operation in a third transaction here would
+ * not make it more atomic, only harder to read. A failure to write the audit
+ * row must never be reported back as if the retry itself failed — the retry
+ * already happened by the time this file can act on it.
  */
 // Same shape as document-store.ts's TRIP_ID / chat-router.ts's inline copies
 // of it (this codebase inlines this particular regex rather than sharing an
@@ -190,12 +209,32 @@ const TRIP_ID_FORMAT = /^[a-z]{2,12}_[A-Za-z0-9]{8,64}$/;
 export async function retryTripViaAdmin(
   db: pg.Pool,
   tripId: string,
+  approvalTtlSeconds: number,
+  operatorChatId: string | undefined,
   correlationId: string = newCorrelationId(),
 ): Promise<RetryProvisionResult> {
   if (!TRIP_ID_FORMAT.test(tripId)) {
     return { ok: false, reason: "TRIP_NOT_FOUND" };
   }
   const result = await retryProvision(db, tripId, correlationId);
+  if (result.ok) {
+    const approval = await issueApproval(db, result.planId, "admin:api-key", approvalTtlSeconds, { operatorChatId });
+    if (!approval.ok) {
+      throw new Error(`admin retry: issueApproval unexpectedly refused a fresh plan (${approval.reason})`);
+    }
+  }
+  // #review 2026-10-03, finding N: a well-formed but nonexistent id (a real
+  // trip was never found, as opposed to the shape check above) must not
+  // reach this permanent audit INSERT with its raw text as target_ref either
+  // -- proven live with a crafted alphanumeric string spelling out a name
+  // and a health condition. Same reasoning as the shape check: a trip that
+  // does not exist has nothing safe or meaningful to log about, whatever the
+  // reason it does not exist. ALREADY_SUSPENDED/NOT_RETRYABLE-style refusals
+  // below are unaffected -- those only fire for a trip that was actually
+  // found, so tripId there is a real, safe opaque id.
+  if (!result.ok && result.reason === "TRIP_NOT_FOUND") {
+    return result;
+  }
   try {
     const evidence = result.ok
       ? { ok: true, jobId: result.jobId, planId: result.planId, releaseId: result.releaseId, supersededPlanId: result.supersededPlanId }
@@ -246,11 +285,14 @@ export async function suspendTrip(
     );
     const trip = row.rows[0];
     if (!trip) {
-      // #review 2026-10-03, finding 5: every refusal is audited now, not
-      // only a success — committed (not rolled back): the audit row itself
-      // is the one thing this attempt actually did, and it must survive.
-      await recordAdminMutation(client, "admin.suspend_trip", tripId, { ok: false, reason: "TRIP_NOT_FOUND" }, correlationId);
-      await client.query("COMMIT");
+      // #review 2026-10-03, finding N (the same raw-id-in-audit risk as
+      // retryTripViaAdmin's TRIP_NOT_FOUND branch, confirmed live for retry
+      // and equally true here): a well-formed but nonexistent id is still
+      // just caller-chosen text, not a verified safe opaque id, so it is not
+      // written to this permanent audit row either — unlike finding 5's
+      // ALREADY_SUSPENDED branch below, which only fires for a trip that was
+      // actually found and so is safe to log normally.
+      await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_FOUND" };
     }
     if (trip.suspended_at !== null) {
@@ -301,11 +343,9 @@ export async function resumeTrip(db: pg.Pool, tripId: string): Promise<ResumeTri
     );
     const trip = row.rows[0];
     if (!trip) {
-      // #review 2026-10-03, finding 5: every refusal is audited, same as
-      // suspendTrip — committed, not rolled back, since the audit row is
-      // the one real effect of this attempt.
-      await recordAdminMutation(client, "admin.resume_trip", tripId, { ok: false, reason: "TRIP_NOT_FOUND" }, correlationId);
-      await client.query("COMMIT");
+      // Same reasoning as suspendTrip's own TRIP_NOT_FOUND branch — see its
+      // comment.
+      await client.query("ROLLBACK");
       return { ok: false, reason: "TRIP_NOT_FOUND" };
     }
     if (trip.suspended_at === null) {
@@ -314,9 +354,15 @@ export async function resumeTrip(db: pg.Pool, tripId: string): Promise<ResumeTri
       return { ok: false, reason: "NOT_SUSPENDED" };
     }
 
+    // #review 2026-10-03 [P2]: suspended_reason is deliberately NOT cleared
+    // here — see migration 20261003060350's updated header. Nulling it
+    // alongside suspended_at used to erase the only durable record of why
+    // the trip had been paused; it now simply carries the last reason until
+    // the next suspend overwrites it, which no reader treats as "currently
+    // suspended" (that's suspended_at alone, cleared below).
     await client.query(
       `UPDATE control_plane.trips
-       SET suspended_at = NULL, suspended_reason = NULL, updated_at = now()
+       SET suspended_at = NULL, updated_at = now()
        WHERE id = $1`,
       [tripId],
     );

@@ -42,8 +42,20 @@
 -- at the DB layer, not only in application code: a CHECK constraint holds
 -- even against a future direct SQL write or a bug in the app-layer validator.
 --
--- The pair is kept consistent by construction: a trip is suspended if and
--- only if both columns are set.
+-- #review 2026-10-03 [P2]: the pair was originally kept consistent by
+-- construction as an equivalence (suspended if and only if both columns are
+-- set), and resumeTrip nulled both together. That lost the only record of
+-- WHY a trip had been paused the moment it was un-paused, with nothing else
+-- durable holding it (admin_events.evidence deliberately never gets a copy
+-- of operator free text — see this file's own note above, and
+-- admin-mutations.ts's module doc). The constraint is now one-directional:
+-- suspended implies a reason, but a reason may outlive the suspension that
+-- wrote it. resumeTrip clears only `suspended_at`; `suspended_reason` keeps
+-- the last reason as a plain operational fact until the NEXT suspend
+-- overwrites it. `suspended_at IS NULL` alone is still the one thing every
+-- reader (job-queue.ts, provisioner.py, suspendTrip/resumeTrip's own checks)
+-- already treats as "is this trip currently suspended" — none of them ever
+-- read `suspended_reason` for that, so nothing downstream changes meaning.
 ALTER TABLE control_plane.trips
   ADD COLUMN suspended_at timestamptz,
   ADD COLUMN suspended_reason text
@@ -51,4 +63,4 @@ ALTER TABLE control_plane.trips
 
 ALTER TABLE control_plane.trips
   ADD CONSTRAINT trips_suspended_pair
-  CHECK ((suspended_at IS NULL) = (suspended_reason IS NULL));
+  CHECK (suspended_at IS NULL OR suspended_reason IS NOT NULL);

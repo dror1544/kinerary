@@ -1790,13 +1790,23 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // why that reuse is correct rather than a parallel implementation.
   app.post("/v1/admin/trips/:id/retry", async (request, reply) => {
     if (!dependencies.admin) return reply.code(503).send({ error: "ADMIN_NOT_CONFIGURED" });
+    // #review 2026-10-03 [P1]: retryTripViaAdmin now issues the approval
+    // retryProvision alone leaves pending (see its own comment) — that
+    // needs planner.config's approval TTL/operator chat id, so this route
+    // needs planner configured too, not just admin.
+    if (!dependencies.planner) return reply.code(503).send({ error: "PLANNER_NOT_CONFIGURED" });
     if (!adminAuth(request)) return reply.code(401).send({ error: "AUTHENTICATION_REQUIRED" });
 
     const params = request.params as Record<string, unknown>;
     const tripId = params?.id;
     if (typeof tripId !== "string") return reply.code(400).send({ error: "INVALID_REQUEST" });
 
-    const result = await retryTripViaAdmin(dependencies.admin.db, tripId);
+    const result = await retryTripViaAdmin(
+      dependencies.admin.db,
+      tripId,
+      dependencies.planner.config.approvalTtlSeconds,
+      dependencies.planner.config.operatorChatId,
+    );
     if (!result.ok) {
       const status = result.reason === "TRIP_NOT_FOUND" ? 404
         : result.reason === "NO_COMPATIBLE_RELEASE" || result.reason === "ORGANIZER_NOT_ON_ROSTER" ? 422

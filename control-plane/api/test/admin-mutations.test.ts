@@ -29,6 +29,7 @@ const DB_URL = testDatabaseUrl();
 const SKIP = !DB_URL;
 const migrationsDir = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
 const KEY = "admin-key-for-mutation-tests";
+const APPROVAL_TTL_SECONDS = 3600;
 
 // Same reasoning as planner.test.ts: generatePlan only selects the
 // manifest-less dev-seed / fixture release when this is on.
@@ -135,7 +136,10 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
   after(async () => { await pool.end(); });
 
   function appWithAdmin() {
-    return buildApp(profile, { admin: { db: pool, apiKey: KEY } });
+    return buildApp(profile, {
+      admin: { db: pool, apiKey: KEY },
+      planner: { db: pool, config: { approvalTtlSeconds: APPROVAL_TTL_SECONDS } },
+    });
   }
 
   // ── Authorization: gated and unmounted exactly like slice 1 ────────────
@@ -234,21 +238,26 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
 
   // ── retry: reuses the real mechanism ────────────────────────────────────
 
-  test("retryTripViaAdmin on a retryable trip calls through to retryProvision: a plan and job are created", async () => {
+  test("retryTripViaAdmin on a retryable trip calls through to retryProvision AND approves the plan it creates, so the job is actually queued (#review 2026-10-03 [P1])", async () => {
     const fix = await setupFixture(pool);
     try {
       const before = await pool.query("SELECT count(*)::int AS n FROM control_plane.plans WHERE trip_id = $1", [fix.tripId]);
       assert.equal(before.rows[0].n, 0);
 
-      const result = await retryTripViaAdmin(pool, fix.tripId, fix.correlationId);
+      const result = await retryTripViaAdmin(pool, fix.tripId, APPROVAL_TTL_SECONDS, undefined, fix.correlationId);
       assert.equal(result.ok, true);
       if (!result.ok) throw new Error("unreachable");
       assert.equal(result.supersededPlanId, null);
       assert.match(result.planId, /^plan_/);
       assert.match(result.jobId, /^job_/);
 
+      // Before the fix, generatePlan left this `pending_approval` and the job
+      // `waiting_for_user_action` — a click that reported success but left
+      // the trip stuck forever, since the dashboard has no approval control.
       const planRow = await pool.query("SELECT status FROM control_plane.plans WHERE id = $1", [result.planId]);
-      assert.equal(planRow.rows[0]?.status, "pending_approval");
+      assert.equal(planRow.rows[0]?.status, "approved");
+      const jobRow = await pool.query("SELECT state FROM control_plane.jobs WHERE id = $1", [result.jobId]);
+      assert.equal(jobRow.rows[0]?.state, "queued");
 
       const evidence = await latestAuditEvidence(pool, "admin.retry_trip", fix.tripId) as Record<string, unknown>;
       assert.equal(evidence.ok, true);
@@ -262,7 +271,7 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
   test("retryTripViaAdmin on a trip in a non-retryable state is refused, not crashed, and the refusal is audited", async () => {
     const fix = await setupFixture(pool, "draft");
     try {
-      const result = await retryTripViaAdmin(pool, fix.tripId, fix.correlationId);
+      const result = await retryTripViaAdmin(pool, fix.tripId, APPROVAL_TTL_SECONDS, undefined, fix.correlationId);
       assert.equal(result.ok, false);
       if (result.ok) throw new Error("unreachable");
       assert.equal(result.reason, "NOT_RETRYABLE_STATE");
@@ -275,11 +284,21 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     }
   });
 
-  test("retryTripViaAdmin on a trip that does not exist returns TRIP_NOT_FOUND", async () => {
-    const result = await retryTripViaAdmin(pool, `trip_${randomHex(16)}`, `corr_${randomHex(8)}`);
+  test("retryTripViaAdmin on a trip that does not exist returns TRIP_NOT_FOUND and writes no audit row (#review 2026-10-03, finding N)", async () => {
+    // A well-formed but nonexistent id is still just caller-chosen text, not
+    // a verified safe opaque id — proven live with a crafted string spelling
+    // out a name and a health condition within the shape check's own
+    // charset. Same treatment as the malformed-shape case below: nothing
+    // safe or meaningful to log about a trip that was never found.
+    const fakeId = "jo_JohnDoe1973PeanutAllergy12";
+    const correlationId = `corr_${randomHex(8)}`;
+    const result = await retryTripViaAdmin(pool, fakeId, APPROVAL_TTL_SECONDS, undefined, correlationId);
     assert.equal(result.ok, false);
     if (result.ok) throw new Error("unreachable");
     assert.equal(result.reason, "TRIP_NOT_FOUND");
+
+    const row = await pool.query("SELECT 1 FROM control_plane.audit_events WHERE target_ref = $1", [fakeId]);
+    assert.equal(row.rowCount, 0, "a well-formed but nonexistent id must never reach audit_events either");
   });
 
   test("retryTripViaAdmin on a malformed id refuses before ever writing an audit row (#review 2026-10-03, finding 3)", async () => {
@@ -288,7 +307,7 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     // TRUNCATE) of free text that was never a real trip id.
     const malformed = "Jane Doe jane.doe@example.com allergic to peanuts";
     const correlationId = `corr_${randomHex(8)}`;
-    const result = await retryTripViaAdmin(pool, malformed, correlationId);
+    const result = await retryTripViaAdmin(pool, malformed, APPROVAL_TTL_SECONDS, undefined, correlationId);
     assert.equal(result.ok, false);
     if (result.ok) throw new Error("unreachable");
     assert.equal(result.reason, "TRIP_NOT_FOUND");
@@ -385,7 +404,11 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     }
   });
 
-  test("suspendTrip on a trip that does not exist returns TRIP_NOT_FOUND and audits the refusal", async () => {
+  test("suspendTrip on a trip that does not exist returns TRIP_NOT_FOUND and writes no audit row (#review 2026-10-03, finding N)", async () => {
+    // Same reasoning as retryTripViaAdmin's equivalent test: a well-formed
+    // but nonexistent id is caller-chosen text, not a verified safe opaque
+    // id, so it must not reach this permanent audit log either — unlike
+    // ALREADY_SUSPENDED above, which only fires for a trip actually found.
     const tripId = `trip_${randomHex(16)}`;
     const result = await suspendTrip(pool, tripId, "a reason");
     assert.equal(result.ok, false);
@@ -393,7 +416,7 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     assert.equal(result.reason, "TRIP_NOT_FOUND");
 
     const evidence = await latestAuditEvidence(pool, "admin.suspend_trip", tripId);
-    assert.deepEqual(evidence, { ok: false, reason: "TRIP_NOT_FOUND" });
+    assert.equal(evidence, undefined, "a trip that was never found must not reach audit_events");
   });
 
   test("suspendTrip on a malformed id refuses before ever writing an audit row (finding 3's risk applies here too)", async () => {
@@ -410,18 +433,25 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     assert.equal(row.rowCount, 0, "a malformed id must never reach audit_events, not even for a refusal");
   });
 
-  test("resumeTrip reverses suspendTrip and audits", async () => {
+  test("resumeTrip reverses suspendTrip, audits, and preserves the suspension reason it reverses (#review 2026-10-03 [P2])", async () => {
     const fix = await setupFixture(pool);
     try {
       await suspendTrip(pool, fix.tripId, "pausing");
       const result = await resumeTrip(pool, fix.tripId);
       assert.equal(result.ok, true);
 
+      // Before the fix, resume nulled suspended_reason along with
+      // suspended_at, permanently losing the only record of WHY the trip
+      // had been paused (the suspend audit event deliberately never copies
+      // it — see admin-mutations.ts's module doc). suspended_at alone is
+      // still the one thing every reader treats as "currently suspended"
+      // (job-queue.ts, provisioner.py, this module's own checks), so a
+      // lingering reason here changes no other behaviour.
       const row = await pool.query<{ suspended_at: Date | null; suspended_reason: string | null }>(
         "SELECT suspended_at, suspended_reason FROM control_plane.trips WHERE id = $1", [fix.tripId],
       );
       assert.equal(row.rows[0]?.suspended_at, null);
-      assert.equal(row.rows[0]?.suspended_reason, null);
+      assert.equal(row.rows[0]?.suspended_reason, "pausing");
 
       const evidence = await latestAuditEvidence(pool, "admin.resume_trip", fix.tripId);
       assert.deepEqual(evidence, { ok: true });
@@ -445,7 +475,8 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     }
   });
 
-  test("resumeTrip on a trip that does not exist returns TRIP_NOT_FOUND and audits the refusal", async () => {
+  test("resumeTrip on a trip that does not exist returns TRIP_NOT_FOUND and writes no audit row (#review 2026-10-03, finding N)", async () => {
+    // Same reasoning as suspendTrip's equivalent test — see its comment.
     const tripId = `trip_${randomHex(16)}`;
     const result = await resumeTrip(pool, tripId);
     assert.equal(result.ok, false);
@@ -453,7 +484,7 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
     assert.equal(result.reason, "TRIP_NOT_FOUND");
 
     const evidence = await latestAuditEvidence(pool, "admin.resume_trip", tripId);
-    assert.deepEqual(evidence, { ok: false, reason: "TRIP_NOT_FOUND" });
+    assert.equal(evidence, undefined, "a trip that was never found must not reach audit_events");
   });
 
   test("resumeTrip on a malformed id refuses before ever writing an audit row", async () => {
