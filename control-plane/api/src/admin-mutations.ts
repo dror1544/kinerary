@@ -149,13 +149,15 @@ async function recordAdminMutation(
   targetRef: string,
   evidence: Record<string, unknown>,
   correlationId: string,
-): Promise<void> {
+): Promise<string> {
+  const id = generateId("audit");
   await client.query(
     `INSERT INTO control_plane.audit_events
        (id, actor_ref, action, target_ref, correlation_id, evidence, occurred_at)
      VALUES ($1, 'admin:api-key', $2, $3, $4, $5::jsonb, now())`,
-    [generateId("audit"), action, targetRef, correlationId, JSON.stringify(evidence)],
+    [id, action, targetRef, correlationId, JSON.stringify(evidence)],
   );
+  return id;
 }
 
 // ── Retry ────────────────────────────────────────────────────────────────
@@ -311,7 +313,20 @@ export async function suspendTrip(
     const suspendedAt = updated.rows[0]!.suspended_at;
 
     // Evidence carries no copy of `reason` — see this module's header.
-    await recordAdminMutation(client, "admin.suspend_trip", tripId, { ok: true }, correlationId);
+    const auditEventId = await recordAdminMutation(client, "admin.suspend_trip", tripId, { ok: true }, correlationId);
+
+    // #review 2026-10-03 [P2], round 2: trips.suspended_reason alone loses
+    // every justification but the last one across a suspend -> resume ->
+    // suspend cycle. This durable, dashboard-excluded history row (migration
+    // 20261003060350) is the one this suspend's reason survives in,
+    // regardless of what happens to the column later — see the migration's
+    // own comment for why no route ever reads this table.
+    await client.query(
+      `INSERT INTO control_plane.trip_suspension_history
+         (id, trip_id, audit_event_id, reason, suspended_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [generateId("suspend_hist"), tripId, auditEventId, reason, suspendedAt],
+    );
 
     await client.query("COMMIT");
     return { ok: true, tripId, suspendedAt: suspendedAt.toISOString() };

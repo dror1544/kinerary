@@ -1,4 +1,7 @@
--- rollback: compatible — two new nullable columns on an existing table; nothing existing changes shape, and nothing reads them until slice 2's admin routes ship
+-- rollback: compatible — two new nullable columns on trips, one new table
+-- (trip_suspension_history) with a foreign key to audit_events; nothing
+-- existing changes shape, and nothing reads any of it until slice 2's admin
+-- routes ship
 
 -- Super-admin dashboard slice 2 (Sprint 6, decision 23 in docs/sprint6-tracks.md):
 -- suspend/retry controls. Retry reuses planner.ts's existing `retryProvision`
@@ -64,3 +67,26 @@ ALTER TABLE control_plane.trips
 ALTER TABLE control_plane.trips
   ADD CONSTRAINT trips_suspended_pair
   CHECK (suspended_at IS NULL OR suspended_reason IS NOT NULL);
+
+-- #review 2026-10-03 [P2], round 2: `trips.suspended_reason` alone still
+-- loses every justification but the LAST one — a suspend -> resume ->
+-- suspend cycle overwrites it a second time, and admin_events.evidence
+-- never carried a copy either (by design, above). This table is that
+-- missing durable history: one row per suspend, append-only (no UPDATE/
+-- DELETE grant beyond the owner role, matching audit_events' own posture),
+-- linked to the audit_events row the mutation already wrote so the two
+-- stay one fact rather than two independently-maintained copies that could
+-- drift. No route reads this table — it is restricted history for an
+-- operator to query directly, exactly as the review asked ("it can remain
+-- excluded from dashboard responses"), never served, never on the
+-- EVIDENCE_ALLOWLIST (admin-dashboard.ts).
+CREATE TABLE control_plane.trip_suspension_history (
+  id text PRIMARY KEY,
+  trip_id text NOT NULL REFERENCES control_plane.trips(id),
+  audit_event_id text NOT NULL REFERENCES control_plane.audit_events(id),
+  reason text NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 500),
+  suspended_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX trip_suspension_history_trip_id_idx ON control_plane.trip_suspension_history (trip_id);

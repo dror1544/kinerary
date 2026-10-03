@@ -109,6 +109,7 @@ async function teardownFixture(fix: Fixture): Promise<void> {
   await pool.query("DELETE FROM control_plane.plans WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.intake_versions WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trip_memberships WHERE trip_id = $1", [tripId]);
+  await pool.query("DELETE FROM control_plane.trip_suspension_history WHERE trip_id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.trips WHERE id = $1", [tripId]);
   await pool.query("DELETE FROM control_plane.user_identities WHERE user_id = $1", [ownerId]);
   await pool.query("DELETE FROM control_plane.users WHERE id = $1", [ownerId]);
@@ -382,6 +383,42 @@ describe("super-admin dashboard: slice 2 (suspend/retry)", { skip: SKIP ? "no CO
 
       const evidence = await latestAuditEvidence(pool, "admin.suspend_trip", fix.tripId);
       assert.deepEqual(evidence, { ok: true });
+
+      const history = await pool.query<{ reason: string; audit_event_id: string }>(
+        "SELECT reason, audit_event_id FROM control_plane.trip_suspension_history WHERE trip_id = $1", [fix.tripId],
+      );
+      assert.equal(history.rows.length, 1);
+      assert.equal(history.rows[0]!.reason, "pausing for a transformer fix");
+      assert.match(history.rows[0]!.audit_event_id, /^audit_/);
+    } finally {
+      await teardownFixture(fix);
+    }
+  });
+
+  test("a suspend -> resume -> suspend cycle preserves BOTH reasons in durable history, never only the latest (#review 2026-10-03 [P2], round 2)", async () => {
+    const fix = await setupFixture(pool);
+    try {
+      await suspendTrip(pool, fix.tripId, "first pause: waiting on a release fix");
+      await resumeTrip(pool, fix.tripId);
+      await suspendTrip(pool, fix.tripId, "second pause: a different reason entirely");
+
+      // trips.suspended_reason alone would only ever show the second —
+      // that's the known, accepted limit of that column (see the
+      // migration's own comment). The history table is where the first
+      // reason survives.
+      const row = await pool.query<{ suspended_reason: string | null }>(
+        "SELECT suspended_reason FROM control_plane.trips WHERE id = $1", [fix.tripId],
+      );
+      assert.equal(row.rows[0]?.suspended_reason, "second pause: a different reason entirely");
+
+      const history = await pool.query<{ reason: string }>(
+        "SELECT reason FROM control_plane.trip_suspension_history WHERE trip_id = $1 ORDER BY created_at ASC",
+        [fix.tripId],
+      );
+      assert.deepEqual(history.rows.map((r) => r.reason), [
+        "first pause: waiting on a release fix",
+        "second pause: a different reason entirely",
+      ]);
     } finally {
       await teardownFixture(fix);
     }
