@@ -1,117 +1,11 @@
---- a/tools/tool_search.py
-+++ b/tools/tool_search.py
-@@ -1029,6 +1029,58 @@
-         return None
- 
- 
-+# The schema says ``arguments``, and models do not all agree. gpt-5.6-terra
-+# spells it ``parameters`` about half the time; other runtimes use ``args`` or
-+# ``input``. Reading only ``arguments`` did not fail loudly — it produced an
-+# empty payload, so ``validate_deferred_call_args`` refused the call as missing
-+# every required field, handed back the schema, and the model re-sent the same
-+# spelling. Live on 2026-09-18 that dropped 49 of one session's 93 dispatches
-+# and half a trip's itinerary was never written, while the agent reported the
-+# work as done. The key the model picked must not decide whether a call runs.
-+_PAYLOAD_KEYS: Tuple[str, ...] = ("arguments", "parameters", "args", "input")
-+
-+
-+def _carries_payload(value: Any) -> bool:
-+    """Whether this value holds arguments, as opposed to an empty stand-in.
-+
-+    A JSON string is parsed before it is judged, because emptiness has more
-+    than one spelling: ``"{ }"`` and ``"{\\n}"`` are as empty as ``"{}"``, and a
-+    runtime that pretty-prints an empty object must not thereby make its key
-+    look populated — that would hand the call back to the documented key,
-+    parse it to ``{}``, and lose it to the validator exactly as before.
-+
-+    Unparseable is NOT empty. A payload the model meant to send, mangled,
-+    belongs in an error naming the key it was sent under; falling through to
-+    an alias would hide it.
-+    """
-+    if isinstance(value, dict):
-+        return bool(value)
-+    if isinstance(value, str):
-+        text = value.strip()
-+        if not text:
-+            return False
-+        try:
-+            return bool(json.loads(text))
-+        except json.JSONDecodeError:
-+            return True
-+    return False
-+
-+
-+def _payload_key(call: Dict[str, Any]) -> str:
-+    """Which key of a ``tool_call`` invocation holds the underlying payload.
-+
-+    ``arguments`` is the documented key and wins whenever it carries anything.
-+    An alias is read only when it is the one with content — that keeps a
-+    genuinely empty call (``get_config()``) reporting against the documented
-+    key, and stops an alias from overriding a payload the model did spell right.
-+    """
-+    present = [k for k in _PAYLOAD_KEYS if call.get(k) is not None]
-+    for key in present:
-+        if _carries_payload(call.get(key)):
-+            return key
-+    return present[0] if present else "arguments"
-+
-+
- def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
-     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
- 
-@@ -1044,16 +1096,17 @@
-         return None, {}, "tool_call requires a 'name' argument"
-     if name in BRIDGE_TOOL_NAMES:
-         return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
--    raw_args = args.get("arguments")
-+    payload_key = _payload_key(args)
-+    raw_args = args.get(payload_key)
-     if raw_args is None:
-         raw_args = {}
-     if isinstance(raw_args, str):
-         try:
-             raw_args = json.loads(raw_args)
-         except json.JSONDecodeError as e:
--            return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
-+            return None, {}, f"tool_call '{payload_key}' is not valid JSON: {e}"
-     if not isinstance(raw_args, dict):
--        return None, {}, "tool_call 'arguments' must be an object"
-+        return None, {}, f"tool_call '{payload_key}' must be an object"
-     if not is_deferrable_tool_name(name):
-         return None, {}, (
-             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
+diff --git a/tests/tools/test_tool_search.py b/tests/tools/test_tool_search.py
+index 9c19eba593..dc489a9e2b 100644
 --- a/tests/tools/test_tool_search.py
 +++ b/tests/tools/test_tool_search.py
-@@ -329,6 +329,25 @@
-         assert err is not None
+@@ -886,3 +886,192 @@ class TestDeferredCallSchemaProbe:
+         }, calls)
  
- 
-+    def test_resolve_underlying_call_reads_parameters_alias(self):
-+        """A payload under 'parameters' is the same call as one under 'arguments'.
-+
-+        gpt-5.6-terra spells the key 'parameters' about half the time. The
-+        resolver used to read only 'arguments', so those calls reached the
-+        probe-validator empty and were refused as missing every required
-+        field — see TestRegression_PayloadKeyAliases below.
-+        """
-+        from tools.tool_search import resolve_underlying_call
-+        TestRegression_PayloadKeyAliases._register("mcp_alias_resolve_probe")
-+        name, args, err = resolve_underlying_call({
-+            "name": "mcp_alias_resolve_probe",
-+            "parameters": {"repo": "kinerary"},
-+        })
-+        assert err is None, err
-+        assert name == "mcp_alias_resolve_probe"
-+        assert args == {"repo": "kinerary"}
-+
-+
-     def test_resolve_underlying_call_rejects_recursion(self):
-         """tool_call cannot invoke tool_call itself."""
-         from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
-@@ -677,3 +696,170 @@
-         ))
-         assert result.get("ok") is True
-         assert result.get("doc") == "abc"
+         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
 +
 +
 +class TestRegression_PayloadKeyAliases:
@@ -279,3 +173,119 @@
 +        })
 +        assert err is not None
 +        assert "parameters" in err
++
++    def test_batch_entry_parameters_alias_resolves(self):
++        """The advertised batch shape is covered too: {"calls": [{name, parameters}]}."""
++        from tools.tool_search import normalize_tool_call_entries
++
++        self._register("mcp_alias_batch_op")
++        entries, err = normalize_tool_call_entries({"calls": [
++            {"name": "mcp_alias_batch_op",
++             "parameters": {"phase_id": "tokyo", "text_he": "batch"}},
++        ]})
++        assert err is None, err
++        assert entries[0]["arguments"] == {"phase_id": "tokyo", "text_he": "batch"}
++
++    def test_batch_entry_malformed_alias_names_its_key(self):
++        from tools.tool_search import normalize_tool_call_entries
++
++        self._register("mcp_alias_batch_bad_op")
++        entries, err = normalize_tool_call_entries({"calls": [
++            {"name": "mcp_alias_batch_bad_op", "parameters": "{not json"},
++        ]})
++        assert entries == []
++        assert "calls[0].parameters" in err
+diff --git a/tools/tool_search_validation.py b/tools/tool_search_validation.py
+index fb62f87977..964e24c003 100644
+--- a/tools/tool_search_validation.py
++++ b/tools/tool_search_validation.py
+@@ -136,6 +136,56 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
+         return None
+ 
+ 
++# The schema says ``arguments``, and models do not all agree. gpt-5.6-terra
++# spells it ``parameters`` about half the time; other runtimes use ``args`` or
++# ``input``. Reading only ``arguments`` did not fail loudly — it produced an
++# empty payload, so ``validate_deferred_call_args`` refused the call as missing
++# every required field, handed back the schema, and the model re-sent the same
++# spelling. The key the model picked must not decide whether a call runs.
++_PAYLOAD_KEYS: Tuple[str, ...] = ("arguments", "parameters", "args", "input")
++
++
++def _carries_payload(value: Any) -> bool:
++    """Whether this value holds arguments, as opposed to an empty stand-in.
++
++    A JSON string is parsed before it is judged, because emptiness has more
++    than one spelling: ``"{ }"`` and ``"{\\n}"`` are as empty as ``"{}"``, and a
++    runtime that pretty-prints an empty object must not thereby make its key
++    look populated — that would hand the call back to the documented key,
++    parse it to ``{}``, and lose it to the validator.
++
++    Unparseable is NOT empty. A payload the model meant to send, mangled,
++    belongs in an error naming the key it was sent under; falling through to
++    an alias would hide it.
++    """
++    if isinstance(value, dict):
++        return bool(value)
++    if isinstance(value, str):
++        text = value.strip()
++        if not text:
++            return False
++        try:
++            return bool(json.loads(text))
++        except json.JSONDecodeError:
++            return True
++    return False
++
++
++def _payload_key(call: Dict[str, Any]) -> str:
++    """Which key of a ``tool_call`` entry holds the underlying payload.
++
++    ``arguments`` is the documented key and wins whenever it carries anything.
++    An alias is read only when it is the one with content — that keeps a
++    genuinely empty call (``get_config()``) reporting against the documented
++    key, and stops an alias from overriding a payload the model did spell right.
++    """
++    present = [k for k in _PAYLOAD_KEYS if call.get(k) is not None]
++    for key in present:
++        if _carries_payload(call.get(key)):
++            return key
++    return present[0] if present else "arguments"
++
++
+ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
+ 
+@@ -150,7 +200,9 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
+         # Legacy single shape.
+         if not str(args.get("name") or "").strip():
+             return [], "tool_call requires 'calls' (an array of {name, arguments})"
+-        raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
++        # The whole dict, not a rebuilt {name, arguments}: the payload may be
++        # spelled with an alias, and the per-entry read below resolves that.
++        raw_calls = [args]
+     if isinstance(raw_calls, str):
+         # Tolerate the model emitting the batch envelope as a JSON string —
+         # mirror the per-entry `arguments` handling below (#114484).
+@@ -172,7 +224,8 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
+             return [], f"tool_call calls[{position}] requires a 'name'"
+         if name in BRIDGE_TOOL_NAMES:
+             return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
+-        raw_args = raw.get("arguments")
++        payload_key = _payload_key(raw)
++        raw_args = raw.get(payload_key)
+         if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
+             # "" / whitespace is how some OpenAI-compatible gateways spell "no arguments" for a
+             # parameterless tool (#83937); the loop already treats an empty outer arguments string
+@@ -183,9 +236,9 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
+             try:
+                 raw_args = json.loads(raw_args)
+             except json.JSONDecodeError as e:
+-                return [], f"tool_call calls[{position}].arguments is not valid JSON: {e}"
++                return [], f"tool_call calls[{position}].{payload_key} is not valid JSON: {e}"
+         if not isinstance(raw_args, dict):
+-            return [], f"tool_call calls[{position}].arguments must be an object"
++            return [], f"tool_call calls[{position}].{payload_key} must be an object"
+         entries.append({"name": name, "arguments": raw_args})
+     return entries, None
+ 

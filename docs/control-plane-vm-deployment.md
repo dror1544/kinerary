@@ -261,6 +261,25 @@ commits are on no remote. `/opt/hermes-src` is a history-less snapshot, and it
 is kept **pristine**: everything we add to the fork lives as a patch in
 `control-plane/deployment/hermes-patches/`, and the build applies them.
 
+**The patch set and the snapshot move together.** The patches in this tree are
+rebased onto upstream `4097709b0c` (v0.21.4 line, 2026-10-03). They do **not**
+apply to the snapshot the VM runs today (`ab0d984145`): upstream restructured the
+code 0001 and 0002 edit, so a build from this tree against `/opt/hermes-src` as it
+stands fails with "does not apply cleanly", by design. The VM changes version only
+by refreshing `/opt/hermes-src` to `4097709b0c` and bumping `HERMES_REV` through
+`kinerary-cp-release` — nothing in this repo does either. Until then a VM image
+can only be built from a checkout that predates this rebase, whose set was
+written for `ab0d984145`.
+
+**Test a patch set against a new Hermes tree before it touches anything.**
+`scripts/hermes-patches.sh check <hermes-tree>` classifies every patch against a
+scratch copy — applies, already applied, superseded (upstream fixed it: its own
+tests pass without it), or conflict — then runs the tests the patches add or touch
+on the patched copy; `apply <hermes-tree>` writes to the tree only when all of that
+is clean, all or nothing. It needs `HERMES_PATCH_PYTHON`, an interpreter that can
+import Hermes' dependencies plus pytest, and refuses without it. Run `check` on
+every upstream update; the image build below still applies the patches itself.
+
 ```bash
 # 1. Build, from a tree of the revision that carries the patch set. Changes nothing that runs.
 git -C /opt/kinerary fetch
@@ -452,8 +471,9 @@ Install section.
 **Why.** Every Hermes profile, the traveller-facing companions included, runs in
 the one `hermes` container as uid 10000 over the one data mount
 `/opt/hermes-data:/opt/data` (`compose.vm.yml:385-406`), and the fork's image
-sets `HERMES_WRITE_SAFE_ROOT=/opt/data` (`Dockerfile:379`, as carried in
-`tests/scripts/fixtures/hermes-src/`), so the monitor's `fleet-stacks.json` sits
+sets `HERMES_WRITE_SAFE_ROOT=/opt/data` (`Dockerfile:449` at upstream
+`4097709b0c`, as carried in `tests/scripts/fixtures/hermes-src/`; it was line 379
+at `ab0d984145`), so the monitor's `fleet-stacks.json` sits
 where a companion's file tools reach. The URL in it must therefore not be the
 relay's read-write login, and the MCP's read-only `PGOPTIONS` is only a session
 default an inherited value replaces (`fleet-mcp.mjs:338`; issue #302, regression
