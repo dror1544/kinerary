@@ -28,6 +28,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { structuredLog } from "./redaction.js";
+// Re-exported below (not just imported) because hermes-search.ts,
+// itinerary-extract.ts and model-runner-env.test.ts all import these two
+// names from "./model-runner.js" / "../src/model-runner.js" — the shared
+// module move (#284) must not change that public surface.
+import { hermesChildEnv, structuringChildEnv } from "../../../shared/child-env.js";
+export { hermesChildEnv, structuringChildEnv };
 
 export type RunnerFailure =
   /** No runner configured for this task — the caller proceeds without a model. */
@@ -472,35 +478,19 @@ type RunOnce = { ok: true; stdout: string; usage?: ModelUsage } | { ok: false; r
  */
 
 /**
- * The variables EVERY structuring child may see: how to find its own
- * executable, a place to write, a locale, and certificates. Nothing here is a
- * credential.
+ * `STRUCTURING_BASE_ENV` (the variables EVERY structuring child may see: how
+ * to find its own executable, a place to write, a locale, and certificates —
+ * nothing there is a credential) and the one allow-list builder on top of it,
+ * `structuringChildEnv` (the base set plus `extra`, a CLI's OWN credentials or
+ * config location, and nothing else the relay holds), now live in
+ * `shared/child-env.js` (#284) — imported above and re-exported below so this
+ * module's public surface is unchanged. An allow-list, because a deny-list
+ * cannot be audited — a secret the relay gains later is withheld by default
+ * rather than by remembering to add it. Codex, Claude and Hermes each express
+ * their environment through this, so there is one mechanism to check rather
+ * than three — and, since #284, one DEFINITION to check, shared with
+ * mcp/mcp.js's own Hermes child.
  */
-const STRUCTURING_BASE_ENV: readonly string[] = [
-  "PATH", "HOME", "XDG_CONFIG_HOME",
-  "TMPDIR", "TMP", "TEMP",
-  "LANG", "LC_ALL", "LC_CTYPE",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
-];
-
-/**
- * The one allow-list builder for a child that reads untrusted organizer or
- * document text: the base set above plus `extra`, the CLI's OWN credentials or
- * config location, and nothing else the relay holds. An allow-list, because a
- * deny-list cannot be audited — a secret the relay gains later
- * is withheld by default rather than by remembering to add it. Codex, Claude
- * and Hermes each express their environment through this, so there is one
- * mechanism to check rather than three.
- */
-export function structuringChildEnv(
-  extra: readonly string[] = [],
-  source: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
-  const allowed = new Set([...STRUCTURING_BASE_ENV, ...extra]);
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined),
-  );
-}
 
 /**
  * The minimal environment a nested Claude CLI needs: its own login, a place to
@@ -551,15 +541,9 @@ export function codexChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.P
   return structuringChildEnv(["CODEX_HOME"], source);
 }
 
-/**
- * The Hermes CLI's environment: how to run, and where its own config lives
- * (`HERMES_HOME`, the same kind of variable as `CODEX_HOME` — a location, not
- * a credential). Hermes keeps its provider keys in `~/.hermes/.env`, which it
- * reads itself, so none of the relay's variables are needed and none are passed.
- */
-export function hermesChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return structuringChildEnv(["HERMES_HOME"], source);
-}
+// `hermesChildEnv` (HERMES_HOME on top of the base) is also shared/child-env.js
+// now — imported and re-exported above, not redefined here. mcp/mcp.js's own
+// Hermes-extracting child builds its environment the same way.
 
 /**
  * The one place a CliSpec's environment becomes a child's. `?? {}` matters:

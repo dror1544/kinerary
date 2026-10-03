@@ -32,6 +32,7 @@ const fetch                  = require('node-fetch');
 const crypto                 = require('crypto');
 const { execFile }           = require('child_process');
 const pdfParse               = require('pdf-parse');
+const { hermesChildEnv }     = require('../shared/child-env.js');
 
 const MCP_PORT    = parseInt(process.env.MCP_PORT || '3001');
 const API_BASE    = (process.env.API_BASE_URL || 'http://trip-server:3000').replace(/\/$/, '');
@@ -846,37 +847,19 @@ const HERMES_BIN             = process.env.HERMES_BIN || 'hermes';
 // executable, a place to write, a locale, certificates) plus HERMES_HOME — a
 // config-directory location, the same kind of variable as CODEX_HOME, not a
 // credential; Hermes reads its own provider keys from ~/.hermes/.env, never
-// from this process's environment (mirrors hermesChildEnv there). A
-// deny-list cannot be audited here either — issue #183: this bridge's own
-// secrets, HERMES_API_KEY (its MCP auth key) and API_BASE_URL (the trip site
-// it talks to), must never reach a process fed a stranger's uploaded PDF, and
-// neither should anything else this process happens to hold. Before this fix,
-// execFile below passed no `env` option at all — Node treats that as
-// "inherit everything" — so a prompt injection in an uploaded document ran
-// inside a process that could see both.
+// from this process's environment. A deny-list cannot be audited here
+// either — issue #183: this bridge's own secrets, HERMES_API_KEY (its MCP
+// auth key) and API_BASE_URL (the trip site it talks to), must never reach a
+// process fed a stranger's uploaded PDF, and neither should anything else
+// this process happens to hold. Before that fix, execFile below passed no
+// `env` option at all — Node treats that as "inherit everything" — so a
+// prompt injection in an uploaded document ran inside a process that could
+// see both.
 //
-// DUPLICATE, NOT SHARED — keep in sync by hand until unified: this list and
-// function are a byte-for-byte copy of control-plane/api/src/model-runner.ts's
-// STRUCTURING_BASE_ENV + hermesChildEnv (#153/#58), not an import of them.
-// mcp.js is plain CommonJS with no existing import path into
-// control-plane/api's TS/ESM build, and model-runner.ts is this task's
-// (#183) "must not touch" — owned by #153/#58 — so a real shared module is a
-// separate, cross-package task with its own brief, not folded into this fix.
-// If either copy's allow-list changes, check the other.
-const HERMES_CHILD_ENV_ALLOW = [
-  'PATH', 'HOME', 'XDG_CONFIG_HOME',
-  'TMPDIR', 'TMP', 'TEMP',
-  'LANG', 'LC_ALL', 'LC_CTYPE',
-  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
-  'HERMES_HOME',
-];
-
-function hermesChildEnv(source = process.env) {
-  const allowed = new Set(HERMES_CHILD_ENV_ALLOW);
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => allowed.has(key) && value !== undefined)
-  );
-}
+// SHARED, not a copy (#284): this used to be a byte-for-byte duplicate of
+// control-plane/api/src/model-runner.ts's STRUCTURING_BASE_ENV + hermesChildEnv
+// (#153/#58) — now both pull from ../shared/child-env.js (required at the top
+// of this file), the one place the allow-list is defined.
 
 async function extractPdfText(buf) {
   const { text } = await pdfParse(buf);
