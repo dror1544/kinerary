@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://kinerary.invalid/analytics/schemas/tripbot-event.v1.json",
   "title": "Trip Bot assistant event, v1",
-  "description": "One metadata-only fact about the Trip Bot's conversation with a family, as stored in control_plane.assistant_events. An ALLOW-LIST: every property is named here, additionalProperties is false, and there is deliberately no field that can carry text, a Telegram chat or user id, a name, a filename, a URL, a digest of any of those, or a tool argument/result. The relay writes delivery facts only and never an outcome of `answered` (design doc section 6.3: an emitter that cannot see tool results must not claim the task succeeded). Mirrored by control-plane/api/src/analytics/contract.ts; test/assistant-events-contract.test.ts fails if the two disagree.",
+  "description": "One metadata-only fact about the Trip Bot's conversation with a family, as stored in control_plane.assistant_events. An ALLOW-LIST: every property is named here, additionalProperties is false, and there is deliberately no field that can carry text, a Telegram chat or user id, a name, a filename, a URL, a digest of any of those, or a tool argument/result. The relay writes delivery facts only and never an outcome of `answered` (design doc section 6.3: an emitter that cannot see tool results must not claim the task succeeded) — and the word stays out of this contract's outcome vocabulary entirely, for every source_service, not just the relay's. A later source (`hermes`, a plugin that DOES see the tool it ran) reports its success outcome as `grounded_answer` instead: narrower and more honest than \"answered\" (it names what was verified, not that the organizer's question was satisfied). Mirrored by control-plane/api/src/analytics/contract.ts; test/assistant-events-contract.test.ts fails if the two disagree.",
   "type": "object",
   "additionalProperties": false,
   "required": ["event_id", "occurred_at", "source_service", "event_type", "outcome"],
@@ -24,8 +24,8 @@
       "format": "date-time"
     },
     "source_service": {
-      "description": "Who observed the fact. Only the relay emits in v1; a later emitter adds its own value.",
-      "enum": ["relay"]
+      "description": "Who observed the fact. `relay` observes delivery; `hermes` is the companion's own agent runtime plugin, observing one trip-mcp tool call.",
+      "enum": ["relay", "hermes"]
     },
     "event_type": {
       "enum": [
@@ -34,7 +34,8 @@
         "request_to_relay",
         "turn_lost",
         "reply_sent",
-        "relay_tool_completed"
+        "relay_tool_completed",
+        "tool_call_completed"
       ]
     },
     "turn_id": {
@@ -52,7 +53,7 @@
       "enum": ["organizer", "participant", "unknown", "unclassified", null]
     },
     "outcome": {
-      "description": "A delivery fact or, where the relay itself did the work, the substantive outcome. `answered` is not in this set on purpose.",
+      "description": "A delivery fact, or a substantive outcome from whichever source actually ran the tool (the relay for relay_tool_completed, Hermes's plugin for tool_call_completed). `answered` is not in this set on purpose — see this schema's top-level description.",
       "enum": [
         "ignored_not_addressed",
         "dispatched",
@@ -64,7 +65,8 @@
         "failed_tool",
         "blocked_by_policy",
         "correction_proposed",
-        "no_new_information"
+        "no_new_information",
+        "grounded_answer"
       ]
     },
     "response_latency_ms": {
@@ -171,6 +173,16 @@
           "outcome": { "enum": ["failed_tool", "blocked_by_policy", "correction_proposed", "no_new_information"] },
           "trip_id": { "type": "string" },
           "turn_id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "event_type": { "const": "tool_call_completed" } } },
+      "then": {
+        "required": ["trip_id"],
+        "properties": {
+          "outcome": { "enum": ["grounded_answer", "failed_tool"] },
+          "trip_id": { "type": "string" }
         }
       }
     }
