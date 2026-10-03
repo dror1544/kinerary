@@ -19,15 +19,20 @@ WHAT IT SENDS, AND WHAT IT NEVER SENDS. One POST per flushed batch to
 assistant-events/tool-outcomes`):
 
     {"profile": "<this trip's Hermes profile name>",
-     "events": [{"event_id": "<uuid4>", "outcome": "grounded_answer"|"failed_tool"}]}
+     "events": [{"event_id": "<uuid4>", "outcome": "grounded_answer"|"failed_tool"|"missing_data",
+                 "tool_name": "<one of KNOWN_TOOL_NAMES below>"}]}
 
-No tool name, no arguments, no result payload, no trip id, no chat id, no
-message text — see analytics/contract.ts's own module doc for why that
-allow-list exists; this plugin writes to the same closed vocabulary, not a
-looser one of its own. `outcome` is NEVER `"answered"` — see
-`classify_tool_outcome`'s docstring for the (deliberately conservative)
-two-value classification and why "narrower, not looser" cuts the way it does
-here specifically.
+No arguments, no result payload, no trip id, no chat id, no message text —
+see analytics/contract.ts's own module doc for why that allow-list exists;
+this plugin writes to the same closed vocabulary, not a looser one of its
+own. `tool_name` IS sent, deliberately: it is the one closed, bounded
+dimension the missing-information control loop's "top missing items"
+(docs/sprint6-tracks.md decision 22) needs to rank by, and it is a tool
+NAME from a fixed set, not tool ARGUMENTS or a RESULT — the line this plugin
+draws is "which tool", never "what it was asked" or "what it returned".
+`outcome` is NEVER `"answered"` — see `classify_tool_outcome`'s docstring
+for the (deliberately conservative) classification and why "narrower, not
+looser" cuts the way it does here specifically.
 
 INERT BY DEFAULT. With `ASSISTANT_EVENTS_INGEST_URL` or
 `ASSISTANT_EVENTS_INGEST_KEY` unset, `register()` still runs but every hook
@@ -169,8 +174,26 @@ def _unwrap_mcp_content(value: Any) -> Any:
 
 
 def classify_tool_outcome(tool_name: str, result: Any) -> Optional[str]:
-    """`"grounded_answer"` | `"failed_tool"` | `None` (not a tool this plugin
-    reports on at all — `tool_name` is not in `KNOWN_TOOL_NAMES`).
+    """`"grounded_answer"` | `"failed_tool"` | `"missing_data"` | `None` (not
+    a tool this plugin reports on at all — `tool_name` is not in
+    `KNOWN_TOOL_NAMES`).
+
+    #review 2026-10-03 (missing-information control loop, decision 22): rules
+    2 and 3 used to both return `failed_tool`, folding two different facts
+    into one — a REAL error (the tool broke), and the tool working fine but
+    the trip's own data having nothing to answer with. This file's own
+    earlier KNOWN LIMIT named the cost of that: "an all-empty result can
+    sometimes be a genuinely informative answer... this classifier cannot
+    tell those apart from the shape alone." Splitting `missing_data` out
+    does not fix that ambiguity (an empty `get_today` before the trip starts
+    is still indistinguishable from a trip with truly nothing booked) — it
+    reclassifies BOTH readings correctly: either way, this is a fact about
+    the TRIP'S DATA, not about the software breaking, so `missing_data` is
+    right for both, and conflating it with `failed_tool` (an infra/bug
+    signal an operator would act on completely differently) was the actual
+    bug. The grounded_answer/not-grounded_answer asymmetry below is
+    UNCHANGED — that risk (a false claim about companion trustworthiness)
+    was never about this distinction.
 
     DELIBERATELY CONSERVATIVE, and the direction of the conservatism matters:
     this REQUIRES a positive signal of real content before calling something
@@ -178,23 +201,16 @@ def classify_tool_outcome(tool_name: str, result: Any) -> Optional[str]:
     `grounded_answer` feeds `grounded_answer_rate` (analytics/rates.ts), a
     rate the daily report treats as evidence the companion is trustworthy —
     a false POSITIVE there is a wrong claim about product quality. A false
-    NEGATIVE (calling a real answer `failed_tool`) only costs one row off
+    NEGATIVE (calling a real answer something else) only costs one row off
     that rate's denominator, undercounting rather than overclaiming. So:
 
       1. An explicit MCP/HTTP error shape (`isError: true`, or a truthy
-         `error` field, before or after unwrapping) → `failed_tool`.
-      2. The unwrapped result is empty — `None`, `""`, `[]`, `{}` → `failed_tool`.
+         `error` field, before or after unwrapping) → `failed_tool`. A real
+         software/infra failure, never a data-completeness one.
+      2. The unwrapped result is empty — `None`, `""`, `[]`, `{}` → `missing_data`.
       3. The unwrapped result is a dict whose every value is itself empty by
          rule 2 (e.g. `get_phase_plan` returning `{"phases": []}`, or
-         `get_today` returning `{"phase": null, "day": null}`) → `failed_tool`.
-         KNOWN LIMIT, deliberately accepted rather than engineered around: an
-         all-empty result can sometimes be a genuinely informative answer
-         ("the trip hasn't started yet", "no bookings filed yet") rather than
-         a failure to retrieve anything — this classifier cannot tell those
-         apart from the shape alone, and per the asymmetry above, calling it
-         `failed_tool` is the side to err on. A per-tool refinement (e.g.
-         `get_today` before the trip starts is legitimately informative) is
-         real follow-up work, not done here — see the handover.
+         `get_today` returning `{"phase": null, "day": null}`) → `missing_data`.
       4. Anything else (non-empty, no error shape) → `grounded_answer`.
     """
     if tool_name not in KNOWN_TOOL_NAMES:
@@ -203,9 +219,9 @@ def classify_tool_outcome(tool_name: str, result: Any) -> Optional[str]:
     if _looks_like_error(result) or _looks_like_error(unwrapped):
         return "failed_tool"
     if _is_empty(unwrapped):
-        return "failed_tool"
+        return "missing_data"
     if isinstance(unwrapped, dict) and all(_is_empty(v) for v in unwrapped.values()):
-        return "failed_tool"
+        return "missing_data"
     return "grounded_answer"
 
 
@@ -277,8 +293,8 @@ def _send_async(events: List[Dict[str, Any]]) -> None:
     thread.start()
 
 
-def _build_event(outcome: str) -> Dict[str, Any]:
-    return {"event_id": str(uuid.uuid4()), "outcome": outcome}
+def _build_event(outcome: str, tool_name: str) -> Dict[str, Any]:
+    return {"event_id": str(uuid.uuid4()), "outcome": outcome, "tool_name": tool_name}
 
 
 # ── Hooks ─────────────────────────────────────────────────────────────────
@@ -299,7 +315,7 @@ def on_post_tool_call(*, tool_name: str = "", result: Any = None, **_: Any) -> N
         outcome = classify_tool_outcome(tool_name, result)
         if outcome is None:
             return
-        _send_async([_build_event(outcome)])
+        _send_async([_build_event(outcome, tool_name)])
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"on_post_tool_call failed: {exc}")
 

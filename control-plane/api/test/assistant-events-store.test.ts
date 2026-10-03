@@ -48,6 +48,7 @@ const ALLOWED_COLUMNS = [
   "requester_role",
   "response_latency_ms",
   "source_service",
+  "tool_name",
   "trigger_type",
   "trip_id",
   "turn_id",
@@ -90,6 +91,7 @@ function event(tripId: string, overrides: Partial<AssistantEvent> = {}): Assista
     message_length_bucket: "1_40",
     media_kind: "none",
     metadata: {},
+    tool_name: null,
     ...overrides,
   };
 }
@@ -151,7 +153,10 @@ describe("control_plane.assistant_events", () => {
       const batch: AssistantEvent[] = [];
       for (const type of EVENT_TYPES) {
         for (const outcome of EVENT_RULES[type].outcomes) {
-          batch.push(event(tripId, { event_type: type, outcome, turn_id: randomUUID() }));
+          batch.push(event(tripId, {
+            event_type: type, outcome, turn_id: randomUUID(),
+            tool_name: type === "tool_call_completed" ? "get_today" : null,
+          }));
         }
       }
       CHANNEL_TYPES.forEach((v) => batch.push(event(tripId, { channel_type: v })));
@@ -270,6 +275,57 @@ describe("rollupAssistantEvents at a window's edge", () => {
       assert.equal(next!.local_day, "2026-09-19");
       assert.equal(next!.replies.delivered, 1);
       assert.equal(next!.requests_forwarded, 0, "and the turn is not counted twice");
+    });
+  });
+});
+
+describe("rollupAssistantEvents — tool_call_completed (missing-information control loop, decision 22)", () => {
+  test("counts grounded_answer/failed_tool/missing_data, and groups missing_data by tool_name", { skip: SKIP }, async () => {
+    await withDb(async (pool, tripId) => {
+      await writeAssistantEvents(pool, [
+        event(tripId, {
+          event_type: "tool_call_completed", outcome: "grounded_answer", source_service: "hermes",
+          tool_name: "get_today", turn_id: null, channel_type: null, trigger_type: null,
+          requester_role: null, message_length_bucket: null, media_kind: null,
+        }),
+        event(tripId, {
+          event_type: "tool_call_completed", outcome: "failed_tool", source_service: "hermes",
+          tool_name: "get_today", turn_id: null, channel_type: null, trigger_type: null,
+          requester_role: null, message_length_bucket: null, media_kind: null,
+        }),
+        event(tripId, {
+          event_type: "tool_call_completed", outcome: "missing_data", source_service: "hermes",
+          tool_name: "get_booking_confirmation", turn_id: null, channel_type: null, trigger_type: null,
+          requester_role: null, message_length_bucket: null, media_kind: null,
+        }),
+        event(tripId, {
+          event_type: "tool_call_completed", outcome: "missing_data", source_service: "hermes",
+          tool_name: "get_booking_confirmation", turn_id: null, channel_type: null, trigger_type: null,
+          requester_role: null, message_length_bucket: null, media_kind: null,
+        }),
+        event(tripId, {
+          event_type: "tool_call_completed", outcome: "missing_data", source_service: "hermes",
+          tool_name: "get_budget", turn_id: null, channel_type: null, trigger_type: null,
+          requester_role: null, message_length_bucket: null, media_kind: null,
+        }),
+      ]);
+      const [day] = await rollupAssistantEvents(pool, { tripId });
+      assert.deepEqual(day!.assistant_tool_outcomes, {
+        grounded_answer: 1,
+        failed_tool: 1,
+        missing_data: 3,
+        missing_data_by_tool: { get_booking_confirmation: 2, get_budget: 1 },
+      });
+    });
+  });
+
+  test("a trip/day with no tool_call_completed events rolls up to all zeros, never undefined", { skip: SKIP }, async () => {
+    await withDb(async (pool, tripId) => {
+      await writeAssistantEvents(pool, [event(tripId)]);
+      const [day] = await rollupAssistantEvents(pool, { tripId });
+      assert.deepEqual(day!.assistant_tool_outcomes, {
+        grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {},
+      });
     });
   });
 });

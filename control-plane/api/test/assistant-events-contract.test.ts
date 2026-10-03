@@ -35,6 +35,7 @@ import {
   requesterRoleOf,
   REQUIRED_FIELDS,
   SOURCE_SERVICES,
+  TOOL_NAMES,
   TRIGGER_TYPES,
   validateAssistantEvent,
   type AssistantEvent,
@@ -214,6 +215,46 @@ describe("validateAssistantEvent", () => {
       assert.equal(result.ok, false, field);
       assert.equal(!result.ok && result.reason, `BAD:${field}`);
     }
+  });
+
+  // ── tool_call_completed: missing_data + tool_name (missing-information
+  // control loop, decision 22) ────────────────────────────────────────────
+
+  function toolCallCompleted(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+    return valid({
+      event_type: "tool_call_completed", source_service: "hermes", outcome: "grounded_answer",
+      turn_id: null, channel_type: null, trigger_type: null, requester_role: null,
+      message_length_bucket: null, media_kind: null, metadata: {}, tool_name: "get_today",
+      ...overrides,
+    });
+  }
+
+  test("tool_call_completed accepts missing_data as an outcome", () => {
+    const result = validateAssistantEvent(toolCallCompleted({ outcome: "missing_data" }));
+    assert.ok(result.ok, JSON.stringify(result));
+  });
+
+  test("tool_call_completed requires tool_name — missing it is refused, not defaulted", () => {
+    const result = validateAssistantEvent(toolCallCompleted({ tool_name: undefined }));
+    assert.deepEqual(result, { ok: false, reason: "MISSING:tool_name" });
+  });
+
+  test("tool_call_completed refuses a tool_name outside the closed set", () => {
+    const result = validateAssistantEvent(toolCallCompleted({ tool_name: "drop_table" }));
+    assert.deepEqual(result, { ok: false, reason: "BAD:tool_name" });
+  });
+
+  test("every tool_name in the closed set is accepted", () => {
+    for (const toolName of TOOL_NAMES) {
+      const result = validateAssistantEvent(toolCallCompleted({ tool_name: toolName }));
+      assert.ok(result.ok, `${toolName}: ${JSON.stringify(result)}`);
+    }
+  });
+
+  test("tool_name is null, never required, for every OTHER event type", () => {
+    const result = validateAssistantEvent(valid({ tool_name: undefined }));
+    assert.ok(result.ok, JSON.stringify(result));
+    assert.equal(result.ok && result.event.tool_name, null);
   });
 
   test("the relay can never write `answered`", () => {

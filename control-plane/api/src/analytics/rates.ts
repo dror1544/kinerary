@@ -43,9 +43,23 @@ export interface NotMeasurable {
   reason: string;
 }
 
-/** Reasons shared by the four assistant-side rates — one sentence, reused so the report and the rates agree word for word. */
+/**
+ * Reason shared by the two assistant-side rates still not measurable —
+ * traveller self-service and post-write trust. Reused so the report and the
+ * rates agree word for word.
+ *
+ * grounded_answer_rate and missing_data_rate moved OFF this list (missing-
+ * information control loop, decision 22): the Hermes plugin's
+ * `tool_call_completed` events give both a real denominator now
+ * (`DayRollup.assistant_tool_outcomes`) — see `deriveRates` below. They are
+ * `0`-valued, correctly, for a trip/day with no Hermes plugin reporting yet
+ * (no traffic observed, not "cannot be observed") — that distinction is
+ * exactly why this file's own rule (`rate()`: a zero denominator is `null`,
+ * never a fabricated `0`) still applies to them the same as every other
+ * rate here.
+ */
 export const NOT_MEASURABLE_REASON =
-  "requires an assistant-side outcome (verified-data answer, missing-data answer, self-service resolution, or post-write verification); the relay observes delivery facts only — this arrives with a later slice's assistant-side events";
+  "requires an assistant-side outcome (self-service resolution, or post-write verification); the relay observes delivery facts only — this arrives with a later slice's assistant-side events";
 
 export interface ChannelRoleRate {
   channel_type: string;
@@ -83,9 +97,12 @@ export interface DayRates {
   /** The same lost-turn rate and addressed share, cut by (channel_type, requester_role) — the one split the rollup actually carries. */
   by_channel_role: ChannelRoleRate[];
 
+  /** grounded_answer / (grounded_answer + failed_tool + missing_data) — the assistant's own tool calls, Hermes-reported. */
+  grounded_answer_rate: Rate;
+  /** missing_data / (grounded_answer + failed_tool + missing_data) — the missing-information control loop's detection rate. */
+  missing_data_rate: Rate;
+
   not_measurable: {
-    grounded_answer_rate: NotMeasurable;
-    missing_data_rate: NotMeasurable;
     traveller_self_service_rate: NotMeasurable;
     post_write_trust_rate: NotMeasurable;
   };
@@ -148,6 +165,8 @@ export function deriveRates(rollup: DayRollup): DayRates {
       Object.entries(rollup.documents.relay_read).map(([outcome, count]) => [outcome, rate(count, relayReadTotal)]),
     ),
   };
+  const { grounded_answer, failed_tool, missing_data } = rollup.assistant_tool_outcomes;
+  const toolCallsTotal = grounded_answer + failed_tool + missing_data;
 
   return {
     trip_id: rollup.trip_id,
@@ -164,9 +183,9 @@ export function deriveRates(rollup: DayRollup): DayRates {
     ),
     relay_read_outcomes: relayReadOutcomes,
     by_channel_role: rollup.by_channel_role.map(channelRoleRate),
+    grounded_answer_rate: rate(grounded_answer, toolCallsTotal),
+    missing_data_rate: rate(missing_data, toolCallsTotal),
     not_measurable: {
-      grounded_answer_rate: notMeasurable(),
-      missing_data_rate: notMeasurable(),
       traveller_self_service_rate: notMeasurable(),
       post_write_trust_rate: notMeasurable(),
     },
@@ -199,6 +218,12 @@ export function emptyDayRollup(tripId: string, localDay: string): DayRollup {
       forwarded_reply_delivered_substantive_outcome_unknown: 0,
       forwarded_unanswered: 0,
       relay_read: {},
+    },
+    assistant_tool_outcomes: {
+      grounded_answer: 0,
+      failed_tool: 0,
+      missing_data: 0,
+      missing_data_by_tool: {},
     },
   };
 }

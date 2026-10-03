@@ -53,7 +53,7 @@
       "enum": ["organizer", "participant", "unknown", "unclassified", null]
     },
     "outcome": {
-      "description": "A delivery fact, or a substantive outcome from whichever source actually ran the tool (the relay for relay_tool_completed, Hermes's plugin for tool_call_completed). `answered` is not in this set on purpose — see this schema's top-level description.",
+      "description": "A delivery fact, or a substantive outcome from whichever source actually ran the tool (the relay for relay_tool_completed, Hermes's plugin for tool_call_completed). `answered` is not in this set on purpose — see this schema's top-level description. `missing_data` is a tool_call_completed-only fact: the tool call itself worked, but the trip's own data had nothing to answer with — the missing-information control loop's detection signal, not a failure.",
       "enum": [
         "ignored_not_addressed",
         "dispatched",
@@ -66,7 +66,8 @@
         "blocked_by_policy",
         "correction_proposed",
         "no_new_information",
-        "grounded_answer"
+        "grounded_answer",
+        "missing_data"
       ]
     },
     "response_latency_ms": {
@@ -89,6 +90,26 @@
         "documents": { "type": "integer", "minimum": 0, "maximum": 20 },
         "document_held": { "type": "boolean" }
       }
+    },
+    "tool_name": {
+      "description": "Which trip-mcp/trip-control tool a tool_call_completed event is about — the missing-information control loop's 'which fact' dimension (decision 22: 'show the top missing items'). A closed set mirroring every tool mcp/mcp.js and companion-mcp.ts register today; required for tool_call_completed only (allOf below), null for every other event type, which has no comparable 'which thing' dimension to name.",
+      "enum": [
+        "health_check", "get_config", "get_agent_brief", "get_photos", "add_photo",
+        "delete_photo", "set_participant_avatar", "add_participant",
+        "reset_participant_password", "bind_participant_telegram", "remove_participant",
+        "set_telegram_group", "get_today", "get_companion_inbox", "publish_companion_reply",
+        "publish_companion_group_update", "set_companion_connection", "set_trip_timezone",
+        "publish_daily_message", "get_budget", "add_budget_item", "update_budget_item",
+        "delete_budget_item", "get_rsvps", "get_ratings", "get_tasks", "get_lost_found",
+        "post_lost_found", "resolve_lost_found", "get_venue_comments", "post_venue_comment",
+        "get_photo_comments", "post_photo_comment", "get_bookings", "add_booking",
+        "update_booking", "delete_booking", "upload_booking_confirmation",
+        "get_booking_confirmation", "get_trivia_state", "trivia_control", "get_trivia_scores",
+        "get_trivia_questions", "add_trivia_question", "get_phase_plan", "swap_plan_days",
+        "set_plan_day_label", "add_plan_item", "update_plan_item", "delete_plan_item",
+        "import_plan_from_bookings", "get_assistant_names", "set_assistant_names", "report_bug",
+        null
+      ]
     }
   },
   "allOf": [
@@ -179,10 +200,11 @@
     {
       "if": { "properties": { "event_type": { "const": "tool_call_completed" } } },
       "then": {
-        "required": ["trip_id"],
+        "required": ["trip_id", "tool_name"],
         "properties": {
-          "outcome": { "enum": ["grounded_answer", "failed_tool"] },
-          "trip_id": { "type": "string" }
+          "outcome": { "enum": ["grounded_answer", "failed_tool", "missing_data"] },
+          "trip_id": { "type": "string" },
+          "tool_name": { "type": "string" }
         }
       }
     }

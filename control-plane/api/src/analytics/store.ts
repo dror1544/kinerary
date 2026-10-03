@@ -68,7 +68,7 @@ export async function writeAssistantEvents(db: WriterDb, input: readonly unknown
         event_id uuid, trip_id text, occurred_at timestamptz, source_service text,
         event_type text, turn_id uuid, channel_type text, trigger_type text,
         requester_role text, outcome text, response_latency_ms integer,
-        message_length_bucket text, media_kind text, metadata jsonb
+        message_length_bucket text, media_kind text, metadata jsonb, tool_name text
       )
     ),
     known AS (
@@ -189,6 +189,22 @@ export interface DayRollup {
     /** The relay's own reads (one per upload burst), by substantive outcome — the relay IS the tool there. */
     relay_read: Record<string, number>;
   };
+  /**
+   * The assistant's OWN tool-outcome facts (`tool_call_completed`,
+   * `source_service: "hermes"`) — the signal `rates.ts`'s
+   * `grounded_answer_rate`/`missing_data_rate` and the daily report's "top
+   * missing items" (missing-information control loop, decision 22) are
+   * built from. Absent entirely from a trip/day with no Hermes plugin
+   * reporting — `emptyDayRollup` zeroes it the same as every other field,
+   * never a fabricated rate.
+   */
+  assistant_tool_outcomes: {
+    grounded_answer: number;
+    failed_tool: number;
+    missing_data: number;
+    /** `missing_data` only, by which tool returned nothing — the report's "top missing items" source. */
+    missing_data_by_tool: Record<string, number>;
+  };
 }
 
 interface EventRow {
@@ -203,6 +219,7 @@ interface EventRow {
   local_day: string;
   occurred_at: Date;
   trip_id: string;
+  tool_name: string | null;
 }
 
 /**
@@ -231,7 +248,7 @@ export async function rollupAssistantEvents(
   const timeZone = options.timeZone ?? "UTC";
   const res = await db.query<EventRow>(
     `SELECT event_type, turn_id::text AS turn_id, channel_type, trigger_type, requester_role,
-            outcome, response_latency_ms, metadata, trip_id, occurred_at,
+            outcome, response_latency_ms, metadata, trip_id, occurred_at, tool_name,
             to_char(occurred_at AT TIME ZONE $1, 'YYYY-MM-DD') AS local_day
        FROM control_plane.assistant_events
       WHERE trip_id IS NOT NULL
@@ -292,6 +309,12 @@ export async function rollupAssistantEvents(
           forwarded_reply_delivered_substantive_outcome_unknown: 0,
           forwarded_unanswered: 0,
           relay_read: {},
+        },
+        assistant_tool_outcomes: {
+          grounded_answer: 0,
+          failed_tool: 0,
+          missing_data: 0,
+          missing_data_by_tool: {},
         },
       };
       days.set(key, day);
@@ -366,6 +389,19 @@ export async function rollupAssistantEvents(
       case "relay_tool_completed":
         // One per read the relay ran (one upload burst), by its outcome.
         day.documents.relay_read[row.outcome] = (day.documents.relay_read[row.outcome] ?? 0) + 1;
+        break;
+      case "tool_call_completed":
+        // The assistant's own fact about one trip-mcp tool call (Hermes
+        // plugin) — the signal grounded_answer_rate/missing_data_rate and
+        // the daily report's "top missing items" are built from.
+        if (row.outcome === "grounded_answer") day.assistant_tool_outcomes.grounded_answer += 1;
+        else if (row.outcome === "failed_tool") day.assistant_tool_outcomes.failed_tool += 1;
+        else if (row.outcome === "missing_data") {
+          day.assistant_tool_outcomes.missing_data += 1;
+          const tool = row.tool_name ?? "unclassified";
+          day.assistant_tool_outcomes.missing_data_by_tool[tool] =
+            (day.assistant_tool_outcomes.missing_data_by_tool[tool] ?? 0) + 1;
+        }
         break;
       default:
         // An event type this rollup does not know is not silently folded into

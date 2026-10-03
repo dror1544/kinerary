@@ -63,25 +63,25 @@ class ClassificationTests(unittest.TestCase):
     def test_a_bare_error_field_is_failed(self) -> None:
         self.assertEqual(plugin.classify_tool_outcome("get_config", {"error": "not found"}), "failed_tool")
         # An empty error string is not a TRUTHY error (rule 1 does not fire),
-        # but the dict's only value is itself empty, so rule 3 does: still
-        # failed_tool, just by a different rule.
-        self.assertEqual(plugin.classify_tool_outcome("get_config", {"error": ""}), "failed_tool")
+        # and the dict's only value is itself empty, so rule 3 does instead:
+        # missing_data, not failed_tool — there is no real error here, just
+        # an empty result shaped like one.
+        self.assertEqual(plugin.classify_tool_outcome("get_config", {"error": ""}), "missing_data")
 
-    def test_a_dict_whose_every_value_is_empty_is_failed(self) -> None:
+    def test_a_dict_whose_every_value_is_empty_is_missing_data(self) -> None:
         # get_phase_plan with nothing planned yet.
-        self.assertEqual(plugin.classify_tool_outcome("get_phase_plan", {"phases": []}), "failed_tool")
-        # get_today before the trip starts — KNOWN LIMIT, see the docstring:
-        # this is arguably informative, and is still classified failed_tool
-        # on purpose (the conservative direction).
-        self.assertEqual(plugin.classify_tool_outcome("get_today", {"phase": None, "day": None}), "failed_tool")
+        self.assertEqual(plugin.classify_tool_outcome("get_phase_plan", {"phases": []}), "missing_data")
+        # get_today before the trip starts: a data-completeness fact, not a
+        # software failure — #review 2026-10-03 split this from failed_tool.
+        self.assertEqual(plugin.classify_tool_outcome("get_today", {"phase": None, "day": None}), "missing_data")
 
-    def test_none_and_empty_results_are_failed(self) -> None:
+    def test_none_and_empty_results_are_missing_data(self) -> None:
         for empty in (None, "", [], {}, "   "):
-            self.assertEqual(plugin.classify_tool_outcome("get_budget", empty), "failed_tool", repr(empty))
+            self.assertEqual(plugin.classify_tool_outcome("get_budget", empty), "missing_data", repr(empty))
 
     def test_the_mcp_text_envelope_is_unwrapped_before_judging_emptiness(self) -> None:
         wrapped_empty = {"content": [{"type": "text", "text": "[]"}]}
-        self.assertEqual(plugin.classify_tool_outcome("get_bookings", wrapped_empty), "failed_tool")
+        self.assertEqual(plugin.classify_tool_outcome("get_bookings", wrapped_empty), "missing_data")
         wrapped_real = {"content": [{"type": "text", "text": '[{"id": "b1"}]'}]}
         self.assertEqual(plugin.classify_tool_outcome("get_bookings", wrapped_real), "grounded_answer")
 
@@ -140,7 +140,7 @@ class ConfigGateTests(unittest.TestCase):
             event = calls[0][0]
             self.assertEqual(event["outcome"], "grounded_answer")
             self.assertRegex(event["event_id"], r"^[0-9a-f-]{36}$")
-            self.assertNotIn("tool_name", event, "no tool identity leaves this hook")
+            self.assertEqual(event["tool_name"], "get_config", "the tool name DOES leave this hook — decision 22")
             self.assertNotIn("trip_id", event, "no trip id leaves this hook")
         finally:
             plugin._send_async = original  # type: ignore
@@ -167,7 +167,7 @@ class ConfigGateTests(unittest.TestCase):
         original_post = plugin._post_batch
         plugin._post_batch = lambda *a, **k: posted.append((a, k))  # type: ignore
         try:
-            plugin._send_async([plugin._build_event("grounded_answer")])
+            plugin._send_async([plugin._build_event("grounded_answer", "get_config")])
             self.assertEqual(posted, [], "an unresolvable profile must never be sent as an empty string")
         finally:
             plugin._post_batch = original_post  # type: ignore
@@ -216,7 +216,7 @@ class DeliveryThreadTests(unittest.TestCase):
 
         def run():
             try:
-                plugin._post_batch("http://127.0.0.1:1/nope", "k", "profile-x", [plugin._build_event("failed_tool")], 0.5)
+                plugin._post_batch("http://127.0.0.1:1/nope", "k", "profile-x", [plugin._build_event("failed_tool", "get_config")], 0.5)
             except BaseException as exc:  # pragma: no cover - the assertion is that this never happens
                 exceptions.append(exc)
 

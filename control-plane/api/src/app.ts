@@ -1901,14 +1901,17 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   //
   // The assistant-side half of the outcome-event pipeline (#177/#326): a
   // companion's Hermes plugin posts a batch of `{event_id, outcome,
-  // occurred_at?}` facts about its OWN trip-mcp tool calls — `grounded_answer`
-  // or `failed_tool`, never `answered` (analytics/contract.ts). The request
-  // names the Hermes PROFILE reporting, never a trip id; `hermes-ingest.ts`
-  // resolves the one trip that profile belongs to (`trips.hermes_profile`)
-  // before anything is written, so a key leaked from one trip's companion
-  // still cannot name another trip in the body.
+  // tool_name, occurred_at?}` facts about its OWN trip-mcp tool calls —
+  // `grounded_answer`, `failed_tool` or `missing_data` (the tool worked, the
+  // trip's own data had nothing to answer with — the missing-information
+  // control loop's detection signal, decision 22), never `answered`
+  // (analytics/contract.ts). The request names the Hermes PROFILE
+  // reporting, never a trip id; `hermes-ingest.ts` resolves the one trip
+  // that profile belongs to (`trips.hermes_profile`) before anything is
+  // written, so a key leaked from one trip's companion still cannot name
+  // another trip in the body.
   //
-  // Body: { profile: string, events: [{ event_id, outcome, occurred_at? }] }
+  // Body: { profile: string, events: [{ event_id, outcome, tool_name, occurred_at? }] }
   // (at most hermes-ingest.ts's MAX_BATCH_SIZE entries). A profile with no trip,
   // or more than one, is a 404/409 and nothing is written; a malformed
   // profile or batch shape is 400 before the database is touched. A
