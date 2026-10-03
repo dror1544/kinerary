@@ -17,13 +17,17 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-TOOL = REPO / "scripts/hermes-patches.sh"
+# HERMES_PATCHES_TOOL points the suite at another copy of the script — how the
+# new write-phase tests were shown to fail against the version they replaced.
+TOOL = Path(os.environ.get("HERMES_PATCHES_TOOL") or REPO / "scripts/hermes-patches.sh")
 BUILD = REPO / "control-plane/deployment/build-hermes-image.sh"
 
 # macOS's own bash (3.2) where there is one: a script run over ssh or by hand gets
@@ -58,28 +62,90 @@ done
 echo "$n passed"
 """
 
-# A `patch` that delegates, except that the Nth REAL forward application fails —
-# the disk-full / killed-halfway case no dry-run can foresee.
+# A `patch` that delegates to the real one, except on the Nth REAL forward
+# application (dry runs and reverse applications always pass through):
+#   FAKE_PATCH_FAIL_AT=N     fail before writing anything — disk full, killed.
+#   FAKE_PATCH_PARTIAL_AT=N  write some of the patch's files (FAKE_PATCH_PARTIAL_FILES,
+#                            relative to the -d tree: append to an existing file,
+#                            create a missing one, chmod 600 the first), then fail —
+#                            what a patch that dies halfway leaves behind.
+#   FAKE_PATCH_BLOCK_AT=N    apply the whole patch, then announce itself (pid in
+#                            FAKE_PATCH_PID, then FAKE_PATCH_READY appears) and
+#                            block on a FIFO nobody writes to: mid-write, until killed.
 FAKE_PATCH = """#!/bin/sh
 real=/usr/bin/patch
 case " $* " in
   *" --dry-run "*|*" --reverse "*|*" -R "*) exec "$real" "$@" ;;
 esac
+dir=.
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-d" ] && dir="$a"
+  prev="$a"
+done
 n=$(cat "$FAKE_PATCH_COUNTER" 2>/dev/null || echo 0)
 n=$((n + 1))
 echo "$n" > "$FAKE_PATCH_COUNTER"
 [ "$n" = "$FAKE_PATCH_FAIL_AT" ] && { echo "fake patch: write failed" >&2; exit 1; }
+if [ "$n" = "$FAKE_PATCH_PARTIAL_AT" ]; then
+  first=1
+  for f in $FAKE_PATCH_PARTIAL_FILES; do
+    mkdir -p "$(dirname "$dir/$f")"
+    echo "PARTIAL WRITE" >> "$dir/$f"
+    [ "$first" = 1 ] && chmod 600 "$dir/$f"
+    first=0
+  done
+  echo "fake patch: died halfway" >&2
+  exit 1
+fi
+if [ "$n" = "$FAKE_PATCH_BLOCK_AT" ]; then
+  "$real" "$@" || exit 1
+  echo $$ > "$FAKE_PATCH_PID"
+  : > "$FAKE_PATCH_READY"
+  read -r _ < "$FAKE_PATCH_FIFO"
+  exit 1
+fi
 exec "$real" "$@"
+"""
+
+# A `cp` that blocks the first time it writes INTO the tree (the restoration;
+# the backups are written elsewhere), so a second signal can be sent while the
+# restoration is under way.
+FAKE_CP = """#!/bin/sh
+for last; do :; done
+case "$last" in
+  *"$FAKE_CP_BLOCK_MATCH"*)
+    if [ ! -e "$FAKE_CP_READY" ]; then
+      : > "$FAKE_CP_READY"
+      read -r _ < "$FAKE_CP_FIFO"
+    fi ;;
+esac
+exec /bin/cp "$@"
 """
 
 
 def snapshot(root: Path) -> dict[str, str]:
-    """Every file under root with a content hash — equality is 'nothing changed'."""
+    """Every file AND directory under root, with content hash and mode — equality
+    is 'nothing changed', down to a directory left behind or a chmod."""
     out: dict[str, str] = {}
     for p in sorted(root.rglob("*")):
+        rel = str(p.relative_to(root))
+        mode = oct(p.stat().st_mode & 0o7777)
         if p.is_file():
-            out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+            out[rel] = f"{hashlib.sha256(p.read_bytes()).hexdigest()} {mode}"
+        elif p.is_dir():
+            out[rel + "/"] = mode
     return out
+
+
+def wait_for(path: Path, what: str, timeout: float = 60.0) -> None:
+    """Wait for a file a stand-in creates to say 'I am here'. Not a pause: the
+    tests below act on the event, never on elapsed time."""
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.01)
 
 
 def unified(before: Path | None, after: Path, label: str) -> str:
@@ -105,6 +171,9 @@ class HermesPatchTool(unittest.TestCase):
         self.python = self.work / "bin/python"
         self.write(self.work, "bin/python", FAKE_PYTHON)
         self.python.chmod(0o755)
+        # Modes are part of "byte-identical": a patch that dies halfway may chmod.
+        (self.tree / "pkg/thing.py").chmod(0o640)
+        (self.tree / "pkg/api.py").chmod(0o750)
         self.make_patch("0001-answer.patch", "pkg/thing.py", STOCK_THING, PATCHED_THING, TEST_ANSWER)
 
     def tearDown(self) -> None:
@@ -143,6 +212,22 @@ class HermesPatchTool(unittest.TestCase):
             [BASH, str(TOOL), mode, "--patches", str(self.patches), str(tree or self.tree)],
             capture_output=True, text=True, env=env,
         )
+
+    def tool_env(self, extra_env: dict[str, str]) -> dict[str, str]:
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_PATCH_PYTHON"}
+        env["TMPDIR"] = str(self.tmpdir)
+        env["HERMES_PATCH_PYTHON"] = str(self.python)
+        env.update(extra_env)
+        return env
+
+    def install_fake(self, name: str, text: str) -> Path:
+        self.write(self.work, f"fakebin/{name}", text)
+        (self.work / "fakebin" / name).chmod(0o755)
+        return self.work / "fakebin"
+
+    def two_patches(self) -> None:
+        self.make_patch("0002-second.patch", "pkg/api.py", STOCK_API,
+                        STOCK_API + "\n\ndef added():\n    return 1\n", None)
 
     def assertNoTempLeft(self) -> None:
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the script left its temp directory behind")
@@ -259,8 +344,128 @@ class HermesPatchTool(unittest.TestCase):
             "FAKE_PATCH_FAIL_AT": "4",   # two scratch applications, then tree patch 1, then tree patch 2
         })
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertIn("reversing what was applied", r.stderr)
+        self.assertIn("restoring", r.stderr)
         self.assertEqual(snapshot(self.tree), before, "a half-applied tree was left behind")
+        self.assertNoTempLeft()
+
+    # ── a patch that dies halfway, and a process that is interrupted ────────
+    def fail_halfway(self, write_number: str, files: str, *, two: bool = False) -> None:
+        """Apply with a `patch` that writes `files`, then fails, on real write
+        number `write_number`; the tree must come back byte-identical."""
+        if two:
+            self.two_patches()
+        fake_bin = self.install_fake("patch", FAKE_PATCH)
+        before = snapshot(self.tree)
+        r = self.run_tool("apply", extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_PATCH_COUNTER": str(self.work / "counter"),
+            "FAKE_PATCH_PARTIAL_AT": write_number,
+            "FAKE_PATCH_PARTIAL_FILES": files,
+        })
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("restoring", r.stderr)
+        self.assertEqual(snapshot(self.tree), before,
+                         "the failing patch's own partial writes were left in the tree")
+        self.assertNoTempLeft()
+
+    def test_a_patch_that_modifies_a_file_then_fails_leaves_the_tree_as_it_was(self) -> None:
+        self.fail_halfway("2", "pkg/thing.py")
+
+    def test_a_patch_that_creates_a_file_then_fails_leaves_no_file_and_no_directory(self) -> None:
+        self.fail_halfway("2", "tests/test_0001_answer.py")
+        self.assertFalse((self.tree / "tests").exists(), "the directory the patch created is still there")
+
+    def test_a_patch_that_creates_and_modifies_then_fails_leaves_the_tree_as_it_was(self) -> None:
+        self.fail_halfway("2", "pkg/thing.py tests/test_0001_answer.py")
+
+    def test_the_second_patch_failing_halfway_takes_the_first_back_out_too(self) -> None:
+        self.fail_halfway("4", "pkg/api.py", two=True)
+
+    # Interruption. The second patch is applied by a stand-in that has written
+    # everything and then blocks, announcing itself through a file; the signal is
+    # sent only after that announcement, so nothing here depends on timing.
+    def start_interrupted_apply(self) -> tuple[subprocess.Popen[str], dict[str, Path]]:
+        self.two_patches()
+        fake_bin = self.install_fake("patch", FAKE_PATCH)
+        self.install_fake("cp", FAKE_CP)
+        paths = {name: self.work / name for name in ("patch.pid", "patch.ready", "patch.fifo",
+                                                     "cp.ready", "cp.fifo")}
+        os.mkfifo(paths["patch.fifo"])
+        os.mkfifo(paths["cp.fifo"])
+        env = self.tool_env({
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_PATCH_COUNTER": str(self.work / "counter"),
+            "FAKE_PATCH_BLOCK_AT": "4",   # two scratch writes, tree patch 1, tree patch 2
+            "FAKE_PATCH_PID": str(paths["patch.pid"]),
+            "FAKE_PATCH_READY": str(paths["patch.ready"]),
+            "FAKE_PATCH_FIFO": str(paths["patch.fifo"]),
+            "FAKE_CP_BLOCK_MATCH": "/hermes/",     # only a write INTO the tree blocks
+            "FAKE_CP_READY": str(paths["cp.ready"]),
+            "FAKE_CP_FIFO": str(paths["cp.fifo"]),
+        })
+        proc = subprocess.Popen(
+            [BASH, str(TOOL), "apply", "--patches", str(self.patches), str(self.tree)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        wait_for(paths["patch.ready"], "the second patch to be mid-write")
+        # Patch 1 is in the tree and so are patch 2's writes: the signal lands on a dirty tree.
+        self.assertEqual((self.tree / "pkg/thing.py").read_text(), PATCHED_THING)
+        return proc, paths
+
+    def assert_interrupted_cleanly(self, proc: subprocess.Popen[str], paths: dict[str, Path],
+                                   before: dict[str, str], code: int) -> None:
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, code, out + err)
+        self.assertEqual(snapshot(self.tree), before, "an interrupted apply left a half-patched tree")
+        self.assertNoTempLeft()
+        pid = int(paths["patch.pid"].read_text())
+        with self.assertRaises(ProcessLookupError, msg="the patch child is still running"):
+            os.kill(pid, 0)
+
+    def release(self, fifo: Path) -> None:
+        fd = os.open(fifo, os.O_WRONLY)
+        try:
+            os.write(fd, b"go\n")
+        finally:
+            os.close(fd)
+
+    def interrupt_once(self, sig: int, code: int) -> None:
+        before = snapshot(self.tree)
+        proc, paths = self.start_interrupted_apply()
+        self.assertNotEqual(snapshot(self.tree), before, "the apply was not mid-write")
+        proc.send_signal(sig)
+        # The restoration copies files back into the tree through the stand-in cp,
+        # which blocks; let it through so this variant ends.
+        wait_for(paths["cp.ready"], "the restoration to start")
+        self.release(paths["cp.fifo"])
+        self.assert_interrupted_cleanly(proc, paths, before, code)
+
+    def test_sigterm_during_the_second_write_restores_the_tree(self) -> None:
+        self.interrupt_once(signal.SIGTERM, 143)
+
+    def test_sigint_during_the_second_write_restores_the_tree(self) -> None:
+        self.interrupt_once(signal.SIGINT, 130)
+
+    def test_sighup_during_the_second_write_restores_the_tree(self) -> None:
+        self.interrupt_once(signal.SIGHUP, 129)
+
+    def test_a_second_signal_during_restoration_does_not_leave_it_half_done(self) -> None:
+        before = snapshot(self.tree)
+        proc, paths = self.start_interrupted_apply()
+        proc.send_signal(signal.SIGTERM)
+        wait_for(paths["cp.ready"], "the restoration to be under way")
+        # Restoration is blocked inside its first copy. Hit it again, and again.
+        proc.send_signal(signal.SIGINT)
+        proc.send_signal(signal.SIGTERM)
+        self.assertIsNone(proc.poll(), "the script died mid-restoration")
+        self.release(paths["cp.fifo"])
+        self.assert_interrupted_cleanly(proc, paths, before, 143)
+
+    def test_an_apply_that_is_not_interrupted_leaves_no_backup_and_exits_zero(self) -> None:
+        r = self.run_tool("apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("restoring", r.stderr)
         self.assertNoTempLeft()
 
     # ── refusals before anything runs ────────────────────────────────────────

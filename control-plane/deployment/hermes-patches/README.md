@@ -43,12 +43,20 @@ test files, with its source hunks left out, already pass — upstream fixed it;
 reported, never applied, exit 1 so a person decides) or `CONFLICT`. Then the
 test files the patches add or touch run on the fully patched copy; one failure
 refuses. `apply` writes only when every patch is `APPLIES` or `ALREADY-APPLIED`
-and the tests pass, reverses a patch that fails midway, and compares what it
-wrote with the tested copy. It stamps no manifest — that file is the image
-build's. The interpreter comes from `HERMES_PATCH_PYTHON` only; unset, the tool
-refuses (the path is per machine, and this repo names no machine). Exit codes:
-0 ready, 1 not ready, 2 could not start. `tests/scripts/test_hermes_patches_tool.py`
-drives it against a fixture tree, one test per classification.
+and the tests pass, and is all-or-nothing: before the first write it copies
+every file the patches touch (bytes, mode, and whether it existed) into its temp
+directory, and any unsuccessful exit after that — a patch that fails or dies
+halfway, a failed final comparison with the tested copy, INT, TERM or HUP —
+restores the tree from those copies, deleting what the patches created, before
+the temp directory goes. Restoration ignores further signals and stops a still
+running `patch` first; if it cannot finish it keeps the temp directory and names
+it. It stamps no manifest — that file is the image build's. The interpreter
+comes from `HERMES_PATCH_PYTHON` only; unset, the tool refuses (the path is per
+machine, and this repo names no machine). Exit codes: 0 ready, 1 not ready,
+2 could not start, 128+N when stopped by signal N.
+`tests/scripts/test_hermes_patches_tool.py` drives it against a fixture tree:
+one test per classification, and for the write phase a stand-in `patch` that
+dies halfway and one that blocks mid-write while signals arrive.
 
 The apply logic is not shared with `build-hermes-image.sh`: that script writes a
 `.kinerary-patches` manifest into the tree and refuses a tree that already
