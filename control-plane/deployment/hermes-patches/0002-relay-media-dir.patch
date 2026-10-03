@@ -1,8 +1,10 @@
+diff --git a/gateway/relay/media.py b/gateway/relay/media.py
+index 4b957f4165..3b2233d033 100644
 --- a/gateway/relay/media.py
 +++ b/gateway/relay/media.py
-@@ -51,6 +51,35 @@
- 
- _REQUEST_TIMEOUT_S = 30.0
+@@ -48,6 +48,35 @@ def media_base_url(relay_dial_url: str) -> str:
+         raw = raw[: -len("/relay")]
+     return raw
  
 +# Where a downloaded attachment is saved, when the deployment needs to say.
 +#
@@ -34,9 +36,9 @@
 +    return raw
 +
  
- def media_base_url(relay_dial_url: str) -> str:
-     """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` base.
-@@ -191,7 +220,8 @@
+ class RelayMediaClient:
+     """Authenticated client for the connector's ``/relay/media`` routes."""
+@@ -145,7 +174,8 @@ class RelayMediaClient:
                      if not ext:
                          mime = (resp.headers.get("Content-Type") or "").split(";")[0]
                          ext = mimetypes.guess_extension(mime) or ".bin"
@@ -46,18 +48,20 @@
                      with os.fdopen(fd, "wb") as fh:
                          fh.write(data)
                      return tmp_path
-@@ -202,4 +232,4 @@
+@@ -156,4 +186,4 @@ class RelayMediaClient:
          return await asyncio.get_running_loop().run_in_executor(None, _get)
  
  
 -__all__ = ["RelayMediaClient", "media_base_url", "MEDIA_MAX_BYTES"]
 +__all__ = ["RelayMediaClient", "media_base_url", "media_dir", "MEDIA_MAX_BYTES"]
+diff --git a/tests/gateway/relay/test_relay_media.py b/tests/gateway/relay/test_relay_media.py
+index c78cf52766..19a2913d9b 100644
 --- a/tests/gateway/relay/test_relay_media.py
 +++ b/tests/gateway/relay/test_relay_media.py
-@@ -176,3 +176,103 @@
-     empty = tmp_path / "empty.bin"
-     empty.write_bytes(b"")
-     assert await c.upload(str(empty)) is None
+@@ -286,3 +286,103 @@ async def test_download_routes_auth_decision_through_is_relay_media_url(monkeypa
+     assert await c.download("https://cdn.discordapp.com/attachments/1/2/i.png")
+     assert asked[-1] == "https://cdn.discordapp.com/attachments/1/2/i.png"
+     assert len(seen) == 1 and "Authorization" not in seen[0]
 +
 +
 +# ── Where a downloaded attachment lands ──────────────────────────────────
