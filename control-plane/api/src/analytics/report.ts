@@ -112,12 +112,18 @@ function usageSection(rollup: DayRollup, rates: DayRates): ReportSection {
   };
 }
 
-/** Every line here needs an assistant-side judgement the relay does not make — no source in this slice. */
-function valueDeliveredSection(): ReportSection {
+/** Every OTHER line here still needs an assistant-side judgement this slice has no source for. */
+function valueDeliveredSection(rollup: DayRollup, rates: DayRates): ReportSection {
+  const toolCalls = rollup.assistant_tool_outcomes;
+  const noToolCalls = toolCalls.grounded_answer + toolCalls.failed_tool + toolCalls.missing_data === 0;
   return {
     title: "Value Delivered",
     lines: [
-      noDataLine("Questions answered from verified website data"),
+      line(
+        "Questions answered from verified website data",
+        fmtPercent(rates.grounded_answer_rate),
+        noToolCalls,
+      ),
       noDataLine("Questions answered with partial data"),
       noDataLine("Questions that required organizer intervention"),
       noDataLine("Repeated questions that the assistant handled"),
@@ -165,12 +171,27 @@ function learningSection(): ReportSection {
   };
 }
 
-/** Every line here needs an assistant-side judgement the relay does not make — no source in this slice. */
-function organizerEnablementSection(): ReportSection {
+/**
+ * "Top 3 missing items" is now real — the missing-information control loop
+ * (Sprint 6 build list, decision 22: "detect a missing fact, record it,
+ * show the top missing items in the daily report"). Grouped by tool name
+ * (the closed, bounded dimension `missing_data` events carry — see
+ * contract.ts's `TOOL_NAMES`), descending by count, capped at 3; empty when
+ * no Hermes plugin reported a missing-data fact that day. The other two
+ * lines are decision 22's explicitly deferred two-thirds — generating the
+ * organizer-facing request text, and tracking whether it was fulfilled —
+ * next sprint's work, not this one's.
+ */
+function organizerEnablementSection(rollup: DayRollup): ReportSection {
+  const byTool = rollup.assistant_tool_outcomes.missing_data_by_tool;
+  const top3 = Object.entries(byTool).sort(([, a], [, b]) => b - a).slice(0, 3);
+  const topMissingLine = top3.length === 0
+    ? noDataLine("Top 3 missing items to request from the organizer")
+    : line("Top 3 missing items to request from the organizer", top3.map(([tool, n]) => `${tool}: ${n}`).join(", "));
   return {
     title: "Organizer Enablement",
     lines: [
-      noDataLine("Top 3 missing items to request from the organizer"),
+      topMissingLine,
       noDataLine("The traveler value unlocked by each item"),
       noDataLine("Suggested message to ask for those items"),
     ],
@@ -189,14 +210,14 @@ export function renderDailyReport(rollup: DayRollup): { json: DailyReport; markd
     local_day: rollup.local_day,
     notes: [
       ...rates.known_limits,
-      `four rates are not measurable this slice: grounded-answer rate, missing-data rate, traveller self-service rate, post-write trust rate — ${rates.not_measurable.grounded_answer_rate.reason}`,
+      `two rates are not measurable this slice: traveller self-service rate, post-write trust rate — ${rates.not_measurable.traveller_self_service_rate.reason}`,
     ],
     sections: [
       usageSection(rollup, rates),
-      valueDeliveredSection(),
+      valueDeliveredSection(rollup, rates),
       informationQualitySection(rollup, rates),
       learningSection(),
-      organizerEnablementSection(),
+      organizerEnablementSection(rollup),
     ],
   };
   return { json, markdown: toMarkdown(json) };

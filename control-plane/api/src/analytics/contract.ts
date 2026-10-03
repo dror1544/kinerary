@@ -80,8 +80,43 @@ export const OUTCOMES = [
   "correction_proposed",
   "no_new_information",
   "grounded_answer",
+  "missing_data",
 ] as const;
 export type Outcome = (typeof OUTCOMES)[number];
+
+/**
+ * The closed set of trip-mcp/trip-control tools a `tool_call_completed`
+ * event may name — the missing-information control loop's "which fact was
+ * missing" dimension (Sprint 6 build list, docs/sprint6-tracks.md decision
+ * 22: "detect a missing fact, record it, show the top missing items").
+ * Mirrors `.agents/hermes-plugins/assistant-events/__init__.py`'s
+ * `KNOWN_TOOL_NAMES` literally — that file cannot import this one (it loads
+ * inside a Python Hermes process), so the two lists are kept in sync by
+ * convention, the same way as every other duplicated-not-imported constant
+ * in this codebase (see admin-mutations.ts's `TRIP_ID_FORMAT`). A tool added
+ * to `mcp/mcp.js`/`companion-mcp.ts` and not here simply gets no
+ * `tool_call_completed` event — safe by omission, not a crash.
+ */
+export const TOOL_NAMES = [
+  // mcp/mcp.js (the trip SITE bridge)
+  "health_check", "get_config", "get_agent_brief", "get_photos", "add_photo",
+  "delete_photo", "set_participant_avatar", "add_participant",
+  "reset_participant_password", "bind_participant_telegram", "remove_participant",
+  "set_telegram_group", "get_today", "get_companion_inbox", "publish_companion_reply",
+  "publish_companion_group_update", "set_companion_connection", "set_trip_timezone",
+  "publish_daily_message", "get_budget", "add_budget_item", "update_budget_item",
+  "delete_budget_item", "get_rsvps", "get_ratings", "get_tasks", "get_lost_found",
+  "post_lost_found", "resolve_lost_found", "get_venue_comments", "post_venue_comment",
+  "get_photo_comments", "post_photo_comment", "get_bookings", "add_booking",
+  "update_booking", "delete_booking", "upload_booking_confirmation",
+  "get_booking_confirmation", "get_trivia_state", "trivia_control", "get_trivia_scores",
+  "get_trivia_questions", "add_trivia_question", "get_phase_plan", "swap_plan_days",
+  "set_plan_day_label", "add_plan_item", "update_plan_item", "delete_plan_item",
+  "import_plan_from_bookings",
+  // control-plane/api/src/companion-mcp.ts (the trip CONTROL server)
+  "get_assistant_names", "set_assistant_names", "report_bug",
+] as const;
+export type ToolName = (typeof TOOL_NAMES)[number];
 
 export const LENGTH_BUCKETS = ["none", "1_40", "41_160", "161_640", "641_plus"] as const;
 export type LengthBucket = (typeof LENGTH_BUCKETS)[number];
@@ -109,6 +144,7 @@ export const EVENT_FIELDS = [
   "message_length_bucket",
   "media_kind",
   "metadata",
+  "tool_name",
 ] as const;
 export type EventField = (typeof EVENT_FIELDS)[number];
 
@@ -171,9 +207,16 @@ export const EVENT_RULES: Record<EventType, { outcomes: readonly Outcome[]; requ
   // resolved server-side at the ingest route from the caller's Hermes
   // profile (never a trip id in the request body — see hermes-ingest.ts),
   // is what ties the row to a trip.
+  // `missing_data` (added for the missing-information control loop, decision
+  // 22): the tool call itself succeeded — no error, this is not `failed_tool`
+  // — but the trip's own data had nothing to answer with. `tool_name` is
+  // required for this event type specifically (not the others) because the
+  // control loop's whole point is "the TOP missing items", which needs to
+  // know which tool kept coming back empty; no other event type has a
+  // comparable "which thing" dimension to name.
   tool_call_completed: {
-    outcomes: ["grounded_answer", "failed_tool"],
-    required: ["trip_id"],
+    outcomes: ["grounded_answer", "failed_tool", "missing_data"],
+    required: ["trip_id", "tool_name"],
   },
 };
 
@@ -192,6 +235,7 @@ export interface AssistantEvent {
   message_length_bucket: LengthBucket | null;
   media_kind: MediaKindClass | null;
   metadata: EventMetadata;
+  tool_name: ToolName | null;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -293,6 +337,7 @@ export function validateAssistantEvent(raw: unknown): ValidationResult {
       message_length_bucket: nullableString("message_length_bucket", (v) => inSet(LENGTH_BUCKETS, v)) as LengthBucket | null,
       media_kind: nullableString("media_kind", (v) => inSet(MEDIA_KINDS, v)) as MediaKindClass | null,
       metadata: validMetadata(input.metadata),
+      tool_name: nullableString("tool_name", (v) => inSet(TOOL_NAMES, v)) as ToolName | null,
     };
 
     const rules = EVENT_RULES[event.event_type];

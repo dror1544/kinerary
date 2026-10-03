@@ -4,17 +4,20 @@ The assistant-side half of the outcome-event pipeline #177/#326 left
 `not_measurable`: the relay can see that a reply reached Telegram, never
 whether the tool behind it actually worked. This plugin runs inside a trip
 companion's own Hermes process, sees every `trip-mcp` / `trip-control` tool
-call's result directly, and reports a two-value verdict —
-`grounded_answer` or `failed_tool` — to the control plane's
-`POST /internal/assistant-events/tool-outcomes` (`control-plane/api/src/app.ts`,
-`hermes-ingest.ts`), which writes it into `control_plane.assistant_events` as
-`source_service: "hermes"`, `event_type: "tool_call_completed"`.
+call's result directly, and reports a verdict — `grounded_answer`,
+`failed_tool`, or `missing_data` (the tool call worked; the trip's own data
+had nothing to answer with — the missing-information control loop's
+detection signal, docs/sprint6-tracks.md decision 22) — plus which tool,
+to the control plane's `POST /internal/assistant-events/tool-outcomes`
+(`control-plane/api/src/app.ts`, `hermes-ingest.ts`), which writes it into
+`control_plane.assistant_events` as `source_service: "hermes"`,
+`event_type: "tool_call_completed"`.
 
 Read `__init__.py`'s own module doc first — it explains what is sent, what
 is never sent, and why the outcome is `grounded_answer` and not `answered`
 (`control-plane/api/src/analytics/contract.ts` bans the literal word, for
 every source, on purpose). `classify_tool_outcome`'s docstring is the
-classification heuristic and its one documented known limit.
+classification heuristic.
 
 ## This repo is the source of truth; `~/.hermes` is not
 

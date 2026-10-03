@@ -1,6 +1,6 @@
 /**
  * The Hermes tool-outcome ingest path: turns a batch of `{event_id, outcome,
- * occurred_at?}` triples from a companion's Hermes plugin into
+ * tool_name, occurred_at?}` entries from a companion's Hermes plugin into
  * `control_plane.assistant_events` rows with `source_service: "hermes"`,
  * `event_type: "tool_call_completed"`.
  *
@@ -28,7 +28,7 @@
  * Nothing here invents a second table or a second vocabulary.
  */
 import type pg from "pg";
-import type { Outcome } from "./analytics/contract.js";
+import { TOOL_NAMES, type Outcome, type ToolName } from "./analytics/contract.js";
 import { writeAssistantEvents, type WriteResult } from "./analytics/store.js";
 
 const EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -38,7 +38,7 @@ const OCCURRED_AT =
   /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?(Z|[+-]([01]\d|2[0-3]):[0-5]\d)$/;
 
 /** The only outcomes this ingest path ever writes — never `answered`; see contract.ts. */
-const HERMES_TOOL_OUTCOMES: readonly Outcome[] = ["grounded_answer", "failed_tool"];
+const HERMES_TOOL_OUTCOMES: readonly Outcome[] = ["grounded_answer", "failed_tool", "missing_data"];
 
 /** A batch any larger than this is almost certainly a bug upstream, not a burst of real tool calls in one flush. */
 export const MAX_BATCH_SIZE = 50;
@@ -67,18 +67,26 @@ export interface RawToolOutcome {
   event_id?: unknown;
   occurred_at?: unknown;
   outcome?: unknown;
+  tool_name?: unknown;
 }
 
 export interface ParsedToolOutcome {
   eventId: string;
   occurredAt: string;
   outcome: Outcome;
+  toolName: ToolName;
 }
 
 /**
  * Parses and bounds-checks one entry of the request body's `events` array.
  * Never throws; a bad entry is a `reason` string, same shape as the
  * contract's own `ValidationResult` so a caller can report it the same way.
+ *
+ * `tool_name` is required here the same way the contract requires it for
+ * `tool_call_completed` — the missing-information control loop's "which
+ * fact" dimension (decision 22) needs it on every event, not only
+ * `missing_data` ones, so "top missing items" can be computed from the same
+ * rollup that also counts grounded_answer/failed_tool per tool.
  */
 export function parseToolOutcome(raw: unknown, now: () => string = () => new Date().toISOString()): { ok: true; event: ParsedToolOutcome } | { ok: false; reason: string } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ok: false, reason: "INVALID_EVENT" };
@@ -87,12 +95,18 @@ export function parseToolOutcome(raw: unknown, now: () => string = () => new Dat
   if (typeof input.outcome !== "string" || !(HERMES_TOOL_OUTCOMES as readonly string[]).includes(input.outcome)) {
     return { ok: false, reason: "BAD:outcome" };
   }
+  if (typeof input.tool_name !== "string" || !(TOOL_NAMES as readonly string[]).includes(input.tool_name)) {
+    return { ok: false, reason: "BAD:tool_name" };
+  }
   let occurredAt = now();
   if (input.occurred_at !== undefined) {
     if (typeof input.occurred_at !== "string" || !OCCURRED_AT.test(input.occurred_at)) return { ok: false, reason: "BAD:occurred_at" };
     occurredAt = input.occurred_at;
   }
-  return { ok: true, event: { eventId: input.event_id, occurredAt, outcome: input.outcome as Outcome } };
+  return {
+    ok: true,
+    event: { eventId: input.event_id, occurredAt, outcome: input.outcome as Outcome, toolName: input.tool_name as ToolName },
+  };
 }
 
 export type IngestResult =
@@ -156,6 +170,7 @@ export async function ingestHermesToolOutcomes(
     message_length_bucket: null,
     media_kind: null,
     metadata: {},
+    tool_name: event.toolName,
   }));
 
   const write = await writeAssistantEvents(db, rows);

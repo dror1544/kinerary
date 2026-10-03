@@ -77,7 +77,7 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
   }
 
   function validEvent(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
-    return { event_id: randomUUID(), outcome: "grounded_answer", ...overrides };
+    return { event_id: randomUUID(), outcome: "grounded_answer", tool_name: "get_today", ...overrides };
   }
 
   // ── Off unless configured ────────────────────────────────────────────────
@@ -140,18 +140,18 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
 
       const response = await app.inject({
         method: "POST", url: ROUTE, headers: { "x-api-key": KEY },
-        payload: { profile: hermesProfile, events: [{ event_id: eventId, outcome: "grounded_answer" }] },
+        payload: { profile: hermesProfile, events: [{ event_id: eventId, outcome: "grounded_answer", tool_name: "get_today" }] },
       });
       assert.equal(response.statusCode, 200, response.body);
       assert.deepEqual(JSON.parse(response.body), { inserted: 1, duplicates: 0, rejected: [] });
 
       const { rows } = await pool.query(
-        "SELECT trip_id, source_service, event_type, outcome, turn_id, channel_type FROM control_plane.assistant_events WHERE event_id = $1",
+        "SELECT trip_id, source_service, event_type, outcome, turn_id, channel_type, tool_name FROM control_plane.assistant_events WHERE event_id = $1",
         [eventId],
       );
       assert.deepEqual(rows, [{
         trip_id: tripId, source_service: "hermes", event_type: "tool_call_completed",
-        outcome: "grounded_answer", turn_id: null, channel_type: null,
+        outcome: "grounded_answer", turn_id: null, channel_type: null, tool_name: "get_today",
       }]);
     } finally {
       await app.close();
@@ -164,7 +164,7 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
       const hermesProfile = `profile-${suffix()}`;
       await seedTrip(hermesProfile);
       const eventId = randomUUID();
-      const payload = { profile: hermesProfile, events: [{ event_id: eventId, outcome: "failed_tool" }] };
+      const payload = { profile: hermesProfile, events: [{ event_id: eventId, outcome: "failed_tool", tool_name: "get_today" }] };
 
       const first = await app.inject({ method: "POST", url: ROUTE, headers: { "x-api-key": KEY }, payload });
       const again = await app.inject({ method: "POST", url: ROUTE, headers: { "x-api-key": KEY }, payload });
@@ -183,7 +183,7 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
     try {
       const hermesProfile = `profile-${suffix()}`;
       await seedTrip(hermesProfile);
-      const events = Array.from({ length: 5 }, (_, i) => ({ event_id: randomUUID(), outcome: i % 2 === 0 ? "grounded_answer" : "failed_tool" }));
+      const events = Array.from({ length: 5 }, (_, i) => ({ event_id: randomUUID(), outcome: i % 2 === 0 ? "grounded_answer" : "failed_tool", tool_name: "get_today" }));
 
       const response = await app.inject({ method: "POST", url: ROUTE, headers: { "x-api-key": KEY }, payload: { profile: hermesProfile, events } });
       assert.equal(response.statusCode, 200, response.body);
@@ -238,7 +238,7 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
       const eventId = randomUUID();
       const response = await app.inject({
         method: "POST", url: ROUTE, headers: { "x-api-key": KEY },
-        payload: { profile: hermesProfile, trip_id: "trip_someoneelsestrip00000000", events: [{ event_id: eventId, outcome: "grounded_answer" }] },
+        payload: { profile: hermesProfile, trip_id: "trip_someoneelsestrip00000000", events: [{ event_id: eventId, outcome: "grounded_answer", tool_name: "get_today" }] },
       });
       assert.equal(response.statusCode, 200, response.body);
       const { rows } = await pool.query("SELECT trip_id FROM control_plane.assistant_events WHERE event_id = $1", [eventId]);
@@ -300,7 +300,9 @@ describe("POST /internal/assistant-events/tool-outcomes", { skip: SKIP ? "no CON
         [{ event_id: randomUUID(), outcome: "answered_with_tools" }, "BAD:outcome"],
         [{ event_id: randomUUID(), outcome: "banana" }, "BAD:outcome"],
         [{ event_id: randomUUID() }, "BAD:outcome"],
-        [{ event_id: randomUUID(), outcome: "grounded_answer", occurred_at: "yesterday" }, "BAD:occurred_at"],
+        [{ event_id: randomUUID(), outcome: "grounded_answer", tool_name: "get_today", occurred_at: "yesterday" }, "BAD:occurred_at"],
+        [{ event_id: randomUUID(), outcome: "grounded_answer" }, "BAD:tool_name"],
+        [{ event_id: randomUUID(), outcome: "grounded_answer", tool_name: "drop_table" }, "BAD:tool_name"],
         ["not-an-object", "INVALID_EVENT"],
         [null, "INVALID_EVENT"],
       ];
