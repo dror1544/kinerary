@@ -59,7 +59,7 @@ import { makeUpgradeToken } from "../src/relay/protocol.js";
 import { uiString } from "../src/intake-copy.js";
 import { applyDecision, settleDocumentCorrections, type InboundSink, type TripBotPollerDeps } from "../src/relay/poller.js";
 import type { SendResult, TelegramClient } from "../src/relay/telegram-api.js";
-import { testDatabaseUrl } from "./support/test-database.js";
+import { testDatabaseUrl, testPool } from "./support/test-database.js";
 
 const databaseUrl = testDatabaseUrl();
 const SKIP = !databaseUrl;
@@ -297,7 +297,7 @@ interface CorrectionTrip {
 
 /** Same shape as document-correction-flow.test.ts's withConfirmedTrip, minimal — only what item 4 needs. */
 async function withConfirmedTrip(fn: (trip: CorrectionTrip) => Promise<void>): Promise<void> {
-  const pool = new pg.Pool({ connectionString: databaseUrl });
+  const pool = testPool();
   const client = await pool.connect();
   try {
     await client.query("DROP SCHEMA IF EXISTS control_plane CASCADE");
