@@ -33,6 +33,7 @@ from .companion_profile import (
 from .compute import ComputeAdapter, NullComputeAdapter
 from .mcp_bridge import McpBridgeAdapter, NullMcpBridgeAdapter, log_fields
 from .release_source import ReleaseSourceError, materialize_release_source
+from . import verification
 from .transformer import (
     derive_bookings,
     derive_trip_slug,
@@ -1052,6 +1053,7 @@ class ProvisionerWorker:
         operator_chat_id: str | None = None,
         seed_password: str | None = None,
         document_store_dir: str | None = None,
+        verification_http_get: "verification.HttpGetFn | None" = None,
     ) -> None:
         self._db_url = db_url
         # Where the control plane keeps uploaded originals (DOCUMENT_STORE_DIR,
@@ -1082,6 +1084,17 @@ class ProvisionerWorker:
         self._repo_root = repo_root or os.environ.get("PROVISIONER_REPO_ROOT") or os.environ.get("REPO_ROOT", "")
         self._materialize = materialize or (
             lambda revision, digest: materialize_release_source(self._repo_root, revision, digest)
+        )
+        # Explicit override first, then whatever the deploy adapter itself
+        # knows how to answer for the URL it just handed back (FakeDeployAdapter
+        # in tests implements `http_get` for exactly this reason — it is the
+        # one object that knows its own invented URL is not real), then a real
+        # network GET. Unlike companion/mcp_bridge this signal needs no LAN/SSH
+        # infra a deployment might lack — every `private_url` is reachable the
+        # same way an organizer's own browser reaches it — so the real check is
+        # ON by default in every deployment, with no extra wiring required.
+        self._verification_http_get = (
+            verification_http_get or getattr(deploy, "http_get", None) or verification.default_http_get
         )
 
     # ── public API ──────────────────────────────────────────────────────────────
@@ -1227,10 +1240,48 @@ class ProvisionerWorker:
                 if source_dir:
                     shutil.rmtree(source_dir, ignore_errors=True)
 
+            # Verification aggregator (Sprint 6, docs/sprint6-tracks.md:472):
+            # a real gate before `ready_private`, not the unconditional UPDATE
+            # that used to be here. Hard-gates on the three signals checkable
+            # now that the site is actually deployed — release compatibility,
+            # runtime health, rendered data — and records (never fabricates)
+            # the other three. Raises VerificationFailed (safe_error_code
+            # VERIFICATION_FAILED) on a hard-gate miss, caught by this
+            # function's own handler below exactly like a materialize
+            # failure: the job fails/retries and the trip stays where it was.
+            # See verification.py's module docstring for why isolation,
+            # messaging binding and backup checkpoint are not hard-gated yet.
+            deployment_ref = plan_desired.get("release_source_revision") or plan_desired.get("release_id")
+            # #review 2026-10-03 [P2], round 1: rendered_data used to accept
+            # ANY reachable trip's nonempty roster, so a misrouted
+            # private_url (a stale ingress entry, two trips racing onto the
+            # same address) could pass this check against another trip's
+            # data entirely. expected_usernames is THIS deploy's own
+            # participant list.
+            # #review 2026-10-03 [P2], round 2: usernames alone do not
+            # identify the TRIP -- a second trip for the same family shares
+            # them. expected_departure/expected_return_date (THIS deploy's
+            # own config["meta"]) cannot collide between two distinct real
+            # trips for one family the way a roster can.
+            expected_usernames = frozenset(
+                p.get("username") for p in (config.get("participants") or [])
+                if isinstance(p, dict) and p.get("username")
+            )
+            meta = config.get("meta") or {}
+            verification.gate_ready_private(
+                conn, trip_id=trip_id, deployment_ref=deployment_ref,
+                plan_desired=plan_desired, private_url=private_url,
+                http_get=self._verification_http_get,
+                expected_usernames=expected_usernames,
+                expected_departure=meta.get("departure"),
+                expected_return_date=meta.get("returnDate"),
+            )
+
             # Commit success.
             self._complete(
                 conn, job_id, plan_id, trip_id, private_url,
                 slug=slug, config=config, intake_version_id=intake_version_id,
+                deployment_ref=deployment_ref,
             )
 
             # Hand the deployed plan to the post-deploy review pass
@@ -1543,6 +1594,7 @@ class ProvisionerWorker:
         slug: str,
         config: dict[str, Any],
         intake_version_id: str,
+        deployment_ref: str | None = None,
     ) -> None:
         result_json = json.dumps({"private_url": private_url})
         with conn.transaction():
@@ -1725,7 +1777,7 @@ class ProvisionerWorker:
             conn, trip_id=trip_id, slug=slug, config=config,
             intake_version_id=intake_version_id, private_url=private_url,
             recipient_chat_id=recipient_chat_id, verified_organizer_chat_id=verified_organizer_chat_id,
-            intro_facts=intro_facts,
+            intro_facts=intro_facts, deployment_ref=deployment_ref,
         )
 
     def reconcile_companion(self, trip_id: str) -> dict[str, Any]:
@@ -1817,6 +1869,7 @@ class ProvisionerWorker:
         verified_organizer_chat_id: str | None,
         intro_facts: dict,
         introduce_once: bool = False,
+        deployment_ref: str | None = None,
     ) -> str | None:
         """The companion half of provisioning: profile, trip tools, chat binding,
         organizer link, introduction, reachability. Returns the profile, or None.
@@ -2148,6 +2201,24 @@ class ProvisionerWorker:
                     conn, trip_id, reachable=False, reason="BINDING_FAILED",
                     consequence="the chat binding write failed; the trip has no routing",
                 )
+
+        # Real evidence for the two signals the pre-ready_private gate could
+        # only record as `skipped` (verification.py's module docstring says
+        # why): now that the companion/bridge/binding steps above have all
+        # been attempted, mcp_isolation and messaging_binding can be checked
+        # for real. Informational only — never reverts ready_private, and a
+        # recording failure must not cost the trip its companion, so this is
+        # best-effort like every other side effect in this function.
+        try:
+            verification.record_post_attach_evidence(
+                conn, trip_id=trip_id, deployment_ref=deployment_ref,
+                slug=slug, hermes_profile=hermes_profile, mcp_bridge_adapter=self._mcp_bridge,
+            )
+        except Exception:
+            logger.warning(
+                "provisioner.post_attach_verification_failed",
+                extra={"trip_id": trip_id}, exc_info=True,
+            )
         return hermes_profile
 
     def _enqueue_operator_notification(
