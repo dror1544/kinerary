@@ -1389,8 +1389,18 @@ class SlugPromotionTests(unittest.TestCase):
             # a suffix that was no longer available and failed on data rather
             # than behaviour. The property is "collisions are suffixed", not
             # "the suffix is 2".
+            #
+            # #342: the YEAR was hardcoded here too (`japan-2026-\d+`), which
+            # is the same class of date bomb one level up. JAPAN_INTAKE names
+            # no explicit date, so derive_trip_slug's own fallback
+            # (`_resolve_dates`: departure = today + 90 days) decides the
+            # year — found live on 2026-10-03, when today + 90 days first
+            # crossed into January and every slug this test produces became
+            # `japan-2027*`, not `japan-2026*`. The property is "some year",
+            # not "2026" specifically — same reasoning as the suffix number,
+            # one component over.
             self.assertTrue(
-                any(re.fullmatch(r"japan-2026-\d+", s) for s in slugs),
+                any(re.fullmatch(r"japan-\d{4}-\d+", s) for s in slugs),
                 f"expected a numeric-suffixed slug among {slugs}",
             )
         finally:
