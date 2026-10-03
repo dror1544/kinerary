@@ -97,6 +97,14 @@ class FakeDeployAdapter:
                     for p in (config.get("participants") or [])
                 ] or [{"username": "organizer", "name": "Organizer"}]
             return 200, json.dumps({"participants": participants})
+        if url.endswith("/api/config/deployment-identity"):
+            # #review 2026-10-03 [P2], round 2: mirrors the real
+            # server/server.js route this verification check now also
+            # probes, reading the same deployed config's meta the way the
+            # roster branch above reads its participants.
+            config = self.deployed[-1]["config"] if self.deployed else {}
+            meta = config.get("meta") or {}
+            return 200, json.dumps({"departure": meta.get("departure"), "returnDate": meta.get("returnDate")})
         return 404, "not found"
 
 

@@ -889,6 +889,23 @@ app.get('/api/config/roster', (_req, res) => {
   res.json({ participants: roster });
 });
 
+// #review 2026-10-03 [P2]: the verification worker's rendered_data check
+// compared the roster above against the deploying plan's expected
+// participants, but two trips for the SAME family can share an identical
+// roster — a private_url misrouted to a sibling trip, or a stale deployment
+// of one, would still pass. departure/returnDate are the one pair of
+// already-allow-listed (shared/config-visibility.js) fields that cannot
+// collide between two distinct real trips the way a family's own roster
+// can. Deliberately its own route rather than folded into /api/config/roster
+// above: that route's whole point, stated in its own comment, is "the
+// four fields a login picker needs" — these two exist for a different
+// reason (deployment identity, not login) and mixing the two would make
+// neither route's surface obvious at a glance any more.
+app.get('/api/config/deployment-identity', (_req, res) => {
+  const meta = publicConfig(TRIP_CONFIG).meta || {};
+  res.json({ departure: meta.departure ?? null, returnDate: meta.returnDate ?? null });
+});
+
 // Stage 1 groundwork: read-only access to stored config history for a future
 // diff view. Content is scrubbed the same way as /api/config; authRequired
 // here is defense-in-depth, not the safety boundary.

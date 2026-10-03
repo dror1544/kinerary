@@ -1252,21 +1252,29 @@ class ProvisionerWorker:
             # See verification.py's module docstring for why isolation,
             # messaging binding and backup checkpoint are not hard-gated yet.
             deployment_ref = plan_desired.get("release_source_revision") or plan_desired.get("release_id")
-            # #review 2026-10-03 [P2]: rendered_data used to accept ANY
-            # reachable trip's nonempty roster, so a misrouted private_url
-            # (a stale ingress entry, two trips racing onto the same address)
-            # could pass this check against another trip's data entirely.
-            # expected_usernames is THIS deploy's own participant list — the
-            # one identity rendered_data can check against with nothing new.
+            # #review 2026-10-03 [P2], round 1: rendered_data used to accept
+            # ANY reachable trip's nonempty roster, so a misrouted
+            # private_url (a stale ingress entry, two trips racing onto the
+            # same address) could pass this check against another trip's
+            # data entirely. expected_usernames is THIS deploy's own
+            # participant list.
+            # #review 2026-10-03 [P2], round 2: usernames alone do not
+            # identify the TRIP -- a second trip for the same family shares
+            # them. expected_departure/expected_return_date (THIS deploy's
+            # own config["meta"]) cannot collide between two distinct real
+            # trips for one family the way a roster can.
             expected_usernames = frozenset(
                 p.get("username") for p in (config.get("participants") or [])
                 if isinstance(p, dict) and p.get("username")
             )
+            meta = config.get("meta") or {}
             verification.gate_ready_private(
                 conn, trip_id=trip_id, deployment_ref=deployment_ref,
                 plan_desired=plan_desired, private_url=private_url,
                 http_get=self._verification_http_get,
                 expected_usernames=expected_usernames,
+                expected_departure=meta.get("departure"),
+                expected_return_date=meta.get("returnDate"),
             )
 
             # Commit success.

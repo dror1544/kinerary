@@ -178,7 +178,11 @@ def check_runtime_health(get: HttpGetFn, private_url: str | None) -> CheckResult
 
 
 def check_rendered_data(
-    get: HttpGetFn, private_url: str | None, expected_usernames: AbstractSet[str] = frozenset(),
+    get: HttpGetFn,
+    private_url: str | None,
+    expected_usernames: AbstractSet[str] = frozenset(),
+    expected_departure: str | None = None,
+    expected_return_date: str | None = None,
 ) -> CheckResult:
     """The trip's own `GET /api/config/roster` — deliberately unauthenticated
     (server/server.js: "the login screen needs to show a pick-yourself roster
@@ -186,16 +190,27 @@ def check_rendered_data(
     still proves real trip.config.json content reached the site, not an empty
     or broken shell.
 
-    #review 2026-10-03 [P2]: a nonempty check alone passes ANY reachable
-    trip's roster — a stale deployment or a `private_url` ingress misrouted to
-    another trip's container would pass both this and `runtime_health` while
-    `ready_private` commits for the WRONG data. `expected_usernames` is the
-    plan's own participant usernames (provisioner.py: `config["participants"]`,
-    the exact config this deploy was FOR) — the one identity this check can
-    compare against with no new route or schema. An empty `expected_usernames`
-    (no provider gave one, or a trip with no usernamed participant at all)
-    skips the identity comparison rather than failing every trip retroactively
-    — the plain nonempty check below still applies either way.
+    #review 2026-10-03 [P2], round 1: a nonempty check alone passes ANY
+    reachable trip's roster — a stale deployment or a `private_url` ingress
+    misrouted to another trip's container would pass both this and
+    `runtime_health` while `ready_private` commits for the WRONG data.
+    `expected_usernames` is the plan's own participant usernames
+    (provisioner.py: `config["participants"]`, the exact config this deploy
+    was FOR). An empty set skips the comparison rather than failing every
+    trip retroactively — the plain nonempty check below still applies either
+    way.
+
+    #review 2026-10-03 [P2], round 2: usernames alone do not identify the
+    TRIP — two trips for the same family (a second trip, re-provisioned with
+    the same roster) share them, so a `private_url` misrouted to the sibling
+    trip, or a stale deployment of it, still passes round 1's check.
+    `expected_departure`/`expected_return_date` (provisioner.py:
+    `config["meta"]`, the same deploy's own dates) are compared against a
+    SECOND unauthenticated route, `GET /api/config/deployment-identity`
+    (server/server.js) — two trips for one family cannot share both dates
+    without being the same trip. Either expected value being `None` skips
+    that half of the comparison the same way an empty `expected_usernames`
+    does; this is additive to round 1, not a replacement for it.
     """
     if not private_url:
         return CheckResult(RENDERED_DATA, "failed", "no private_url to probe")
@@ -220,6 +235,31 @@ def check_rendered_data(
                 RENDERED_DATA, "failed",
                 f"roster mismatch at {url}: expected usernames {sorted(expected_usernames)}, "
                 f"got {sorted(actual_usernames)} — this private_url may be serving another trip",
+            )
+    if expected_departure is not None or expected_return_date is not None:
+        identity_url = private_url.rstrip("/") + "/api/config/deployment-identity"
+        try:
+            id_status, id_body = get(identity_url)
+        except Exception as exc:
+            return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} raised {type(exc).__name__}: {exc}")
+        if id_status != 200:
+            return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} -> HTTP {id_status}: {id_body[:500]}")
+        try:
+            id_payload = json.loads(id_body)
+        except (ValueError, TypeError):
+            return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} -> non-JSON body: {id_body[:500]}")
+        actual_departure = id_payload.get("departure") if isinstance(id_payload, dict) else None
+        actual_return_date = id_payload.get("returnDate") if isinstance(id_payload, dict) else None
+        mismatches = []
+        if expected_departure is not None and actual_departure != expected_departure:
+            mismatches.append(f"departure: expected {expected_departure!r}, got {actual_departure!r}")
+        if expected_return_date is not None and actual_return_date != expected_return_date:
+            mismatches.append(f"returnDate: expected {expected_return_date!r}, got {actual_return_date!r}")
+        if mismatches:
+            return CheckResult(
+                RENDERED_DATA, "failed",
+                f"deployment identity mismatch at {identity_url}: {'; '.join(mismatches)} — "
+                "this private_url may be serving a different trip for the same family",
             )
     return CheckResult(RENDERED_DATA, "passed", body)
 
@@ -298,6 +338,8 @@ def run_pre_ready_private_checks(
     private_url: str | None,
     http_get: HttpGetFn,
     expected_usernames: AbstractSet[str] = frozenset(),
+    expected_departure: str | None = None,
+    expected_return_date: str | None = None,
 ) -> list[CheckResult]:
     """All six, in the shape they can honestly be evaluated in BEFORE
     `_attach_companion` has run. See the module docstring for why the last
@@ -305,7 +347,7 @@ def run_pre_ready_private_checks(
     return [
         check_release_compatibility(conn, plan_desired),
         check_runtime_health(http_get, private_url),
-        check_rendered_data(http_get, private_url, expected_usernames),
+        check_rendered_data(http_get, private_url, expected_usernames, expected_departure, expected_return_date),
         CheckResult(
             MCP_ISOLATION, "skipped",
             "not attempted yet: the companion/bridge wiring step (_attach_companion) "
@@ -366,6 +408,8 @@ def gate_ready_private(
     private_url: str | None,
     http_get: HttpGetFn | None = None,
     expected_usernames: AbstractSet[str] = frozenset(),
+    expected_departure: str | None = None,
+    expected_return_date: str | None = None,
 ) -> list[CheckResult]:
     """Runs all six checks, records evidence for all six (always — a hard-gate
     failure is recorded before it is ever raised, so the evidence survives
@@ -376,6 +420,7 @@ def gate_ready_private(
     results = run_pre_ready_private_checks(
         conn, plan_desired=plan_desired, private_url=private_url, http_get=get,
         expected_usernames=expected_usernames,
+        expected_departure=expected_departure, expected_return_date=expected_return_date,
     )
     record_evidence(conn, trip_id=trip_id, deployment_ref=deployment_ref, results=results)
 

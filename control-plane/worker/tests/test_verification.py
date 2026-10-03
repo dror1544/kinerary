@@ -180,6 +180,46 @@ class RenderedDataCheckTests(unittest.TestCase):
         result = verification.check_rendered_data(get, "https://trip.example", frozenset())
         self.assertEqual(result.outcome, "passed")
 
+    def test_passes_when_departure_and_return_date_both_match(self) -> None:
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set(
+            "/api/config/deployment-identity", 200,
+            json.dumps({"departure": "2027-03-10T06:00:00+03:00", "returnDate": "2027-03-20"}),
+        )
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}),
+            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+        )
+        self.assertEqual(result.outcome, "passed")
+
+    def test_fails_when_the_matching_roster_belongs_to_a_sibling_trip_for_the_same_family(self) -> None:
+        """#review 2026-10-03 [P2], round 2: a SECOND trip for the same
+        family can share its roster exactly -- round 1's username comparison
+        alone would pass against the wrong trip. departure/returnDate cannot
+        collide between two distinct real trips for one family."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set(
+            "/api/config/deployment-identity", 200,
+            json.dumps({"departure": "2028-07-01T06:00:00+03:00", "returnDate": "2028-07-10"}),
+        )
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}),
+            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+        )
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("deployment identity mismatch", result.evidence)
+
+    def test_still_passes_with_no_expected_dates_to_compare(self) -> None:
+        """Matching round 1's own fallback: expected_departure/
+        expected_return_date both None skips this half of the comparison
+        rather than failing retroactively."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        result = verification.check_rendered_data(get, "https://trip.example", frozenset({"tali"}))
+        self.assertEqual(result.outcome, "passed")
+
 
 class DefaultHttpGetTests(unittest.TestCase):
     def test_refuses_non_http_schemes(self) -> None:
