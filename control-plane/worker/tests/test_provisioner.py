@@ -590,6 +590,76 @@ class ProvisionerHappyPathTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["state"], "queued")
 
+    def test_no_claimable_job_when_trip_suspended(self) -> None:
+        # Sprint 6 slice 2 admin dashboard (migration 20261003060350):
+        # _claim() mirrors job-queue.ts's claimJob() in excluding a
+        # suspended trip's jobs. Approval is untouched and valid — suspend is
+        # what alone must stop the claim.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = now(), suspended_reason = 'test pause' WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertFalse(result)
+        row = self.conn.execute(
+            "SELECT state FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "queued")
+
+        # Resuming (clearing both columns together, same pairing the
+        # migration's CHECK enforces) makes the job claimable again.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = NULL, suspended_reason = NULL WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertTrue(result)
+
+    def test_claim_cannot_win_a_race_against_a_suspend_still_mid_transaction(self) -> None:
+        # The race the boundary review proved live (2026-10-03) against this
+        # exact production path. Tested against _claim() directly (not
+        # run_once(), which also WORKS a claimed job afterward — a later step
+        # in that pipeline touches the trips row too, so once _claim() wins
+        # the race it then genuinely blocks on holder's own lock for the rest
+        # of the job, which is a real but separate behaviour from the race
+        # this test is pinning).
+        #
+        # holder mirrors suspendTrip's TS equivalent's opening move exactly:
+        # BEGIN, then the same `SELECT ... FOR UPDATE` on the trips row, held
+        # open. Before the fix (_claim's own FOR UPDATE OF j, pa only), a
+        # concurrent _claim() call claimed the job in ~0.05s with no regard
+        # for that lock. After the fix (FOR UPDATE OF j, pa, t), it must skip
+        # the row instead.
+        holder = psycopg.connect(DB_URL, row_factory=dict_row)
+        try:
+            holder.execute(
+                "SELECT suspended_at FROM control_plane.trips WHERE id = %s FOR UPDATE",
+                (self.fix["trip_id"],),
+            )
+
+            with psycopg.connect(DB_URL, row_factory=dict_row) as claim_conn:
+                claimed = self.worker._claim(claim_conn)
+            self.assertIsNone(claimed, "a claim must not win while the trip row is locked by an in-flight suspend")
+
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s",
+                (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual(row["state"], "queued")
+        finally:
+            # Release the held lock without ever actually suspending the
+            # trip — this test only needs to prove the lock window matters.
+            holder.rollback()
+            holder.close()
+
+        # With the lock released and the trip never actually suspended, a
+        # normal claim now succeeds — proving the fix doesn't over-block.
+        result = self.worker.run_once()
+        self.assertTrue(result)
+
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
 class ReleaseMaterializationTests(unittest.TestCase):

@@ -1287,6 +1287,18 @@ class ProvisionerWorker:
     # ── DB operations (mirror job-queue.ts) ────────────────────────────────────
 
     def _claim(self, conn: psycopg.Connection) -> dict | None:
+        # Also excludes a suspended trip's jobs (`trips.suspended_at`,
+        # migration 20261003060350, Sprint 6 slice 2 admin dashboard) — kept
+        # identical to job-queue.ts's claimJob() per this class's own
+        # docstring ("the claim/complete/fail logic mirrors job-queue.ts
+        # exactly"), including the same fix: `t` is named in `FOR UPDATE OF`
+        # alongside `j`/`pa` so `SKIP LOCKED` also covers it. Without `t`
+        # here a concurrent suspendTrip()'s own `SELECT ... FOR UPDATE` on
+        # the trips row would not block or skip this claim at all — proven
+        # live (#review 2026-10-03): this exact query claimed a job in 0.05s
+        # while a held suspend transaction on that trip was still 4s from
+        # committing. With `t` locked too, that claim now SKIPs the row
+        # instead while the suspend is in flight.
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -1296,14 +1308,16 @@ class ProvisionerWorker:
                     FROM   control_plane.jobs j
                     JOIN   control_plane.plans p ON p.id = j.plan_id
                     JOIN   control_plane.plan_approvals pa ON pa.plan_id = j.plan_id
+                    JOIN   control_plane.trips t ON t.id = j.trip_id
                     WHERE  j.state = 'queued'
                       AND  j.job_type = 'provision'
                       AND  pa.used_at IS NULL
                       AND  pa.expires_at > now()
                       AND  pa.plan_digest = p.digest
+                      AND  t.suspended_at IS NULL
                     ORDER BY j.created_at
                     LIMIT  1
-                    FOR UPDATE OF j, pa SKIP LOCKED
+                    FOR UPDATE OF j, pa, t SKIP LOCKED
                     """,
                 )
                 row = cur.fetchone()
