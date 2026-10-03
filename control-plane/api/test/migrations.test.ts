@@ -90,6 +90,9 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20260922120000_destination_info.sql",
       "20260925143012_assistant_events.sql",
       "20260925180000_intake_pending_changes.sql",
+      "20261003060350_trip_suspend.sql",
+      "20261003140000_assistant_events_tool_outcome.sql",
+      "20261003150000_tool_call_missing_data.sql",
     ]);
     assert.deepEqual(await applyMigrations(client, migrationsDir), []);
     const tables = await client.query("SELECT count(*)::int AS count FROM information_schema.tables WHERE table_schema = 'control_plane'");
@@ -160,6 +163,9 @@ test("fresh and upgrade migrations succeed on PostgreSQL", { skip: !databaseUrl 
       "20260922120000_destination_info.sql",
       "20260925143012_assistant_events.sql",
       "20260925180000_intake_pending_changes.sql",
+      "20261003060350_trip_suspend.sql",
+      "20261003140000_assistant_events_tool_outcome.sql",
+      "20261003150000_tool_call_missing_data.sql",
     ]);
   } finally {
     await reset(client);

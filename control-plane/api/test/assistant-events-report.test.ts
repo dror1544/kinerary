@@ -34,6 +34,7 @@ const DM_DAY: DayRollup = {
     forwarded_reply_delivered_substantive_outcome_unknown: 0, forwarded_unanswered: 0,
     relay_read: { failed_tool: 4 },
   },
+  assistant_tool_outcomes: { grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {} },
 };
 
 const GROUP_DAY: DayRollup = {
@@ -54,6 +55,7 @@ const GROUP_DAY: DayRollup = {
     forwarded_reply_delivered_substantive_outcome_unknown: 1, forwarded_unanswered: 0,
     relay_read: {},
   },
+  assistant_tool_outcomes: { grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {} },
 };
 
 const ALL_SECTION_TITLES = ["Usage", "Value Delivered", "Information Quality", "Learning and Enrichment", "Organizer Enablement"];
@@ -160,6 +162,61 @@ describe("renderDailyReport — Information Quality reflects the relay's own doc
   });
 });
 
+// ── The missing-information control loop (decision 22): "detect a missing
+// fact, record it, show the top missing items" — the one new signal this
+// slice adds, from the Hermes plugin's tool_call_completed events. ────────
+
+const DAY_WITH_TOOL_CALLS: DayRollup = {
+  ...GROUP_DAY,
+  assistant_tool_outcomes: {
+    grounded_answer: 6, failed_tool: 1, missing_data: 3,
+    missing_data_by_tool: { get_booking_confirmation: 2, get_budget: 1 },
+  },
+};
+
+describe("renderDailyReport — Value Delivered's grounded-answer line, now real", () => {
+  test("renders a percentage once the Hermes plugin has reported tool calls that day", () => {
+    const { json } = renderDailyReport(DAY_WITH_TOOL_CALLS);
+    const vd = json.sections.find((s) => s.title === "Value Delivered")!;
+    const item = vd.lines.find((l) => l.label === "Questions answered from verified website data")!;
+    assert.equal(item.no_data, false);
+    assert.equal(item.value, "60.0% (6/10)");
+  });
+
+  test("still no data recorded when nothing reported that day — GROUP_DAY has zero tool calls", () => {
+    const { json } = renderDailyReport(GROUP_DAY);
+    const vd = json.sections.find((s) => s.title === "Value Delivered")!;
+    const item = vd.lines.find((l) => l.label === "Questions answered from verified website data")!;
+    assert.equal(item.no_data, true);
+  });
+});
+
+describe("renderDailyReport — Organizer Enablement's top-missing-items line, now real", () => {
+  test("ranks missing_data_by_tool descending, capped at 3", () => {
+    const { json } = renderDailyReport(DAY_WITH_TOOL_CALLS);
+    const oe = json.sections.find((s) => s.title === "Organizer Enablement")!;
+    const item = oe.lines.find((l) => l.label === "Top 3 missing items to request from the organizer")!;
+    assert.equal(item.no_data, false);
+    assert.equal(item.value, "get_booking_confirmation: 2, get_budget: 1");
+  });
+
+  test("the other two Organizer Enablement lines stay no data recorded — next sprint's work", () => {
+    const { json } = renderDailyReport(DAY_WITH_TOOL_CALLS);
+    const oe = json.sections.find((s) => s.title === "Organizer Enablement")!;
+    for (const label of ["The traveler value unlocked by each item", "Suggested message to ask for those items"]) {
+      const item = oe.lines.find((l) => l.label === label)!;
+      assert.equal(item.no_data, true, label);
+    }
+  });
+
+  test("no data recorded when no missing-data fact was reported that day", () => {
+    const { json } = renderDailyReport(GROUP_DAY);
+    const oe = json.sections.find((s) => s.title === "Organizer Enablement")!;
+    const item = oe.lines.find((l) => l.label === "Top 3 missing items to request from the organizer")!;
+    assert.equal(item.no_data, true);
+  });
+});
+
 describe("renderDailyReport — the KNOWN LIMIT caveat is carried into the report text, never hidden", () => {
   test("the relay-restart caveat is in notes, and in the rendered Markdown", () => {
     const { json, markdown } = renderDailyReport(GROUP_DAY);
@@ -167,10 +224,10 @@ describe("renderDailyReport — the KNOWN LIMIT caveat is carried into the repor
     assert.ok(markdown.includes("relay restart"));
   });
 
-  test("the four not-measurable rates are named in notes, with their reason", () => {
+  test("the two remaining not-measurable rates are named in notes, with their reason", () => {
     const { json, markdown } = renderDailyReport(GROUP_DAY);
-    assert.ok(json.notes.some((n) => n.includes("grounded-answer rate") && n.includes("post-write trust rate")));
-    assert.ok(markdown.includes("grounded-answer rate"));
+    assert.ok(json.notes.some((n) => n.includes("traveller self-service rate") && n.includes("post-write trust rate")));
+    assert.ok(markdown.includes("traveller self-service rate"));
   });
 });
 

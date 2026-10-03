@@ -313,6 +313,7 @@ export class RelayAssistantEvents implements ReplyObserver {
         message_length_bucket: lengthBucketOf(contentLength),
         media_kind: null,
         metadata: {},
+        tool_name: null,
       });
     });
   }
@@ -437,6 +438,7 @@ export class RelayAssistantEvents implements ReplyObserver {
       message_length_bucket: facts.lengthBucket,
       media_kind: facts.mediaKind,
       metadata: extra.metadata ?? {},
+      tool_name: null,
     });
   }
 

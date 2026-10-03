@@ -19,6 +19,22 @@ export type ClaimJobResult =
  * non-used) approval whose digest matches the plan. Uses SKIP LOCKED so
  * concurrent workers never block each other and each job is claimed at
  * most once.
+ *
+ * Also excludes any job whose trip is suspended (`trips.suspended_at`,
+ * migration 20261003060350, Sprint 6 slice 2) — the one place this file
+ * makes a suspended trip's jobs actually unclaimable, rather than suspend
+ * being a flag nothing reads. `t` is named in `FOR UPDATE OF` alongside `j`
+ * and `pa` specifically so `SKIP LOCKED` also applies to it: `suspendTrip`
+ * takes its own `SELECT ... FOR UPDATE` on the trips row while its
+ * transaction is open, and without `t` here a concurrent claim could read
+ * "not suspended" in the instant before that transaction commits, then
+ * lease the job anyway — reproduced live (#review 2026-10-03): a claim
+ * completed in 0.05s while a held suspend transaction was still 4s from
+ * committing, and the job was leased despite the suspend succeeding right
+ * after. With `t` locked too, that same claim now SKIPs the row instead
+ * (not an error, not a block — the next claim tick sees the committed
+ * `suspended_at` and correctly excludes the job via the WHERE clause, or
+ * sees the suspend rolled back and claims normally).
  */
 export async function claimJob(
   db: pg.Pool,
@@ -40,13 +56,15 @@ export async function claimJob(
        FROM control_plane.jobs j
        JOIN control_plane.plans p ON p.id = j.plan_id
        JOIN control_plane.plan_approvals pa ON pa.plan_id = j.plan_id
+       JOIN control_plane.trips t ON t.id = j.trip_id
        WHERE j.state = 'queued'
          AND pa.used_at IS NULL
          AND pa.expires_at > now()
          AND pa.plan_digest = p.digest
+         AND t.suspended_at IS NULL
        ORDER BY j.created_at
        LIMIT 1
-       FOR UPDATE OF j, pa SKIP LOCKED`,
+       FOR UPDATE OF j, pa, t SKIP LOCKED`,
     );
 
     const job = row.rows[0];

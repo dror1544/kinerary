@@ -1486,16 +1486,56 @@ observe, pause and recover it.
 
 Build:
 
-- Implement a verification aggregator requiring release compatibility,
+- **Implement a verification aggregator requiring release compatibility,
   runtime/service health, rendered trip data, MCP/context/profile isolation,
-  messaging binding and backup checkpoint before `ready_private`.
+  messaging binding and backup checkpoint before `ready_private`. — BUILT
+  (2026-10-03).** PR #343: `control_plane_worker/verification.py`, six named
+  checks, each recorded as a `control_plane.verification_evidence` row every
+  run. **Hard-gated** (block `ready_private` on failure): release
+  compatibility, runtime health, rendered trip data — the last reviewed twice
+  after the initial build: round 1 added a roster-identity comparison (a
+  misrouted or stale deployment could otherwise pass against another trip's
+  data), round 2 added a second comparison against the deploying plan's own
+  departure/return date, via a new unauthenticated route,
+  `GET /api/config/deployment-identity` (`server/server.js`) — roster alone
+  doesn't distinguish two trips for the *same* family. **Recorded as an
+  honest `skipped`, not faked:** `mcp_isolation` and `messaging_binding`
+  cannot be truthfully checked before `_attach_companion` runs, which happens
+  *after* the `ready_private` commit by deliberate, incident-dated design
+  (2026-09-06, 2026-09-20); both get a real, informational (non-blocking)
+  pass right after attach instead. **Cut, and currently unowned:**
+  `backup_checkpoint` has no mechanism to check against anywhere in this
+  codebase — no `backup_checkpoints` table, no per-trip snapshot or backup
+  event exists — so it is recorded as a permanent, honest `skipped` rather
+  than a fabricated pass, per the module's own docstring. No sprint or issue
+  currently owns building that mechanism; see Decisions needed.
 - Generate a separate, expiring activation plan with the exact logical
   hostname/TLS/upstream intent. Apply it only from a distinct approval.
-- Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
+- **Add super-admin lifecycle dashboard: funnel/state, jobs/blocked actions,
   release/resource versions, redacted failures, health, audit trail and
-  bounded analytics. Add suspend/retry controls with server-side authorization.
-  This dashboard stays **operator-only**. The **organizer-facing** view — the
-  landing SPA now in-tree at `web/` — reads the same aggregator but through a
+  bounded analytics. Add suspend/retry controls with server-side
+  authorization. — BUILT, operator-only half (slice 1: read-only
+  `/v1/admin/*` + one operator page, PR #275, merged 2026-09-27; slice 2:
+  suspend/retry, PR #348, merged 2026-10-03).** Per `docs/sprint6-tracks.md`
+  decision 23: built in two slices, "built as specified" kept, only the order
+  changed. Slice 2 adds `control-plane/api/src/admin-mutations.ts` and
+  migration `20261003060350_trip_suspend.sql`
+  (`control_plane.trip_suspension_history`, a durable, dashboard-excluded
+  record of every suspension reason, kept separate so resume never erases
+  it). Suspend is deliberately narrow — it pauses job *claiming* for the
+  trip only; it does not touch the live site or its data, and does not stop
+  the relay engaging the trip's companion (the migration's own comment calls
+  wiring the relay to this flag a real future option, not this slice's
+  scope). Went through a boundary review (findings fixed before merge: a
+  race between job claiming and suspend, malformed-id audit-log pollution, a
+  Unicode control-character validation gap, and an unaudited refusal path)
+  and two further rounds of review after that: round 1 found admin Retry
+  created a job but never queued it (left stuck `pending_approval`) — fixed
+  by having `retryTripViaAdmin` issue the approval itself; round 2 found
+  resume was permanently erasing the suspension justification — fixed by the
+  new history table above. This dashboard stays **operator-only**. The
+  **organizer-facing** view — the landing SPA now in-tree at `web/` — reads
+  the same aggregator but through a
   separate, organizer-scoped projection and its own auth surface. Whether that
   projection is built here (cheap once the aggregator exists) or deferred to
   the post-MVP web track is an open decision — see §5's Landing SPA note
@@ -1504,7 +1544,7 @@ Build:
 - Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
   destructive rollback.
-- Emit the assistant-experience **outcome** events defined in
+- **Emit the assistant-experience outcome events defined in
   `trip-assistant-experience-metrics.md` — grounded, partial and
   missing-data answers, unanswered group mentions, organizer follow-up
   requested/answered, post-write verification passed/failed — inside the base
@@ -1513,15 +1553,58 @@ Build:
   rate, traveler self-service rate and post-write trust rate from them, grouped
   by trip, phase, day, channel, user role and topic so a quality problem can be
   attributed to platform reliability, website data gaps, organizer workflow
-  friction or assistant behaviour.
+  friction or assistant behaviour. — The assistant-side (Hermes) half is BUILT
+  (2026-10-03); the bullet as a whole is still partial.** The relay-side half
+  (base event envelope, response rate) was already built in an earlier,
+  separate PR before this round of work, per issue #177, PR #181 (merged
+  2026-09-25) — no change here. This round, PR #347 adds the assistant-side
+  half: a new Hermes plugin (`.agents/hermes-plugins/assistant-events/`) and
+  an authenticated ingest route, `POST
+  /internal/assistant-events/tool-outcomes`
+  (`control-plane/api/src/hermes-ingest.ts`). The brief's implied outcome
+  name "answered" is permanently banned by an existing guardrail test
+  (`analytics/contract.ts` refuses the literal word `answered` for any
+  source, forever); the actual name shipped is `grounded_answer`, which the
+  derived-rate name `grounded_answer_rate` (already named in
+  `analytics/rates.ts` before this PR, as a `not_measurable` placeholder)
+  already anticipated. **Outcome vocabulary shipped so far is narrower than
+  this bullet's full scope:** `tool_call_completed` currently carries only
+  `grounded_answer` and `failed_tool` (`analytics/contract.ts`) — a distinct
+  `missing_data` outcome is split out of `failed_tool` only by PR #351 (open,
+  not yet merged; see the missing-information bullet below), and no outcome
+  exists yet for "partial", organizer follow-up requested/answered, or
+  post-write verification passed/failed. **Off by default everywhere**
+  (`ASSISTANT_EVENTS_ENABLED` unset; not enabled in any deployment). Of the
+  five derived rates, only response rate is computed from real events today;
+  `grounded_answer_rate` and `missing_data_rate` move off `not_measurable`
+  only once PR #351 merges; traveler self-service rate and post-write trust
+  rate have no event source at all yet and stay `not_measurable`, per this
+  section's own automated-test requirement (an unmeasured rate must say so,
+  never fabricate a number).
 - Add the daily control-plan report to the dashboard: usage, value delivered,
   information quality, learning and enrichment, and organizer enablement —
   including the top missing items to request and the traveler value each one
   unlocks.
-- Implement the missing-information control loop: detect a missing fact while
+- **Implement the missing-information control loop: detect a missing fact while
   answering, convert it into a focused organizer request naming the smallest
   artifact that unlocks the most value, and track whether the request was
-  fulfilled.
+  fulfilled. — Narrowed scope BUILT, PR OPEN, not yet merged (as of
+  2026-10-03).** Per `docs/sprint6-tracks.md` decision 22, the loop was cut
+  for Sprint 6 to: detect a missing fact, record it, and show the top
+  missing items in the daily report; the focused organizer request and
+  tracking whether it was fulfilled move to the next sprint — that
+  narrowing, not this update, is what is built. The narrowed scope is on
+  PR #351 (`feat/missing-info-control-loop`), **open, CI running, not
+  merged**: a new `missing_data` outcome on `tool_call_completed` events
+  (split out of what used to be folded into `failed_tool`), a new required
+  `tool_name` field, `grounded_answer_rate`/`missing_data_rate` in
+  `analytics/rates.ts` moving off `not_measurable` to real computed rates,
+  and the "Top 3 missing items to request from the organizer" line in the
+  daily report (`analytics/report.ts`) going from a hardcoded "no data
+  recorded" to a real ranked list. **Not built, and not claimed here:** the
+  organizer-request-generation and fulfillment-tracking thirds of this
+  bullet as originally written — those are explicitly deferred to next
+  sprint per decision 22, unchanged by this PR.
 
 Automated tests:
 

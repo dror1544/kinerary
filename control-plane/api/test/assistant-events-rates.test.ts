@@ -36,6 +36,7 @@ const DM_DAY: DayRollup = {
     forwarded_reply_delivered_substantive_outcome_unknown: 0, forwarded_unanswered: 0,
     relay_read: { failed_tool: 4 },
   },
+  assistant_tool_outcomes: { grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {} },
 };
 
 /** Wednesday: the family group — 5 chatter + 1 unaddressed PDF, 5 forwarded requests (one lost), one PDF forwarded and replied to. */
@@ -57,6 +58,7 @@ const GROUP_DAY: DayRollup = {
     forwarded_reply_delivered_substantive_outcome_unknown: 1, forwarded_unanswered: 0,
     relay_read: {},
   },
+  assistant_tool_outcomes: { grounded_answer: 0, failed_tool: 0, missing_data: 0, missing_data_by_tool: {} },
 };
 
 describe("deriveRates — the DM day (organizer_dm only, nothing forwarded to the companion)", () => {
@@ -148,22 +150,42 @@ describe("deriveRates — the group day, hand-computed against the replay's own 
   });
 });
 
-describe("the four rates the relay's facts cannot support", () => {
-  test("grounded-answer, missing-data, traveller self-service and post-write trust are not_measurable, with a reason — never 0, never a number", () => {
+describe("traveller self-service and post-write trust — the two rates still not measurable", () => {
+  test("are not_measurable, with a reason — never 0, never a number", () => {
     for (const rollup of [DM_DAY, GROUP_DAY, emptyDayRollup(TRIP_ID, "2026-01-01")]) {
       const rates = deriveRates(rollup);
-      for (const key of [
-        "grounded_answer_rate",
-        "missing_data_rate",
-        "traveller_self_service_rate",
-        "post_write_trust_rate",
-      ] as const) {
+      for (const key of ["traveller_self_service_rate", "post_write_trust_rate"] as const) {
         const nm = rates.not_measurable[key];
         assert.equal(nm.not_measurable, true, `${key} on ${rollup.local_day}`);
         assert.equal(nm.reason, NOT_MEASURABLE_REASON);
         assert.ok(nm.reason.length > 0);
       }
     }
+  });
+});
+
+describe("grounded-answer rate and missing-data rate — now measurable (missing-information control loop)", () => {
+  test("null-valued (never 0, never not_measurable) when no Hermes tool call was reported that day", () => {
+    for (const rollup of [DM_DAY, GROUP_DAY, emptyDayRollup(TRIP_ID, "2026-01-01")]) {
+      const rates = deriveRates(rollup);
+      assert.deepEqual(rates.grounded_answer_rate, { value: null, numerator: 0, denominator: 0 });
+      assert.deepEqual(rates.missing_data_rate, { value: null, numerator: 0, denominator: 0 });
+      assert.ok(!("grounded_answer_rate" in rates.not_measurable));
+      assert.ok(!("missing_data_rate" in rates.not_measurable));
+    }
+  });
+
+  test("computed from the day's assistant_tool_outcomes when the Hermes plugin did report", () => {
+    const rollup: DayRollup = {
+      ...emptyDayRollup(TRIP_ID, "2026-10-03"),
+      assistant_tool_outcomes: {
+        grounded_answer: 6, failed_tool: 1, missing_data: 3,
+        missing_data_by_tool: { get_booking_confirmation: 2, get_budget: 1 },
+      },
+    };
+    const rates = deriveRates(rollup);
+    assert.deepEqual(rates.grounded_answer_rate, { value: 0.6, numerator: 6, denominator: 10 });
+    assert.deepEqual(rates.missing_data_rate, { value: 0.3, numerator: 3, denominator: 10 });
   });
 });
 

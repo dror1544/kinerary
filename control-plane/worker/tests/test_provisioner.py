@@ -39,10 +39,21 @@ SKIP = not DB_URL
 # ── Fake deploy adapter ───────────────────────────────────────────────────────
 
 class FakeDeployAdapter:
-    def __init__(self, fail: bool = False, error_code: str = "FAKE_DEPLOY_FAILURE") -> None:
+    def __init__(
+        self,
+        fail: bool = False,
+        error_code: str = "FAKE_DEPLOY_FAILURE",
+        health_ok: bool = True,
+        roster_participants: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.deployed: list[dict[str, Any]] = []
         self._fail = fail
         self._error_code = error_code
+        # Backs this adapter's own `http_get` below — lets a test simulate
+        # the deployed site failing its own /api/health or serving an empty
+        # roster, without a real network call. Defaults are the happy path.
+        self._health_ok = health_ok
+        self._roster_participants = roster_participants
 
     def deploy(
         self,
@@ -65,6 +76,36 @@ class FakeDeployAdapter:
             "documents": list(documents or []), "trip_id": trip_id,
         })
         return f"https://{slug}.test.example"
+
+    def http_get(self, url: str) -> tuple[int, str]:
+        """Doubles as the verification aggregator's HTTP transport for the
+        fake URL `deploy()` just invented. `ProvisionerWorker.__init__`
+        prefers the deploy adapter's own `http_get` (when present) over a
+        real network call — exactly so every one of this file's existing
+        call sites, which never heard of verification, keeps exercising the
+        happy path without being touched one by one."""
+        if not self._health_ok:
+            return 503, '{"ok": false}'
+        if url.endswith("/api/health"):
+            return 200, '{"ok": true}'
+        if url.endswith("/api/config/roster"):
+            participants = self._roster_participants
+            if participants is None:
+                config = self.deployed[-1]["config"] if self.deployed else {}
+                participants = [
+                    {"username": p.get("username"), "name": p.get("name")}
+                    for p in (config.get("participants") or [])
+                ] or [{"username": "organizer", "name": "Organizer"}]
+            return 200, json.dumps({"participants": participants})
+        if url.endswith("/api/config/deployment-identity"):
+            # #review 2026-10-03 [P2], round 2: mirrors the real
+            # server/server.js route this verification check now also
+            # probes, reading the same deployed config's meta the way the
+            # roster branch above reads its participants.
+            config = self.deployed[-1]["config"] if self.deployed else {}
+            meta = config.get("meta") or {}
+            return 200, json.dumps({"departure": meta.get("departure"), "returnDate": meta.get("returnDate")})
+        return 404, "not found"
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -193,6 +234,10 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
             cur.execute("DELETE FROM control_plane.intake_versions WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
+            # The verification aggregator (Sprint 6) now writes one row per
+            # check on every happy-path run_once(), which FK-references trips —
+            # so every fixture that ever reached _complete leaves rows here.
+            cur.execute("DELETE FROM control_plane.verification_evidence WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.releases WHERE id = %s", (fix["release_id"],))
             cur.execute("DELETE FROM control_plane.users WHERE id = %s", (fix["user_id"],))
@@ -589,6 +634,76 @@ class ProvisionerHappyPathTests(unittest.TestCase):
             (self.fix["job_id"],),
         ).fetchone()
         self.assertEqual(row["state"], "queued")
+
+    def test_no_claimable_job_when_trip_suspended(self) -> None:
+        # Sprint 6 slice 2 admin dashboard (migration 20261003060350):
+        # _claim() mirrors job-queue.ts's claimJob() in excluding a
+        # suspended trip's jobs. Approval is untouched and valid — suspend is
+        # what alone must stop the claim.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = now(), suspended_reason = 'test pause' WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertFalse(result)
+        row = self.conn.execute(
+            "SELECT state FROM control_plane.jobs WHERE id = %s",
+            (self.fix["job_id"],),
+        ).fetchone()
+        self.assertEqual(row["state"], "queued")
+
+        # Resuming (clearing both columns together, same pairing the
+        # migration's CHECK enforces) makes the job claimable again.
+        self.conn.execute(
+            "UPDATE control_plane.trips SET suspended_at = NULL, suspended_reason = NULL WHERE id = %s",
+            (self.fix["trip_id"],),
+        )
+        self.conn.commit()
+        result = self.worker.run_once()
+        self.assertTrue(result)
+
+    def test_claim_cannot_win_a_race_against_a_suspend_still_mid_transaction(self) -> None:
+        # The race the boundary review proved live (2026-10-03) against this
+        # exact production path. Tested against _claim() directly (not
+        # run_once(), which also WORKS a claimed job afterward — a later step
+        # in that pipeline touches the trips row too, so once _claim() wins
+        # the race it then genuinely blocks on holder's own lock for the rest
+        # of the job, which is a real but separate behaviour from the race
+        # this test is pinning).
+        #
+        # holder mirrors suspendTrip's TS equivalent's opening move exactly:
+        # BEGIN, then the same `SELECT ... FOR UPDATE` on the trips row, held
+        # open. Before the fix (_claim's own FOR UPDATE OF j, pa only), a
+        # concurrent _claim() call claimed the job in ~0.05s with no regard
+        # for that lock. After the fix (FOR UPDATE OF j, pa, t), it must skip
+        # the row instead.
+        holder = psycopg.connect(DB_URL, row_factory=dict_row)
+        try:
+            holder.execute(
+                "SELECT suspended_at FROM control_plane.trips WHERE id = %s FOR UPDATE",
+                (self.fix["trip_id"],),
+            )
+
+            with psycopg.connect(DB_URL, row_factory=dict_row) as claim_conn:
+                claimed = self.worker._claim(claim_conn)
+            self.assertIsNone(claimed, "a claim must not win while the trip row is locked by an in-flight suspend")
+
+            row = self.conn.execute(
+                "SELECT state FROM control_plane.jobs WHERE id = %s",
+                (self.fix["job_id"],),
+            ).fetchone()
+            self.assertEqual(row["state"], "queued")
+        finally:
+            # Release the held lock without ever actually suspending the
+            # trip — this test only needs to prove the lock window matters.
+            holder.rollback()
+            holder.close()
+
+        # With the lock released and the trip never actually suspended, a
+        # normal claim now succeeds — proving the fix doesn't over-block.
+        result = self.worker.run_once()
+        self.assertTrue(result)
 
 
 @unittest.skipIf(SKIP, "CONTROL_PLANE_TEST_DATABASE_URL not set")
@@ -1274,8 +1389,18 @@ class SlugPromotionTests(unittest.TestCase):
             # a suffix that was no longer available and failed on data rather
             # than behaviour. The property is "collisions are suffixed", not
             # "the suffix is 2".
+            #
+            # #342: the YEAR was hardcoded here too (`japan-2026-\d+`), which
+            # is the same class of date bomb one level up. JAPAN_INTAKE names
+            # no explicit date, so derive_trip_slug's own fallback
+            # (`_resolve_dates`: departure = today + 90 days) decides the
+            # year — found live on 2026-10-03, when today + 90 days first
+            # crossed into January and every slug this test produces became
+            # `japan-2027*`, not `japan-2026*`. The property is "some year",
+            # not "2026" specifically — same reasoning as the suffix number,
+            # one component over.
             self.assertTrue(
-                any(re.fullmatch(r"japan-2026-\d+", s) for s in slugs),
+                any(re.fullmatch(r"japan-\d{4}-\d+", s) for s in slugs),
                 f"expected a numeric-suffixed slug among {slugs}",
             )
         finally:

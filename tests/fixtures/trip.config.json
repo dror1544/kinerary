@@ -3,6 +3,7 @@
     "title": "Test Trip 2027",
     "brand": "TEST",
     "departure": "2027-03-10T06:00:00+03:00",
+    "returnDate": "2027-03-20",
     "defaultLang": "he",
     "homeCurrency": "ILS"
   },
