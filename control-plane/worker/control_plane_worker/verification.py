@@ -118,10 +118,23 @@ def default_http_get(url: str, timeout: float = 10.0) -> "tuple[int, str]":
     """A real GET. `private_url` is a value this worker already trusts and
     already hands to the organizer (same provenance as the notification
     sent in `_complete`), so this only pins the scheme — never file://, never
-    anything else urlopen would otherwise honour."""
+    anything else urlopen would otherwise honour.
+
+    #review 2026-10-03: found live — every real deploy was hitting Cloudflare's
+    Browser Integrity Check (error 1010) on EVERY attempt, not an unreachable
+    site. `urlopen` with no explicit User-Agent sends `Python-urllib/3.x`,
+    which Cloudflare blocks outright for a Cloudflare-proxied hostname; no
+    retry budget can ever recover from that, because the block doesn't heal
+    with time. A non-empty, non-browser-impersonating User-Agent is enough to
+    clear it.
+    """
     if urlsplit(url).scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) scheme in verification probe: {url!r}")
-    request = Request(url, headers={"Accept": "application/json"}, method="GET")
+    request = Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "Kinerary-ControlPlane-Verification/1.0"},
+        method="GET",
+    )
     try:
         # nosec B310: scheme is checked above.
         with urlopen(request, timeout=timeout) as response:
