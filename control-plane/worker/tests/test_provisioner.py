@@ -39,10 +39,21 @@ SKIP = not DB_URL
 # ── Fake deploy adapter ───────────────────────────────────────────────────────
 
 class FakeDeployAdapter:
-    def __init__(self, fail: bool = False, error_code: str = "FAKE_DEPLOY_FAILURE") -> None:
+    def __init__(
+        self,
+        fail: bool = False,
+        error_code: str = "FAKE_DEPLOY_FAILURE",
+        health_ok: bool = True,
+        roster_participants: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.deployed: list[dict[str, Any]] = []
         self._fail = fail
         self._error_code = error_code
+        # Backs this adapter's own `http_get` below — lets a test simulate
+        # the deployed site failing its own /api/health or serving an empty
+        # roster, without a real network call. Defaults are the happy path.
+        self._health_ok = health_ok
+        self._roster_participants = roster_participants
 
     def deploy(
         self,
@@ -65,6 +76,28 @@ class FakeDeployAdapter:
             "documents": list(documents or []), "trip_id": trip_id,
         })
         return f"https://{slug}.test.example"
+
+    def http_get(self, url: str) -> tuple[int, str]:
+        """Doubles as the verification aggregator's HTTP transport for the
+        fake URL `deploy()` just invented. `ProvisionerWorker.__init__`
+        prefers the deploy adapter's own `http_get` (when present) over a
+        real network call — exactly so every one of this file's existing
+        call sites, which never heard of verification, keeps exercising the
+        happy path without being touched one by one."""
+        if not self._health_ok:
+            return 503, '{"ok": false}'
+        if url.endswith("/api/health"):
+            return 200, '{"ok": true}'
+        if url.endswith("/api/config/roster"):
+            participants = self._roster_participants
+            if participants is None:
+                config = self.deployed[-1]["config"] if self.deployed else {}
+                participants = [
+                    {"username": p.get("username"), "name": p.get("name")}
+                    for p in (config.get("participants") or [])
+                ] or [{"username": "organizer", "name": "Organizer"}]
+            return 200, json.dumps({"participants": participants})
+        return 404, "not found"
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -193,6 +226,10 @@ def teardown_fixture(conn: psycopg.Connection, fix: dict) -> None:
             cur.execute("DELETE FROM control_plane.intake_versions WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.runtime_routes WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trip_memberships WHERE trip_id = %s", (trip_id,))
+            # The verification aggregator (Sprint 6) now writes one row per
+            # check on every happy-path run_once(), which FK-references trips —
+            # so every fixture that ever reached _complete leaves rows here.
+            cur.execute("DELETE FROM control_plane.verification_evidence WHERE trip_id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.trips WHERE id = %s", (trip_id,))
             cur.execute("DELETE FROM control_plane.releases WHERE id = %s", (fix["release_id"],))
             cur.execute("DELETE FROM control_plane.users WHERE id = %s", (fix["user_id"],))
