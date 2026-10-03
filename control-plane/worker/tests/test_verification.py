@@ -153,6 +153,33 @@ class RenderedDataCheckTests(unittest.TestCase):
         result = verification.check_rendered_data(get, "https://trip.example")
         self.assertEqual(result.outcome, "failed")
 
+    def test_passes_when_the_roster_matches_the_expected_usernames(self) -> None:
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}, {"username": "ron"}]}))
+        result = verification.check_rendered_data(get, "https://trip.example", frozenset({"tali", "ron"}))
+        self.assertEqual(result.outcome, "passed")
+
+    def test_fails_when_the_roster_belongs_to_a_different_trip(self) -> None:
+        """#review 2026-10-03 [P2]: a nonempty roster alone used to pass this
+        check even when it was some OTHER trip's roster — a misrouted
+        private_url serving the wrong container would pass both this and
+        runtime_health. Caught now by comparing against the deploy's own
+        expected usernames."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "someone_else"}]}))
+        result = verification.check_rendered_data(get, "https://trip.example", frozenset({"tali", "ron"}))
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("roster mismatch", result.evidence)
+
+    def test_a_nonempty_roster_still_passes_with_no_expected_usernames_to_compare(self) -> None:
+        """An empty expected_usernames (no participant with a username at
+        all) skips the identity comparison rather than failing every such
+        trip retroactively -- the plain nonempty check still applies."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "a"}]}))
+        result = verification.check_rendered_data(get, "https://trip.example", frozenset())
+        self.assertEqual(result.outcome, "passed")
+
 
 class DefaultHttpGetTests(unittest.TestCase):
     def test_refuses_non_http_schemes(self) -> None:

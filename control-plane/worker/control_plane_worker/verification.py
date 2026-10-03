@@ -58,7 +58,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from typing import Any, Callable, Mapping, NamedTuple
+from typing import AbstractSet, Any, Callable, Mapping, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -177,12 +177,26 @@ def check_runtime_health(get: HttpGetFn, private_url: str | None) -> CheckResult
     return CheckResult(RUNTIME_HEALTH, "passed", body)
 
 
-def check_rendered_data(get: HttpGetFn, private_url: str | None) -> CheckResult:
+def check_rendered_data(
+    get: HttpGetFn, private_url: str | None, expected_usernames: AbstractSet[str] = frozenset(),
+) -> CheckResult:
     """The trip's own `GET /api/config/roster` — deliberately unauthenticated
     (server/server.js: "the login screen needs to show a pick-yourself roster
     before any session exists"), so this is checkable with no credentials and
     still proves real trip.config.json content reached the site, not an empty
-    or broken shell."""
+    or broken shell.
+
+    #review 2026-10-03 [P2]: a nonempty check alone passes ANY reachable
+    trip's roster — a stale deployment or a `private_url` ingress misrouted to
+    another trip's container would pass both this and `runtime_health` while
+    `ready_private` commits for the WRONG data. `expected_usernames` is the
+    plan's own participant usernames (provisioner.py: `config["participants"]`,
+    the exact config this deploy was FOR) — the one identity this check can
+    compare against with no new route or schema. An empty `expected_usernames`
+    (no provider gave one, or a trip with no usernamed participant at all)
+    skips the identity comparison rather than failing every trip retroactively
+    — the plain nonempty check below still applies either way.
+    """
     if not private_url:
         return CheckResult(RENDERED_DATA, "failed", "no private_url to probe")
     url = private_url.rstrip("/") + "/api/config/roster"
@@ -199,6 +213,14 @@ def check_rendered_data(get: HttpGetFn, private_url: str | None) -> CheckResult:
     participants = payload.get("participants") if isinstance(payload, dict) else None
     if not isinstance(participants, list) or not participants:
         return CheckResult(RENDERED_DATA, "failed", body)
+    if expected_usernames:
+        actual_usernames = {p.get("username") for p in participants if isinstance(p, dict) and p.get("username")}
+        if actual_usernames != set(expected_usernames):
+            return CheckResult(
+                RENDERED_DATA, "failed",
+                f"roster mismatch at {url}: expected usernames {sorted(expected_usernames)}, "
+                f"got {sorted(actual_usernames)} — this private_url may be serving another trip",
+            )
     return CheckResult(RENDERED_DATA, "passed", body)
 
 
@@ -271,7 +293,11 @@ def check_backup_checkpoint() -> CheckResult:
 # ── Aggregation / recording ──────────────────────────────────────────────────
 
 def run_pre_ready_private_checks(
-    conn: Any, *, plan_desired: Mapping[str, Any], private_url: str | None, http_get: HttpGetFn,
+    conn: Any, *,
+    plan_desired: Mapping[str, Any],
+    private_url: str | None,
+    http_get: HttpGetFn,
+    expected_usernames: AbstractSet[str] = frozenset(),
 ) -> list[CheckResult]:
     """All six, in the shape they can honestly be evaluated in BEFORE
     `_attach_companion` has run. See the module docstring for why the last
@@ -279,7 +305,7 @@ def run_pre_ready_private_checks(
     return [
         check_release_compatibility(conn, plan_desired),
         check_runtime_health(http_get, private_url),
-        check_rendered_data(http_get, private_url),
+        check_rendered_data(http_get, private_url, expected_usernames),
         CheckResult(
             MCP_ISOLATION, "skipped",
             "not attempted yet: the companion/bridge wiring step (_attach_companion) "
@@ -339,6 +365,7 @@ def gate_ready_private(
     plan_desired: Mapping[str, Any],
     private_url: str | None,
     http_get: HttpGetFn | None = None,
+    expected_usernames: AbstractSet[str] = frozenset(),
 ) -> list[CheckResult]:
     """Runs all six checks, records evidence for all six (always — a hard-gate
     failure is recorded before it is ever raised, so the evidence survives
@@ -348,6 +375,7 @@ def gate_ready_private(
     get = http_get or default_http_get
     results = run_pre_ready_private_checks(
         conn, plan_desired=plan_desired, private_url=private_url, http_get=get,
+        expected_usernames=expected_usernames,
     )
     record_evidence(conn, trip_id=trip_id, deployment_ref=deployment_ref, results=results)
 
