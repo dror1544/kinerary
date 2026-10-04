@@ -1588,14 +1588,14 @@ Build:
 - **Implement the missing-information control loop: detect a missing fact while
   answering, convert it into a focused organizer request naming the smallest
   artifact that unlocks the most value, and track whether the request was
-  fulfilled. — Narrowed scope BUILT, PR OPEN, not yet merged (as of
-  2026-10-03).** Per `docs/sprint6-tracks.md` decision 22, the loop was cut
-  for Sprint 6 to: detect a missing fact, record it, and show the top
-  missing items in the daily report; the focused organizer request and
-  tracking whether it was fulfilled move to the next sprint — that
-  narrowing, not this update, is what is built. The narrowed scope is on
-  PR #351 (`feat/missing-info-control-loop`), **open, CI running, not
-  merged**: a new `missing_data` outcome on `tool_call_completed` events
+  fulfilled. — Narrowed scope BUILT and merged (PR #351, 2026-10-03).** Per
+  `docs/sprint6-tracks.md` decision 22, the loop was cut for Sprint 6 to:
+  detect a missing fact, record it, and show the top missing items in the
+  daily report; the focused organizer request and tracking whether it was
+  fulfilled move to the next sprint — that narrowing, not this update, is
+  what is built. The narrowed scope is on PR #351
+  (`feat/missing-info-control-loop`, merged as `ed7709a`): a new
+  `missing_data` outcome on `tool_call_completed` events
   (split out of what used to be folded into `failed_tool`), a new required
   `tool_name` field, `grounded_answer_rate`/`missing_data_rate` in
   `analytics/rates.ts` moving off `not_measurable` to real computed rates,
@@ -1622,42 +1622,34 @@ Automated tests:
 
 Manual tests:
 
+> **Superseded (decision 27, `docs/sprint6-tracks.md`, 2026-09-26).** The
+> `japan-2026` re-provision below, the activation rejection rehearsal and the
+> activation approval replay/expiry test are **dropped** — `japan-2026`
+> collided with the live trip's own slug and dates, and the activation design
+> itself is superseded (see the bullet above). The deliberately-failed
+> health check and the worker-restart-before-a-clean-retry steps **stay**.
+> What replaces the re-provision: a full-cycle run of the `multi` or `manual`
+> scenario on a **fresh** container proves the same thing — no hand-seeded
+> state anywhere in the row — without needing a live slug at all, and this
+> now also runs nightly on the Mac (`~/kinerary-nightly`). **That half is
+> proven: `scripts/preflight-deploy.sh --deploy --auto --scenario multi
+> --cleanup` went fully green end to end on 2026-10-04** (signup → interview
+> → document extraction → provisioning → the verification gate → site
+> content/venue/booking checks → companion + trip-mcp), on a freshly
+> allocated container (vmid 105), with the row the pipeline actually
+> produced. **Not yet exercised:** the deliberately-failed-health-check and
+> worker-restart-before-a-clean-retry rehearsal that decision 27 keeps in
+> scope — `test_verification.py` covers the unit-level shape of a failed
+> health check, but no run has yet restarted the worker mid-job and watched
+> it claim and retry cleanly.
+
 - perform the complete demo rehearsal with two people: organizer executes
   signup/interview/confirm/group actions; super-admin reviews the two approval
   gates and observes the dashboard;
-- test an activation rejection, a deliberately failed health check and a
-  worker restart before approving a clean retry;
+- test a deliberately failed health check and a worker restart before
+  approving a clean retry;
 - after success, open the non-production trip URL, exercise a safe companion
   request, verify monitoring, then suspend/archive and run labelled cleanup.
-- **Re-provision `japan-2026` through the full cycle onto a fresh
-  control-plane-managed container** (decided 2026-09-02). This is the first
-  trip to go end to end — signup → interview → intake → plan → approve →
-  provision → verify → activate — with no hand-seeded state anywhere in it.
-
-  The reason it is worth doing on *this* slug: the compute half already works
-  for it and the intake half never ran. `LxcProvisionAdapter` really did
-  allocate vmid 101 at `192.168.0.60` and write its `topology.yaml`, and the
-  container is serving on both the LAN and `japan-2026.ara-united.store`. But
-  the trip row is `trip_japan2026seed0000000000000a`, hand-seeded with empty
-  `title`, `destination_label`, `start_date` and `end_date` so the Sprint 5
-  router had a binding target for the live group test. A full cycle replaces
-  that stub with a row the pipeline actually produced, which is precisely the
-  "without manual database changes" clause in the exit gate below.
-
-  Three things to get right when it runs:
-
-  - **Provision onto a NEW container, not vmid 101.** Do not add `japan-2026`
-    to `PROVISIONER_VMID_MAP` to force reuse — a static entry means "legacy,
-    hand-provisioned", and using one here would skip the very allocation path
-    under test. Let Phase G allocate the next free IP in the 60-99 pool.
-  - **The existing container and its chat binding are LIVE.** A real family
-    supergroup is bound to the seed trip. Cutting over means a reviewed
-    reassignment, which is still unbuilt (see Sprint 5's "who closes a
-    binding"), so plan the binding move explicitly rather than letting the
-    provisioner attempt it — `bind_chat_to_trip` refuses to move a chat to a
-    different trip by design, and correctly so.
-  - **Keep the old container until the new one verifies**, then run labelled
-    cleanup on it. Two trips must not answer on one hostname mid-cutover.
 
 Exit gate: the complete demo script passes, its evidence is retained, cleanup
 is verified, and the team can repeat the run without manual database changes.
