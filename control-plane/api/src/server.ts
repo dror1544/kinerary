@@ -3,6 +3,7 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
+import { recoverStaleLeases } from "./job-queue.js";
 import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
@@ -229,6 +230,35 @@ if (signup) {
       })
       .finally(() => { dispatching = false; });
   }, OUTBOX_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Reclaims jobs whose worker died mid-run. `claimJob` sets a 900s lease
+// (provisioner.py's LEASE_SECONDS) renewed by a heartbeat while the worker is
+// alive; job-queue.ts's own comments and provisioner.py's call it "the real
+// safety net" for a dead worker, but until now nothing ever called it outside
+// a test — a worker that crashed left its job `leased` forever, with no
+// automatic retry and no terminal failure either. Runs unconditionally, like
+// the plan-review loop: lease recovery depends on no optional profile.
+{
+  let recovering = false;
+  const STALE_LEASE_POLL_INTERVAL_MS = 2 * 60_000;
+  const timer = setInterval(() => {
+    if (recovering) return;
+    recovering = true;
+    recoverStaleLeases(pool)
+      .then((count) => {
+        if (count > 0) {
+          process.stderr.write(`${structuredLog("warn", "job_queue.stale_leases_recovered", { count })}\n`);
+        }
+      })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "job_queue.stale_lease_recovery_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { recovering = false; });
+  }, STALE_LEASE_POLL_INTERVAL_MS);
   timer.unref();
 }
 
