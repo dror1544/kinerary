@@ -1541,9 +1541,20 @@ Build:
   the post-MVP web track is an open decision — see §5's Landing SPA note
   (points 1–2), `docs/landing-page-plan.md`,
   `docs/web-control-plane-integration-plan.md`.
-- Document a runbook for failed provisioning, stale worker lease, failed
+- **Document a runbook for failed provisioning, stale worker lease, failed
   activation, cleanup, upgrade rehearsal and rollback. No automatic
-  destructive rollback.
+  destructive rollback. — BUILT (2026-10-04).** `docs/control-plane-ops-runbook.md`.
+  Per `docs/sprint6-tracks.md`'s "Monitoring" section, cleanup and
+  upgrade/rollback were already covered elsewhere (`teardown-trip.py`,
+  `kinerary-cp-release`) and are linked rather than duplicated; failed
+  activation has no runbook because activation itself is superseded (see
+  above). Writing the failed-provisioning and stale-lease sections surfaced
+  a real gap, now fixed: `recoverStaleLeases` — described in its own code
+  comments as "the real safety net" for a worker that dies mid-job — was
+  never actually called outside a test. A dead worker's job stayed `leased`
+  forever. It now runs on a 2-minute timer in the API process
+  (`server.ts`), unconditionally, the same pattern every other background
+  loop there already uses.
 - **Emit the assistant-experience outcome events defined in
   `trip-assistant-experience-metrics.md` — grounded, partial and
   missing-data answers, unanswered group mentions, organizer follow-up
