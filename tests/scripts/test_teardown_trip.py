@@ -441,3 +441,79 @@ class BuildProvisioner(unittest.TestCase):
 
     def test_it_needs_no_pool_variable_at_all(self):
         self.assertEqual(self.build({})["ip_pool"], [])
+
+
+class _FakeProfileDir:
+    """A profile directory that may be recreated by an external ticker at
+    chosen points in fake time — independent of when `delete()` runs, the way
+    the interviewer's own cron ticker is independent of teardown's call."""
+
+    def __init__(self, clock, recreate_at=()):
+        self.clock = clock
+        self.recreate_at = sorted(recreate_at)
+        self.present = True
+        self._fired = set()
+        self.delete_calls = 0
+
+    def is_dir(self):
+        for t in self.recreate_at:
+            if t not in self._fired and self.clock["t"] >= t:
+                self.present = True
+                self._fired.add(t)
+        return self.present
+
+    def delete(self):
+        self.delete_calls += 1
+        self.present = False
+
+
+class DeleteProfileAndWatch(unittest.TestCase):
+    """issue #352: a single delete-then-wait-then-check gave the interviewer's
+    cron ticker exactly one free shot at recreating the profile directory. The
+    fix re-deletes it every time it reappears, for the same total budget."""
+
+    def _clock(self):
+        clock = {"t": 0.0}
+        sleep = lambda dt: clock.__setitem__("t", clock["t"] + dt)  # noqa: E731
+        monotonic = lambda: clock["t"]  # noqa: E731
+        return clock, sleep, monotonic
+
+    def test_never_recreated_succeeds_with_exactly_one_delete(self):
+        clock, sleep, monotonic = self._clock()
+        fake = _FakeProfileDir(clock, recreate_at=())
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=sleep, monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 0)
+        self.assertEqual(fake.delete_calls, 1)
+
+    def test_recreated_once_mid_window_is_redeleted_and_still_succeeds(self):
+        clock, sleep, monotonic = self._clock()
+        fake = _FakeProfileDir(clock, recreate_at=(12.0,))
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=sleep, monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 1)
+        self.assertEqual(fake.delete_calls, 2)
+
+    def test_something_that_keeps_ticking_the_whole_window_still_fails(self):
+        clock, sleep, monotonic = self._clock()
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=70, delete=lambda: None, is_dir=lambda: True,
+            sleep=sleep, monotonic=monotonic)
+        self.assertFalse(ok)
+        self.assertEqual(redeletes, 14)  # 70s / 5s poll
+
+    def test_zero_settle_seconds_skips_the_watch_and_never_sleeps(self):
+        clock, sleep, monotonic = self._clock()
+        sleep_calls = []
+        fake = _FakeProfileDir(clock, recreate_at=())
+        ok, redeletes = teardown.delete_profile_and_watch(
+            Path("/irrelevant"), settle_seconds=0, delete=fake.delete, is_dir=fake.is_dir,
+            sleep=lambda dt: sleep_calls.append(dt), monotonic=monotonic)
+        self.assertTrue(ok)
+        self.assertEqual(redeletes, 0)
+        self.assertEqual(sleep_calls, [])
+        self.assertEqual(fake.delete_calls, 1)

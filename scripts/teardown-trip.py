@@ -67,6 +67,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 REPO = Path(__file__).resolve().parents[1]
 HOME = Path.home()
@@ -340,6 +341,35 @@ def s6_rescan() -> None:
     if not MACOS:
         subprocess.run(["docker", "exec", HERMES_CONTAINER, "/command/s6-svscanctl", "-an", "/run/service"],
                        capture_output=True)
+
+
+def delete_profile_and_watch(
+    home: Path, *, settle_seconds: float, poll_s: float = 5.0,
+    delete: Callable[[], None], is_dir: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep, monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[bool, int]:
+    """Delete, then keep deleting it back for the whole settle window.
+
+    A single delete-then-wait-then-check gave the interviewer's cron ticker
+    exactly one free shot at recreating `home` (issue #352): the ticker can
+    fire once between the allowlist restart and it actually taking effect,
+    and that one recreation used to fail the whole teardown even when
+    nothing was left ticking by the end of the window. Re-deleting each time
+    it reappears, for the same total budget, only fails now if something
+    keeps recreating it — a real still-running supervisor, not a single lost
+    race. Returns `(ok, redeletes)`.
+    """
+    is_dir = is_dir or Path(home).is_dir
+    delete()
+    redeletes = 0
+    if settle_seconds > 0:
+        deadline = monotonic() + settle_seconds
+        while monotonic() < deadline:
+            sleep(min(poll_s, max(0.0, deadline - monotonic())))
+            if is_dir():
+                redeletes += 1
+                delete()
+    return not is_dir(), redeletes
 
 
 def listeners(port: str) -> list[str]:
@@ -765,15 +795,22 @@ def main() -> int:
 
     home = PROFILES / profile
     if home.is_dir():
-        subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True,
-                       stdin=subprocess.DEVNULL)
-        s6_rescan()
+        def _delete_profile() -> None:
+            subprocess.run([hermes(), "profile", "delete", "-y", profile], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+            s6_rescan()
+
         if args.settle_seconds > 0:
             print(f"    {DIM}watching {args.settle_seconds}s for the profile coming back…{RESET}")
-            time.sleep(args.settle_seconds)
-        if home.is_dir():
+        ok, redeletes = delete_profile_and_watch(home, settle_seconds=args.settle_seconds, delete=_delete_profile)
+        if redeletes:
+            print(f"    {DIM}profile came back {redeletes}x mid-window — deleted it again each time{RESET}")
+        if not ok:
             failed = True
-            say(f"{RED}✗{RESET}", f"profile    {home} CAME BACK — something still ticks it; nothing removed it again")
+            say(f"{RED}✗{RESET}", f"profile    {home} CAME BACK — something still ticks it; nothing removed it again"
+                + (f" ({redeletes} re-delete(s) all lost the race)" if redeletes else ""))
+        elif redeletes:
+            say(f"{GREEN}✓{RESET}", f"profile    deleted, and stayed gone (recreated {redeletes}x mid-window, re-deleted each time)")
         else:
             say(f"{GREEN}✓{RESET}", "profile    deleted, and stayed gone")
         if not MACOS:
