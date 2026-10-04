@@ -80,6 +80,12 @@ services:
       # leaves this unset, so only a manifest-backed, digest-verified release is
       # ever selectable.
       CONTROL_PLANE_ALLOW_UNSEALED_RELEASE: ${CONTROL_PLANE_ALLOW_UNSEALED_RELEASE:-1}
+      # Gates every /v1/admin/* route (app.ts's adminAuth, checked against
+      # X-API-Key) — unset leaves them unmounted entirely, which is why the
+      # super-admin dashboard (sprint6-tracks.md "Monitoring") has never been
+      # reachable on this local stack. compose.vm.yml already passes this
+      # through for the relay; the api service here never got the same line.
+      CONTROL_PLANE_ADMIN_KEY: ${CONTROL_PLANE_ADMIN_KEY:-}
     # The secret is still mounted: the profile's file:// database reference
     # resolves to this path.
     # trip_bot_creds is mounted so the stand-down check can resolve the relay's
