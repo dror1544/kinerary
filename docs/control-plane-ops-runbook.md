@@ -6,6 +6,26 @@ docs; this is the single page that names which one to read for which
 symptom. Each section says only what is not already written better
 elsewhere, and points at the real thing instead of duplicating it.
 
+## A code fix that tests clean but the running stack doesn't see
+
+Found live, 2026-10-05: `CLAUDE.md`'s "the directory decides the branch"
+warning covers bringing the local stack up from the wrong checkout. It does
+not say the sharper thing — **a single-service `docker compose up -d
+<service>` does not fix that either, even run from the right directory,
+even after a real config change forces a recreate.** Once a Compose
+project's bind-mount source is pinned (by whoever first brought it up —
+the nightly run, another session, an earlier you), later single-service
+`up` calls against the same project name keep it. `src` compiling clean,
+`tsc --noEmit` passing, and unit tests passing via `tsx` all say nothing
+about this — none of them touch the running container. The only tell is
+`docker inspect <container> --format '{{range .Mounts}}{{.Source}} ->
+{{.Destination}}{{"\n"}}{{end}}'` actually showing the path you expect.
+Fix: bring the **whole** stack up fresh, from the checkout you mean, the
+way `CLAUDE.md`'s "the containers mount a checkout" section already says —
+`WORKER_REPO_ROOT_HOST=$PWD BUILDX_CONFIG=~/.docker/buildx-local docker
+compose -f control-plane/deployment/compose.local.yml up -d --build
+--wait` — not a targeted `up -d api`.
+
 ## Failed provisioning
 
 Start from the evidence, not the guess:
