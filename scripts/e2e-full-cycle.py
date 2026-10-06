@@ -470,6 +470,22 @@ def stage_confirm_and_build(ctx: dict, wait_minutes: int, build: bool = True) ->
     ctx["slug"] = psql(f"SELECT slug FROM control_plane.trips WHERE id='{trip}'")
     ok(f"slug promoted to '{ctx['slug']}'")
 
+    # The verification aggregator (PR #343) is what makes "provisioning job
+    # succeeded" above actually mean something — on 2026-09-06 a trip reached
+    # exactly that state with no working companion behind it. Confirm the gate
+    # really ran and really recorded evidence for this trip, not just that the
+    # job didn't throw.
+    rows = psql(
+        f"SELECT check_name || '=' || outcome FROM control_plane.verification_evidence "
+        f"WHERE trip_id='{trip}' ORDER BY check_name"
+    ).splitlines()
+    evidence = dict(r.split("=", 1) for r in rows if "=" in r)
+    check(len(evidence) == 6, f"{len(evidence)} verification check(s) recorded",
+          f"expected 6 verification_evidence rows, found {len(evidence)}: {evidence}")
+    for hard_gated in ("release_compatibility", "runtime_health", "rendered_data"):
+        check(evidence.get(hard_gated) == "passed", f"{hard_gated}: passed",
+              f"{hard_gated}: {evidence.get(hard_gated, 'MISSING')} (this blocks ready_private — how did provisioning succeed?)")
+
 
 def stage_site(ctx: dict) -> None:
     stage("The site — up, and serving THIS trip")
