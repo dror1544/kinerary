@@ -1908,8 +1908,22 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
   // (analytics/contract.ts). The request names the Hermes PROFILE
   // reporting, never a trip id; `hermes-ingest.ts` resolves the one trip
   // that profile belongs to (`trips.hermes_profile`) before anything is
-  // written, so a key leaked from one trip's companion still cannot name
-  // another trip in the body.
+  // written.
+  //
+  // #review 2026-10-06 [N2], PR review before the sprint-6 -> main merge:
+  // this comment used to claim that resolution meant "a key leaked from one
+  // trip's companion still cannot name another trip in the body." That is
+  // false — ASSISTANT_EVENTS_INGEST_KEY is ONE shared key for every
+  // companion (see server.ts), not one per trip, so any holder of it can
+  // name ANY real profile and insert outcomes for that trip's analytics
+  // (confirmed live). The attacker gets integrity only — poisoned
+  // assistant-quality/missing-data metrics, not trip-data read access — and
+  // this is dormant today: ASSISTANT_EVENTS_INGEST_KEY is unset everywhere,
+  // so the route 503s before auth is even checked. Fixing this for real
+  // needs a credential actually scoped to one profile (a per-trip key, or
+  // an equivalent binding), which this one shared key cannot be made to do
+  // no matter how the body is re-shaped — tracked as a precondition on
+  // #327 before recording is ever turned on anywhere.
   //
   // Body: { profile: string, events: [{ event_id, outcome, tool_name, occurred_at? }] }
   // (at most hermes-ingest.ts's MAX_BATCH_SIZE entries). A profile with no trip,
