@@ -186,7 +186,10 @@ const EVIDENCE_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map([
   // closed `reason` enum (TRIP_NOT_FOUND / ALREADY_SUSPENDED / NOT_SUSPENDED)
   // — same posture as admin.retry_trip's `reason` above, never free text.
   ["admin.suspend_trip", ["ok", "reason"]],
-  ["admin.resume_trip", ["ok", "reason"]],
+  // reapprovalNeeded (2026-10-06 [P2]) is a plain boolean this codebase
+  // computes itself — whether resuming found and reverted an approval that
+  // expired while the trip was suspended — never traveler or operator text.
+  ["admin.resume_trip", ["ok", "reason", "reapprovalNeeded"]],
 ]);
 
 function projectEvidence(action: string, evidence: unknown): unknown {

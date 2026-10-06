@@ -225,12 +225,12 @@ function TripActions({ tripId, adminKey, onDone }: { tripId: string; adminKey: s
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
-  async function run(label: string, action: () => Promise<unknown>) {
+  async function run<T>(label: string, action: () => Promise<T>, describe?: (result: T) => string) {
     setPending(true);
     setMessage(null);
     try {
-      await action();
-      setMessage(`${label}: done.`);
+      const result = await action();
+      setMessage(describe ? describe(result) : `${label}: done.`);
       onDone();
     } catch (error) {
       setMessage(`${label} failed: ${error instanceof AdminApiError ? error.message : "unexpected error"}`);
@@ -245,6 +245,22 @@ function TripActions({ tripId, adminKey, onDone }: { tripId: string; adminKey: s
     void run("Suspend", () => suspendTrip(adminKey, tripId, reason));
   }
 
+  // PR review before the sprint-6 -> main merge, 2026-10-06 [P2]: resume
+  // used to report bare success even when the trip's approval had expired
+  // while suspended, leaving its job stuck unclaimable with no visible
+  // error. The API now reverts that case itself and says so
+  // (reapprovalNeeded) — surface it, since this is the one branch where
+  // "done." would otherwise read as safe when it isn't.
+  function onResume() {
+    void run(
+      "Resume",
+      () => resumeTrip(adminKey, tripId),
+      (result) => result.reapprovalNeeded
+        ? "Resume: done — its approval expired while suspended; the plan needs a fresh approval before it can run again."
+        : "Resume: done.",
+    );
+  }
+
   return (
     <div className="trip-actions">
       <button className="text-button" disabled={pending} onClick={() => void run("Retry", () => retryTrip(adminKey, tripId))}>
@@ -253,7 +269,7 @@ function TripActions({ tripId, adminKey, onDone }: { tripId: string; adminKey: s
       <button className="text-button" disabled={pending} onClick={onSuspend}>
         Suspend
       </button>
-      <button className="text-button" disabled={pending} onClick={() => void run("Resume", () => resumeTrip(adminKey, tripId))}>
+      <button className="text-button" disabled={pending} onClick={onResume}>
         Resume
       </button>
       {message && <p className="subtle">{message}</p>}

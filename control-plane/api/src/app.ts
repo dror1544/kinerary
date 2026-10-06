@@ -1894,7 +1894,7 @@ export function buildApp(profile: ArchitectureProfile, dependencies: AppDependen
       const status = result.reason === "TRIP_NOT_FOUND" ? 404 : 409;
       return reply.code(status).send({ error: result.reason });
     }
-    return reply.code(200).send({ tripId: result.tripId });
+    return reply.code(200).send({ tripId: result.tripId, reapprovalNeeded: result.reapprovalNeeded });
   });
 
   // ── Hermes tool-outcome ingest ───────────────────────────────────────────

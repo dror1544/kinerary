@@ -339,7 +339,7 @@ export async function suspendTrip(
 }
 
 export type ResumeTripResult =
-  | { ok: true; tripId: string }
+  | { ok: true; tripId: string; reapprovalNeeded: boolean }
   | { ok: false; reason: "TRIP_NOT_FOUND" | "NOT_SUSPENDED" };
 
 /** Reverses `suspendTrip`. Atomic with its own audit row, same as suspend. */
@@ -382,10 +382,49 @@ export async function resumeTrip(db: pg.Pool, tripId: string): Promise<ResumeTri
       [tripId],
     );
 
-    await recordAdminMutation(client, "admin.resume_trip", tripId, { ok: true }, correlationId);
+    // PR review before the sprint-6 -> main merge, 2026-10-06 [P2]: suspend
+    // only blocks claimJob's own WHERE clause (job-queue.ts) — it does not
+    // pause the approval's own TTL. An approval that expires WHILE a trip
+    // is suspended used to leave resume reporting bare success: the job
+    // stayed `queued` but permanently unclaimable (claimJob requires
+    // `pa.expires_at > now()`), and a fresh approval attempt failed
+    // ALREADY_APPROVED, because the plan was still `approved`. Stuck, with
+    // no error anywhere. `recoverExpiredApprovals` (job-queue.ts) already
+    // does the right revert — plan back to `pending_approval`, job back to
+    // `waiting_for_user_action` — but had no production caller at all until
+    // now (see server.ts). This is that same revert, scoped to this one
+    // trip, inside this same transaction and lock, so the operator's
+    // response says so immediately rather than waiting for that timer.
+    const reverted = await client.query<{ job_id: string }>(
+      `WITH reverted_plan AS (
+         UPDATE control_plane.plans p
+         SET status = 'pending_approval', updated_at = now()
+         FROM control_plane.plan_approvals pa
+         WHERE pa.plan_id = p.id
+           AND p.trip_id = $1
+           AND p.status = 'approved'
+           AND pa.used_at IS NULL
+           AND pa.expires_at < now()
+           AND NOT EXISTS (
+             SELECT 1 FROM control_plane.plan_approvals pa2
+             WHERE pa2.plan_id = p.id AND pa2.used_at IS NULL AND pa2.expires_at >= now()
+           )
+         RETURNING p.id AS plan_id
+       )
+       UPDATE control_plane.jobs j
+       SET state = 'waiting_for_user_action', updated_at = now()
+       FROM reverted_plan
+       WHERE j.plan_id = reverted_plan.plan_id
+         AND j.state = 'queued'
+       RETURNING j.id AS job_id`,
+      [tripId],
+    );
+    const reapprovalNeeded = (reverted.rowCount ?? 0) > 0;
+
+    await recordAdminMutation(client, "admin.resume_trip", tripId, { ok: true, reapprovalNeeded }, correlationId);
 
     await client.query("COMMIT");
-    return { ok: true, tripId };
+    return { ok: true, tripId, reapprovalNeeded };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

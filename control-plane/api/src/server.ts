@@ -3,7 +3,7 @@ import { createNotificationAdapter } from "./adapters/notification.js";
 import { loadArchitectureProfile, validateBeforeProvider } from "./config.js";
 import { createDatabasePool, databaseReadiness } from "./database.js";
 import { dispatchPendingTripNotifications } from "./outbox-dispatcher.js";
-import { recoverStaleLeases } from "./job-queue.js";
+import { recoverStaleLeases, recoverExpiredApprovals } from "./job-queue.js";
 import { destinationInfoSearchConfigured, refreshStaleDestinationInfo } from "./destination-info-store.js";
 import { venueLinkSearchConfigured } from "./itinerary-extract.js";
 import { resolvePendingVenueLinks } from "./venue-links.js";
@@ -284,6 +284,35 @@ if (signup) {
       })
       .finally(() => { recovering = false; });
   }, STALE_LEASE_POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+// Reverts a plan (and its job) whose approval expired before anyone acted on
+// it. Same "no production caller" gap as recoverStaleLeases above, found in
+// the same PR review (2026-10-06 [P2]): resumeTrip (admin-mutations.ts) now
+// does this inline for the one trip it is resuming, but a plan can also sit
+// expired without ever being suspended at all — an organizer who approved
+// and then did nothing. Runs unconditionally, same reasoning as the lease
+// recovery above.
+{
+  let reverting = false;
+  const EXPIRED_APPROVAL_POLL_INTERVAL_MS = 2 * 60_000;
+  const timer = setInterval(() => {
+    if (reverting) return;
+    reverting = true;
+    recoverExpiredApprovals(pool)
+      .then((count) => {
+        if (count > 0) {
+          process.stderr.write(`${structuredLog("warn", "job_queue.expired_approvals_reverted", { count })}\n`);
+        }
+      })
+      .catch((error) => {
+        process.stderr.write(`${structuredLog("error", "job_queue.expired_approval_revert_error", {
+          safe_error_code: error instanceof Error ? error.name : "UNKNOWN",
+        })}\n`);
+      })
+      .finally(() => { reverting = false; });
+  }, EXPIRED_APPROVAL_POLL_INTERVAL_MS);
   timer.unref();
 }
 
