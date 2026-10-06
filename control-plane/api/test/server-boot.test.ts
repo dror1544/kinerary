@@ -265,3 +265,82 @@ test("the real server entrypoint refuses to start when a signup secret cannot be
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+// Found in a boundary review before the Sprint 6 -> main merge (2026-10-06):
+// every comment next to these five env vars asserts they are distinct keys
+// for distinct trust tiers (admin, operator, interview-agent, chat-routing,
+// assistant-events ingest) — nothing enforced it. An operator who copy-pastes
+// the same value into two of them would silently let one credential pass as
+// another.
+test("the real server entrypoint refuses to start when two shared secret keys collide", async () => {
+  const port = await freePort();
+  const workerPort = await freePort();
+  const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-boot-"));
+  try {
+    const profilePath = join(directory, "architecture.json");
+    await writeFile(profilePath, JSON.stringify(baseProfile(port, workerPort)), "utf8");
+
+    const child = spawn(process.execPath, ["--import", "tsx", serverEntrypoint], {
+      cwd: apiDirectory,
+      env: {
+        ...process.env,
+        CONTROL_PLANE_ARCHITECTURE_PROFILE: profilePath,
+        CONTROL_PLANE_DATABASE_URL: "postgresql://unused.invalid:5432/unused",
+        CONTROL_PLANE_ADMIN_KEY: "shared-secret-by-mistake",
+        ASSISTANT_EVENTS_INGEST_KEY: "shared-secret-by-mistake",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+
+    const code = await exitCodeWithin(child, 20_000);
+    assert.notEqual(code, 0, "two colliding shared-secret keys must fail the boot");
+    assert.match(stderr, /ASSISTANT_EVENTS_INGEST_KEY must not equal CONTROL_PLANE_ADMIN_KEY/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the real server entrypoint boots when several shared secret keys are all genuinely distinct", async () => {
+  const port = await freePort();
+  const workerPort = await freePort();
+  const directory = await mkdtemp(join(tmpdir(), "kinerary-control-plane-boot-"));
+  try {
+    const profilePath = join(directory, "architecture.json");
+    await writeFile(profilePath, JSON.stringify(baseProfile(port, workerPort)), "utf8");
+
+    const child = spawn(process.execPath, ["--import", "tsx", serverEntrypoint], {
+      cwd: apiDirectory,
+      env: {
+        ...process.env,
+        CONTROL_PLANE_ARCHITECTURE_PROFILE: profilePath,
+        CONTROL_PLANE_DATABASE_URL: "postgresql://unused.invalid:5432/unused",
+        CONTROL_PLANE_ADMIN_KEY: "boot-test-admin-key",
+        ASSISTANT_EVENTS_INGEST_KEY: "boot-test-ingest-key",
+        CONTROL_PLANE_OPERATOR_KEY: "boot-test-operator-key",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+    let exited: number | null = null;
+    child.on("exit", (code) => { exited = code ?? 0; });
+
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      if (exited !== null) throw new Error(`server exited with code ${exited} before listening:\n${stderr}`);
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(500) });
+        if (response.ok) { child.kill("SIGTERM"); return; }
+      } catch {
+        // not listening yet
+      }
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    child.kill("SIGTERM");
+    throw new Error(`server did not listen within 20s:\n${stderr}`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

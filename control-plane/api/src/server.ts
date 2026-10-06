@@ -187,6 +187,31 @@ if (assistantEventsIngestKey) {
   assistantEventsIngest = { db: pool, apiKey: assistantEventsIngestKey };
 }
 
+// Every comment above asserts these are distinct keys — nothing checked it.
+// An operator who copy-pastes the same value into two of these env vars
+// (or a deploy template that defaults more than one to the same secret)
+// would silently let one credential pass as another: an ingest key
+// granted admin, or an interview-agent key granted the operator's. Fail
+// loud at boot rather than discover it from an audit log.
+{
+  const named: Array<[string, string | undefined]> = [
+    ["CONTROL_PLANE_CHAT_ROUTING_KEY", chatRoutingKey],
+    ["CONTROL_PLANE_INTERVIEW_AGENT_KEY", interviewAgentKey],
+    ["CONTROL_PLANE_OPERATOR_KEY", operatorKey],
+    ["CONTROL_PLANE_ADMIN_KEY", adminKey],
+    ["ASSISTANT_EVENTS_INGEST_KEY", assistantEventsIngestKey],
+  ];
+  const seen = new Map<string, string>();
+  for (const [name, value] of named) {
+    if (!value) continue;
+    const collidesWith = seen.get(value);
+    if (collidesWith) {
+      throw new Error(`${name} must not equal ${collidesWith} — each shared secret must be distinct`);
+    }
+    seen.set(value, name);
+  }
+}
+
 const app = buildApp(profile, {
   readiness: () => databaseReadiness(pool),
   close: () => pool.end(),
