@@ -1286,9 +1286,15 @@ class ProvisionerWorker:
             # participant list.
             # #review 2026-10-03 [P2], round 2: usernames alone do not
             # identify the TRIP -- a second trip for the same family shares
-            # them. expected_departure/expected_return_date (THIS deploy's
-            # own config["meta"]) cannot collide between two distinct real
-            # trips for one family the way a roster can.
+            # them. expected_deployment_nonce (THIS deploy's own
+            # config["meta"]["deploymentNonce"], generated fresh per render
+            # by transformer.py) cannot collide between two distinct real
+            # trips, or two distinct deploys, the way a roster can. Carries
+            # no information about the trip itself (#review 2026-10-06 [N1]
+            # -- this used to be the deploy's own departure/returnDate,
+            # served back by an unauthenticated route; see verification.py's
+            # docstring for why that leaked real information and this
+            # doesn't).
             expected_usernames = frozenset(
                 p.get("username") for p in (config.get("participants") or [])
                 if isinstance(p, dict) and p.get("username")
@@ -1299,8 +1305,7 @@ class ProvisionerWorker:
                 plan_desired=plan_desired, private_url=private_url,
                 http_get=self._verification_http_get,
                 expected_usernames=expected_usernames,
-                expected_departure=meta.get("departure"),
-                expected_return_date=meta.get("returnDate"),
+                expected_deployment_nonce=meta.get("deploymentNonce"),
                 retry_attempts=self._verification_retry_attempts,
                 retry_delay_s=self._verification_retry_delay_s,
                 sleep=self._verification_sleep,

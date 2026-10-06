@@ -236,41 +236,60 @@ class RenderedDataCheckTests(unittest.TestCase):
         result = verification.check_rendered_data(get, "https://trip.example", frozenset())
         self.assertEqual(result.outcome, "passed")
 
-    def test_passes_when_departure_and_return_date_both_match(self) -> None:
+    def test_passes_when_the_deployment_nonce_matches(self) -> None:
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
-        get.set(
-            "/api/config/deployment-identity", 200,
-            json.dumps({"departure": "2027-03-10T06:00:00+03:00", "returnDate": "2027-03-20"}),
-        )
+        get.set("/api/config/deployment-identity", 200, json.dumps({"deploymentNonce": "abc123"}))
         result = verification.check_rendered_data(
-            get, "https://trip.example", frozenset({"tali"}),
-            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
         )
         self.assertEqual(result.outcome, "passed")
+
+    def test_a_404_on_deployment_identity_degrades_to_roster_only_rather_than_failing(self) -> None:
+        """PR review before the sprint-6 -> main merge, 2026-10-06 (P1): the
+        planner still considers older manifest-backed releases compatible,
+        and the worker can materialize exactly one of them -- a real site
+        with no bug at all, just predating this route. A roster match is
+        still required and still ran; this is strictly less protection than
+        a newer release gets, never less than that older release ever had."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set("/api/config/deployment-identity", 404, "Not Found")
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
+        )
+        self.assertEqual(result.outcome, "passed")
+        self.assertIn("404", result.evidence)
+
+    def test_a_non_404_error_on_deployment_identity_still_fails(self) -> None:
+        """The route existing and erroring is new evidence of a real
+        problem -- unlike a 404, it must not be waved through."""
+        get = FakeGet()
+        get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
+        get.set("/api/config/deployment-identity", 500, "boom")
+        result = verification.check_rendered_data(
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
+        )
+        self.assertEqual(result.outcome, "failed")
 
     def test_fails_when_the_matching_roster_belongs_to_a_sibling_trip_for_the_same_family(self) -> None:
         """#review 2026-10-03 [P2], round 2: a SECOND trip for the same
         family can share its roster exactly -- round 1's username comparison
-        alone would pass against the wrong trip. departure/returnDate cannot
-        collide between two distinct real trips for one family."""
+        alone would pass against the wrong trip. The deployment nonce cannot
+        collide between two distinct real deploys the way a roster can."""
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
-        get.set(
-            "/api/config/deployment-identity", 200,
-            json.dumps({"departure": "2028-07-01T06:00:00+03:00", "returnDate": "2028-07-10"}),
-        )
+        get.set("/api/config/deployment-identity", 200, json.dumps({"deploymentNonce": "a-different-nonce"}))
         result = verification.check_rendered_data(
-            get, "https://trip.example", frozenset({"tali"}),
-            expected_departure="2027-03-10T06:00:00+03:00", expected_return_date="2027-03-20",
+            get, "https://trip.example", frozenset({"tali"}), expected_deployment_nonce="abc123",
         )
         self.assertEqual(result.outcome, "failed")
         self.assertIn("deployment identity mismatch", result.evidence)
 
-    def test_still_passes_with_no_expected_dates_to_compare(self) -> None:
-        """Matching round 1's own fallback: expected_departure/
-        expected_return_date both None skips this half of the comparison
-        rather than failing retroactively."""
+    def test_still_passes_with_no_expected_nonce_to_compare(self) -> None:
+        """Matching round 1's own fallback: expected_deployment_nonce being
+        None skips this half of the comparison rather than failing
+        retroactively."""
         get = FakeGet()
         get.set("/api/config/roster", 200, json.dumps({"participants": [{"username": "tali"}]}))
         result = verification.check_rendered_data(get, "https://trip.example", frozenset({"tali"}))

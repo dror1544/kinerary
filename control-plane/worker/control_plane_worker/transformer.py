@@ -90,6 +90,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
@@ -2078,6 +2079,20 @@ def transform_intake(
             "departure": departure_iso,
             "returnDate": return_date.strftime("%Y-%m-%d"),
             "totalDays": total_days,
+            # An opaque per-render token, never derived from anything
+            # guessable (never dates, never the trip id) — PR review before
+            # the sprint-6 -> main merge, 2026-10-06 [N1]: the verification
+            # gate's /api/config/deployment-identity route used to serve
+            # `departure`/`returnDate` directly, unauthenticated, so anyone
+            # who knew a trip's hostname learned exactly when that family is
+            # away. A hash of the dates wouldn't have fixed it either —
+            # there are only a few thousand plausible departure/return
+            # pairs, trivially brute-forced with no secret salt. This value
+            # carries no information about the trip at all; the worker
+            # compares it against the one it just generated for THIS
+            # render, in memory, the same way it already compares
+            # `departure`/`returnDate` via `config["meta"]`.
+            "deploymentNonce": secrets.token_hex(16),
             # Not derived from the intake — there's no "organizer's home
             # currency" question yet. Every real trip on this platform so far
             # is an Israeli family traveling elsewhere, so ILS is the

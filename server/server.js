@@ -893,17 +893,24 @@ app.get('/api/config/roster', (_req, res) => {
 // compared the roster above against the deploying plan's expected
 // participants, but two trips for the SAME family can share an identical
 // roster — a private_url misrouted to a sibling trip, or a stale deployment
-// of one, would still pass. departure/returnDate are the one pair of
-// already-allow-listed (shared/config-visibility.js) fields that cannot
-// collide between two distinct real trips the way a family's own roster
-// can. Deliberately its own route rather than folded into /api/config/roster
-// above: that route's whole point, stated in its own comment, is "the
-// four fields a login picker needs" — these two exist for a different
-// reason (deployment identity, not login) and mixing the two would make
-// neither route's surface obvious at a glance any more.
+// of one, would still pass. Originally served departure/returnDate, since
+// those cannot collide between two distinct real trips for one family the
+// way a roster can.
+//
+// #review 2026-10-06 [N1], PR review before the sprint-6 -> main merge: that
+// served the family's actual travel dates with no authentication — anyone
+// who knew the hostname learned exactly when the family is away. A hash of
+// the dates would not have fixed it: there are only a few thousand plausible
+// departure/return pairs, trivially brute-forced with no secret salt. Now
+// serves `deploymentNonce` instead — an opaque value carrying no information
+// about the trip, generated fresh per render (transformer.py) and compared
+// by the worker against the one it just generated for THIS deploy. Still its
+// own route rather than folded into /api/config/roster above, for the same
+// reason as before: that route's own comment says its whole point is "the
+// four fields a login picker needs," and this exists for a different reason.
 app.get('/api/config/deployment-identity', (_req, res) => {
   const meta = publicConfig(TRIP_CONFIG).meta || {};
-  res.json({ departure: meta.departure ?? null, returnDate: meta.returnDate ?? null });
+  res.json({ deploymentNonce: meta.deploymentNonce ?? null });
 });
 
 // Stage 1 groundwork: read-only access to stored config history for a future

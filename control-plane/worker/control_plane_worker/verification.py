@@ -228,8 +228,7 @@ def check_rendered_data(
     get: HttpGetFn,
     private_url: str | None,
     expected_usernames: AbstractSet[str] = frozenset(),
-    expected_departure: str | None = None,
-    expected_return_date: str | None = None,
+    expected_deployment_nonce: str | None = None,
 ) -> CheckResult:
     """The trip's own `GET /api/config/roster` — deliberately unauthenticated
     (server/server.js: "the login screen needs to show a pick-yourself roster
@@ -251,13 +250,22 @@ def check_rendered_data(
     TRIP — two trips for the same family (a second trip, re-provisioned with
     the same roster) share them, so a `private_url` misrouted to the sibling
     trip, or a stale deployment of it, still passes round 1's check.
-    `expected_departure`/`expected_return_date` (provisioner.py:
-    `config["meta"]`, the same deploy's own dates) are compared against a
+    `expected_deployment_nonce` (provisioner.py: `config["meta"]
+    ["deploymentNonce"]`, the same deploy's own value) is compared against a
     SECOND unauthenticated route, `GET /api/config/deployment-identity`
-    (server/server.js) — two trips for one family cannot share both dates
-    without being the same trip. Either expected value being `None` skips
-    that half of the comparison the same way an empty `expected_usernames`
-    does; this is additive to round 1, not a replacement for it.
+    (server/server.js) — two deploys cannot share a nonce without being the
+    same one. `None` skips that half of the comparison the same way an empty
+    `expected_usernames` does; this is additive to round 1, not a
+    replacement for it.
+
+    #review 2026-10-06 [N1], PR review before the sprint-6 -> main merge:
+    this used to compare `departure`/`returnDate` directly, which meant the
+    route served the family's real travel dates with no authentication.
+    `deploymentNonce` carries no information about the trip at all — a
+    random value generated fresh per render (transformer.py), compared only
+    against the exact value this same deploy generated. A 404 on the route
+    (an older, pre-nonce release) degrades to roster-only protection rather
+    than failing — see the inline comment below for why that is safe.
     """
     if not private_url:
         return CheckResult(RENDERED_DATA, "failed", "no private_url to probe")
@@ -283,30 +291,42 @@ def check_rendered_data(
                 f"roster mismatch at {url}: expected usernames {sorted(expected_usernames)}, "
                 f"got {sorted(actual_usernames)} — this private_url may be serving another trip",
             )
-    if expected_departure is not None or expected_return_date is not None:
+    if expected_deployment_nonce is not None:
         identity_url = private_url.rstrip("/") + "/api/config/deployment-identity"
         try:
             id_status, id_body = get(identity_url)
         except Exception as exc:
             return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} raised {type(exc).__name__}: {exc}")
+        # A 404 here means "this release predates the route," not "this
+        # release is the wrong trip" — PR review, 2026-10-06: the planner
+        # still considers older manifest-backed releases compatible by
+        # intake-schema range, and the worker can materialize exactly one of
+        # them. Hard-failing turned a healthy, correctly-identified older
+        # deployment into an unrecoverable provisioning failure. The roster
+        # check above still ran and still has to have passed for this
+        # function to reach here, so a 404 degrades to roster-only
+        # protection — exactly the coverage every trip had before this date
+        # comparison existed, never less. Any OTHER non-200 (the route
+        # exists but errors) is still a hard failure: that is new evidence
+        # of a real problem, not an absent capability.
+        if id_status == 404:
+            return CheckResult(
+                RENDERED_DATA, "passed",
+                f"{body} | deployment-identity skipped: HTTP 404 at {identity_url} "
+                "(release predates this route; roster match stands alone)",
+            )
         if id_status != 200:
             return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} -> HTTP {id_status}: {id_body[:500]}")
         try:
             id_payload = json.loads(id_body)
         except (ValueError, TypeError):
             return CheckResult(RENDERED_DATA, "failed", f"GET {identity_url} -> non-JSON body: {id_body[:500]}")
-        actual_departure = id_payload.get("departure") if isinstance(id_payload, dict) else None
-        actual_return_date = id_payload.get("returnDate") if isinstance(id_payload, dict) else None
-        mismatches = []
-        if expected_departure is not None and actual_departure != expected_departure:
-            mismatches.append(f"departure: expected {expected_departure!r}, got {actual_departure!r}")
-        if expected_return_date is not None and actual_return_date != expected_return_date:
-            mismatches.append(f"returnDate: expected {expected_return_date!r}, got {actual_return_date!r}")
-        if mismatches:
+        actual_nonce = id_payload.get("deploymentNonce") if isinstance(id_payload, dict) else None
+        if actual_nonce != expected_deployment_nonce:
             return CheckResult(
                 RENDERED_DATA, "failed",
-                f"deployment identity mismatch at {identity_url}: {'; '.join(mismatches)} — "
-                "this private_url may be serving a different trip for the same family",
+                f"deployment identity mismatch at {identity_url}: expected nonce {expected_deployment_nonce!r}, "
+                f"got {actual_nonce!r} — this private_url may be serving a different trip for the same family",
             )
     return CheckResult(RENDERED_DATA, "passed", body)
 
@@ -385,8 +405,7 @@ def run_pre_ready_private_checks(
     private_url: str | None,
     http_get: HttpGetFn,
     expected_usernames: AbstractSet[str] = frozenset(),
-    expected_departure: str | None = None,
-    expected_return_date: str | None = None,
+    expected_deployment_nonce: str | None = None,
     retry_attempts: int = 1,
     retry_delay_s: float = 0.0,
     sleep: SleepFn = time.sleep,
@@ -405,7 +424,7 @@ def run_pre_ready_private_checks(
         check_release_compatibility(conn, plan_desired),
         _retrying(lambda: check_runtime_health(http_get, private_url), attempts=retry_attempts, delay_s=retry_delay_s, sleep=sleep),
         _retrying(
-            lambda: check_rendered_data(http_get, private_url, expected_usernames, expected_departure, expected_return_date),
+            lambda: check_rendered_data(http_get, private_url, expected_usernames, expected_deployment_nonce),
             attempts=retry_attempts, delay_s=retry_delay_s, sleep=sleep,
         ),
         CheckResult(
@@ -468,8 +487,7 @@ def gate_ready_private(
     private_url: str | None,
     http_get: HttpGetFn | None = None,
     expected_usernames: AbstractSet[str] = frozenset(),
-    expected_departure: str | None = None,
-    expected_return_date: str | None = None,
+    expected_deployment_nonce: str | None = None,
     retry_attempts: int = 1,
     retry_delay_s: float = 0.0,
     sleep: SleepFn = time.sleep,
@@ -490,7 +508,7 @@ def gate_ready_private(
     results = run_pre_ready_private_checks(
         conn, plan_desired=plan_desired, private_url=private_url, http_get=get,
         expected_usernames=expected_usernames,
-        expected_departure=expected_departure, expected_return_date=expected_return_date,
+        expected_deployment_nonce=expected_deployment_nonce,
         retry_attempts=retry_attempts, retry_delay_s=retry_delay_s, sleep=sleep,
     )
     record_evidence(conn, trip_id=trip_id, deployment_ref=deployment_ref, results=results)

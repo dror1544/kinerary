@@ -98,13 +98,15 @@ class FakeDeployAdapter:
                 ] or [{"username": "organizer", "name": "Organizer"}]
             return 200, json.dumps({"participants": participants})
         if url.endswith("/api/config/deployment-identity"):
-            # #review 2026-10-03 [P2], round 2: mirrors the real
-            # server/server.js route this verification check now also
-            # probes, reading the same deployed config's meta the way the
-            # roster branch above reads its participants.
+            # #review 2026-10-03 [P2], round 2 (updated #review 2026-10-06
+            # [N1]): mirrors the real server/server.js route this
+            # verification check now also probes, reading the same deployed
+            # config's meta the way the roster branch above reads its
+            # participants. The real route now serves an opaque
+            # deploymentNonce rather than raw dates; this fake does too.
             config = self.deployed[-1]["config"] if self.deployed else {}
             meta = config.get("meta") or {}
-            return 200, json.dumps({"departure": meta.get("departure"), "returnDate": meta.get("returnDate")})
+            return 200, json.dumps({"deploymentNonce": meta.get("deploymentNonce")})
         return 404, "not found"
 
 

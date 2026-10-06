@@ -807,20 +807,22 @@ describe('GET /api/config/roster', () => {
 });
 
 // ── GET /api/config/deployment-identity ───────────────────────────────────────
-// Deliberately public and deliberately just these two fields — #review
-// 2026-10-03 [P2]: the verification worker's rendered_data check compared
-// only the roster, and two trips for the same family can share one, so a
-// misrouted private_url could pass against the wrong trip. departure/
-// returnDate cannot collide between two distinct real trips the way a
-// family's own roster can.
+// Deliberately public, deliberately just this one field — #review 2026-10-03
+// [P2]: the verification worker's rendered_data check compared only the
+// roster, and two trips for the same family can share one, so a misrouted
+// private_url could pass against the wrong trip. #review 2026-10-06 [N1]:
+// this used to serve the real departure/returnDate, which meant anyone who
+// knew the hostname learned exactly when the family is away. Now serves an
+// opaque deploymentNonce instead — carries no information about the trip,
+// so a public, unauthenticated route stays safe to probe.
 describe('GET /api/config/deployment-identity', () => {
-  test('is reachable without a token, and carries only departure/returnDate', async () => {
+  test('is reachable without a token, and carries only an opaque nonce — never the real dates', async () => {
     const res = await api('/api/config/deployment-identity');
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(Object.keys(body).sort(), ['departure', 'returnDate']);
-    assert.equal(typeof body.departure, 'string');
-    assert.equal(typeof body.returnDate, 'string');
+    assert.deepEqual(Object.keys(body).sort(), ['deploymentNonce']);
+    assert.equal(typeof body.deploymentNonce, 'string');
+    assert.ok(!('departure' in body) && !('returnDate' in body), 'must never serve real dates here');
   });
 });
 
