@@ -1030,6 +1030,12 @@ async function tripDetail({ stack = CONFIG.defaultStack, trip }) {
 
 async function failures({ stack = CONFIG.defaultStack, days = 7 }) {
   const d = clamp(days, 1, 180, 7);
+  // Sprint 6, 2026-10-06: a deliberately suspended trip's job sits exactly
+  // like this (queued, unclaimed, for however long the suspension lasts) —
+  // without this, every suspend shows up here looking like an incident. A
+  // stack behind migration 20261003060350 has no such column at all.
+  const hasSuspend = await columnExists(stack, "control_plane.trips", "suspended_at");
+  const suspendColumn = hasSuspend ? "t.suspended_at IS NOT NULL" : "false";
   const [jobs, notifications, unreachable] = await Promise.all([
     // Failed, gave up, or in flight for over an hour. It used to be
     // `NOT IN ('succeeded','completed')` — and 'completed' is not one of the
@@ -1037,7 +1043,9 @@ async function failures({ stack = CONFIG.defaultStack, days = 7 }) {
     // running build was listed under FAILED / STUCK while it was working
     // perfectly. `safe_error_code` is only set once the retries are exhausted,
     // so a job that is still retrying shows '-' rather than a cause.
-    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, j.job_type, j.state, coalesce(j.safe_error_code,'-'),
+    runSql(stack, `SELECT t.slug, ${tripClassSql(stack)}, j.job_type,
+                          j.state || (CASE WHEN ${suspendColumn} THEN ' (SUSPENDED — not an incident)' ELSE '' END),
+                          coalesce(j.safe_error_code,'-'),
                           j.attempt || '/' || j.max_attempts, to_char(j.updated_at,'MM-DD HH24:MI')
                      FROM control_plane.jobs j JOIN control_plane.trips t ON t.id = j.trip_id
                     WHERE (j.state IN ('failed','cancelled')
@@ -1535,6 +1543,22 @@ async function tableExists(stack, qualified) {
 }
 
 /**
+ * Same reasoning as `tableExists`, one level narrower: a stack can have the
+ * TABLE but be a migration behind on one of its COLUMNS (`trips.suspended_at`,
+ * added 2026-10-03 — a stack from before that still has `control_plane.trips`,
+ * just not this column), and PostgreSQL resolves a missing column at plan
+ * time exactly like a missing relation.
+ */
+async function columnExists(stack, table, column) {
+  const rows = await runSql(
+    stack,
+    `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+      WHERE table_schema || '.' || table_name = '${table}' AND column_name = '${column}');`,
+  );
+  return rows[0]?.[0] === "t";
+}
+
+/**
  * Free text is the first thing in this catalog that can contain a NEWLINE, and
  * psql delimits ROWS with newlines. Left alone, a two-line quote becomes two
  * rows — which is not a rendering glitch but a forgery primitive: a traveller
@@ -1611,8 +1635,14 @@ async function loadAlerts(stack, h) {
   // CHANGES, so a new report is a change and a week of the same ones is not.
   // Guarded, because a stack a schema behind must degrade, not break.
   const hasReports = await tableExists(stack, "control_plane.companion_bug_reports");
+  // Sprint 6's verification aggregator; a stack built before it has no such
+  // table at all.
+  const hasVerification = await tableExists(stack, "control_plane.verification_evidence");
 
-  const [unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported] = await Promise.all([
+  const [
+    unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
+    verificationFailed, awaitingApproval,
+  ] = await Promise.all([
     runSql(stack, `SELECT t.slug, coalesce(t.unreachable_reason,'-')
                      FROM control_plane.trips t
                     WHERE t.reachability = 'unreachable' AND ${real}
@@ -1679,8 +1709,43 @@ async function loadAlerts(stack, h) {
                         WHERE r.reported_at > now() - interval '7 days'
                         ORDER BY r.reported_at DESC, r.id;`)
       : Promise.resolve([]),
+    // A trip's own LATEST attempt at each hard-gated check, not its history —
+    // a trip that failed once and later passed on retry is not an incident.
+    // Only release_compatibility/runtime_health/rendered_data are hard-gated
+    // (verification.py); the other three are honest skips by design and
+    // would otherwise alert on every trip, forever. Guarded like
+    // companion_bug_reports above.
+    hasVerification
+      ? runSql(stack, `SELECT t.slug, ve.check_name,
+                              to_char(ve.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
+                         FROM control_plane.verification_evidence ve
+                         JOIN control_plane.trips t ON t.id = ve.trip_id
+                        WHERE ve.outcome = 'failed'
+                          AND ve.check_name IN ('release_compatibility','runtime_health','rendered_data')
+                          AND ve.observed_at = (SELECT max(ve2.observed_at) FROM control_plane.verification_evidence ve2
+                                                 WHERE ve2.trip_id = ve.trip_id AND ve2.check_name = ve.check_name)
+                          AND ${real}
+                        ORDER BY t.slug, ve.check_name;`)
+      : Promise.resolve([]),
+    // A job sitting in waiting_for_user_action for a while — a fresh plan
+    // nobody has approved yet, or (2026-10-06) an approval that expired,
+    // including while the trip was suspended: resumeTrip reverts that case
+    // itself now (admin-mutations.ts), but this is the same signal for a
+    // trip that was never suspended at all and just sat too long. updated_at,
+    // not created_at: a revert or a heartbeat both bump it, so this only
+    // fires once nothing has moved for real.
+    runSql(stack, `SELECT t.slug, j.job_type,
+                          to_char(j.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') || ' UTC'
+                     FROM control_plane.jobs j JOIN control_plane.trips t ON t.id = j.trip_id
+                    WHERE j.state = 'waiting_for_user_action'
+                      AND j.updated_at < now() - interval '${h} hours'
+                      AND ${real}
+                    ORDER BY t.slug, j.id;`),
   ]);
-  return { unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported };
+  return {
+    unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
+    verificationFailed, awaitingApproval,
+  };
 }
 
 /**
@@ -1693,7 +1758,10 @@ async function loadAlerts(stack, h) {
  * because Hermes hashes them); `digest` is the same incident for a person, with
  * the trip first. Anything a person could have typed goes through `md`.
  */
-function alertSections({ unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported }) {
+function alertSections({
+  unreachable, jobs, notifications, stuck, awaiting, companionless, modelFailing, reported,
+  verificationFailed, awaitingApproval,
+}) {
   return [
     { title: "UNREACHABLE", label: "unreachable", rows: unreachable,
       text: (r) => `${r[0]} — ${r[1]}`,
@@ -1704,6 +1772,19 @@ function alertSections({ unreachable, jobs, notifications, stuck, awaiting, comp
     { title: "FAILED JOBS", label: "failed job", rows: jobs,
       text: (r) => `${r[0]} — ${r[1]} ${r[2]} (attempt ${r[3]})`,
       digest: (r) => `${md(r[0])} — ${md(r[1])} ${md(r[2])} (attempt ${md(r[3])})` },
+    // Named by which check, not folded into FAILED JOBS: a verification
+    // failure means the site came up but is wrong (the wrong trip's data, an
+    // incompatible release), which is a different thing to go fix than a job
+    // that threw. (2026-10-06)
+    { title: "VERIFICATION FAILED", label: "verification failed", rows: verificationFailed,
+      text: (r) => `${r[0]} — ${r[1]} failed as of ${r[2]}`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])} failed as of ${md(r[2])}` },
+    // Distinct from a suspend/resume cycle, which handles its own expired
+    // approval inline (admin-mutations.ts) — this is the trip that was never
+    // suspended at all and just sat unapproved too long. (2026-10-06)
+    { title: "AWAITING ORGANIZER APPROVAL", label: "awaiting approval", rows: awaitingApproval,
+      text: (r) => `${r[0]} — ${r[1]}, waiting since ${r[2]}`,
+      digest: (r) => `${md(r[0])} — ${md(r[1])}, waiting since ${md(r[2])}` },
     { title: "CONFIRMED BUT NEVER BUILT", label: "confirmed, never built", rows: stuck,
       text: (r) => `${r[0]} — ${r[1]}, confirmed ${r[2]}`,
       digest: (r) => `${md(r[0])} — ${r[1] === "intake_confirmed" ? "" : `${stageLabel(r[1])}, `}confirmed ${md(r[2])}` },

@@ -429,6 +429,53 @@ class FleetMcp(unittest.TestCase):
                 continue
             self.assertIn("ORDER BY", statement, "an alerts query has no stable row order:\n" + statement)
 
+    # ---------------------------------------------- verification / approval --
+    def test_a_trip_s_latest_verification_failure_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("to_regclass", [["t"]]),
+            ("ve.outcome = 'failed'", [["trip-v", "runtime_health", "2026-10-06 09:00 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertIn("VERIFICATION FAILED", text)
+        self.assertIn("trip-v — runtime_health failed as of 2026-10-06 09:00 UTC", text)
+
+    def test_verification_failure_is_not_checked_on_a_stack_without_the_table(self):
+        """to_regclass absent/false (no fixture match) must degrade, not error."""
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([]))
+        self.assertFalse(is_error, text)
+        self.assertNotIn("VERIFICATION FAILED", text)
+
+    def test_a_job_waiting_too_long_for_organizer_approval_appears_in_alerts(self):
+        text, is_error = self.tool("alerts", {}, env=self.fixtures_env([
+            ("j.state = 'waiting_for_user_action'", [["trip-w", "provision", "2026-10-06 06:00 UTC"]]),
+        ]))
+        self.assertFalse(is_error, text)
+        self.assertIn("AWAITING ORGANIZER APPROVAL", text)
+        self.assertIn("trip-w — provision, waiting since 2026-10-06 06:00 UTC", text)
+
+    # ------------------------------------------------------- suspended trips --
+    # The fake psql returns exactly the rows a fixture names — it never
+    # evaluates the SQL sent to it — so what these two can actually prove is
+    # the query TEXT: whether it references t.suspended_at at all, which is
+    # the real safety property (a stack behind migration 20261003060350 has
+    # no such column, and referencing it would fail the whole query the way
+    # `tableExists`'s own docstring describes for a missing relation).
+    def test_a_suspended_trip_s_job_is_annotated_not_hidden_in_failures(self):
+        self.tool("failures", {}, env=self.fixtures_env([("information_schema.columns", [["t"]])]))
+        joined = "\n".join(self.statements())
+        self.assertIn("t.suspended_at IS NOT NULL", joined)
+        self.assertIn("SUSPENDED", joined)
+
+    def test_failures_degrades_when_the_suspended_at_column_does_not_exist(self):
+        """No fixture match for information_schema.columns == the column
+        isn't there. The query must then never reference t.suspended_at at
+        all, rather than fail outright the way a bare missing-column
+        reference would."""
+        self.tool("failures", {}, env=self.fixtures_env([]))
+        joined = "\n".join(self.statements())
+        self.assertNotIn("t.suspended_at", joined)
+        self.assertIn("WHEN false THEN", joined)
+
     # --------------------------------------------------------- failed reads --
     def test_a_failed_query_is_reported_as_a_failure_not_as_no_rows(self):
         text, is_error = self.tool("fleet_overview", env={"FLEET_TEST_FAIL": "1"})
